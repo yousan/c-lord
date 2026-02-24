@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-COGS_DIR = Path(__file__).parent.parent / "claude_discord" / "cogs"
+COGS_DIR = Path(__file__).parent.parent / "c_lord" / "cogs"
 RUN_HELPER = COGS_DIR / "_run_helper.py"
 
 

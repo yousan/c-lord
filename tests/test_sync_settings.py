@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
-from claude_discord.database.repository import SessionRecord
+from c_lord.database.repository import SessionRecord
 
 
 def _make_record(
@@ -42,7 +42,7 @@ def _make_cog(
     cli_sessions_path: str | None = None,
     channel_id: int = 999,
 ):
-    from claude_discord.cogs.session_manage import SessionManageCog
+    from c_lord.cogs.session_manage import SessionManageCog
 
     bot = MagicMock()
     bot.channel_id = channel_id

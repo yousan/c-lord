@@ -3,9 +3,9 @@
 > **참고:** 이 문서는 원본 영어 문서의 자동 번역본입니다.
 > 내용이 다를 경우 [영어 버전](../../README.md)이 우선합니다.
 
-# claude-code-discord-bridge
+# c-lord
 
-[![CI](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/yousan/c-lord/actions/workflows/ci.yml/badge.svg)](https://github.com/yousan/c-lord/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -92,7 +92,7 @@ GitHub PR ←── git push ←── Claude Code ─────────�
 
 ```bash
 # 다른 Claude 세션이나 CI 스크립트에서:
-curl -X POST "$CCDB_API_URL/api/spawn" \
+curl -X POST "$CLORD_API_URL/api/spawn" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "저장소에 보안 스캔 실행", "thread_name": "보안 스캔"}'
 # 스레드 ID와 함께 즉시 반환; Claude는 백그라운드에서 실행
@@ -188,13 +188,13 @@ Claude 서브프로세스는 `DISCORD_THREAD_ID`를 환경 변수로 받으므�
 ### 독립형
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 
 cp .env.example .env
 # 봇 토큰과 채널 ID로 .env 편집
 
-uv run python -m claude_discord.main
+uv run python -m c_lord.main
 ```
 
 ### 패키지로 설치
@@ -202,12 +202,12 @@ uv run python -m claude_discord.main
 이미 discord.py 봇이 있는 경우 (Discord는 토큰당 하나의 Gateway 연결만 허용):
 
 ```bash
-uv add git+https://github.com/ebibibi/claude-code-discord-bridge.git
+uv add git+https://github.com/yousan/c-lord.git
 ```
 
 ```python
 from discord.ext import commands
-from claude_discord import ClaudeRunner, setup_bridge
+from c_lord import ClaudeRunner, setup_bridge
 
 bot = commands.Bot(...)
 runner = ClaudeRunner(command="claude", model="sonnet")
@@ -227,7 +227,7 @@ async def on_ready():
 최신 버전으로 업데이트:
 
 ```bash
-uv lock --upgrade-package claude-code-discord-bridge && uv sync
+uv lock --upgrade-package c-lord && uv sync
 ```
 
 ---
@@ -246,7 +246,7 @@ uv lock --upgrade-package claude-code-discord-bridge && uv sync
 | `SESSION_TIMEOUT_SECONDS` | 세션 비활성 시간 초과 | `300` |
 | `DISCORD_OWNER_ID` | Claude가 입력이 필요할 때 @멘션할 사용자 ID | (선택) |
 | `COORDINATION_CHANNEL_ID` | 세션 간 이벤트 브로드캐스트 채널 ID | (선택) |
-| `CCDB_COORDINATION_CHANNEL_NAME` | 이름으로 조율 채널 자동 생성 | (선택) |
+| `CLORD_COORDINATION_CHANNEL_NAME` | 이름으로 조율 채널 자동 생성 | (선택) |
 | `WORKTREE_BASE_DIR` | 세션 worktree 스캔 기본 디렉토리 (자동 정리 활성화) | (선택) |
 
 ---
@@ -265,7 +265,7 @@ uv lock --upgrade-package claude-code-discord-bridge && uv sync
 ## 테스트
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 700+ 테스트가 파서, 분할기, 저장소, 러너, 스트리밍, 웹훅 트리거, 자동 업그레이드(`/upgrade` 슬래시 명령, 스레드 호출 및 승인 버튼 포함), REST API, AskUserQuestion UI, 스레드 대시보드, 예약 작업, 세션 동기화, AI Lounge, 시작 시 재개, 모델 전환, 압축 감지, TodoWrite 진행 embed, 권한/elicitation/plan-mode 이벤트 파싱을 커버합니다.

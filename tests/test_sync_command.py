@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.database.models import init_db
-from claude_discord.database.repository import SessionRecord, SessionRepository
+from c_lord.database.models import init_db
+from c_lord.database.repository import SessionRecord, SessionRepository
 
 
 @pytest.fixture
@@ -52,7 +52,7 @@ def _make_cog(
     cli_sessions_path: str | None = None,
     channel_id: int = 999,
 ):
-    from claude_discord.cogs.session_manage import SessionManageCog
+    from c_lord.cogs.session_manage import SessionManageCog
 
     bot = MagicMock()
     bot.channel_id = channel_id

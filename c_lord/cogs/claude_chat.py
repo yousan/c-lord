@@ -471,7 +471,7 @@ class ClaudeChatCog(commands.Cog):
                     data = await attachment.read()
                     suffix = f"_{attachment.filename}"
                     with tempfile.NamedTemporaryFile(
-                        delete=False, suffix=suffix, prefix="ccdb_img_"
+                        delete=False, suffix=suffix, prefix="clord_img_"
                     ) as f:
                         f.write(data)
                         image_paths.append(f.name)
@@ -574,7 +574,8 @@ class ClaudeChatCog(commands.Cog):
                         ask_repo=self._ask_repo,
                         lounge_repo=self._lounge_repo,
                         stop_view=stop_view,
-                        worktree_manager=getattr(self.bot, "worktree_manager", None),
+                        session_dir_manager=getattr(self.bot, "session_dir_manager", None),
+                        tmux_manager=getattr(self.bot, "tmux_manager", None),
                         image_paths=image_paths,
                     )
                 )

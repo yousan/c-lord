@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from claude_discord.database.notification_repo import NotificationRepository
+from c_lord.database.notification_repo import NotificationRepository
 
 
 @pytest.fixture

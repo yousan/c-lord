@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.discord_ui.views import StopView
+from c_lord.discord_ui.views import StopView
 
 
 def _make_runner() -> MagicMock:

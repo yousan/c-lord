@@ -1,4 +1,4 @@
-"""Cogs for claude-code-discord-bridge."""
+"""Cogs for c-lord."""
 
 from .auto_upgrade import AutoUpgradeCog
 from .claude_chat import ClaudeChatCog

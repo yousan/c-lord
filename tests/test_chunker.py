@@ -1,6 +1,6 @@
 """Tests for fence-aware message chunker."""
 
-from claude_discord.discord_ui.chunker import (
+from c_lord.discord_ui.chunker import (
     _close_open_fence,
     _is_table_line,
     _wrap_tables_in_fences,

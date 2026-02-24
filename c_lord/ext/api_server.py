@@ -1,7 +1,7 @@
 """REST API server for Discord bot push notifications.
 
 Optional extension — requires aiohttp. Install with:
-    pip install claude-code-discord-bridge[api]
+    pip install c-lord[api]
 
 Provides endpoints for sending immediate and scheduled notifications
 to Discord channels via the bot.
@@ -40,8 +40,8 @@ class ApiServer:
 
     Usage::
 
-        from claude_discord.database.notification_repo import NotificationRepository
-        from claude_discord.ext.api_server import ApiServer
+        from c_lord.database.notification_repo import NotificationRepository
+        from c_lord.ext.api_server import ApiServer
 
         repo = NotificationRepository("data/notifications.db")
         await repo.init_db()

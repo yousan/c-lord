@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from claude_discord.claude.runner import ClaudeRunner
-from claude_discord.cogs.claude_chat import ClaudeChatCog
-from claude_discord.cogs.webhook_trigger import WebhookTriggerCog
-from claude_discord.protocols import DrainAware
+from c_lord.claude.runner import ClaudeRunner
+from c_lord.cogs.claude_chat import ClaudeChatCog
+from c_lord.cogs.webhook_trigger import WebhookTriggerCog
+from c_lord.protocols import DrainAware
 
 
 class TestDrainAwareProtocol:

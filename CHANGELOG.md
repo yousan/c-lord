@@ -54,11 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Scheduled Task Executor** (`SchedulerCog`) — register periodic Claude Code tasks via Discord chat or REST API. Tasks are stored in SQLite and executed by a single 30-second master loop. No code changes needed to add new tasks (#90)
-- **`/api/tasks` REST endpoints** — `POST`, `GET`, `DELETE`, `PATCH` for managing scheduled tasks. Claude Code calls these via Bash tool using `CCDB_API_URL` env var (#90)
+- **`/api/tasks` REST endpoints** — `POST`, `GET`, `DELETE`, `PATCH` for managing scheduled tasks. Claude Code calls these via Bash tool using `CLORD_API_URL` env var (#90)
 - **`TaskRepository`** (`database/task_repo.py`) — CRUD for `scheduled_tasks` table with `get_due()`, `update_next_run()`, enable/disable support (#90)
-- **`ClaudeRunner.api_port` / `api_secret` params** — when set, `CCDB_API_URL` (and optionally `CCDB_API_SECRET`) are injected into Claude subprocess env, enabling Claude to self-register tasks (#90)
+- **`ClaudeRunner.api_port` / `api_secret` params** — when set, `CLORD_API_URL` (and optionally `CLORD_API_SECRET`) are injected into Claude subprocess env, enabling Claude to self-register tasks (#90)
 - **`setup_bridge()` auto-discovery** — convenience factory that auto-wires `ClaudeRunner`, `SessionStore`, and `CoordinationChannel` from env vars; consumer smoke test in CI (#92)
-- **Zero-config coordination** — `CoordinationChannel` auto-creates its channel from `CCDB_COORDINATION_CHANNEL_NAME` env var with no consumer wiring needed (#89)
+- **Zero-config coordination** — `CoordinationChannel` auto-creates its channel from `CLORD_COORDINATION_CHANNEL_NAME` env var with no consumer wiring needed (#89)
 - **Session Sync** — sync existing Claude Code CLI sessions into Discord threads with `/sync-sessions` command; backfills recent conversation messages into the thread (#30, #31, #36)
 - **Session sync filters** — `since_days` / `since_hours` + `min_results` two-tier filtering, configurable thread style, origin filter for `/sessions` (#37, #38, #39)
 - **LiveToolTimer** — live elapsed-time updates on long-running tool call embeds (#84, #85)
@@ -139,10 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI pipeline: Python 3.10/3.11/3.12, ruff, pytest
 - Branch protection and PR workflow
 
-[Unreleased]: https://github.com/ebibibi/claude-code-discord-bridge/compare/v1.4.0...HEAD
-[1.4.0]: https://github.com/ebibibi/claude-code-discord-bridge/compare/v1.3.0...v1.4.0
-[1.3.0]: https://github.com/ebibibi/claude-code-discord-bridge/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/ebibibi/claude-code-discord-bridge/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/ebibibi/claude-code-discord-bridge/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/ebibibi/claude-code-discord-bridge/compare/v0.1.0...v1.0.0
-[0.1.0]: https://github.com/ebibibi/claude-code-discord-bridge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/yousan/c-lord/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/yousan/c-lord/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/yousan/c-lord/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/yousan/c-lord/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/yousan/c-lord/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/yousan/c-lord/compare/v0.1.0...v1.0.0
+[0.1.0]: https://github.com/yousan/c-lord/releases/tag/v0.1.0

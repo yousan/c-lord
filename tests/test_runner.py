@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from claude_discord.claude.runner import ClaudeRunner
+from c_lord.claude.runner import ClaudeRunner
 
 
 class TestBuildArgs:
@@ -150,31 +150,31 @@ class TestBuildEnv:
         env = runner._build_env()
         assert "PATH" in env
 
-    def test_injects_ccdb_api_url_when_api_port_set(self) -> None:
+    def test_injects_clord_api_url_when_api_port_set(self) -> None:
         runner = ClaudeRunner(api_port=8099)
         env = runner._build_env()
-        assert env["CCDB_API_URL"] == "http://127.0.0.1:8099"
+        assert env["CLORD_API_URL"] == "http://127.0.0.1:8099"
 
-    def test_no_ccdb_api_url_when_api_port_not_set(self) -> None:
-        # Remove CCDB_API_URL from the process env so it isn't inherited
-        original = os.environ.pop("CCDB_API_URL", None)
+    def test_no_clord_api_url_when_api_port_not_set(self) -> None:
+        # Remove CLORD_API_URL from the process env so it isn't inherited
+        original = os.environ.pop("CLORD_API_URL", None)
         try:
             runner = ClaudeRunner()
             env = runner._build_env()
-            assert "CCDB_API_URL" not in env
+            assert "CLORD_API_URL" not in env
         finally:
             if original is not None:
-                os.environ["CCDB_API_URL"] = original
+                os.environ["CLORD_API_URL"] = original
 
-    def test_injects_ccdb_api_secret_when_set(self) -> None:
+    def test_injects_clord_api_secret_when_set(self) -> None:
         runner = ClaudeRunner(api_port=8099, api_secret="my-secret")
         env = runner._build_env()
-        assert env["CCDB_API_SECRET"] == "my-secret"
+        assert env["CLORD_API_SECRET"] == "my-secret"
 
-    def test_no_ccdb_api_secret_when_not_set(self) -> None:
+    def test_no_clord_api_secret_when_not_set(self) -> None:
         runner = ClaudeRunner(api_port=8099)
         env = runner._build_env()
-        assert "CCDB_API_SECRET" not in env
+        assert "CLORD_API_SECRET" not in env
 
 
 class TestClone:

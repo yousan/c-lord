@@ -7,7 +7,7 @@ description: Enforce test-driven development — write tests FIRST, then impleme
 
 **This is not a suggestion. This is the workflow.**
 
-When adding features or fixing bugs in claude-code-discord-bridge, you MUST write tests before writing implementation code. No exceptions.
+When adding features or fixing bugs in c-lord, you MUST write tests before writing implementation code. No exceptions.
 
 ## When to Activate
 
@@ -43,15 +43,15 @@ uv run pytest tests/test_new_feature.py -v
 Improve the implementation while keeping all tests green. Then run the full suite:
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord --cov-report=term-missing
+uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing
 ```
 
 ### Step 4: VERIFY — Lint + Format + Full Suite
 
 ```bash
-uv run ruff check claude_discord/
-uv run ruff format claude_discord/
-uv run pytest tests/ -v --cov=claude_discord
+uv run ruff check c_lord/
+uv run ruff format c_lord/
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 ## What to Test First (by module type)
@@ -71,7 +71,7 @@ def test_parse_new_event_type_missing_data():
     event = parse_line(line)
     assert event is not None  # Should handle gracefully
 
-# THEN implement in claude_discord/claude/parser.py
+# THEN implement in c_lord/claude/parser.py
 ```
 
 ### New Cog Command
@@ -92,7 +92,7 @@ def test_validates_input_format():
     # Test that invalid input is rejected before reaching CLI
     assert not re.match(r"^[\w-]+$", "invalid; rm -rf /")
 
-# THEN implement in claude_discord/cogs/my_cog.py
+# THEN implement in c_lord/cogs/my_cog.py
 ```
 
 ### New Chunker Behavior
@@ -111,7 +111,7 @@ def test_chunk_unicode_content():
     chunks = chunk_message(text)
     assert all(len(c.encode("utf-8")) <= 8000 for c in chunks)
 
-# THEN implement the fix in claude_discord/discord_ui/chunker.py
+# THEN implement the fix in c_lord/discord_ui/chunker.py
 ```
 
 ### Bug Fix
@@ -148,7 +148,7 @@ async def test_concurrent_saves(repo):
     await asyncio.gather(*tasks)
     # All should succeed without errors
 
-# THEN implement or verify in claude_discord/database/repository.py
+# THEN implement or verify in c_lord/database/repository.py
 ```
 
 ## Coverage Requirements
@@ -211,7 +211,7 @@ uv run pytest tests/test_parser.py -v
 uv run pytest tests/test_parser.py::test_parse_system_message -v
 
 # Run with coverage
-uv run pytest tests/ -v --cov=claude_discord --cov-report=term-missing
+uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing
 
 # Stop on first failure
 uv run pytest tests/ -x

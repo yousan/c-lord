@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from claude_discord.concurrency import ActiveSession, SessionRegistry
+from c_lord.concurrency import ActiveSession, SessionRegistry
 
 
 class TestSessionRegistry:
@@ -10,12 +10,12 @@ class TestSessionRegistry:
 
     def test_register_and_list(self) -> None:
         registry = SessionRegistry()
-        registry.register(1001, "Working on ccdb Issue #52", "/home/ebi/ccdb")
+        registry.register(1001, "Working on c-lord Issue #52", "/home/ebi/c-lord")
         sessions = registry.list_active()
         assert len(sessions) == 1
         assert sessions[0].thread_id == 1001
-        assert sessions[0].description == "Working on ccdb Issue #52"
-        assert sessions[0].working_dir == "/home/ebi/ccdb"
+        assert sessions[0].description == "Working on c-lord Issue #52"
+        assert sessions[0].working_dir == "/home/ebi/c-lord"
 
     def test_unregister(self) -> None:
         registry = SessionRegistry()
@@ -120,12 +120,12 @@ class TestConcurrencyNotice:
         assert "task B" in notice
         assert "task C" in notice
 
-    def test_notice_mentions_git_worktree(self) -> None:
-        """The notice should advise git worktree usage."""
+    def test_notice_mentions_independent_clone(self) -> None:
+        """The notice should mention independent clone directories."""
         registry = SessionRegistry()
         registry.register(1001, "my task")
         notice = registry.build_concurrency_notice(1001)
-        assert "worktree" in notice.lower()
+        assert "independent clone" in notice.lower()
 
     def test_notice_mentions_shared_resources(self) -> None:
         """The notice should warn about non-git conflicts too."""

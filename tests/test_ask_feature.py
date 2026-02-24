@@ -13,9 +13,9 @@ import json
 
 import pytest
 
-from claude_discord.claude.parser import _parse_ask_questions, parse_line
-from claude_discord.claude.types import AskOption, AskQuestion, ToolCategory
-from claude_discord.discord_ui.embeds import ask_embed
+from c_lord.claude.parser import _parse_ask_questions, parse_line
+from c_lord.claude.types import AskOption, AskQuestion, ToolCategory
+from c_lord.discord_ui.embeds import ask_embed
 
 # ---------------------------------------------------------------------------
 # types
@@ -39,7 +39,7 @@ class TestAskTypes:
         assert ToolCategory.ASK.value == "ask"
 
     def test_ask_in_tool_categories(self) -> None:
-        from claude_discord.claude.types import TOOL_CATEGORIES
+        from c_lord.claude.types import TOOL_CATEGORIES
 
         assert "AskUserQuestion" in TOOL_CATEGORIES
         assert TOOL_CATEGORIES["AskUserQuestion"] == ToolCategory.ASK
@@ -298,8 +298,8 @@ class TestCollectAskAnswersTimeout:
         import asyncio
         from unittest.mock import AsyncMock, MagicMock, patch
 
-        from claude_discord.claude.types import AskOption, AskQuestion
-        from claude_discord.discord_ui.ask_handler import collect_ask_answers
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.discord_ui.ask_handler import collect_ask_answers
 
         q = AskQuestion(
             question="Which option?",
@@ -312,7 +312,7 @@ class TestCollectAskAnswersTimeout:
         thread.send = AsyncMock(return_value=mock_msg)
 
         with patch(
-            "claude_discord.discord_ui.ask_handler.asyncio.wait_for",
+            "c_lord.discord_ui.ask_handler.asyncio.wait_for",
             side_effect=asyncio.TimeoutError,
         ):
             result = await collect_ask_answers(thread, [q], session_id="abc123")

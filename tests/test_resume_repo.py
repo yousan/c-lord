@@ -7,8 +7,8 @@ import tempfile
 
 import pytest
 
-from claude_discord.database.models import init_db
-from claude_discord.database.resume_repo import PendingResumeRepository
+from c_lord.database.models import init_db
+from c_lord.database.resume_repo import PendingResumeRepository
 
 
 @pytest.fixture

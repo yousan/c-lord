@@ -16,11 +16,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from claude_discord.database.lounge_repo import LoungeMessage, LoungeRepository
-from claude_discord.database.models import init_db
-from claude_discord.database.notification_repo import NotificationRepository
-from claude_discord.ext.api_server import ApiServer
-from claude_discord.lounge import _NO_MESSAGES, build_lounge_prompt
+from c_lord.database.lounge_repo import LoungeMessage, LoungeRepository
+from c_lord.database.models import init_db
+from c_lord.database.notification_repo import NotificationRepository
+from c_lord.ext.api_server import ApiServer
+from c_lord.lounge import _NO_MESSAGES, build_lounge_prompt
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -162,7 +162,7 @@ class TestLoungeRepository:
 
     async def test_pruning_keeps_max_messages(self, lounge_repo: LoungeRepository) -> None:
         """After exceeding _MAX_STORED_MESSAGES, old messages are pruned."""
-        from claude_discord.database.lounge_repo import _MAX_STORED_MESSAGES
+        from c_lord.database.lounge_repo import _MAX_STORED_MESSAGES
 
         # Insert max + 5 messages
         for i in range(_MAX_STORED_MESSAGES + 5):
@@ -210,7 +210,7 @@ class TestBuildLoungePrompt:
         """The prompt always explains how to post a message."""
         result = build_lounge_prompt([])
         assert "curl" in result
-        assert "CCDB_API_URL" in result
+        assert "CLORD_API_URL" in result
         assert "/api/lounge" in result
 
 
@@ -316,7 +316,7 @@ class TestRunHelperLoungeInjection:
         Injecting it via --append-system-prompt (system prompt) prevents the "Prompt is too
         long" error that would otherwise occur in long-running sessions.
         """
-        from claude_discord.cogs._run_helper import run_claude_in_thread
+        from c_lord.cogs._run_helper import run_claude_in_thread
 
         lounge_repo_mock = AsyncMock(spec=LoungeRepository)
         lounge_repo_mock.get_recent.return_value = [
@@ -329,7 +329,7 @@ class TestRunHelperLoungeInjection:
 
         async def fake_run(prompt: str, session_id: str | None):
             captured_prompt.append(prompt)
-            from claude_discord.claude.types import MessageType, StreamEvent
+            from c_lord.claude.types import MessageType, StreamEvent
 
             result = StreamEvent(message_type=MessageType.RESULT)
             result.is_complete = True
@@ -368,13 +368,13 @@ class TestRunHelperLoungeInjection:
 
     async def test_no_lounge_context_when_repo_is_none(self) -> None:
         """When lounge_repo is None, the prompt is unchanged and runner is not cloned."""
-        from claude_discord.cogs._run_helper import run_claude_in_thread
+        from c_lord.cogs._run_helper import run_claude_in_thread
 
         captured_prompt: list[str] = []
 
         async def fake_run(prompt: str, session_id: str | None):
             captured_prompt.append(prompt)
-            from claude_discord.claude.types import MessageType, StreamEvent
+            from c_lord.claude.types import MessageType, StreamEvent
 
             result = StreamEvent(message_type=MessageType.RESULT)
             result.is_complete = True

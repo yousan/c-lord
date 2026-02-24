@@ -1,4 +1,4 @@
-# claude-code-discord-bridge — Copilot Instructions
+# c-lord — Copilot Instructions
 
 Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
 
@@ -16,10 +16,10 @@ Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
 
 ## Architecture
 
-- `claude_discord/claude/` — CLI subprocess runner and stream-json parser
-- `claude_discord/cogs/` — Discord.py Cogs. Use `_run_helper.run_claude_in_thread()` for CLI execution
-- `claude_discord/database/` — SQLite session persistence (aiosqlite)
-- `claude_discord/discord_ui/` — Status reactions, message chunking, embeds
+- `c_lord/claude/` — CLI subprocess runner and stream-json parser
+- `c_lord/cogs/` — Discord.py Cogs. Use `_run_helper.run_claude_in_thread()` for CLI execution
+- `c_lord/database/` — SQLite session persistence (aiosqlite)
+- `c_lord/discord_ui/` — Status reactions, message chunking, embeds
 - `tests/` — pytest suite
 
 ## Testing (TDD Enforced)
@@ -27,9 +27,9 @@ Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
 **Write tests FIRST, then implement.** Follow RED → GREEN → REFACTOR for all new features and bug fixes.
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
-uv run ruff check claude_discord/
-uv run ruff format --check claude_discord/
+uv run pytest tests/ -v --cov=c_lord
+uv run ruff check c_lord/
+uv run ruff format --check c_lord/
 ```
 
 ## Security (Mandatory Pre-Commit)

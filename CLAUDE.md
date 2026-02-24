@@ -1,12 +1,12 @@
-# claude-code-discord-bridge (ccdb)
+# c-lord (c-lord)
 
 Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a personal bot.**
 
-**略称: ccdb** (claude-code-discord-bridge)
+**略称: c-lord** (c-lord)
 
 ## Framework vs Instance
 
-- **claude-code-discord-bridge** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
+- **c-lord** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
 - Personal instances (e.g. EbiBot) install this as a package and import the Cog. The instance repo handles server-specific config, additional Cogs, and secrets.
 - When adding features: if it's useful to anyone → add here. If it's personal workflow → add in the instance repo.
 
@@ -16,8 +16,8 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 
 - New features should be enabled by default (auto-discovery, sensible defaults)
 - New constructor parameters must have backward-compatible defaults (`= None`)
-- If a feature requires consumers to wire something up, the design is wrong — fix it in ccdb
-- Consumers should NEVER need to copy, wrap, or subclass ccdb Cogs. If they do, ccdb is missing an extension point
+- If a feature requires consumers to wire something up, the design is wrong — fix it in c-lord
+- Consumers should NEVER need to copy, wrap, or subclass c-lord Cogs. If they do, c-lord is missing an extension point
 
 ## Architecture
 
@@ -32,34 +32,34 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
 3. **Emoji reactions for status**: Non-intrusive progress indication on the user's message. Debounced to avoid Discord rate limits.
 4. **Fence-aware chunking**: Never split Discord messages inside a code block.
-5. **Installable package**: `claude_discord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
+5. **Installable package**: `c_lord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
 6. **Shared run helper**: `cogs/_run_helper.py` centralizes Claude CLI execution logic used by both ClaudeChatCog and SkillCommandCog.
-7. **REST API as the control plane**: Claude Code subprocesses communicate back to ccdb via REST API (`CCDB_API_URL` env var), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
+7. **REST API as the control plane**: Claude Code subprocesses communicate back to c-lord via REST API (`CLORD_API_URL` env var), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
 8. **SQLite-backed dynamic scheduler**: Scheduled tasks are stored in `scheduled_tasks` DB table and executed by a single `discord.ext.tasks` master loop (every 30s). Tasks are registered at runtime via REST API — no code changes needed to add new tasks. `discord.ext.tasks` decorators are only used for the master loop, not per-task (they're static/compile-time constructs).
-9. **Claude handles "what", ccdb handles "when"**: For scheduled tasks, ccdb only manages the schedule. All domain logic (what to check, how to deduplicate, what to post) lives in the Claude prompt. No GitHub/AzureDevOps-specific code in ccdb itself.
+9. **Claude handles "what", c-lord handles "when"**: For scheduled tasks, c-lord only manages the schedule. All domain logic (what to check, how to deduplicate, what to post) lives in the Claude prompt. No GitHub/AzureDevOps-specific code in c-lord itself.
 
-### Why REST API over stdout markers for Claude→ccdb communication
+### Why REST API over stdout markers for Claude→c-lord communication
 
-Alternative considered: Claude embeds `<!-- ccdb:schedule {...} -->` in response text; ccdb parses stdout.
+Alternative considered: Claude embeds `<!-- c-lord:schedule {...} -->` in response text; c-lord parses stdout.
 
 **Rejected because**: fragile text parsing, untestable, can't be triggered externally, implicit side effect from output.
 
-**REST API chosen because**: clean interface, independently testable, usable by external systems, already an established ccdb pattern (`ext/api_server.py`). Claude uses its Bash tool to `curl $CCDB_API_URL/api/tasks`.
+**REST API chosen because**: clean interface, independently testable, usable by external systems, already an established c-lord pattern (`ext/api_server.py`). Claude uses its Bash tool to `curl $CLORD_API_URL/api/tasks`.
 
 ## Development
 
 ### Setup
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 uv sync --dev
 ```
 
 ### Running Tests
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 All tests must pass before submitting a PR. CI runs on Python 3.10, 3.11, and 3.12.
@@ -67,8 +67,8 @@ All tests must pass before submitting a PR. CI runs on Python 3.10, 3.11, and 3.
 ### Linting & Formatting
 
 ```bash
-uv run ruff check claude_discord/    # lint
-uv run ruff format claude_discord/   # format
+uv run ruff check c_lord/    # lint
+uv run ruff format c_lord/   # format
 ```
 
 CI enforces both `ruff check` and `ruff format --check`. Fix all issues before pushing.
@@ -78,7 +78,7 @@ CI enforces both `ruff check` and `ruff format --check`. Fix all issues before p
 ```bash
 cp .env.example .env
 # Edit .env with your Discord bot token and channel ID
-uv run python -m claude_discord.main
+uv run python -m c_lord.main
 ```
 
 ## Code Conventions
@@ -127,7 +127,7 @@ If you modify `runner.py`, `_run_helper.py`, or any Cog, the security audit is *
 1. **RED**: Write a failing test → `uv run pytest tests/test_xxx.py -v` → confirm it FAILS
 2. **GREEN**: Write minimal code to pass → confirm it PASSES
 3. **REFACTOR**: Clean up, keeping tests green
-4. **VERIFY**: `uv run ruff check claude_discord/ && uv run pytest tests/ -v --cov=claude_discord`
+4. **VERIFY**: `uv run ruff check c_lord/ && uv run pytest tests/ -v --cov=c_lord`
 
 See `.claude/skills/tdd/SKILL.md` for detailed patterns per module type.
 
@@ -140,11 +140,13 @@ See `.claude/skills/tdd/SKILL.md` for detailed patterns per module type.
 ## Project Structure
 
 ```
-claude_discord/          # Installable Python package
+c_lord/          # Installable Python package
   __init__.py            # Public API exports
   protocols.py           # Shared protocols (DrainAware)
   main.py                # Standalone entry point
   bot.py                 # Discord Bot class
+  session_dir.py         # Git clone based session directory management
+  tmux.py                # Tmux session management wrapper
   cogs/
     claude_chat.py       # Main chat Cog (thread creation, message handling)
     skill_command.py     # /skill slash command with autocomplete
@@ -178,15 +180,15 @@ CONTRIBUTING.md          # Contribution guidelines
 
 ### Adding a New Cog
 
-1. Create `claude_discord/cogs/your_cog.py`
+1. Create `c_lord/cogs/your_cog.py`
 2. If it runs Claude CLI, use `_run_helper.run_claude_in_thread()` — don't duplicate the streaming logic
-3. Export from `claude_discord/cogs/__init__.py`
-4. Add to `claude_discord/__init__.py` public API
+3. Export from `c_lord/cogs/__init__.py`
+4. Add to `c_lord/__init__.py` public API
 5. Write tests in `tests/test_your_cog.py`
 
 ### Adding a New Discord UI Component
 
-1. Add to the appropriate file in `claude_discord/discord_ui/`
+1. Add to the appropriate file in `c_lord/discord_ui/`
 2. Export from `__init__.py` if it's part of the public API
 3. Test edge cases (empty strings, very long strings, Unicode, code blocks)
 

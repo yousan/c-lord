@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for claude_discord tests.
+"""Shared pytest fixtures for c_lord tests.
 
 These fixtures are automatically available to all test files in this directory.
 Class-level fixtures with the same name take precedence (pytest scoping rules).
@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.claude.types import MessageType, StreamEvent
+from c_lord.claude.types import MessageType, StreamEvent
 
 
 @pytest.fixture

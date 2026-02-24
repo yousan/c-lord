@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
-from claude_discord.database.repository import SessionRecord
+from c_lord.database.repository import SessionRecord
 
 
 def _make_record(
@@ -48,7 +48,7 @@ def _make_channel_interaction() -> MagicMock:
 
 
 def _make_cog():
-    from claude_discord.cogs.session_manage import SessionManageCog
+    from c_lord.cogs.session_manage import SessionManageCog
 
     bot = MagicMock()
     bot.channel_id = 999

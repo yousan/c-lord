@@ -1,16 +1,16 @@
 #!/bin/bash
-# Cleanup merged worktrees for ccdb
+# Cleanup merged worktrees for c-lord
 # Usage: ./scripts/cleanup_worktrees.sh [--dry-run]
 #
 # Checks each worktree's branch against GitHub PR status.
 # Removes worktrees whose PRs are MERGED or CLOSED.
 # Keeps worktrees for OPEN PRs and the main worktree.
 #
-# Run from repo root: /home/ebi/claude-code-discord-bridge/
+# Run from repo root: /home/yousan/c-lord/
 
 set -euo pipefail
 
-REPO_ROOT="/home/ebi/claude-code-discord-bridge"
+REPO_ROOT="/home/yousan/c-lord"
 DRY_RUN=false
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -76,7 +76,7 @@ while IFS= read -r line; do
         echo "--- Worktree: $current_path (branch: $current_branch)"
 
         # Check PR status via gh CLI
-        pr_json=$(gh pr list --repo ebibibi/claude-code-discord-bridge \
+        pr_json=$(gh pr list --repo yousan/c-lord \
             --head "$current_branch" --state all --json state --limit 1 2>/dev/null || echo "[]")
 
         pr_state=$(echo "$pr_json" | jq -r '.[0].state // empty' 2>/dev/null || true)

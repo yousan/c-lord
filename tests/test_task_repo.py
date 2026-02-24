@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from claude_discord.database.task_repo import TaskRepository
+from c_lord.database.task_repo import TaskRepository
 
 
 @pytest.fixture

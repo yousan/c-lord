@@ -1,9 +1,9 @@
 ---
 name: security-audit
-description: Security checklist specific to claude-code-discord-bridge — subprocess injection, env leaks, input validation
+description: Security checklist specific to c-lord — subprocess injection, env leaks, input validation
 ---
 
-# Security Audit — claude-code-discord-bridge Specific
+# Security Audit — c-lord Specific
 
 This project runs **arbitrary Claude Code sessions** triggered by Discord messages. Security is the #1 priority.
 
@@ -24,7 +24,7 @@ This project runs **arbitrary Claude Code sessions** triggered by Discord messag
 | Session hijack | Fake session ID | Strict regex validation `^[a-f0-9\-]+$` |
 | Skill injection | Malicious skill name | Strict regex validation `^[\w-]+$` |
 | Secret exfiltration | Claude Bash tool reads env | Strip secrets from subprocess env |
-| Nesting attack | Claude spawns another claude-code-discord-bridge | Strip `CLAUDECODE` from env |
+| Nesting attack | Claude spawns another c-lord | Strip `CLAUDECODE` from env |
 | Token theft | Bot token in logs/errors | Never log tokens, strip from env |
 
 ## Checklist
@@ -68,12 +68,12 @@ This project runs **arbitrary Claude Code sessions** triggered by Discord messag
 
 ```bash
 # Search for dangerous patterns
-grep -rn "shell=True" claude_discord/
-grep -rn "subprocess\.call" claude_discord/
-grep -rn "subprocess\.run" claude_discord/
+grep -rn "shell=True" c_lord/
+grep -rn "subprocess\.call" c_lord/
+grep -rn "subprocess\.run" c_lord/
 
 # Check that secrets are stripped
-grep -n "_STRIPPED_ENV_KEYS" claude_discord/claude/runner.py
+grep -n "_STRIPPED_ENV_KEYS" c_lord/claude/runner.py
 
 # Verify .env is gitignored
 grep "\.env" .gitignore

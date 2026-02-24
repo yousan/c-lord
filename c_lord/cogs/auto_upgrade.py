@@ -126,7 +126,7 @@ class AutoUpgradeCog(commands.Cog):
     Usage::
 
         config = UpgradeConfig(
-            package_name="claude-code-discord-bridge",
+            package_name="c-lord",
             trigger_prefix="🔄 ebibot-upgrade",
             working_dir="/home/user/my-bot",
             restart_command=["sudo", "systemctl", "restart", "my-bot.service"],

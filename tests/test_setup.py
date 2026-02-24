@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from claude_discord.setup import BridgeComponents, setup_bridge
+from c_lord.setup import BridgeComponents, setup_bridge
 
 
 def _make_bot() -> MagicMock:
@@ -131,9 +131,9 @@ def _make_api_server() -> MagicMock:
 
 def test_apply_to_api_server_wires_task_and_lounge_repos(tmp_path: object) -> None:
     """apply_to_api_server should set task_repo and lounge_repo on the ApiServer."""
-    from claude_discord.database.lounge_repo import LoungeRepository
-    from claude_discord.database.repository import SessionRepository
-    from claude_discord.database.task_repo import TaskRepository
+    from c_lord.database.lounge_repo import LoungeRepository
+    from c_lord.database.repository import SessionRepository
+    from c_lord.database.task_repo import TaskRepository
 
     session_repo = MagicMock(spec=SessionRepository)
     task_repo = MagicMock(spec=TaskRepository)
@@ -154,7 +154,7 @@ def test_apply_to_api_server_wires_task_and_lounge_repos(tmp_path: object) -> No
 
 def test_apply_to_api_server_skips_none_repos() -> None:
     """apply_to_api_server should not overwrite existing repos with None."""
-    from claude_discord.database.repository import SessionRepository
+    from c_lord.database.repository import SessionRepository
 
     session_repo = MagicMock(spec=SessionRepository)
     components = BridgeComponents(
@@ -174,9 +174,9 @@ def test_apply_to_api_server_skips_none_repos() -> None:
 
 def test_apply_to_api_server_is_idempotent() -> None:
     """apply_to_api_server called twice should leave the same repo references."""
-    from claude_discord.database.lounge_repo import LoungeRepository
-    from claude_discord.database.repository import SessionRepository
-    from claude_discord.database.task_repo import TaskRepository
+    from c_lord.database.lounge_repo import LoungeRepository
+    from c_lord.database.repository import SessionRepository
+    from c_lord.database.task_repo import TaskRepository
 
     session_repo = MagicMock(spec=SessionRepository)
     task_repo = MagicMock(spec=TaskRepository)

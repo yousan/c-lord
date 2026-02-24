@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from claude_discord.claude.types import ToolCategory, ToolUseEvent
-from claude_discord.discord_ui.embeds import (
+from c_lord.claude.types import ToolCategory, ToolUseEvent
+from c_lord.discord_ui.embeds import (
     redacted_thinking_embed,
     session_complete_embed,
     thinking_embed,
@@ -305,8 +305,8 @@ class TestTodoEmbed:
     """Tests for todo_embed()."""
 
     def test_shows_all_statuses(self) -> None:
-        from claude_discord.claude.types import TodoItem
-        from claude_discord.discord_ui.embeds import todo_embed
+        from c_lord.claude.types import TodoItem
+        from c_lord.discord_ui.embeds import todo_embed
 
         todos = [
             TodoItem(content="Task A", status="completed"),
@@ -320,8 +320,8 @@ class TestTodoEmbed:
         assert "⬜" in embed.description
 
     def test_in_progress_shows_active_form(self) -> None:
-        from claude_discord.claude.types import TodoItem
-        from claude_discord.discord_ui.embeds import todo_embed
+        from c_lord.claude.types import TodoItem
+        from c_lord.discord_ui.embeds import todo_embed
 
         todos = [TodoItem(content="Task", status="in_progress", active_form="Running Task")]
         embed = todo_embed(todos)
@@ -329,8 +329,8 @@ class TestTodoEmbed:
         assert "Running Task" in embed.description
 
     def test_in_progress_falls_back_to_content(self) -> None:
-        from claude_discord.claude.types import TodoItem
-        from claude_discord.discord_ui.embeds import todo_embed
+        from c_lord.claude.types import TodoItem
+        from c_lord.discord_ui.embeds import todo_embed
 
         todos = [TodoItem(content="Task without active form", status="in_progress", active_form="")]
         embed = todo_embed(todos)
@@ -338,8 +338,8 @@ class TestTodoEmbed:
         assert "Task without active form" in embed.description
 
     def test_title_shows_progress_count(self) -> None:
-        from claude_discord.claude.types import TodoItem
-        from claude_discord.discord_ui.embeds import todo_embed
+        from c_lord.claude.types import TodoItem
+        from c_lord.discord_ui.embeds import todo_embed
 
         todos = [
             TodoItem(content="Done", status="completed"),
@@ -350,7 +350,7 @@ class TestTodoEmbed:
         assert "1/2" in embed.title
 
     def test_empty_list(self) -> None:
-        from claude_discord.discord_ui.embeds import todo_embed
+        from c_lord.discord_ui.embeds import todo_embed
 
         embed = todo_embed([])
         assert embed.description is not None

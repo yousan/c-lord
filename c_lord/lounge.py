@@ -32,7 +32,7 @@ _LOUNGE_INVITE = """\
 
 投稿コマンド:
 ```bash
-curl -s -X POST "$CCDB_API_URL/api/lounge" \\
+curl -s -X POST "$CLORD_API_URL/api/lounge" \\
   -H "Content-Type: application/json" \\
   -d '{"message": "ここに一言", "label": "自分のニックネーム"}'
 ```

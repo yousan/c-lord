@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from claude_discord.database.models import init_db
-from claude_discord.database.repository import SessionRepository
-from claude_discord.session_sync import CliSession, extract_recent_messages, scan_cli_sessions
+from c_lord.database.models import init_db
+from c_lord.database.repository import SessionRepository
+from c_lord.session_sync import CliSession, extract_recent_messages, scan_cli_sessions
 
 
 @pytest.fixture

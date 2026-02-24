@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from claude_discord.database.models import init_db
-from claude_discord.database.settings_repo import SettingsRepository
+from c_lord.database.models import init_db
+from c_lord.database.settings_repo import SettingsRepository
 
 
 @pytest.fixture

@@ -5,7 +5,7 @@ threads are processing automatically vs. waiting for user input.
 When a thread transitions to WAITING_INPUT, the bot mentions the owner
 so Discord's notification system surfaces the request immediately.
 
-Issue: https://github.com/ebibibi/claude-code-discord-bridge/issues/67
+Issue: https://github.com/yousan/c-lord/issues/67
 """
 
 from __future__ import annotations

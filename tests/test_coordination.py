@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.coordination.service import CoordinationService
+from c_lord.coordination.service import CoordinationService
 
 
 def _make_thread(name: str = "Test Thread") -> MagicMock:

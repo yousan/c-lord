@@ -1,10 +1,10 @@
-"""claude-code-discord-bridge — Discord frontend for Claude Code CLI.
+"""c-lord — Discord frontend for Claude Code CLI.
 
 Built entirely by Claude Code itself. See README.md for details.
 
 Quick start::
 
-    from claude_discord import ClaudeChatCog, ClaudeRunner, SessionRepository
+    from c_lord import ClaudeChatCog, ClaudeRunner, SessionRepository
 
 """
 
@@ -33,8 +33,10 @@ from .discord_ui.embeds import (
 )
 from .discord_ui.status import StatusManager
 from .protocols import DrainAware
+from .session_dir import CleanupResult, SessionDirInfo, SessionDirManager
 from .session_sync import CliSession, SessionMessage, extract_recent_messages, scan_cli_sessions
 from .setup import BridgeComponents, setup_bridge
+from .tmux import TmuxSessionManager
 
 __all__ = [
     # Core
@@ -71,6 +73,11 @@ __all__ = [
     "ToolUseEvent",
     # Parsing
     "parse_line",
+    # Session Management
+    "SessionDirManager",
+    "SessionDirInfo",
+    "CleanupResult",
+    "TmuxSessionManager",
     # Setup
     "setup_bridge",
     "BridgeComponents",

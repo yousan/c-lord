@@ -94,7 +94,7 @@ This document captures the "why" behind key architectural choices. Each decision
 
 ## 6. Installable Package, Not Monolith
 
-**Decision:** Ship `claude_discord` as a proper Python package installable via `uv add git+...` or `pip install git+...`.
+**Decision:** Ship `c_lord` as a proper Python package installable via `uv add git+...` or `pip install git+...`.
 
 **Alternatives considered:**
 - Monolithic bot — easier to start, harder to customize
@@ -103,7 +103,7 @@ This document captures the "why" behind key architectural choices. Each decision
 
 **Why package:**
 - **Separation of concerns**: The framework handles Discord↔CLI bridging. The consumer handles project-specific config, secrets, and custom Cogs
-- **Upgrade path**: `uv lock --upgrade-package claude-code-discord-bridge && uv sync` gets you the latest framework without touching your custom code
+- **Upgrade path**: `uv lock --upgrade-package c-lord && uv sync` gets you the latest framework without touching your custom code
 - **No conflict**: Your bot's `pyproject.toml` pins the framework version. Multiple bots can use different versions
 - **Real-world validation**: EbiBot proves this works — it imports `ClaudeChatCog`, `ClaudeRunner`, `SkillCommandCog`, and adds its own Cogs (reminders, watchdog, docs-sync, auto-upgrade)
 

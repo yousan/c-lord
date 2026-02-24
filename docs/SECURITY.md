@@ -2,7 +2,7 @@
 
 ## Threat Model
 
-claude-code-discord-bridge spawns Claude Code CLI subprocesses that can execute arbitrary code on the host machine (read/write files, run commands, make network requests). This is **by design** — Claude Code's value comes from its ability to interact with the development environment.
+c-lord spawns Claude Code CLI subprocesses that can execute arbitrary code on the host machine (read/write files, run commands, make network requests). This is **by design** — Claude Code's value comes from its ability to interact with the development environment.
 
 The bridge's security goal is:
 
@@ -161,7 +161,7 @@ Key principles:
 4. **Review Claude Code permissions**: Configure `permission_mode` and `allowed_tools` to restrict Claude Code's capabilities as needed
 5. **Don't use `dangerously_skip_permissions`**: This flag exists for power users who understand the implications. It disables Claude Code's built-in safety prompts
 6. **Monitor the bot**: Check logs regularly. Claude Code sessions are logged with timing and cost data
-7. **Keep dependencies updated**: `uv lock --upgrade-package claude-code-discord-bridge && uv sync`
+7. **Keep dependencies updated**: `uv lock --upgrade-package c-lord && uv sync`
 
 ## Security Audit Checklist
 

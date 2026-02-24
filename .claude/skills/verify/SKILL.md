@@ -21,31 +21,31 @@ Run all steps in order. **Stop on first failure.**
 ### Step 1: Lint
 
 ```bash
-uv run ruff check claude_discord/
+uv run ruff check c_lord/
 ```
 
 If there are auto-fixable issues:
 
 ```bash
-uv run ruff check --fix claude_discord/
+uv run ruff check --fix c_lord/
 ```
 
 ### Step 2: Format
 
 ```bash
-uv run ruff format --check claude_discord/
+uv run ruff format --check c_lord/
 ```
 
 If formatting is needed:
 
 ```bash
-uv run ruff format claude_discord/
+uv run ruff format c_lord/
 ```
 
 ### Step 3: Tests
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord --cov-report=term-missing
+uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing
 ```
 
 All tests must pass. Review coverage for newly added code.
@@ -62,7 +62,7 @@ Before committing, check for these security concerns specific to this project:
 
 ```bash
 # Quick security grep
-uv run ruff check claude_discord/ --select S  # bandit rules via ruff
+uv run ruff check c_lord/ --select S  # bandit rules via ruff
 ```
 
 ### Step 5: Import Check
@@ -70,7 +70,7 @@ uv run ruff check claude_discord/ --select S  # bandit rules via ruff
 Verify the public API still works:
 
 ```python
-python -c "from claude_discord import ClaudeRunner, ClaudeChatCog, SkillCommandCog, SessionRepository"
+python -c "from c_lord import ClaudeRunner, ClaudeChatCog, SkillCommandCog, SessionRepository"
 ```
 
 ## Failure Protocol

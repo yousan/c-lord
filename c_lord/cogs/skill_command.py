@@ -207,7 +207,8 @@ class SkillCommandCog(commands.Cog):
                     prompt=prompt,
                     session_id=session_id,
                     registry=self._registry,
-                    worktree_manager=getattr(self.bot, "worktree_manager", None),
+                    session_dir_manager=getattr(self.bot, "session_dir_manager", None),
+                    tmux_manager=getattr(self.bot, "tmux_manager", None),
                 )
             )
             return
@@ -237,6 +238,7 @@ class SkillCommandCog(commands.Cog):
                 prompt=prompt,
                 session_id=None,
                 registry=self._registry,
-                worktree_manager=getattr(self.bot, "worktree_manager", None),
+                session_dir_manager=getattr(self.bot, "session_dir_manager", None),
+                tmux_manager=getattr(self.bot, "tmux_manager", None),
             )
         )

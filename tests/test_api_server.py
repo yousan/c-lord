@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from claude_discord.database.notification_repo import NotificationRepository
-from claude_discord.ext.api_server import ApiServer
+from c_lord.database.notification_repo import NotificationRepository
+from c_lord.ext.api_server import ApiServer
 
 
 @pytest.fixture
@@ -365,8 +365,8 @@ class TestMarkResume:
         import os
         import tempfile
 
-        from claude_discord.database.models import init_db as _init
-        from claude_discord.database.resume_repo import PendingResumeRepository
+        from c_lord.database.models import init_db as _init
+        from c_lord.database.resume_repo import PendingResumeRepository
 
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)

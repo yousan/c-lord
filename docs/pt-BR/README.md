@@ -3,9 +3,9 @@
 > **Nota:** Esta é uma versão autotraduzida da documentação original em inglês.
 > Em caso de discrepâncias, a [versão em inglês](../../README.md) prevalece.
 
-# claude-code-discord-bridge
+# c-lord
 
-[![CI](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/yousan/c-lord/actions/workflows/ci.yml/badge.svg)](https://github.com/yousan/c-lord/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -92,7 +92,7 @@ Crie novas sessões do Claude Code a partir de scripts, GitHub Actions ou outras
 
 ```bash
 # De outra sessão do Claude ou um script CI:
-curl -X POST "$CCDB_API_URL/api/spawn" \
+curl -X POST "$CLORD_API_URL/api/spawn" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Executar scan de segurança no repositório", "thread_name": "Scan de Segurança"}'
 # Retorna imediatamente com o ID da thread; Claude roda em segundo plano
@@ -164,7 +164,7 @@ Se o bot reiniciar no meio de uma sessão, as sessões do Claude interrompidas s
 - **Informações de retomada** — `/resume-info` mostra o comando CLI para continuar a sessão atual em um terminal
 - **Retomada ao iniciar** — Sessões interrompidas reiniciam automaticamente após qualquer reinício do bot; `AutoUpgradeCog` (reinícios por atualização) e `ClaudeChatCog.cog_unload()` (todos os outros encerramentos) as marcam automaticamente, ou use `POST /api/mark-resume` manualmente
 - **Criação programática** — `POST /api/spawn` cria uma nova thread do Discord + sessão do Claude de qualquer script ou subprocesso do Claude; retorna um 201 não bloqueante imediatamente após a criação da thread
-- **Injeção de ID da thread** — A variável de ambiente `DISCORD_THREAD_ID` é passada para cada subprocesso do Claude, permitindo que sessões criem sessões filhas via `$CCDB_API_URL/api/spawn`
+- **Injeção de ID da thread** — A variável de ambiente `DISCORD_THREAD_ID` é passada para cada subprocesso do Claude, permitindo que sessões criem sessões filhas via `$CLORD_API_URL/api/spawn`
 - **Gerenciamento de worktree** — `/worktree-list` mostra todos os worktrees de sessão ativos com status limpo/sujo; `/worktree-cleanup` remove worktrees limpos órfãos (suporta preview com `dry_run`)
 
 ### Segurança
@@ -188,13 +188,13 @@ Se o bot reiniciar no meio de uma sessão, as sessões do Claude interrompidas s
 ### Execução autônoma
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 
 cp .env.example .env
 # Edite .env com seu token de bot e ID do canal
 
-uv run python -m claude_discord.main
+uv run python -m c_lord.main
 ```
 
 ### Instalar como pacote
@@ -202,12 +202,12 @@ uv run python -m claude_discord.main
 Se você já tem um bot discord.py rodando (Discord permite apenas uma conexão Gateway por token):
 
 ```bash
-uv add git+https://github.com/ebibibi/claude-code-discord-bridge.git
+uv add git+https://github.com/yousan/c-lord.git
 ```
 
 ```python
 from discord.ext import commands
-from claude_discord import ClaudeRunner, setup_bridge
+from c_lord import ClaudeRunner, setup_bridge
 
 bot = commands.Bot(...)
 runner = ClaudeRunner(command="claude", model="sonnet")
@@ -222,12 +222,12 @@ async def on_ready():
     )
 ```
 
-`setup_bridge()` conecta todos os Cogs automaticamente. Novos Cogs adicionados ao ccdb são incluídos sem mudanças no código do consumidor.
+`setup_bridge()` conecta todos os Cogs automaticamente. Novos Cogs adicionados ao c-lord são incluídos sem mudanças no código do consumidor.
 
 Atualizar para a última versão:
 
 ```bash
-uv lock --upgrade-package claude-code-discord-bridge && uv sync
+uv lock --upgrade-package c-lord && uv sync
 ```
 
 ---
@@ -246,7 +246,7 @@ uv lock --upgrade-package claude-code-discord-bridge && uv sync
 | `SESSION_TIMEOUT_SECONDS` | Timeout de inatividade da sessão | `300` |
 | `DISCORD_OWNER_ID` | ID do usuário para @mencionar quando o Claude precisa de input | (opcional) |
 | `COORDINATION_CHANNEL_ID` | ID do canal para transmissões de eventos entre sessões | (opcional) |
-| `CCDB_COORDINATION_CHANNEL_NAME` | Criar automaticamente canal de coordenação por nome | (opcional) |
+| `CLORD_COORDINATION_CHANNEL_NAME` | Criar automaticamente canal de coordenação por nome | (opcional) |
 | `WORKTREE_BASE_DIR` | Diretório base para escanear worktrees de sessão (ativa limpeza automática) | (opcional) |
 
 ---
@@ -299,7 +299,7 @@ jobs:
 **Configuração do bot:**
 
 ```python
-from claude_discord import WebhookTriggerCog, WebhookTrigger, ClaudeRunner
+from c_lord import WebhookTriggerCog, WebhookTrigger, ClaudeRunner
 
 runner = ClaudeRunner(command="claude", model="sonnet")
 
@@ -355,7 +355,7 @@ De dentro de uma sessão no Discord, o Claude pode registrar uma tarefa:
 
 ```bash
 # Claude chama isso dentro de uma sessão:
-curl -X POST "$CCDB_API_URL/api/tasks" \
+curl -X POST "$CLORD_API_URL/api/tasks" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Verificar dependências desatualizadas e abrir uma issue se encontradas", "interval_seconds": 604800}'
 ```
@@ -378,10 +378,10 @@ O loop mestre de 30 segundos detecta tarefas pendentes e cria sessões do Claude
 Atualize automaticamente o bot quando uma nova versão é publicada:
 
 ```python
-from claude_discord import AutoUpgradeCog, UpgradeConfig
+from c_lord import AutoUpgradeCog, UpgradeConfig
 
 config = UpgradeConfig(
-    package_name="claude-code-discord-bridge",
+    package_name="c-lord",
     trigger_prefix="🔄 bot-upgrade",
     working_dir="/home/user/my-bot",
     restart_command=["sudo", "systemctl", "restart", "my-bot.service"],
@@ -416,7 +416,7 @@ class MyCog(commands.Cog):
 REST API opcional para notificações e gerenciamento de tarefas. Requer aiohttp:
 
 ```bash
-uv add "claude-code-discord-bridge[api]"
+uv add "c-lord[api]"
 ```
 
 ### Endpoints
@@ -454,7 +454,7 @@ curl -X POST http://localhost:8080/api/tasks \
 ## Arquitetura
 
 ```
-claude_discord/
+c_lord/
   main.py                  # Ponto de entrada autônomo
   setup.py                 # setup_bridge() — conexão de Cogs com uma chamada
   bot.py                   # Classe Discord Bot
@@ -517,7 +517,7 @@ claude_discord/
 ## Testes
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 700+ testes cobrindo parser, chunker, repositório, runner, streaming, disparadores webhook, auto-atualização (incluindo o comando `/upgrade`, invocação de thread e botão de aprovação), REST API, UI do AskUserQuestion, painel de threads, tarefas agendadas, sincronização de sessões, AI Lounge, retomada na inicialização, troca de modelo, detecção de compactação, embeds de progresso do TodoWrite, e análise de eventos de permissão/elicitation/plan-mode.

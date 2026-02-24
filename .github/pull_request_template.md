@@ -13,6 +13,6 @@
 ## Checklist
 
 - [ ] Tests pass: `uv run pytest tests/ -v`
-- [ ] Lint passes: `uv run ruff check claude_discord/`
+- [ ] Lint passes: `uv run ruff check c_lord/`
 - [ ] New functionality has tests
 - [ ] README updated (if applicable)

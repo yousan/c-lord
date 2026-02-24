@@ -8,14 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.cogs.claude_chat import (
+from c_lord.cogs.claude_chat import (
     _MAX_ATTACHMENT_BYTES,
     _MAX_ATTACHMENTS,
     _MAX_TOTAL_BYTES,
     ClaudeChatCog,
 )
-from claude_discord.concurrency import SessionRegistry
-from claude_discord.coordination.service import CoordinationService
+from c_lord.concurrency import SessionRegistry
+from c_lord.coordination.service import CoordinationService
 
 
 def _make_cog() -> ClaudeChatCog:
@@ -658,7 +658,7 @@ class TestOnReady:
         """If resume_repo returns no pending entries, on_ready does nothing."""
         from unittest.mock import AsyncMock, MagicMock
 
-        from claude_discord.database.resume_repo import PendingResumeRepository
+        from c_lord.database.resume_repo import PendingResumeRepository
 
         resume_repo = MagicMock(spec=PendingResumeRepository)
         resume_repo.get_pending = AsyncMock(return_value=[])
@@ -675,7 +675,7 @@ class TestOnReady:
 
         import discord
 
-        from claude_discord.database.resume_repo import PendingResume, PendingResumeRepository
+        from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
         entry = PendingResume(
             id=7,
@@ -722,7 +722,7 @@ class TestOnReady:
 
         import discord
 
-        from claude_discord.database.resume_repo import PendingResume, PendingResumeRepository
+        from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
         entry = PendingResume(
             id=1,

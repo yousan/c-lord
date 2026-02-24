@@ -96,33 +96,33 @@ async def _build_system_context(config: RunConfig) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
-async def _cleanup_session_worktree(config: RunConfig) -> None:
-    """Remove the session worktree for this thread if it is clean.
+async def _cleanup_session_dir(config: RunConfig) -> None:
+    """Remove the session directory for this thread if it is clean.
 
     Runs git operations in a thread pool to avoid blocking the event loop.
     Logs the outcome but never raises — cleanup failures are non-fatal.
     """
     import asyncio
 
-    assert config.worktree_manager is not None  # caller ensures this
+    assert config.session_dir_manager is not None  # caller ensures this
 
     try:
         result = await asyncio.to_thread(
-            config.worktree_manager.cleanup_for_thread,
+            config.session_dir_manager.cleanup_for_thread,
             config.thread.id,
         )
         if result.removed:
             logger.info(
-                "Cleaned up session worktree for thread %d: %s",
+                "Cleaned up session dir for thread %d: %s",
                 config.thread.id,
                 result.path,
             )
-        elif result.reason == "worktree directory does not exist":
-            # Normal case — Claude didn't create a worktree
+        elif result.reason == "session directory does not exist":
+            # Normal case — session dir was never created
             pass
         else:
             logger.warning(
-                "Could not clean up worktree for thread %d (%s): %s",
+                "Could not clean up session dir for thread %d (%s): %s",
                 config.thread.id,
                 result.path,
                 result.reason,
@@ -131,12 +131,28 @@ async def _cleanup_session_worktree(config: RunConfig) -> None:
             if "uncommitted changes" in result.reason:
                 with contextlib.suppress(Exception):
                     await config.thread.send(
-                        f"⚠️ **Worktree not cleaned up** — `{result.path}` has uncommitted "
-                        f"changes. Please commit or stash them, then run:\n"
-                        f"```\ngit worktree remove {result.path}\n```"
+                        f"⚠️ **Session directory not cleaned up** — `{result.path}` has "
+                        f"uncommitted changes. Please commit or stash them, then remove "
+                        f"the directory manually."
                     )
     except Exception:
-        logger.exception("Unexpected error during worktree cleanup for thread %d", config.thread.id)
+        logger.exception(
+            "Unexpected error during session dir cleanup for thread %d", config.thread.id
+        )
+
+
+async def _cleanup_tmux_session(config: RunConfig) -> None:
+    """Kill the tmux session for this thread. Non-fatal on failure."""
+    import asyncio
+
+    assert config.tmux_manager is not None  # caller ensures this
+
+    try:
+        await asyncio.to_thread(config.tmux_manager.kill_session, config.thread.id)
+    except Exception:
+        logger.exception(
+            "Unexpected error during tmux cleanup for thread %d", config.thread.id
+        )
 
 
 async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:
@@ -189,8 +205,10 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         await processor.finalize()
         if config.registry is not None:
             config.registry.unregister(config.thread.id)
-        if config.worktree_manager is not None:
-            await _cleanup_session_worktree(config)
+        if config.session_dir_manager is not None:
+            await _cleanup_session_dir(config)
+        if config.tmux_manager is not None:
+            await _cleanup_tmux_session(config)
         if config.image_paths:
             await _cleanup_image_tempfiles(config.image_paths)
 

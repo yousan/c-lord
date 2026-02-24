@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 from discord.ext import commands
 
-from claude_discord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
+from c_lord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
 
 _PATCH_EXEC = "asyncio.create_subprocess_exec"
 _PATCH_WAIT = "asyncio.wait_for"
@@ -32,7 +32,7 @@ def _make_bot() -> MagicMock:
 
 def _make_config(slash_command_enabled: bool = True, **kwargs) -> UpgradeConfig:
     defaults = {
-        "package_name": "claude-code-discord-bridge",
+        "package_name": "c-lord",
         "trigger_prefix": "🔄 upgrade",
         "working_dir": "/tmp",
     }

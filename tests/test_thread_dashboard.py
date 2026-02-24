@@ -1,6 +1,6 @@
 """Tests for the ThreadStatusDashboard — live session status embed.
 
-Issue: https://github.com/ebibibi/claude-code-discord-bridge/issues/67
+Issue: https://github.com/ebibibi/c-lord/issues/67
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.discord_ui.thread_dashboard import (
+from c_lord.discord_ui.thread_dashboard import (
     _STALE_HOURS,
     ThreadState,
     ThreadStatusDashboard,

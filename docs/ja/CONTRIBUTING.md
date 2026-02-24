@@ -3,7 +3,7 @@
 > **注意:** これは英語のオリジナルドキュメントを自動翻訳したものです。
 > 内容に相違がある場合は、[英語版](../../CONTRIBUTING.md)が優先されます。
 
-# claude-code-discord-bridge へのコントリビューション
+# c-lord へのコントリビューション
 
 コントリビューションに興味を持っていただきありがとうございます！このプロジェクトは Claude Code によって構築されており、人間と AI エージェント両方からのコントリビューションを歓迎します。
 
@@ -40,8 +40,8 @@ main（常にリリース可能）
 ## 開発環境のセットアップ
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 uv sync --dev
 make setup   # git hooks を登録（クローン後に一度だけ実行）
 ```
@@ -54,7 +54,7 @@ make setup   # git hooks を登録（クローン後に一度だけ実行）
 ## テストの実行
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 PR を提出する前にすべてのテストが通過している必要があります。
@@ -67,17 +67,17 @@ PR を提出する前にすべてのテストが通過している必要があ�
 - **Python**: 3.10+（モダンな構文のために `from __future__ import annotations` を使用）
 
 ```bash
-uv run ruff check claude_discord/
-uv run ruff format claude_discord/
+uv run ruff check c_lord/
+uv run ruff format c_lord/
 ```
 
 ## プロジェクト構造
 
-- `claude_discord/claude/` — Claude Code CLI との連携（runner、parser、types）
-- `claude_discord/cogs/` — Discord.py の Cog（chat、skill コマンド、webhook トリガー、自動アップグレード）
-- `claude_discord/database/` — SQLite セッションおよび通知の永続化
-- `claude_discord/discord_ui/` — Discord UI コンポーネント（status、chunker、embeds）
-- `claude_discord/ext/` — オプション拡張（REST API サーバー — aiohttp が必要）
+- `c_lord/claude/` — Claude Code CLI との連携（runner、parser、types）
+- `c_lord/cogs/` — Discord.py の Cog（chat、skill コマンド、webhook トリガー、自動アップグレード）
+- `c_lord/database/` — SQLite セッションおよび通知の永続化
+- `c_lord/discord_ui/` — Discord UI コンポーネント（status、chunker、embeds）
+- `c_lord/ext/` — オプション拡張（REST API サーバー — aiohttp が必要）
 - `tests/` — pytest テストスイート
 
 ## 変更の提出
@@ -86,8 +86,8 @@ uv run ruff format claude_discord/
 2. 新機能のテストを書く
 3. プッシュ前にローカルで実行:
    ```bash
-   uv run ruff check claude_discord/
-   uv run ruff format --check claude_discord/
+   uv run ruff check c_lord/
+   uv run ruff format --check c_lord/
    uv run pytest tests/ -v
    ```
 4. 何を・なぜという明確な説明を付けて PR を提出
@@ -102,11 +102,11 @@ uv run ruff format claude_discord/
 
 ## 新しい Cog の追加
 
-1. `claude_discord/cogs/your_cog.py` を作成
+1. `c_lord/cogs/your_cog.py` を作成
 2. Claude CLI 実行には `_run_helper.run_claude_with_config(RunConfig(...))` を使用
    （旧 `run_claude_in_thread()` shim も引き続き使えるが、新規コードは `run_claude_with_config` を優先）
-3. `claude_discord/cogs/__init__.py` からエクスポート
-4. `claude_discord/__init__.py` のパブリック API に追加
+3. `c_lord/cogs/__init__.py` からエクスポート
+4. `c_lord/__init__.py` のパブリック API に追加
 5. `tests/test_your_cog.py` にテストを書く
 
 ## AI 生成コードについて

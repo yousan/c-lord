@@ -18,7 +18,8 @@ if TYPE_CHECKING:
     from .database.ask_repo import PendingAskRepository
     from .database.lounge_repo import LoungeRepository
     from .discord_ui.thread_dashboard import ThreadStatusDashboard
-    from .worktree import WorktreeManager
+    from .session_dir import SessionDirManager
+    from .tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,8 @@ class ClaudeDiscordBot(commands.Bot):
         ask_repo: PendingAskRepository | None = None,
         lounge_repo: LoungeRepository | None = None,
         lounge_channel_id: int | None = None,
-        worktree_manager: WorktreeManager | None = None,
+        session_dir_manager: SessionDirManager | None = None,
+        tmux_manager: TmuxSessionManager | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -56,8 +58,10 @@ class ClaudeDiscordBot(commands.Bot):
         # AI Lounge — casual shared space for concurrent Claude sessions (optional)
         self.lounge_repo: LoungeRepository | None = lounge_repo
         self.lounge_channel_id: int | None = lounge_channel_id
-        # Worktree lifecycle manager — cleans up session worktrees after runs
-        self.worktree_manager: WorktreeManager | None = worktree_manager
+        # Session directory lifecycle manager — cleans up clone dirs after runs
+        self.session_dir_manager: SessionDirManager | None = session_dir_manager
+        # Tmux session lifecycle manager (optional)
+        self.tmux_manager: TmuxSessionManager | None = tmux_manager
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
@@ -85,13 +89,19 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Cleanup orphaned session worktrees from previous bot runs.
+        # Cleanup orphaned session directories from previous bot runs.
         # At startup there are no active sessions, so all clean session
-        # worktrees are safe to remove.
-        if self.worktree_manager is not None:
+        # directories are safe to remove.
+        if self.session_dir_manager is not None:
             import asyncio
 
-            asyncio.create_task(self._cleanup_orphaned_worktrees())
+            asyncio.create_task(self._cleanup_orphaned_session_dirs())
+
+        # Cleanup orphaned tmux sessions from previous bot runs.
+        if self.tmux_manager is not None:
+            import asyncio
+
+            asyncio.create_task(self._cleanup_orphaned_tmux_sessions())
 
         # Sync slash commands
         try:
@@ -100,35 +110,53 @@ class ClaudeDiscordBot(commands.Bot):
         except Exception:
             logger.exception("Failed to sync slash commands")
 
-    async def _cleanup_orphaned_worktrees(self) -> None:
-        """Remove leftover clean session worktrees from previous bot runs.
+    async def _cleanup_orphaned_session_dirs(self) -> None:
+        """Remove leftover clean session directories from previous bot runs.
 
         Runs in a background task so it does not block on_ready().
         """
         import asyncio
 
-        assert self.worktree_manager is not None  # caller ensures this
+        assert self.session_dir_manager is not None  # caller ensures this
         try:
             results = await asyncio.to_thread(
-                self.worktree_manager.cleanup_orphaned,
+                self.session_dir_manager.cleanup_orphaned,
                 set(),  # no active sessions at startup
             )
             removed = [r for r in results if r.removed]
             skipped = [r for r in results if not r.removed and "does not exist" not in r.reason]
             if removed:
                 logger.info(
-                    "Startup worktree cleanup: removed %d orphaned worktree(s): %s",
+                    "Startup session dir cleanup: removed %d orphaned dir(s): %s",
                     len(removed),
                     [r.path for r in removed],
                 )
             if skipped:
                 logger.warning(
-                    "Startup worktree cleanup: skipped %d worktree(s) (dirty or locked): %s",
+                    "Startup session dir cleanup: skipped %d dir(s) (dirty or locked): %s",
                     len(skipped),
                     [(r.path, r.reason) for r in skipped],
                 )
         except Exception:
-            logger.exception("Error during startup worktree cleanup")
+            logger.exception("Error during startup session dir cleanup")
+
+    async def _cleanup_orphaned_tmux_sessions(self) -> None:
+        """Kill leftover tmux sessions from previous bot runs.
+
+        Runs in a background task so it does not block on_ready().
+        """
+        import asyncio
+
+        assert self.tmux_manager is not None  # caller ensures this
+        try:
+            killed = await asyncio.to_thread(
+                self.tmux_manager.cleanup_orphaned,
+                set(),  # no active sessions at startup
+            )
+            if killed:
+                logger.info("Startup tmux cleanup: killed %d orphaned session(s)", killed)
+        except Exception:
+            logger.exception("Error during startup tmux session cleanup")
 
     async def _restore_pending_ask_views(self) -> None:
         """Re-register persistent AskViews for questions pending before restart.

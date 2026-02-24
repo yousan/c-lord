@@ -3,9 +3,9 @@
 > **注意：** 这是原始英文文档的自动翻译版本。
 > 如有任何差异，以[英文版](../../README.md)为准。
 
-# claude-code-discord-bridge
+# c-lord
 
-[![CI](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/yousan/c-lord/actions/workflows/ci.yml/badge.svg)](https://github.com/yousan/c-lord/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -96,12 +96,12 @@ GitHub PR ←── git push ←── Claude Code ─────────�
 
 ```bash
 # 会话在开始前发布意图：
-curl -X POST "$CCDB_API_URL/api/lounge" \
+curl -X POST "$CLORD_API_URL/api/lounge" \
   -H "Content-Type: application/json" \
   -d '{"message": "feature/oauth 上开始 auth 重构 — worktree-A", "label": "功能开发"}'
 
 # 读取最近的 Lounge 消息（也会自动注入每个会话）：
-curl "$CCDB_API_URL/api/lounge"
+curl "$CLORD_API_URL/api/lounge"
 ```
 
 Lounge 频道同时也是人类可见的活动动态——在 Discord 中打开它，即可一眼看清所有活跃 Claude 会话当前在做什么。
@@ -112,7 +112,7 @@ Lounge 频道同时也是人类可见的活动动态——在 Discord 中打开�
 
 ```bash
 # 从另一个 Claude 会话或 CI 脚本：
-curl -X POST "$CCDB_API_URL/api/spawn" \
+curl -X POST "$CLORD_API_URL/api/spawn" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "对仓库进行安全扫描", "thread_name": "安全扫描"}'
 # 立即返回线程 ID；Claude 在后台运行
@@ -184,7 +184,7 @@ Claude 子进程将 `DISCORD_THREAD_ID` 作为环境变量接收，因此运行�
 - **恢复信息** — `/resume-info` 显示在终端继续当前会话的 CLI 命令
 - **启动恢复** — 中断的会话在任意 bot 重启后自动恢复；`AutoUpgradeCog`（升级重启）和 `ClaudeChatCog.cog_unload()`（其他关闭）自动标记，或通过 `POST /api/mark-resume` 手动标记
 - **程序化创建** — `POST /api/spawn` 从任意脚本或 Claude 子进程创建新 Discord 线程 + Claude 会话；创建线程后立即返回非阻塞 201
-- **线程 ID 注入** — `DISCORD_THREAD_ID` 环境变量传递给每个 Claude 子进程，使会话可通过 `$CCDB_API_URL/api/spawn` 创建子会话
+- **线程 ID 注入** — `DISCORD_THREAD_ID` 环境变量传递给每个 Claude 子进程，使会话可通过 `$CLORD_API_URL/api/spawn` 创建子会话
 - **Worktree 管理** — `/worktree-list` 显示所有活跃会话 worktree 的干净/脏状态；`/worktree-cleanup` 清理孤立的干净 worktree（支持 `dry_run` 预览）
 
 ### 安全性
@@ -208,13 +208,13 @@ Claude 子进程将 `DISCORD_THREAD_ID` 作为环境变量接收，因此运行�
 ### 独立运行
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 
 cp .env.example .env
 # 使用你的 Bot token 和频道 ID 编辑 .env
 
-uv run python -m claude_discord.main
+uv run python -m c_lord.main
 ```
 
 ### 作为包安装
@@ -222,12 +222,12 @@ uv run python -m claude_discord.main
 如果你已有运行中的 discord.py Bot（Discord 每个 token 只允许一个 Gateway 连接）：
 
 ```bash
-uv add git+https://github.com/ebibibi/claude-code-discord-bridge.git
+uv add git+https://github.com/yousan/c-lord.git
 ```
 
 ```python
 from discord.ext import commands
-from claude_discord import ClaudeRunner, setup_bridge
+from c_lord import ClaudeRunner, setup_bridge
 
 bot = commands.Bot(...)
 runner = ClaudeRunner(command="claude", model="sonnet")
@@ -242,12 +242,12 @@ async def on_ready():
     )
 ```
 
-`setup_bridge()` 自动连接所有 Cog。ccdb 新增的 Cog 无需修改消费者代码即可自动包含。
+`setup_bridge()` 自动连接所有 Cog。c-lord 新增的 Cog 无需修改消费者代码即可自动包含。
 
 更新到最新版本：
 
 ```bash
-uv lock --upgrade-package claude-code-discord-bridge && uv sync
+uv lock --upgrade-package c-lord && uv sync
 ```
 
 ---
@@ -266,7 +266,7 @@ uv lock --upgrade-package claude-code-discord-bridge && uv sync
 | `SESSION_TIMEOUT_SECONDS` | 会话非活动超时 | `300` |
 | `DISCORD_OWNER_ID` | Claude 需要输入时 @提及的用户 ID | （可选） |
 | `COORDINATION_CHANNEL_ID` | 跨会话事件广播的频道 ID | （可选） |
-| `CCDB_COORDINATION_CHANNEL_NAME` | 按名称自动创建协调频道 | （可选） |
+| `CLORD_COORDINATION_CHANNEL_NAME` | 按名称自动创建协调频道 | （可选） |
 | `WORKTREE_BASE_DIR` | 扫描会话 worktree 的基础目录（启用自动清理） | （可选） |
 
 ---
@@ -319,7 +319,7 @@ jobs:
 **Bot 配置：**
 
 ```python
-from claude_discord import WebhookTriggerCog, WebhookTrigger, ClaudeRunner
+from c_lord import WebhookTriggerCog, WebhookTrigger, ClaudeRunner
 
 runner = ClaudeRunner(command="claude", model="sonnet")
 
@@ -375,7 +375,7 @@ jobs:
 
 ```bash
 # Claude 在会话中调用：
-curl -X POST "$CCDB_API_URL/api/tasks" \
+curl -X POST "$CLORD_API_URL/api/tasks" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "检查过时依赖并在发现时开启 issue", "interval_seconds": 604800}'
 ```
@@ -398,10 +398,10 @@ curl -X POST http://localhost:8080/api/tasks \
 当新版本发布时自动升级 bot：
 
 ```python
-from claude_discord import AutoUpgradeCog, UpgradeConfig
+from c_lord import AutoUpgradeCog, UpgradeConfig
 
 config = UpgradeConfig(
-    package_name="claude-code-discord-bridge",
+    package_name="c-lord",
     trigger_prefix="🔄 bot-upgrade",
     working_dir="/home/user/my-bot",
     restart_command=["sudo", "systemctl", "restart", "my-bot.service"],
@@ -436,7 +436,7 @@ class MyCog(commands.Cog):
 可选的 REST API，用于通知和任务管理。需要 aiohttp：
 
 ```bash
-uv add "claude-code-discord-bridge[api]"
+uv add "c-lord[api]"
 ```
 
 ### 端点
@@ -476,7 +476,7 @@ curl -X POST http://localhost:8080/api/tasks \
 ## 架构
 
 ```
-claude_discord/
+c_lord/
   main.py                  # 独立入口点
   setup.py                 # setup_bridge() — 一键 Cog 连接
   bot.py                   # Discord Bot 类
@@ -539,7 +539,7 @@ claude_discord/
 ## 测试
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 700+ 个测试覆盖解析器、分块器、仓库、运行器、流式传输、webhook 触发、自动升级（含 `/upgrade` 斜杠命令、线程调用和批准按钮）、REST API、AskUserQuestion UI、线程面板、计划任务、会话同步、AI Lounge、启动恢复、模型切换、压缩检测、TodoWrite 进度 embed，以及权限/elicitation/plan-mode 事件解析。

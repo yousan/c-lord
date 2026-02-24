@@ -1,10 +1,10 @@
 ---
 name: release
-description: ccdb のマイナー/メジャーリリース手順。「v1.4.0としてリリースして」等と言われたときに使う。
+description: c-lord のマイナー/メジャーリリース手順。「v1.4.0としてリリースして」等と言われたときに使う。
 allowed-tools: Bash, Read, Edit
 ---
 
-# ccdb リリース手順
+# c-lord リリース手順
 
 ## バージョン体系
 
@@ -26,7 +26,7 @@ v1.4.0  ← 手動マイナーリリース（このスキルの対象）
 ### Step 1: リポジトリに入る
 
 ```bash
-cd /home/ebi/claude-code-discord-bridge
+cd /home/yousan/c-lord
 git checkout main && git pull
 ```
 
@@ -61,12 +61,12 @@ version = "1.4.0"
 ### Step 5: PR を作成（タイトルに **必ず** `[release]` を含める）
 
 ```bash
-PATH="/home/ebi/.local/bin:$PATH" git add pyproject.toml CHANGELOG.md
-PATH="/home/ebi/.local/bin:$PATH" git commit -m "release: v1.4.0 [release]"
+PATH="/home/yousan/.local/bin:$PATH" git add pyproject.toml CHANGELOG.md
+PATH="/home/yousan/.local/bin:$PATH" git commit -m "release: v1.4.0 [release]"
 git push -u origin release/v1.4.0
 
 gh pr create \
-  --repo ebibibi/claude-code-discord-bridge \
+  --repo yousan/c-lord \
   --base main \
   --title "release: v1.4.0 [release]" \
   --body "Release v1.4.0
@@ -82,7 +82,7 @@ See CHANGELOG.md for details."
 auto-approve により PR が自動マージされ、タグ `v1.4.0` と GitHub Release が作成される:
 
 ```bash
-gh release view v1.4.0 --repo ebibibi/claude-code-discord-bridge
+gh release view v1.4.0 --repo yousan/c-lord
 ```
 
 ---
@@ -106,4 +106,4 @@ docs-sync PR（翻訳・ドキュメント更新）はバンプも Release も�
 | 状況 | 原因 | 対処 |
 |------|------|------|
 | v1.4.1 になってしまった | PR タイトルに `[release]` がなかった | タグを削除して再度 release PR を作る |
-| タグが既に存在するエラー | 同じバージョンでタグを作ろうとした | タグを削除: `gh api repos/ebibibi/claude-code-discord-bridge/git/refs/tags/v1.4.0 --method DELETE` |
+| タグが既に存在するエラー | 同じバージョンでタグを作ろうとした | タグを削除: `gh api repos/yousan/c-lord/git/refs/tags/v1.4.0 --method DELETE` |

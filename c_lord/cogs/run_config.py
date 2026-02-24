@@ -22,7 +22,8 @@ from ..discord_ui.status import StatusManager
 
 if TYPE_CHECKING:
     from ..discord_ui.views import StopView
-    from ..worktree import WorktreeManager
+    from ..session_dir import SessionDirManager
+    from ..tmux import TmuxSessionManager
 
 
 @dataclass
@@ -46,9 +47,12 @@ class RunConfig:
         lounge_repo: Repository for AI Lounge context injection.
         stop_view: StopView instance to bump after each major message, keeping
                    the Stop button at the bottom of the thread.
-        worktree_manager: WorktreeManager for automatic session worktree cleanup.
-                          When provided, the worktree for this thread is removed
-                          (if clean) after the session ends.
+        session_dir_manager: SessionDirManager for automatic session dir cleanup.
+                            When provided, the directory for this thread is
+                            removed (if clean) after the session ends.
+        tmux_manager: TmuxSessionManager for tmux session lifecycle.
+                      When provided, the tmux session for this thread is
+                      killed after the session ends.
     """
 
     thread: discord.Thread
@@ -61,7 +65,8 @@ class RunConfig:
     ask_repo: PendingAskRepository | None = None
     lounge_repo: LoungeRepository | None = None
     stop_view: StopView | None = None
-    worktree_manager: WorktreeManager | None = None
+    session_dir_manager: SessionDirManager | None = None
+    tmux_manager: TmuxSessionManager | None = None
     # Paths to downloaded image tempfiles passed via --image flags.
     # Cleaned up in run_claude_with_config() finally block.
     image_paths: list[str] | None = None

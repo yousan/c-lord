@@ -9,9 +9,9 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from claude_discord.database.notification_repo import NotificationRepository
-from claude_discord.database.task_repo import TaskRepository
-from claude_discord.ext.api_server import ApiServer
+from c_lord.database.notification_repo import NotificationRepository
+from c_lord.database.task_repo import TaskRepository
+from c_lord.ext.api_server import ApiServer
 
 
 @pytest.fixture

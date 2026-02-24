@@ -1,9 +1,9 @@
 ---
 name: test-guide
-description: Testing patterns for claude-code-discord-bridge — pytest, async testing, mocking Discord objects, TDD workflow
+description: Testing patterns for c-lord — pytest, async testing, mocking Discord objects, TDD workflow
 ---
 
-# Test Guide — Testing Patterns for claude-code-discord-bridge
+# Test Guide — Testing Patterns for c-lord
 
 ## When to Activate
 
@@ -125,7 +125,7 @@ def test_chunk_splits_at_boundary():
 
 ```bash
 # Full suite with coverage
-uv run pytest tests/ -v --cov=claude_discord --cov-report=term-missing
+uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing
 
 # Single file
 uv run pytest tests/test_parser.py -v

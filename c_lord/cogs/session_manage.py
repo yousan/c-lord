@@ -21,7 +21,7 @@ from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..session_sync import CliSession, extract_recent_messages, scan_cli_sessions
-from ..worktree import WorktreeManager
+from ..session_dir import SessionDirManager
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
@@ -542,23 +542,23 @@ class SessionManageCog(commands.Cog):
             await thread.send(chunk)
 
     # ------------------------------------------------------------------
-    # Worktree commands
+    # Session directory commands
     # ------------------------------------------------------------------
 
-    def _get_worktree_manager(self) -> WorktreeManager | None:
-        """Return the WorktreeManager from the bot, if configured."""
-        return getattr(self.bot, "worktree_manager", None)
+    def _get_session_dir_manager(self) -> SessionDirManager | None:
+        """Return the SessionDirManager from the bot, if configured."""
+        return getattr(self.bot, "session_dir_manager", None)
 
     @app_commands.command(
-        name="worktree-list",
-        description="List all active Claude Code session worktrees",
+        name="session-dirs",
+        description="List all active Claude Code session directories",
     )
-    async def worktree_list(self, interaction: discord.Interaction) -> None:
-        """Show all session worktrees (branch ``session/\\d+``) and their status."""
-        wm = self._get_worktree_manager()
-        if wm is None:
+    async def session_dirs_list(self, interaction: discord.Interaction) -> None:
+        """Show all session directories and their status."""
+        sdm = self._get_session_dir_manager()
+        if sdm is None:
             await interaction.response.send_message(
-                "❌ Worktree manager is not configured.", ephemeral=True
+                "❌ Session directory manager is not configured.", ephemeral=True
             )
             return
 
@@ -566,50 +566,51 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        worktrees = await asyncio.to_thread(wm.find_session_worktrees)
+        dirs = await asyncio.to_thread(sdm.find_session_dirs)
 
-        if not worktrees:
+        if not dirs:
             await interaction.followup.send(
                 embed=discord.Embed(
-                    title="🌲 Session Worktrees",
-                    description="No session worktrees found.",
+                    title="📁 Session Directories",
+                    description="No session directories found.",
                     color=COLOR_INFO,
                 )
             )
             return
 
-        from ..worktree import _is_clean  # noqa: PLC0415
-
         embed = discord.Embed(
-            title=f"🌲 Session Worktrees ({len(worktrees)})",
+            title=f"📁 Session Directories ({len(dirs)})",
             color=COLOR_INFO,
         )
-        for wt in worktrees:
-            clean = await asyncio.to_thread(_is_clean, wt.path)
-            status = "✅ clean" if clean else "⚠️ dirty"
-            name = f"`wt-{wt.thread_id}`"
-            value = f"Branch: `{wt.branch}`\nRepo: `{wt.main_repo or 'unknown'}`\nStatus: {status}"
+        for d in dirs:
+            status = "✅ clean" if d.is_clean else "⚠️ dirty"
+            name = f"`{d.thread_id}`"
+            value = (
+                f"Path: `{d.path}`\n"
+                f"Commit: `{d.commit or 'unknown'}`\n"
+                f"Status: {status}"
+            )
             embed.add_field(name=name, value=value, inline=False)
 
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(
-        name="worktree-cleanup",
-        description="Remove clean orphaned session worktrees",
+        name="session-cleanup",
+        description="Remove clean orphaned session directories",
     )
     @app_commands.describe(
         dry_run="Preview what would be removed without actually removing anything",
     )
-    async def worktree_cleanup(
+    async def session_cleanup(
         self,
         interaction: discord.Interaction,
         dry_run: bool = False,
     ) -> None:
-        """Remove session worktrees that have no active session and are clean."""
-        wm = self._get_worktree_manager()
-        if wm is None:
+        """Remove session directories that have no active session and are clean."""
+        sdm = self._get_session_dir_manager()
+        if sdm is None:
             await interaction.response.send_message(
-                "❌ Worktree manager is not configured.", ephemeral=True
+                "❌ Session directory manager is not configured.", ephemeral=True
             )
             return
 
@@ -624,44 +625,42 @@ class SessionManageCog(commands.Cog):
 
         if dry_run:
             # Just list what would be removed
-            worktrees = await asyncio.to_thread(wm.find_session_worktrees)
-            from ..worktree import _is_clean  # noqa: PLC0415
+            dirs = await asyncio.to_thread(sdm.find_session_dirs)
 
             candidates = []
             skipped = []
-            for wt in worktrees:
-                if wt.thread_id in active_ids:
-                    skipped.append((wt, "session is active"))
+            for d in dirs:
+                if d.thread_id in active_ids:
+                    skipped.append((d, "session is active"))
                     continue
-                clean = await asyncio.to_thread(_is_clean, wt.path)
-                if clean:
-                    candidates.append(wt)
+                if d.is_clean:
+                    candidates.append(d)
                 else:
-                    skipped.append((wt, "dirty"))
+                    skipped.append((d, "dirty"))
 
             embed = discord.Embed(
-                title="🌲 Worktree Cleanup — Dry Run",
+                title="📁 Session Cleanup — Dry Run",
                 color=COLOR_INFO,
             )
             if candidates:
                 embed.add_field(
                     name=f"Would remove ({len(candidates)})",
-                    value="\n".join(f"`{wt.path}`" for wt in candidates) or "—",
+                    value="\n".join(f"`{d.path}`" for d in candidates) or "—",
                     inline=False,
                 )
             if skipped:
                 embed.add_field(
                     name=f"Would skip ({len(skipped)})",
-                    value="\n".join(f"`{wt.path}` — {reason}" for wt, reason in skipped) or "—",
+                    value="\n".join(f"`{d.path}` — {reason}" for d, reason in skipped) or "—",
                     inline=False,
                 )
             if not candidates and not skipped:
-                embed.description = "No session worktrees found."
+                embed.description = "No session directories found."
             embed.set_footer(text="Re-run without dry_run=True to actually remove.")
             await interaction.followup.send(embed=embed)
             return
 
-        results = await asyncio.to_thread(wm.cleanup_orphaned, active_ids)
+        results = await asyncio.to_thread(sdm.cleanup_orphaned, active_ids)
 
         removed = [r for r in results if r.removed]
         dirty = [r for r in results if not r.removed and "uncommitted changes" in r.reason]
@@ -678,7 +677,7 @@ class SessionManageCog(commands.Cog):
             color = COLOR_TOOL
 
         embed = discord.Embed(
-            title="🌲 Worktree Cleanup Complete",
+            title="📁 Session Cleanup Complete",
             color=color,
         )
         embed.add_field(
@@ -696,6 +695,48 @@ class SessionManageCog(commands.Cog):
             embed.add_field(
                 name=f"ℹ️ Skipped ({len(other_skipped)})",
                 value="\n".join(f"`{r.path}` — {r.reason}" for r in other_skipped) or "—",
+                inline=False,
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(
+        name="tmux-list",
+        description="List all active tmux sessions for Claude Code",
+    )
+    async def tmux_list(self, interaction: discord.Interaction) -> None:
+        """Show all clord-* tmux sessions."""
+        tmux_mgr = getattr(self.bot, "tmux_manager", None)
+        if tmux_mgr is None:
+            await interaction.response.send_message(
+                "❌ Tmux manager is not configured.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        import asyncio
+
+        sessions = await asyncio.to_thread(tmux_mgr.list_sessions)
+
+        if not sessions:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="🖥️ Tmux Sessions",
+                    description="No tmux sessions found.",
+                    color=COLOR_INFO,
+                )
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"🖥️ Tmux Sessions ({len(sessions)})",
+            color=COLOR_INFO,
+        )
+        for s in sessions:
+            embed.add_field(
+                name=f"`{s['name']}`",
+                value=f"Dir: `{s['working_dir'] or 'unknown'}`",
                 inline=False,
             )
 

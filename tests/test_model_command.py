@@ -14,11 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.cogs.session_manage import (
+from c_lord.cogs.session_manage import (
     SETTING_CLAUDE_MODEL,
     SessionManageCog,
 )
-from claude_discord.database.repository import SessionRecord
+from c_lord.database.repository import SessionRecord
 
 
 def _make_record(
@@ -60,7 +60,7 @@ def _make_cog(
     default_model: str = "sonnet",
     settings_model: str | None = None,
 ) -> SessionManageCog:
-    from claude_discord.cogs.session_manage import SessionManageCog
+    from c_lord.cogs.session_manage import SessionManageCog
 
     bot = MagicMock()
     bot.channel_id = 999
@@ -135,7 +135,7 @@ class TestModelShow:
 
     async def test_show_no_settings_repo(self):
         """Graceful fallback when settings_repo is None."""
-        from claude_discord.cogs.session_manage import SessionManageCog
+        from c_lord.cogs.session_manage import SessionManageCog
 
         bot = MagicMock()
         repo = MagicMock()
@@ -181,7 +181,7 @@ class TestModelSet:
 
     async def test_set_model_no_settings_repo(self):
         """When settings_repo is None, set sends ephemeral error."""
-        from claude_discord.cogs.session_manage import SessionManageCog
+        from c_lord.cogs.session_manage import SessionManageCog
 
         bot = MagicMock()
         repo = MagicMock()

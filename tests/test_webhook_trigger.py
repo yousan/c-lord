@@ -8,9 +8,9 @@ import discord
 import pytest
 from discord.ext import commands
 
-from claude_discord.cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
+from c_lord.cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
 
-_PATCH_RUN = "claude_discord.cogs.webhook_trigger.run_claude_with_config"
+_PATCH_RUN = "c_lord.cogs.webhook_trigger.run_claude_with_config"
 
 
 @pytest.fixture

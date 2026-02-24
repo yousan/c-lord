@@ -9,13 +9,13 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.claude.types import (
+from c_lord.claude.types import (
     MessageType,
     StreamEvent,
     ToolCategory,
     ToolUseEvent,
 )
-from claude_discord.cogs._run_helper import (
+from c_lord.cogs._run_helper import (
     TOOL_RESULT_MAX_CHARS,
     LiveToolTimer,
     StreamingMessageManager,
@@ -23,7 +23,7 @@ from claude_discord.cogs._run_helper import (
     _truncate_result,
     run_claude_in_thread,
 )
-from claude_discord.concurrency import SessionRegistry
+from c_lord.concurrency import SessionRegistry
 
 
 class TestTruncateResult:
@@ -266,7 +266,7 @@ class TestPartialMessageStreaming:
     @pytest.mark.asyncio
     async def test_is_partial_detection_in_parser(self) -> None:
         """Parser must set is_partial based on stop_reason."""
-        from claude_discord.claude.parser import parse_line
+        from c_lord.claude.parser import parse_line
 
         partial = parse_line(
             '{"type": "assistant", "message": {"stop_reason": null, "content": '
@@ -882,7 +882,7 @@ class TestLiveToolTimer:
     @pytest.mark.asyncio
     async def test_timer_updates_embed_after_interval(self) -> None:
         """After TOOL_TIMER_INTERVAL seconds, the embed should be updated with elapsed time."""
-        import claude_discord.discord_ui.tool_timer as tt
+        import c_lord.discord_ui.tool_timer as tt
 
         msg = self._make_msg()
         timer = LiveToolTimer(msg, self._bash_tool())
@@ -909,7 +909,7 @@ class TestLiveToolTimer:
     @pytest.mark.asyncio
     async def test_timer_cancelled_stops_updates(self) -> None:
         """After cancellation, no further edits should occur."""
-        import claude_discord.discord_ui.tool_timer as tt
+        import c_lord.discord_ui.tool_timer as tt
 
         msg = self._make_msg()
         timer = LiveToolTimer(msg, self._bash_tool())
@@ -930,7 +930,7 @@ class TestLiveToolTimer:
     @pytest.mark.asyncio
     async def test_run_claude_cancels_timer_on_tool_result(self) -> None:
         """Timer task should be cancelled when the tool result arrives."""
-        import claude_discord.cogs._run_helper as rh
+        import c_lord.cogs._run_helper as rh
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 11111

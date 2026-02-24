@@ -2,8 +2,8 @@
 
 import pytest
 
-from claude_discord.database.models import init_db
-from claude_discord.database.repository import SessionRepository
+from c_lord.database.models import init_db
+from c_lord.database.repository import SessionRepository
 
 
 @pytest.fixture

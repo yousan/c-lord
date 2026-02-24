@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from claude_discord.claude.types import (
+from c_lord.claude.types import (
     AskOption,
     AskQuestion,
     MessageType,
@@ -24,8 +24,8 @@ from claude_discord.claude.types import (
     ToolCategory,
     ToolUseEvent,
 )
-from claude_discord.cogs.event_processor import EventProcessor
-from claude_discord.cogs.run_config import RunConfig
+from c_lord.cogs.event_processor import EventProcessor
+from c_lord.cogs.run_config import RunConfig
 
 
 def _make_config(thread: MagicMock, runner: MagicMock, **kwargs) -> RunConfig:

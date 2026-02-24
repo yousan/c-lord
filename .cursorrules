@@ -1,4 +1,4 @@
-# discord-claude-code-bridge — Cursor Rules
+# C-lord — Cursor Rules
 
 Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
 
@@ -30,16 +30,18 @@ Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
 
 ## File Layout
 
-- `claude_discord/cogs/` — Discord Cogs (use `_run_helper.run_claude_in_thread()`)
-- `claude_discord/claude/` — CLI runner, stream parser, types
-- `claude_discord/database/` — SQLite repository
-- `claude_discord/discord_ui/` — Status, chunker, embeds
+- `c_lord/cogs/` — Discord Cogs (use `_run_helper.run_claude_in_thread()`)
+- `c_lord/claude/` — CLI runner, stream parser, types
+- `c_lord/session_dir.py` — Git clone based session directory management
+- `c_lord/tmux.py` — Tmux session management wrapper
+- `c_lord/database/` — SQLite repository
+- `c_lord/discord_ui/` — Status, chunker, embeds
 - `tests/` — pytest suite
 
 ## Commands
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
-uv run ruff check claude_discord/
-uv run ruff format claude_discord/
+uv run pytest tests/ -v --cov=c_lord
+uv run ruff check c_lord/
+uv run ruff format c_lord/
 ```

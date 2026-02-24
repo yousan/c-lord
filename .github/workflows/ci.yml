@@ -30,13 +30,13 @@ jobs:
         run: uv sync --dev
 
       - name: Lint
-        run: uv run ruff check claude_discord/
+        run: uv run ruff check c_lord/
 
       - name: Format check
-        run: uv run ruff format --check claude_discord/
+        run: uv run ruff format --check c_lord/
 
       - name: Type check
-        run: uv run pyright claude_discord/
+        run: uv run pyright c_lord/
 
       - name: Test
-        run: uv run pytest tests/ -v --cov=claude_discord --cov-report=term-missing
+        run: uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing

@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from claude_discord.claude.types import ToolCategory
-from claude_discord.discord_ui.status import (
+from c_lord.claude.types import ToolCategory
+from c_lord.discord_ui.status import (
     STALL_HARD_SECONDS,
     StatusManager,
 )
@@ -97,7 +97,7 @@ class TestCompactStatus:
 
     @pytest.mark.asyncio
     async def test_set_compact_changes_emoji(self) -> None:
-        from claude_discord.discord_ui.status import EMOJI_COMPACT
+        from c_lord.discord_ui.status import EMOJI_COMPACT
 
         msg = _make_message()
         sm = StatusManager(msg)

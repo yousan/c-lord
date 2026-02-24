@@ -3,9 +3,9 @@
 > **注意:** これは英語のオリジナルドキュメントを自動翻訳したものです。
 > 内容に相違がある場合は、[英語版](../../README.md)が優先されます。
 
-# claude-code-discord-bridge
+# c-lord
 
-[![CI](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ebibibi/claude-code-discord-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/yousan/c-lord/actions/workflows/ci.yml/badge.svg)](https://github.com/yousan/c-lord/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -94,12 +94,12 @@ Claude Code CLI を直接使っている場合は `/sync-sessions` で既存の�
 
 ```bash
 # セッションは作業を始める前に意図を投稿します:
-curl -X POST "$CCDB_API_URL/api/lounge" \
+curl -X POST "$CLORD_API_URL/api/lounge" \
   -H "Content-Type: application/json" \
   -d '{"message": "feature/oauth で auth リファクタリング開始 — worktree-A", "label": "機能開発"}'
 
 # 最近のラウンジメッセージを確認（各セッションにも自動注入）:
-curl "$CCDB_API_URL/api/lounge"
+curl "$CLORD_API_URL/api/lounge"
 ```
 
 ラウンジチャンネルは人間が見るアクティビティフィードとしても機能します — Discord で開けば、すべてのアクティブな Claude セッションが今何をしているかを一目で確認できます。
@@ -110,7 +110,7 @@ curl "$CCDB_API_URL/api/lounge"
 
 ```bash
 # 別の Claude セッションや CI スクリプトから:
-curl -X POST "$CCDB_API_URL/api/spawn" \
+curl -X POST "$CLORD_API_URL/api/spawn" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "リポジトリのセキュリティスキャンを実行", "thread_name": "Security Scan"}'
 # スレッド作成後すぐに返答し、Claude はバックグラウンドで実行
@@ -193,7 +193,7 @@ Bot の再起動中にセッションが中断された場合、Bot が再起動
 - **リジューム情報** — 現在のセッションをターミナルで継続する CLI コマンドを表示（`/resume-info`）
 - **スタートアップリジューム** — 任意のBot 再起動後に中断セッションを自動再開。`AutoUpgradeCog`（アップグレード再起動）および `ClaudeChatCog.cog_unload()`（その他すべてのシャットダウン）が自動登録、または `POST /api/mark-resume` で手動登録
 - **プログラム的スポーン** — `POST /api/spawn` でスクリプトや Claude サブプロセスから新しい Discord スレッド + Claude セッションを作成。スレッド作成後すぐに非ブロッキング 201 を返す
-- **スレッド ID 注入** — すべての Claude サブプロセスに `DISCORD_THREAD_ID` 環境変数を渡し、セッションから `$CCDB_API_URL/api/spawn` で子セッションを起動可能
+- **スレッド ID 注入** — すべての Claude サブプロセスに `DISCORD_THREAD_ID` 環境変数を渡し、セッションから `$CLORD_API_URL/api/spawn` で子セッションを起動可能
 - **Worktree 管理** — `/worktree-list` でアクティブなセッション Worktree を clean/dirty ステータス付きで表示、`/worktree-cleanup` で孤立した clean な Worktree を削除（`dry_run` プレビューあり）
 - **実行時モデル切り替え** — `/model-show` で現在のグローバルモデルとスレッドごとのセッションモデルを表示、`/model-set` で再起動不要のまま全新規セッションのモデルを変更
 
@@ -218,13 +218,13 @@ Bot の再起動中にセッションが中断された場合、Bot が再起動
 ### スタンドアロン
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 
 cp .env.example .env
 # .env を Bot トークンとチャンネル ID で編集
 
-uv run python -m claude_discord.main
+uv run python -m c_lord.main
 ```
 
 ### パッケージとしてインストール
@@ -232,12 +232,12 @@ uv run python -m claude_discord.main
 すでに discord.py Bot を動かしている場合（Discord はトークンごとに 1 Gateway 接続のみ許可）:
 
 ```bash
-uv add git+https://github.com/ebibibi/claude-code-discord-bridge.git
+uv add git+https://github.com/yousan/c-lord.git
 ```
 
 ```python
 from discord.ext import commands
-from claude_discord import ClaudeRunner, setup_bridge
+from c_lord import ClaudeRunner, setup_bridge
 
 bot = commands.Bot(...)
 runner = ClaudeRunner(command="claude", model="sonnet")
@@ -252,12 +252,12 @@ async def on_ready():
     )
 ```
 
-`setup_bridge()` はすべての Cog を自動的に配線します。ccdb に追加された新しい Cog はコード変更なしで含まれます。
+`setup_bridge()` はすべての Cog を自動的に配線します。c-lord に追加された新しい Cog はコード変更なしで含まれます。
 
 最新版へのアップデート:
 
 ```bash
-uv lock --upgrade-package claude-code-discord-bridge && uv sync
+uv lock --upgrade-package c-lord && uv sync
 ```
 
 ---
@@ -276,7 +276,7 @@ uv lock --upgrade-package claude-code-discord-bridge && uv sync
 | `SESSION_TIMEOUT_SECONDS` | セッション非アクティブタイムアウト | `300` |
 | `DISCORD_OWNER_ID` | Claude が入力待ちのとき @mention する Discord ユーザー ID | （オプション） |
 | `COORDINATION_CHANNEL_ID` | セッション間イベントブロードキャスト用チャンネル ID | （オプション） |
-| `CCDB_COORDINATION_CHANNEL_NAME` | 協調チャンネルを名前で自動作成 | （オプション） |
+| `CLORD_COORDINATION_CHANNEL_NAME` | 協調チャンネルを名前で自動作成 | （オプション） |
 | `WORKTREE_BASE_DIR` | セッション Worktree のスキャン対象ディレクトリ（自動クリーンアップを有効化） | （オプション） |
 
 ---
@@ -329,7 +329,7 @@ jobs:
 **Bot の設定:**
 
 ```python
-from claude_discord import WebhookTriggerCog, WebhookTrigger, ClaudeRunner
+from c_lord import WebhookTriggerCog, WebhookTrigger, ClaudeRunner
 
 runner = ClaudeRunner(command="claude", model="sonnet")
 
@@ -385,7 +385,7 @@ Discord セッション内から Claude がタスクを登録:
 
 ```bash
 # Claude がセッション内で呼び出す:
-curl -X POST "$CCDB_API_URL/api/tasks" \
+curl -X POST "$CLORD_API_URL/api/tasks" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "古い依存関係をチェックして見つかったら Issue を開く", "interval_seconds": 604800}'
 ```
@@ -408,10 +408,10 @@ curl -X POST http://localhost:8080/api/tasks \
 新しいリリースが公開されたときに Bot を自動アップグレード:
 
 ```python
-from claude_discord import AutoUpgradeCog, UpgradeConfig
+from c_lord import AutoUpgradeCog, UpgradeConfig
 
 config = UpgradeConfig(
-    package_name="claude-code-discord-bridge",
+    package_name="c-lord",
     trigger_prefix="🔄 bot-upgrade",
     working_dir="/home/user/my-bot",
     restart_command=["sudo", "systemctl", "restart", "my-bot.service"],
@@ -453,7 +453,7 @@ class MyCog(commands.Cog):
 通知とタスク管理のためのオプション REST API。aiohttp が必要:
 
 ```bash
-uv add "claude-code-discord-bridge[api]"
+uv add "c-lord[api]"
 ```
 
 ### エンドポイント
@@ -493,7 +493,7 @@ curl -X POST http://localhost:8080/api/tasks \
 ## アーキテクチャ
 
 ```
-claude_discord/
+c_lord/
   main.py                  # スタンドアロンエントリーポイント
   setup.py                 # setup_bridge() — 1 行で Cog を配線
   bot.py                   # Discord Bot クラス
@@ -556,7 +556,7 @@ claude_discord/
 ## テスト
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 700 件以上のテストがパーサー、チャンカー、リポジトリ、ランナー、ストリーミング、Webhook トリガー、自動アップグレード（`/upgrade` スラッシュコマンド、スレッド内実行、承認ボタン含む）、REST API、AskUserQuestion UI、スレッドダッシュボード、スケジュールタスク、セッション同期、AI Lounge、スタートアップリジューム、モデル切り替え、コンパクト検出、TodoWrite 進捗 embed、許可／Elicitation／Plan Mode イベントパースをカバーしています。

@@ -7,7 +7,7 @@ Design:
 - ``discord.ext.tasks`` is used only for the master loop — individual tasks
   are not @tasks.loop decorated (they are runtime-dynamic).
 - Claude handles all domain logic (what to check, how to deduplicate).
-  ccdb only manages scheduling.
+  c-lord only manages scheduling.
 
 See: Issue #90, CLAUDE.md §Key Design Decisions #7-9.
 """
@@ -86,7 +86,7 @@ class SchedulerCog(commands.Cog):
 
             asyncio.create_task(
                 self._run_task(task),
-                name=f"ccdb-scheduler-{task_id}",
+                name=f"clord-scheduler-{task_id}",
             )
 
     @_master_loop.before_loop

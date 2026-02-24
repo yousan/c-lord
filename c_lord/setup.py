@@ -1,7 +1,7 @@
-"""One-call setup for all ccdb bridge Cogs.
+"""One-call setup for all c-lord bridge Cogs.
 
 Consumers call this instead of manually wiring each Cog.
-New Cogs added to ccdb are automatically included — no consumer code changes needed.
+New Cogs added to c-lord are automatically included — no consumer code changes needed.
 """
 
 from __future__ import annotations
@@ -74,12 +74,15 @@ async def setup_bridge(
     enable_scheduler: bool = True,
     task_db_path: str = "data/tasks.db",
     lounge_channel_id: int | None = None,
-    worktree_base_dir: str | None = None,
+    session_dir_base: str | None = None,
+    session_source_repo: str | None = None,
+    session_clone_branch: str | None = None,
+    enable_tmux: bool = False,
 ) -> BridgeComponents:
-    """Initialize and register all ccdb Cogs in one call.
+    """Initialize and register all c-lord Cogs in one call.
 
-    This is the recommended way for consumers to set up ccdb.
-    New Cogs added to ccdb will be automatically included.
+    This is the recommended way for consumers to set up c-lord.
+    New Cogs added to c-lord will be automatically included.
 
     Pass ``api_server`` to automatically wire all repos and set the runner's
     ``api_port`` — consumers then need zero manual wiring::
@@ -91,7 +94,7 @@ async def setup_bridge(
         bot: Discord bot instance.
         runner: ClaudeRunner for Claude CLI invocation.
         api_server: Optional ApiServer to auto-wire repos into.  Also sets
-                    runner.api_port so CCDB_API_URL is available to Claude.
+                    runner.api_port so CLORD_API_URL is available to Claude.
         session_db_path: Path for session SQLite DB.
         allowed_user_ids: Set of Discord user IDs allowed to use Claude.
         claude_channel_id: Channel ID for Claude chat (needed for SkillCommandCog).
@@ -102,11 +105,18 @@ async def setup_bridge(
                            Defaults to COORDINATION_CHANNEL_ID env var so
                            lounge and coordination share the same channel
                            with no extra configuration needed.
-        worktree_base_dir: Base directory to scan for session worktrees
-                           (e.g. ``/home/user``). When set, a WorktreeManager
-                           is created and attached to the bot, enabling automatic
-                           cleanup of session worktrees at session end and startup.
-                           Defaults to WORKTREE_BASE_DIR env var, or None (disabled).
+        session_dir_base: Base directory for session clone directories.
+                          When set with ``session_source_repo``, a
+                          SessionDirManager is created and attached to the bot.
+                          Defaults to SESSION_DIR_BASE env var, or None (disabled).
+        session_source_repo: Git repository URL or local path to clone for
+                             each session. Required when session_dir_base is set.
+                             Defaults to SESSION_SOURCE_REPO env var.
+        session_clone_branch: Optional branch to clone. Defaults to
+                              SESSION_CLONE_BRANCH env var, or None (default branch).
+        enable_tmux: Whether to enable tmux session management. When True,
+                     a TmuxSessionManager is created and attached to the bot.
+                     Defaults to CLORD_TMUX_ENABLED env var ("true"/"1").
 
     Returns:
         BridgeComponents with references to initialized repositories.
@@ -122,20 +132,40 @@ async def setup_bridge(
     from .database.resume_repo import PendingResumeRepository
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
-    from .worktree import WorktreeManager
+    from .session_dir import SessionDirManager
+    from .tmux import TmuxSessionManager
 
     # Lounge shares the coordination channel unless explicitly overridden
     if lounge_channel_id is None:
         ch_str = os.getenv("COORDINATION_CHANNEL_ID", "")
         lounge_channel_id = int(ch_str) if ch_str.isdigit() else None
 
-    # WorktreeManager — attach to bot so cogs can access it via bot.worktree_manager
-    if worktree_base_dir is None:
-        worktree_base_dir = os.getenv("WORKTREE_BASE_DIR")
-    if worktree_base_dir is not None:
-        if not hasattr(bot, "worktree_manager"):
-            bot.worktree_manager = WorktreeManager(base_dir=worktree_base_dir)  # type: ignore[attr-defined]
-        logger.info("WorktreeManager enabled (base_dir=%s)", worktree_base_dir)
+    # SessionDirManager — attach to bot so cogs can access it via bot.session_dir_manager
+    if session_dir_base is None:
+        session_dir_base = os.getenv("SESSION_DIR_BASE")
+    if session_source_repo is None:
+        session_source_repo = os.getenv("SESSION_SOURCE_REPO")
+    if session_clone_branch is None:
+        session_clone_branch = os.getenv("SESSION_CLONE_BRANCH") or None
+    if session_dir_base is not None and session_source_repo is not None:
+        if not hasattr(bot, "session_dir_manager"):
+            bot.session_dir_manager = SessionDirManager(  # type: ignore[attr-defined]
+                base_dir=session_dir_base,
+                source_repo=session_source_repo,
+                clone_branch=session_clone_branch,
+            )
+        logger.info(
+            "SessionDirManager enabled (base=%s, repo=%s)", session_dir_base, session_source_repo
+        )
+
+    # TmuxSessionManager — attach to bot so cogs can access it via bot.tmux_manager
+    tmux_env = os.getenv("CLORD_TMUX_ENABLED", "").lower()
+    if not enable_tmux and tmux_env in ("true", "1", "yes"):
+        enable_tmux = True
+    if enable_tmux:
+        if not hasattr(bot, "tmux_manager"):
+            bot.tmux_manager = TmuxSessionManager()  # type: ignore[attr-defined]
+        logger.info("TmuxSessionManager enabled")
 
     # --- Session DB (also hosts lounge_messages and pending_resumes tables) ---
     os.makedirs(os.path.dirname(session_db_path) or ".", exist_ok=True)
@@ -148,7 +178,7 @@ async def setup_bridge(
     logger.info("Session DB initialized: %s", session_db_path)
 
     # Attach repos to bot so generic cogs (e.g. AutoUpgradeCog) can discover them
-    # without a hard import dependency on ccdb internals.
+    # without a hard import dependency on c-lord internals.
     bot.session_repo = session_repo  # type: ignore[attr-defined]
     bot.resume_repo = resume_repo  # type: ignore[attr-defined]
 

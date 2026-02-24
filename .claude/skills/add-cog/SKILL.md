@@ -15,7 +15,7 @@ description: Step-by-step guide to add a new discord.py Cog to the framework
 
 ### 1. Create the Cog File
 
-Create `claude_discord/cogs/your_cog.py`:
+Create `c_lord/cogs/your_cog.py`:
 
 ```python
 """Short description of what this Cog does."""
@@ -64,13 +64,13 @@ await run_claude_in_thread(
 
 ### 3. Export from Package
 
-Add to `claude_discord/cogs/__init__.py`:
+Add to `c_lord/cogs/__init__.py`:
 
 ```python
 from .your_cog import YourCog
 ```
 
-Add to `claude_discord/__init__.py`:
+Add to `c_lord/__init__.py`:
 
 ```python
 from .cogs.your_cog import YourCog
@@ -91,9 +91,9 @@ Create `tests/test_your_cog.py`:
 Run the verify skill to ensure everything passes:
 
 ```bash
-uv run ruff check claude_discord/
-uv run ruff format claude_discord/
-uv run pytest tests/ -v --cov=claude_discord
+uv run ruff check c_lord/
+uv run ruff format c_lord/
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 ## Conventions

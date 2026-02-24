@@ -9,7 +9,7 @@ import discord
 import pytest
 from discord.ext import commands
 
-from claude_discord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeApprovalView, UpgradeConfig
+from c_lord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeApprovalView, UpgradeConfig
 
 _PATCH_EXEC = "asyncio.create_subprocess_exec"
 _PATCH_WAIT = "asyncio.wait_for"
@@ -24,7 +24,7 @@ def bot() -> MagicMock:
 @pytest.fixture
 def config() -> UpgradeConfig:
     return UpgradeConfig(
-        package_name="claude-code-discord-bridge",
+        package_name="c-lord",
         trigger_prefix="🔄 ebibot-upgrade",
         working_dir="/home/user/bot",
     )
@@ -684,8 +684,8 @@ class TestActiveSessionCount:
     """Tests for ClaudeChatCog.active_session_count property."""
 
     def test_count_starts_at_zero(self) -> None:
-        from claude_discord.claude.runner import ClaudeRunner
-        from claude_discord.cogs.claude_chat import ClaudeChatCog
+        from c_lord.claude.runner import ClaudeRunner
+        from c_lord.cogs.claude_chat import ClaudeChatCog
 
         bot = MagicMock()
         bot.channel_id = 999
@@ -697,8 +697,8 @@ class TestActiveSessionCount:
         assert cog.active_session_count == 0
 
     def test_count_reflects_runners(self) -> None:
-        from claude_discord.claude.runner import ClaudeRunner
-        from claude_discord.cogs.claude_chat import ClaudeChatCog
+        from c_lord.claude.runner import ClaudeRunner
+        from c_lord.cogs.claude_chat import ClaudeChatCog
 
         bot = MagicMock()
         bot.channel_id = 999

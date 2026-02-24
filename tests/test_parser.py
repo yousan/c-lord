@@ -2,8 +2,8 @@
 
 import json
 
-from claude_discord.claude.parser import parse_line
-from claude_discord.claude.types import MessageType, ToolCategory
+from c_lord.claude.parser import parse_line
+from c_lord.claude.types import MessageType, ToolCategory
 
 
 class TestParseLine:

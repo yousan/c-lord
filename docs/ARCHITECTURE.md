@@ -2,7 +2,7 @@
 
 ## Overview
 
-claude-code-discord-bridge is a thin UI layer that bridges Discord messages to the Claude Code CLI. It has no AI logic of its own — all intelligence comes from Claude Code's existing capabilities (CLAUDE.md, skills, tools, memory, MCP servers). The bridge's sole responsibility is: accept user input from Discord, spawn the CLI, parse its output, and render results back to Discord.
+c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. It has no AI logic of its own — all intelligence comes from Claude Code's existing capabilities (CLAUDE.md, skills, tools, memory, MCP servers). The bridge's sole responsibility is: accept user input from Discord, spawn the CLI, parse its output, and render results back to Discord.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -211,7 +211,7 @@ claude-code-discord-bridge is a thin UI layer that bridges Discord messages to t
 ## Dependency Graph
 
 ```
-claude_discord/
+c_lord/
   __init__.py ──────────┬──→ claude/runner.py
                         ├──→ claude/parser.py
                         ├──→ claude/types.py

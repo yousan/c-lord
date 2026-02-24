@@ -257,14 +257,14 @@ class ClaudeRunner:
         Strips CLAUDECODE (nesting detection) and known secret variables
         so that the CLI process cannot read them via Bash tool.
 
-        Injects CCDB_API_URL (and optionally CCDB_API_SECRET) so Claude Code
-        can register scheduled tasks via ``curl $CCDB_API_URL/api/tasks``.
+        Injects CLORD_API_URL (and optionally CLORD_API_SECRET) so Claude Code
+        can register scheduled tasks via ``curl $CLORD_API_URL/api/tasks``.
         """
         env = {k: v for k, v in os.environ.items() if k not in self._STRIPPED_ENV_KEYS}
         if self.api_port is not None:
-            env["CCDB_API_URL"] = f"http://127.0.0.1:{self.api_port}"
+            env["CLORD_API_URL"] = f"http://127.0.0.1:{self.api_port}"
         if self.api_secret is not None:
-            env["CCDB_API_SECRET"] = self.api_secret
+            env["CLORD_API_SECRET"] = self.api_secret
         if self.thread_id is not None:
             env["DISCORD_THREAD_ID"] = str(self.thread_id)
         return env

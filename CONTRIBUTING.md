@@ -1,4 +1,4 @@
-# Contributing to claude-code-discord-bridge
+# Contributing to c-lord
 
 Thanks for your interest in contributing! This project was built by Claude Code and welcomes contributions from both humans and AI agents.
 
@@ -35,8 +35,8 @@ main (always releasable)
 ## Development Setup
 
 ```bash
-git clone https://github.com/ebibibi/claude-code-discord-bridge.git
-cd claude-code-discord-bridge
+git clone https://github.com/yousan/c-lord.git
+cd c-lord
 uv sync --dev
 make setup   # register git hooks (one-time per clone)
 ```
@@ -51,7 +51,7 @@ make setup   # register git hooks (one-time per clone)
 ## Running Tests
 
 ```bash
-uv run pytest tests/ -v --cov=claude_discord
+uv run pytest tests/ -v --cov=c_lord
 ```
 
 All tests must pass before submitting a PR.
@@ -64,17 +64,17 @@ All tests must pass before submitting a PR.
 - **Python**: 3.10+ (use `from __future__ import annotations` for modern syntax)
 
 ```bash
-uv run ruff check claude_discord/
-uv run ruff format claude_discord/
+uv run ruff check c_lord/
+uv run ruff format c_lord/
 ```
 
 ## Project Structure
 
-- `claude_discord/claude/` — Claude Code CLI interaction (runner, parser, types)
-- `claude_discord/cogs/` — Discord.py Cogs (chat, skill command, webhook trigger, auto-upgrade)
-- `claude_discord/database/` — SQLite session and notification persistence
-- `claude_discord/discord_ui/` — Discord UI components (status, chunker, embeds)
-- `claude_discord/ext/` — Optional extensions (REST API server — requires aiohttp)
+- `c_lord/claude/` — Claude Code CLI interaction (runner, parser, types)
+- `c_lord/cogs/` — Discord.py Cogs (chat, skill command, webhook trigger, auto-upgrade)
+- `c_lord/database/` — SQLite session and notification persistence
+- `c_lord/discord_ui/` — Discord UI components (status, chunker, embeds)
+- `c_lord/ext/` — Optional extensions (REST API server — requires aiohttp)
 - `tests/` — pytest test suite
 
 ## Submitting Changes
@@ -83,8 +83,8 @@ uv run ruff format claude_discord/
 2. Write tests for new functionality
 3. Run locally before pushing:
    ```bash
-   uv run ruff check claude_discord/
-   uv run ruff format --check claude_discord/
+   uv run ruff check c_lord/
+   uv run ruff format --check c_lord/
    uv run pytest tests/ -v
    ```
 4. Submit a PR with a clear description of what and why
@@ -99,11 +99,11 @@ This project uses automatic versioning — **you never need to manually bump the
 
 ## Adding a New Cog
 
-1. Create `claude_discord/cogs/your_cog.py`
+1. Create `c_lord/cogs/your_cog.py`
 2. Use `_run_helper.run_claude_with_config(RunConfig(...))` for Claude CLI execution
    (The legacy `run_claude_in_thread()` shim is still available but prefer `run_claude_with_config`)
-3. Export from `claude_discord/cogs/__init__.py`
-4. Add to `claude_discord/__init__.py` public API
+3. Export from `c_lord/cogs/__init__.py`
+4. Add to `c_lord/__init__.py` public API
 5. Write tests in `tests/test_your_cog.py`
 
 ## A Note on AI-Generated Code

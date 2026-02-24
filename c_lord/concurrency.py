@@ -4,7 +4,7 @@ Layer 1: Every session receives a generic concurrency warning in its prompt.
 Layer 2: An in-memory registry tracks active sessions so each one knows
          what others are doing and can avoid conflicts.
 
-See: https://github.com/ebibibi/claude-code-discord-bridge/issues/52
+See: https://github.com/yousan/c-lord/issues/52
 """
 
 from __future__ import annotations
@@ -31,20 +31,17 @@ _BASE_CONCURRENCY_NOTICE = """\
 running simultaneously via Discord. Other sessions ARE active right now. \
 You MUST follow these rules to avoid destroying each other's work:
 
-1. **Git — USE A WORKTREE (REQUIRED)**: Run \
-`git worktree add ../wt-{thread_id} -b session/{thread_id}` BEFORE making \
-any changes. Work ONLY inside your worktree. NEVER modify the main working \
-directory directly. Always commit and push before finishing — uncommitted \
-changes WILL be lost.
-2. **Files**: Another session may be editing the same files RIGHT NOW. \
-Check `git status` and recent file modification times before overwriting.
+1. **Git — INDEPENDENT CLONE**: You are working in an independent clone \
+directory, isolated from other sessions. Always commit and push before \
+finishing — uncommitted changes WILL be lost when the session ends.
+2. **Files**: Another session may be working on overlapping files in a \
+separate clone. Coordinate via git (commit, push, pull) to avoid conflicts.
 3. **Ports & processes**: Shared network ports or lock files may already be in use.
 4. **Resources**: Shared databases, APIs with rate limits, or singleton processes \
 may be accessed concurrently.
 
-CRITICAL: If your target repository is the same as another active session's, \
-you MUST use a separate worktree or stop and warn the user. \
-Do NOT proceed without isolation.\
+CRITICAL: If your work targets the same repository as another active session, \
+coordinate via git branches to avoid conflicts.\
 """
 
 _OTHER_SESSIONS_HEADER = """
@@ -114,7 +111,7 @@ class SessionRegistry:
         Combines the base Layer 1 warning with Layer 2 context about
         other active sessions.
         """
-        notice = _BASE_CONCURRENCY_NOTICE.format(thread_id=thread_id)
+        notice = _BASE_CONCURRENCY_NOTICE
         others = self.list_others(thread_id)
         if others:
             notice += _OTHER_SESSIONS_HEADER
@@ -125,6 +122,6 @@ class SessionRegistry:
                 notice += line + "\n"
             notice += (
                 "\nIf your work targets the same repository as any session above, "
-                "you MUST use a git worktree. Do NOT proceed without isolation.\n"
+                "coordinate via git branches to avoid conflicts.\n"
             )
         return notice
