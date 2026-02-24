@@ -150,9 +150,7 @@ async def _cleanup_tmux_session(config: RunConfig) -> None:
     try:
         await asyncio.to_thread(config.tmux_manager.kill_session, config.thread.id)
     except Exception:
-        logger.exception(
-            "Unexpected error during tmux cleanup for thread %d", config.thread.id
-        )
+        logger.exception("Unexpected error during tmux cleanup for thread %d", config.thread.id)
 
 
 async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:

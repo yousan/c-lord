@@ -105,9 +105,7 @@ class TmuxSessionManager:
         if not self._check_available():
             return []
 
-        result = _run(
-            ["tmux", "list-sessions", "-F", "#{session_name}:#{pane_current_path}"]
-        )
+        result = _run(["tmux", "list-sessions", "-F", "#{session_name}:#{pane_current_path}"])
         if result.returncode != 0:
             return []
 
@@ -134,12 +132,11 @@ class TmuxSessionManager:
         for session in self.list_sessions():
             name = session["name"]
             # Extract thread_id from session name
-            suffix = name[len(SESSION_PREFIX):]
+            suffix = name[len(SESSION_PREFIX) :]
             if not suffix.isdigit():
                 continue
             thread_id = int(suffix)
-            if thread_id not in active_thread_ids:
-                if self.kill_session(thread_id):
-                    killed += 1
+            if thread_id not in active_thread_ids and self.kill_session(thread_id):
+                killed += 1
 
         return killed

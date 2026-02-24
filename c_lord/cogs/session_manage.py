@@ -20,8 +20,8 @@ from discord.ext import commands
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
-from ..session_sync import CliSession, extract_recent_messages, scan_cli_sessions
 from ..session_dir import SessionDirManager
+from ..session_sync import CliSession, extract_recent_messages, scan_cli_sessions
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
@@ -585,11 +585,7 @@ class SessionManageCog(commands.Cog):
         for d in dirs:
             status = "✅ clean" if d.is_clean else "⚠️ dirty"
             name = f"`{d.thread_id}`"
-            value = (
-                f"Path: `{d.path}`\n"
-                f"Commit: `{d.commit or 'unknown'}`\n"
-                f"Status: {status}"
-            )
+            value = f"Path: `{d.path}`\nCommit: `{d.commit or 'unknown'}`\nStatus: {status}"
             embed.add_field(name=name, value=value, inline=False)
 
         await interaction.followup.send(embed=embed)
