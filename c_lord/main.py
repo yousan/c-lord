@@ -18,6 +18,8 @@ from .database.ask_repo import PendingAskRepository
 from .database.lounge_repo import LoungeRepository
 from .database.models import init_db
 from .database.repository import SessionRepository
+from .session_dir import SessionDirManager
+from .tmux import TmuxSessionManager
 from .utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,27 @@ async def main() -> None:
     coordination_channel_id = (
         int(config["coordination_channel_id"]) if config["coordination_channel_id"] else None
     )
+
+    # Session directory manager (git clone based isolation)
+    session_dir_manager: SessionDirManager | None = None
+    if config["session_dir_base"] and config["session_source_repo"]:
+        session_dir_manager = SessionDirManager(
+            base_dir=config["session_dir_base"],
+            source_repo=config["session_source_repo"],
+            clone_branch=config["session_clone_branch"] or None,
+        )
+        logger.info(
+            "SessionDirManager enabled (base=%s, repo=%s)",
+            config["session_dir_base"],
+            config["session_source_repo"],
+        )
+
+    # Tmux session manager
+    tmux_manager: TmuxSessionManager | None = None
+    if config["enable_tmux"].lower() in ("true", "1", "yes"):
+        tmux_manager = TmuxSessionManager()
+        logger.info("TmuxSessionManager enabled")
+
     bot = ClaudeDiscordBot(
         channel_id=int(config["channel_id"]),
         owner_id=owner_id,
@@ -89,6 +112,8 @@ async def main() -> None:
         ask_repo=ask_repo,
         lounge_repo=lounge_repo,
         lounge_channel_id=coordination_channel_id,  # lounge uses the same channel
+        session_dir_manager=session_dir_manager,
+        tmux_manager=tmux_manager,
     )
 
     # Register cog

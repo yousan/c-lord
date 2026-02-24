@@ -89,20 +89,6 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Cleanup orphaned session directories from previous bot runs.
-        # At startup there are no active sessions, so all clean session
-        # directories are safe to remove.
-        if self.session_dir_manager is not None:
-            import asyncio
-
-            asyncio.create_task(self._cleanup_orphaned_session_dirs())
-
-        # Cleanup orphaned tmux sessions from previous bot runs.
-        if self.tmux_manager is not None:
-            import asyncio
-
-            asyncio.create_task(self._cleanup_orphaned_tmux_sessions())
-
         # Sync slash commands
         try:
             synced = await self.tree.sync()

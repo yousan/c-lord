@@ -203,10 +203,6 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         await processor.finalize()
         if config.registry is not None:
             config.registry.unregister(config.thread.id)
-        if config.session_dir_manager is not None:
-            await _cleanup_session_dir(config)
-        if config.tmux_manager is not None:
-            await _cleanup_tmux_session(config)
         if config.image_paths:
             await _cleanup_image_tempfiles(config.image_paths)
 

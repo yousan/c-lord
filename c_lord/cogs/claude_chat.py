@@ -555,10 +555,38 @@ class ClaudeChatCog(commands.Cog):
 
             model_override = await self._get_current_model()
             runner = self.runner.clone(thread_id=thread.id, model=model_override)
+
+            # Create session directory (git clone) and tmux session if configured
+            import asyncio as _asyncio
+
+            session_dir_manager = getattr(self.bot, "session_dir_manager", None)
+            tmux_manager = getattr(self.bot, "tmux_manager", None)
+
+            working_dir = runner.working_dir  # default
+            if session_dir_manager is not None:
+                session_dir = await _asyncio.to_thread(
+                    session_dir_manager.create_session_dir, thread.id
+                )
+                runner.working_dir = session_dir
+                working_dir = session_dir
+                logger.info("Session dir for thread %d: %s", thread.id, session_dir)
+
+            window_name: str | None = None
+            if tmux_manager is not None:
+                window_name = await _asyncio.to_thread(
+                    tmux_manager.create_session, thread.id, working_dir
+                )
+                logger.info("tmux window for thread %d: %s", thread.id, window_name)
+
             self._active_runners[thread.id] = runner
 
             stop_view = StopView(runner)
-            stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
+            if window_name:
+                stop_msg = await thread.send(
+                    f"-# ⏺ Session running (`{window_name}`)", view=stop_view,
+                )
+            else:
+                stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
             stop_view.set_message(stop_msg)
 
             try:

@@ -698,10 +698,10 @@ class SessionManageCog(commands.Cog):
 
     @app_commands.command(
         name="tmux-list",
-        description="List all active tmux sessions for Claude Code",
+        description="List all active tmux windows for Claude Code",
     )
     async def tmux_list(self, interaction: discord.Interaction) -> None:
-        """Show all clord-* tmux sessions."""
+        """Show all windows in the clord tmux session."""
         tmux_mgr = getattr(self.bot, "tmux_manager", None)
         if tmux_mgr is None:
             await interaction.response.send_message(
@@ -713,27 +713,77 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        sessions = await asyncio.to_thread(tmux_mgr.list_sessions)
+        windows = await asyncio.to_thread(tmux_mgr.list_sessions)
 
-        if not sessions:
+        if not windows:
             await interaction.followup.send(
                 embed=discord.Embed(
-                    title="🖥️ Tmux Sessions",
-                    description="No tmux sessions found.",
+                    title="🖥️ Tmux Windows",
+                    description="No tmux windows found.",
                     color=COLOR_INFO,
                 )
             )
             return
 
         embed = discord.Embed(
-            title=f"🖥️ Tmux Sessions ({len(sessions)})",
+            title=f"🖥️ Tmux Windows ({len(windows)})",
             color=COLOR_INFO,
         )
-        for s in sessions:
+        for w in windows:
+            tid = w.get("thread_id", "")
+            tid_display = f"Thread: `{tid}`" if tid else "Thread: —"
             embed.add_field(
-                name=f"`{s['name']}`",
-                value=f"Dir: `{s['working_dir'] or 'unknown'}`",
+                name=f"`{w['window_name']}`",
+                value=f"Dir: `{w['working_dir'] or 'unknown'}`\n{tid_display}",
                 inline=False,
             )
 
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(
+        name="workspace-delete",
+        description="Delete the tmux window and session directory for this thread",
+    )
+    async def workspace_delete(self, interaction: discord.Interaction) -> None:
+        """Delete the tmux window and session directory for the current thread."""
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "This command can only be used in a Claude chat thread.",
+                ephemeral=True,
+            )
+            return
+
+        thread_id = interaction.channel.id
+        await interaction.response.defer()
+
+        import asyncio
+
+        results: list[str] = []
+
+        # Kill tmux window
+        tmux_mgr = getattr(self.bot, "tmux_manager", None)
+        if tmux_mgr is not None:
+            killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
+            if killed:
+                results.append("✅ Tmux window deleted")
+            else:
+                results.append("ℹ️ No tmux window found")
+
+        # Remove session directory
+        sdm = self._get_session_dir_manager()
+        if sdm is not None:
+            cleanup = await asyncio.to_thread(sdm.cleanup_for_thread, thread_id)
+            if cleanup.removed:
+                results.append(f"✅ Session directory removed: `{cleanup.path}`")
+            else:
+                results.append(f"ℹ️ Session directory: {cleanup.reason}")
+
+        if not results:
+            results.append("ℹ️ Neither tmux manager nor session dir manager is configured.")
+
+        embed = discord.Embed(
+            title="🗑️ Workspace Deleted",
+            description="\n".join(results),
+            color=COLOR_SUCCESS,
+        )
         await interaction.followup.send(embed=embed)
