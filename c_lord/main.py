@@ -53,7 +53,6 @@ def load_config() -> dict[str, str]:
         "session_dir_base": os.getenv("SESSION_DIR_BASE", ""),
         "session_source_repo": os.getenv("SESSION_SOURCE_REPO", ""),
         "session_clone_branch": os.getenv("SESSION_CLONE_BRANCH", ""),
-        "enable_tmux": os.getenv("CLORD_TMUX_ENABLED", ""),
     }
 
 
@@ -99,11 +98,9 @@ async def main() -> None:
             config["session_source_repo"],
         )
 
-    # Tmux session manager
-    tmux_manager: TmuxSessionManager | None = None
-    if config["enable_tmux"].lower() in ("true", "1", "yes"):
-        tmux_manager = TmuxSessionManager()
-        logger.info("TmuxSessionManager enabled")
+    # Tmux session manager — always enabled (degrades gracefully if tmux not installed)
+    tmux_manager = TmuxSessionManager()
+    logger.info("TmuxSessionManager enabled")
 
     bot = ClaudeDiscordBot(
         channel_id=int(config["channel_id"]),

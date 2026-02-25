@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import discord
 
 from ..claude.runner import ClaudeRunner
+from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
 from ..database.ask_repo import PendingAskRepository
 from ..database.lounge_repo import LoungeRepository
@@ -56,7 +57,7 @@ class RunConfig:
     """
 
     thread: discord.Thread
-    runner: ClaudeRunner
+    runner: ClaudeRunner | TmuxClaudeRunner
     prompt: str
     session_id: str | None = None
     repo: SessionRepository | None = None

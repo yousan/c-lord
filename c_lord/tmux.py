@@ -68,13 +68,20 @@ class TmuxSessionManager:
             return True
 
         # Create with a temporary first window that will be replaced
-        result = _run([
-            "tmux", "new-session", "-d", "-s", SESSION_NAME,
-        ])
+        result = _run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                SESSION_NAME,
+            ]
+        )
         if result.returncode != 0:
             logger.warning(
                 "Failed to create tmux session %s: %s",
-                SESSION_NAME, result.stderr.strip(),
+                SESSION_NAME,
+                result.stderr.strip(),
             )
             return False
 
@@ -90,10 +97,17 @@ class TmuxSessionManager:
         cached = self._thread_to_window.get(thread_id)
         if cached is not None:
             # Verify the window still exists
-            result = _run([
-                "tmux", "show-option", "-w", "-v",
-                "-t", f"{SESSION_NAME}:{cached}", "@thread_id",
-            ])
+            result = _run(
+                [
+                    "tmux",
+                    "show-option",
+                    "-w",
+                    "-v",
+                    "-t",
+                    f"{SESSION_NAME}:{cached}",
+                    "@thread_id",
+                ]
+            )
             if result.returncode == 0 and result.stdout.strip() == str(thread_id):
                 return cached
             # Stale cache entry
@@ -117,10 +131,16 @@ class TmuxSessionManager:
         """
         self._thread_to_window.clear()
 
-        result = _run([
-            "tmux", "list-windows", "-t", SESSION_NAME,
-            "-F", "#{window_name}",
-        ])
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                SESSION_NAME,
+                "-F",
+                "#{window_name}",
+            ]
+        )
         if result.returncode != 0:
             return
 
@@ -130,10 +150,17 @@ class TmuxSessionManager:
                 continue
 
             # Read the @thread_id option for this window
-            opt_result = _run([
-                "tmux", "show-option", "-w", "-v",
-                "-t", f"{SESSION_NAME}:{window_name}", "@thread_id",
-            ])
+            opt_result = _run(
+                [
+                    "tmux",
+                    "show-option",
+                    "-w",
+                    "-v",
+                    "-t",
+                    f"{SESSION_NAME}:{window_name}",
+                    "@thread_id",
+                ]
+            )
             if opt_result.returncode == 0:
                 tid_str = opt_result.stdout.strip()
                 if tid_str.isdigit():
@@ -141,7 +168,7 @@ class TmuxSessionManager:
 
             # Track highest work ID
             if window_name.startswith(WINDOW_PREFIX):
-                suffix = window_name[len(WINDOW_PREFIX):]
+                suffix = window_name[len(WINDOW_PREFIX) :]
                 if suffix.isdigit():
                     max_id = max(max_id, int(suffix))
 
@@ -169,30 +196,45 @@ class TmuxSessionManager:
 
         window_name = self._next_window_name()
 
-        result = _run([
-            "tmux", "new-window",
-            "-t", SESSION_NAME,
-            "-n", window_name,
-            "-c", working_dir,
-        ])
+        result = _run(
+            [
+                "tmux",
+                "new-window",
+                "-t",
+                SESSION_NAME,
+                "-n",
+                window_name,
+                "-c",
+                working_dir,
+            ]
+        )
         if result.returncode != 0:
             logger.warning(
                 "Failed to create tmux window %s: %s",
-                window_name, result.stderr.strip(),
+                window_name,
+                result.stderr.strip(),
             )
             return window_name
 
         # Store thread_id as a window option
-        _run([
-            "tmux", "set-option", "-w",
-            "-t", f"{SESSION_NAME}:{window_name}",
-            "@thread_id", str(thread_id),
-        ])
+        _run(
+            [
+                "tmux",
+                "set-option",
+                "-w",
+                "-t",
+                f"{SESSION_NAME}:{window_name}",
+                "@thread_id",
+                str(thread_id),
+            ]
+        )
 
         self._thread_to_window[thread_id] = window_name
         logger.info(
             "Created tmux window: %s (thread=%d, dir=%s)",
-            window_name, thread_id, working_dir,
+            window_name,
+            thread_id,
+            working_dir,
         )
         return window_name
 
@@ -213,10 +255,14 @@ class TmuxSessionManager:
             logger.debug("No tmux window found for thread %d", thread_id)
             return False
 
-        result = _run([
-            "tmux", "kill-window",
-            "-t", f"{SESSION_NAME}:{window_name}",
-        ])
+        result = _run(
+            [
+                "tmux",
+                "kill-window",
+                "-t",
+                f"{SESSION_NAME}:{window_name}",
+            ]
+        )
         if result.returncode == 0:
             self._thread_to_window.pop(thread_id, None)
             logger.info("Killed tmux window: %s (thread=%d)", window_name, thread_id)
@@ -234,10 +280,16 @@ class TmuxSessionManager:
         if not self._check_available():
             return []
 
-        result = _run([
-            "tmux", "list-windows", "-t", SESSION_NAME,
-            "-F", "#{window_name}:#{pane_current_path}",
-        ])
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                SESSION_NAME,
+                "-F",
+                "#{window_name}:#{pane_current_path}",
+            ]
+        )
         if result.returncode != 0:
             return []
 
@@ -250,19 +302,200 @@ class TmuxSessionManager:
             working_dir = parts[1] if len(parts) > 1 else ""
 
             # Read the @thread_id option
-            opt_result = _run([
-                "tmux", "show-option", "-w", "-v",
-                "-t", f"{SESSION_NAME}:{window_name}", "@thread_id",
-            ])
+            opt_result = _run(
+                [
+                    "tmux",
+                    "show-option",
+                    "-w",
+                    "-v",
+                    "-t",
+                    f"{SESSION_NAME}:{window_name}",
+                    "@thread_id",
+                ]
+            )
             tid = opt_result.stdout.strip() if opt_result.returncode == 0 else ""
 
-            windows.append({
-                "window_name": window_name,
-                "working_dir": working_dir,
-                "thread_id": tid,
-            })
+            windows.append(
+                {
+                    "window_name": window_name,
+                    "working_dir": working_dir,
+                    "thread_id": tid,
+                }
+            )
 
         return windows
+
+    # ── Claude execution API ────────────────────────────────────────
+
+    def start_claude(
+        self,
+        thread_id: int,
+        prompt: str,
+        model: str = "sonnet",
+        *,
+        permission_mode: str = "acceptEdits",
+        dangerously_skip_permissions: bool = False,
+    ) -> bool:
+        """Start Claude Code inside the tmux window for *thread_id*.
+
+        Sends ``claude --model {model} 'prompt'`` via ``send-keys``.
+        The window must already exist (call ``create_session`` first).
+
+        The prompt is passed as a CLI argument so Claude starts a new
+        conversation immediately (without a prompt, ``claude`` tries to
+        resume and exits with "No conversation found to continue").
+
+        The command is prefixed with ``unalias claude`` and
+        ``env -u CLAUDECODE`` to bypass any shell aliases (e.g.
+        ``--continue``) and to prevent the nested-session guard from
+        blocking startup.
+
+        Returns True if the command was sent successfully.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("start_claude: no window for thread %d", thread_id)
+            return False
+
+        target = f"{SESSION_NAME}:{window}"
+        cmd_parts = ["env", "-u", "CLAUDECODE", "claude", "--model", model]
+        if dangerously_skip_permissions:
+            cmd_parts.append("--dangerously-skip-permissions")
+        else:
+            cmd_parts.extend(["--permission-mode", permission_mode])
+
+        # Escape single quotes in the prompt for shell safety.
+        safe_prompt = prompt.replace("'", "'\\''")
+        cmd_parts.append(f"'{safe_prompt}'")
+        # Prefix with unalias to bypass any shell alias (e.g. --continue).
+        cmd = f"unalias claude 2>/dev/null; {' '.join(cmd_parts)}"
+
+        result = _run(["tmux", "send-keys", "-t", target, cmd, "Enter"])
+        if result.returncode != 0:
+            logger.warning("start_claude: send-keys failed: %s", result.stderr.strip())
+            return False
+
+        logger.info("start_claude: sent command to %s", target)
+        return True
+
+    def send_input(self, thread_id: int, text: str) -> bool:
+        """Send text to the Claude process in the tmux window via ``send-keys -l``.
+
+        Uses ``-l`` (literal) to prevent tmux from interpreting special
+        characters in the text.  Sends Enter afterwards to submit.
+
+        Returns True on success.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("send_input: no window for thread %d", thread_id)
+            return False
+
+        target = f"{SESSION_NAME}:{window}"
+
+        # Send the text literally (no tmux key interpretation)
+        result = _run(["tmux", "send-keys", "-l", "-t", target, text])
+        if result.returncode != 0:
+            logger.warning("send_input: send-keys -l failed: %s", result.stderr.strip())
+            return False
+
+        # Press Enter to submit
+        result = _run(["tmux", "send-keys", "-t", target, "Enter"])
+        return result.returncode == 0
+
+    def capture_pane(self, thread_id: int, history_lines: int = 500) -> str:
+        """Capture the current pane text from the tmux window.
+
+        Uses ``tmux capture-pane -p`` to retrieve the visible and scrollback
+        text.
+
+        Args:
+            thread_id: The Discord thread ID.
+            history_lines: Number of scrollback lines to capture (default 500).
+
+        Returns:
+            The pane text, or empty string on failure.
+        """
+        if not self._check_available():
+            return ""
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return ""
+
+        target = f"{SESSION_NAME}:{window}"
+        result = _run(
+            [
+                "tmux",
+                "capture-pane",
+                "-p",
+                "-t",
+                target,
+                "-S",
+                f"-{history_lines}",
+            ]
+        )
+        if result.returncode != 0:
+            return ""
+
+        return result.stdout
+
+    def send_interrupt(self, thread_id: int) -> bool:
+        """Send C-c (SIGINT) to the tmux window.
+
+        Returns True on success.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("send_interrupt: no window for thread %d", thread_id)
+            return False
+
+        target = f"{SESSION_NAME}:{window}"
+        result = _run(["tmux", "send-keys", "-t", target, "C-c"])
+        return result.returncode == 0
+
+    def is_claude_running(self, thread_id: int) -> bool:
+        """Check if the pane's current process is ``claude``.
+
+        Uses ``tmux list-panes -F '#{pane_current_command}'`` to inspect the
+        foreground command.
+
+        Returns True if claude is the active foreground process.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return False
+
+        target = f"{SESSION_NAME}:{window}"
+        result = _run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                target,
+                "-F",
+                "#{pane_current_command}",
+            ]
+        )
+        if result.returncode != 0:
+            return False
+
+        command = result.stdout.strip()
+        return "claude" in command.lower()
+
+    # ── Cleanup ──────────────────────────────────────────────────────
 
     def cleanup_orphaned(self, active_thread_ids: set[int]) -> int:
         """Kill tmux windows whose threads are no longer active.

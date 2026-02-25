@@ -173,14 +173,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         The final session_id, or None if the run failed.
     """
     system_context = await _build_system_context(config)
-    runner = (
-        config.runner.clone(append_system_prompt=system_context)
-        if system_context
-        else config.runner
-    )
-    # Inject per-invocation image paths (not inherited by runner.clone()).
-    if config.image_paths:
-        runner.image_paths = config.image_paths
+
+    # TmuxClaudeRunner does not support clone() or image_paths — it runs
+    # Claude in TUI mode where these subprocess-only features don't apply.
+    runner = config.runner
+    if hasattr(runner, "clone"):
+        if system_context:
+            runner = runner.clone(append_system_prompt=system_context)
+        # Inject per-invocation image paths (not inherited by runner.clone()).
+        if config.image_paths:
+            runner.image_paths = config.image_paths
 
     processor = EventProcessor(config)
 

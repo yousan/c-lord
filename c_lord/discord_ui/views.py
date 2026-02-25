@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from typing import Protocol, runtime_checkable
 
 import discord
 
-from ..claude.runner import ClaudeRunner
 from .embeds import stopped_embed
 
 logger = logging.getLogger(__name__)
+
+# Protocol-compatible type: any object with an async interrupt() method.
+# Both ClaudeRunner and TmuxClaudeRunner satisfy this.
+
+
+@runtime_checkable
+class Interruptable(Protocol):
+    async def interrupt(self) -> None: ...
 
 
 class StopView(discord.ui.View):
@@ -26,7 +34,7 @@ class StopView(discord.ui.View):
     button at the bottom of the thread (most recently visible position).
     """
 
-    def __init__(self, runner: ClaudeRunner) -> None:
+    def __init__(self, runner: Interruptable) -> None:
         super().__init__(timeout=None)
         self._runner = runner
         self._stopped = False

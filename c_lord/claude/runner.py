@@ -79,13 +79,11 @@ class ClaudeRunner:
 
         logger.info("Starting Claude CLI: %s", " ".join(args[:6]) + " ...")
 
-        # stdin=PIPE enables bidirectional communication: we can send
-        # tool results / permission responses back to the Claude process
-        # while it is still running. This is required for Plan Mode (#44),
-        # Permission requests (#47), and MCP elicitation (#48).
+        # stdin=DEVNULL so Claude CLI (in -p mode) sees immediate EOF
+        # and doesn't block waiting for input.
         self._process = await asyncio.create_subprocess_exec(
             *args,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,

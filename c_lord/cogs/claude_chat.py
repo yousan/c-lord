@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..claude.runner import ClaudeRunner
+from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
 from ..database.ask_repo import PendingAskRepository
@@ -79,7 +80,7 @@ class ClaudeChatCog(commands.Cog):
         self._allowed_user_ids = allowed_user_ids
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._active_runners: dict[int, ClaudeRunner] = {}
+        self._active_runners: dict[int, ClaudeRunner | TmuxClaudeRunner] = {}
         # Tracks the asyncio.Task running _run_claude for each thread.
         # Used by _handle_thread_reply to wait for an interrupted session
         # to fully clean up before starting the replacement session.
@@ -147,8 +148,8 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
-        # Ignore bot messages
-        if message.author.bot:
+        # Ignore bot messages (but allow webhook messages through for testing)
+        if message.author.bot and not message.webhook_id:
             return
 
         # Authorization check — if allowed_user_ids is set, only those users
@@ -554,7 +555,6 @@ class ClaudeChatCog(commands.Cog):
             await status.set_thinking()
 
             model_override = await self._get_current_model()
-            runner = self.runner.clone(thread_id=thread.id, model=model_override)
 
             # Create session directory (git clone) and tmux session if configured
             import asyncio as _asyncio
@@ -562,28 +562,46 @@ class ClaudeChatCog(commands.Cog):
             session_dir_manager = getattr(self.bot, "session_dir_manager", None)
             tmux_manager = getattr(self.bot, "tmux_manager", None)
 
-            working_dir = runner.working_dir  # default
+            working_dir = self.runner.working_dir  # default
             if session_dir_manager is not None:
                 session_dir = await _asyncio.to_thread(
                     session_dir_manager.create_session_dir, thread.id
                 )
-                runner.working_dir = session_dir
                 working_dir = session_dir
                 logger.info("Session dir for thread %d: %s", thread.id, session_dir)
 
             window_name: str | None = None
             if tmux_manager is not None:
                 window_name = await _asyncio.to_thread(
-                    tmux_manager.create_session, thread.id, working_dir
+                    tmux_manager.create_session, thread.id, working_dir or "."
                 )
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
+
+            # Choose runner: TmuxClaudeRunner when tmux is available,
+            # otherwise the standard subprocess-based ClaudeRunner.
+            runner: ClaudeRunner | TmuxClaudeRunner
+            if tmux_manager is not None:
+                runner = TmuxClaudeRunner(
+                    tmux_manager=tmux_manager,
+                    thread_id=thread.id,
+                    model=model_override or self.runner.model,
+                    working_dir=working_dir,
+                    timeout_seconds=self.runner.timeout_seconds,
+                    permission_mode=self.runner.permission_mode,
+                    dangerously_skip_permissions=self.runner.dangerously_skip_permissions,
+                )
+            else:
+                runner = self.runner.clone(thread_id=thread.id, model=model_override)
+                if working_dir:
+                    runner.working_dir = working_dir
 
             self._active_runners[thread.id] = runner
 
             stop_view = StopView(runner)
             if window_name:
                 stop_msg = await thread.send(
-                    f"-# ⏺ Session running (`{window_name}`)", view=stop_view,
+                    f"-# ⏺ Session running (`{window_name}`)",
+                    view=stop_view,
                 )
             else:
                 stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)

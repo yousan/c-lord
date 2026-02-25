@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from c_lord.tmux import SESSION_NAME, WINDOW_PREFIX, TmuxSessionManager
+from c_lord.tmux import SESSION_NAME, TmuxSessionManager
 
 
 class TestTmuxSessionManager:
@@ -326,3 +326,244 @@ class TestTmuxSessionManager:
             assert mgr.session_exists(12345) is False
             assert mgr.list_sessions() == []
             assert mgr.kill_session(12345) is False
+
+    # ── Claude execution methods ─────────────────────────────────────
+
+    def test_start_claude_sends_command_with_prompt(self) -> None:
+        """start_claude sends the claude command with the prompt as CLI arg."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: show-option verify
+                MagicMock(returncode=0),  # send-keys for claude command
+            ]
+            result = mgr.start_claude(12345, "hello world", "sonnet")
+
+        assert result is True
+
+        # Verify the claude command was sent with prompt
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        assert "send-keys" in args
+        assert f"{SESSION_NAME}:work1" in args
+        # The command string should contain the prompt
+        cmd_str = " ".join(args[3:])
+        assert "claude --model sonnet" in cmd_str
+        assert "hello world" in cmd_str
+        assert "Enter" in args
+
+    def test_start_claude_no_window_returns_false(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            result = mgr.start_claude(99999, "hello")
+
+        assert result is False
+
+    def test_start_claude_tmux_unavailable(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = False
+
+        assert mgr.start_claude(12345, "hello") is False
+
+    def test_start_claude_dangerously_skip_permissions(self) -> None:
+        """start_claude uses --dangerously-skip-permissions flag."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys for claude command
+            ]
+            mgr.start_claude(12345, "hello", dangerously_skip_permissions=True)
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])  # everything after -t
+        assert "--dangerously-skip-permissions" in cmd_str
+
+    def test_start_claude_escapes_single_quotes(self) -> None:
+        """Prompt with single quotes is properly escaped."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),
+                MagicMock(returncode=0),
+            ]
+            mgr.start_claude(12345, "it's a test")
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        # Single quote should be escaped
+        assert "'" in cmd_str
+
+    def test_send_input_sends_text_and_enter(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys -l (text)
+                MagicMock(returncode=0),  # send-keys Enter
+            ]
+            result = mgr.send_input(12345, "my prompt")
+
+        assert result is True
+
+        # Verify send-keys -l was called with the text
+        text_call = mock_run.call_args_list[1]
+        args = text_call[0][0]
+        assert "send-keys" in args
+        assert "-l" in args
+        assert "my prompt" in args
+
+        # Verify Enter was sent
+        enter_call = mock_run.call_args_list[2]
+        args = enter_call[0][0]
+        assert "Enter" in args
+
+    def test_send_input_no_window(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.send_input(99999, "hello") is False
+
+    def test_send_input_tmux_unavailable(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = False
+        assert mgr.send_input(12345, "hello") is False
+
+    def test_capture_pane_returns_text(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout="Hello from Claude\n"),  # capture-pane
+            ]
+            text = mgr.capture_pane(12345)
+
+        assert text == "Hello from Claude\n"
+
+        # Verify capture-pane command
+        cap_call = mock_run.call_args_list[1]
+        args = cap_call[0][0]
+        assert "capture-pane" in args
+        assert "-p" in args
+        assert f"{SESSION_NAME}:work1" in args
+        assert "-S" in args
+
+    def test_capture_pane_custom_history(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find
+                MagicMock(returncode=0, stdout="text\n"),  # capture-pane
+            ]
+            mgr.capture_pane(12345, history_lines=100)
+
+        cap_call = mock_run.call_args_list[1]
+        args = cap_call[0][0]
+        assert "-100" in args
+
+    def test_capture_pane_no_window(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.capture_pane(99999) == ""
+
+    def test_capture_pane_tmux_unavailable(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = False
+        assert mgr.capture_pane(12345) == ""
+
+    def test_send_interrupt_sends_ctrl_c(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys C-c
+            ]
+            result = mgr.send_interrupt(12345)
+
+        assert result is True
+
+        int_call = mock_run.call_args_list[1]
+        args = int_call[0][0]
+        assert "send-keys" in args
+        assert "C-c" in args
+
+    def test_send_interrupt_no_window(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.send_interrupt(99999) is False
+
+    def test_send_interrupt_tmux_unavailable(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = False
+        assert mgr.send_interrupt(12345) is False
+
+    def test_is_claude_running_true(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout="claude\n"),  # list-panes
+            ]
+            assert mgr.is_claude_running(12345) is True
+
+    def test_is_claude_running_false_other_command(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout="bash\n"),  # list-panes
+            ]
+            assert mgr.is_claude_running(12345) is False
+
+    def test_is_claude_running_no_window(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.is_claude_running(99999) is False
+
+    def test_is_claude_running_tmux_unavailable(self) -> None:
+        mgr = TmuxSessionManager()
+        mgr._available = False
+        assert mgr.is_claude_running(12345) is False
