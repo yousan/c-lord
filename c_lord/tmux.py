@@ -409,15 +409,15 @@ class TmuxSessionManager:
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         return result.returncode == 0
 
-    def capture_pane(self, thread_id: int, history_lines: int = 500) -> str:
+    def capture_pane(self, thread_id: int, history_lines: int = 100) -> str:
         """Capture the current pane text from the tmux window.
 
-        Uses ``tmux capture-pane -p`` to retrieve the visible and scrollback
-        text.
+        Uses ``tmux capture-pane -p -J`` to retrieve the visible and scrollback
+        text with wrapped lines joined.
 
         Args:
             thread_id: The Discord thread ID.
-            history_lines: Number of scrollback lines to capture (default 500).
+            history_lines: Number of scrollback lines to capture (default 100).
 
         Returns:
             The pane text, or empty string on failure.
@@ -435,6 +435,7 @@ class TmuxSessionManager:
                 "tmux",
                 "capture-pane",
                 "-p",
+                "-J",
                 "-t",
                 target,
                 "-S",
