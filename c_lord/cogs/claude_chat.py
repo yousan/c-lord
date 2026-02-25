@@ -581,14 +581,15 @@ class ClaudeChatCog(commands.Cog):
             # otherwise the standard subprocess-based ClaudeRunner.
             runner: ClaudeRunner | TmuxClaudeRunner
             if tmux_manager is not None:
+                # TUI mode cannot handle interactive permission prompts,
+                # so always use --dangerously-skip-permissions.
                 runner = TmuxClaudeRunner(
                     tmux_manager=tmux_manager,
                     thread_id=thread.id,
                     model=model_override or self.runner.model,
                     working_dir=working_dir,
                     timeout_seconds=self.runner.timeout_seconds,
-                    permission_mode=self.runner.permission_mode,
-                    dangerously_skip_permissions=self.runner.dangerously_skip_permissions,
+                    dangerously_skip_permissions=True,
                 )
             else:
                 runner = self.runner.clone(thread_id=thread.id, model=model_override)
