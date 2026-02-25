@@ -77,12 +77,21 @@ class StatusManager:
         self._reset_stall_timer()
 
     async def set_done(self) -> None:
-        """Set status to done."""
+        """Set status to done — add ✅ and leave it permanently."""
         self._cancel_stall_timer()
-        await self._set_status(EMOJI_DONE)
-        # Hold done emoji briefly, then clean up
-        await asyncio.sleep(1.5)
-        await self.cleanup()
+        # Cancel any pending debounce that might overwrite the done emoji
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        # Remove the current status emoji (thinking, tool, etc.) if any
+        if self._current_emoji and self._current_emoji != EMOJI_DONE:
+            with contextlib.suppress(discord.HTTPException, AttributeError):
+                guild = self._message.guild
+                if guild:
+                    await self._message.remove_reaction(self._current_emoji, guild.me)
+        # Add ✅ and leave it
+        with contextlib.suppress(discord.HTTPException):
+            await self._message.add_reaction(EMOJI_DONE)
+        self._current_emoji = EMOJI_DONE
 
     async def set_compact(self) -> None:
         """Set status to compacting (context compression in progress)."""

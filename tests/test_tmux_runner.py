@@ -405,6 +405,85 @@ class TestCleanTuiLines:
         result = _clean_tui_lines(lines)
         assert result == "Done."
 
+    def test_removes_press_ctrl_c_exit(self) -> None:
+        """'Press Ctrl-C again to exit' TUI noise is stripped."""
+        lines = [
+            "● Answer here.",
+            "Press Ctrl-C again to exit",
+        ]
+        result = _clean_tui_lines(lines)
+        assert result == "Answer here."
+        assert "Ctrl-C" not in result
+
+    def test_removes_greeting(self) -> None:
+        """Claude TUI greeting line is stripped."""
+        lines = [
+            "Hi! How can I help you today?",
+            "",
+            "● Actual response.",
+        ]
+        result = _clean_tui_lines(lines)
+        assert result == "Actual response."
+        assert "Hi!" not in result
+
+    def test_removes_greeting_with_bullet_marker(self) -> None:
+        """Greeting with ● marker is stripped (common in TUI output)."""
+        lines = [
+            "● Hi! How can I help you with c-lord today?",
+        ]
+        result = _clean_tui_lines(lines)
+        assert result == ""
+        assert "Hi!" not in result
+
+    def test_removes_mode_switched(self) -> None:
+        """'Claude Code has switched...' notification is stripped."""
+        lines = [
+            "Claude Code has switched to compact mode",
+            "",
+            "● Response text.",
+        ]
+        result = _clean_tui_lines(lines)
+        assert result == "Response text."
+        assert "switched" not in result
+
+    def test_removes_insert_status_bar(self) -> None:
+        """Vim-style '-- INSERT ...' status bar line is stripped."""
+        lines = [
+            "● Done.",
+            "-- INSERT ⏵⏵ bypass permissions on",
+        ]
+        result = _clean_tui_lines(lines)
+        assert result == "Done."
+        assert "INSERT" not in result
+
+    def test_removes_normal_status_bar(self) -> None:
+        """Vim-style '-- NORMAL ...' status bar line is stripped."""
+        lines = [
+            "● Done.",
+            "-- NORMAL ⏸⏸",
+        ]
+        result = _clean_tui_lines(lines)
+        assert result == "Done."
+        assert "NORMAL" not in result
+
+    def test_removes_ascii_hyphen_separator(self) -> None:
+        """ASCII hyphen separator lines (5+ hyphens) are stripped."""
+        lines = [
+            "● Text above.",
+            "----------",
+            "● Text below.",
+        ]
+        result = _clean_tui_lines(lines)
+        assert "----------" not in result
+        assert "Text above." in result
+        assert "Text below." in result
+
+    def test_keeps_short_hyphen_sequences(self) -> None:
+        """Short hyphen sequences (< 5) in content are preserved."""
+        lines = ["● Use -- for flags"]
+        result = _clean_tui_lines(lines)
+        assert "Use -- for flags" in result
+
 
 # -- Tests for _compute_delta (kept for backward compat) --------------------
 

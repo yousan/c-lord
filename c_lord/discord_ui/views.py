@@ -83,7 +83,7 @@ class StopView(discord.ui.View):
             await interaction.followup.send(embed=stopped_embed())
 
     async def disable(self, message: discord.Message | None = None) -> None:
-        """Disable the button after the session ends naturally.
+        """Delete the stop-button message after the session ends naturally.
 
         Uses the stored message reference if ``message`` is not provided.
         No-op if the stop button was already clicked.
@@ -93,11 +93,8 @@ class StopView(discord.ui.View):
 
         target = message or self._message
         self._stopped = True
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
         self.stop()
 
         if target:
             with contextlib.suppress(discord.HTTPException):
-                await target.edit(view=self)
+                await target.delete()

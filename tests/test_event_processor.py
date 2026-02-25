@@ -344,16 +344,17 @@ class TestOnComplete:
     """RESULT (is_complete) event handling."""
 
     @pytest.mark.asyncio
-    async def test_complete_sends_session_complete_embed(
+    async def test_complete_does_not_send_session_complete_embed(
         self, thread: MagicMock, runner: MagicMock
     ) -> None:
+        """Successful completion no longer posts a session_complete embed."""
         config = _make_config(thread, runner)
         p = EventProcessor(config)
 
         await p.process(_make_result_event(session_id="s1"))
 
         embed_sends = [c for c in thread.send.call_args_list if "embed" in c.kwargs]
-        assert len(embed_sends) >= 1
+        assert len(embed_sends) == 0
 
     @pytest.mark.asyncio
     async def test_error_sends_error_embed(self, thread: MagicMock, runner: MagicMock) -> None:

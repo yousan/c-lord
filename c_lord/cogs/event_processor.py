@@ -243,10 +243,7 @@ class EventProcessor:
             self._config.status._reset_stall_timer()
 
     async def _on_complete(self, event: StreamEvent) -> None:
-        """Handle RESULT events — finalize streaming, post summary embed."""
-        from ..discord_ui.embeds import (
-            session_complete_embed,
-        )
+        """Handle RESULT events — finalize streaming, mark done."""
         from ..discord_ui.streaming_manager import StreamingMessageManager
         from ._run_helper import _make_error_embed
 
@@ -266,17 +263,6 @@ class EventProcessor:
                 for chunk in chunk_message(response_text):
                     await self._config.thread.send(chunk)
 
-            await self._config.thread.send(
-                embed=session_complete_embed(
-                    event.cost_usd,
-                    event.duration_ms,
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.cache_read_tokens,
-                    event.context_window,
-                    event.cache_creation_tokens,
-                )
-            )
             if self._config.status:
                 await self._config.status.set_done()
 
