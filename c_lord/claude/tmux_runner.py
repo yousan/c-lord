@@ -52,7 +52,9 @@ _PERMISSION_PROMPT_MARKERS = (
 _SEPARATOR_RE = re.compile(r"^[─━═─\s]{10,}$")
 
 # TUI status bar patterns at the very bottom.
-_STATUS_BAR_MARKERS = ("-- INSERT --", "-- NORMAL --", "⏵⏵", "⏸⏸")
+# Use prefix-only ("-- INSERT") because the TUI sometimes omits the closing "--"
+# e.g. "-- INSERT ⏵⏵ bypass permissions on (shift…"
+_STATUS_BAR_MARKERS = ("-- INSERT", "-- NORMAL", "--", "⏵⏵", "⏸⏸")
 
 # TUI generation status indicators (shown during Claude's response generation).
 # These appear between two separator lines at the bottom of the pane.
@@ -74,13 +76,17 @@ _STRIP_PATTERNS = (
     re.compile(r"[^\w\s●⎿❯>] \w+ for \d+s?"),
     # TUI noise — interactive prompts and greetings
     re.compile(r"Press Ctrl-C again to exit"),
-    re.compile(r"Hi! How can I help you.*"),
+    re.compile(r"(?:Hi|Hello|Hey)!?\s+How can I help you.*"),
     re.compile(r"Claude Code has switched.*"),
+    # TUI tool activity indicators (e.g. "Reading 1 file…", "Recalling 2 memories…")
+    re.compile(r"(?:Reading|Recalling|Writing|Searching|Running|Checking) \d+ .+…"),
     # Vim-style status bar lines that leak into the response area
     re.compile(r"--\s*INSERT\s.*"),
     re.compile(r"--\s*NORMAL\s.*"),
     # ASCII hyphen separator lines (5+ hyphens)
     re.compile(r"^-{5,}$"),
+    # Box-drawing separator lines (safety net if bottom-chrome stripping misses them)
+    re.compile(r"^[─━═\s]{10,}$"),
 )
 
 

@@ -577,6 +577,11 @@ class ClaudeChatCog(commands.Cog):
                 )
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
 
+                # Prefix thread name with tmux window name (e.g. "work3: hi")
+                with contextlib.suppress(discord.HTTPException):
+                    current_name = thread.name or ""
+                    await thread.edit(name=f"{window_name}: {current_name}"[:100])
+
             # Choose runner: TmuxClaudeRunner when tmux is available,
             # otherwise the standard subprocess-based ClaudeRunner.
             runner: ClaudeRunner | TmuxClaudeRunner
