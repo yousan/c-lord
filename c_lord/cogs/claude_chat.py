@@ -673,14 +673,18 @@ class ClaudeChatCog(commands.Cog):
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
 
                 # Prefix thread name with tmux window name (e.g. "work3: hi")
+                # Skip if the prefix is already present to avoid duplication
+                # (e.g. "work2: work2: work2: ...").
                 # Use a short timeout to avoid blocking on 429 rate limits
                 # (discord.py silently waits retry_after seconds before raising).
-                with contextlib.suppress(discord.HTTPException, asyncio.TimeoutError):
-                    current_name = thread.name or ""
-                    await asyncio.wait_for(
-                        thread.edit(name=f"{window_name}: {current_name}"[:100]),
-                        timeout=5.0,
-                    )
+                current_name = thread.name or ""
+                prefix = f"{window_name}: "
+                if not current_name.startswith(prefix):
+                    with contextlib.suppress(discord.HTTPException, asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            thread.edit(name=f"{prefix}{current_name}"[:100]),
+                            timeout=5.0,
+                        )
 
             # Choose runner: TmuxClaudeRunner when tmux is available,
             # otherwise the standard subprocess-based ClaudeRunner.
