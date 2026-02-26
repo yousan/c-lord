@@ -461,7 +461,7 @@ class TmuxSessionManager:
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         return result.returncode == 0
 
-    def capture_pane(self, thread_id: int, history_lines: int = 100) -> str:
+    def capture_pane(self, thread_id: int, history_lines: int = 500) -> str:
         """Capture the current pane text from the tmux window.
 
         Uses ``tmux capture-pane -p -J`` to retrieve the visible and scrollback

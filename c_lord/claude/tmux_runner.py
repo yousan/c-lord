@@ -398,10 +398,32 @@ class TmuxClaudeRunner:
                 break
 
         if prompt_idx == -1:
-            return ""
-
-        # Step 3: Extract response lines between prompt and end.
-        response_lines = lines[prompt_idx + 1 : end]
+            # Fallback: the user prompt has scrolled off-screen (long response).
+            # Only activate when TUI chrome is present (both separators found)
+            # to avoid false positives on non-TUI text.
+            if separator_count < 2:
+                return ""
+            # Strip top-of-pane noise (banner, shell lines) and use the rest.
+            banner_chars = ("▐", "▝", "▘")
+            start = 0
+            for i in range(end):
+                stripped = lines[i].strip()
+                # Skip empty lines, shell prompts, and the Claude TUI banner
+                is_noise = (
+                    not stripped
+                    or stripped.startswith("$")
+                    or stripped.startswith("yousan")
+                    or "Claude Code" in stripped
+                    or any(stripped.startswith(c) for c in banner_chars)
+                )
+                if is_noise:
+                    start = i + 1
+                else:
+                    break
+            response_lines = lines[start:end]
+        else:
+            # Step 3: Extract response lines between prompt and end.
+            response_lines = lines[prompt_idx + 1 : end]
 
         # Step 4: Clean up the response.
         return _clean_tui_lines(response_lines)
