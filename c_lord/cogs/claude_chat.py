@@ -158,9 +158,9 @@ class ClaudeChatCog(commands.Cog):
         if self._allowed_user_ids is not None and message.author.id not in self._allowed_user_ids:
             return
 
-        # Check if message is in the configured channel (new conversation)
+        # Channel direct messages are ignored — thread creation is limited to
+        # slash commands (/skill) and API (spawn_session) to prevent accidental sessions.
         if message.channel.id == self.bot.channel_id:
-            await self._handle_new_conversation(message)
             return
 
         # Check if message is in a thread under the configured channel
