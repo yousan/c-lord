@@ -42,7 +42,8 @@ class TmuxSessionManager:
     window option.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_name: str | None = None) -> None:
+        self.session_name: str = session_name or SESSION_NAME
         self._available: bool | None = None
         self._next_work_id: int = 1
         self._thread_to_window: dict[int, str] = {}
@@ -63,7 +64,7 @@ class TmuxSessionManager:
         Returns True if the session is available (already existed or was
         created), False on failure.
         """
-        result = _run(["tmux", "has-session", "-t", SESSION_NAME])
+        result = _run(["tmux", "has-session", "-t", self.session_name])
         if result.returncode == 0:
             return True
 
@@ -74,18 +75,18 @@ class TmuxSessionManager:
                 "new-session",
                 "-d",
                 "-s",
-                SESSION_NAME,
+                self.session_name,
             ]
         )
         if result.returncode != 0:
             logger.warning(
                 "Failed to create tmux session %s: %s",
-                SESSION_NAME,
+                self.session_name,
                 result.stderr.strip(),
             )
             return False
 
-        logger.info("Created global tmux session: %s", SESSION_NAME)
+        logger.info("Created global tmux session: %s", self.session_name)
         return True
 
     def _find_window_for_thread(self, thread_id: int) -> str | None:
@@ -104,7 +105,7 @@ class TmuxSessionManager:
                     "-w",
                     "-v",
                     "-t",
-                    f"{SESSION_NAME}:{cached}",
+                    f"{self.session_name}:{cached}",
                     "@thread_id",
                 ]
             )
@@ -136,7 +137,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                SESSION_NAME,
+                self.session_name,
                 "-F",
                 "#{window_name}",
             ]
@@ -157,7 +158,7 @@ class TmuxSessionManager:
                     "-w",
                     "-v",
                     "-t",
-                    f"{SESSION_NAME}:{window_name}",
+                    f"{self.session_name}:{window_name}",
                     "@thread_id",
                 ]
             )
@@ -201,7 +202,7 @@ class TmuxSessionManager:
                 "tmux",
                 "new-window",
                 "-t",
-                SESSION_NAME,
+                self.session_name,
                 "-n",
                 window_name,
                 "-c",
@@ -223,7 +224,7 @@ class TmuxSessionManager:
                 "set-option",
                 "-w",
                 "-t",
-                f"{SESSION_NAME}:{window_name}",
+                f"{self.session_name}:{window_name}",
                 "@thread_id",
                 str(thread_id),
             ]
@@ -237,6 +238,57 @@ class TmuxSessionManager:
             working_dir,
         )
         return window_name
+
+    def remap_window(self, thread_id: int, window_name: str) -> bool:
+        """Remap an existing tmux window to a new thread ID.
+
+        Updates the ``@thread_id`` window option and the in-memory cache.
+        Any previous thread mapping to this window is removed.
+
+        Returns True on success, False if the window does not exist or
+        tmux is unavailable.
+        """
+        if not self._check_available():
+            return False
+
+        # Check the window exists by reading its @thread_id option.
+        # (tmux has no ``has-window`` command; ``show-option -w`` fails
+        # with "no such window" when the target does not exist.)
+        result = _run(
+            [
+                "tmux",
+                "show-option",
+                "-w",
+                "-t",
+                f"{self.session_name}:{window_name}",
+                "@thread_id",
+            ]
+        )
+        if result.returncode != 0:
+            logger.debug("remap_window: window %s not found", window_name)
+            return False
+
+        # Update the @thread_id option
+        _run(
+            [
+                "tmux",
+                "set-option",
+                "-w",
+                "-t",
+                f"{self.session_name}:{window_name}",
+                "@thread_id",
+                str(thread_id),
+            ]
+        )
+
+        # Update cache: remove any old thread→window mapping for this window
+        old_threads = [tid for tid, wname in self._thread_to_window.items() if wname == window_name]
+        for tid in old_threads:
+            del self._thread_to_window[tid]
+        self._thread_to_window[thread_id] = window_name
+
+        logger.info("Remapped window %s → thread %d", window_name, thread_id)
+        return True
 
     def session_exists(self, thread_id: int) -> bool:
         """Return True if a tmux window exists for the given thread."""
@@ -260,7 +312,7 @@ class TmuxSessionManager:
                 "tmux",
                 "kill-window",
                 "-t",
-                f"{SESSION_NAME}:{window_name}",
+                f"{self.session_name}:{window_name}",
             ]
         )
         if result.returncode == 0:
@@ -285,7 +337,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                SESSION_NAME,
+                self.session_name,
                 "-F",
                 "#{window_name}:#{pane_current_path}",
             ]
@@ -309,7 +361,7 @@ class TmuxSessionManager:
                     "-w",
                     "-v",
                     "-t",
-                    f"{SESSION_NAME}:{window_name}",
+                    f"{self.session_name}:{window_name}",
                     "@thread_id",
                 ]
             )
@@ -360,7 +412,7 @@ class TmuxSessionManager:
             logger.warning("start_claude: no window for thread %d", thread_id)
             return False
 
-        target = f"{SESSION_NAME}:{window}"
+        target = f"{self.session_name}:{window}"
         cmd_parts = ["env", "-u", "CLAUDECODE", "claude", "--model", model]
         if dangerously_skip_permissions:
             cmd_parts.append("--dangerously-skip-permissions")
@@ -397,7 +449,7 @@ class TmuxSessionManager:
             logger.warning("send_input: no window for thread %d", thread_id)
             return False
 
-        target = f"{SESSION_NAME}:{window}"
+        target = f"{self.session_name}:{window}"
 
         # Send the text literally (no tmux key interpretation)
         result = _run(["tmux", "send-keys", "-l", "-t", target, text])
@@ -429,7 +481,7 @@ class TmuxSessionManager:
         if window is None:
             return ""
 
-        target = f"{SESSION_NAME}:{window}"
+        target = f"{self.session_name}:{window}"
         result = _run(
             [
                 "tmux",
@@ -460,7 +512,7 @@ class TmuxSessionManager:
             logger.warning("send_interrupt: no window for thread %d", thread_id)
             return False
 
-        target = f"{SESSION_NAME}:{window}"
+        target = f"{self.session_name}:{window}"
         result = _run(["tmux", "send-keys", "-t", target, "C-c"])
         return result.returncode == 0
 
@@ -479,7 +531,7 @@ class TmuxSessionManager:
         if window is None:
             return False
 
-        target = f"{SESSION_NAME}:{window}"
+        target = f"{self.session_name}:{window}"
         result = _run(
             [
                 "tmux",
