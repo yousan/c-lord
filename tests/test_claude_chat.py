@@ -969,8 +969,8 @@ class TestStartSessionCommand:
         assert kwargs["session_id"] is None
 
     @pytest.mark.asyncio
-    async def test_wrong_channel_rejected(self) -> None:
-        """Using /clord in a channel the bot doesn't manage sends ephemeral error."""
+    async def test_any_channel_allowed(self) -> None:
+        """/clord works in any channel, not just the bot's configured channel."""
         cog = _make_cog()  # bot.channel_id = 999
         interaction = MagicMock(spec=discord.Interaction)
         interaction.user = MagicMock()
@@ -979,30 +979,75 @@ class TestStartSessionCommand:
         channel.id = 7777  # different from bot.channel_id
         interaction.channel = channel
         interaction.response = MagicMock()
-        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.mention = "<#thread>"
+        cog.spawn_session = AsyncMock(return_value=thread)
 
         await cog.start_session.callback(cog, interaction, prompt="hello")
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        interaction.response.defer.assert_called_once()
+        cog.spawn_session.assert_called_once_with(channel, "hello")
+
+
+class TestMultiChannelOnMessage:
+    """on_message should handle threads with existing sessions in any channel."""
+
+    def _make_thread_message(
+        self, thread_id: int = 42, parent_id: int = 7777
+    ) -> MagicMock:
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = parent_id
+        thread.send = AsyncMock()
+        msg = MagicMock(spec=discord.Message)
+        msg.channel = thread
+        msg.content = "follow up"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+        msg.webhook_id = None
+        return msg
 
     @pytest.mark.asyncio
-    async def test_wrong_thread_parent_rejected(self) -> None:
-        """Using /clord in a thread under a different channel sends ephemeral error."""
+    async def test_thread_with_session_in_other_channel_handled(self) -> None:
+        """A thread in a non-configured channel is handled if it has a DB session."""
         cog = _make_cog()  # bot.channel_id = 999
-        interaction = MagicMock(spec=discord.Interaction)
-        interaction.user = MagicMock()
-        interaction.user.id = 42
-        thread = MagicMock(spec=discord.Thread)
-        thread.id = 555
-        thread.parent_id = 7777  # different from bot.channel_id
-        interaction.channel = thread
-        interaction.response = MagicMock()
-        interaction.response.send_message = AsyncMock()
+        message = self._make_thread_message(thread_id=42, parent_id=7777)
 
-        await cog.start_session.callback(cog, interaction, prompt="hello")
+        record = MagicMock()
+        record.session_id = "sess-xyz"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog._handle_thread_reply = AsyncMock()
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        await cog.on_message(message)
+
+        cog._handle_thread_reply.assert_called_once_with(message)
+
+    @pytest.mark.asyncio
+    async def test_thread_without_session_in_other_channel_ignored(self) -> None:
+        """A thread in a non-configured channel with no DB session is ignored."""
+        cog = _make_cog()  # bot.channel_id = 999
+        message = self._make_thread_message(thread_id=42, parent_id=7777)
+
+        cog.repo.get = AsyncMock(return_value=None)
+        cog._handle_thread_reply = AsyncMock()
+
+        await cog.on_message(message)
+
+        cog._handle_thread_reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_configured_channel_thread_still_works(self) -> None:
+        """Threads under the configured channel still work as before."""
+        cog = _make_cog()  # bot.channel_id = 999
+        message = self._make_thread_message(thread_id=42, parent_id=999)
+
+        cog._handle_thread_reply = AsyncMock()
+
+        await cog.on_message(message)
+
+        cog._handle_thread_reply.assert_called_once_with(message)

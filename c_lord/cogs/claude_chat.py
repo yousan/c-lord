@@ -163,10 +163,10 @@ class ClaudeChatCog(commands.Cog):
         if message.channel.id == self.bot.channel_id:
             return
 
-        # Check if message is in a thread under the configured channel
-        if (
-            isinstance(message.channel, discord.Thread)
-            and message.channel.parent_id == self.bot.channel_id
+        # Handle threads: configured channel always, other channels if session exists
+        if isinstance(message.channel, discord.Thread) and (
+            message.channel.parent_id == self.bot.channel_id
+            or await self.repo.get(message.channel.id) is not None
         ):
             await self._handle_thread_reply(message)
 
@@ -184,21 +184,9 @@ class ClaudeChatCog(commands.Cog):
             )
             return
 
-        # Channel check — must be the bot's configured channel or a thread under it
-        channel = interaction.channel
-        if isinstance(channel, discord.Thread):
-            channel_id = channel.parent_id
-        else:
-            channel_id = getattr(channel, "id", None)
-        if channel_id != self.bot.channel_id:
-            await interaction.response.send_message(
-                "This command can only be used in the bot's configured channel.",
-                ephemeral=True,
-            )
-            return
-
         await interaction.response.defer()
 
+        channel = interaction.channel
         if isinstance(channel, discord.Thread):
             # Continue in existing thread
             record = await self.repo.get(channel.id)
