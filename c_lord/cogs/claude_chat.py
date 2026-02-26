@@ -170,6 +170,37 @@ class ClaudeChatCog(commands.Cog):
         ):
             await self._handle_thread_reply(message)
 
+    @app_commands.command(name="clord", description="Start a new Claude Code session")
+    @app_commands.describe(prompt="Message to send to Claude Code")
+    async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
+        """Start a new Claude Code session or continue in an existing thread."""
+        # Authorization check
+        if (
+            self._allowed_user_ids is not None
+            and interaction.user.id not in self._allowed_user_ids
+        ):
+            await interaction.response.send_message(
+                "You are not authorized to use this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        channel = interaction.channel
+        if isinstance(channel, discord.Thread):
+            # Continue in existing thread
+            record = await self.repo.get(channel.id)
+            session_id = record.session_id if record else None
+            seed_message = await channel.send(prompt)
+            await self._run_claude(
+                seed_message, channel, prompt=prompt, session_id=session_id
+            )
+            await interaction.followup.send("Session completed.", silent=True)
+        else:
+            # Create a new thread via spawn_session
+            thread = await self.spawn_session(channel, prompt)
+            await interaction.followup.send(f"Session started → {thread.mention}")
+
     @app_commands.command(name="stop", description="Stop the active session (session is preserved)")
     async def stop_session(self, interaction: discord.Interaction) -> None:
         """Stop the active Claude run without clearing the session.

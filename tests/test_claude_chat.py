@@ -840,3 +840,130 @@ class TestCogUnloadMarkForResume:
         await cog.cog_unload()
 
         assert resume_repo.mark.call_args.kwargs["session_id"] is None
+
+
+class TestStartSessionCommand:
+    """/claude slash command tests."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_rejected(self) -> None:
+        """When allowed_user_ids is set, unauthorized users get ephemeral error."""
+        bot = MagicMock()
+        bot.channel_id = 999
+        cog = ClaudeChatCog(
+            bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111}
+        )
+        interaction = _make_channel_interaction()
+        interaction.user = MagicMock()
+        interaction.user.id = 999  # not in allowed set
+
+        await cog.start_session.callback(cog, interaction, prompt="hello")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_no_allowed_user_ids_allows_everyone(self) -> None:
+        """When allowed_user_ids is None, any user can use /claude."""
+        cog = _make_cog()  # allowed_user_ids=None
+        interaction = _make_channel_interaction()
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        interaction.channel = MagicMock(spec=discord.TextChannel)
+        interaction.channel.id = 999  # matches bot.channel_id
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.mention = "<#thread>"
+        cog.spawn_session = AsyncMock(return_value=thread)
+
+        await cog.start_session.callback(cog, interaction, prompt="hello")
+
+        # Should proceed (not reject) — spawn_session called
+        cog.spawn_session.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_channel_execution_calls_spawn_session(self) -> None:
+        """Running /claude in a channel creates a new thread via spawn_session."""
+        cog = _make_cog()
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 999  # matches bot.channel_id
+        interaction.channel = channel
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.mention = "<#12345>"
+        cog.spawn_session = AsyncMock(return_value=thread)
+
+        await cog.start_session.callback(cog, interaction, prompt="build a feature")
+
+        interaction.response.defer.assert_called_once()
+        cog.spawn_session.assert_called_once_with(channel, "build a feature")
+        interaction.followup.send.assert_called_once()
+        sent_text = interaction.followup.send.call_args.args[0]
+        assert "<#12345>" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_thread_execution_calls_run_claude(self) -> None:
+        """Running /claude inside a thread continues the session via _run_claude."""
+        cog = _make_cog()
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        interaction.channel = thread
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        record = MagicMock()
+        record.session_id = "sess-abc"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog._run_claude = AsyncMock()
+
+        await cog.start_session.callback(cog, interaction, prompt="continue this")
+
+        interaction.response.defer.assert_called_once()
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs["session_id"] == "sess-abc"
+        assert kwargs["prompt"] == "continue this"
+
+    @pytest.mark.asyncio
+    async def test_thread_execution_no_existing_session(self) -> None:
+        """Running /claude in a thread with no DB record passes session_id=None."""
+        cog = _make_cog()
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        interaction.channel = thread
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        cog.repo.get = AsyncMock(return_value=None)
+        cog._run_claude = AsyncMock()
+
+        await cog.start_session.callback(cog, interaction, prompt="start fresh")
+
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs["session_id"] is None
