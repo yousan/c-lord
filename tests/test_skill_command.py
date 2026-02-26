@@ -260,9 +260,7 @@ class TestLazyReload:
         cog = _make_cog(skills=[])
         cog._last_loaded = time.monotonic() - SKILL_RELOAD_INTERVAL - 1
         new_skills = [{"name": "fresh", "description": "New skill"}]
-        with patch(
-            "c_lord.cogs.skill_command._load_skills", return_value=new_skills
-        ) as mock_load:
+        with patch("c_lord.cogs.skill_command._load_skills", return_value=new_skills) as mock_load:
             cog._maybe_reload_skills()
             mock_load.assert_called_once_with(cog._skills_dir)
         assert cog._skills == new_skills
@@ -369,9 +367,7 @@ class TestNewThreadMode:
         mock_channel.create_thread = AsyncMock(return_value=mock_thread)
         cog.bot.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch(
-            "c_lord.cogs.skill_command.run_claude_with_config", new_callable=AsyncMock
-        ):
+        with patch("c_lord.cogs.skill_command.run_claude_with_config", new_callable=AsyncMock):
             await cog.run_skill.callback(cog, interaction, name="todoist", args="search work")
         call_kwargs = mock_channel.create_thread.call_args.kwargs
         assert call_kwargs["name"] == "/todoist search work"

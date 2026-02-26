@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from c_lord.session_dir import (
-    CleanupResult,
     SessionDirInfo,
     SessionDirManager,
     _is_clean,
@@ -196,9 +195,7 @@ class TestFindSessionDirs:
             patch("c_lord.session_dir._get_commit", return_value="abc1234"),
             patch("c_lord.session_dir._is_clean", return_value=True),
         ):
-            mgr = SessionDirManager(
-                base_dir=str(tmp_path), source_repo="/repo"
-            )
+            mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             dirs = mgr.find_session_dirs()
 
         assert len(dirs) == 1
@@ -223,9 +220,7 @@ class TestCleanupForThread:
         (session / "file.txt").write_text("content")
 
         with patch("c_lord.session_dir._is_clean", return_value=True):
-            mgr = SessionDirManager(
-                base_dir=str(tmp_path), source_repo="/repo"
-            )
+            mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             result = mgr.cleanup_for_thread(999)
 
         assert result.removed is True
@@ -238,9 +233,7 @@ class TestCleanupForThread:
         (session / ".git").mkdir()
 
         with patch("c_lord.session_dir._is_clean", return_value=False):
-            mgr = SessionDirManager(
-                base_dir=str(tmp_path), source_repo="/repo"
-            )
+            mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             result = mgr.cleanup_for_thread(999)
 
         assert result.removed is False
@@ -269,9 +262,7 @@ class TestCleanupOrphaned:
             patch("c_lord.session_dir._get_commit", return_value="abc"),
             patch("c_lord.session_dir._is_clean", return_value=True),
         ):
-            mgr = SessionDirManager(
-                base_dir=str(tmp_path), source_repo="/repo"
-            )
+            mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             results = mgr.cleanup_orphaned(active_thread_ids={555})
 
         assert len(results) == 1
@@ -287,9 +278,7 @@ class TestCleanupOrphaned:
             patch("c_lord.session_dir._get_commit", return_value="abc"),
             patch("c_lord.session_dir._is_clean", return_value=True),
         ):
-            mgr = SessionDirManager(
-                base_dir=str(tmp_path), source_repo="/repo"
-            )
+            mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             results = mgr.cleanup_orphaned(active_thread_ids=set())
 
         assert len(results) == 1

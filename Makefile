@@ -1,4 +1,4 @@
-.PHONY: setup check-setup format check test ci
+.PHONY: setup check-setup format check test ci tmux
 
 # One-time setup after cloning: install uv (if needed) and register the committed git hooks.
 setup:
@@ -36,3 +36,13 @@ test:
 
 # Full CI simulation: format check + lint + tests.
 ci: check test
+
+# Attach to the running c-lord tmux session.
+# Session name: $CLORD_TMUX_SESSION_NAME env var, or basename of $PWD.
+tmux:
+	@SESSION=$${CLORD_TMUX_SESSION_NAME:-$$(basename "$$PWD")}; \
+	if ! tmux has-session -t "$$SESSION" 2>/dev/null; then \
+		echo "Creating tmux session '$$SESSION' ..."; \
+		tmux new-session -d -s "$$SESSION" -n admin; \
+	fi; \
+	exec tmux attach -t "$$SESSION"
