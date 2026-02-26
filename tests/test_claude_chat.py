@@ -967,3 +967,42 @@ class TestStartSessionCommand:
 
         _, kwargs = cog._run_claude.call_args
         assert kwargs["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_wrong_channel_rejected(self) -> None:
+        """Using /clord in a channel the bot doesn't manage sends ephemeral error."""
+        cog = _make_cog()  # bot.channel_id = 999
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 7777  # different from bot.channel_id
+        interaction.channel = channel
+        interaction.response = MagicMock()
+        interaction.response.send_message = AsyncMock()
+
+        await cog.start_session.callback(cog, interaction, prompt="hello")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_wrong_thread_parent_rejected(self) -> None:
+        """Using /clord in a thread under a different channel sends ephemeral error."""
+        cog = _make_cog()  # bot.channel_id = 999
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 7777  # different from bot.channel_id
+        interaction.channel = thread
+        interaction.response = MagicMock()
+        interaction.response.send_message = AsyncMock()
+
+        await cog.start_session.callback(cog, interaction, prompt="hello")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
