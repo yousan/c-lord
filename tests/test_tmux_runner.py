@@ -415,25 +415,24 @@ class TestCleanTuiLines:
         assert result == "Answer here."
         assert "Ctrl-C" not in result
 
-    def test_removes_greeting(self) -> None:
-        """Claude TUI greeting line is stripped."""
+    def test_greeting_preserved(self) -> None:
+        """Claude greeting is kept — it may be a legitimate response to user's 'hi'."""
         lines = [
             "Hi! How can I help you today?",
             "",
             "● Actual response.",
         ]
         result = _clean_tui_lines(lines)
-        assert result == "Actual response."
-        assert "Hi!" not in result
+        assert "Hi! How can I help you today?" in result
+        assert "Actual response." in result
 
-    def test_removes_greeting_with_bullet_marker(self) -> None:
-        """Greeting with ● marker is stripped (common in TUI output)."""
+    def test_greeting_with_bullet_marker_preserved(self) -> None:
+        """Greeting with ● marker is kept as a valid response."""
         lines = [
             "● Hi! How can I help you with c-lord today?",
         ]
         result = _clean_tui_lines(lines)
-        assert result == ""
-        assert "Hi!" not in result
+        assert "Hi! How can I help you with c-lord today?" in result
 
     def test_removes_mode_switched(self) -> None:
         """'Claude Code has switched...' notification is stripped."""

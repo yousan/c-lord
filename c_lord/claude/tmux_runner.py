@@ -76,7 +76,6 @@ _STRIP_PATTERNS = (
     re.compile(r"[^\w\s●⎿❯>] \w+ for \d+s?"),
     # TUI noise — interactive prompts and greetings
     re.compile(r"Press Ctrl-C again to exit"),
-    re.compile(r"(?:Hi|Hello|Hey)!?\s+How can I help you.*"),
     re.compile(r"Claude Code has switched.*"),
     # TUI tool activity indicators (e.g. "Reading 1 file…", "Recalling 2 memories…")
     re.compile(r"(?:Reading|Recalling|Writing|Searching|Running|Checking) \d+ .+…"),
@@ -287,11 +286,12 @@ class TmuxClaudeRunner:
                     "Trust prompt detected, sending Enter to accept (thread=%d)",
                     self._thread_id,
                 )
-                from ..tmux import SESSION_NAME, _run
+                from ..tmux import _run
 
                 window = self._tmux._find_window_for_thread(self._thread_id)
                 if window:
-                    _run(["tmux", "send-keys", "-t", f"{SESSION_NAME}:{window}", "Enter"])
+                    target = f"{self._tmux.session_name}:{window}"
+                    _run(["tmux", "send-keys", "-t", target, "Enter"])
                 trust_handled = True
                 await asyncio.sleep(1.0)
                 elapsed += 1.0
@@ -322,11 +322,12 @@ class TmuxClaudeRunner:
             "Permission prompt detected, auto-accepting (thread=%d)",
             self._thread_id,
         )
-        from ..tmux import SESSION_NAME, _run
+        from ..tmux import _run
 
         window = self._tmux._find_window_for_thread(self._thread_id)
         if window:
-            _run(["tmux", "send-keys", "-t", f"{SESSION_NAME}:{window}", "Enter"])
+            target = f"{self._tmux.session_name}:{window}"
+            _run(["tmux", "send-keys", "-t", target, "Enter"])
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:
