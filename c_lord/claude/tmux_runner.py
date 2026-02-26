@@ -207,8 +207,16 @@ class TmuxClaudeRunner:
             else:
                 stable_seconds += _POLL_INTERVAL
 
-            # Done: non-empty response has been stable.
-            if last_response and stable_seconds >= _RESPONSE_STABLE_TIMEOUT:
+            # Done: non-empty response has been stable AND Claude shows
+            # an input prompt (❯), meaning it has finished generating.
+            # Without the input-prompt check, the loop exits prematurely
+            # when Claude is thinking or using tools (response text stays
+            # the same for >3s but Claude isn't done yet).
+            if (
+                last_response
+                and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
+                and self._has_input_prompt(current)
+            ):
                 break
 
             # Idle timeout: no response received for too long.

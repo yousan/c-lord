@@ -747,7 +747,7 @@ class TestTmuxClaudeRunnerRun:
     async def test_extracted_text_yielded_as_partial(self, runner, tmux_manager) -> None:
         """Extracted response text is yielded as partial ASSISTANT events."""
         pane_v1 = _make_pane(["● Line 1"])
-        pane_v2 = _make_pane(["● Line 1", "  Line 2"])
+        pane_v2 = _make_pane(["● Line 1", "  Line 2"], with_input_prompt=True)
         call_idx = 0
 
         def capture_fn(tid):
@@ -757,7 +757,7 @@ class TestTmuxClaudeRunnerRun:
                 return "Loading..."  # _handle_startup_prompts
             if call_idx == 3:
                 return pane_v1  # first version
-            return pane_v2  # final version (grows then stabilises)
+            return pane_v2  # final version (grows then stabilises, with input prompt)
 
         tmux_manager.capture_pane.side_effect = capture_fn
         tmux_manager.is_claude_running.return_value = False
@@ -808,7 +808,9 @@ class TestTmuxClaudeRunnerRun:
         """Response stabilising for _RESPONSE_STABLE_TIMEOUT triggers completion."""
         tmux_manager.is_claude_running.return_value = True
         pane_v1 = _make_pane(["● Growing..."], user_prompt="q")
-        pane_v2 = _make_pane(["● Growing...", "  Done now."], user_prompt="q")
+        pane_v2 = _make_pane(
+            ["● Growing...", "  Done now."], user_prompt="q", with_input_prompt=True
+        )
         call_idx = 0
 
         def capture_fn(tid):
