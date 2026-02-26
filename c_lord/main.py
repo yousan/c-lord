@@ -58,7 +58,9 @@ def load_config() -> dict[str, str]:
 
 async def main() -> None:
     """Start the bot."""
-    setup_logging()
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    setup_logging(log_level)
     config = load_config()
 
     # Initialize database
@@ -99,8 +101,9 @@ async def main() -> None:
         )
 
     # Tmux session manager — always enabled (degrades gracefully if tmux not installed)
-    tmux_manager = TmuxSessionManager()
-    logger.info("TmuxSessionManager enabled")
+    tmux_session_name = os.getenv("CLORD_TMUX_SESSION_NAME") or Path.cwd().name
+    tmux_manager = TmuxSessionManager(session_name=tmux_session_name)
+    logger.info("TmuxSessionManager enabled (session=%s)", tmux_session_name)
 
     bot = ClaudeDiscordBot(
         channel_id=int(config["channel_id"]),

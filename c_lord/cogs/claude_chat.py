@@ -163,6 +163,11 @@ class ClaudeChatCog(commands.Cog):
         if message.channel.id == self.bot.channel_id:
             return
 
+        # Text commands (e.g. !attach) are handled by process_commands — skip here
+        ctx = await self.bot.get_context(message)
+        if ctx.valid:
+            return
+
         # Handle threads: configured channel always, other channels if session exists
         if isinstance(message.channel, discord.Thread) and (
             message.channel.parent_id == self.bot.channel_id
@@ -175,10 +180,7 @@ class ClaudeChatCog(commands.Cog):
     async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
         """Start a new Claude Code session or continue in an existing thread."""
         # Authorization check
-        if (
-            self._allowed_user_ids is not None
-            and interaction.user.id not in self._allowed_user_ids
-        ):
+        if self._allowed_user_ids is not None and interaction.user.id not in self._allowed_user_ids:
             await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
@@ -192,9 +194,7 @@ class ClaudeChatCog(commands.Cog):
             record = await self.repo.get(channel.id)
             session_id = record.session_id if record else None
             seed_message = await channel.send(prompt)
-            await self._run_claude(
-                seed_message, channel, prompt=prompt, session_id=session_id
-            )
+            await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
             await interaction.followup.send("Session completed.", silent=True)
         else:
             # Create a new thread via spawn_session
@@ -225,6 +225,70 @@ class ClaudeChatCog(commands.Cog):
         # _active_runners cleanup is handled by _run_claude's finally block.
         # We intentionally do NOT delete from the session DB so the user can resume.
         await interaction.response.send_message(embed=stopped_embed())
+
+    @app_commands.command(
+        name="clord-attach",
+        description="Attach this thread to an existing tmux window",
+    )
+    @app_commands.describe(window="tmux window name (e.g. work1)")
+    async def attach_window(self, interaction: discord.Interaction, window: str) -> None:
+        """Remap an existing tmux window to the current thread."""
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "This command can only be used in a thread.", ephemeral=True
+            )
+            return
+
+        if self._allowed_user_ids is not None and interaction.user.id not in self._allowed_user_ids:
+            await interaction.response.send_message(
+                "You are not authorized to use this command.", ephemeral=True
+            )
+            return
+
+        tmux_manager = getattr(self.bot, "tmux_manager", None)
+        if tmux_manager is None:
+            await interaction.response.send_message(
+                "tmux is not configured for this bot.", ephemeral=True
+            )
+            return
+
+        ok = tmux_manager.remap_window(interaction.channel.id, window)
+        if ok:
+            await self.repo.save(
+                interaction.channel.id, session_id=f"tmux-{interaction.channel.id}"
+            )
+            await interaction.response.send_message(f"Attached this thread to `{window}`.")
+        else:
+            await interaction.response.send_message(
+                f"Window `{window}` not found in tmux.", ephemeral=True
+            )
+
+    @commands.command(name="attach")
+    async def attach_text(self, ctx: commands.Context, window: str) -> None:
+        """Text command: attach this thread to a tmux window.
+
+        E2E-testable alternative to the /clord-attach slash command.
+        Usage: !attach work13
+        """
+        if not isinstance(ctx.channel, discord.Thread):
+            await ctx.send("This command can only be used in a thread.")
+            return
+
+        if self._allowed_user_ids is not None and ctx.author.id not in self._allowed_user_ids:
+            await ctx.send("You are not authorized to use this command.")
+            return
+
+        tmux_manager = getattr(self.bot, "tmux_manager", None)
+        if tmux_manager is None:
+            await ctx.send("tmux is not configured for this bot.")
+            return
+
+        ok = tmux_manager.remap_window(ctx.channel.id, window)
+        if ok:
+            await self.repo.save(ctx.channel.id, session_id=f"tmux-{ctx.channel.id}")
+            await ctx.send(f"Attached this thread to `{window}`.")
+        else:
+            await ctx.send(f"Window `{window}` not found in tmux.")
 
     @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
     async def clear_session(self, interaction: discord.Interaction) -> None:
@@ -609,9 +673,14 @@ class ClaudeChatCog(commands.Cog):
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
 
                 # Prefix thread name with tmux window name (e.g. "work3: hi")
-                with contextlib.suppress(discord.HTTPException):
+                # Use a short timeout to avoid blocking on 429 rate limits
+                # (discord.py silently waits retry_after seconds before raising).
+                with contextlib.suppress(discord.HTTPException, asyncio.TimeoutError):
                     current_name = thread.name or ""
-                    await thread.edit(name=f"{window_name}: {current_name}"[:100])
+                    await asyncio.wait_for(
+                        thread.edit(name=f"{window_name}: {current_name}"[:100]),
+                        timeout=5.0,
+                    )
 
             # Choose runner: TmuxClaudeRunner when tmux is available,
             # otherwise the standard subprocess-based ClaudeRunner.
