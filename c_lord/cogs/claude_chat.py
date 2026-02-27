@@ -168,10 +168,9 @@ class ClaudeChatCog(commands.Cog):
         if ctx.valid:
             return
 
-        # Handle threads: configured channel always, other channels if session exists
+        # Handle threads: only respond if session exists in DB (opt-in)
         if isinstance(message.channel, discord.Thread) and (
-            message.channel.parent_id == self.bot.channel_id
-            or await self.repo.get(message.channel.id) is not None
+            await self.repo.get(message.channel.id) is not None
         ):
             await self._handle_thread_reply(message)
 
