@@ -6,11 +6,78 @@ Discord 上で c-lord ボットを使うためのガイドです。
 
 ---
 
+## アーキテクチャ全体像
+
+1 つの Bot が複数の Discord チャンネルを担当し、チャンネルごとに異なるリポジトリで Claude Code が作業します。
+
+```
+Bot (c-lord プロセス)                                    ← 1つ
+│
+├── アクセス制御: @claude-operator ロール
+│   └── このロールを持つユーザーのみ Bot と対話可能
+│
+├── #project-a (channel)
+│   │
+│   ├── リポジトリ: github.com/user/project-a.git
+│   │   └── /clord-init で紐づけ (DB に保存)
+│   │
+│   ├── tmux session: "project-a"
+│   │   ├── work1 ── Thread 101 の Claude Code CLI
+│   │   └── work2 ── Thread 102 の Claude Code CLI
+│   │
+│   └── session_dir: ~/c-lord-sessions/project-a/
+│       ├── 101/ ── git clone of project-a (Thread 101 用)
+│       └── 102/ ── git clone of project-a (Thread 102 用)
+│
+├── #project-b (channel)
+│   │
+│   ├── リポジトリ: github.com/user/project-b.git
+│   │
+│   ├── tmux session: "project-b"
+│   │   └── work1 ── Thread 201 の Claude Code CLI
+│   │
+│   └── session_dir: ~/c-lord-sessions/project-b/
+│       └── 201/ ── git clone of project-b (Thread 201 用)
+│
+└── #general (リポジトリ未設定)
+    └── /clord → エラー「リポジトリが設定されていません」
+```
+
+### 各要素の関係
+
+| 関係 | 対応 | 紐づけキー |
+|------|------|-----------|
+| Channel : リポジトリ | 1:1 | `/clord-init` で DB に保存 |
+| Channel : tmux session | 1:1 | チャンネル名から自動生成 |
+| Thread : tmux window | 1:1 | `@thread_id` (tmux window option) |
+| Thread : session_dir | 1:1 | `~/c-lord-sessions/{project}/{thread_id}/` |
+| Thread : Claude session | 1:1 | DB (`sessions` テーブル) |
+
+### 紐づけの流れ
+
+```
+管理者: /clord-init repo:https://github.com/user/project-a.git
+  ↓
+DB に保存: channel_id → repo URL, tmux session 名, session_dir パス
+  ↓
+利用者: /clord auth.py のバグを修正して
+  ↓
+Bot が自動で:
+  1. Thread 作成 (Discord)
+  2. git clone (session_dir)
+  3. tmux window 作成 (work1, work2, ...)
+  4. Claude Code CLI 起動
+```
+
+> **注意:** `/clord-init` およびロールベースのアクセス制御は実装予定です。現在は `.env` の `DISCORD_CHANNEL_ID` / `SESSION_SOURCE_REPO` で 1 チャンネル = 1 リポジトリの構成で動作します。
+
+---
+
 ## セッションの開始
 
 ### `/clord <プロンプト>`
 
-Claude Code セッションを開始する基本コマンド。ボットが監視しているチャンネルで使用します。
+Claude Code セッションを開始する基本コマンド。リポジトリが紐づけられたチャンネルで使用します。
 
 ```
 /clord auth.py のログインバグを修正して
@@ -92,17 +159,19 @@ Claude が `TodoWrite` でタスクを管理すると、1 つの embed が投稿
 | `/clord-attach <ウィンドウ>` | tmux ウィンドウを現在のスレッドに紐づけ | 利用可能 |
 | `/stop` | 現在のセッションを停止（リジューム可能な状態で保持） | 利用可能 |
 | `/clear` | スレッドの Claude Code セッションをリセット | 利用可能 |
+| `/clord-init <repo>` | チャンネルにリポジトリを紐づけ | 予定 |
 | `/skill <名前> [引数]` | Claude Code スキルを実行（オートコンプリート付き） | 実装中 |
 | `/sessions` | セッション一覧（origin、時間帯でフィルタ可能） | 実装中 |
 | `/sync-sessions` | CLI セッションを Discord スレッドにインポート | 実装中 |
 | `/resume-info` | このセッションをターミナルで継続するための CLI コマンドを表示 | 実装中 |
 | `/model-show` | 現在のモデル表示（グローバル + スレッド別） | 実装中 |
 | `/model-set <モデル>` | 新規セッションのモデルを変更（再起動不要） | 実装中 |
-| `/worktree-list` | アクティブなセッション worktree の一覧 | 実装中 |
-| `/worktree-cleanup` | 孤立した clean worktree を削除 | 実装中 |
 | `/upgrade` | ボットのアップグレードをトリガー（有効時のみ） | 実装中 |
 
-> **注意:** 「実装中」のコマンドはコードベースには存在しますが、標準起動 (`main.py`) ではまだ有効化されていません。今後のリリースで利用可能になる予定です。
+> **状態の説明:**
+> - **利用可能** — 現在のバージョンで使用可能
+> - **実装中** — コードベースに存在するが標準起動 (`main.py`) で未有効化。今後のリリースで利用可能になる予定
+> - **予定** — 設計済み、未実装
 
 ### テキストコマンド
 
@@ -112,18 +181,50 @@ Claude が `TodoWrite` でタスクを管理すると、1 つの embed が投稿
 
 ---
 
+## アクセス制御
+
+> **注意:** ロールベースのアクセス制御は実装予定です。現在は `.env` の `DISCORD_OWNER_ID` による制限が利用可能です。
+
+Bot と対話できるユーザーは Discord のロールで制御します。
+
+- サーバー管理者が `@claude-operator` ロールを作成
+- このロールを付与されたユーザーのみが `/clord`, `/clord-init` 等を実行可能
+- ロールのないユーザーがスレッドに書き込んでも Bot は無視
+- ロールの追加・削除は Discord のサーバー設定で行う（Bot の再起動不要）
+
+---
+
 ## セッションのライフサイクル
 
 ```
 /clord "バグを修正して"
     ↓
-[スレッド作成] ← ボットがここで応答
+[スレッド作成] ← Bot がここで応答
     ↓
 フォローアップメッセージ → 同じセッションで Claude が継続
     ↓
 /stop → セッション一時停止（メッセージ送信で再開可能）
     ↓
 ボット再起動 → セッション自動再開
+```
+
+### 裏側で起きていること
+
+```
+/clord "バグを修正して"
+    ↓
+1. DB に session レコード作成 (thread_id → session_id)
+2. session_dir 作成: ~/c-lord-sessions/project-a/{thread_id}/
+   └── git clone https://github.com/user/project-a.git
+3. tmux window 作成: project-a:work1
+   └── @thread_id = {thread_id}
+4. Claude Code CLI 起動 (tmux window 内で実行)
+    ↓
+スレッドにメッセージ送信
+    ↓
+5. DB から session_id を取得
+6. tmux window に入力を送信
+7. Claude Code の出力をストリーミングでスレッドに投稿
 ```
 
 ### タイムアウト
@@ -151,11 +252,24 @@ Claude が作業中に新しいメッセージを送ると、現在の処理が�
 
 ---
 
-## スレッドダッシュボード
+## tmux によるセッション管理
 
-ボットのチャンネルにピン留めされた embed で、全アクティブセッションの状態が一覧できます:
-- どのスレッドがアクティブか、入力待ちか
-- Claude が入力を必要としている場合、スレッドオーナーに @メンションで通知
+各 Claude Code セッションは tmux ウィンドウ内で動作します。サーバーに SSH できる管理者は tmux で直接セッションを確認・操作できます。
+
+```bash
+# プロジェクトの tmux セッション一覧
+tmux ls
+# project-a: 2 windows (created ...)
+# project-b: 1 windows (created ...)
+
+# project-a のセッションにアタッチ
+tmux attach -t project-a
+
+# 特定ウィンドウに切り替え (work1, work2, ...)
+# Ctrl-b + n (次), Ctrl-b + p (前), Ctrl-b + 1 (番号指定)
+```
+
+各ウィンドウには Claude Code CLI のターミナルが見えるので、Claude が何をしているかリアルタイムで確認できます。
 
 ---
 
@@ -163,6 +277,5 @@ Claude が作業中に新しいメッセージを送ると、現在の処理が�
 
 1. **1 スレッド = 1 タスク** — 各スレッドは独立した Claude Code セッションです。タスクごとにスレッドを分けましょう。
 2. **具体的に指示する** — `/clord` の最初のメッセージがコンテキストを決定します。明確で詳細なプロンプトがより良い結果を生みます。
-3. **スキルを活用** — `/skill` でオートコンプリート付きの定義済みワークフローを実行でき、長いプロンプトを打つ必要がありません。
-4. **ダッシュボードを確認** — ピン留めされたスレッドダッシュボードで全セッションの状態が確認できます。
-5. **ターミナルから継続** — `/resume-info` で CLI コマンドを取得し、Discord のセッションをターミナルで続けられます。
+3. **tmux で覗く** — サーバーにアクセスできるなら `tmux attach` で Claude の動きをリアルタイムに確認できます。
+4. **チャンネル = プロジェクト** — チャンネルごとにリポジトリが紐づいています。正しいチャンネルで `/clord` してください。
