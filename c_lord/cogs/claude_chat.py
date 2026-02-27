@@ -121,8 +121,10 @@ class ClaudeChatCog(commands.Cog):
         If ChannelRepoCog is loaded and has a per-channel binding, use that.
         Otherwise fall back to the global bot.session_dir_manager.
         """
+        from .channel_repo import ChannelRepoCog
+
         channel_cog = self.bot.get_cog("ChannelRepoCog")
-        if channel_cog is not None:
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
             manager = await channel_cog.resolve_manager(channel_id)
             if manager is not None:
                 return manager
