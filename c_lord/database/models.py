@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
     resume_prompt TEXT,        -- message to post + send to Claude on resume
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+-- Per-channel repository bindings (1 channel = 1 repo)
+CREATE TABLE IF NOT EXISTS channel_repo_bindings (
+    channel_id   INTEGER PRIMARY KEY,
+    source_repo  TEXT    NOT NULL,
+    clone_branch TEXT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 # Migrations for existing databases that lack new columns.
@@ -83,6 +92,15 @@ _MIGRATIONS = [
         "reason TEXT NOT NULL DEFAULT 'self_restart', "
         "resume_prompt TEXT, "
         "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
+    ),
+    # channel_repo_bindings added for /clord-init (per-channel repo binding)
+    (
+        "CREATE TABLE IF NOT EXISTS channel_repo_bindings ("
+        "channel_id INTEGER PRIMARY KEY, "
+        "source_repo TEXT NOT NULL, "
+        "clone_branch TEXT, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
+        "updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
     ),
 ]
 

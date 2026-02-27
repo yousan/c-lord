@@ -38,6 +38,7 @@ from .run_config import RunConfig
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
+    from ..session_dir import SessionDirManager
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,21 @@ class ClaudeChatCog(commands.Cog):
         if self._dashboard is None:
             self._dashboard = getattr(self.bot, "thread_dashboard", None)
         return self._dashboard
+
+    async def _resolve_session_dir_manager(self, channel_id: int) -> SessionDirManager | None:
+        """Resolve a SessionDirManager for the given channel.
+
+        If ChannelRepoCog is loaded and has a per-channel binding, use that.
+        Otherwise fall back to the global bot.session_dir_manager.
+        """
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            manager = await channel_cog.resolve_manager(channel_id)
+            if manager is not None:
+                return manager
+        return getattr(self.bot, "session_dir_manager", None)
 
     async def _get_current_model(self) -> str | None:
         """Return the model override from settings_repo, or None to use runner default.
@@ -653,7 +669,9 @@ class ClaudeChatCog(commands.Cog):
             # Create session directory (git clone) and tmux session if configured
             import asyncio as _asyncio
 
-            session_dir_manager = getattr(self.bot, "session_dir_manager", None)
+            session_dir_manager = await self._resolve_session_dir_manager(
+                getattr(thread, "parent_id", None) or thread.id
+            )
             tmux_manager = getattr(self.bot, "tmux_manager", None)
 
             working_dir = self.runner.working_dir  # default
@@ -729,7 +747,7 @@ class ClaudeChatCog(commands.Cog):
                         ask_repo=self._ask_repo,
                         lounge_repo=self._lounge_repo,
                         stop_view=stop_view,
-                        session_dir_manager=getattr(self.bot, "session_dir_manager", None),
+                        session_dir_manager=session_dir_manager,
                         tmux_manager=getattr(self.bot, "tmux_manager", None),
                         image_paths=image_paths,
                     )

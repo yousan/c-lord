@@ -12,6 +12,7 @@ from .claude.parser import parse_line
 from .claude.runner import ClaudeRunner
 from .claude.types import MessageType, StreamEvent, ToolCategory, ToolUseEvent
 from .cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
+from .cogs.channel_repo import ChannelRepoCog
 from .cogs.claude_chat import ClaudeChatCog
 from .cogs.event_processor import EventProcessor
 from .cogs.run_config import RunConfig
@@ -20,6 +21,7 @@ from .cogs.session_manage import SessionManageCog
 from .cogs.skill_command import SkillCommandCog
 from .cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
 from .concurrency import ActiveSession, SessionRegistry
+from .database.channel_repo import ChannelRepository
 from .database.notification_repo import NotificationRepository
 from .database.repository import SessionRepository
 from .database.settings_repo import SettingsRepository
@@ -42,6 +44,8 @@ __all__ = [
     # Core
     "ClaudeRunner",
     "ClaudeChatCog",
+    "ChannelRepoCog",
+    "ChannelRepository",
     "RunConfig",
     "EventProcessor",
     # Concurrency
