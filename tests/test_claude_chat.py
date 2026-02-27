@@ -1232,6 +1232,11 @@ class TestOnMessageSkipsTextCommands:
         msg.author.id = 42
         msg.webhook_id = None
 
+        # DB session must exist for opt-in response
+        record = MagicMock()
+        record.session_id = "sess-123"
+        cog.repo.get = AsyncMock(return_value=record)
+
         # Mock get_context to return an invalid context (not a command)
         mock_ctx = MagicMock()
         mock_ctx.valid = False
@@ -1288,11 +1293,27 @@ class TestMultiChannelOnMessage:
         cog._handle_thread_reply.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_configured_channel_thread_still_works(self) -> None:
-        """Threads under the configured channel still work as before."""
+    async def test_configured_channel_thread_without_session_ignored(self) -> None:
+        """Threads under the configured channel are ignored if no DB session exists."""
         cog = _make_cog()  # bot.channel_id = 999
         message = self._make_thread_message(thread_id=42, parent_id=999)
 
+        cog.repo.get = AsyncMock(return_value=None)
+        cog._handle_thread_reply = AsyncMock()
+
+        await cog.on_message(message)
+
+        cog._handle_thread_reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_configured_channel_thread_with_session_handled(self) -> None:
+        """Threads under the configured channel are handled if DB session exists."""
+        cog = _make_cog()  # bot.channel_id = 999
+        message = self._make_thread_message(thread_id=42, parent_id=999)
+
+        record = MagicMock()
+        record.session_id = "sess-abc"
+        cog.repo.get = AsyncMock(return_value=record)
         cog._handle_thread_reply = AsyncMock()
 
         await cog.on_message(message)
