@@ -70,6 +70,7 @@ async def setup_bridge(
     api_server: ApiServer | None = None,
     session_db_path: str = "data/sessions.db",
     allowed_user_ids: set[int] | None = None,
+    allowed_role_name: str | None = None,
     claude_channel_id: int | None = None,
     cli_sessions_path: str | None = None,
     enable_scheduler: bool = True,
@@ -98,6 +99,9 @@ async def setup_bridge(
                     runner.api_port so CLORD_API_URL is available to Claude.
         session_db_path: Path for session SQLite DB.
         allowed_user_ids: Set of Discord user IDs allowed to use Claude.
+        allowed_role_name: Discord role name whose members are allowed to use Claude.
+                           OR logic with allowed_user_ids.  Defaults to
+                           CLORD_ALLOWED_ROLE env var, or None (disabled).
         claude_channel_id: Channel ID for Claude chat (needed for SkillCommandCog).
         cli_sessions_path: Path to ~/.claude/projects for session sync.
         enable_scheduler: Whether to enable SchedulerCog.
@@ -137,6 +141,10 @@ async def setup_bridge(
     from .database.task_repo import TaskRepository
     from .session_dir import SessionDirManager
     from .tmux import TmuxSessionManager
+
+    # Role-based access control — auto-read from env var if not explicitly provided
+    if allowed_role_name is None:
+        allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
 
     # Lounge shares the coordination channel unless explicitly overridden
     if lounge_channel_id is None:
@@ -198,6 +206,7 @@ async def setup_bridge(
         repo=session_repo,
         runner=runner,
         allowed_user_ids=allowed_user_ids,
+        allowed_role_name=allowed_role_name,
         ask_repo=ask_repo,
         lounge_repo=lounge_repo,
         resume_repo=resume_repo,
@@ -223,6 +232,7 @@ async def setup_bridge(
         bot,
         repo=channel_repo,
         allowed_user_ids=allowed_user_ids,
+        allowed_role_name=allowed_role_name,
         session_dir_base=session_dir_base,
     )
     await bot.add_cog(channel_repo_cog)
@@ -236,6 +246,7 @@ async def setup_bridge(
             runner=runner,
             claude_channel_id=claude_channel_id,
             allowed_user_ids=allowed_user_ids,
+            allowed_role_name=allowed_role_name,
         )
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")

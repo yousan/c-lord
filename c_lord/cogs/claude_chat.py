@@ -39,6 +39,7 @@ from .run_config import RunConfig
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
     from ..session_dir import SessionDirManager
+    from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +74,14 @@ class ClaudeChatCog(commands.Cog):
         lounge_repo: LoungeRepository | None = None,
         resume_repo: PendingResumeRepository | None = None,
         settings_repo: SettingsRepository | None = None,
+        allowed_role_name: str | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.runner = runner
         self._max_concurrent = max_concurrent
         self._allowed_user_ids = allowed_user_ids
+        self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_runners: dict[int, ClaudeRunner | TmuxClaudeRunner] = {}
@@ -98,6 +101,20 @@ class ClaudeChatCog(commands.Cog):
         self._resume_repo = resume_repo or getattr(bot, "resume_repo", None)
         # Settings repo for dynamic model lookup (optional — falls back to runner.model)
         self._settings_repo = settings_repo or getattr(bot, "settings_repo", None)
+
+    def _is_allowed(self, member: discord.Member | discord.User) -> bool:
+        """Check if a member/user is authorized to use the bot.
+
+        OR logic: allowed_user_ids match OR allowed_role_name match.
+        When neither is configured, everyone is allowed.
+        """
+        if self._allowed_user_ids is not None and member.id in self._allowed_user_ids:
+            return True
+        if self._allowed_role_name is not None:
+            if isinstance(member, discord.Member):
+                return any(r.name == self._allowed_role_name for r in member.roles)
+            return False  # DM — no role info
+        return self._allowed_user_ids is None
 
     @property
     def active_session_count(self) -> int:
@@ -129,6 +146,21 @@ class ClaudeChatCog(commands.Cog):
             if manager is not None:
                 return manager
         return getattr(self.bot, "session_dir_manager", None)
+
+    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel.
+
+        If ChannelRepoCog is loaded and has a per-channel binding, use that.
+        Otherwise fall back to the global bot.tmux_manager.
+        """
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            manager = await channel_cog.resolve_tmux_manager(channel_id)
+            if manager is not None:
+                return manager
+        return getattr(self.bot, "tmux_manager", None)
 
     async def _get_current_model(self) -> str | None:
         """Return the model override from settings_repo, or None to use runner default.
@@ -168,10 +200,9 @@ class ClaudeChatCog(commands.Cog):
         if message.author.bot and not message.webhook_id:
             return
 
-        # Authorization check — if allowed_user_ids is set, only those users
-        # can invoke Claude.  When unset, channel-level Discord permissions
-        # are the only gate (suitable for private servers).
-        if self._allowed_user_ids is not None and message.author.id not in self._allowed_user_ids:
+        # Authorization check — user must match allowed_user_ids or have
+        # the allowed role.  When neither is configured, everyone is allowed.
+        if not self._is_allowed(message.author):
             return
 
         # Channel direct messages are ignored — thread creation is limited to
@@ -195,7 +226,7 @@ class ClaudeChatCog(commands.Cog):
     async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
         """Start a new Claude Code session or continue in an existing thread."""
         # Authorization check
-        if self._allowed_user_ids is not None and interaction.user.id not in self._allowed_user_ids:
+        if not self._is_allowed(interaction.user):
             await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
@@ -254,13 +285,14 @@ class ClaudeChatCog(commands.Cog):
             )
             return
 
-        if self._allowed_user_ids is not None and interaction.user.id not in self._allowed_user_ids:
+        if not self._is_allowed(interaction.user):
             await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
             return
 
-        tmux_manager = getattr(self.bot, "tmux_manager", None)
+        parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel.id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
         if tmux_manager is None:
             await interaction.response.send_message(
                 "tmux is not configured for this bot.", ephemeral=True
@@ -289,11 +321,12 @@ class ClaudeChatCog(commands.Cog):
             await ctx.send("This command can only be used in a thread.")
             return
 
-        if self._allowed_user_ids is not None and ctx.author.id not in self._allowed_user_ids:
+        if not self._is_allowed(ctx.author):
             await ctx.send("You are not authorized to use this command.")
             return
 
-        tmux_manager = getattr(self.bot, "tmux_manager", None)
+        parent_id = getattr(ctx.channel, "parent_id", None) or ctx.channel.id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
         if tmux_manager is None:
             await ctx.send("tmux is not configured for this bot.")
             return
@@ -669,10 +702,9 @@ class ClaudeChatCog(commands.Cog):
             # Create session directory (git clone) and tmux session if configured
             import asyncio as _asyncio
 
-            session_dir_manager = await self._resolve_session_dir_manager(
-                getattr(thread, "parent_id", None) or thread.id
-            )
-            tmux_manager = getattr(self.bot, "tmux_manager", None)
+            parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+            session_dir_manager = await self._resolve_session_dir_manager(parent_channel_id)
+            tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
 
             working_dir = self.runner.working_dir  # default
             if session_dir_manager is not None:
@@ -748,7 +780,7 @@ class ClaudeChatCog(commands.Cog):
                         lounge_repo=self._lounge_repo,
                         stop_view=stop_view,
                         session_dir_manager=session_dir_manager,
-                        tmux_manager=getattr(self.bot, "tmux_manager", None),
+                        tmux_manager=tmux_manager,
                         image_paths=image_paths,
                     )
                 )

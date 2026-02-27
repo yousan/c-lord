@@ -14,13 +14,29 @@ logger = logging.getLogger(__name__)
 
 CHANNEL_REPO_SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel_repo_bindings (
-    channel_id   INTEGER PRIMARY KEY,
-    source_repo  TEXT    NOT NULL,
-    clone_branch TEXT,
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
-    updated_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+    channel_id         INTEGER PRIMARY KEY,
+    source_repo        TEXT    NOT NULL,
+    clone_branch       TEXT,
+    tmux_session_name  TEXT,
+    created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 """
+
+
+def derive_session_name(source_repo: str) -> str:
+    """Derive a tmux session name from a repository URL or path.
+
+    Examples::
+
+        'https://github.com/org/my-project.git' → 'my-project'
+        'git@github.com:org/my-project.git'     → 'my-project'
+        '/home/user/repos/my-project'           → 'my-project'
+    """
+    name = source_repo.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name or "clord"
 
 
 class ChannelRepository:
@@ -70,14 +86,17 @@ class ChannelRepository:
         channel_id: int,
         source_repo: str,
         clone_branch: str | None = None,
+        tmux_session_name: str | None = None,
     ) -> None:
         """Insert or replace a channel-repo binding."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """INSERT OR REPLACE INTO channel_repo_bindings
-                   (channel_id, source_repo, clone_branch, created_at, updated_at)
-                   VALUES (?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))""",
-                (channel_id, source_repo, clone_branch),
+                   (channel_id, source_repo, clone_branch, tmux_session_name,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, datetime('now', 'localtime'),
+                           datetime('now', 'localtime'))""",
+                (channel_id, source_repo, clone_branch, tmux_session_name),
             )
             await db.commit()
         logger.info("Saved channel binding: channel=%d repo=%s", channel_id, source_repo)
