@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Opt-in thread response** — Bot no longer auto-responds to all threads in the configured channel. Only threads with a DB session record (created via `/clord`, `!attach`, or `POST /api/spawn`) receive responses. This prevents the bot from interfering with threads created by other bots or for human-only conversations.
+
 ## [1.4.0] - 2026-02-22
 
 ### Added

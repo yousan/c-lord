@@ -133,6 +133,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 
 #### 🔗 Session Basics
 - **Thread = Session** — 1:1 mapping between Discord thread and Claude Code session
+- **Opt-in threads** — Bot only responds in threads created via `/clord`, `!attach`, or API spawn; other threads are left alone
 - **Session persistence** — Resume conversations across messages via `--resume`
 - **Concurrent sessions** — Multiple parallel sessions with configurable limit
 - **Stop without clearing** — `/stop` halts a session while preserving it for resume
@@ -271,7 +272,7 @@ c-lord start    # start the bot (reads .env in current dir)
 c-lord start --env /path/to/.env   # custom .env location
 ```
 
-Send a message in the configured channel — Claude will reply in a new thread.
+Use `/clord <prompt>` in any channel to start a new Claude Code session in a thread. The bot only responds in threads it created or that were attached via `!attach` — it won't interfere with other threads.
 
 ---
 
