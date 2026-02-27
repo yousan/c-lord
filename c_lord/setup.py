@@ -186,6 +186,9 @@ async def setup_bridge(
     # without a hard import dependency on c-lord internals.
     bot.session_repo = session_repo  # type: ignore[attr-defined]
     bot.resume_repo = resume_repo  # type: ignore[attr-defined]
+    bot.ask_repo = ask_repo  # type: ignore[attr-defined]
+    bot.lounge_repo = lounge_repo  # type: ignore[attr-defined]
+    bot.lounge_channel_id = lounge_channel_id  # type: ignore[attr-defined]
 
     # --- ClaudeChatCog ---
     chat_cog = ClaudeChatCog(
