@@ -567,3 +567,124 @@ class TestTmuxSessionManager:
         mgr = TmuxSessionManager()
         mgr._available = False
         assert mgr.is_claude_running(12345) is False
+
+    # ── Custom session name ──────────────────────────────────────────
+
+    def test_default_session_name(self) -> None:
+        """Default session name is the SESSION_NAME constant."""
+        mgr = TmuxSessionManager()
+        assert mgr.session_name == SESSION_NAME
+
+    def test_custom_session_name(self) -> None:
+        """Custom session name is used."""
+        mgr = TmuxSessionManager(session_name="mybot")
+        assert mgr.session_name == "mybot"
+
+    def test_custom_session_name_used_in_commands(self) -> None:
+        """Custom session name appears in tmux commands."""
+        mgr = TmuxSessionManager(session_name="mybot")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: show-option verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            mgr.start_claude(12345, "hello", "sonnet")
+
+        # Verify the custom session name is used in the target
+        cmd_call = mock_run.call_args_list[0]
+        args = cmd_call[0][0]
+        assert "mybot:work1" in args
+
+    def test_custom_session_name_in_ensure_session(self) -> None:
+        """Custom session name is used when creating the tmux session."""
+        mgr = TmuxSessionManager(session_name="custom")
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1),  # has-session → not exists
+                MagicMock(returncode=0),  # new-session → success
+            ]
+            assert mgr._ensure_session() is True
+
+        # Verify has-session used custom name
+        has_call = mock_run.call_args_list[0]
+        assert "custom" in has_call[0][0]
+
+        # Verify new-session used custom name
+        new_call = mock_run.call_args_list[1]
+        assert "custom" in new_call[0][0]
+
+    def test_none_session_name_uses_default(self) -> None:
+        """Passing None as session_name uses the default."""
+        mgr = TmuxSessionManager(session_name=None)
+        assert mgr.session_name == SESSION_NAME
+
+    # ── remap_window ────────────────────────────────────────────────
+
+    def test_remap_window_success(self) -> None:
+        """remap_window updates @thread_id and cache for an existing window."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # show-option @thread_id → window exists
+                MagicMock(returncode=0, stdout="11111\n"),
+                # set-option @thread_id
+                MagicMock(returncode=0),
+            ]
+            result = mgr.remap_window(99999, "work1")
+
+        assert result is True
+        assert mgr._thread_to_window[99999] == "work1"
+
+        # Verify set-option was called with new thread_id
+        set_call = mock_run.call_args_list[1]
+        args = set_call[0][0]
+        assert "set-option" in args
+        assert "@thread_id" in args
+        assert "99999" in args
+
+    def test_remap_window_not_found(self) -> None:
+        """remap_window returns False when the window does not exist."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)
+            result = mgr.remap_window(99999, "nonexistent")
+
+        assert result is False
+        assert 99999 not in mgr._thread_to_window
+
+    def test_remap_window_updates_cache(self) -> None:
+        """remap_window removes old mapping and adds new one."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        # Pre-existing mapping: thread 11111 → work1
+        mgr._thread_to_window[11111] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="11111\n"),  # show-option → window exists
+                MagicMock(returncode=0),  # set-option
+            ]
+            result = mgr.remap_window(22222, "work1")
+
+        assert result is True
+        # Old thread removed from cache
+        assert 11111 not in mgr._thread_to_window
+        # New thread mapped
+        assert mgr._thread_to_window[22222] == "work1"
+
+    def test_remap_window_tmux_unavailable(self) -> None:
+        """remap_window returns False when tmux is not installed."""
+        mgr = TmuxSessionManager()
+        mgr._available = False
+
+        result = mgr.remap_window(12345, "work1")
+
+        assert result is False

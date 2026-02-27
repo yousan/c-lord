@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .claude.types import AskOption, AskQuestion
@@ -43,7 +44,7 @@ class ClaudeDiscordBot(commands.Bot):
         intents.guilds = True
 
         super().__init__(
-            command_prefix="!",  # Not used, but required
+            command_prefix="!",
             intents=intents,
         )
         self.channel_id = channel_id
@@ -62,6 +63,26 @@ class ClaudeDiscordBot(commands.Bot):
         self.session_dir_manager: SessionDirManager | None = session_dir_manager
         # Tmux session lifecycle manager (optional)
         self.tmux_manager: TmuxSessionManager | None = tmux_manager
+
+    async def process_commands(self, message: discord.Message, /) -> None:
+        """Override to allow webhook messages to trigger text commands.
+
+        The default ``commands.Bot.process_commands`` silently drops all
+        messages from bot authors (``message.author.bot``).  Since webhook
+        messages are marked as bot-authored, this prevents E2E testing via
+        webhooks.  We relax the check: webhook messages (identified by
+        ``message.webhook_id``) are allowed through.
+        """
+        if message.author.bot and not message.webhook_id:
+            return
+        ctx = await self.get_context(message)
+        await self.invoke(ctx)
+
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """Log slash command errors that would otherwise be silently swallowed."""
+        logger.error("Slash command error: %s", error, exc_info=error)
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")

@@ -149,6 +149,49 @@ class TestExtractResponse:
         pane = "Some random text\nwithout prompt markers"
         assert TmuxClaudeRunner._extract_response(pane) == ""
 
+    def test_scrolled_off_prompt_fallback(self) -> None:
+        """When the user prompt scrolled off-screen, extract response from visible content."""
+        pane = "\n".join(
+            [
+                "",
+                "● 2",
+                "",
+                "  詳しく知りたい部分はありますか？",
+                "",
+                "──────────────────────────────────────────",
+                "❯\xa0",
+                "──────────────────────────────────────────",
+                "  -- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "2" in result
+        assert "詳しく知りたい部分はありますか？" in result
+
+    def test_scrolled_off_prompt_strips_banner(self) -> None:
+        """Fallback mode strips shell noise and banner at the top."""
+        pane = "\n".join(
+            [
+                "$ unalias claude; env -u CLAUDECODE claude --model sonnet 'hi'",
+                "",
+                " ▐▛███▜▌   Claude Code v2.1.59",
+                "▝▜█████▛▘  Sonnet 4.6",
+                "  ▘▘ ▝▝    ~/work",
+                "",
+                "● Hello! How can I help?",
+                "",
+                "──────────────────────────────────────────",
+                "❯\xa0",
+                "──────────────────────────────────────────",
+                "  -- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "Hello! How can I help?" in result
+        # Banner and shell noise should not appear
+        assert "Claude Code" not in result
+        assert "unalias" not in result
+
     def test_pane_with_shell_noise_and_banner(self) -> None:
         """Shell noise and banner before the user prompt are ignored."""
         pane = "\n".join(
@@ -704,7 +747,7 @@ class TestTmuxClaudeRunnerRun:
     async def test_extracted_text_yielded_as_partial(self, runner, tmux_manager) -> None:
         """Extracted response text is yielded as partial ASSISTANT events."""
         pane_v1 = _make_pane(["● Line 1"])
-        pane_v2 = _make_pane(["● Line 1", "  Line 2"])
+        pane_v2 = _make_pane(["● Line 1", "  Line 2"], with_input_prompt=True)
         call_idx = 0
 
         def capture_fn(tid):
@@ -714,7 +757,7 @@ class TestTmuxClaudeRunnerRun:
                 return "Loading..."  # _handle_startup_prompts
             if call_idx == 3:
                 return pane_v1  # first version
-            return pane_v2  # final version (grows then stabilises)
+            return pane_v2  # final version (grows then stabilises, with input prompt)
 
         tmux_manager.capture_pane.side_effect = capture_fn
         tmux_manager.is_claude_running.return_value = False
@@ -765,7 +808,9 @@ class TestTmuxClaudeRunnerRun:
         """Response stabilising for _RESPONSE_STABLE_TIMEOUT triggers completion."""
         tmux_manager.is_claude_running.return_value = True
         pane_v1 = _make_pane(["● Growing..."], user_prompt="q")
-        pane_v2 = _make_pane(["● Growing...", "  Done now."], user_prompt="q")
+        pane_v2 = _make_pane(
+            ["● Growing...", "  Done now."], user_prompt="q", with_input_prompt=True
+        )
         call_idx = 0
 
         def capture_fn(tid):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -77,7 +78,7 @@ async def setup_bridge(
     session_dir_base: str | None = None,
     session_source_repo: str | None = None,
     session_clone_branch: str | None = None,
-    enable_tmux: bool = False,
+    enable_tmux: bool = True,
 ) -> BridgeComponents:
     """Initialize and register all c-lord Cogs in one call.
 
@@ -114,9 +115,9 @@ async def setup_bridge(
                              Defaults to SESSION_SOURCE_REPO env var.
         session_clone_branch: Optional branch to clone. Defaults to
                               SESSION_CLONE_BRANCH env var, or None (default branch).
-        enable_tmux: Whether to enable tmux session management. When True,
-                     a TmuxSessionManager is created and attached to the bot.
-                     Defaults to CLORD_TMUX_ENABLED env var ("true"/"1").
+        enable_tmux: Whether to enable tmux session management. Enabled by
+                     default (degrades gracefully if tmux is not installed).
+                     Set CLORD_TMUX_ENABLED to "false"/"0"/"no" to disable.
 
     Returns:
         BridgeComponents with references to initialized repositories.
@@ -159,13 +160,17 @@ async def setup_bridge(
         )
 
     # TmuxSessionManager — attach to bot so cogs can access it via bot.tmux_manager
+    # Enabled by default; set CLORD_TMUX_ENABLED=false/0/no to disable.
     tmux_env = os.getenv("CLORD_TMUX_ENABLED", "").lower()
-    if not enable_tmux and tmux_env in ("true", "1", "yes"):
-        enable_tmux = True
+    if tmux_env in ("false", "0", "no"):
+        enable_tmux = False
     if enable_tmux:
+        session_name = os.getenv("CLORD_TMUX_SESSION_NAME") or Path.cwd().name
         if not hasattr(bot, "tmux_manager"):
-            bot.tmux_manager = TmuxSessionManager()  # type: ignore[attr-defined]
-        logger.info("TmuxSessionManager enabled")
+            bot.tmux_manager = TmuxSessionManager(  # type: ignore[attr-defined]
+                session_name=session_name,
+            )
+        logger.info("TmuxSessionManager enabled (session=%s)", session_name)
 
     # --- Session DB (also hosts lounge_messages and pending_resumes tables) ---
     os.makedirs(os.path.dirname(session_db_path) or ".", exist_ok=True)

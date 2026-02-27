@@ -24,8 +24,13 @@ logger = logging.getLogger(__name__)
 # How often to poll capture-pane (seconds).
 _POLL_INTERVAL = 0.5
 
-# If extracted response text hasn't changed for this long, consider Claude done.
+# If extracted response text hasn't changed for this long AND the input prompt
+# is visible (❯ bare), consider Claude done.
 _RESPONSE_STABLE_TIMEOUT = 3.0
+
+# Fallback: if response is stable for this long, break even without an input
+# prompt (the prompt area may contain completion summaries or suggestions).
+_RESPONSE_STABLE_FALLBACK = 30.0
 
 # If no response appears at all for this long, give up (idle timeout).
 _IDLE_TIMEOUT = 15.0
@@ -192,6 +197,17 @@ class TmuxClaudeRunner:
 
             # Extract the clean response from the TUI pane.
             response = self._extract_response(current)
+            has_prompt = self._has_input_prompt(current)
+
+            if elapsed % 10 < _POLL_INTERVAL:  # Log every ~10 seconds
+                logger.debug(
+                    "poll: elapsed=%.0fs stable=%.1fs resp_len=%d has_prompt=%s (thread=%d)",
+                    elapsed,
+                    stable_seconds,
+                    len(response),
+                    has_prompt,
+                    self._thread_id,
+                )
 
             if response != last_response:
                 # Response changed (new content appeared or grew).
@@ -207,8 +223,18 @@ class TmuxClaudeRunner:
             else:
                 stable_seconds += _POLL_INTERVAL
 
-            # Done: non-empty response has been stable.
-            if last_response and stable_seconds >= _RESPONSE_STABLE_TIMEOUT:
+            # Done: non-empty response has been stable long enough.
+            # Two tiers:
+            #  - Quick exit (3s): response stable AND input prompt visible
+            #    (Claude is definitely done and waiting for input).
+            #  - Fallback exit (30s): response stable but no input prompt
+            #    (Claude may have finished but prompt detection failed,
+            #    e.g. completion summary text in the prompt area).
+            if (
+                last_response
+                and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
+                and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
+            ):
                 break
 
             # Idle timeout: no response received for too long.
@@ -398,10 +424,32 @@ class TmuxClaudeRunner:
                 break
 
         if prompt_idx == -1:
-            return ""
-
-        # Step 3: Extract response lines between prompt and end.
-        response_lines = lines[prompt_idx + 1 : end]
+            # Fallback: the user prompt has scrolled off-screen (long response).
+            # Only activate when TUI chrome is present (both separators found)
+            # to avoid false positives on non-TUI text.
+            if separator_count < 2:
+                return ""
+            # Strip top-of-pane noise (banner, shell lines) and use the rest.
+            banner_chars = ("▐", "▝", "▘")
+            start = 0
+            for i in range(end):
+                stripped = lines[i].strip()
+                # Skip empty lines, shell prompts, and the Claude TUI banner
+                is_noise = (
+                    not stripped
+                    or stripped.startswith("$")
+                    or stripped.startswith("yousan")
+                    or "Claude Code" in stripped
+                    or any(stripped.startswith(c) for c in banner_chars)
+                )
+                if is_noise:
+                    start = i + 1
+                else:
+                    break
+            response_lines = lines[start:end]
+        else:
+            # Step 3: Extract response lines between prompt and end.
+            response_lines = lines[prompt_idx + 1 : end]
 
         # Step 4: Clean up the response.
         return _clean_tui_lines(response_lines)

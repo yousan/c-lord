@@ -22,6 +22,10 @@ def _make_cog() -> ClaudeChatCog:
     """Return a ClaudeChatCog with minimal mocked dependencies."""
     bot = MagicMock()
     bot.channel_id = 999
+    # Default get_context returns a non-command context (valid=False)
+    _default_ctx = MagicMock()
+    _default_ctx.valid = False
+    bot.get_context = AsyncMock(return_value=_default_ctx)
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
@@ -850,9 +854,7 @@ class TestStartSessionCommand:
         """When allowed_user_ids is set, unauthorized users get ephemeral error."""
         bot = MagicMock()
         bot.channel_id = 999
-        cog = ClaudeChatCog(
-            bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111}
-        )
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111})
         interaction = _make_channel_interaction()
         interaction.user = MagicMock()
         interaction.user.id = 999  # not in allowed set
@@ -993,12 +995,257 @@ class TestStartSessionCommand:
         cog.spawn_session.assert_called_once_with(channel, "hello")
 
 
+class TestAttachWindowCommand:
+    """/clord-attach slash command tests."""
+
+    @pytest.mark.asyncio
+    async def test_attach_outside_thread_sends_ephemeral(self) -> None:
+        """Using /clord-attach outside a thread sends an ephemeral error."""
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+
+        await cog.attach_window.callback(cog, interaction, window="work1")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_attach_unauthorized_user_rejected(self) -> None:
+        """Unauthorized users get ephemeral error."""
+        bot = MagicMock()
+        bot.channel_id = 999
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111})
+        interaction = _make_thread_interaction()
+        interaction.user = MagicMock()
+        interaction.user.id = 999  # not in allowed set
+
+        await cog.attach_window.callback(cog, interaction, window="work1")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_attach_no_tmux_manager(self) -> None:
+        """When tmux_manager is not configured, sends ephemeral error."""
+        cog = _make_cog()
+        cog.bot.tmux_manager = None  # explicitly no tmux
+        interaction = _make_thread_interaction()
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+
+        await cog.attach_window.callback(cog, interaction, window="work1")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_attach_success(self) -> None:
+        """Successful remap responds with confirmation and saves DB record."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.remap_window.return_value = True
+        cog.bot.tmux_manager = tmux_mgr
+
+        interaction = _make_thread_interaction(thread_id=12345)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+
+        await cog.attach_window.callback(cog, interaction, window="work3")
+
+        tmux_mgr.remap_window.assert_called_once_with(12345, "work3")
+        interaction.response.send_message.assert_called_once()
+        msg = interaction.response.send_message.call_args.args[0]
+        assert "work3" in msg
+        # DB session record must be created so on_message picks up thread replies
+        cog.repo.save.assert_called_once_with(12345, session_id="tmux-12345")
+
+    @pytest.mark.asyncio
+    async def test_attach_window_not_found(self) -> None:
+        """When remap returns False, sends failure message."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.remap_window.return_value = False
+        cog.bot.tmux_manager = tmux_mgr
+
+        interaction = _make_thread_interaction(thread_id=12345)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+
+        await cog.attach_window.callback(cog, interaction, window="nonexistent")
+
+        interaction.response.send_message.assert_called_once()
+        call_kwargs = interaction.response.send_message.call_args.kwargs
+        assert call_kwargs.get("ephemeral") is True
+        msg = interaction.response.send_message.call_args.args[0]
+        assert "nonexistent" in msg
+
+
+class TestAttachTextCommand:
+    """!attach text command tests (E2E-testable alternative to /clord-attach)."""
+
+    def _make_ctx(
+        self,
+        *,
+        thread_id: int = 12345,
+        in_thread: bool = True,
+        author_id: int = 42,
+    ) -> MagicMock:
+        """Return a commands.Context with a thread channel."""
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.author = MagicMock()
+        ctx.author.id = author_id
+        if in_thread:
+            thread = MagicMock(spec=discord.Thread)
+            thread.id = thread_id
+            ctx.channel = thread
+        else:
+            ctx.channel = MagicMock(spec=discord.TextChannel)
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_attach_text_success(self) -> None:
+        """!attach work13 → remap_window + repo.save called."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.remap_window.return_value = True
+        cog.bot.tmux_manager = tmux_mgr
+        ctx = self._make_ctx(thread_id=12345)
+
+        await cog.attach_text.callback(cog, ctx, window="work13")
+
+        tmux_mgr.remap_window.assert_called_once_with(12345, "work13")
+        cog.repo.save.assert_called_once_with(12345, session_id="tmux-12345")
+        ctx.send.assert_called_once()
+        msg = ctx.send.call_args.args[0]
+        assert "work13" in msg
+
+    @pytest.mark.asyncio
+    async def test_attach_text_outside_thread(self) -> None:
+        """!attach in a non-thread channel sends an error."""
+        cog = _make_cog()
+        cog.bot.tmux_manager = MagicMock()
+        ctx = self._make_ctx(in_thread=False)
+
+        await cog.attach_text.callback(cog, ctx, window="work1")
+
+        ctx.send.assert_called_once()
+        msg = ctx.send.call_args.args[0]
+        assert "thread" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_attach_text_no_tmux(self) -> None:
+        """!attach when tmux_manager is None sends an error."""
+        cog = _make_cog()
+        cog.bot.tmux_manager = None
+        ctx = self._make_ctx()
+
+        await cog.attach_text.callback(cog, ctx, window="work1")
+
+        ctx.send.assert_called_once()
+        msg = ctx.send.call_args.args[0]
+        assert "tmux" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_attach_text_window_not_found(self) -> None:
+        """!attach with non-existent window sends failure message."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.remap_window.return_value = False
+        cog.bot.tmux_manager = tmux_mgr
+        ctx = self._make_ctx()
+
+        await cog.attach_text.callback(cog, ctx, window="nonexistent")
+
+        ctx.send.assert_called_once()
+        msg = ctx.send.call_args.args[0]
+        assert "nonexistent" in msg
+
+    @pytest.mark.asyncio
+    async def test_attach_text_unauthorized(self) -> None:
+        """!attach from unauthorized user sends error."""
+        bot = MagicMock()
+        bot.channel_id = 999
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111})
+        cog.bot.tmux_manager = MagicMock()
+        ctx = self._make_ctx(author_id=999)
+
+        await cog.attach_text.callback(cog, ctx, window="work1")
+
+        ctx.send.assert_called_once()
+        msg = ctx.send.call_args.args[0]
+        assert "authorized" in msg.lower() or "permission" in msg.lower()
+
+
+class TestOnMessageSkipsTextCommands:
+    """on_message must not send !attach messages to _handle_thread_reply."""
+
+    @pytest.mark.asyncio
+    async def test_attach_command_not_forwarded_to_handle_thread_reply(self) -> None:
+        """!attach in a thread should NOT trigger _handle_thread_reply."""
+        cog = _make_cog()
+        cog._handle_thread_reply = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        thread.parent_id = 999  # matches bot.channel_id
+
+        msg = MagicMock(spec=discord.Message)
+        msg.channel = thread
+        msg.content = "!attach work13"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+        msg.author.id = 42
+        msg.webhook_id = None
+
+        # Mock get_context to return a valid context (simulating a text command)
+        mock_ctx = MagicMock()
+        mock_ctx.valid = True
+        cog.bot.get_context = AsyncMock(return_value=mock_ctx)
+
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_normal_message_still_forwarded(self) -> None:
+        """Regular messages in threads should still reach _handle_thread_reply."""
+        cog = _make_cog()
+        cog._handle_thread_reply = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        thread.parent_id = 999  # matches bot.channel_id
+
+        msg = MagicMock(spec=discord.Message)
+        msg.channel = thread
+        msg.content = "hello Claude"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+        msg.author.id = 42
+        msg.webhook_id = None
+
+        # Mock get_context to return an invalid context (not a command)
+        mock_ctx = MagicMock()
+        mock_ctx.valid = False
+        cog.bot.get_context = AsyncMock(return_value=mock_ctx)
+
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_called_once_with(msg)
+
+
 class TestMultiChannelOnMessage:
     """on_message should handle threads with existing sessions in any channel."""
 
-    def _make_thread_message(
-        self, thread_id: int = 42, parent_id: int = 7777
-    ) -> MagicMock:
+    def _make_thread_message(self, thread_id: int = 42, parent_id: int = 7777) -> MagicMock:
         thread = MagicMock(spec=discord.Thread)
         thread.id = thread_id
         thread.parent_id = parent_id

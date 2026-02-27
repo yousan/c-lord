@@ -81,6 +81,23 @@ cp .env.example .env
 uv run python -m c_lord.main
 ```
 
+### E2E Testing (Discord)
+
+Bot 再起動は積極的に行ってよい。新しいコードで Bot を再起動し、Discord 上で動作確認する。
+
+```bash
+# 1. Bot 再起動
+pgrep -f "c_lord.main" | xargs kill 2>/dev/null; sleep 2
+nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &
+
+# 2. E2E テスト実行（要 E2E_TEST_WEBHOOK_URL in .env）
+uv run python tests/e2e_discord_attach.py
+```
+
+**Webhook セットアップ**: Discord → Server Settings → Integrations → Webhooks で `DISCORD_CHANNEL_ID` のチャンネルに Webhook を作成し、`.env` の `E2E_TEST_WEBHOOK_URL` に設定する。
+
+テキストコマンド (`!attach` 等) は Webhook 経由で E2E テスト可能。`process_commands` が Webhook メッセージを処理するよう `ClaudeDiscordBot` でオーバーライド済み。
+
 ## Code Conventions
 
 ### Style
