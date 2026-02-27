@@ -122,11 +122,13 @@ async def setup_bridge(
     Returns:
         BridgeComponents with references to initialized repositories.
     """
+    from .cogs.channel_repo import ChannelRepoCog
     from .cogs.claude_chat import ClaudeChatCog
     from .cogs.scheduler import SchedulerCog
     from .cogs.session_manage import SessionManageCog
     from .cogs.skill_command import SkillCommandCog
     from .database.ask_repo import PendingAskRepository
+    from .database.channel_repo import ChannelRepository
     from .database.lounge_repo import LoungeRepository
     from .database.models import init_db
     from .database.repository import SessionRepository
@@ -213,6 +215,18 @@ async def setup_bridge(
     )
     await bot.add_cog(session_manage_cog)
     logger.info("Registered SessionManageCog")
+
+    # --- ChannelRepoCog (per-channel repo bindings, zero-config) ---
+    channel_repo = ChannelRepository(session_db_path)
+    await channel_repo.init_db()
+    channel_repo_cog = ChannelRepoCog(
+        bot,
+        repo=channel_repo,
+        allowed_user_ids=allowed_user_ids,
+        session_dir_base=session_dir_base,
+    )
+    await bot.add_cog(channel_repo_cog)
+    logger.info("Registered ChannelRepoCog")
 
     # --- SkillCommandCog (requires channel ID) ---
     if claude_channel_id is not None:
