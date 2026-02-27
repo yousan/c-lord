@@ -1,23 +1,24 @@
 # c-lord (c-lord)
 
-Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a personal bot.**
+Discord frontend for Claude Code CLI. **スタンドアロンで動作するパッケージ** — clone して `.env` を設定すれば即利用可能。
 
 **略称: c-lord** (c-lord)
 
-## Framework vs Instance
+## パッケージとしての位置づけ
 
-- **c-lord** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
-- Personal instances (e.g. EbiBot) install this as a package and import the Cog. The instance repo handles server-specific config, additional Cogs, and secrets.
-- When adding features: if it's useful to anyone → add here. If it's personal workflow → add in the instance repo.
+- **c-lord** (this repo) = すぐに使えるスタンドアロンパッケージ。`main.py` で起動すれば Discord ボットとして動作する。
+- `setup_bridge()` 経由で既存の discord.py ボットに組み込むこともできる（ライブラリとしての利用）。
+- **`main.py` 起動が標準**: ドキュメントに記載された機能は `main.py` 起動で動作することを前提とする。`main.py` で登録されていない Cog の機能は「使える」とは言えない。
+- No personal config, no secrets, no server-specific logic in this repo.
 
 ### Zero-Config Principle (Critical)
 
-**Consumers must get new features by updating the package alone — no code changes required.**
+**利用者はパッケージを更新するだけで新機能が使えるようになること。コード変更は不要。**
 
 - New features should be enabled by default (auto-discovery, sensible defaults)
 - New constructor parameters must have backward-compatible defaults (`= None`)
+- **`main.py` に Cog が登録されていなければ、その機能は利用者に提供されていないのと同じ**
 - If a feature requires consumers to wire something up, the design is wrong — fix it in c-lord
-- Consumers should NEVER need to copy, wrap, or subclass c-lord Cogs. If they do, c-lord is missing an extension point
 
 ## Architecture
 

@@ -86,26 +86,29 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 
 ## Slash Commands
 
-| Command | Description |
-|---------|-------------|
-| `/clord <prompt>` | Start a new Claude Code session |
-| `/clord-attach <window>` | Attach a tmux window to the current thread |
-| `/skill <name> [args]` | Run a Claude Code skill (with autocomplete) |
-| `/stop` | Stop the current session (preserves it for resume) |
-| `/sessions` | List sessions (filter by origin, time window) |
-| `/sync-sessions` | Import CLI sessions as Discord threads |
-| `/resume-info` | Show the CLI command to continue this session in a terminal |
-| `/model-show` | Show current model (global + per-thread) |
-| `/model-set <model>` | Change model for all new sessions |
-| `/worktree-list` | Show active session worktrees |
-| `/worktree-cleanup` | Remove orphaned clean worktrees |
-| `/upgrade` | Trigger bot upgrade (if enabled) |
+| Command | Description | Status |
+|---------|-------------|--------|
+| `/clord <prompt>` | Start a new Claude Code session | Available |
+| `/clord-attach <window>` | Attach a tmux window to the current thread | Available |
+| `/stop` | Stop the current session (preserves it for resume) | Available |
+| `/clear` | Reset the Claude Code session for this thread | Available |
+| `/skill <name> [args]` | Run a Claude Code skill (with autocomplete) | Planned |
+| `/sessions` | List sessions (filter by origin, time window) | Planned |
+| `/sync-sessions` | Import CLI sessions as Discord threads | Planned |
+| `/resume-info` | Show the CLI command to continue this session in a terminal | Planned |
+| `/model-show` | Show current model (global + per-thread) | Planned |
+| `/model-set <model>` | Change model for all new sessions | Planned |
+| `/worktree-list` | Show active session worktrees | Planned |
+| `/worktree-cleanup` | Remove orphaned clean worktrees | Planned |
+| `/upgrade` | Trigger bot upgrade (if enabled) | Planned |
+
+> **Note:** Commands marked "Planned" are implemented in the codebase but not yet enabled in the standard startup (`main.py`). They will be available in a future release.
 
 ### Text Commands
 
-| Command | Description |
-|---------|-------------|
-| `!attach <window>` | Attach a tmux window (same as `/clord-attach`) |
+| Command | Description | Status |
+|---------|-------------|--------|
+| `!attach <window>` | Attach a tmux window (same as `/clord-attach`) | Available |
 
 ---
 
