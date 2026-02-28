@@ -103,6 +103,8 @@ class ApiServer:
         self.app.router.add_post("/api/lounge", self.post_lounge)
         # Session spawn route
         self.app.router.add_post("/api/spawn", self.spawn)
+        # Thread message route (CLI input forwarding)
+        self.app.router.add_post("/api/threads/{thread_id}/messages", self.post_thread_message)
         # Startup resume routes
         self.app.router.add_post("/api/mark-resume", self.mark_resume)
 
@@ -591,6 +593,58 @@ class ApiServer:
             session_id,
         )
         return web.json_response({"status": "marked", "id": row_id}, status=201)
+
+    # ------------------------------------------------------------------
+    # Thread message endpoint (/api/threads/{thread_id}/messages)
+    # ------------------------------------------------------------------
+
+    async def post_thread_message(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/messages — post a message to a Discord thread.
+
+        Enables external Claude Code instances (CLI, tmux) to forward human
+        inputs to a Discord thread, creating a complete conversation log.
+
+        Body (JSON):
+            content: The message text to post (required).
+            source: Label for the input source (optional; "cli", "tmux", "api").
+                    Defaults to "cli".
+
+        Returns (200):
+            ``{"status": "sent"}``
+        """
+        try:
+            thread_id = int(request.match_info["thread_id"])
+        except (ValueError, KeyError):
+            return web.json_response({"error": "Invalid thread_id"}, status=400)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        content = (data.get("content") or "").strip()
+        if not content:
+            return web.json_response({"error": "content is required"}, status=400)
+
+        source = str(data.get("source", "cli")).strip() or "cli"
+
+        # Resolve the thread/channel
+        raw = self.bot.get_channel(thread_id)
+        if raw is None:
+            try:
+                raw = await self.bot.fetch_channel(thread_id)
+            except Exception:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+        if not hasattr(raw, "send"):
+            return web.json_response({"error": "Channel is not messageable"}, status=400)
+
+        # Format and send — use subdued markdown so it's visually distinct
+        # from bot/Claude messages but doesn't overwhelm the thread.
+        formatted = f"-# \U0001f4bb ({source}) {content}"
+        await raw.send(formatted)  # type: ignore[union-attr]
+
+        return web.json_response({"status": "sent"})
 
     async def _send_lounge_to_discord(self, label: str, message: str, posted_at: str) -> None:
         """Send a lounge message to the configured Discord lounge channel."""
