@@ -25,7 +25,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..claude.runner import ClaudeRunner
+from ..claude.config import ClaudeConfig
+from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
 from ._run_helper import run_claude_with_config
@@ -89,7 +90,7 @@ class SkillCommandCog(commands.Cog):
         self,
         bot: commands.Bot,
         repo: SessionRepository,
-        runner: ClaudeRunner,
+        runner: ClaudeConfig,
         claude_channel_id: int,
         skills_dir: Path | str | None = None,
         allowed_user_ids: set[int] | None = None,
@@ -182,6 +183,17 @@ class SkillCommandCog(commands.Cog):
             choices.append(app_commands.Choice(name=label[:100], value=s["name"]))
         return choices
 
+    def _make_runner(self, tmux: TmuxSessionManager, thread_id: int) -> TmuxClaudeRunner:
+        """Create a TmuxClaudeRunner from the stored config and resolved tmux manager."""
+        return TmuxClaudeRunner(
+            tmux_manager=tmux,
+            thread_id=thread_id,
+            model=self.runner.model,
+            working_dir=self.runner.working_dir,
+            timeout_seconds=self.runner.timeout_seconds,
+            dangerously_skip_permissions=True,
+        )
+
     def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:
         """Check if the channel is a thread under the configured claude channel."""
         return isinstance(channel, discord.Thread) and channel.parent_id == self.claude_channel_id
@@ -235,6 +247,12 @@ class SkillCommandCog(commands.Cog):
             sdm = await self._resolve_session_dir_manager(parent_channel_id)
             tmux = await self._resolve_tmux_manager(parent_channel_id)
 
+            if tmux is None:
+                await interaction.followup.send(
+                    "⚠️ tmux is not configured for this channel.", ephemeral=True
+                )
+                return
+
             session_id = None
             record = await self.repo.get(channel.id)
             if record:
@@ -243,7 +261,7 @@ class SkillCommandCog(commands.Cog):
             display = f"`/{name} {args}`" if args else f"`/{name}`"
             await interaction.followup.send(f"Running {display} in this thread…")
 
-            runner = self.runner.clone()
+            runner = self._make_runner(tmux, channel.id)
             await run_claude_with_config(
                 RunConfig(
                     thread=channel,
@@ -269,7 +287,7 @@ class SkillCommandCog(commands.Cog):
         tmux = await self._resolve_tmux_manager(channel.id)
 
         # Unbound channel check
-        if sdm is None and tmux is None:
+        if tmux is None:
             await interaction.followup.send(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
                 "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
@@ -287,7 +305,7 @@ class SkillCommandCog(commands.Cog):
         display = f"`/{name} {args}`" if args else f"`/{name}`"
         await interaction.followup.send(f"Running {display} → {thread.mention}")
 
-        runner = self.runner.clone()
+        runner = self._make_runner(tmux, thread.id)
         await run_claude_with_config(
             RunConfig(
                 thread=thread,

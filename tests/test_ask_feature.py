@@ -1,20 +1,16 @@
 """Tests for AskUserQuestion Discord integration.
 
 Covers:
-- types: AskOption, AskQuestion, ToolCategory.ASK
-- parser: AskUserQuestion tool_use → ask_questions
+- types: AskOption, AskQuestion, ToolCategory.ASK, _parse_ask_questions
 - embeds: ask_embed
 - run_helper: _collect_ask_answers (answer formatting)
 """
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
-from c_lord.claude.parser import _parse_ask_questions, parse_line
-from c_lord.claude.types import AskOption, AskQuestion, ToolCategory
+from c_lord.claude.types import AskOption, AskQuestion, ToolCategory, _parse_ask_questions
 from c_lord.discord_ui.embeds import ask_embed
 
 # ---------------------------------------------------------------------------
@@ -46,131 +42,11 @@ class TestAskTypes:
 
 
 # ---------------------------------------------------------------------------
-# parser
+# _parse_ask_questions
 # ---------------------------------------------------------------------------
 
-_ASK_LINE = json.dumps(
-    {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "toolu_ask1",
-                    "name": "AskUserQuestion",
-                    "input": {
-                        "questions": [
-                            {
-                                "question": "Which auth approach?",
-                                "header": "Auth method",
-                                "multiSelect": False,
-                                "options": [
-                                    {
-                                        "label": "JWT tokens",
-                                        "description": "Stateless, good for APIs",
-                                    },
-                                    {
-                                        "label": "Session cookies",
-                                        "description": "Simple, stateful",
-                                    },
-                                    {
-                                        "label": "OAuth2",
-                                        "description": "Federated identity",
-                                    },
-                                ],
-                            }
-                        ]
-                    },
-                }
-            ]
-        },
-    }
-)
 
-
-class TestParserAskUserQuestion:
-    def test_ask_tool_use_detected(self) -> None:
-        event = parse_line(_ASK_LINE)
-        assert event is not None
-        assert event.tool_use is not None
-        assert event.tool_use.tool_name == "AskUserQuestion"
-        assert event.tool_use.category == ToolCategory.ASK
-
-    def test_ask_questions_populated(self) -> None:
-        event = parse_line(_ASK_LINE)
-        assert event is not None
-        assert event.ask_questions is not None
-        assert len(event.ask_questions) == 1
-
-    def test_question_fields(self) -> None:
-        event = parse_line(_ASK_LINE)
-        assert event is not None
-        q = event.ask_questions[0]
-        assert q.question == "Which auth approach?"
-        assert q.header == "Auth method"
-        assert q.multi_select is False
-
-    def test_options_parsed(self) -> None:
-        event = parse_line(_ASK_LINE)
-        assert event is not None
-        opts = event.ask_questions[0].options
-        assert len(opts) == 3
-        assert opts[0].label == "JWT tokens"
-        assert opts[0].description == "Stateless, good for APIs"
-        assert opts[2].label == "OAuth2"
-
-    def test_normal_tool_has_no_ask_questions(self) -> None:
-        line = json.dumps(
-            {
-                "type": "assistant",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_bash",
-                            "name": "Bash",
-                            "input": {"command": "ls"},
-                        }
-                    ]
-                },
-            }
-        )
-        event = parse_line(line)
-        assert event is not None
-        assert event.ask_questions is None
-
-    def test_multi_select_question(self) -> None:
-        line = json.dumps(
-            {
-                "type": "assistant",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_ask2",
-                            "name": "AskUserQuestion",
-                            "input": {
-                                "questions": [
-                                    {
-                                        "question": "Which features?",
-                                        "header": "Features",
-                                        "multiSelect": True,
-                                        "options": [
-                                            {"label": "Auth"},
-                                            {"label": "Logging"},
-                                        ],
-                                    }
-                                ]
-                            },
-                        }
-                    ]
-                },
-            }
-        )
-        event = parse_line(line)
-        assert event is not None
-        assert event.ask_questions[0].multi_select is True
-
+class TestParseAskQuestions:
     def test_empty_options_list(self) -> None:
         tool_input = {"questions": [{"question": "Free form?", "options": []}]}
         questions = _parse_ask_questions(tool_input)
@@ -205,6 +81,46 @@ class TestParserAskUserQuestion:
         assert len(questions) == 2
         assert questions[0].question == "Q1?"
         assert questions[1].question == "Q2?"
+
+    def test_full_parse(self) -> None:
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which auth approach?",
+                    "header": "Auth method",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "JWT tokens", "description": "Stateless, good for APIs"},
+                        {"label": "Session cookies", "description": "Simple, stateful"},
+                        {"label": "OAuth2", "description": "Federated identity"},
+                    ],
+                }
+            ]
+        }
+        questions = _parse_ask_questions(tool_input)
+        assert len(questions) == 1
+        q = questions[0]
+        assert q.question == "Which auth approach?"
+        assert q.header == "Auth method"
+        assert q.multi_select is False
+        assert len(q.options) == 3
+        assert q.options[0].label == "JWT tokens"
+        assert q.options[0].description == "Stateless, good for APIs"
+        assert q.options[2].label == "OAuth2"
+
+    def test_multi_select_question(self) -> None:
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which features?",
+                    "header": "Features",
+                    "multiSelect": True,
+                    "options": [{"label": "Auth"}, {"label": "Logging"}],
+                }
+            ]
+        }
+        questions = _parse_ask_questions(tool_input)
+        assert questions[0].multi_select is True
 
 
 # ---------------------------------------------------------------------------

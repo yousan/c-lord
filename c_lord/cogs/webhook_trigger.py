@@ -25,7 +25,7 @@ from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
 
 if TYPE_CHECKING:
-    from ..claude.runner import ClaudeRunner
+    from ..claude.config import ClaudeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,9 @@ class WebhookTrigger:
 
     Attributes:
         prompt: The Claude Code prompt to execute when triggered.
-        working_dir: Override ClaudeRunner's working directory.
-        timeout: Override ClaudeRunner's timeout in seconds.
-        allowed_tools: Override ClaudeRunner's allowed tools list.
+        working_dir: Override the default working directory.
+        timeout: Override the default timeout in seconds.
+        allowed_tools: Override the default allowed tools list.
         dangerously_skip_permissions: Whether to skip Claude Code permission checks.
     """
 
@@ -57,7 +57,7 @@ class WebhookTriggerCog(commands.Cog):
 
     Args:
         bot: The Discord bot instance.
-        runner: Base ClaudeRunner to clone for each trigger execution.
+        runner: ClaudeConfig with CLI settings.
         triggers: Mapping of prefix string → WebhookTrigger configuration.
         allowed_webhook_ids: Optional set of allowed Discord webhook IDs.
             If None, all webhooks are accepted.
@@ -68,7 +68,7 @@ class WebhookTriggerCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
-        runner: ClaudeRunner,
+        runner: ClaudeConfig,
         triggers: dict[str, WebhookTrigger],
         allowed_webhook_ids: set[int] | None = None,
         channel_ids: set[int] | None = None,
@@ -130,6 +130,15 @@ class WebhookTriggerCog(commands.Cog):
         async with lock:
             await self._execute_trigger(message, matched_prefix, matched_trigger)
 
+    async def _resolve_tmux_manager(self, channel_id: int):
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog.resolve_tmux_manager(channel_id)
+        return None
+
     async def _execute_trigger(
         self,
         message: discord.Message,
@@ -137,15 +146,23 @@ class WebhookTriggerCog(commands.Cog):
         trigger: WebhookTrigger,
     ) -> None:
         """Execute a matched trigger via Claude Code."""
+        from ..claude.tmux_runner import TmuxClaudeRunner
+
         thread = await message.create_thread(name=prefix[:100])
 
-        runner = self.runner.clone()
-        runner.dangerously_skip_permissions = trigger.dangerously_skip_permissions
-        runner.timeout_seconds = trigger.timeout
-        if trigger.working_dir:
-            runner.working_dir = trigger.working_dir
-        if trigger.allowed_tools is not None:
-            runner.allowed_tools = trigger.allowed_tools
+        tmux = await self._resolve_tmux_manager(message.channel.id)
+        if tmux is None:
+            await thread.send("⚠️ tmux is not configured for this channel.")
+            return
+
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux,
+            thread_id=thread.id,
+            model=self.runner.model,
+            working_dir=trigger.working_dir or self.runner.working_dir,
+            timeout_seconds=trigger.timeout,
+            dangerously_skip_permissions=trigger.dangerously_skip_permissions,
+        )
 
         self._active_count += 1
         try:

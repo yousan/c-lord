@@ -25,7 +25,7 @@ from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
 if TYPE_CHECKING:
-    from ..claude.runner import ClaudeRunner
+    from ..claude.config import ClaudeConfig
     from ..database.task_repo import TaskRepository
 
 logger = logging.getLogger(__name__)
@@ -39,14 +39,14 @@ class SchedulerCog(commands.Cog):
 
     Args:
         bot: The Discord bot instance.
-        runner: Base ClaudeRunner to clone per task execution.
+        runner: ClaudeConfig with CLI settings.
         repo: TaskRepository for reading/updating scheduled tasks.
     """
 
     def __init__(
         self,
         bot: commands.Bot,
-        runner: ClaudeRunner,
+        runner: ClaudeConfig,
         *,
         repo: TaskRepository,
     ) -> None:
@@ -93,8 +93,19 @@ class SchedulerCog(commands.Cog):
     async def _before_master_loop(self) -> None:
         await self.bot.wait_until_ready()
 
+    async def _resolve_tmux_manager(self, channel_id: int):
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog.resolve_tmux_manager(channel_id)
+        return None
+
     async def _run_task(self, task: dict) -> None:
         """Execute a single scheduled task in a Discord thread."""
+        from ..claude.tmux_runner import TmuxClaudeRunner
+
         task_id: int = task["id"]
         self._running.add(task_id)
         try:
@@ -111,6 +122,16 @@ class SchedulerCog(commands.Cog):
                 logger.warning("SchedulerCog: channel %d is not a TextChannel", task["channel_id"])
                 return
 
+            tmux = await self._resolve_tmux_manager(channel.id)
+            if tmux is None:
+                logger.warning(
+                    "SchedulerCog: no tmux manager for channel %d, task %d (%s)",
+                    task["channel_id"],
+                    task_id,
+                    task["name"],
+                )
+                return
+
             # Post a starter message first so the thread appears in the channel
             # timeline and shows up in the left sidebar under the parent channel.
             # channel.create_thread() without a message only appears in the
@@ -120,15 +141,21 @@ class SchedulerCog(commands.Cog):
                 name=f"[Scheduled] {task['name']}",
             )
 
-            cloned = self.runner.clone()
-            if task.get("working_dir"):
-                cloned.working_dir = task["working_dir"]
+            working_dir = task.get("working_dir") or self.runner.working_dir
+            runner = TmuxClaudeRunner(
+                tmux_manager=tmux,
+                thread_id=thread.id,
+                model=self.runner.model,
+                working_dir=working_dir,
+                timeout_seconds=self.runner.timeout_seconds,
+                dangerously_skip_permissions=True,
+            )
 
             registry = getattr(self.bot, "session_registry", None)
             await run_claude_with_config(
                 RunConfig(
                     thread=thread,
-                    runner=cloned,
+                    runner=runner,
                     repo=None,  # scheduled tasks don't persist session state
                     prompt=task["prompt"],
                     session_id=None,

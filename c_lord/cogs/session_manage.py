@@ -80,7 +80,7 @@ class SessionManageCog(commands.Cog):
         self.repo = repo
         self.cli_sessions_path = cli_sessions_path
         self.settings_repo = settings_repo
-        # Optional ClaudeRunner reference for reading the default model.
+        # Optional ClaudeConfig reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
 

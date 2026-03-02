@@ -50,17 +50,6 @@ class TestChannelRepoSave:
         assert binding is not None
         assert binding["channel_id"] == 100
         assert binding["source_repo"] == "https://github.com/org/repo.git"
-        assert binding["clone_branch"] is None
-
-    async def test_save_with_branch(self, repo: ChannelRepository) -> None:
-        await repo.save(
-            channel_id=200,
-            source_repo="https://github.com/org/repo.git",
-            clone_branch="develop",
-        )
-        binding = await repo.get(200)
-        assert binding is not None
-        assert binding["clone_branch"] == "develop"
 
     async def test_save_upsert(self, repo: ChannelRepository) -> None:
         await repo.save(channel_id=300, source_repo="https://github.com/org/old.git")
@@ -128,15 +117,6 @@ class TestChannelRepoCogResolveManager:
         m2 = await cog.resolve_manager(100)
         assert m1 is m2  # same object from cache
 
-    async def test_resolve_with_branch(self, cog: ChannelRepoCog, repo: ChannelRepository) -> None:
-        await repo.save(
-            channel_id=200,
-            source_repo="/tmp/fake-repo.git",
-            clone_branch="develop",
-        )
-        manager = await cog.resolve_manager(200)
-        assert manager is not None
-        assert manager._clone_branch == "develop"
 
 
 # ===========================================================================
@@ -168,29 +148,6 @@ class TestDeriveSessionName:
 
 
 # ===========================================================================
-# ChannelRepository tmux_session_name tests
-# ===========================================================================
-
-
-class TestChannelRepoSaveTmux:
-    async def test_save_with_tmux_session_name(self, repo: ChannelRepository) -> None:
-        await repo.save(
-            channel_id=700,
-            source_repo="https://github.com/org/repo.git",
-            tmux_session_name="my-session",
-        )
-        binding = await repo.get(700)
-        assert binding is not None
-        assert binding["tmux_session_name"] == "my-session"
-
-    async def test_save_without_tmux_session_name(self, repo: ChannelRepository) -> None:
-        await repo.save(channel_id=800, source_repo="https://github.com/org/repo.git")
-        binding = await repo.get(800)
-        assert binding is not None
-        assert binding["tmux_session_name"] is None
-
-
-# ===========================================================================
 # ChannelRepoCog tmux manager tests
 # ===========================================================================
 
@@ -199,18 +156,6 @@ class TestChannelRepoCogResolveTmuxManager:
     async def test_resolve_returns_none_without_binding(self, cog: ChannelRepoCog) -> None:
         manager = await cog.resolve_tmux_manager(999)
         assert manager is None
-
-    async def test_resolve_from_binding_explicit_name(
-        self, cog: ChannelRepoCog, repo: ChannelRepository
-    ) -> None:
-        await repo.save(
-            channel_id=100,
-            source_repo="https://github.com/org/my-project.git",
-            tmux_session_name="custom-session",
-        )
-        manager = await cog.resolve_tmux_manager(100)
-        assert manager is not None
-        assert manager.session_name == "custom-session"
 
     async def test_resolve_auto_derives_from_repo(
         self, cog: ChannelRepoCog, repo: ChannelRepository

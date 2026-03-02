@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from ..claude.runner import ClaudeRunner
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
 from ..database.ask_repo import PendingAskRepository
@@ -33,7 +32,7 @@ class RunConfig:
 
     Required fields:
         thread: Discord thread to post results to.
-        runner: A fresh (cloned) ClaudeRunner instance.
+        runner: A TmuxClaudeRunner instance for this thread.
         prompt: The user's message or skill invocation.
 
     Optional fields:
@@ -57,7 +56,7 @@ class RunConfig:
     """
 
     thread: discord.Thread
-    runner: ClaudeRunner | TmuxClaudeRunner
+    runner: TmuxClaudeRunner
     prompt: str
     session_id: str | None = None
     repo: SessionRepository | None = None

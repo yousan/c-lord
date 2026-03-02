@@ -97,8 +97,8 @@ _STRIP_PATTERNS = (
 class TmuxClaudeRunner:
     """Runs Claude Code inside a tmux window and streams output via capture-pane.
 
-    Provides the same public interface as ``ClaudeRunner`` (``run``,
-    ``interrupt``, ``kill``) so it can be used interchangeably.
+    This is the sole execution backend for c-lord.  It provides ``run``,
+    ``interrupt``, and ``kill`` methods.
     """
 
     def __init__(
@@ -137,6 +137,16 @@ class TmuxClaudeRunner:
         7. Yield a final RESULT event with ``is_complete=True``.
         """
         self._stopped = False
+
+        # Emit a synthetic SYSTEM event so EventProcessor._on_system() saves
+        # the session_id to the DB.  Without this, thread replies are ignored
+        # because repo.get(thread_id) returns None.
+        synthetic_session_id = f"tmux-{self._thread_id}"
+        yield StreamEvent(
+            raw={},
+            message_type=MessageType.SYSTEM,
+            session_id=synthetic_session_id,
+        )
 
         # Start Claude or send a new prompt to an already-running instance.
         claude_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)

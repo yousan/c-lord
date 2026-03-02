@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from c_lord.claude.runner import ClaudeRunner
+from c_lord.claude.config import ClaudeConfig
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.cogs.webhook_trigger import WebhookTriggerCog
 from c_lord.protocols import DrainAware
@@ -19,14 +19,14 @@ class TestDrainAwareProtocol:
         cog = ClaudeChatCog(
             bot=bot,
             repo=MagicMock(),
-            runner=MagicMock(spec=ClaudeRunner),
+            runner=MagicMock(spec=ClaudeConfig),
         )
         assert isinstance(cog, DrainAware)
 
     def test_webhook_trigger_cog_satisfies_protocol(self) -> None:
         cog = WebhookTriggerCog(
             bot=MagicMock(),
-            runner=MagicMock(spec=ClaudeRunner),
+            runner=MagicMock(spec=ClaudeConfig),
             triggers={},
         )
         assert isinstance(cog, DrainAware)

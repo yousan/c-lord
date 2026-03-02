@@ -13,6 +13,7 @@ Bot → Channel (= 1 リポジトリ + 1 tmux session) → Thread (= 1 tmux wind
 - **Channel ↔ リポジトリ**: 各 Discord チャンネルは `/clord-init` で git リポジトリに紐づけます。紐づけはデータベースに保存されます。
 - **Thread ↔ セッション**: 各 Discord スレッドは Claude Code セッションと 1:1 で対応します。スレッド内の返信は `--resume` で同じセッションを継続します。
 - **未設定チャンネル**: `/clord-init` で紐づけのないチャンネルで `/clord` を実行するとエラーが返され、先に紐づけを設定するよう案内されます。
+- **実行モード**: Claude Code は tmux TUI モードのみで動作します。レガシーの subprocess モードは v1.x で廃止されました。
 
 ## スラッシュコマンド
 
@@ -44,7 +45,7 @@ Bot → Channel (= 1 リポジトリ + 1 tmux session) → Thread (= 1 tmux wind
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
 | `/clord-init` | チャンネルとリポジトリの紐づけを一覧表示 | 任意のチャンネル |
-| `/clord-init repo:<url> [branch:<名前>] [tmux_session:<名前>]` | このチャンネルを git リポジトリに紐づけ | 任意のチャンネル |
+| `/clord-init repo:<url>` | このチャンネルを git リポジトリに紐づけ | 任意のチャンネル |
 | `/clord-init remove:True` | このチャンネルの紐づけを解除 | 任意のチャンネル |
 
 **サーバー管理**権限が必要です。チャンネルをリポジトリに紐づけると、そのチャンネルで開始されたセッションは自動的にそのリポジトリを作業ディレクトリとして使用します。

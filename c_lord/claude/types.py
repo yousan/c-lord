@@ -183,6 +183,48 @@ class StreamEvent:
     error: str | None = None
 
 
+def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
+    """Parse AskUserQuestion tool input into a list of AskQuestion objects."""
+    questions_raw = tool_input.get("questions", [])
+    result: list[AskQuestion] = []
+    for q in questions_raw:
+        options = [
+            AskOption(
+                label=o.get("label", ""),
+                description=o.get("description", ""),
+            )
+            for o in q.get("options", [])
+            if o.get("label")
+        ]
+        result.append(
+            AskQuestion(
+                question=q.get("question", ""),
+                header=q.get("header", ""),
+                multi_select=bool(q.get("multiSelect", False)),
+                options=options,
+            )
+        )
+    return result
+
+
+def _parse_todo_items(tool_input: dict[str, Any]) -> list[TodoItem]:
+    """Parse TodoWrite tool input into a list of TodoItem objects."""
+    todos_raw = tool_input.get("todos", [])
+    result: list[TodoItem] = []
+    for t in todos_raw:
+        content = t.get("content", "")
+        if not content:
+            continue
+        result.append(
+            TodoItem(
+                content=content,
+                status=t.get("status", "pending"),
+                active_form=t.get("activeForm", ""),
+            )
+        )
+    return result
+
+
 @dataclass
 class SessionState:
     """Tracks the state of a Claude Code session during a single run.
