@@ -146,20 +146,6 @@ class TestCreateSessionDir:
         assert result == str(session_dir)
         mock_run.assert_not_called()
 
-    def test_clone_with_branch(self, tmp_path: Path) -> None:
-        base = str(tmp_path / "sessions")
-
-        mock_result = MagicMock(returncode=0, stderr="")
-        with patch("c_lord.session_dir._run", return_value=mock_result) as mock_run:
-            mgr = SessionDirManager(base_dir=base, source_repo="/repo", clone_branch="develop")
-            Path(base).mkdir(parents=True)
-            mgr.create_session_dir(12345)
-
-        call_args = mock_run.call_args[0][0]
-        assert "-b" in call_args
-        idx = call_args.index("-b")
-        assert call_args[idx + 1] == "develop"
-
     def test_clone_failure_raises(self, tmp_path: Path) -> None:
         base = str(tmp_path / "sessions")
 

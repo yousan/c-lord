@@ -27,7 +27,7 @@ def thread() -> MagicMock:
 
 @pytest.fixture
 def runner() -> MagicMock:
-    """A MagicMock ClaudeRunner with interrupt() wired up."""
+    """A MagicMock runner (TmuxClaudeRunner) with interrupt() wired up."""
     r = MagicMock()
     r.interrupt = AsyncMock()
     return r

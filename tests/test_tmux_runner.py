@@ -726,9 +726,11 @@ class TestTmuxClaudeRunnerRun:
         async for event in runner.run("test"):
             events.append(event)
 
-        assert len(events) == 1
-        assert events[0].is_complete
-        assert events[0].error == "Failed to start Claude in tmux"
+        assert len(events) == 2
+        assert events[0].message_type == MessageType.SYSTEM
+        assert events[0].session_id == "tmux-12345"
+        assert events[-1].is_complete
+        assert events[-1].error == "Failed to start Claude in tmux"
 
     @pytest.mark.asyncio
     async def test_send_input_failure_yields_error(self, runner, tmux_manager) -> None:
@@ -739,9 +741,11 @@ class TestTmuxClaudeRunnerRun:
         async for event in runner.run("test"):
             events.append(event)
 
-        assert len(events) == 1
-        assert events[0].is_complete
-        assert events[0].error == "Failed to send input to Claude in tmux"
+        assert len(events) == 2
+        assert events[0].message_type == MessageType.SYSTEM
+        assert events[0].session_id == "tmux-12345"
+        assert events[-1].is_complete
+        assert events[-1].error == "Failed to send input to Claude in tmux"
 
     @pytest.mark.asyncio
     async def test_extracted_text_yielded_as_partial(self, runner, tmux_manager) -> None:

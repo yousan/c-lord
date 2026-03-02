@@ -4,12 +4,12 @@ Built entirely by Claude Code itself. See README.md for details.
 
 Quick start::
 
-    from c_lord import ClaudeChatCog, ClaudeRunner, SessionRepository
+    from c_lord import ClaudeChatCog, ClaudeConfig, SessionRepository
 
 """
 
-from .claude.parser import parse_line
-from .claude.runner import ClaudeRunner
+from .claude.config import ClaudeConfig
+from .claude.tmux_runner import TmuxClaudeRunner
 from .claude.types import MessageType, StreamEvent, ToolCategory, ToolUseEvent
 from .cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
 from .cogs.channel_repo import ChannelRepoCog
@@ -42,7 +42,8 @@ from .tmux import TmuxSessionManager
 
 __all__ = [
     # Core
-    "ClaudeRunner",
+    "ClaudeConfig",
+    "TmuxClaudeRunner",
     "ClaudeChatCog",
     "ChannelRepoCog",
     "ChannelRepository",
@@ -75,8 +76,6 @@ __all__ = [
     "StreamEvent",
     "ToolCategory",
     "ToolUseEvent",
-    # Parsing
-    "parse_line",
     # Session Management
     "SessionDirManager",
     "SessionDirInfo",

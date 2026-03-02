@@ -13,7 +13,7 @@ from .embeds import stopped_embed
 logger = logging.getLogger(__name__)
 
 # Protocol-compatible type: any object with an async interrupt() method.
-# Both ClaudeRunner and TmuxClaudeRunner satisfy this.
+# TmuxClaudeRunner satisfies this.
 
 
 @runtime_checkable

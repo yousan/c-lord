@@ -684,7 +684,7 @@ class TestActiveSessionCount:
     """Tests for ClaudeChatCog.active_session_count property."""
 
     def test_count_starts_at_zero(self) -> None:
-        from c_lord.claude.runner import ClaudeRunner
+        from c_lord.claude.config import ClaudeConfig
         from c_lord.cogs.claude_chat import ClaudeChatCog
 
         bot = MagicMock()
@@ -692,12 +692,12 @@ class TestActiveSessionCount:
         cog = ClaudeChatCog(
             bot=bot,
             repo=MagicMock(),
-            runner=MagicMock(spec=ClaudeRunner),
+            runner=MagicMock(spec=ClaudeConfig),
         )
         assert cog.active_session_count == 0
 
     def test_count_reflects_runners(self) -> None:
-        from c_lord.claude.runner import ClaudeRunner
+        from c_lord.claude.config import ClaudeConfig
         from c_lord.cogs.claude_chat import ClaudeChatCog
 
         bot = MagicMock()
@@ -705,7 +705,7 @@ class TestActiveSessionCount:
         cog = ClaudeChatCog(
             bot=bot,
             repo=MagicMock(),
-            runner=MagicMock(spec=ClaudeRunner),
+            runner=MagicMock(spec=ClaudeConfig),
         )
         cog._active_runners[1] = MagicMock()
         cog._active_runners[2] = MagicMock()

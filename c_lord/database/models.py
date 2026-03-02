@@ -63,8 +63,6 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
 CREATE TABLE IF NOT EXISTS channel_repo_bindings (
     channel_id         INTEGER PRIMARY KEY,
     source_repo        TEXT    NOT NULL,
-    clone_branch       TEXT,
-    tmux_session_name  TEXT,
     created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -105,6 +103,9 @@ _MIGRATIONS = [
     ),
     # tmux_session_name column for per-channel tmux session isolation
     "ALTER TABLE channel_repo_bindings ADD COLUMN tmux_session_name TEXT",
+    # Drop unused columns (requires SQLite 3.35.0+; suppressed on older versions)
+    "ALTER TABLE channel_repo_bindings DROP COLUMN clone_branch",
+    "ALTER TABLE channel_repo_bindings DROP COLUMN tmux_session_name",
 ]
 
 

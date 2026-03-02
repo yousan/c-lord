@@ -19,8 +19,11 @@ def _make_bot() -> MagicMock:
 
 
 def _make_runner() -> MagicMock:
+    """Create a mock ClaudeConfig with required attributes."""
     runner = MagicMock()
-    runner.clone.return_value = runner
+    runner.model = "sonnet"
+    runner.working_dir = None
+    runner.timeout_seconds = 300
     return runner
 
 
@@ -127,6 +130,7 @@ class TestSchedulerCogMasterLoop:
         mock_channel.send = AsyncMock(return_value=mock_starter_msg)
 
         cog.bot.get_channel = MagicMock(return_value=mock_channel)
+        cog._resolve_tmux_manager = AsyncMock(return_value=MagicMock())
 
         with patch(
             "c_lord.cogs.scheduler.run_claude_with_config", new_callable=AsyncMock

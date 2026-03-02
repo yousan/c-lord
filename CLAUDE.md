@@ -127,7 +127,7 @@ This project runs arbitrary Claude Code sessions. Security is non-negotiable.
 - **Environment stripping**: `DISCORD_BOT_TOKEN` and other secrets are removed from the subprocess env so Claude's Bash tool can't read them
 - **No `dangerously_skip_permissions` by default**: This flag exists for advanced users who understand the risk
 
-If you modify `runner.py`, `_run_helper.py`, or any Cog, the security audit is **mandatory** before committing.
+If you modify `tmux_runner.py`, `_run_helper.py`, or any Cog, the security audit is **mandatory** before committing.
 
 ### Naming
 
@@ -172,8 +172,8 @@ c_lord/          # Installable Python package
     scheduler.py         # Scheduled task executor (SQLite-backed, master loop)
     _run_helper.py       # Shared Claude CLI execution logic (DRY)
   claude/
-    runner.py            # Claude CLI subprocess manager
-    parser.py            # stream-json event parser
+    config.py            # ClaudeConfig dataclass (CLI settings)
+    tmux_runner.py       # Claude Code tmux TUI runner (capture-pane)
     types.py             # Type definitions for SDK messages
   database/
     models.py            # SQLite schema

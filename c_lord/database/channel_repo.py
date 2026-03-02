@@ -16,8 +16,6 @@ CHANNEL_REPO_SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel_repo_bindings (
     channel_id         INTEGER PRIMARY KEY,
     source_repo        TEXT    NOT NULL,
-    clone_branch       TEXT,
-    tmux_session_name  TEXT,
     created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -85,18 +83,16 @@ class ChannelRepository:
         self,
         channel_id: int,
         source_repo: str,
-        clone_branch: str | None = None,
-        tmux_session_name: str | None = None,
     ) -> None:
         """Insert or replace a channel-repo binding."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """INSERT OR REPLACE INTO channel_repo_bindings
-                   (channel_id, source_repo, clone_branch, tmux_session_name,
+                   (channel_id, source_repo,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, datetime('now', 'localtime'),
+                   VALUES (?, ?, datetime('now', 'localtime'),
                            datetime('now', 'localtime'))""",
-                (channel_id, source_repo, clone_branch, tmux_session_name),
+                (channel_id, source_repo),
             )
             await db.commit()
         logger.info("Saved channel binding: channel=%d repo=%s", channel_id, source_repo)

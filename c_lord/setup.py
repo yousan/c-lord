@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
 
-    from .claude.runner import ClaudeRunner
+    from .claude.config import ClaudeConfig
     from .database.lounge_repo import LoungeRepository
     from .database.repository import SessionRepository
     from .database.resume_repo import PendingResumeRepository
@@ -31,11 +31,11 @@ class BridgeComponents:
     After calling setup_bridge(), pass this to apply_to_api_server() so the
     ApiServer gains access to all repos without manual wiring::
 
-        components = await setup_bridge(bot, runner, api_server=api_server)
+        components = await setup_bridge(bot, config, api_server=api_server)
 
     Or manually if you need more control::
 
-        components = await setup_bridge(bot, runner)
+        components = await setup_bridge(bot, config)
         components.apply_to_api_server(api_server)
     """
 
@@ -64,7 +64,7 @@ class BridgeComponents:
 
 async def setup_bridge(
     bot: Bot,
-    runner: ClaudeRunner,
+    runner: ClaudeConfig,
     *,
     api_server: ApiServer | None = None,
     session_db_path: str = "data/sessions.db",
@@ -77,7 +77,6 @@ async def setup_bridge(
     lounge_channel_id: int | None = None,
     session_dir_base: str | None = None,
     session_source_repo: str | None = None,
-    session_clone_branch: str | None = None,
     enable_tmux: bool = True,
 ) -> BridgeComponents:
     """Initialize and register all c-lord Cogs in one call.
@@ -93,7 +92,7 @@ async def setup_bridge(
 
     Args:
         bot: Discord bot instance.
-        runner: ClaudeRunner for Claude CLI invocation.
+        runner: ClaudeConfig with CLI invocation settings.
         api_server: Optional ApiServer to auto-wire repos into.  Also sets
                     runner.api_port so CLORD_API_URL is available to Claude.
         session_db_path: Path for session SQLite DB.
@@ -116,8 +115,6 @@ async def setup_bridge(
         session_source_repo: Git repository URL or local path to clone for
                              each session. Required when session_dir_base is set.
                              Defaults to SESSION_SOURCE_REPO env var.
-        session_clone_branch: Optional branch to clone. Defaults to
-                              SESSION_CLONE_BRANCH env var, or None (default branch).
         enable_tmux: Whether to enable tmux session management. Enabled by
                      default (degrades gracefully if tmux is not installed).
                      Set CLORD_TMUX_ENABLED to "false"/"0"/"no" to disable.
@@ -250,11 +247,9 @@ async def setup_bridge(
         resume_repo=resume_repo,
     )
 
-    # Auto-wire repos to ApiServer and set runner.api_port if provided
+    # Auto-wire repos to ApiServer if provided
     if api_server is not None:
         components.apply_to_api_server(api_server)
-        if runner.api_port is None:
-            runner.api_port = api_server.port
         logger.info("Auto-wired repos to ApiServer (port=%d)", api_server.port)
 
     return components

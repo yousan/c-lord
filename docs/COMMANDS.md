@@ -13,6 +13,7 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 - **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
 - **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
 - **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding will return an error directing the user to configure the binding first.
+- **Execution mode**: Claude Code runs exclusively in tmux TUI mode. The legacy subprocess mode was removed in v1.x.
 
 ## Slash Commands
 
@@ -44,7 +45,7 @@ Skills are predefined prompts stored in `~/.claude/skills/`. The `name` paramete
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/clord-init` | Show all channel-to-repo bindings | Any channel |
-| `/clord-init repo:<url> [branch:<name>] [tmux_session:<name>]` | Bind this channel to a git repository | Any channel |
+| `/clord-init repo:<url>` | Bind this channel to a git repository | Any channel |
 | `/clord-init remove:True` | Remove the binding for this channel | Any channel |
 
 Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory.

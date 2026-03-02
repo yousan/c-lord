@@ -8,9 +8,11 @@ import discord
 import pytest
 from discord.ext import commands
 
+from c_lord.claude.config import ClaudeConfig
 from c_lord.cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
 
 _PATCH_RUN = "c_lord.cogs.webhook_trigger.run_claude_with_config"
+_PATCH_TMUX_RUNNER = "c_lord.claude.tmux_runner.TmuxClaudeRunner"
 
 
 @pytest.fixture
@@ -19,19 +21,15 @@ def bot() -> MagicMock:
 
 
 @pytest.fixture
-def runner() -> MagicMock:
-    r = MagicMock()
-    r.command = "claude"
-    r.model = "sonnet"
-    r.permission_mode = "acceptEdits"
-    r.working_dir = "/home/user"
-    r.timeout_seconds = 300
-    r.allowed_tools = None
-    r.dangerously_skip_permissions = False
-    r.include_partial_messages = True
-    cloned = MagicMock()
-    r.clone.return_value = cloned
-    return r
+def runner() -> ClaudeConfig:
+    return ClaudeConfig(
+        command="claude",
+        model="sonnet",
+        permission_mode="acceptEdits",
+        working_dir="/home/user",
+        timeout_seconds=300,
+        dangerously_skip_permissions=False,
+    )
 
 
 @pytest.fixture
@@ -49,16 +47,25 @@ def triggers() -> dict[str, WebhookTrigger]:
 
 
 @pytest.fixture
+def tmux_manager() -> MagicMock:
+    """Mock TmuxSessionManager returned by _resolve_tmux_manager."""
+    return MagicMock()
+
+
+@pytest.fixture
 def cog(
     bot: MagicMock,
-    runner: MagicMock,
+    runner: ClaudeConfig,
     triggers: dict[str, WebhookTrigger],
+    tmux_manager: MagicMock,
 ) -> WebhookTriggerCog:
-    return WebhookTriggerCog(
+    c = WebhookTriggerCog(
         bot=bot,
         runner=runner,
         triggers=triggers,
     )
+    c._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
+    return c
 
 
 def _make_message(
@@ -97,8 +104,9 @@ class TestWebhookFiltering:
     async def test_ignores_unauthorized_webhook(
         self,
         bot: MagicMock,
-        runner: MagicMock,
+        runner: ClaudeConfig,
         triggers: dict[str, WebhookTrigger],
+        tmux_manager: MagicMock,
     ) -> None:
         """Unauthorized webhooks are ignored."""
         cog = WebhookTriggerCog(
@@ -107,6 +115,7 @@ class TestWebhookFiltering:
             triggers=triggers,
             allowed_webhook_ids={99999},
         )
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
         msg = _make_message(webhook_id=12345)
         with patch(_PATCH_RUN) as mock_run:
             await cog.on_message(msg)
@@ -116,8 +125,9 @@ class TestWebhookFiltering:
     async def test_accepts_authorized_webhook(
         self,
         bot: MagicMock,
-        runner: MagicMock,
+        runner: ClaudeConfig,
         triggers: dict[str, WebhookTrigger],
+        tmux_manager: MagicMock,
     ) -> None:
         """Authorized webhooks are processed."""
         cog = WebhookTriggerCog(
@@ -126,6 +136,7 @@ class TestWebhookFiltering:
             triggers=triggers,
             allowed_webhook_ids={12345},
         )
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
         msg = _make_message(webhook_id=12345)
         with patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run:
             mock_run.return_value = "session-123"
@@ -136,8 +147,9 @@ class TestWebhookFiltering:
     async def test_ignores_wrong_channel(
         self,
         bot: MagicMock,
-        runner: MagicMock,
+        runner: ClaudeConfig,
         triggers: dict[str, WebhookTrigger],
+        tmux_manager: MagicMock,
     ) -> None:
         """Messages in other channels are ignored."""
         cog = WebhookTriggerCog(
@@ -146,6 +158,7 @@ class TestWebhookFiltering:
             triggers=triggers,
             channel_ids={111},
         )
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
         msg = _make_message(channel_id=999)
         with patch(_PATCH_RUN) as mock_run:
             await cog.on_message(msg)
@@ -170,7 +183,6 @@ class TestTriggerExecution:
     async def test_matching_prefix_triggers_run(
         self,
         cog: WebhookTriggerCog,
-        runner: MagicMock,
     ) -> None:
         """A matching prefix should trigger Claude Code execution."""
         msg = _make_message(content="🔄 docs-sync")
@@ -221,22 +233,74 @@ class TestTriggerExecution:
             msg.add_reaction.assert_called_with("❌")
 
     @pytest.mark.asyncio
-    async def test_runner_clone_overrides(
+    async def test_tmux_runner_created_with_trigger_config(
         self,
         cog: WebhookTriggerCog,
-        runner: MagicMock,
+        tmux_manager: MagicMock,
     ) -> None:
-        """Trigger config should override cloned runner settings."""
+        """TmuxClaudeRunner should be created with trigger-specific config."""
         msg = _make_message(content="🔄 docs-sync")
-        cloned = runner.clone.return_value
-        with patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run:
+        with (
+            patch(_PATCH_TMUX_RUNNER) as mock_tmux_cls,
+            patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run,
+        ):
             mock_run.return_value = "session-abc"
             await cog.on_message(msg)
 
-            runner.clone.assert_called_once()
-            assert cloned.dangerously_skip_permissions is True
-            assert cloned.timeout_seconds == 600
-            assert cloned.working_dir == "/home/user/project"
+            mock_tmux_cls.assert_called_once()
+            call_kwargs = mock_tmux_cls.call_args[1]
+            assert call_kwargs["tmux_manager"] is tmux_manager
+            assert call_kwargs["model"] == "sonnet"
+            assert call_kwargs["working_dir"] == "/home/user/project"
+            assert call_kwargs["timeout_seconds"] == 600
+            assert call_kwargs["dangerously_skip_permissions"] is True
+
+    @pytest.mark.asyncio
+    async def test_tmux_runner_falls_back_to_config_working_dir(
+        self,
+        bot: MagicMock,
+        runner: ClaudeConfig,
+        tmux_manager: MagicMock,
+    ) -> None:
+        """When trigger has no working_dir, fall back to ClaudeConfig.working_dir."""
+        triggers = {
+            "🔄 deploy": WebhookTrigger(
+                prompt="Deploy to staging",
+            ),
+        }
+        cog = WebhookTriggerCog(bot=bot, runner=runner, triggers=triggers)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
+
+        msg = _make_message(content="🔄 deploy")
+        with (
+            patch(_PATCH_TMUX_RUNNER) as mock_tmux_cls,
+            patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run,
+        ):
+            mock_run.return_value = "session-abc"
+            await cog.on_message(msg)
+
+            call_kwargs = mock_tmux_cls.call_args[1]
+            assert call_kwargs["working_dir"] == "/home/user"
+
+    @pytest.mark.asyncio
+    async def test_tmux_not_configured_sends_warning(
+        self,
+        bot: MagicMock,
+        runner: ClaudeConfig,
+        triggers: dict[str, WebhookTrigger],
+    ) -> None:
+        """When _resolve_tmux_manager returns None, a warning is sent to the thread."""
+        cog = WebhookTriggerCog(bot=bot, runner=runner, triggers=triggers)
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+
+        msg = _make_message(content="🔄 docs-sync")
+        with patch(_PATCH_RUN, new_callable=AsyncMock) as mock_run:
+            await cog.on_message(msg)
+            mock_run.assert_not_called()
+
+        thread = msg.create_thread.return_value
+        thread.send.assert_called_once()
+        assert "tmux is not configured" in thread.send.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_prefix_starts_with_matching(
@@ -325,7 +389,7 @@ class TestActiveCount:
         self,
         cog: WebhookTriggerCog,
     ) -> None:
-        """active_count should decrement even if run_claude_in_thread raises."""
+        """active_count should decrement even if run_claude_with_config raises."""
         msg = _make_message(content="🔄 docs-sync")
 
         with (

@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .bot import ClaudeDiscordBot
-from .claude.runner import ClaudeRunner
+from .claude.config import ClaudeConfig
 from .setup import setup_bridge
 from .utils.logger import setup_logging
 
@@ -58,7 +58,7 @@ async def main() -> None:
     data_dir.mkdir(exist_ok=True)
     db_path = str(data_dir / "sessions.db")
 
-    runner = ClaudeRunner(
+    runner = ClaudeConfig(
         command=config["claude_command"],
         model=config["claude_model"],
         permission_mode=config["claude_permission_mode"],

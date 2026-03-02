@@ -32,7 +32,9 @@ def _make_cog(
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
     runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
+    runner.model = "sonnet"
+    runner.working_dir = None
+    runner.timeout_seconds = 300
 
     # Use a non-existent dir so _load_skills returns empty
     if skills_dir is None:
@@ -399,10 +401,16 @@ class TestNewThreadMode:
 
 
 class TestInThreadMode:
+    def _setup_in_thread_cog(self, cog: SkillCommandCog) -> None:
+        """Mock tmux/session_dir resolution for in-thread mode."""
+        cog._resolve_tmux_manager = AsyncMock(return_value=MagicMock())
+        cog._resolve_session_dir_manager = AsyncMock(return_value=MagicMock())
+
     @pytest.mark.asyncio
     async def test_resumes_session_in_thread(self) -> None:
         """When /skill is used inside a claude thread, resume the session."""
         cog = _make_cog(skills=[{"name": "recall", "description": ""}])
+        self._setup_in_thread_cog(cog)
         thread = _make_thread(thread_id=5555, parent_id=999)
         interaction = _make_interaction(channel=thread)
 
@@ -424,6 +432,7 @@ class TestInThreadMode:
     async def test_no_session_in_thread(self) -> None:
         """In-thread mode with no existing session passes session_id=None."""
         cog = _make_cog(skills=[{"name": "recall", "description": ""}])
+        self._setup_in_thread_cog(cog)
         thread = _make_thread(thread_id=5555, parent_id=999)
         interaction = _make_interaction(channel=thread)
         cog.repo.get = AsyncMock(return_value=None)
@@ -466,6 +475,7 @@ class TestInThreadMode:
     async def test_in_thread_with_args(self) -> None:
         """In-thread mode includes args in prompt."""
         cog = _make_cog(skills=[{"name": "todoist", "description": ""}])
+        self._setup_in_thread_cog(cog)
         thread = _make_thread(thread_id=5555, parent_id=999)
         interaction = _make_interaction(channel=thread)
         cog.repo.get = AsyncMock(return_value=None)

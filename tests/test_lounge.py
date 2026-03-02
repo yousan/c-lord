@@ -309,12 +309,10 @@ class TestLoungeApiEndpoints:
 class TestRunHelperLoungeInjection:
     """Verify that lounge context is injected as --append-system-prompt when lounge_repo is set."""
 
-    async def test_lounge_context_injected_as_system_prompt(self) -> None:
-        """When lounge_repo has messages, they appear in --append-system-prompt (not user prompt).
-
-        Lounge context is ephemeral metadata that must NOT accumulate in session history.
-        Injecting it via --append-system-prompt (system prompt) prevents the "Prompt is too
-        long" error that would otherwise occur in long-running sessions.
+    async def test_lounge_context_built_but_not_injected(self) -> None:
+        """When lounge_repo has messages, the context is built (side effect)
+        but NOT injected into the CLI — tmux TUI mode doesn't support
+        --append-system-prompt. The user prompt must be passed unchanged.
         """
         from c_lord.cogs._run_helper import run_claude_in_thread
 
@@ -342,8 +340,6 @@ class TestRunHelperLoungeInjection:
 
         runner = MagicMock()
         runner.working_dir = None
-        # clone() returns the same mock so fake_run is accessible from the clone.
-        runner.clone.return_value = runner
         runner.run = fake_run
 
         await run_claude_in_thread(
@@ -359,12 +355,11 @@ class TestRunHelperLoungeInjection:
         # User prompt is unchanged — lounge context is NOT in the user message.
         assert captured_prompt[0] == "Do something cool"
 
-        # Lounge context is in --append-system-prompt via clone().
-        runner.clone.assert_called_once()
-        _, kwargs = runner.clone.call_args
-        system_prompt = kwargs.get("append_system_prompt", "")
-        assert "BotX" in system_prompt
-        assert "Busy here!" in system_prompt
+        # Side effect: lounge_repo.get_recent was still called (context was built).
+        lounge_repo_mock.get_recent.assert_called_once()
+
+        # clone() is NOT called — tmux TUI mode doesn't support --append-system-prompt.
+        runner.clone.assert_not_called()
 
     async def test_no_lounge_context_when_repo_is_none(self) -> None:
         """When lounge_repo is None, the prompt is unchanged and runner is not cloned."""

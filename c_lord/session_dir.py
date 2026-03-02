@@ -91,19 +91,15 @@ class SessionDirManager:
     Args:
         base_dir: Parent directory for all session dirs.
         source_repo: Git repository URL or local path to clone from.
-        clone_branch: Optional branch to clone.  When None, the default
-                      branch of the source repo is used.
     """
 
     def __init__(
         self,
         base_dir: str,
         source_repo: str,
-        clone_branch: str | None = None,
     ) -> None:
         self._base_dir = base_dir
         self._source_repo = source_repo
-        self._clone_branch = clone_branch
 
     @property
     def base_dir(self) -> str:
@@ -134,9 +130,6 @@ class SessionDirManager:
             args.append("--local")
         else:
             args.extend(["--depth=1", "--single-branch"])
-
-        if self._clone_branch:
-            args.extend(["-b", self._clone_branch])
 
         args.extend([self._source_repo, target])
 

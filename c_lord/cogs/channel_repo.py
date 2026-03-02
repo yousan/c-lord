@@ -5,7 +5,7 @@ repository so that each channel can have its own SessionDirManager.
 
 Usage::
 
-    /clord-init repo:https://github.com/org/project.git branch:main
+    /clord-init repo:https://github.com/org/project.git
     /clord-init remove:True
     /clord-init                       # show current bindings
 """
@@ -73,7 +73,6 @@ class ChannelRepoCog(commands.Cog):
         manager = SessionDirManager(
             base_dir=str(Path(base) / str(channel_id)),
             source_repo=binding["source_repo"],
-            clone_branch=binding["clone_branch"],
         )
         self._manager_cache[channel_id] = manager
         return manager
@@ -83,7 +82,7 @@ class ChannelRepoCog(commands.Cog):
 
         Lookup order:
           1. In-memory cache
-          2. DB binding → create manager with derived/explicit session name
+          2. DB binding → create manager with auto-derived session name
           3. None (caller should fall back to global bot.tmux_manager)
         """
         if channel_id in self._tmux_cache:
@@ -93,7 +92,7 @@ class ChannelRepoCog(commands.Cog):
         if binding is None:
             return None
 
-        session_name = binding["tmux_session_name"] or derive_session_name(binding["source_repo"])
+        session_name = derive_session_name(binding["source_repo"])
         manager = TmuxSessionManager(session_name=session_name)
         self._tmux_cache[channel_id] = manager
         return manager
@@ -137,16 +136,12 @@ class ChannelRepoCog(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         repo="Git repository URL to clone for sessions in this channel",
-        branch="Branch to clone (default: repo default branch)",
-        tmux_session="tmux session name (default: derived from repo URL)",
         remove="Set True to remove the binding for this channel",
     )
     async def clord_init(
         self,
         interaction: discord.Interaction,
         repo: str | None = None,
-        branch: str | None = None,
-        tmux_session: str | None = None,
         remove: bool = False,
     ) -> None:
         """Bind / unbind / show channel-repo bindings."""
@@ -184,25 +179,16 @@ class ChannelRepoCog(commands.Cog):
 
             lines = []
             for b in bindings:
-                branch_str = f" (branch: `{b['clone_branch']}`)" if b["clone_branch"] else ""
-                tmux_name = b.get("tmux_session_name") or derive_session_name(b["source_repo"])
-                tmux_str = f" (tmux: `{tmux_name}`)"
-                lines.append(f"<#{b['channel_id']}> → `{b['source_repo']}`{branch_str}{tmux_str}")
+                tmux_name = derive_session_name(b["source_repo"])
+                lines.append(f"<#{b['channel_id']}> → `{b['source_repo']}` (tmux: `{tmux_name}`)")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
             return
 
         # --- Bind channel to repo ---
-        await self._repo.save(
-            channel_id=channel_id,
-            source_repo=repo,
-            clone_branch=branch,
-            tmux_session_name=tmux_session,
-        )
+        await self._repo.save(channel_id=channel_id, source_repo=repo)
         self.evict_cache(channel_id)
 
-        branch_msg = f" (branch: `{branch}`)" if branch else ""
-        tmux_display = tmux_session or derive_session_name(repo)
-        tmux_msg = f" (tmux: `{tmux_display}`)"
+        tmux_display = derive_session_name(repo)
         await interaction.response.send_message(
-            f"Bound <#{channel_id}> → `{repo}`{branch_msg}{tmux_msg}", ephemeral=True
+            f"Bound <#{channel_id}> → `{repo}` (tmux: `{tmux_display}`)", ephemeral=True
         )

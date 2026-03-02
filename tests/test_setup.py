@@ -198,10 +198,9 @@ def test_apply_to_api_server_is_idempotent() -> None:
 
 @pytest.mark.asyncio
 async def test_setup_bridge_auto_wires_api_server(tmp_path: object) -> None:
-    """setup_bridge(api_server=...) should auto-wire repos and set runner.api_port."""
+    """setup_bridge(api_server=...) should auto-wire repos."""
     bot = _make_bot()
     runner = _make_runner()
-    runner.api_port = None  # Not set yet
     api_server = _make_api_server()
 
     result = await setup_bridge(
@@ -216,16 +215,14 @@ async def test_setup_bridge_auto_wires_api_server(tmp_path: object) -> None:
     # Repos should be wired automatically
     assert api_server.task_repo is result.task_repo
     assert api_server.lounge_repo is result.lounge_repo
-    # runner.api_port should be set from api_server.port
-    assert runner.api_port == api_server.port
 
 
 @pytest.mark.asyncio
-async def test_setup_bridge_preserves_existing_runner_api_port(tmp_path: object) -> None:
-    """setup_bridge should not overwrite runner.api_port if already set."""
+async def test_setup_bridge_does_not_set_runner_api_port(tmp_path: object) -> None:
+    """setup_bridge no longer sets runner.api_port (ClaudeConfig doesn't have it)."""
     bot = _make_bot()
     runner = _make_runner()
-    runner.api_port = 9999  # Already set
+    runner.api_port = 9999  # Pre-existing value
     api_server = _make_api_server()
     api_server.port = 8099
 
@@ -237,7 +234,7 @@ async def test_setup_bridge_preserves_existing_runner_api_port(tmp_path: object)
         enable_scheduler=False,
     )
 
-    # Should NOT overwrite the existing value
+    # setup_bridge no longer touches runner.api_port — it stays as-is.
     assert runner.api_port == 9999
 
 

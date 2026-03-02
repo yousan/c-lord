@@ -263,32 +263,6 @@ class TestPartialMessageStreaming:
         # Exactly ONE thinking embed — the final complete one, not each partial
         assert len(thinking_embeds) == 1
 
-    @pytest.mark.asyncio
-    async def test_is_partial_detection_in_parser(self) -> None:
-        """Parser must set is_partial based on stop_reason."""
-        from c_lord.claude.parser import parse_line
-
-        partial = parse_line(
-            '{"type": "assistant", "message": {"stop_reason": null, "content": '
-            '[{"type": "text", "text": "hello"}]}}'
-        )
-        assert partial is not None
-        assert partial.is_partial is True
-
-        complete = parse_line(
-            '{"type": "assistant", "message": {"stop_reason": "end_turn", "content": '
-            '[{"type": "text", "text": "hello"}]}}'
-        )
-        assert complete is not None
-        assert complete.is_partial is False
-
-        tool_stop = parse_line(
-            '{"type": "assistant", "message": {"stop_reason": "tool_use", "content": '
-            '[{"type": "text", "text": "hello"}]}}'
-        )
-        assert tool_stop is not None
-        assert tool_stop.is_partial is False
-
 
 class TestRunClaudeInThread:
     """Integration tests for run_claude_in_thread with mocked runner."""
@@ -732,13 +706,12 @@ class TestConcurrencyIntegration:
         ]
 
     @pytest.mark.asyncio
-    async def test_concurrency_notice_injected_as_system_prompt(
+    async def test_concurrency_notice_not_injected_into_prompt(
         self, thread: MagicMock, runner: MagicMock, repo: MagicMock
     ) -> None:
-        """When registry is provided, concurrency notice goes into --append-system-prompt.
-
-        The user prompt is passed unchanged; the notice is injected as an ephemeral
-        system prompt so it does NOT accumulate in session history.
+        """When registry is provided, the session is registered but the concurrency
+        notice is NOT injected into the CLI (tmux TUI mode doesn't support
+        --append-system-prompt). The user prompt must be passed unchanged.
         """
         registry = SessionRegistry()
         captured_prompt = []
@@ -752,15 +725,12 @@ class TestConcurrencyIntegration:
 
         await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
 
-        # Prompt is unchanged — notice moved to --append-system-prompt via clone().
+        # Prompt is unchanged — no concurrency notice injected.
         assert len(captured_prompt) == 1
         assert captured_prompt[0] == "fix the bug"
 
-        # clone() must have been called with the concurrency notice as system prompt.
-        runner.clone.assert_called_once()
-        _, kwargs = runner.clone.call_args
-        system_prompt = kwargs.get("append_system_prompt", "")
-        assert "[CONCURRENCY NOTICE" in system_prompt
+        # clone() is NOT called — tmux TUI mode doesn't support --append-system-prompt.
+        runner.clone.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_session_registered_during_run(
@@ -815,10 +785,12 @@ class TestConcurrencyIntegration:
         assert registry.list_active() == []
 
     @pytest.mark.asyncio
-    async def test_other_sessions_in_system_prompt(
+    async def test_other_sessions_registered_but_not_injected(
         self, thread: MagicMock, runner: MagicMock, repo: MagicMock
     ) -> None:
-        """When other sessions exist, their info should appear in --append-system-prompt."""
+        """When other sessions exist, the registry side effect still happens
+        but the concurrency notice is NOT injected into the CLI.
+        """
         registry = SessionRegistry()
         registry.register(9999, "running /goodmorning", "/home/ebi")
 
@@ -833,14 +805,12 @@ class TestConcurrencyIntegration:
 
         await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
 
-        # User prompt is unchanged.
+        # User prompt is unchanged — no concurrency notice injected.
         assert len(captured_prompt) == 1
         assert captured_prompt[0] == "fix the bug"
 
-        # Other session info is in the system prompt, not the user message.
-        _, kwargs = runner.clone.call_args
-        system_prompt = kwargs.get("append_system_prompt", "")
-        assert "/goodmorning" in system_prompt
+        # clone() is NOT called — tmux TUI mode doesn't support --append-system-prompt.
+        runner.clone.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_registry_no_clone(

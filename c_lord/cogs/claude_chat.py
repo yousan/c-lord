@@ -20,7 +20,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..claude.runner import ClaudeRunner
+from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
@@ -64,7 +64,7 @@ class ClaudeChatCog(commands.Cog):
         self,
         bot: ClaudeDiscordBot,
         repo: SessionRepository,
-        runner: ClaudeRunner,
+        runner: ClaudeConfig,
         max_concurrent: int = 3,
         allowed_user_ids: set[int] | None = None,
         registry: SessionRegistry | None = None,
@@ -84,7 +84,7 @@ class ClaudeChatCog(commands.Cog):
         self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._active_runners: dict[int, ClaudeRunner | TmuxClaudeRunner] = {}
+        self._active_runners: dict[int, TmuxClaudeRunner] = {}
         # Tracks the asyncio.Task running _run_claude for each thread.
         # Used by _handle_thread_reply to wait for an interrupted session
         # to fully clean up before starting the replacement session.
@@ -755,24 +755,17 @@ class ClaudeChatCog(commands.Cog):
                             timeout=5.0,
                         )
 
-            # Choose runner: TmuxClaudeRunner when tmux is available,
-            # otherwise the standard subprocess-based ClaudeRunner.
-            runner: ClaudeRunner | TmuxClaudeRunner
-            if tmux_manager is not None:
-                # TUI mode cannot handle interactive permission prompts,
-                # so always use --dangerously-skip-permissions.
-                runner = TmuxClaudeRunner(
-                    tmux_manager=tmux_manager,
-                    thread_id=thread.id,
-                    model=model_override or self.runner.model,
-                    working_dir=working_dir,
-                    timeout_seconds=self.runner.timeout_seconds,
-                    dangerously_skip_permissions=True,
-                )
-            else:
-                runner = self.runner.clone(thread_id=thread.id, model=model_override)
-                if working_dir:
-                    runner.working_dir = working_dir
+            # Create a TmuxClaudeRunner for this thread.
+            # TUI mode cannot handle interactive permission prompts,
+            # so always use --dangerously-skip-permissions.
+            runner = TmuxClaudeRunner(
+                tmux_manager=tmux_manager,
+                thread_id=thread.id,
+                model=model_override or self.runner.model,
+                working_dir=working_dir,
+                timeout_seconds=self.runner.timeout_seconds,
+                dangerously_skip_permissions=True,
+            )
 
             self._active_runners[thread.id] = runner
 
