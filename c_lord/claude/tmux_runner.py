@@ -119,6 +119,7 @@ class TmuxClaudeRunner:
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
         self._stopped = False
+        self._silent_stop = False
         self._last_capture: str = ""
 
     async def run(
@@ -236,14 +237,19 @@ class TmuxClaudeRunner:
             # Done: non-empty response has been stable long enough.
             # Two tiers:
             #  - Quick exit (3s): response stable AND input prompt visible
-            #    (Claude is definitely done and waiting for input).
+            #    AND not actively generating (no ✻ Running… etc.).
+            #    Without the is_gen check, tool execution pauses (where the
+            #    pane is stable for several seconds) would trigger false
+            #    completion, posting raw tool-call text instead of Claude's
+            #    final formatted response.
             #  - Fallback exit (30s): response stable but no input prompt
             #    (Claude may have finished but prompt detection failed,
             #    e.g. completion summary text in the prompt area).
+            is_gen = self._is_generating(current)
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
-                and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
+                and ((has_prompt and not is_gen) or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
             ):
                 break
 
@@ -266,7 +272,7 @@ class TmuxClaudeRunner:
                 message_type=MessageType.RESULT,
                 is_complete=True,
                 text=last_response or None,
-                error="Stopped by user",
+                error=None if self._silent_stop else "Stopped by user",
             )
         elif elapsed >= self.timeout_seconds:
             yield StreamEvent(
@@ -292,9 +298,17 @@ class TmuxClaudeRunner:
                 text=last_response or None,
             )
 
-    async def interrupt(self) -> None:
-        """Send C-c to the tmux pane (graceful interrupt)."""
+    async def interrupt(self, *, silent: bool = False) -> None:
+        """Send C-c to the tmux pane (graceful interrupt).
+
+        Args:
+            silent: When True, the RESULT event will have ``error=None``
+                instead of ``"Stopped by user"``.  Used when a new message
+                automatically interrupts the previous run — users should
+                not see a scary error embed they didn't cause.
+        """
         self._stopped = True
+        self._silent_stop = silent
         await asyncio.to_thread(self._tmux.send_interrupt, self._thread_id)
 
     async def kill(self) -> None:
@@ -463,6 +477,22 @@ class TmuxClaudeRunner:
 
         # Step 4: Clean up the response.
         return _clean_tui_lines(response_lines)
+
+    @staticmethod
+    def _is_generating(text: str) -> bool:
+        """Check if Claude is actively generating (thinking/tool indicators visible).
+
+        Looks at the bottom 6 lines (which contain TUI chrome) for a generation
+        status indicator that ends with ``…`` (U+2026).  Active indicators
+        like ``✻ Running…`` end with ellipsis; completion summaries like
+        ``✻ Cooked for 56s`` do not.
+        """
+        lines = text.rstrip().splitlines()
+        for line in lines[-6:]:
+            stripped = line.strip()
+            if _GENERATION_STATUS_RE.match(stripped) and stripped.endswith("…"):
+                return True
+        return False
 
     @staticmethod
     def _has_input_prompt(text: str) -> bool:

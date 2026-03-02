@@ -85,6 +85,10 @@ class ClaudeChatCog(commands.Cog):
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_runners: dict[int, TmuxClaudeRunner] = {}
+        # Per-thread lock to prevent duplicate _run_claude invocations.
+        # Without this, two messages arriving in quick succession could
+        # both enter _run_claude before the first registers in _active_runners.
+        self._thread_locks: dict[int, asyncio.Lock] = {}
         # Tracks the asyncio.Task running _run_claude for each thread.
         # Used by _handle_thread_reply to wait for an interrupted session
         # to fully clean up before starting the replacement session.
@@ -555,29 +559,35 @@ class ClaudeChatCog(commands.Cog):
         session (graceful interrupt, like pressing Escape) and waits for it to
         finish cleaning up before starting the new session.  This prevents two
         Claude processes from running in parallel in the same thread.
+
+        A per-thread asyncio.Lock serializes concurrent calls so that a second
+        message arriving before the first registers in ``_active_runners``
+        cannot spawn a duplicate ``_run_claude``.
         """
         thread = message.channel
         assert isinstance(thread, discord.Thread)
 
-        record = await self.repo.get(thread.id)
-        session_id = record.session_id if record else None
-        prompt, image_paths = await self._build_prompt_and_images(message)
+        lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
+        async with lock:
+            record = await self.repo.get(thread.id)
+            session_id = record.session_id if record else None
+            prompt, image_paths = await self._build_prompt_and_images(message)
 
-        # Interrupt any active session in this thread before starting a new one.
-        existing_runner = self._active_runners.get(thread.id)
-        existing_task = self._active_tasks.get(thread.id)
-        if existing_runner is not None:
-            await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
-            await existing_runner.interrupt()
-            # Wait for the interrupted _run_claude to finish its finally block
-            # (which releases the semaphore and removes entries from dicts).
-            if existing_task is not None and not existing_task.done():
-                with contextlib.suppress(Exception):
-                    await existing_task
+            # Interrupt any active session in this thread before starting a new one.
+            existing_runner = self._active_runners.get(thread.id)
+            existing_task = self._active_tasks.get(thread.id)
+            if existing_runner is not None:
+                await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
+                await existing_runner.interrupt(silent=True)
+                # Wait for the interrupted _run_claude to finish its finally block
+                # (which releases the semaphore and removes entries from dicts).
+                if existing_task is not None and not existing_task.done():
+                    with contextlib.suppress(Exception):
+                        await existing_task
 
-        await self._run_claude(
-            message, thread, prompt, session_id=session_id, image_paths=image_paths
-        )
+            await self._run_claude(
+                message, thread, prompt, session_id=session_id, image_paths=image_paths
+            )
 
     async def _build_prompt(self, message: discord.Message) -> str:
         """Build the prompt string (text only). Use _build_prompt_and_images for full processing."""
