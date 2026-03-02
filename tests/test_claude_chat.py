@@ -1339,3 +1339,58 @@ class TestMultiChannelOnMessage:
         await cog.on_message(message)
 
         cog._handle_thread_reply.assert_called_once_with(message)
+
+
+# -- Tests for per-thread Lock (duplicate prevention) -----------------------
+
+
+class TestThreadLockSerialization:
+    """Tests that _handle_thread_reply serializes concurrent calls per thread."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_messages_serialized(self) -> None:
+        """Two on_message calls for the same thread should not run _run_claude concurrently.
+
+        Without a per-thread lock, both messages could enter _run_claude before
+        the first registers in _active_runners, causing duplicate responses.
+        """
+        channel_cog = _make_channel_cog_mock(tmux_manager=MagicMock())
+        cog = _make_cog(channel_cog=channel_cog)
+
+        # Track the order of _run_claude calls and ensure no overlap
+        call_log: list[str] = []
+
+        async def mock_run_claude(*args, **kwargs):
+            call_log.append("start")
+            await asyncio.sleep(0.1)  # simulate work
+            call_log.append("end")
+
+        cog._run_claude = mock_run_claude
+
+        # Create two messages for the same thread
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        thread.send = AsyncMock()
+
+        msg1 = MagicMock(spec=discord.Message)
+        msg1.channel = thread
+        msg1.content = "first"
+        msg1.attachments = []
+
+        msg2 = MagicMock(spec=discord.Message)
+        msg2.channel = thread
+        msg2.content = "second"
+        msg2.attachments = []
+
+        record = MagicMock()
+        record.session_id = "sess-1"
+        cog.repo.get = AsyncMock(return_value=record)
+
+        # Fire both concurrently
+        t1 = asyncio.create_task(cog._handle_thread_reply(msg1))
+        t2 = asyncio.create_task(cog._handle_thread_reply(msg2))
+        await asyncio.gather(t1, t2)
+
+        # With serialization, call_log should be [start, end, start, end]
+        # Without it, it would be [start, start, end, end]
+        assert call_log == ["start", "end", "start", "end"]

@@ -900,3 +900,202 @@ class TestTmuxClaudeRunnerInterrupt:
         result_events = [e for e in events if e.is_complete]
         assert len(result_events) == 1
         assert result_events[0].error == "Stopped by user"
+
+    @pytest.mark.asyncio
+    async def test_silent_interrupt_no_error(self, runner, tmux_manager) -> None:
+        """interrupt(silent=True) yields a RESULT with error=None (no error embed)."""
+        tmux_manager.is_claude_running.return_value = True
+        pane = _make_pane(["● Partial response"], user_prompt="q")
+        call_count = 0
+
+        def capture_side_effect(tid):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                return ""
+            return pane
+
+        tmux_manager.capture_pane.side_effect = capture_side_effect
+
+        events = []
+
+        async def interrupt_after_delay():
+            await asyncio.sleep(0.15)
+            await runner.interrupt(silent=True)
+
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            task = asyncio.create_task(interrupt_after_delay())
+            async for event in runner.run("q"):
+                events.append(event)
+            await task
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        # Silent interrupt should NOT produce an error
+        assert result_events[0].error is None
+        assert result_events[0].text == "Partial response"
+
+
+# -- Tests for _is_generating ------------------------------------------------
+
+
+class TestIsGenerating:
+    """Tests for TmuxClaudeRunner._is_generating."""
+
+    def test_is_generating_during_tool_execution(self) -> None:
+        """Active generation indicator (ending with …) → True."""
+        text = "\n".join(
+            [
+                "❯ list issues",
+                "",
+                "● Bash(gh issue list ...)",
+                "",
+                "─" * 40,
+                "✻ Running…",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is True
+
+    def test_is_generating_when_completed(self) -> None:
+        """No generation indicator, just bare ❯ → False."""
+        text = "\n".join(
+            [
+                "❯ list issues",
+                "",
+                "● Here are the issues.",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is False
+
+    def test_is_generating_completion_summary(self) -> None:
+        """Completion summary without … (e.g. 'Cooked for 56s') → False."""
+        text = "\n".join(
+            [
+                "❯ question",
+                "",
+                "● Full answer.",
+                "",
+                "─" * 40,
+                "✻ Cooked for 56s",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is False
+
+    def test_is_generating_thinking_indicator(self) -> None:
+        """Thinking indicator (ending with …) → True."""
+        text = "\n".join(
+            [
+                "❯ hello",
+                "",
+                "─" * 40,
+                "✻ Envisioning…",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is True
+
+    def test_is_generating_ascii_asterisk(self) -> None:
+        """tmux-captured ASCII asterisk thinking (ending with …) → True."""
+        text = "\n".join(
+            [
+                "❯ test",
+                "",
+                "─" * 40,
+                "* Forming…",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is True
+
+    def test_is_generating_empty_text(self) -> None:
+        """Empty pane text → False."""
+        assert TmuxClaudeRunner._is_generating("") is False
+
+
+class TestToolExecutionCompletion:
+    """Tests that tool execution does not trigger false early completion."""
+
+    @pytest.mark.asyncio
+    async def test_tool_execution_does_not_trigger_early_completion(
+        self, runner, tmux_manager
+    ) -> None:
+        """When ✻ Running… is visible and text is stable, quick-exit should NOT fire.
+
+        The pane shows a tool call with ✻ Running… indicator and bare ❯ prompt.
+        Without the _is_generating guard, the 3s quick-exit would fire.
+        With the guard, only the 30s fallback can trigger completion.
+        """
+        tmux_manager.is_claude_running.return_value = True
+
+        # Pane shows a tool call with ✻ Running… — text is stable but not done
+        tool_pane = "\n".join(
+            [
+                "❯ list issues",
+                "",
+                "● Bash(gh issue list --limit 10)",
+                "",
+                "─" * 40,
+                "✻ Running…",
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        # After several polls at tool_pane (stable but generating),
+        # Claude finishes and shows the final response
+        final_pane = _make_pane(
+            [
+                "● Here are the issues:",
+                "",
+                "  | # | Title     |",
+                "  |---|-----------|",
+                "  | 1 | Fix bug   |",
+            ],
+            user_prompt="list issues",
+            with_input_prompt=True,
+        )
+
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Polls 1-8: tool running (stable text with ✻ Running…)
+            if call_idx <= 8:
+                return tool_pane
+            # Polls 9+: final response
+            return final_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.15),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 30.0),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("list issues"):
+                events.append(event)
+
+        # The final response should contain the table, NOT the raw tool call
+        finals = [
+            e for e in events if e.message_type == MessageType.ASSISTANT and not e.is_partial
+        ]
+        assert len(finals) == 1
+        assert "Fix bug" in finals[0].text
+        assert "Running…" not in finals[0].text
