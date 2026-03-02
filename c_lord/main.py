@@ -74,6 +74,7 @@ async def main() -> None:
         int(config["coordination_channel_id"]) if config["coordination_channel_id"] else None
     )
     allowed_user_ids = {owner_id} if owner_id else None
+    allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
 
     bot = ClaudeDiscordBot(
         channel_id=int(config["channel_id"]),
@@ -87,6 +88,7 @@ async def main() -> None:
             runner,
             session_db_path=db_path,
             allowed_user_ids=allowed_user_ids,
+            allowed_role_name=allowed_role_name,
             claude_channel_id=int(config["channel_id"]),
             enable_scheduler=True,
         )

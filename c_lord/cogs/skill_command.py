@@ -89,12 +89,14 @@ class SkillCommandCog(commands.Cog):
         skills_dir: Path | str | None = None,
         allowed_user_ids: set[int] | None = None,
         registry: SessionRegistry | None = None,
+        allowed_role_name: str | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.runner = runner
         self.claude_channel_id = claude_channel_id
         self._allowed_user_ids = allowed_user_ids
+        self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
 
         # Default to ~/.claude/skills/
@@ -111,10 +113,26 @@ class SkillCommandCog(commands.Cog):
             self._skills = _load_skills(self._skills_dir)
             self._last_loaded = now
 
-    def _is_authorized(self, user_id: int) -> bool:
-        if self._allowed_user_ids is None:
+    def _is_authorized(self, member: discord.Member | discord.User | int) -> bool:
+        """Check if a member/user is authorized.
+
+        Accepts a Member, User, or bare int (user ID) for backward compatibility.
+        """
+        if isinstance(member, int):
+            # Legacy call-site: bare user ID — cannot check roles
+            user_id = member
+            if self._allowed_user_ids is not None and user_id in self._allowed_user_ids:
+                return True
+            # Cannot check roles with a bare int
+            return self._allowed_user_ids is None and self._allowed_role_name is None
+
+        if self._allowed_user_ids is not None and member.id in self._allowed_user_ids:
             return True
-        return user_id in self._allowed_user_ids
+        if self._allowed_role_name is not None:
+            if isinstance(member, discord.Member):
+                return any(r.name == self._allowed_role_name for r in member.roles)
+            return False  # DM — no role info
+        return self._allowed_user_ids is None
 
     async def _skill_name_autocomplete(
         self,
@@ -158,7 +176,7 @@ class SkillCommandCog(commands.Cog):
         args: str | None = None,
     ) -> None:
         """Run a Claude Code skill by name, optionally with arguments."""
-        if not self._is_authorized(interaction.user.id):
+        if not self._is_authorized(interaction.user):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
             )

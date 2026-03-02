@@ -61,11 +61,12 @@ CREATE TABLE IF NOT EXISTS pending_resumes (
 
 -- Per-channel repository bindings (1 channel = 1 repo)
 CREATE TABLE IF NOT EXISTS channel_repo_bindings (
-    channel_id   INTEGER PRIMARY KEY,
-    source_repo  TEXT    NOT NULL,
-    clone_branch TEXT,
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
-    updated_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+    channel_id         INTEGER PRIMARY KEY,
+    source_repo        TEXT    NOT NULL,
+    clone_branch       TEXT,
+    tmux_session_name  TEXT,
+    created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 """
 
@@ -102,6 +103,8 @@ _MIGRATIONS = [
         "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
         "updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
     ),
+    # tmux_session_name column for per-channel tmux session isolation
+    "ALTER TABLE channel_repo_bindings ADD COLUMN tmux_session_name TEXT",
 ]
 
 

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from c_lord.database.channel_repo import ChannelRepository
 from c_lord.cogs.channel_repo import ChannelRepoCog
-
+from c_lord.database.channel_repo import ChannelRepository, derive_session_name
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -109,9 +108,7 @@ class TestChannelRepoListAll:
 
 
 class TestChannelRepoCogResolveManager:
-    async def test_resolve_returns_none_without_binding(
-        self, cog: ChannelRepoCog
-    ) -> None:
+    async def test_resolve_returns_none_without_binding(self, cog: ChannelRepoCog) -> None:
         manager = await cog.resolve_manager(999)
         assert manager is None
 
@@ -131,9 +128,7 @@ class TestChannelRepoCogResolveManager:
         m2 = await cog.resolve_manager(100)
         assert m1 is m2  # same object from cache
 
-    async def test_resolve_with_branch(
-        self, cog: ChannelRepoCog, repo: ChannelRepository
-    ) -> None:
+    async def test_resolve_with_branch(self, cog: ChannelRepoCog, repo: ChannelRepository) -> None:
         await repo.save(
             channel_id=200,
             source_repo="/tmp/fake-repo.git",
@@ -142,6 +137,100 @@ class TestChannelRepoCogResolveManager:
         manager = await cog.resolve_manager(200)
         assert manager is not None
         assert manager._clone_branch == "develop"
+
+
+# ===========================================================================
+# derive_session_name tests
+# ===========================================================================
+
+
+class TestDeriveSessionName:
+    def test_github_https_url(self) -> None:
+        assert derive_session_name("https://github.com/org/my-project.git") == "my-project"
+
+    def test_github_https_url_no_dot_git(self) -> None:
+        assert derive_session_name("https://github.com/org/my-project") == "my-project"
+
+    def test_trailing_slash(self) -> None:
+        assert derive_session_name("https://github.com/org/my-project/") == "my-project"
+
+    def test_ssh_url(self) -> None:
+        assert derive_session_name("git@github.com:org/my-project.git") == "my-project"
+
+    def test_local_path(self) -> None:
+        assert derive_session_name("/home/user/repos/my-project") == "my-project"
+
+    def test_empty_string_returns_fallback(self) -> None:
+        assert derive_session_name("") == "clord"
+
+    def test_dot_git_only_returns_fallback(self) -> None:
+        assert derive_session_name(".git") == "clord"
+
+
+# ===========================================================================
+# ChannelRepository tmux_session_name tests
+# ===========================================================================
+
+
+class TestChannelRepoSaveTmux:
+    async def test_save_with_tmux_session_name(self, repo: ChannelRepository) -> None:
+        await repo.save(
+            channel_id=700,
+            source_repo="https://github.com/org/repo.git",
+            tmux_session_name="my-session",
+        )
+        binding = await repo.get(700)
+        assert binding is not None
+        assert binding["tmux_session_name"] == "my-session"
+
+    async def test_save_without_tmux_session_name(self, repo: ChannelRepository) -> None:
+        await repo.save(channel_id=800, source_repo="https://github.com/org/repo.git")
+        binding = await repo.get(800)
+        assert binding is not None
+        assert binding["tmux_session_name"] is None
+
+
+# ===========================================================================
+# ChannelRepoCog tmux manager tests
+# ===========================================================================
+
+
+class TestChannelRepoCogResolveTmuxManager:
+    async def test_resolve_returns_none_without_binding(self, cog: ChannelRepoCog) -> None:
+        manager = await cog.resolve_tmux_manager(999)
+        assert manager is None
+
+    async def test_resolve_from_binding_explicit_name(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        await repo.save(
+            channel_id=100,
+            source_repo="https://github.com/org/my-project.git",
+            tmux_session_name="custom-session",
+        )
+        manager = await cog.resolve_tmux_manager(100)
+        assert manager is not None
+        assert manager.session_name == "custom-session"
+
+    async def test_resolve_auto_derives_from_repo(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        await repo.save(
+            channel_id=200,
+            source_repo="https://github.com/org/my-project.git",
+        )
+        manager = await cog.resolve_tmux_manager(200)
+        assert manager is not None
+        assert manager.session_name == "my-project"
+
+    async def test_resolve_cached(self, cog: ChannelRepoCog, repo: ChannelRepository) -> None:
+        await repo.save(
+            channel_id=300,
+            source_repo="https://github.com/org/repo.git",
+        )
+        m1 = await cog.resolve_tmux_manager(300)
+        m2 = await cog.resolve_tmux_manager(300)
+        assert m1 is m2  # same object from cache
 
 
 class TestChannelRepoCogEvictCache:
@@ -153,3 +242,12 @@ class TestChannelRepoCogEvictCache:
         assert 100 in cog._manager_cache
         cog.evict_cache(100)
         assert 100 not in cog._manager_cache
+
+    async def test_evict_removes_tmux_cache(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        await repo.save(channel_id=100, source_repo="https://github.com/org/repo.git")
+        await cog.resolve_tmux_manager(100)
+        assert 100 in cog._tmux_cache
+        cog.evict_cache(100)
+        assert 100 not in cog._tmux_cache
