@@ -1,0 +1,169 @@
+# コマンドリファレンス
+
+Discord ユーザーおよび API 利用者が使えるすべてのコマンド一覧です。
+
+## スラッシュコマンド
+
+### チャット & セッション
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/clord <prompt>` | 新しい Claude Code セッションを開始 | チャンネル・スレッド |
+| `/stop` | 実行中のセッションを停止（セッションは保持される） | スレッドのみ |
+| `/clear` | セッションをリセット — 次のメッセージで新規セッション開始 | スレッドのみ |
+| `/clord-attach <window>` | このスレッドを既存の tmux ウィンドウに接続 | スレッドのみ |
+
+**`/clord`** は新しいスレッドを作成し、プロンプトを Claude Code に送信します。既存スレッド内で使うと、同じセッションを継続します。
+
+**`/stop`** はプロセスを安全に中断します。セッションは保存されるので、スレッドにメッセージを送ればいつでも再開できます。
+
+**`/clord-attach`** はスレッドを tmux ウィンドウにリンクし、Discord とターミナルの両方から同じ Claude Code セッションを操作できるようにします。
+
+### スキル
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/skill <name> [args]` | Claude Code スキルを実行 | チャンネル・スレッド |
+
+スキルは `~/.claude/skills/` に保存された定義済みプロンプトです。`name` パラメータはオートコンプリートに対応しています。
+
+### チャンネル設定
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/clord-init` | チャンネルとリポジトリの紐づけを一覧表示 | 任意のチャンネル |
+| `/clord-init repo:<url> [branch:<名前>] [tmux_session:<名前>]` | このチャンネルを git リポジトリに紐づけ | 任意のチャンネル |
+| `/clord-init remove:True` | このチャンネルの紐づけを解除 | 任意のチャンネル |
+
+**サーバー管理**権限が必要です。チャンネルをリポジトリに紐づけると、そのチャンネルで開始されたセッションは自動的にそのリポジトリを作業ディレクトリとして使用します。
+
+### モデル管理
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/model-show` | 現在の Claude モデルを表示 | どこでも |
+| `/model-set <model>` | 新規セッション用のグローバルモデルを変更 | どこでも |
+
+選択可能なモデル: `haiku`（高速）、`sonnet`（バランス型、デフォルト）、`opus`（高性能）。
+
+### セッション管理
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/resume-info` | このスレッドのセッションを CLI で再開するコマンドを表示 | スレッドのみ |
+| `/sessions [origin]` | 全セッション一覧（フィルタ: `all`, `discord`, `cli`） | どこでも |
+| `/sync-sessions` | CLI セッションを Discord スレッドとしてインポート | どこでも |
+| `/sync-settings` | セッション同期の設定を表示・変更 | どこでも |
+
+**`/resume-info`** は `claude --resume <session_id>` コマンドを表示します。ターミナルから会話を続けたいときに使います。
+
+**`/sync-sessions`** はローカルの Claude Code セッションをスキャンし、CLI で開始されたセッションを Discord スレッドとして取り込みます。
+
+### ワークスペース管理
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/session-dirs` | アクティブなセッションディレクトリを一覧表示 | どこでも |
+| `/session-cleanup [dry_run]` | 孤立したセッションディレクトリを削除 | どこでも |
+| `/tmux-list` | アクティブな tmux ウィンドウを一覧表示 | どこでも |
+| `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | スレッドのみ |
+
+### アップグレード
+
+| コマンド | 説明 | 使用場所 |
+|---------|------|---------|
+| `/upgrade` | パッケージの手動アップグレード | どこでも |
+
+Bot 運用者がアップグレードコマンドを有効にしている場合のみ利用可能です。
+
+---
+
+## テキストコマンド
+
+| コマンド | 説明 | 例 |
+|---------|------|---|
+| `!attach <window>` | このスレッドを tmux ウィンドウに接続 | `!attach work13` |
+
+テキストコマンドは `!` プレフィックスを使います。`!attach` は `/clord-attach` と同じ機能です。
+
+---
+
+## アクセス制御
+
+Bot は 2 つの認可方式に対応しています（OR 条件 — どちらか一方で許可）：
+
+1. **ユーザー ID** — `.env` で `DISCORD_OWNER_ID` を設定すると、特定ユーザーのみに制限できます。
+2. **Discord ロール** — `.env` で `CLORD_ALLOWED_ROLE` にロール名（例: `claude-operator`）を設定すると、そのロールを持つメンバーが Bot を使えます。
+
+どちらも未設定の場合、全ユーザーが Bot を利用できます。
+
+---
+
+## REST API
+
+オプションの REST API サーバーにより、外部ツール（Claude Code CLI、CI/CD、スクリプト等）から Bot をプログラム的に操作できます。
+
+**ベース URL:** `http://127.0.0.1:8080`（変更可能）
+**認証:** `Authorization: Bearer <CLORD_API_SECRET>` ヘッダー（`/api/health` 以外はオプション）
+
+### エンドポイント一覧
+
+| メソッド | パス | 説明 |
+|---------|------|------|
+| `GET` | `/api/health` | ヘルスチェック |
+| `POST` | `/api/notify` | Discord へ即時通知を送信 |
+| `POST` | `/api/schedule` | 通知を予約 |
+| `GET` | `/api/scheduled` | 予約済み通知の一覧 |
+| `DELETE` | `/api/scheduled/{id}` | 予約済み通知をキャンセル |
+| `POST` | `/api/tasks` | スケジュールタスクを登録 |
+| `GET` | `/api/tasks` | スケジュールタスクの一覧 |
+| `PATCH` | `/api/tasks/{id}` | タスクを更新（有効/無効、プロンプト、間隔） |
+| `DELETE` | `/api/tasks/{id}` | タスクを削除 |
+| `POST` | `/api/spawn` | 新しいスレッドを作成して Claude Code を開始 |
+| `POST` | `/api/threads/{thread_id}/messages` | Discord スレッドにメッセージを投稿 |
+| `POST` | `/api/mark-resume` | 再起動後にスレッドを再開するようマーク |
+| `GET` | `/api/lounge` | AI Lounge の最新メッセージ一覧 |
+| `POST` | `/api/lounge` | AI Lounge にメッセージを投稿 |
+
+### 使用例
+
+通知を送信:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/notify \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{"message": "ビルド完了!", "title": "CI"}'
+```
+
+新しいセッションを開始:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/spawn \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{"prompt": "最新の PR をレビューして変更点をまとめてください"}'
+```
+
+CLI の入力をスレッドに転送:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/threads/123456789/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{"content": "テストカバレッジも確認してください", "source": "cli"}'
+```
+
+スケジュールタスクを登録:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{
+    "name": "daily-review",
+    "prompt": "オープン中の PR を確認してサマリーを投稿してください",
+    "interval_seconds": 86400,
+    "channel_id": 123456789
+  }'
+```

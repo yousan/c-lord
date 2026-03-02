@@ -1,0 +1,169 @@
+# Command Reference
+
+All commands available to Discord users and API consumers.
+
+## Slash Commands
+
+### Chat & Sessions
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/clord <prompt>` | Start a new Claude Code session | Channel or thread |
+| `/stop` | Stop the active session (session is preserved for resume) | Thread only |
+| `/clear` | Reset the session — next message starts fresh | Thread only |
+| `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
+
+**`/clord`** creates a new thread and sends your prompt to Claude Code. If used inside an existing thread, it continues the same session.
+
+**`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
+
+**`/clord-attach`** links a thread to a tmux window so you can interact with the same Claude Code session from both Discord and the terminal.
+
+### Skills
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/skill <name> [args]` | Run a Claude Code skill | Channel or thread |
+
+Skills are predefined prompts stored in `~/.claude/skills/`. The `name` parameter supports autocomplete — start typing to filter available skills.
+
+### Channel Configuration
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/clord-init` | Show all channel-to-repo bindings | Any channel |
+| `/clord-init repo:<url> [branch:<name>] [tmux_session:<name>]` | Bind this channel to a git repository | Any channel |
+| `/clord-init remove:True` | Remove the binding for this channel | Any channel |
+
+Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory.
+
+### Model Management
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/model-show` | Show the current Claude model | Anywhere |
+| `/model-set <model>` | Change the global model for new sessions | Anywhere |
+
+Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful).
+
+### Session Management
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/resume-info` | Show the CLI command to resume this thread's session | Thread only |
+| `/sessions [origin]` | List all known sessions (filter: `all`, `discord`, `cli`) | Anywhere |
+| `/sync-sessions` | Import CLI sessions as Discord threads | Anywhere |
+| `/sync-settings` | View or change session sync settings | Anywhere |
+
+**`/resume-info`** displays `claude --resume <session_id>` so you can continue the conversation from your terminal.
+
+**`/sync-sessions`** scans your local Claude Code session storage and creates Discord threads for sessions that were started from the CLI.
+
+### Workspace Management
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/session-dirs` | List all active session directories | Anywhere |
+| `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
+| `/tmux-list` | List all active tmux windows | Anywhere |
+| `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
+
+### Upgrade
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/upgrade` | Manually trigger a package upgrade | Anywhere |
+
+Only available when the bot operator has enabled the upgrade slash command.
+
+---
+
+## Text Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `!attach <window>` | Attach this thread to a tmux window | `!attach work13` |
+
+Text commands use the `!` prefix. `!attach` is functionally identical to `/clord-attach` — it exists for E2E testing and as a fallback when slash commands are unavailable.
+
+---
+
+## Access Control
+
+The bot supports two authorization methods (OR logic — either one grants access):
+
+1. **User ID** — Set `DISCORD_OWNER_ID` in `.env` to restrict commands to a specific user.
+2. **Discord Role** — Set `CLORD_ALLOWED_ROLE` in `.env` to a role name (e.g., `claude-operator`). Any member with that role can use the bot.
+
+If neither is configured, all users can use the bot.
+
+---
+
+## REST API
+
+The optional REST API server allows external tools (Claude Code CLI, CI/CD, scripts) to interact with the bot programmatically.
+
+**Base URL:** `http://127.0.0.1:8080` (configurable)
+**Auth:** `Authorization: Bearer <CLORD_API_SECRET>` header (optional, except `/api/health`)
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/health` | Health check |
+| `POST` | `/api/notify` | Send immediate notification to Discord |
+| `POST` | `/api/schedule` | Schedule a notification for later |
+| `GET` | `/api/scheduled` | List pending notifications |
+| `DELETE` | `/api/scheduled/{id}` | Cancel a pending notification |
+| `POST` | `/api/tasks` | Register a scheduled Claude Code task |
+| `GET` | `/api/tasks` | List all scheduled tasks |
+| `PATCH` | `/api/tasks/{id}` | Update a task (enable/disable, prompt, interval) |
+| `DELETE` | `/api/tasks/{id}` | Remove a scheduled task |
+| `POST` | `/api/spawn` | Create a new thread and start Claude Code |
+| `POST` | `/api/threads/{thread_id}/messages` | Post a message to a Discord thread |
+| `POST` | `/api/mark-resume` | Mark a thread for resumption after restart |
+| `GET` | `/api/lounge` | List recent AI Lounge messages |
+| `POST` | `/api/lounge` | Post a message to the AI Lounge |
+
+### Examples
+
+Send a notification:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/notify \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{"message": "Build complete!", "title": "CI"}'
+```
+
+Spawn a new session:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/spawn \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{"prompt": "Review the latest PR and summarize changes"}'
+```
+
+Forward CLI input to a thread:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/threads/123456789/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{"content": "Please also check the test coverage", "source": "cli"}'
+```
+
+Register a scheduled task:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CLORD_API_SECRET" \
+  -d '{
+    "name": "daily-review",
+    "prompt": "Check for open PRs and post a summary",
+    "interval_seconds": 86400,
+    "channel_id": 123456789
+  }'
+```
