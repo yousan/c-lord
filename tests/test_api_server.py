@@ -440,3 +440,125 @@ class TestMarkResume:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status == 400
+
+
+class TestPostThreadMessage:
+    """Tests for POST /api/threads/{id}/messages — post message to a Discord thread."""
+
+    @pytest.fixture
+    def thread_mock(self) -> MagicMock:
+        import discord
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 111222333
+        thread.send = AsyncMock()
+        return thread
+
+    @pytest.fixture
+    def bot_with_thread(self, thread_mock: MagicMock) -> MagicMock:
+        b = MagicMock()
+        b.get_channel.return_value = thread_mock
+        return b
+
+    @pytest.fixture
+    async def thread_client(
+        self, repo: NotificationRepository, bot_with_thread: MagicMock
+    ) -> TestClient:
+        api = ApiServer(repo=repo, bot=bot_with_thread, default_channel_id=12345)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        yield client
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_post_message_returns_200(
+        self, thread_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        resp = await thread_client.post(
+            "/api/threads/111222333/messages",
+            json={"content": "Hello from CLI"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "sent"
+        thread_mock.send.assert_called_once()
+        sent_text = thread_mock.send.call_args.args[0]
+        assert "Hello from CLI" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_post_message_with_source(
+        self, thread_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        resp = await thread_client.post(
+            "/api/threads/111222333/messages",
+            json={"content": "Test input", "source": "tmux"},
+        )
+        assert resp.status == 200
+        sent_text = thread_mock.send.call_args.args[0]
+        assert "tmux" in sent_text.lower() or "Test input" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_post_message_missing_content_returns_400(
+        self, thread_client: TestClient
+    ) -> None:
+        resp = await thread_client.post("/api/threads/111222333/messages", json={})
+        assert resp.status == 400
+        data = await resp.json()
+        assert "content" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_post_message_empty_content_returns_400(self, thread_client: TestClient) -> None:
+        resp = await thread_client.post("/api/threads/111222333/messages", json={"content": "   "})
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_post_message_invalid_thread_id_returns_400(
+        self, thread_client: TestClient
+    ) -> None:
+        resp = await thread_client.post(
+            "/api/threads/not-a-number/messages", json={"content": "Test"}
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_post_message_thread_not_found(self, repo: NotificationRepository) -> None:
+        bot = MagicMock()
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(side_effect=Exception("Not found"))
+        api = ApiServer(repo=repo, bot=bot, default_channel_id=12345)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post("/api/threads/999/messages", json={"content": "Test"})
+            assert resp.status == 404
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_post_message_non_messageable_returns_400(
+        self, repo: NotificationRepository
+    ) -> None:
+        bot = MagicMock()
+        # Return a channel without send method
+        channel = MagicMock(spec=[])
+        bot.get_channel.return_value = channel
+        api = ApiServer(repo=repo, bot=bot, default_channel_id=12345)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post("/api/threads/123/messages", json={"content": "Test"})
+            assert resp.status == 400
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_post_message_invalid_json_returns_400(self, thread_client: TestClient) -> None:
+        resp = await thread_client.post(
+            "/api/threads/111222333/messages",
+            data=b"bad",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
