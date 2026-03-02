@@ -239,3 +239,66 @@ async def test_setup_bridge_preserves_existing_runner_api_port(tmp_path: object)
 
     # Should NOT overwrite the existing value
     assert runner.api_port == 9999
+
+
+# ---------------------------------------------------------------------------
+# Global manager generation removed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_global_session_dir_manager(tmp_path: object) -> None:
+    """setup_bridge should NOT set bot.session_dir_manager even with env vars."""
+    bot = _make_bot()
+    runner = _make_runner()
+
+    # Track attribute assignments by wrapping __setattr__
+    assigned_attrs: list[str] = []
+    original_setattr = type(bot).__setattr__
+
+    def tracking_setattr(self: object, name: str, value: object) -> None:
+        assigned_attrs.append(name)
+        original_setattr(self, name, value)
+
+    type(bot).__setattr__ = tracking_setattr  # type: ignore[assignment]
+    try:
+        await setup_bridge(
+            bot,
+            runner,
+            session_db_path=str(tmp_path / "sessions.db"),  # type: ignore[operator]
+            enable_scheduler=False,
+            session_dir_base="/tmp/test-base",
+            session_source_repo="https://example.com/repo.git",
+        )
+    finally:
+        type(bot).__setattr__ = original_setattr  # type: ignore[assignment]
+
+    assert "session_dir_manager" not in assigned_attrs
+
+
+@pytest.mark.asyncio
+async def test_no_global_tmux_manager(tmp_path: object) -> None:
+    """setup_bridge should NOT set bot.tmux_manager."""
+    bot = _make_bot()
+    runner = _make_runner()
+
+    assigned_attrs: list[str] = []
+    original_setattr = type(bot).__setattr__
+
+    def tracking_setattr(self: object, name: str, value: object) -> None:
+        assigned_attrs.append(name)
+        original_setattr(self, name, value)
+
+    type(bot).__setattr__ = tracking_setattr  # type: ignore[assignment]
+    try:
+        await setup_bridge(
+            bot,
+            runner,
+            session_db_path=str(tmp_path / "sessions.db"),  # type: ignore[operator]
+            enable_scheduler=False,
+            enable_tmux=True,
+        )
+    finally:
+        type(bot).__setattr__ = original_setattr  # type: ignore[assignment]
+
+    assert "tmux_manager" not in assigned_attrs

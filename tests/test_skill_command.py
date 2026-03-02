@@ -314,9 +314,17 @@ class TestRunSkillValidation:
 
 
 class TestNewThreadMode:
+    def _setup_bound_channel(self, cog: SkillCommandCog) -> None:
+        """Set up ChannelRepoCog mock so the channel appears bound."""
+        cc = _make_channel_cog_mock(
+            session_dir_manager=MagicMock(), tmux_manager=MagicMock()
+        )
+        cog.bot.get_cog = MagicMock(return_value=cc)
+
     @pytest.mark.asyncio
     async def test_creates_thread_and_runs(self) -> None:
         cog = _make_cog(skills=[{"name": "todoist", "description": "Tasks"}])
+        self._setup_bound_channel(cog)
         interaction = _make_interaction()
 
         # Set up the channel returned by bot.get_channel
@@ -343,6 +351,7 @@ class TestNewThreadMode:
     @pytest.mark.asyncio
     async def test_args_included_in_prompt(self) -> None:
         cog = _make_cog(skills=[{"name": "todoist", "description": "Tasks"}])
+        self._setup_bound_channel(cog)
         interaction = _make_interaction()
 
         mock_channel = MagicMock(spec=discord.TextChannel)
@@ -360,6 +369,7 @@ class TestNewThreadMode:
     @pytest.mark.asyncio
     async def test_thread_name_includes_args(self) -> None:
         cog = _make_cog(skills=[{"name": "todoist", "description": "Tasks"}])
+        self._setup_bound_channel(cog)
         interaction = _make_interaction()
 
         mock_channel = MagicMock(spec=discord.TextChannel)
@@ -429,6 +439,11 @@ class TestInThreadMode:
     async def test_non_claude_thread_creates_new(self) -> None:
         """A thread not under the claude channel creates a new thread."""
         cog = _make_cog(skills=[{"name": "test", "description": ""}])
+        # Set up ChannelRepoCog so channel appears bound
+        cc = _make_channel_cog_mock(
+            session_dir_manager=MagicMock(), tmux_manager=MagicMock()
+        )
+        cog.bot.get_cog = MagicMock(return_value=cc)
         # Thread with different parent_id
         thread = _make_thread(thread_id=5555, parent_id=888)
         interaction = _make_interaction(channel=thread)
@@ -483,3 +498,94 @@ class TestIsClaudeThread:
         cog = _make_cog()
         channel = MagicMock(spec=discord.TextChannel)
         assert cog._is_claude_thread(channel) is False
+
+
+# ---------------------------------------------------------------------------
+# Per-channel resolution
+# ---------------------------------------------------------------------------
+
+
+def _make_channel_cog_mock(
+    *,
+    session_dir_manager: object = None,
+    tmux_manager: object = None,
+) -> MagicMock:
+    """Return a mock ChannelRepoCog with configurable resolve methods."""
+    from c_lord.cogs.channel_repo import ChannelRepoCog
+
+    channel_cog = MagicMock(spec=ChannelRepoCog)
+    channel_cog.resolve_manager = AsyncMock(return_value=session_dir_manager)
+    channel_cog.resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
+    return channel_cog
+
+
+class TestPerChannelResolution:
+    """SkillCommandCog should resolve managers per-channel via ChannelRepoCog."""
+
+    @pytest.mark.asyncio
+    async def test_in_thread_resolves_per_channel(self) -> None:
+        """In-thread mode uses ChannelRepoCog to resolve managers."""
+        sdm = MagicMock()
+        tmux = MagicMock()
+        cc = _make_channel_cog_mock(session_dir_manager=sdm, tmux_manager=tmux)
+
+        cog = _make_cog(skills=[{"name": "recall", "description": ""}])
+        cog.bot.get_cog = MagicMock(return_value=cc)
+        thread = _make_thread(thread_id=5555, parent_id=999)
+        interaction = _make_interaction(channel=thread)
+        cog.repo.get = AsyncMock(return_value=None)
+
+        with patch(
+            "c_lord.cogs.skill_command.run_claude_with_config", new_callable=AsyncMock
+        ) as mock_run:
+            await cog.run_skill.callback(cog, interaction, name="recall", args=None)
+            config = mock_run.call_args[0][0]
+            assert config.session_dir_manager is sdm
+            assert config.tmux_manager is tmux
+
+    @pytest.mark.asyncio
+    async def test_new_thread_resolves_per_channel(self) -> None:
+        """New-thread mode uses ChannelRepoCog to resolve managers."""
+        sdm = MagicMock()
+        tmux = MagicMock()
+        cc = _make_channel_cog_mock(session_dir_manager=sdm, tmux_manager=tmux)
+
+        cog = _make_cog(skills=[{"name": "test", "description": ""}])
+        cog.bot.get_cog = MagicMock(return_value=cc)
+
+        mock_channel = MagicMock(spec=discord.TextChannel)
+        mock_channel.id = 999
+        new_thread = _make_thread()
+        mock_channel.create_thread = AsyncMock(return_value=new_thread)
+        cog.bot.get_channel = MagicMock(return_value=mock_channel)
+
+        interaction = _make_interaction()  # non-thread channel
+
+        with patch(
+            "c_lord.cogs.skill_command.run_claude_with_config", new_callable=AsyncMock
+        ) as mock_run:
+            await cog.run_skill.callback(cog, interaction, name="test", args=None)
+            config = mock_run.call_args[0][0]
+            assert config.session_dir_manager is sdm
+            assert config.tmux_manager is tmux
+
+    @pytest.mark.asyncio
+    async def test_unbound_channel_returns_error(self) -> None:
+        """Unbound channel (no /clord-init) returns an error."""
+        # ChannelRepoCog returns None for both managers
+        cc = _make_channel_cog_mock()
+        cog = _make_cog(skills=[{"name": "test", "description": ""}])
+        cog.bot.get_cog = MagicMock(return_value=cc)
+
+        mock_channel = MagicMock(spec=discord.TextChannel)
+        mock_channel.id = 777  # unbound
+        cog.bot.get_channel = MagicMock(return_value=mock_channel)
+
+        interaction = _make_interaction()  # non-thread channel
+
+        await cog.run_skill.callback(cog, interaction, name="test", args=None)
+
+        # Should have sent error mentioning /clord-init
+        interaction.followup.send.assert_called_once()
+        msg = interaction.followup.send.call_args.args[0]
+        assert "/clord-init" in msg

@@ -19,6 +19,7 @@ import logging
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
@@ -29,6 +30,10 @@ from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
+
+if TYPE_CHECKING:
+    from ..session_dir import SessionDirManager
+    from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +110,24 @@ class SkillCommandCog(commands.Cog):
         self._skills_dir = Path(skills_dir)
         self._skills = _load_skills(self._skills_dir)
         self._last_loaded: float = time.monotonic()
+
+    async def _resolve_session_dir_manager(self, channel_id: int) -> SessionDirManager | None:
+        """Resolve a SessionDirManager for the given channel via ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog.resolve_manager(channel_id)
+        return None
+
+    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog.resolve_tmux_manager(channel_id)
+        return None
 
     def _maybe_reload_skills(self) -> None:
         """Reload skills from disk if SKILL_RELOAD_INTERVAL has elapsed."""
@@ -208,6 +231,10 @@ class SkillCommandCog(commands.Cog):
         # In-thread mode: if invoked inside a thread under the claude channel, resume it
         channel = interaction.channel
         if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
+            parent_channel_id = channel.parent_id or self.claude_channel_id
+            sdm = await self._resolve_session_dir_manager(parent_channel_id)
+            tmux = await self._resolve_tmux_manager(parent_channel_id)
+
             session_id = None
             record = await self.repo.get(channel.id)
             if record:
@@ -225,8 +252,8 @@ class SkillCommandCog(commands.Cog):
                     prompt=prompt,
                     session_id=session_id,
                     registry=self._registry,
-                    session_dir_manager=getattr(self.bot, "session_dir_manager", None),
-                    tmux_manager=getattr(self.bot, "tmux_manager", None),
+                    session_dir_manager=sdm,
+                    tmux_manager=tmux,
                 )
             )
             return
@@ -235,6 +262,19 @@ class SkillCommandCog(commands.Cog):
         channel = self.bot.get_channel(self.claude_channel_id)
         if not isinstance(channel, discord.TextChannel):
             await interaction.followup.send("Claude channel not found.", ephemeral=True)
+            return
+
+        # Resolve per-channel managers
+        sdm = await self._resolve_session_dir_manager(channel.id)
+        tmux = await self._resolve_tmux_manager(channel.id)
+
+        # Unbound channel check
+        if sdm is None and tmux is None:
+            await interaction.followup.send(
+                "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
+                "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
+                ephemeral=True,
+            )
             return
 
         thread_name = f"/{name} {args}" if args else f"/{name}"
@@ -256,7 +296,7 @@ class SkillCommandCog(commands.Cog):
                 prompt=prompt,
                 session_id=None,
                 registry=self._registry,
-                session_dir_manager=getattr(self.bot, "session_dir_manager", None),
-                tmux_manager=getattr(self.bot, "tmux_manager", None),
+                session_dir_manager=sdm,
+                tmux_manager=tmux,
             )
         )
