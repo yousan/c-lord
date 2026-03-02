@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -139,8 +138,6 @@ async def setup_bridge(
     from .database.resume_repo import PendingResumeRepository
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
-    from .session_dir import SessionDirManager
-    from .tmux import TmuxSessionManager
 
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:
@@ -151,36 +148,21 @@ async def setup_bridge(
         ch_str = os.getenv("COORDINATION_CHANNEL_ID", "")
         lounge_channel_id = int(ch_str) if ch_str.isdigit() else None
 
-    # SessionDirManager — attach to bot so cogs can access it via bot.session_dir_manager
+    # Global SessionDirManager and TmuxSessionManager are no longer created here.
+    # Per-channel managers are resolved dynamically via ChannelRepoCog.
+    # The session_dir_base parameter is still accepted and forwarded to
+    # ChannelRepoCog so per-channel directories share the same base path.
     if session_dir_base is None:
         session_dir_base = os.getenv("SESSION_DIR_BASE")
-    if session_source_repo is None:
-        session_source_repo = os.getenv("SESSION_SOURCE_REPO")
-    if session_clone_branch is None:
-        session_clone_branch = os.getenv("SESSION_CLONE_BRANCH") or None
-    if session_dir_base is not None and session_source_repo is not None:
-        if not hasattr(bot, "session_dir_manager"):
-            bot.session_dir_manager = SessionDirManager(  # type: ignore[attr-defined]
-                base_dir=session_dir_base,
-                source_repo=session_source_repo,
-                clone_branch=session_clone_branch,
-            )
-        logger.info(
-            "SessionDirManager enabled (base=%s, repo=%s)", session_dir_base, session_source_repo
-        )
+    if session_source_repo is not None or os.getenv("SESSION_SOURCE_REPO"):
+        import warnings
 
-    # TmuxSessionManager — attach to bot so cogs can access it via bot.tmux_manager
-    # Enabled by default; set CLORD_TMUX_ENABLED=false/0/no to disable.
-    tmux_env = os.getenv("CLORD_TMUX_ENABLED", "").lower()
-    if tmux_env in ("false", "0", "no"):
-        enable_tmux = False
-    if enable_tmux:
-        session_name = os.getenv("CLORD_TMUX_SESSION_NAME") or Path.cwd().name
-        if not hasattr(bot, "tmux_manager"):
-            bot.tmux_manager = TmuxSessionManager(  # type: ignore[attr-defined]
-                session_name=session_name,
-            )
-        logger.info("TmuxSessionManager enabled (session=%s)", session_name)
+        warnings.warn(
+            "session_source_repo / SESSION_SOURCE_REPO is deprecated. "
+            "Use /clord-init to bind channels to repositories.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     # --- Session DB (also hosts lounge_messages and pending_resumes tables) ---
     os.makedirs(os.path.dirname(session_db_path) or ".", exist_ok=True)

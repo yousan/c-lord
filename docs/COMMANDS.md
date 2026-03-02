@@ -2,6 +2,18 @@
 
 All commands available to Discord users and API consumers.
 
+> For a comprehensive guide with architecture diagrams, session lifecycle, and tips, see the **[User Guide](USER_GUIDE.md)**.
+
+## Architecture Overview
+
+```
+Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
+```
+
+- **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
+- **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
+- **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding will return an error directing the user to configure the binding first.
+
 ## Slash Commands
 
 ### Chat & Sessions

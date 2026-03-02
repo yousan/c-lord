@@ -135,32 +135,30 @@ class ClaudeChatCog(commands.Cog):
     async def _resolve_session_dir_manager(self, channel_id: int) -> SessionDirManager | None:
         """Resolve a SessionDirManager for the given channel.
 
-        If ChannelRepoCog is loaded and has a per-channel binding, use that.
-        Otherwise fall back to the global bot.session_dir_manager.
+        Returns the per-channel manager from ChannelRepoCog if a binding exists,
+        or None. Does NOT fall back to a global bot.session_dir_manager —
+        channels without a ``/clord-init`` binding get no manager.
         """
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            manager = await channel_cog.resolve_manager(channel_id)
-            if manager is not None:
-                return manager
-        return getattr(self.bot, "session_dir_manager", None)
+            return await channel_cog.resolve_manager(channel_id)
+        return None
 
     async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
         """Resolve a TmuxSessionManager for the given channel.
 
-        If ChannelRepoCog is loaded and has a per-channel binding, use that.
-        Otherwise fall back to the global bot.tmux_manager.
+        Returns the per-channel manager from ChannelRepoCog if a binding exists,
+        or None. Does NOT fall back to a global bot.tmux_manager —
+        channels without a ``/clord-init`` binding get no manager.
         """
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            manager = await channel_cog.resolve_tmux_manager(channel_id)
-            if manager is not None:
-                return manager
-        return getattr(self.bot, "tmux_manager", None)
+            return await channel_cog.resolve_tmux_manager(channel_id)
+        return None
 
     async def _get_current_model(self) -> str | None:
         """Return the model override from settings_repo, or None to use runner default.
@@ -232,9 +230,22 @@ class ClaudeChatCog(commands.Cog):
             )
             return
 
+        # Unbound channel check: verify /clord-init binding before proceeding
+        channel = interaction.channel
+        if not isinstance(channel, discord.Thread):
+            channel_id = channel.id if channel else interaction.channel_id
+            sdm = await self._resolve_session_dir_manager(channel_id)
+            tmux = await self._resolve_tmux_manager(channel_id)
+            if sdm is None and tmux is None:
+                await interaction.response.send_message(
+                    "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
+                    "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
+                    ephemeral=True,
+                )
+                return
+
         await interaction.response.defer()
 
-        channel = interaction.channel
         if isinstance(channel, discord.Thread):
             # Continue in existing thread
             record = await self.repo.get(channel.id)
@@ -662,6 +673,18 @@ class ClaudeChatCog(commands.Cog):
         image_paths: list[str] | None = None,
     ) -> None:
         """Execute Claude Code CLI and stream results to the thread."""
+        # Unbound channel check: verify /clord-init binding before proceeding
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        session_dir_manager = await self._resolve_session_dir_manager(parent_channel_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
+
+        if session_dir_manager is None and tmux_manager is None:
+            await thread.send(
+                "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
+                "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。"
+            )
+            return
+
         if self._semaphore.locked():
             await thread.send(
                 f"\u23f3 Waiting for a free session slot... "
@@ -702,10 +725,7 @@ class ClaudeChatCog(commands.Cog):
             # Create session directory (git clone) and tmux session if configured
             import asyncio as _asyncio
 
-            parent_channel_id = getattr(thread, "parent_id", None) or thread.id
-            session_dir_manager = await self._resolve_session_dir_manager(parent_channel_id)
-            tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
-
+            # session_dir_manager and tmux_manager already resolved above
             working_dir = self.runner.working_dir  # default
             if session_dir_manager is not None:
                 session_dir = await _asyncio.to_thread(

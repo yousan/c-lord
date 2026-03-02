@@ -25,6 +25,7 @@ from ..session_sync import CliSession, extract_recent_messages, scan_cli_session
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
+    from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -546,19 +547,52 @@ class SessionManageCog(commands.Cog):
     # ------------------------------------------------------------------
 
     def _get_session_dir_manager(self) -> SessionDirManager | None:
-        """Return the SessionDirManager from the bot, if configured."""
-        return getattr(self.bot, "session_dir_manager", None)
+        """Return the SessionDirManager from the bot, if configured.
+
+        .. deprecated::
+            This returns None now that global managers are removed.
+            Use :meth:`_resolve_session_dir_manager` for per-channel lookup.
+        """
+        return None
+
+    async def _resolve_session_dir_manager(self, channel_id: int) -> SessionDirManager | None:
+        """Resolve a SessionDirManager for the given channel via ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog.resolve_manager(channel_id)
+        return None
+
+    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog.resolve_tmux_manager(channel_id)
+        return None
+
+    async def _get_all_bindings(self) -> list[dict]:
+        """Return all channel-repo bindings from ChannelRepoCog."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
+            return await channel_cog._repo.list_all()
+        return []
 
     @app_commands.command(
         name="session-dirs",
         description="List all active Claude Code session directories",
     )
     async def session_dirs_list(self, interaction: discord.Interaction) -> None:
-        """Show all session directories and their status."""
-        sdm = self._get_session_dir_manager()
-        if sdm is None:
+        """Show all session directories and their status (across all bindings)."""
+        bindings = await self._get_all_bindings()
+        if not bindings:
             await interaction.response.send_message(
-                "❌ Session directory manager is not configured.", ephemeral=True
+                "❌ No channel-repo bindings configured. Use `/clord-init` first.",
+                ephemeral=True,
             )
             return
 
@@ -566,9 +600,14 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        dirs = await asyncio.to_thread(sdm.find_session_dirs)
+        all_dirs = []
+        for binding in bindings:
+            sdm = await self._resolve_session_dir_manager(binding["channel_id"])
+            if sdm is not None:
+                dirs = await asyncio.to_thread(sdm.find_session_dirs)
+                all_dirs.extend(dirs)
 
-        if not dirs:
+        if not all_dirs:
             await interaction.followup.send(
                 embed=discord.Embed(
                     title="📁 Session Directories",
@@ -579,10 +618,10 @@ class SessionManageCog(commands.Cog):
             return
 
         embed = discord.Embed(
-            title=f"📁 Session Directories ({len(dirs)})",
+            title=f"📁 Session Directories ({len(all_dirs)})",
             color=COLOR_INFO,
         )
-        for d in dirs:
+        for d in all_dirs:
             status = "✅ clean" if d.is_clean else "⚠️ dirty"
             name = f"`{d.thread_id}`"
             value = f"Path: `{d.path}`\nCommit: `{d.commit or 'unknown'}`\nStatus: {status}"
@@ -603,10 +642,11 @@ class SessionManageCog(commands.Cog):
         dry_run: bool = False,
     ) -> None:
         """Remove session directories that have no active session and are clean."""
-        sdm = self._get_session_dir_manager()
-        if sdm is None:
+        bindings = await self._get_all_bindings()
+        if not bindings:
             await interaction.response.send_message(
-                "❌ Session directory manager is not configured.", ephemeral=True
+                "❌ No channel-repo bindings configured. Use `/clord-init` first.",
+                ephemeral=True,
             )
             return
 
@@ -619,13 +659,32 @@ class SessionManageCog(commands.Cog):
         if hasattr(self.bot, "session_registry"):
             active_ids = {s.thread_id for s in self.bot.session_registry.list_active()}
 
+        # Collect managers from all bindings
+        managers: list[SessionDirManager] = []
+        for binding in bindings:
+            sdm = await self._resolve_session_dir_manager(binding["channel_id"])
+            if sdm is not None:
+                managers.append(sdm)
+
+        if not managers:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="📁 Session Cleanup",
+                    description="No session directory managers found.",
+                    color=COLOR_INFO,
+                )
+            )
+            return
+
         if dry_run:
-            # Just list what would be removed
-            dirs = await asyncio.to_thread(sdm.find_session_dirs)
+            all_dirs = []
+            for sdm in managers:
+                dirs = await asyncio.to_thread(sdm.find_session_dirs)
+                all_dirs.extend(dirs)
 
             candidates = []
             skipped = []
-            for d in dirs:
+            for d in all_dirs:
                 if d.thread_id in active_ids:
                     skipped.append((d, "session is active"))
                     continue
@@ -656,13 +715,16 @@ class SessionManageCog(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
 
-        results = await asyncio.to_thread(sdm.cleanup_orphaned, active_ids)
+        all_results = []
+        for sdm in managers:
+            results = await asyncio.to_thread(sdm.cleanup_orphaned, active_ids)
+            all_results.extend(results)
 
-        removed = [r for r in results if r.removed]
-        dirty = [r for r in results if not r.removed and "uncommitted changes" in r.reason]
+        removed = [r for r in all_results if r.removed]
+        dirty = [r for r in all_results if not r.removed and "uncommitted changes" in r.reason]
         other_skipped = [
             r
-            for r in results
+            for r in all_results
             if not r.removed
             and "uncommitted changes" not in r.reason
             and r.reason != "session is still active"
@@ -701,11 +763,12 @@ class SessionManageCog(commands.Cog):
         description="List all active tmux windows for Claude Code",
     )
     async def tmux_list(self, interaction: discord.Interaction) -> None:
-        """Show all windows in the clord tmux session."""
-        tmux_mgr = getattr(self.bot, "tmux_manager", None)
-        if tmux_mgr is None:
+        """Show all windows across all channel tmux sessions."""
+        bindings = await self._get_all_bindings()
+        if not bindings:
             await interaction.response.send_message(
-                "❌ Tmux manager is not configured.", ephemeral=True
+                "❌ No channel-repo bindings configured. Use `/clord-init` first.",
+                ephemeral=True,
             )
             return
 
@@ -713,9 +776,14 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        windows = await asyncio.to_thread(tmux_mgr.list_sessions)
+        all_windows: list[dict] = []
+        for binding in bindings:
+            tmux_mgr = await self._resolve_tmux_manager(binding["channel_id"])
+            if tmux_mgr is not None:
+                windows = await asyncio.to_thread(tmux_mgr.list_sessions)
+                all_windows.extend(windows)
 
-        if not windows:
+        if not all_windows:
             await interaction.followup.send(
                 embed=discord.Embed(
                     title="🖥️ Tmux Windows",
@@ -726,10 +794,10 @@ class SessionManageCog(commands.Cog):
             return
 
         embed = discord.Embed(
-            title=f"🖥️ Tmux Windows ({len(windows)})",
+            title=f"🖥️ Tmux Windows ({len(all_windows)})",
             color=COLOR_INFO,
         )
-        for w in windows:
+        for w in all_windows:
             tid = w.get("thread_id", "")
             tid_display = f"Thread: `{tid}`" if tid else "Thread: —"
             embed.add_field(
@@ -754,6 +822,7 @@ class SessionManageCog(commands.Cog):
             return
 
         thread_id = interaction.channel.id
+        parent_channel_id = interaction.channel.parent_id or thread_id
         await interaction.response.defer()
 
         import asyncio
@@ -761,7 +830,7 @@ class SessionManageCog(commands.Cog):
         results: list[str] = []
 
         # Kill tmux window
-        tmux_mgr = getattr(self.bot, "tmux_manager", None)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
         if tmux_mgr is not None:
             killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
             if killed:
@@ -770,7 +839,7 @@ class SessionManageCog(commands.Cog):
                 results.append("ℹ️ No tmux window found")
 
         # Remove session directory
-        sdm = self._get_session_dir_manager()
+        sdm = await self._resolve_session_dir_manager(parent_channel_id)
         if sdm is not None:
             cleanup = await asyncio.to_thread(sdm.cleanup_for_thread, thread_id)
             if cleanup.removed:
@@ -779,7 +848,10 @@ class SessionManageCog(commands.Cog):
                 results.append(f"ℹ️ Session directory: {cleanup.reason}")
 
         if not results:
-            results.append("ℹ️ Neither tmux manager nor session dir manager is configured.")
+            results.append(
+                "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
+                " `/clord-init` で設定してください。"
+            )
 
         embed = discord.Embed(
             title="🗑️ Workspace Deleted",

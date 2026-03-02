@@ -44,9 +44,6 @@ def load_config() -> dict[str, str]:
         "timeout": os.getenv("SESSION_TIMEOUT_SECONDS", "300"),
         "owner_id": os.getenv("DISCORD_OWNER_ID", ""),
         "coordination_channel_id": os.getenv("COORDINATION_CHANNEL_ID", ""),
-        "session_dir_base": os.getenv("SESSION_DIR_BASE", ""),
-        "session_source_repo": os.getenv("SESSION_SOURCE_REPO", ""),
-        "session_clone_branch": os.getenv("SESSION_CLONE_BRANCH", ""),
     }
 
 

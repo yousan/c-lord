@@ -18,7 +18,21 @@ from c_lord.concurrency import SessionRegistry
 from c_lord.coordination.service import CoordinationService
 
 
-def _make_cog() -> ClaudeChatCog:
+def _make_channel_cog_mock(
+    *,
+    session_dir_manager: object = None,
+    tmux_manager: object = None,
+) -> MagicMock:
+    """Return a mock ChannelRepoCog with configurable resolve methods."""
+    from c_lord.cogs.channel_repo import ChannelRepoCog
+
+    channel_cog = MagicMock(spec=ChannelRepoCog)
+    channel_cog.resolve_manager = AsyncMock(return_value=session_dir_manager)
+    channel_cog.resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
+    return channel_cog
+
+
+def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
     """Return a ClaudeChatCog with minimal mocked dependencies."""
     bot = MagicMock()
     bot.channel_id = 999
@@ -26,6 +40,9 @@ def _make_cog() -> ClaudeChatCog:
     _default_ctx = MagicMock()
     _default_ctx.valid = False
     bot.get_context = AsyncMock(return_value=_default_ctx)
+    # By default, ChannelRepoCog returns None (no binding).
+    # Tests that need a binding should pass a channel_cog mock.
+    bot.get_cog = MagicMock(return_value=channel_cog)
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
@@ -868,7 +885,8 @@ class TestStartSessionCommand:
     @pytest.mark.asyncio
     async def test_no_allowed_user_ids_allows_everyone(self) -> None:
         """When allowed_user_ids is None, any user can use /claude."""
-        cog = _make_cog()  # allowed_user_ids=None
+        cc = _make_channel_cog_mock(tmux_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)  # allowed_user_ids=None
         interaction = _make_channel_interaction()
         interaction.user = MagicMock()
         interaction.user.id = 42
@@ -891,7 +909,8 @@ class TestStartSessionCommand:
     @pytest.mark.asyncio
     async def test_channel_execution_calls_spawn_session(self) -> None:
         """Running /claude in a channel creates a new thread via spawn_session."""
-        cog = _make_cog()
+        cc = _make_channel_cog_mock(tmux_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
         interaction = MagicMock(spec=discord.Interaction)
         interaction.user = MagicMock()
         interaction.user.id = 42
@@ -973,7 +992,8 @@ class TestStartSessionCommand:
     @pytest.mark.asyncio
     async def test_any_channel_allowed(self) -> None:
         """/clord works in any channel, not just the bot's configured channel."""
-        cog = _make_cog()  # bot.channel_id = 999
+        cc = _make_channel_cog_mock(tmux_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)  # bot.channel_id = 999
         interaction = MagicMock(spec=discord.Interaction)
         interaction.user = MagicMock()
         interaction.user.id = 42
@@ -1046,10 +1066,10 @@ class TestAttachWindowCommand:
     @pytest.mark.asyncio
     async def test_attach_success(self) -> None:
         """Successful remap responds with confirmation and saves DB record."""
-        cog = _make_cog()
         tmux_mgr = MagicMock()
         tmux_mgr.remap_window.return_value = True
-        cog.bot.tmux_manager = tmux_mgr
+        cc = _make_channel_cog_mock(tmux_manager=tmux_mgr)
+        cog = _make_cog(channel_cog=cc)
 
         interaction = _make_thread_interaction(thread_id=12345)
         interaction.user = MagicMock()
@@ -1067,10 +1087,10 @@ class TestAttachWindowCommand:
     @pytest.mark.asyncio
     async def test_attach_window_not_found(self) -> None:
         """When remap returns False, sends failure message."""
-        cog = _make_cog()
         tmux_mgr = MagicMock()
         tmux_mgr.remap_window.return_value = False
-        cog.bot.tmux_manager = tmux_mgr
+        cc = _make_channel_cog_mock(tmux_manager=tmux_mgr)
+        cog = _make_cog(channel_cog=cc)
 
         interaction = _make_thread_interaction(thread_id=12345)
         interaction.user = MagicMock()
@@ -1111,10 +1131,10 @@ class TestAttachTextCommand:
     @pytest.mark.asyncio
     async def test_attach_text_success(self) -> None:
         """!attach work13 → remap_window + repo.save called."""
-        cog = _make_cog()
         tmux_mgr = MagicMock()
         tmux_mgr.remap_window.return_value = True
-        cog.bot.tmux_manager = tmux_mgr
+        cc = _make_channel_cog_mock(tmux_manager=tmux_mgr)
+        cog = _make_cog(channel_cog=cc)
         ctx = self._make_ctx(thread_id=12345)
 
         await cog.attach_text.callback(cog, ctx, window="work13")
@@ -1154,10 +1174,10 @@ class TestAttachTextCommand:
     @pytest.mark.asyncio
     async def test_attach_text_window_not_found(self) -> None:
         """!attach with non-existent window sends failure message."""
-        cog = _make_cog()
         tmux_mgr = MagicMock()
         tmux_mgr.remap_window.return_value = False
-        cog.bot.tmux_manager = tmux_mgr
+        cc = _make_channel_cog_mock(tmux_manager=tmux_mgr)
+        cog = _make_cog(channel_cog=cc)
         ctx = self._make_ctx()
 
         await cog.attach_text.callback(cog, ctx, window="nonexistent")
