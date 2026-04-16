@@ -74,38 +74,18 @@ class SessionRepository:
             raise RuntimeError(f"Failed to retrieve session after save for thread {thread_id}")
         return record
 
-    async def get_by_session_id(self, session_id: str) -> SessionRecord | None:
-        """Reverse lookup: get session by Claude Code session ID."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM sessions WHERE session_id = ?",
-                (session_id,),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            return SessionRecord(**dict(row))
-
-    async def list_all(self, limit: int = 50, origin: str | None = None) -> list[SessionRecord]:
+    async def list_all(self, limit: int = 50) -> list[SessionRecord]:
         """List all sessions ordered by most recently used.
 
         Args:
             limit: Maximum number of records to return.
-            origin: Optional filter by origin ('discord', 'cli'). None returns all.
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            if origin:
-                cursor = await db.execute(
-                    "SELECT * FROM sessions WHERE origin = ? ORDER BY last_used_at DESC LIMIT ?",
-                    (origin, limit),
-                )
-            else:
-                cursor = await db.execute(
-                    "SELECT * FROM sessions ORDER BY last_used_at DESC LIMIT ?",
-                    (limit,),
-                )
+            cursor = await db.execute(
+                "SELECT * FROM sessions ORDER BY last_used_at DESC LIMIT ?",
+                (limit,),
+            )
             rows = await cursor.fetchall()
             return [SessionRecord(**dict(row)) for row in rows]
 

@@ -36,7 +36,6 @@ from .discord_ui.embeds import (
 from .discord_ui.status import StatusManager
 from .protocols import DrainAware
 from .session_dir import CleanupResult, SessionDirInfo, SessionDirManager
-from .session_sync import CliSession, SessionMessage, extract_recent_messages, scan_cli_sessions
 from .setup import BridgeComponents, setup_bridge
 from .tmux import TmuxSessionManager
 
@@ -56,11 +55,6 @@ __all__ = [
     "SkillCommandCog",
     "SessionRepository",
     "SettingsRepository",
-    # Session Sync
-    "CliSession",
-    "SessionMessage",
-    "extract_recent_messages",
-    "scan_cli_sessions",
     # Webhook & Automation
     "WebhookTriggerCog",
     "WebhookTrigger",

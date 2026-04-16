@@ -55,7 +55,6 @@ def _make_cog():
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     repo.list_all = AsyncMock(return_value=[])
-    repo.get_by_session_id = AsyncMock(return_value=None)
     return SessionManageCog(bot=bot, repo=repo)
 
 
@@ -126,3 +125,131 @@ class TestSessionsList:
         # Discord sessions show 💬, CLI sessions show 🖥️
         assert "\U0001f4ac" in embed.fields[0].name  # 💬
         assert "\U0001f5a5" in embed.fields[1].name  # 🖥️
+
+    async def test_tmux_session_shows_window_name(self):
+        """tmux sessions should display window name (e.g. work3) instead of tmux-147..."""
+        cog = _make_cog()
+        records = [
+            _make_record(
+                thread_id=200,
+                session_id="tmux-200",
+                origin="discord",
+                summary="Tmux task",
+            ),
+        ]
+        cog.repo.list_all = AsyncMock(return_value=records)
+
+        # Mock tmux manager to return window name mapping
+        tmux_mgr = MagicMock()
+        tmux_mgr._thread_to_window = {200: "work3"}
+        tmux_mgr._rebuild_mapping = MagicMock()
+        cog._resolve_all_tmux_managers = AsyncMock(return_value=[tmux_mgr])
+
+        interaction = _make_channel_interaction()
+        await cog.sessions_list.callback(cog, interaction)
+        embed = interaction.response.send_message.call_args.kwargs["embed"]
+        assert len(embed.fields) == 1
+        # Should show window name, not tmux-200
+        assert "work3" in embed.fields[0].value
+        assert "tmux-200" not in embed.fields[0].value
+
+    async def test_tmux_session_no_window_shows_tmux(self):
+        """tmux sessions with no live window should show 'tmux'."""
+        cog = _make_cog()
+        records = [
+            _make_record(
+                thread_id=200,
+                session_id="tmux-200",
+                origin="discord",
+                summary="Tmux task",
+            ),
+        ]
+        cog.repo.list_all = AsyncMock(return_value=records)
+
+        # No tmux managers available
+        cog._resolve_all_tmux_managers = AsyncMock(return_value=[])
+
+        interaction = _make_channel_interaction()
+        await cog.sessions_list.callback(cog, interaction)
+        embed = interaction.response.send_message.call_args.kwargs["embed"]
+        assert "`tmux`" in embed.fields[0].value
+
+    async def test_cli_session_shows_short_id(self):
+        """Non-tmux sessions should display truncated session ID as before."""
+        cog = _make_cog()
+        records = [
+            _make_record(session_id="abcdef12-3456-7890", origin="discord", summary="CLI task"),
+        ]
+        cog.repo.list_all = AsyncMock(return_value=records)
+        interaction = _make_channel_interaction()
+        await cog.sessions_list.callback(cog, interaction)
+        embed = interaction.response.send_message.call_args.kwargs["embed"]
+        assert "`abcdef12...`" in embed.fields[0].value
+
+
+class TestResumeInfoTmux:
+    """Tests for /resume-info with tmux sessions."""
+
+    async def test_tmux_session_shows_tmux_attach(self):
+        """tmux sessions should show tmux attach command, not claude --resume."""
+        cog = _make_cog()
+        record = _make_record(
+            thread_id=555,
+            session_id="tmux-1477909096400294011",
+        )
+        cog.repo.get = AsyncMock(return_value=record)
+        interaction = _make_thread_interaction(thread_id=555)
+        await cog.resume_info.callback(cog, interaction)
+        call_args = interaction.response.send_message.call_args
+        embed = call_args.kwargs.get("embed")
+        assert embed is not None
+        # Should NOT contain claude --resume for tmux sessions
+        assert "claude --resume" not in embed.description
+        # Should contain tmux attach guidance
+        assert "tmux" in embed.description
+
+    async def test_cli_session_shows_claude_resume(self):
+        """Non-tmux sessions should still show claude --resume."""
+        cog = _make_cog()
+        record = _make_record(thread_id=555, session_id="def-456")
+        cog.repo.get = AsyncMock(return_value=record)
+        interaction = _make_thread_interaction(thread_id=555)
+        await cog.resume_info.callback(cog, interaction)
+        call_args = interaction.response.send_message.call_args
+        embed = call_args.kwargs.get("embed")
+        assert embed is not None
+        assert "claude --resume def-456" in embed.description
+
+
+class TestHelperFunctions:
+    """Tests for _is_tmux_session and _format_session_short."""
+
+    def test_is_tmux_session_true(self):
+        from c_lord.cogs.session_manage import _is_tmux_session
+
+        assert _is_tmux_session("tmux-1477909096400294011") is True
+
+    def test_is_tmux_session_false(self):
+        from c_lord.cogs.session_manage import _is_tmux_session
+
+        assert _is_tmux_session("abcdef12-3456-7890") is False
+
+    def test_is_tmux_session_empty(self):
+        from c_lord.cogs.session_manage import _is_tmux_session
+
+        assert _is_tmux_session("") is False
+
+    def test_format_session_short_tmux_without_window(self):
+        from c_lord.cogs.session_manage import _format_session_short
+
+        assert _format_session_short("tmux-1477909096400294011") == "tmux"
+
+    def test_format_session_short_tmux_with_window(self):
+        from c_lord.cogs.session_manage import _format_session_short
+
+        assert _format_session_short("tmux-1477909096400294011", window_name="work3") == "work3"
+
+    def test_format_session_short_cli(self):
+        from c_lord.cogs.session_manage import _format_session_short
+
+        assert _format_session_short("abcdef12-3456-7890") == "abcdef12"

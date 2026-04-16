@@ -59,8 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ClaudeRunner.api_port` / `api_secret` params** — when set, `CLORD_API_URL` (and optionally `CLORD_API_SECRET`) are injected into Claude subprocess env, enabling Claude to self-register tasks (#90)
 - **`setup_bridge()` auto-discovery** — convenience factory that auto-wires `ClaudeRunner`, `SessionStore`, and `CoordinationChannel` from env vars; consumer smoke test in CI (#92)
 - **Zero-config coordination** — `CoordinationChannel` auto-creates its channel from `CLORD_COORDINATION_CHANNEL_NAME` env var with no consumer wiring needed (#89)
-- **Session Sync** — sync existing Claude Code CLI sessions into Discord threads with `/sync-sessions` command; backfills recent conversation messages into the thread (#30, #31, #36)
-- **Session sync filters** — `since_days` / `since_hours` + `min_results` two-tier filtering, configurable thread style, origin filter for `/sessions` (#37, #38, #39)
+- **Session Sync** — sync existing Claude Code CLI sessions into Discord threads with `/sync-sessions` command; backfills recent conversation messages into the thread (#30, #31, #36) *(Removed in #24)*
+- **Session sync filters** — `since_days` / `since_hours` + `min_results` two-tier filtering, configurable thread style, origin filter for `/sessions` (#37, #38, #39) *(Removed in #24)*
 - **LiveToolTimer** — live elapsed-time updates on long-running tool call embeds (#84, #85)
 - **Coordination channel** — cross-session awareness so concurrent Claude Code sessions can see each other (#78)
 - **Persistent AskView buttons** — bus routing and restart recovery for interactive Discord buttons (#81, #86)

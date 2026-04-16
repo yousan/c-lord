@@ -301,6 +301,37 @@ class TestRedactedThinkingEmbed:
         assert redacted.colour.value != regular.colour.value
 
 
+class TestSessionStartEmbed:
+    """Tests for session_start_embed tmux/CLI/None display."""
+
+    def test_tmux_session_shows_tmux_footer(self) -> None:
+        from c_lord.discord_ui.embeds import session_start_embed
+
+        embed = session_start_embed(session_id="tmux-1477909096400294011")
+        assert embed.footer is not None
+        assert embed.footer.text == "Session: tmux"
+
+    def test_tmux_session_with_window_name(self) -> None:
+        from c_lord.discord_ui.embeds import session_start_embed
+
+        embed = session_start_embed(session_id="tmux-1477909096400294011", window_name="work3")
+        assert embed.footer is not None
+        assert embed.footer.text == "Session: work3"
+
+    def test_cli_session_shows_short_id_footer(self) -> None:
+        from c_lord.discord_ui.embeds import session_start_embed
+
+        embed = session_start_embed(session_id="abcdef12-3456-7890")
+        assert embed.footer is not None
+        assert embed.footer.text == "Session: abcdef12..."
+
+    def test_no_session_id_no_footer(self) -> None:
+        from c_lord.discord_ui.embeds import session_start_embed
+
+        embed = session_start_embed(session_id=None)
+        assert embed.footer is None or embed.footer.text is None
+
+
 class TestTodoEmbed:
     """Tests for todo_embed()."""
 
