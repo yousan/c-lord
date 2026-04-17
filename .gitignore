@@ -31,3 +31,6 @@ Thumbs.db
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Personal workflow scripts (not part of the OSS framework)
+tmux.sh
