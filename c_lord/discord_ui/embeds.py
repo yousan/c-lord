@@ -54,14 +54,22 @@ def tool_use_embed(
     return embed
 
 
-def session_start_embed(session_id: str | None = None) -> discord.Embed:
+def session_start_embed(
+    session_id: str | None = None,
+    *,
+    window_name: str | None = None,
+) -> discord.Embed:
     """Create an embed for session start."""
     embed = discord.Embed(
         title="\U0001f916 Claude Code session started",
         color=COLOR_INFO,
     )
     if session_id:
-        embed.set_footer(text=f"Session: {session_id[:8]}...")
+        if session_id.startswith("tmux-"):
+            label = window_name or "tmux"
+            embed.set_footer(text=f"Session: {label}")
+        else:
+            embed.set_footer(text=f"Session: {session_id[:8]}...")
     return embed
 
 

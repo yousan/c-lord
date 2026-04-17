@@ -64,13 +64,9 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/resume-info` | Show the CLI command to resume this thread's session | Thread only |
-| `/sessions [origin]` | List all known sessions (filter: `all`, `discord`, `cli`) | Anywhere |
-| `/sync-sessions` | Import CLI sessions as Discord threads | Anywhere |
-| `/sync-settings` | View or change session sync settings | Anywhere |
+| `/sessions` | List all known sessions | Anywhere |
 
 **`/resume-info`** displays `claude --resume <session_id>` so you can continue the conversation from your terminal.
-
-**`/sync-sessions`** scans your local Claude Code session storage and creates Discord threads for sessions that were started from the CLI.
 
 ### Workspace Management
 

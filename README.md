@@ -81,10 +81,6 @@ GitHub PR ←── git push ←── Claude Code ─────────�
 
 **Real example:** On every push to `main`, Claude analyzes the diff, updates English + Japanese documentation, creates a bilingual PR, and enables auto-merge. Zero human interaction.
 
-### Session Sync
-
-Already use Claude Code CLI directly? Sync your existing terminal sessions into Discord threads with `/sync-sessions`. Backfills recent conversation messages so you can continue a CLI session from your phone without losing context.
-
 ### AI Lounge
 
 A shared "breakroom" channel where all concurrent sessions announce themselves, read each other's updates, and coordinate before disruptive operations.
@@ -187,8 +183,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Manual upgrade trigger** — `/upgrade` slash command lets authorised users trigger the upgrade pipeline directly from Discord (opt-in via `slash_command_enabled=True`)
 
 ### Session Management
-- **Session sync** — Import CLI sessions as Discord threads (`/sync-sessions`)
-- **Session list** — `/sessions` with filtering by origin (Discord / CLI / all) and time window
+- **Session list** — `/sessions` lists all known sessions
 - **Resume info** — `/resume-info` shows the CLI command to continue the current session in a terminal
 - **Startup resume** — Interrupted sessions restart automatically after any bot reboot; `AutoUpgradeCog` (upgrade restarts) and `ClaudeChatCog.cog_unload()` (all other shutdowns) mark them automatically, or use `POST /api/mark-resume` manually
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
@@ -565,7 +560,7 @@ c_lord/
   cogs/
     claude_chat.py         # Interactive chat (thread creation, message handling)
     skill_command.py       # /skill slash command with autocomplete
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /sessions, /resume-info
     scheduler.py           # Periodic Claude Code task executor
     webhook_trigger.py     # Webhook → Claude Code task execution (CI/CD)
     auto_upgrade.py        # Webhook → package upgrade + drain-aware restart
@@ -598,7 +593,6 @@ c_lord/
     plan_view.py           # Approve/Cancel buttons for Plan Mode (ExitPlanMode)
     permission_view.py     # Allow/Deny buttons for tool permission requests
     elicitation_view.py    # Discord UI for MCP elicitation (Modal form or URL button)
-  session_sync.py          # CLI session discovery and import
   worktree.py              # WorktreeManager — safe git worktree lifecycle (cleanup at session end + startup)
   ext/
     api_server.py          # REST API (optional, requires aiohttp)
@@ -623,7 +617,7 @@ c_lord/
 uv run pytest tests/ -v --cov=c_lord
 ```
 
-700+ tests covering parser, chunker, repository, runner, streaming, webhook triggers, auto-upgrade (including `/upgrade` slash command, thread-invocation, and approval button), REST API, AskUserQuestion UI, thread dashboard, scheduled tasks, session sync, AI Lounge, startup resume, model switching, compact detection, TodoWrite progress embeds, and permission/elicitation/plan-mode event parsing.
+700+ tests covering parser, chunker, repository, runner, streaming, webhook triggers, auto-upgrade (including `/upgrade` slash command, thread-invocation, and approval button), REST API, AskUserQuestion UI, thread dashboard, scheduled tasks, AI Lounge, startup resume, model switching, compact detection, TodoWrite progress embeds, and permission/elicitation/plan-mode event parsing.
 
 ---
 

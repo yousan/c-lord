@@ -71,7 +71,6 @@ async def setup_bridge(
     allowed_user_ids: set[int] | None = None,
     allowed_role_name: str | None = None,
     claude_channel_id: int | None = None,
-    cli_sessions_path: str | None = None,
     enable_scheduler: bool = True,
     task_db_path: str = "data/tasks.db",
     lounge_channel_id: int | None = None,
@@ -101,7 +100,6 @@ async def setup_bridge(
                            OR logic with allowed_user_ids.  Defaults to
                            CLORD_ALLOWED_ROLE env var, or None (disabled).
         claude_channel_id: Channel ID for Claude chat (needed for SkillCommandCog).
-        cli_sessions_path: Path to ~/.claude/projects for session sync.
         enable_scheduler: Whether to enable SchedulerCog.
         task_db_path: Path for scheduled tasks SQLite DB.
         lounge_channel_id: Discord channel ID for AI Lounge messages.
@@ -198,7 +196,6 @@ async def setup_bridge(
     session_manage_cog = SessionManageCog(
         bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
         repo=session_repo,
-        cli_sessions_path=cli_sessions_path,
         settings_repo=settings_repo,
     )
     await bot.add_cog(session_manage_cog)
