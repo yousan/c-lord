@@ -136,13 +136,17 @@ class ClaudeChatCog(commands.Cog):
             self._dashboard = getattr(self.bot, "thread_dashboard", None)
         return self._dashboard
 
-    async def _resolve_session_dir_manager(self, channel_id: int) -> SessionDirManager | None:
+    async def _resolve_session_dir_manager(
+        self, channel_id: int | None
+    ) -> SessionDirManager | None:
         """Resolve a SessionDirManager for the given channel.
 
         Returns the per-channel manager from ChannelRepoCog if a binding exists,
         or None. Does NOT fall back to a global bot.session_dir_manager —
         channels without a ``/clord-init`` binding get no manager.
         """
+        if channel_id is None:
+            return None
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
@@ -150,13 +154,15 @@ class ClaudeChatCog(commands.Cog):
             return await channel_cog.resolve_manager(channel_id)
         return None
 
-    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
+    async def _resolve_tmux_manager(self, channel_id: int | None) -> TmuxSessionManager | None:
         """Resolve a TmuxSessionManager for the given channel.
 
         Returns the per-channel manager from ChannelRepoCog if a binding exists,
         or None. Does NOT fall back to a global bot.tmux_manager —
         channels without a ``/clord-init`` binding get no manager.
         """
+        if channel_id is None:
+            return None
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
@@ -258,7 +264,12 @@ class ClaudeChatCog(commands.Cog):
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
             await interaction.followup.send("Session completed.", silent=True)
         else:
-            # Create a new thread via spawn_session
+            # Create a new thread via spawn_session (text channels only)
+            if not isinstance(channel, discord.TextChannel):
+                await interaction.followup.send(
+                    "This command must be used in a text channel.", ephemeral=True
+                )
+                return
             thread = await self.spawn_session(channel, prompt)
             await interaction.followup.send(f"Session started → {thread.mention}")
 
@@ -768,6 +779,10 @@ class ClaudeChatCog(commands.Cog):
             # Create a TmuxClaudeRunner for this thread.
             # TUI mode cannot handle interactive permission prompts,
             # so always use --dangerously-skip-permissions.
+            # tmux_manager is guaranteed non-None: resolver returns it iff the
+            # channel has a /clord-init binding (same precondition as session_dir_manager,
+            # checked above).
+            assert tmux_manager is not None
             runner = TmuxClaudeRunner(
                 tmux_manager=tmux_manager,
                 thread_id=thread.id,
