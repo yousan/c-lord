@@ -242,6 +242,41 @@ class TestExtractResponse:
         assert result == "Second answer"
         assert "First answer" not in result
 
+    def test_strips_ccstatusline_block(self) -> None:
+        """ccstatusline output (multi-line, indented, between bottom separator and
+        vim status bar) must be stripped from the Discord output.
+
+        The Claude TUI bottom layout when ccstatusline is configured:
+            ───────── (top separator)
+            ❯ <input>
+            ───────── (bottom separator)
+            <ccstatusline lines, variable count, leading whitespace>
+            -- INSERT -- ⏵⏵ ...
+        """
+        pane = "\n".join(
+            [
+                "❯ hello",
+                "",
+                "● Hello! How can I help you today?",
+                "",
+                "✻ Crunched for 2s",
+                "",
+                "─" * 100,
+                "❯ ",
+                "─" * 100,
+                "   Model: Sonnet 4.6  Style: default  Ctx: 21.9k  Context: [...] 22k/1000k",
+                "   Cost: $0.05  Session: 7.0%  Weekly: 14.0%  Reset: 1hr 51m",
+                "   ⎇ main  (+0,-0)  +0  -0  1499210603107975270  cwd: /home/yousan/c-lord",
+                "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert result == "Hello! How can I help you today?"
+        assert "Model:" not in result
+        assert "Cost:" not in result
+        assert "cwd:" not in result
+        assert "INSERT" not in result
+
     def test_strips_generation_status_during_streaming(self) -> None:
         """During generation, thinking indicators and tips at bottom are stripped."""
         pane = "\n".join(
@@ -1093,9 +1128,7 @@ class TestToolExecutionCompletion:
                 events.append(event)
 
         # The final response should contain the table, NOT the raw tool call
-        finals = [
-            e for e in events if e.message_type == MessageType.ASSISTANT and not e.is_partial
-        ]
+        finals = [e for e in events if e.message_type == MessageType.ASSISTANT and not e.is_partial]
         assert len(finals) == 1
         assert "Fix bug" in finals[0].text
         assert "Running…" not in finals[0].text
