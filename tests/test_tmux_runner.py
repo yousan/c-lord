@@ -820,6 +820,54 @@ class TestTmuxClaudeRunnerRun:
         assert events[-1].error == "Failed to send input to Claude in tmux"
 
     @pytest.mark.asyncio
+    async def test_artifact_frame_not_yielded(self, runner, tmux_manager) -> None:
+        """A transient TUI redraw artifact frame must not be yielded to Discord.
+
+        Scenario: capture-pane snaps a mid-redraw frame where a file path got
+        corrupted (``claude_chat.pypy``), then the next frame shows the clean
+        version (``claude_chat.py``). The artifact must be debounced —
+        only the clean text reaches Discord.
+        """
+        pane_clean1 = _make_pane(["● Reading file:", "  c_lord/cogs/claude_chat.py"])
+        pane_artifact = _make_pane(["● Reading file:", "  c_lord/cogs/claude_chat.pypy"])
+        pane_clean2 = _make_pane(
+            ["● Reading file:", "  c_lord/cogs/claude_chat.py"],
+            with_input_prompt=True,
+        )
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 2:
+                return "Loading..."  # _handle_startup_prompts
+            if call_idx == 3:
+                return pane_clean1
+            if call_idx == 4:
+                return pane_artifact  # transient corruption
+            return pane_clean2  # back to clean, then stable
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        tmux_manager.is_claude_running.return_value = False
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.09),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        partials = [e for e in events if e.message_type == MessageType.ASSISTANT]
+        # The artifact text must never appear in any yielded event.
+        for ev in partials:
+            assert "pypy" not in ev.text, f"Artifact leaked: {ev.text}"
+        # The clean text should reach Discord.
+        assert any("claude_chat.py" in ev.text for ev in partials)
+
+    @pytest.mark.asyncio
     async def test_extracted_text_yielded_as_partial(self, runner, tmux_manager) -> None:
         """Extracted response text is yielded as partial ASSISTANT events."""
         pane_v1 = _make_pane(["● Line 1"])
@@ -907,9 +955,11 @@ class TestTmuxClaudeRunnerRun:
             async for event in runner.run("q"):
                 events.append(event)
 
-        # Should have partial events as response grew.
+        # Should have at least one partial event with the final response.
+        # Note: with debounce, only responses confirmed by 2 consecutive
+        # captures are yielded — transient intermediate frames may be skipped.
         partials = [e for e in events if e.message_type == MessageType.ASSISTANT and e.is_partial]
-        assert len(partials) == 2  # v1 and v2
+        assert len(partials) >= 1
         assert "Done now." in partials[-1].text
 
         # Should have final non-partial and result.
