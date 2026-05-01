@@ -196,6 +196,10 @@ class TmuxClaudeRunner:
         elapsed = 0.0
         stable_seconds = 0.0
         last_response = ""
+        # Previous capture's extracted response — used to debounce non-prefix
+        # changes so that transient TUI redraw artifacts (e.g. mid-frame cursor
+        # rewrites that produce text like "claude_chat.pypy") are not yielded.
+        prev_capture_response = ""
 
         while not self._stopped and elapsed < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
@@ -222,19 +226,29 @@ class TmuxClaudeRunner:
                     self._thread_id,
                 )
 
-            if response != last_response:
-                # Response changed (new content appeared or grew).
-                stable_seconds = 0.0
-                if response:
-                    last_response = response
-                    yield StreamEvent(
-                        raw={},
-                        message_type=MessageType.ASSISTANT,
-                        text=last_response,
-                        is_partial=True,
-                    )
-            else:
+            if response == last_response:
+                # No change from already-yielded state — accumulate stability.
                 stable_seconds += _POLL_INTERVAL
+            elif response and response == prev_capture_response:
+                # Confirmed by two consecutive captures — debounced yield.
+                # Adds ~_POLL_INTERVAL latency per change, but drops transient
+                # TUI redraw artifacts (e.g. mid-frame ".pypy" corruptions
+                # caused by capture-pane snapping a cursor-back rewrite).
+                stable_seconds = 0.0
+                last_response = response
+                yield StreamEvent(
+                    raw={},
+                    message_type=MessageType.ASSISTANT,
+                    text=last_response,
+                    is_partial=True,
+                )
+            else:
+                # First sighting of this response — hold for one more poll.
+                # If the next capture confirms it, we yield; otherwise it is
+                # dropped as a transient artifact.
+                stable_seconds = 0.0
+
+            prev_capture_response = response
 
             # Done: non-empty response has been stable long enough.
             # Two tiers:
