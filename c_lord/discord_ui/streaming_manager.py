@@ -88,9 +88,9 @@ class StreamingMessageManager:
 
         try:
             if self._current_message is None:
-                self._current_message = await self._thread.send(display_text)
+                self._current_message = await self._thread.send(display_text, suppress_embeds=True)
             else:
-                await self._current_message.edit(content=display_text)
+                await self._current_message.edit(content=display_text, suppress=True)
             self._last_edit_time = time.monotonic()
         except Exception:
             # Catch all exceptions including aiohttp.ClientError (e.g. ServerDisconnectedError
