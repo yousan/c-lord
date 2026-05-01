@@ -82,8 +82,10 @@ _STRIP_PATTERNS = (
     # TUI noise — interactive prompts and greetings
     re.compile(r"Press Ctrl-C again to exit"),
     re.compile(r"Claude Code has switched.*"),
-    # TUI tool activity indicators (e.g. "Reading 1 file…", "Recalling 2 memories…")
-    re.compile(r"(?:Reading|Recalling|Writing|Searching|Running|Checking) \d+ .+…"),
+    # TUI tool activity indicators (e.g. "Reading 1 file…", "Recalling 2 memories…",
+    # "Searching for 1 pattern…"). The `(?:\s+\w+)*` allows optional words between
+    # the verb and the digit (e.g. "Searching for N …", "Checking against N …").
+    re.compile(r"(?:Reading|Recalling|Writing|Searching|Running|Checking)(?:\s+\w+)*\s+\d+\s+.+…"),
     # Vim-style status bar lines that leak into the response area
     re.compile(r"--\s*INSERT\s.*"),
     re.compile(r"--\s*NORMAL\s.*"),
