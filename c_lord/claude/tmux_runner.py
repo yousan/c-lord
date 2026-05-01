@@ -405,20 +405,31 @@ class TmuxClaudeRunner:
         #   ──────────── (separator 1)
         #   ❯ <input or hint>  (or "· Thinking…", "Tip: ...")
         #   ──────────── (separator 2)
+        #   <ccstatusline lines, optional, variable count>
         #   -- INSERT -- (status bar)
         #
         # We track separator_count so that ❯ lines are only stripped while
         # inside the input area (between or below the two separators).
         # Once we've passed both separators, a ❯ line is a user prompt
         # and should NOT be stripped.
+        #
+        # `in_status_bar_zone` is True after we've consumed the vim status
+        # bar (-- INSERT) and before we've crossed the bottom separator.
+        # In this zone, unrecognised lines are user-configured ccstatusline
+        # output (Model:, Cost:, ⎇ branch, etc.) and must be stripped.
         end = len(lines)
         separator_count = 0
+        in_status_bar_zone = False
         while end > 0:
             stripped = lines[end - 1].strip()
             if not stripped or any(stripped.startswith(m) for m in _STATUS_BAR_MARKERS):
+                if any(stripped.startswith(m) for m in _STATUS_BAR_MARKERS):
+                    in_status_bar_zone = True
                 end -= 1
             elif _SEPARATOR_RE.match(stripped):
                 separator_count += 1
+                # Crossing the bottom separator exits the ccstatusline zone.
+                in_status_bar_zone = False
                 end -= 1
             elif stripped.startswith("❯") or stripped.startswith(">"):
                 if separator_count < 2:
@@ -430,6 +441,11 @@ class TmuxClaudeRunner:
             elif any(
                 stripped.startswith(m) for m in _GENERATION_STATUS_MARKERS
             ) or _GENERATION_STATUS_RE.match(stripped):
+                end -= 1
+            elif in_status_bar_zone:
+                # Unrecognised line between vim status bar and bottom separator —
+                # this is ccstatusline output (user-configurable, so we cannot
+                # match it with explicit patterns).
                 end -= 1
             else:
                 break
