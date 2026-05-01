@@ -71,6 +71,14 @@ _GENERATION_STATUS_RE = re.compile(r"^(?!❯)[\u2700-\u27BF*·] .+$")
 # Additional explicit markers.
 _GENERATION_STATUS_MARKERS = ("Tip:", "·")
 
+# Markers that indicate Claude has actually started producing output:
+#   ● — assistant response paragraph
+#   ⎿ — tool result
+#   ✻ ✶ ✽ ✦ ✹ — thinking / generation indicators (when leaked into response zone)
+# If none of these appear in the post-prompt region, what we see is just the
+# user's own input echoing through the TUI and we should yield nothing.
+_RESPONSE_MARKERS: tuple[str, ...] = ("●", "⎿", "✻", "✶", "✽", "✦", "✹")
+
 # Lines to strip from the response (TUI hints, not useful on Discord).
 _STRIP_PATTERNS = (
     re.compile(r"● Recalled \d+ memor(?:y|ies).*"),
@@ -505,7 +513,19 @@ class TmuxClaudeRunner:
             response_lines = lines[start:end]
         else:
             # Step 3: Extract response lines between prompt and end.
-            response_lines = lines[prompt_idx + 1 : end]
+            raw_response_lines = lines[prompt_idx + 1 : end]
+            # Anchor on the first Claude response marker (●/⎿/✻ etc.) so that
+            # continuation lines of a multi-line user prompt — which sit
+            # between the ❯ line and Claude's first marker — are not treated
+            # as response text and echoed back to Discord (issue #30).
+            first_marker = -1
+            for i, line in enumerate(raw_response_lines):
+                if line.lstrip().startswith(_RESPONSE_MARKERS):
+                    first_marker = i
+                    break
+            if first_marker == -1:
+                return ""
+            response_lines = raw_response_lines[first_marker:]
 
         # Step 4: Clean up the response.
         return _clean_tui_lines(response_lines)

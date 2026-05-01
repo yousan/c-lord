@@ -424,6 +424,93 @@ class TestExtractResponse:
         assert result == "Full answer here."
         assert "Cooked" not in result
 
+    def test_returns_empty_when_only_user_prompt_no_response(self) -> None:
+        """User prompt visible but Claude has not started responding — return empty.
+
+        Regression for issue #30: previously the Bot echoed the user's input
+        because the post-prompt region was returned even without any Claude
+        response markers (●/⎿/✻).
+        """
+        pane = "\n".join(
+            [
+                "❯ ユーザーの質問",
+                "",
+                "─" * 40,
+                "❯ ",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert TmuxClaudeRunner._extract_response(pane) == ""
+
+    def test_returns_empty_for_multiline_user_prompt_no_response(self) -> None:
+        """Multi-line user input continuation lines must NOT be returned as response.
+
+        Root cause of issue #30: the Discord message was multi-line, and the
+        TUI showed continuation lines after the ❯ prompt line. Those lines
+        had no ●/⎿ marker but the previous extractor treated them as Claude's
+        response and echoed them back.
+        """
+        pane = "\n".join(
+            [
+                "❯ first line of question",
+                "  second line of question",
+                "  third line of question",
+                "",
+                "─" * 40,
+                "❯ ",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert TmuxClaudeRunner._extract_response(pane) == ""
+
+    def test_returns_empty_when_only_thinking_indicator(self) -> None:
+        """Thinking indicator alone (no ●/⎿) → empty response."""
+        pane = "\n".join(
+            [
+                "❯ ユーザーの質問",
+                "",
+                "─" * 40,
+                "✻ Envisioning…",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert TmuxClaudeRunner._extract_response(pane) == ""
+
+    def test_extracts_response_when_bullet_marker_present(self) -> None:
+        """When the response zone contains a ● marker, extract normally."""
+        pane = "\n".join(
+            [
+                "❯ ユーザーの質問",
+                "",
+                "● Claude の応答",
+                "",
+                "─" * 40,
+                "❯ ",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert "Claude の応答" in TmuxClaudeRunner._extract_response(pane)
+
+    def test_extracts_response_with_tool_marker_only(self) -> None:
+        """When only a ⎿ tool marker is present (no ●), still treat as response."""
+        pane = "\n".join(
+            [
+                "❯ ファイル読んで",
+                "",
+                "⎿ Reading file ...",
+                "",
+                "─" * 40,
+                "❯ ",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        assert TmuxClaudeRunner._extract_response(pane) != ""
+
     def test_strips_ascii_asterisk_thinking_in_chrome(self) -> None:
         """Plain * thinking indicators in bottom chrome are stripped."""
         pane = "\n".join(
@@ -866,6 +953,73 @@ class TestTmuxClaudeRunnerRun:
             assert "pypy" not in ev.text, f"Artifact leaked: {ev.text}"
         # The clean text should reach Discord.
         assert any("claude_chat.py" in ev.text for ev in partials)
+
+    @pytest.mark.asyncio
+    async def test_run_does_not_echo_multiline_user_prompt(self, runner, tmux_manager) -> None:
+        """run() must not echo back the user's multi-line input as a response.
+
+        Regression test for issue #30. Sequence:
+          1. User submits multi-line message (rendered in TUI as ❯ line + continuations)
+          2. Claude takes time to respond — multiple captures show only the prompt
+          3. Claude's response appears with ● marker
+        Before the fix the bot yielded the continuation lines as a partial
+        and committed completion before Claude's real response arrived.
+        """
+        tmux_manager.is_claude_running.return_value = True
+
+        pane_no_response = "\n".join(
+            [
+                "❯ first line",
+                "  second line",
+                "",
+                "─" * 40,
+                "❯ ",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        pane_with_response = "\n".join(
+            [
+                "❯ first line",
+                "  second line",
+                "",
+                "● Hi there!",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+
+        captures = [pane_no_response] * 4 + [pane_with_response] * 6
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            if call_idx >= len(captures):
+                return captures[-1]
+            c = captures[call_idx]
+            call_idx += 1
+            return c
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.09),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("first line\nsecond line"):
+                events.append(event)
+
+        partials = [e for e in events if e.message_type == MessageType.ASSISTANT]
+        # No event should echo the user's continuation line
+        for ev in partials:
+            assert "second line" not in ev.text, f"Echo bug: yielded '{ev.text}'"
+        # Claude's actual response should reach Discord
+        assert any("Hi there!" in ev.text for ev in partials)
 
     @pytest.mark.asyncio
     async def test_extracted_text_yielded_as_partial(self, runner, tmux_manager) -> None:
