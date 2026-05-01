@@ -242,6 +242,43 @@ class TestExtractResponse:
         assert result == "Second answer"
         assert "First answer" not in result
 
+    def test_strips_searching_with_intermediate_word(self) -> None:
+        """Tool indicators with words between verb and digit must be stripped.
+
+        The TUI shows "Searching for 1 pattern…" (note "for" between verb and
+        digit) — the original \\d+-only regex missed this case and let it
+        leak into the Discord output.
+        """
+        pane = _make_pane(
+            [
+                "● Searching for 1 pattern…",
+                "● Found it.",
+            ],
+            with_chrome=True,
+            with_input_prompt=True,
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "Searching for 1 pattern" not in result
+        assert "Found it." in result
+
+    def test_strips_tool_indicator_with_animation_artifacts(self) -> None:
+        """Tool indicator captured mid-animation has trailing chars after `…`.
+
+        e.g. ``Reading 1 file…e…`` (TUI redraws ellipsis dots one-by-one and
+        ``capture-pane`` snapshots a partial frame). Must still be stripped.
+        """
+        pane = _make_pane(
+            [
+                "● Reading 1 file…e…",
+                "● Done reading.",
+            ],
+            with_chrome=True,
+            with_input_prompt=True,
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "Reading 1 file" not in result
+        assert "Done reading." in result
+
     def test_strips_ccstatusline_block(self) -> None:
         """ccstatusline output (multi-line, indented, between bottom separator and
         vim status bar) must be stripped from the Discord output.
