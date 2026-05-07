@@ -111,6 +111,7 @@ _STRIP_PATTERNS = (
     re.compile(r"Cost:\s\$.+\sSession:.+"),  # ccstatusline row 2 ("Cost: $... Session: ...")
     re.compile(r"⎇\s.+\scwd:.+"),  # ccstatusline row 3 ("⎇ branch ... cwd: ...")
     re.compile(r"\d+\s+skill descriptions?\s+dropped.*"),
+    re.compile(r"Tip:\s.+"),  # TUI hint line ("Tip: Use Plan Mode ...")
 )
 
 
