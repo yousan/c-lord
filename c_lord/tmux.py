@@ -251,20 +251,25 @@ class TmuxSessionManager:
         if not self._check_available():
             return False
 
-        # Check the window exists by reading its @thread_id option.
-        # (tmux has no ``has-window`` command; ``show-option -w`` fails
-        # with "no such window" when the target does not exist.)
+        # Check the window exists via list-windows. We cannot use
+        # ``show-option -w @thread_id`` because tmux returns rc=1 for both
+        # "window missing" and "option unset" — the latter is the normal
+        # case for windows created manually with ``tmux new-window`` (issue #37).
         result = _run(
             [
                 "tmux",
-                "show-option",
-                "-w",
+                "list-windows",
                 "-t",
-                f"{self.session_name}:{window_name}",
-                "@thread_id",
+                self.session_name,
+                "-F",
+                "#{window_name}",
             ]
         )
         if result.returncode != 0:
+            logger.debug("remap_window: session %s not found", self.session_name)
+            return False
+        existing = {line for line in result.stdout.splitlines() if line}
+        if window_name not in existing:
             logger.debug("remap_window: window %s not found", window_name)
             return False
 

@@ -631,8 +631,8 @@ class TestTmuxSessionManager:
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
-                # show-option @thread_id → window exists
-                MagicMock(returncode=0, stdout="11111\n"),
+                # list-windows → window exists
+                MagicMock(returncode=0, stdout="work1\n"),
                 # set-option @thread_id
                 MagicMock(returncode=0),
             ]
@@ -654,7 +654,8 @@ class TestTmuxSessionManager:
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1)
+            # list-windows succeeds but does not contain target name
+            mock_run.return_value = MagicMock(returncode=0, stdout="work1\nwork2\n")
             result = mgr.remap_window(99999, "nonexistent")
 
         assert result is False
@@ -669,7 +670,7 @@ class TestTmuxSessionManager:
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="11111\n"),  # show-option → window exists
+                MagicMock(returncode=0, stdout="work1\n"),  # list-windows → exists
                 MagicMock(returncode=0),  # set-option
             ]
             result = mgr.remap_window(22222, "work1")
@@ -688,3 +689,51 @@ class TestTmuxSessionManager:
         result = mgr.remap_window(12345, "work1")
 
         assert result is False
+
+    def test_remap_window_manually_created(self) -> None:
+        """remap_window succeeds for a window with no pre-existing @thread_id.
+
+        Regression for issue #37: windows created manually via ``tmux new-window``
+        do not have the ``@thread_id`` option set, so ``show-option -w @thread_id``
+        returns rc=1 ("no such option"). Existence must instead be checked via
+        ``list-windows``.
+        """
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        def fake_run(argv: list[str], *args, **kwargs) -> MagicMock:
+            # show-option for @thread_id on a manually-created window → rc=1
+            if "show-option" in argv and "@thread_id" in argv:
+                return MagicMock(returncode=1, stdout="")
+            # list-windows → window exists in session
+            if "list-windows" in argv:
+                return MagicMock(returncode=0, stdout="work1\nproj34\nwork2\n")
+            # set-option succeeds
+            if "set-option" in argv:
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            result = mgr.remap_window(77777, "proj34")
+
+        assert result is True
+        assert mgr._thread_to_window[77777] == "proj34"
+
+    def test_remap_window_truly_missing(self) -> None:
+        """remap_window returns False when window genuinely does not exist."""
+        mgr = TmuxSessionManager()
+        mgr._available = True
+
+        def fake_run(argv: list[str], *args, **kwargs) -> MagicMock:
+            if "show-option" in argv:
+                return MagicMock(returncode=1, stdout="")
+            if "list-windows" in argv:
+                # session listing does NOT contain target name
+                return MagicMock(returncode=0, stdout="work1\nwork2\n")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            result = mgr.remap_window(77777, "proj34")
+
+        assert result is False
+        assert 77777 not in mgr._thread_to_window
