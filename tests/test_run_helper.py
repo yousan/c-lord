@@ -76,7 +76,7 @@ class TestStreamingMessageManager:
         mgr = StreamingMessageManager(thread)
         mgr._buffer = "test content"
         await mgr.finalize()
-        thread.send.assert_called_once_with("test content")
+        thread.send.assert_called_once_with("test content", suppress_embeds=True)
 
     @pytest.mark.asyncio
     async def test_append_after_finalize_ignored(self, thread: MagicMock) -> None:

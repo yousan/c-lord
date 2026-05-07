@@ -101,6 +101,16 @@ _STRIP_PATTERNS = (
     re.compile(r"^-{5,}$"),
     # Box-drawing separator lines (safety net if bottom-chrome stripping misses them)
     re.compile(r"^[─━═\s]{10,}$"),
+    # Issue #32: defense-in-depth against TUI chrome leaking into Discord
+    # when capture-pane catches a mid-redraw frame. Step 1 walks bottom-up
+    # and bails on unrecognised lines, so a "ghost" copy of chrome above the
+    # real chrome is not stripped. These patterns catch the chrome content
+    # itself in _clean_tui_lines.
+    re.compile(r"❯"),  # bare input prompt char
+    re.compile(r"Model:\s.+\sStyle:.+"),  # ccstatusline row 1 ("Model: ... Style: ...")
+    re.compile(r"Cost:\s\$.+\sSession:.+"),  # ccstatusline row 2 ("Cost: $... Session: ...")
+    re.compile(r"⎇\s.+\scwd:.+"),  # ccstatusline row 3 ("⎇ branch ... cwd: ...")
+    re.compile(r"\d+\s+skill descriptions?\s+dropped.*"),
 )
 
 
