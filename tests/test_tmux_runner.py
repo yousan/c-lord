@@ -529,12 +529,101 @@ class TestExtractResponse:
         assert result == "Answer."
         assert "Forming" not in result
 
+    def test_does_not_emit_chrome_during_redraw_race(self) -> None:
+        """Regression for issue #32.
+
+        When tmux capture-pane catches a frame mid-redraw, the pane may show
+        a "ghost" copy of the bottom chrome (bare ❯ + ccstatusline + tool
+        fragment) above the real bottom chrome. The extractor must NOT emit
+        these chrome lines as response text.
+
+        Real-world reproduction: Discord message 1501818362169397428 in
+        thread 1499664870948339834 on 2026-05-07 contained:
+            ❯
+               Model: Opus 4.7 ... Style: default ...
+               Cost: $0.06 ...
+               ⎇ main ... cwd: ... Skill: none
+               ... 3 skill descriptions dropped · /doctor for details ...
+              Error: Exit code 127
+        """
+        pane = "\n".join(
+            [
+                "$ cd /home/yousan/c-lord",
+                "yousan@host:~$ claude",
+                "",
+                # "ghost" mid-pane chrome from a stale redraw frame
+                "❯",
+                "   Model: Opus 4.7  v2.1.132  Style: default  Ctx: 22.8k  Context: [...]",
+                "   Cost: $0.06  Session: 5.0%  Weekly: 21.0%  Reset: 4hr 10m",
+                "   ⎇ main  (+0,-0)  +0  -0  cwd: /home/yousan/c-lord  Skill: none",
+                "                3 skill descriptions dropped · /doctor for details",
+                "  Error: Exit code 127",
+                "     === /home/yousan/c-lord/data/sessions.db ===",
+                # real bottom chrome
+                "─" * 100,
+                "❯",
+                "─" * 100,
+                "   Model: Opus 4.7  v2.1.132  Style: default  Ctx: 22.8k",
+                "  -- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "Model:" not in result, f"ccstatusline leaked: {result!r}"
+        assert "Cost:" not in result, f"ccstatusline leaked: {result!r}"
+        assert "/doctor" not in result, f"tool indicator leaked: {result!r}"
+        for line in result.splitlines():
+            assert line.strip() != "❯", f"bare prompt leaked: {result!r}"
+
 
 # -- Tests for _clean_tui_lines ---------------------------------------------
 
 
 class TestCleanTuiLines:
     """Tests for the _clean_tui_lines helper function."""
+
+    def test_strips_bare_input_prompt_line(self) -> None:
+        """Bare ❯ line in response area is chrome leakage; must be dropped."""
+        assert _clean_tui_lines(["❯", "● Hi"]) == "Hi"
+
+    def test_strips_ccstatusline_model_row(self) -> None:
+        """ccstatusline 'Model: ... Style:' rows must not leak (issue #32)."""
+        result = _clean_tui_lines(
+            [
+                "● Real response.",
+                "   Model: Opus 4.7  Style: default  Ctx: 22.8k",
+            ]
+        )
+        assert result == "Real response."
+
+    def test_strips_ccstatusline_cost_row(self) -> None:
+        """ccstatusline 'Cost: $... Session:' rows must not leak (issue #32)."""
+        result = _clean_tui_lines(
+            [
+                "● Real response.",
+                "   Cost: $0.06  Session: 5.0%  Weekly: 21.0%",
+            ]
+        )
+        assert result == "Real response."
+
+    def test_strips_ccstatusline_branch_row(self) -> None:
+        """ccstatusline '⎇ branch ... cwd:' rows must not leak (issue #32)."""
+        result = _clean_tui_lines(
+            [
+                "● Real response.",
+                "   ⎇ main  (+0,-0)  cwd: /home/yousan/c-lord  Skill: none",
+            ]
+        )
+        assert result == "Real response."
+
+    def test_strips_skill_descriptions_dropped_indicator(self) -> None:
+        """'N skill descriptions dropped · /doctor for details' is TUI noise."""
+        result = _clean_tui_lines(
+            [
+                "● Real response.",
+                "                3 skill descriptions dropped · /doctor for details",
+            ]
+        )
+        assert result == "Real response."
 
     def test_strips_bullet_marker(self) -> None:
         assert _clean_tui_lines(["● Hello"]) == "Hello"
