@@ -90,9 +90,15 @@ Bot 再起動は積極的に行ってよい。新しいコードで Bot を再�
 pgrep -f "c_lord.main" | xargs kill 2>/dev/null; sleep 2
 nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &
 
-# 2. E2E テスト実行（要 E2E_TEST_WEBHOOK_URL in .env）
-uv run python tests/e2e_discord_attach.py
+# 2. E2E テスト実行（要 .env: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID / E2E_TEST_WEBHOOK_URL）
+uv run pytest -m e2e tests/e2e/ -v
 ```
+
+E2E テストは `tests/e2e/` 配下に pytest として実装され、`@pytest.mark.e2e` マーカーで分離されている。デフォルトの `pytest` 実行 (CI 含む) からは除外され、`-m e2e` を明示した時だけ走る。`.env` に必要なキーが揃っていない場合はテストごと skip される。
+
+**カバーしているフロー**:
+- `tests/e2e/test_attach_command.py` — `!attach` テキストコマンド (webhook → process_commands)
+- `tests/e2e/test_message_flow.py` — スレッドメッセージ → Claude 応答 + TUI chrome leak / OGP suppression 回帰
 
 **Webhook セットアップ**: Discord → Server Settings → Integrations → Webhooks で `DISCORD_CHANNEL_ID` のチャンネルに Webhook を作成し、`.env` の `E2E_TEST_WEBHOOK_URL` に設定する。
 
