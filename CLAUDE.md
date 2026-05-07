@@ -114,11 +114,21 @@ c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) �
 - 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
 - Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多いので、デバッグ時は **Discord REST API を curl で叩く方が確実**
 
+**Token 取得**: 各 clone の作業ディレクトリ直下の `.env` を見るのが基本。本体 (bot を起動している c-lord clone) 以外の並行作業 clone (`c-lord-parallel`, `c-lord-parallel-2`, ...) には **`.env` を本体に symlink する規約** にしている:
+
+```bash
+# 並行 clone を新規作成したら一度だけ
+ln -s /home/yousan/c-lord/.env /path/to/your-clone/.env
+# (パスは運用に合わせて。canonical な bot の .env を指す symlink)
+```
+
+これで以降 `.env` (相対パス) を読めば全 clone から同じ token に届く。bot 本体 clone は実ファイル、並行 clone は symlink。
+
 **読み取り (任意の thread / channel のメッセージ取得)**:
 
 ```bash
-# bot 本体の .env から token を取得 (パスは運用に合わせて)
-TOKEN=$(grep '^DISCORD_BOT_TOKEN=' /path/to/c-lord/.env | cut -d= -f2-)
+# clone のルートで実行 (実ファイル / symlink どちらでも OK)
+TOKEN=$(grep '^DISCORD_BOT_TOKEN=' .env | cut -d= -f2-)
 
 # 直近 N 件のメッセージ
 curl -s -H "Authorization: Bot $TOKEN" \
@@ -140,6 +150,8 @@ curl -s -X POST -H "Authorization: Bot $TOKEN" \
   -d '{"content":"debug: ..."}' \
   "https://discord.com/api/v10/channels/<THREAD_ID>/messages"
 ```
+
+**bot 内 spawn 子 Claude (`c-lord-sessions/<ch>/<thr>/` cwd) の場合**: env は strip されているが、ファイル読みは strip 対象外なので絶対パス (`cat /path/to/c-lord/.env`) で token を取得可能。並行 clone と違い session_dir には symlink を入れていないため絶対パス必須。
 
 **代替: c-lord REST API (`ext/api_server.py`)**:
 api_server をオプトインで有効化してある環境では `POST /api/threads/{thread_id}/messages` で同等の操作が可能 (詳細は `docs/COMMANDS.md`)。bot を再起動せずに有効化する手段はないため、デバッグ目的では上の curl が手軽。
