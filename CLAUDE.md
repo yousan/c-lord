@@ -105,6 +105,45 @@ E2E テストは `tests/e2e/` 配下に pytest として実装され、`@pytest.
 
 テキストコマンド (`!attach` 等) は Webhook 経由で E2E テスト可能。`process_commands` が Webhook メッセージを処理するよう `ClaudeDiscordBot` でオーバーライド済み。
 
+### Debugging Discord from a Claude session
+
+c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) で動かしている Claude から Discord をデバッグ目的で参照・操作したいときの手順。bot 本体や bot が spawn した子プロセスではなく、**手動で起動した Claude / 別マシンの Claude** が対象。
+
+**前提と制約**:
+- `c_lord/cogs/_run_helper.py` は **bot が spawn する子 Claude の env から `DISCORD_BOT_TOKEN` を strip する** (security audit に記載)。bot 経由で立った Claude は環境変数からは token を読めない
+- 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
+- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多いので、デバッグ時は **Discord REST API を curl で叩く方が確実**
+
+**読み取り (任意の thread / channel のメッセージ取得)**:
+
+```bash
+# bot 本体の .env から token を取得 (パスは運用に合わせて)
+TOKEN=$(grep '^DISCORD_BOT_TOKEN=' /path/to/c-lord/.env | cut -d= -f2-)
+
+# 直近 N 件のメッセージ
+curl -s -H "Authorization: Bot $TOKEN" \
+  -H "User-Agent: DiscordBot (https://github.com/yousan/c-lord, 1.0)" \
+  "https://discord.com/api/v10/channels/<THREAD_OR_CHANNEL_ID>/messages?limit=10" \
+  | python3 -c "import sys,json; [print(f\"{m['author']['username']}: {m['content'][:200]}\") for m in reversed(json.load(sys.stdin))]"
+
+# 個別メッセージ
+curl -s -H "Authorization: Bot $TOKEN" \
+  -H "User-Agent: DiscordBot/1.0" \
+  "https://discord.com/api/v10/channels/<CH>/messages/<MSG>"
+```
+
+**投稿 (デバッグ通知を Discord に送る)**:
+
+```bash
+curl -s -X POST -H "Authorization: Bot $TOKEN" \
+  -H "User-Agent: DiscordBot/1.0" -H "Content-Type: application/json" \
+  -d '{"content":"debug: ..."}' \
+  "https://discord.com/api/v10/channels/<THREAD_ID>/messages"
+```
+
+**代替: c-lord REST API (`ext/api_server.py`)**:
+api_server をオプトインで有効化してある環境では `POST /api/threads/{thread_id}/messages` で同等の操作が可能 (詳細は `docs/COMMANDS.md`)。bot を再起動せずに有効化する手段はないため、デバッグ目的では上の curl が手軽。
+
 ## Code Conventions
 
 ### Style
