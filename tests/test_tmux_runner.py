@@ -615,6 +615,16 @@ class TestCleanTuiLines:
         )
         assert result == "Real response."
 
+    def test_strips_tip_line(self) -> None:
+        """'Tip: Use Plan Mode ...' lines are TUI hints, not Claude response."""
+        result = _clean_tui_lines(
+            [
+                "Tip: Use Plan Mode to prepare for a complex request before making changes.",
+                "● Real response.",
+            ]
+        )
+        assert result == "Real response."
+
     def test_strips_skill_descriptions_dropped_indicator(self) -> None:
         """'N skill descriptions dropped · /doctor for details' is TUI noise."""
         result = _clean_tui_lines(
