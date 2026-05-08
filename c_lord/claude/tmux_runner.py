@@ -74,17 +74,18 @@ _GENERATION_STATUS_MARKERS = ("Tip:", "·")
 # Markers that indicate Claude has actually started producing output:
 #   ● — assistant response paragraph
 #   ⎿ — tool result
-#   ✻ ✶ ✽ ✦ ✹ — thinking / generation indicators (when leaked into response zone)
-# If none of these appear in the post-prompt region, what we see is just the
-# user's own input echoing through the TUI and we should yield nothing.
-_RESPONSE_MARKERS: tuple[str, ...] = ("●", "⎿", "✻", "✶", "✽", "✦", "✹")
+# Thinking/generation indicators (✻ ✶ ✽ ✦ ✹) are intentionally NOT included:
+# anchoring on them caused TUI animations like "✶ Calling plugin:discord:discord…"
+# to leak as response text and stall the turn (issue #39).
+_RESPONSE_MARKERS: tuple[str, ...] = ("●", "⎿")
 
 # Lines to strip from the response (TUI hints, not useful on Discord).
 _STRIP_PATTERNS = (
     re.compile(r"● Recalled \d+ memor(?:y|ies).*"),
     re.compile(r"\(ctrl\+o to expand\)"),
-    # Thinking animations: "✻ Forming…", "* Moseying…", "· Thinking…"
-    re.compile(r"[^\w\s●⎿❯>] \w+…"),
+    # Thinking animations: "✻ Forming…", "* Moseying…", "· Thinking…",
+    # and multi-word variants like "✶ Calling plugin:discord:discord…" (#39).
+    re.compile(r"[^\w\s●⎿❯>] [^\n]+…"),
     # Completion summaries: "✻ Cooked for 56s", "* Worked for 3s"
     re.compile(r"[^\w\s●⎿❯>] \w+ for \d+s?"),
     # TUI noise — interactive prompts and greetings
