@@ -511,6 +511,24 @@ class TestExtractResponse:
         )
         assert TmuxClaudeRunner._extract_response(pane) != ""
 
+    def test_extract_response_strips_calling_mcp_tool_indicator(self) -> None:
+        """`✶ Calling plugin:discord:discord…` is a thinking indicator,
+        not a response anchor — must not leak as content. Regression for #39.
+        """
+        pane = (
+            "❯ user question\n"
+            "\n"
+            "✶ Calling plugin:discord:discord…\n"
+            "\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "-- INSERT -- ⏵⏵ bypass permissions on\n"
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "Calling plugin:discord:discord" not in result
+        assert result == ""
+
     def test_strips_ascii_asterisk_thinking_in_chrome(self) -> None:
         """Plain * thinking indicators in bottom chrome are stripped."""
         pane = "\n".join(
