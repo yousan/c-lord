@@ -30,6 +30,7 @@ from ..discord_ui.streaming_manager import (  # noqa: F401
 )
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
+from ..utils.logger import log_ctx
 from .event_processor import EventProcessor
 from .run_config import RunConfig  # noqa: F401
 
@@ -172,6 +173,9 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     Returns:
         The final session_id, or None if the run failed.
     """
+    ctx = log_ctx(thread_id=config.thread.id, session_id=config.session_id)
+    logger.info("%s run_claude: enter (prompt=%d chars)", ctx, len(config.prompt))
+
     # Build system context for side effects (session registry, lounge prompt).
     # The context string itself is not injected — tmux TUI mode does not
     # support --append-system-prompt.
@@ -186,7 +190,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
                 continue
             await processor.process(event)
     except Exception:
-        logger.exception("Error running Claude CLI for thread %d", config.thread.id)
+        logger.exception("%s Error running Claude CLI", ctx)
         # Wrap Discord sends in suppress — the connection may already be closed
         # (e.g. ServerDisconnectedError on bot shutdown), and sending would fail too.
         with contextlib.suppress(Exception):
@@ -213,11 +217,15 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         )
         if answer_prompt:
             logger.info(
-                "Resuming session %s after AskUserQuestion answer",
-                processor.session_id,
+                "%s Resuming after AskUserQuestion answer",
+                log_ctx(thread_id=config.thread.id, session_id=processor.session_id),
             )
             return await run_claude_with_config(config.with_prompt(answer_prompt))
 
+    logger.info(
+        "%s run_claude: exit",
+        log_ctx(thread_id=config.thread.id, session_id=processor.session_id),
+    )
     return processor.session_id
 
 

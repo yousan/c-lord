@@ -23,6 +23,7 @@ from discord.ext import commands
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
+from ..utils.logger import log_ctx
 
 if TYPE_CHECKING:
     from ..claude.config import ClaudeConfig
@@ -117,7 +118,8 @@ class WebhookTriggerCog(commands.Cog):
             return
 
         logger.info(
-            "Webhook trigger matched: prefix=%r, webhook_id=%d",
+            "%s Webhook trigger matched: prefix=%r, webhook_id=%d",
+            log_ctx(channel_id=message.channel.id),
             matched_prefix,
             message.webhook_id,
         )
