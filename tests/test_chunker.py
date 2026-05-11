@@ -3,6 +3,7 @@
 from c_lord.discord_ui.chunker import (
     _close_open_fence,
     _is_table_line,
+    _normalize_leading_indent,
     _wrap_tables_in_fences,
     chunk_message,
 )
@@ -150,6 +151,55 @@ class TestTableChunking:
             if "| val |" in chunk or "| Col |" in chunk:
                 fence_count = chunk.count("```")
                 assert fence_count % 2 == 0, f"Chunk {i} has unbalanced fences: {chunk[:120]!r}"
+
+
+class TestNormalizeLeadingIndent:
+    def test_flat_bullet_list_dedented(self):
+        """Issue #43: flat `  - ` bullets with no parent get dedented."""
+        text = "残り 2 件:\n\n  - #38 — foo\n  - #20 — bar"
+        result = _normalize_leading_indent(text)
+        assert "\n- #38 — foo\n- #20 — bar" in result
+
+    def test_real_nested_list_preserved(self):
+        """Nested list with parent in same paragraph is not dedented."""
+        text = "- top\n  - nested\n  - also nested"
+        result = _normalize_leading_indent(text)
+        assert result == text
+
+    def test_fenced_content_untouched(self):
+        """Lines inside ``` fences keep their leading whitespace."""
+        text = "```\n  indented in fence\n    deeper\n```"
+        result = _normalize_leading_indent(text)
+        assert result == text
+
+    def test_paragraphs_dedented_independently(self):
+        """Each paragraph computes its own common indent."""
+        text = "  first para\n  also indented\n\n    second para deeper"
+        result = _normalize_leading_indent(text)
+        assert result == "first para\nalso indented\n\nsecond para deeper"
+
+    def test_empty_text(self):
+        assert _normalize_leading_indent("") == ""
+
+    def test_no_leading_whitespace_unchanged(self):
+        text = "Hello\n\nWorld"
+        assert _normalize_leading_indent(text) == text
+
+    def test_gh_output_paragraph_first_line_flush(self):
+        """gh-style output where header is flush and rows are indented: first
+        line at col 0 prevents dedent (common min = 0), so other lines keep
+        their indent. Acceptable — those rows are not bullets and don't get
+        misread as nested lists."""
+        text = "Bash(gh issue list)\n  38 OPEN foo\n     20 OPEN bar"
+        result = _normalize_leading_indent(text)
+        assert result == text
+
+    def test_chunk_message_applies_normalization(self):
+        """chunk_message should dedent flat bullet lists before chunking."""
+        text = "Header:\n\n  - item one\n  - item two"
+        chunks = chunk_message(text)
+        assert "- item one" in chunks[0]
+        assert "  - item one" not in chunks[0]
 
 
 class TestCloseOpenFence:

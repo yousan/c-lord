@@ -643,6 +643,19 @@ class TestCleanTuiLines:
         )
         assert result == "Real response."
 
+    def test_strips_effort_indicator(self) -> None:
+        """'◐ medium · /effort' TUI footer must not leak (Issue #50)."""
+        result = _clean_tui_lines(
+            [
+                "● Real response.",
+                "",
+                "◐ medium · /effort",
+            ]
+        )
+        assert "◐" not in result
+        assert "/effort" not in result
+        assert "Real response." in result
+
     def test_strips_skill_descriptions_dropped_indicator(self) -> None:
         """'N skill descriptions dropped · /doctor for details' is TUI noise."""
         result = _clean_tui_lines(

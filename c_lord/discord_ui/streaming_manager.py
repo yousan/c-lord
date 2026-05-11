@@ -13,6 +13,8 @@ import time
 
 import discord
 
+from .chunker import _normalize_leading_indent
+
 logger = logging.getLogger(__name__)
 
 # Streaming message edit interval (seconds). Discord rate limit is 5 edits/5s.
@@ -87,7 +89,7 @@ class StreamingMessageManager:
         if not self._buffer:
             return
 
-        display_text = self._buffer
+        display_text = _normalize_leading_indent(self._buffer)
         if len(display_text) > 2000:
             display_text = display_text[:1997] + "..."
 
