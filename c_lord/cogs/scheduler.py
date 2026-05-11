@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands, tasks
 
+from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -73,11 +74,12 @@ class SchedulerCog(commands.Cog):
         if not due:
             return
 
-        logger.info("SchedulerCog: %d task(s) due", len(due))
+        due_ids = [t["id"] for t in due]
+        logger.info("SchedulerCog: %d task(s) due (ids=%s)", len(due), due_ids)
         for task in due:
             task_id: int = task["id"]
             if task_id in self._running:
-                logger.debug("Task %d still running — skipping", task_id)
+                logger.debug("%s still running — skipping", log_ctx(task_id=task_id))
                 continue
 
             # Advance next_run_at *before* spawning to prevent duplicate runs
@@ -107,29 +109,21 @@ class SchedulerCog(commands.Cog):
         from ..claude.tmux_runner import TmuxClaudeRunner
 
         task_id: int = task["id"]
+        ctx = log_ctx(task_id=task_id, channel_id=task["channel_id"])
         self._running.add(task_id)
+        logger.info("%s _run_task: enter (name=%s)", ctx, task["name"])
         try:
             channel = self.bot.get_channel(task["channel_id"])
             if channel is None:
-                logger.warning(
-                    "SchedulerCog: channel %d not found for task %d (%s)",
-                    task["channel_id"],
-                    task_id,
-                    task["name"],
-                )
+                logger.warning("%s channel not found (name=%s)", ctx, task["name"])
                 return
             if not isinstance(channel, discord.TextChannel):
-                logger.warning("SchedulerCog: channel %d is not a TextChannel", task["channel_id"])
+                logger.warning("%s channel is not a TextChannel", ctx)
                 return
 
             tmux = await self._resolve_tmux_manager(channel.id)
             if tmux is None:
-                logger.warning(
-                    "SchedulerCog: no tmux manager for channel %d, task %d (%s)",
-                    task["channel_id"],
-                    task_id,
-                    task["name"],
-                )
+                logger.warning("%s no tmux manager (name=%s)", ctx, task["name"])
                 return
 
             # Post a starter message first so the thread appears in the channel
@@ -164,6 +158,7 @@ class SchedulerCog(commands.Cog):
             )
 
         except Exception:
-            logger.exception("SchedulerCog: task %d (%s) failed", task_id, task["name"])
+            logger.exception("%s task failed (name=%s)", ctx, task["name"])
         finally:
             self._running.discard(task_id)
+            logger.info("%s _run_task: exit", ctx)

@@ -156,6 +156,55 @@ curl -s -X POST -H "Authorization: Bot $TOKEN" \
 **代替: c-lord REST API (`ext/api_server.py`)**:
 api_server をオプトインで有効化してある環境では `POST /api/threads/{thread_id}/messages` で同等の操作が可能 (詳細は `docs/COMMANDS.md`)。bot を再起動せずに有効化する手段はないため、デバッグ目的では上の curl が手軽。
 
+## Debugging & Troubleshooting
+
+Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ** と **Discord 上のメッセージ** の 2 つ。前者は `nohup` 経由で `/tmp/clord-bot.log` に出ているのが運用上の標準 (上の "Running (standalone)" 参照)。後者は `.env` を読んで Discord REST API を curl で叩く ("Debugging Discord from a Claude session" 参照 — Claude Code から実行可)。
+
+### ログの読み方
+
+すべてのログは Python `logging` 経由で `c_lord/utils/logger.py` で設定された StreamHandler に流れる。フォーマットは `%(asctime)s [%(levelname)s] %(name)s: %(message)s`。
+
+**構造化コンテキスト**: 重要な処理ポイントには `log_ctx()` ヘルパー (`c_lord/utils/logger.py`) で `[thread=<id> session=<short> task=<id> channel=<id>]` 形式の prefix が付く。これで `grep "thread=12345"` すると 1 スレッドの一連の処理を抽出できる。`session=` は UUID-shaped (≥32 文字) のときは先頭セグメントだけに省略される。
+
+**主要な入口/出口ログ**:
+- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit` (Claude 実行 1 回ごと)
+- `cogs/scheduler.py:_run_task` — `_run_task: enter` / `_run_task: exit` (スケジュール実行ごと)
+- `cogs/scheduler.py:_master_loop` — `SchedulerCog: N task(s) due (ids=[...])` (30 秒ごと、due があるときのみ)
+- `cogs/webhook_trigger.py:on_message` — `Webhook trigger matched` (CI/CD webhook 着弾時)
+
+**典型的な調査フロー**:
+1. Discord で問題のスレッド ID を取得 (URL の末尾、または右クリック → Copy ID)
+2. `grep "thread=<ID>" /tmp/clord-bot.log` で当該スレッドの処理ログを抽出
+3. `enter` と `exit` の対応関係 / エラー stacktrace の有無を確認
+4. `session=<short>` を別途 grep すると Claude CLI 側のセッションスコープも追える
+
+新規にログを書くときは、**thread / session / task / channel のいずれかが文脈上ある場合は必ず `log_ctx()` を使う**。素の文字列 interpolation を増やすと grep 性が落ちる。
+
+### セッションライフサイクル
+
+c-lord で 1 つの「セッション」が辿る状態遷移:
+
+1. **作成** — ユーザーがチャンネルにメッセージ → `ClaudeChatCog` がスレッドを作成
+2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)
+3. **tmux window 作成** — `tmux.py::resolve_tmux_manager(channel_id)` で per-channel session を取得し、新規 window (`work1`, `work2`, ...) を立てる
+4. **Claude CLI 起動** — `claude/tmux_runner.py` が tmux window 内で `claude` コマンドを起動。stream-json で stdout を読みつつ Discord にストリーミング表示
+5. **応答完了** — `EventProcessor.finalize()` で最終応答を post、reaction 更新、registry から unregister
+6. **継続** — 同じスレッドへの reply は session_id を `--resume` で渡して同一セッションを継続
+7. **クリーンアップ (任意)** — `_cleanup_session_dir` / `_cleanup_tmux_session` (現状はコマンド経由で明示的にトリガ。スレッド close 時の自動クリーンアップは未実装)
+
+**よくある問題と確認手順**:
+
+| 症状 | 最初に見るべき場所 | 典型的な原因 |
+|------|-----------------|------------|
+| スレッドが作られない | bot ログの `on_message` 周辺、`DISCORD_CHANNEL_ID` が一致しているか | Intent 不足 / channel ID 設定ミス |
+| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか | tmux window 作成失敗、Claude CLI hang、timeout |
+| 同一セッションのはずが別セッション扱い | `_run_helper` で `session_id=` ログを確認、DB の `sessions` テーブル | repository から session_id が読めていない |
+| Webhook trigger が無視される | `Webhook trigger matched` ログの有無 | webhook_id allowlist / channel_ids 不一致、prefix mismatch |
+| Scheduler が動かない | `SchedulerCog: N task(s) due` の有無 (30 秒間隔) | `next_run_at` が未来、`scheduled_tasks` が空 |
+| tmux session が見つからない | `tmux ls` で session 名を確認 | channel に `/clord-init` 未実行 → fallback `clord` を期待してしまう。常に `resolve_tmux_manager(channel_id)` 経由で取得 |
+
+これでも切り分かないときは Discord 側の状態 (リアクション・スレッド存在・最終メッセージの author) を上の curl で確認するのが速い。
+
 ## Code Conventions
 
 ### Style
