@@ -34,6 +34,7 @@ from ..discord_ui.plan_view import PlanApprovalView
 from ..discord_ui.progress_buffer import ProgressBuffer
 from ..discord_ui.streaming_manager import StreamingMessageManager
 from ..discord_ui.tool_timer import LiveToolTimer
+from ..discord_ui.tui_strip import strip_tool_noise
 from .run_config import RunConfig
 
 logger = logging.getLogger(__name__)
@@ -413,29 +414,53 @@ class EventProcessor:
                 await self._state.todo_message.edit(embed=embed)
 
     async def _maybe_attach_progress(self) -> None:
-        """Edit the last assistant message to attach ``progress-*.txt`` (Issue #38).
+        """Edit the last assistant message: clean the body + attach ``progress-*.txt`` (Issue #38).
 
-        Skips silently when there is nothing to attach (no tool use, or the
-        assistant text was never posted as a regular message — e.g. error path).
-        Discord ``Message.edit(attachments=[...])`` replaces existing attachments;
-        the assistant message has none, so this just adds the file.
+        Two transformations applied together when tools were used:
+
+        1. **Body cleanup** — strip ``ToolName(arg)`` headers and the indented
+           output that follows, so the user sees only Claude's final answer.
+        2. **Attachment** — attach ``progress-*.txt`` (JSONL of stream events)
+           for users who want the raw progress.
+
+        Skips silently when there was no assistant message or no tool use
+        (``ProgressBuffer.should_attach`` is False).
         """
         if self._last_assistant_message is None:
             return
         progress_file = self._progress.to_discord_file()
         if progress_file is None:
             return
+
+        # ``discord.Message.content`` may be stale after several edits — fetch
+        # the latest server-side state so the stripper sees what the user sees.
         try:
-            await self._last_assistant_message.edit(attachments=[progress_file])
+            refreshed = await self._config.thread.fetch_message(self._last_assistant_message.id)
+            original_content = refreshed.content or ""
+            self._last_assistant_message = refreshed
+        except discord.HTTPException:
+            original_content = self._last_assistant_message.content or ""
+        cleaned_content = strip_tool_noise(original_content)
+        should_replace_content = bool(cleaned_content) and cleaned_content != original_content
+
+        try:
+            if should_replace_content:
+                await self._last_assistant_message.edit(
+                    content=cleaned_content, attachments=[progress_file]
+                )
+            else:
+                await self._last_assistant_message.edit(attachments=[progress_file])
             logger.info(
-                "Attached %s to final message (events=%d, tools=%d)",
+                "Attached %s to final message (events=%d, tools=%d, stripped=%d→%d chars)",
                 progress_file.filename,
                 len(self._progress._events),
                 self._progress.tool_count,
+                len(original_content),
+                len(cleaned_content),
             )
         except discord.HTTPException:
             logger.warning(
-                "Failed to attach progress.txt to thread %d",
+                "Failed to finalize assistant message in thread %d",
                 self._config.thread.id,
                 exc_info=True,
             )
