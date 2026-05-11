@@ -435,9 +435,7 @@ class EventProcessor:
         # ``discord.Message.content`` may be stale after several edits — fetch
         # the latest server-side state so the stripper sees what the user sees.
         try:
-            refreshed = await self._config.thread.fetch_message(
-                self._last_assistant_message.id
-            )
+            refreshed = await self._config.thread.fetch_message(self._last_assistant_message.id)
             original_content = refreshed.content or ""
             self._last_assistant_message = refreshed
         except discord.HTTPException:
