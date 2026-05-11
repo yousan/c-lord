@@ -324,6 +324,54 @@ CONTRIBUTING.md          # Contribution guidelines
 - **Squash merge preferred**: Keeps main history clean
 - **Commit style**: `<type>: <description>` — types: feat, fix, refactor, docs, test, chore, security
 
+### Standard Development Flow (Mandatory)
+
+Issue → branch → PR → **動作確認 + セルフレビュー** → merge → prod deploy。動作確認なしで merge しないこと。「直ったか分からない」状態を残さないのがルール。
+
+1. **Issue 起票 / 受領** — 何を直すか / 何を作るかを明文化。バグなら**再現条件**を Issue に書く
+2. **ブランチ作成 + TDD で実装** — 失敗テスト → 実装 → グリーン
+3. **PR 作成** — Closes #N で Issue と連動、CI green を確認
+4. **動作確認 (E2E on staging)** ← **必須** — 下記のスキーム
+5. **セルフレビュー** — diff を読み返す / 不要な変更がないか / セキュリティ監査 (`security-audit` skill)
+6. **Merge** (squash + delete branch)
+7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && pgrep -f c_lord.main | xargs -r kill && sleep 3 && nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &`
+
+### 動作確認スキーム (必須)
+
+**ルール**: バグ修正 / 機能追加の PR は必ず staging 環境で「**修正前 = 再現できる**」「**修正後 = 再現しない (グリーン)**」を webhook 経由で確認する。これを通らないものはマージしない。
+
+**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。詳細は memory `project_staging_env.md` 参照。本番 (`/home/yousan/c-lord`) は kill しない。
+
+**手順** (バグ修正の例):
+```bash
+# 1. RED 再現 — staging 上で問題が発生することを webhook 経由で確認
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"content":"<bug を再現する入力>"}' \
+  "$E2E_TEST_WEBHOOK_URL?wait=true&thread_id=$E2E_TEST_THREAD_ID"
+# → /tmp/clord-bot-staging.log で問題発生をログ確認
+# → Discord 上で症状を確認 (REST API で fetch_messages)
+
+# 2. 修正実装 + ユニットテスト
+
+# 3. staging bot を新コードで再起動
+pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
+nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
+
+# 4. GREEN 確認 — 同じ webhook 入力で問題が再現しないこと
+curl -X POST ... (上と同じ)
+# → ログ + Discord 上の応答が期待通りであることを確認
+
+# 5. PR 本文の "Test plan" にこの再現→修正のログ抜粋を貼る
+```
+
+**機能追加の場合**: RED の代わりに「実装前は存在しない挙動」「実装後は期待挙動」を webhook + ログで観測する。例: 構造化ログ追加 PR では `grep "thread=<id>" /tmp/clord-bot-staging.log` で **before = ヒットしない / after = enter/exit ペアが出る** を比較。
+
+**スキップしてよい例外**:
+- 純粋なドキュメント PR (CLAUDE.md / README のみ)
+- 純粋なリファクタで挙動が変わらないことが自明 (それでも `pytest` は必須)
+
+それ以外で staging 検証を省略するときは PR 本文に省略理由を書く。
+
 ## AI Agent Configuration
 
 This project ships AI agent configs for all major tools:
