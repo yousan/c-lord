@@ -41,6 +41,11 @@ class StreamingMessageManager:
     def has_content(self) -> bool:
         return bool(self._buffer)
 
+    @property
+    def last_message(self) -> discord.Message | None:
+        """The most recent Discord message this manager sent/edited, if any."""
+        return self._current_message
+
     async def append(self, text: str) -> None:
         """Append text to the streaming buffer and schedule an edit."""
         if self._finalized:
