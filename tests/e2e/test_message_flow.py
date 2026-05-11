@@ -23,6 +23,7 @@ CHROME_BLACKLIST = (
     "Tip: Use Plan Mode",  # TUI hint
     "skill descriptions dropped",  # /doctor indicator
     "-- INSERT --",  # vim status bar
+    "· /effort",  # Issue #50: effort/model footer ("◐ medium · /effort")
 )
 
 

@@ -112,6 +112,10 @@ _STRIP_PATTERNS = (
     re.compile(r"⎇\s.+\scwd:.+"),  # ccstatusline row 3 ("⎇ branch ... cwd: ...")
     re.compile(r"\d+\s+skill descriptions?\s+dropped.*"),
     re.compile(r"Tip:\s.+"),  # TUI hint line ("Tip: Use Plan Mode ...")
+    # Issue #50: effort/model footer indicator ("◐ medium · /effort", "○ low · /effort").
+    # Geometric Shapes block (U+25A0–U+25FF) is not covered by _GENERATION_STATUS_RE
+    # which only matches Dingbats (U+2700–U+27BF).
+    re.compile(r"^[■-◿]\s+\w+\s+·\s+/\w+"),
 )
 
 
