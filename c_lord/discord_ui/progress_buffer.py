@@ -22,6 +22,7 @@ import json
 import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
+from enum import Enum
 from io import BytesIO
 from typing import Any
 
@@ -178,6 +179,6 @@ def _dataclass_to_dict(obj: Any) -> Any:
         return [_dataclass_to_dict(v) for v in obj]
     if isinstance(obj, dict):
         return {k: _dataclass_to_dict(v) for k, v in obj.items()}
-    if hasattr(obj, "value") and hasattr(obj, "name"):  # Enum
+    if isinstance(obj, Enum):
         return obj.value
     return obj
