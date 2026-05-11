@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from c_lord.claude.tmux_runner import TmuxClaudeRunner, _clean_tui_lines
+from c_lord.claude.tmux_runner import TmuxClaudeRunner, _clean_tui_lines, _normalize_capture
 from c_lord.claude.types import MessageType
 
 
@@ -1055,6 +1055,7 @@ class TestTmuxClaudeRunnerRun:
         result_events = [e for e in events if e.is_complete]
         assert len(result_events) == 1
 
+
 class TestTmuxClaudeRunnerInterrupt:
     """Tests for interrupt() and kill()."""
 
@@ -1234,3 +1235,139 @@ class TestIsGenerating:
 class TestToolExecutionCompletion:
     """Tests that tool execution does not trigger false early completion."""
 
+    @pytest.mark.asyncio
+    async def test_tool_execution_does_not_trigger_early_completion(
+        self, runner, tmux_manager
+    ) -> None:
+        """When ✻ Running… is visible and text is stable, quick-exit should NOT fire.
+
+        The pane shows a tool call with ✻ Running… indicator and bare ❯ prompt.
+        Without the _is_generating guard, the 3s quick-exit would fire.
+        With the guard, only the 30s fallback can trigger completion.
+        """
+        tmux_manager.is_claude_running.return_value = True
+
+        # Pane shows a tool call with ✻ Running… — text is stable but not done
+        tool_pane = "\n".join(
+            [
+                "❯ list issues",
+                "",
+                "● Bash(gh issue list --limit 10)",
+                "",
+                "─" * 40,
+                "✻ Running…",
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        # After several polls at tool_pane (stable but generating),
+        # Claude finishes and shows the final response
+        final_pane = _make_pane(
+            [
+                "● Here are the issues:",
+                "",
+                "  | # | Title     |",
+                "  |---|-----------|",
+                "  | 1 | Fix bug   |",
+            ],
+            user_prompt="list issues",
+            with_input_prompt=True,
+        )
+
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Polls 1-8: tool running (stable text with ✻ Running…)
+            if call_idx <= 8:
+                return tool_pane
+            # Polls 9+: final response
+            return final_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.15),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 30.0),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("list issues"):
+                events.append(event)
+
+        # Runner should complete normally without early exit during tool execution.
+        # ASSISTANT events are no longer yielded (#53); check RESULT instead.
+        results = [e for e in events if e.message_type == MessageType.RESULT]
+        assert len(results) == 1
+        assert results[0].is_complete is True
+        assert results[0].error is None
+
+
+# -- Tests for OSC 8 hyperlink normalization (issue #47) --------------------
+
+
+class TestNormalizeCapture:
+    """Tests for _normalize_capture — OSC 8 → bare URL + ANSI strip."""
+
+    def test_http_osc8_becomes_text_with_bare_url(self) -> None:
+        """`#45` link to GitHub PR becomes `#45 (https://...)`."""
+        text = "PR \x1b]8;id=abc;https://github.com/yousan/c-lord/pull/45\x1b\\#45\x1b]8;;\x1b\\"
+        result = _normalize_capture(text)
+        assert "#45" in result
+        assert "https://github.com/yousan/c-lord/pull/45" in result
+
+    def test_file_url_dropped_keep_text_only(self) -> None:
+        """file:// URLs are local to bot; keep only the visible text."""
+        text = "\x1b]8;id=x;file:///home/y/foo.py\x1b\\foo.py\x1b]8;;\x1b\\"
+        result = _normalize_capture(text)
+        assert result.strip() == "foo.py"
+        assert "file://" not in result
+
+    def test_ansi_color_codes_stripped(self) -> None:
+        """CSI color escapes are removed."""
+        text = "\x1b[38;5;114m●\x1b[39m \x1b[1mHello\x1b[0m"
+        result = _normalize_capture(text)
+        assert result == "● Hello"
+
+    def test_osc8_and_ansi_combined(self) -> None:
+        """Realistic capture-pane output with both."""
+        text = (
+            "\x1b[34m\x1b]8;id=1;https://docs.pytest.org/x.html\x1b\\"
+            "https://docs.pytest.org/x.html\x1b[39m\x1b]8;;\x1b\\"
+        )
+        result = _normalize_capture(text)
+        # When visible text == URL, emit URL once (no duplication).
+        assert result.count("https://docs.pytest.org/x.html") == 1
+        assert "\x1b" not in result
+
+    def test_plain_text_unchanged(self) -> None:
+        assert _normalize_capture("hello world") == "hello world"
+
+    def test_empty_string(self) -> None:
+        assert _normalize_capture("") == ""
+
+
+class TestExtractResponsePreservesHyperlinks:
+    """Issue #47: URLs in TUI markdown links must survive into Discord output."""
+
+    def test_issue_reference_link_preserved(self) -> None:
+        """Claude TUI output `[#271](https://...)` (rendered as OSC 8) keeps URL."""
+        link = "\x1b]8;id=a;https://github.com/foo/bar/issues/271\x1b\\#271\x1b]8;;\x1b\\"
+        pane = "\n".join(
+            [
+                "❯ list issues",
+                "",
+                f"● - {link} a bug",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT --",
+            ]
+        )
+        result = TmuxClaudeRunner._extract_response(pane)
+        assert "#271" in result
+        assert "https://github.com/foo/bar/issues/271" in result
