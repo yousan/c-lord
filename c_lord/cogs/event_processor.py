@@ -13,6 +13,8 @@ from __future__ import annotations
 import contextlib
 import logging
 
+import discord
+
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
 from ..discord_ui.chunker import chunk_message
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
@@ -29,6 +31,7 @@ from ..discord_ui.embeds import (
 )
 from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
+from ..discord_ui.progress_buffer import ProgressBuffer
 from ..discord_ui.streaming_manager import StreamingMessageManager
 from ..discord_ui.tool_timer import LiveToolTimer
 from .run_config import RunConfig
@@ -93,6 +96,13 @@ class EventProcessor:
         # (skip events) then handle the ask after the stream ends.
         self._pending_ask: list[AskQuestion] | None = None
 
+        # Accumulates events for progress.txt attachment (Issue #38).
+        self._progress = ProgressBuffer()
+
+        # The last Discord message we sent assistant text to. ``_on_complete``
+        # edits this with the progress.txt attachment when tools were used.
+        self._last_assistant_message: discord.Message | None = None
+
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
@@ -123,6 +133,7 @@ class EventProcessor:
 
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
+        self._progress.add(event)
         if event.message_type == MessageType.SYSTEM:
             await self._on_system(event)
         elif event.message_type == MessageType.ASSISTANT:
@@ -251,6 +262,8 @@ class EventProcessor:
         if self._streamer.has_content:
             await self._streamer.finalize()
             self._assistant_text_sent = True
+            if self._streamer.last_message is not None:
+                self._last_assistant_message = self._streamer.last_message
 
         if event.error:
             await self._config.thread.send(embed=_make_error_embed(event.error))
@@ -261,10 +274,14 @@ class EventProcessor:
             response_text = event.text
             if response_text and not self._assistant_text_sent:
                 for chunk in chunk_message(response_text):
-                    await self._config.thread.send(chunk)
+                    sent = await self._config.thread.send(chunk)
+                    self._last_assistant_message = sent
 
             if self._config.status:
                 await self._config.status.set_done()
+
+        # Attach progress.txt to the final message (Issue #38).
+        await self._maybe_attach_progress()
 
         if event.session_id:
             if self._config.repo:
@@ -294,11 +311,14 @@ class EventProcessor:
                 if delta:
                     await self._streamer.append(delta)
                 await self._streamer.finalize()
+                if self._streamer.last_message is not None:
+                    self._last_assistant_message = self._streamer.last_message
                 self._streamer = StreamingMessageManager(self._config.thread)
             else:
                 # No partial events arrived — post the full text directly.
                 for chunk in chunk_message(event.text):
-                    await self._config.thread.send(chunk)
+                    sent = await self._config.thread.send(chunk)
+                    self._last_assistant_message = sent
             self._state.partial_text = ""
             self._state.accumulated_text = event.text
             self._assistant_text_sent = True
@@ -391,6 +411,34 @@ class EventProcessor:
             # Subsequent updates: edit in-place.
             with contextlib.suppress(Exception):
                 await self._state.todo_message.edit(embed=embed)
+
+    async def _maybe_attach_progress(self) -> None:
+        """Edit the last assistant message to attach ``progress-*.txt`` (Issue #38).
+
+        Skips silently when there is nothing to attach (no tool use, or the
+        assistant text was never posted as a regular message — e.g. error path).
+        Discord ``Message.edit(attachments=[...])`` replaces existing attachments;
+        the assistant message has none, so this just adds the file.
+        """
+        if self._last_assistant_message is None:
+            return
+        progress_file = self._progress.to_discord_file()
+        if progress_file is None:
+            return
+        try:
+            await self._last_assistant_message.edit(attachments=[progress_file])
+            logger.info(
+                "Attached %s to final message (events=%d, tools=%d)",
+                progress_file.filename,
+                len(self._progress._events),
+                self._progress.tool_count,
+            )
+        except discord.HTTPException:
+            logger.warning(
+                "Failed to attach progress.txt to thread %d",
+                self._config.thread.id,
+                exc_info=True,
+            )
 
     async def _bump_stop(self) -> None:
         """Move the Stop button to the bottom of the thread if configured."""
