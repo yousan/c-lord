@@ -34,3 +34,4 @@ htmlcov/
 
 # Personal workflow scripts (not part of the OSS framework)
 tmux.sh
+.claude/scheduled_tasks.lock
