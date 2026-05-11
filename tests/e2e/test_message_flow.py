@@ -85,3 +85,45 @@ def test_url_in_reply_has_embeds_suppressed(
     flags = reply.get("flags", 0)
     assert flags & 4, f"SUPPRESS_EMBEDS flag missing (flags={flags}). PR #33 regression."
     assert not reply.get("embeds"), "Reply contains embed cards despite SUPPRESS_EMBEDS"
+
+
+@pytest.mark.e2e
+def test_bullet_list_leading_indent_is_normalized(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+    attached_thread_id: str,
+) -> None:
+    """Issue #43: flat bullet lists with leading spaces must be flattened.
+
+    Claude is asked to echo a bullet list with 2-space leading indent. The
+    bot's reply must contain the bullets at column 0, not indented (otherwise
+    Discord renders them as nested under nothing — the regression we fixed).
+    """
+    marker = "e2e-43-indent-zk9"
+    wh = discord_client.webhook_post(
+        "以下を返答にそのままコピーして含めてください。説明不要、装飾不要、"
+        f"marker `{marker}` を含めること:\n\n"
+        f"result {marker}:\n\n  - alpha\n  - beta\n  - gamma",
+        thread_id=attached_thread_id,
+    )
+
+    reply = discord_client.wait_for_bot_reply(
+        attached_thread_id,
+        after_message_id=wh["id"],
+        bot_id=bot_id,
+        contains=marker,
+        timeout=180.0,
+        poll=4.0,
+    )
+    assert reply is not None, f"Bot did not reply with marker {marker!r} within 180s"
+
+    content = reply["content"]
+    # Each bullet must appear at column 0, not preceded by spaces — otherwise
+    # Discord (CommonMark) renders them as a nested list with no parent.
+    for token in ("- alpha", "- beta", "- gamma"):
+        assert f"\n{token}" in content or content.startswith(token), (
+            f"Bullet {token!r} not at column 0 in reply: {content!r}"
+        )
+        assert f"  {token}" not in content, (
+            f"Bullet {token!r} still preceded by indent in reply: {content!r}"
+        )
