@@ -11,6 +11,8 @@ across messages both appear with correct column alignment.
 
 from __future__ import annotations
 
+import textwrap
+
 DISCORD_MAX_CHARS = 2000
 # Leave room for fence reopening overhead
 EFFECTIVE_MAX = DISCORD_MAX_CHARS - 50
@@ -29,6 +31,7 @@ def chunk_message(text: str, max_chars: int = EFFECTIVE_MAX) -> list[str]:
     if not text:
         return []
 
+    text = _normalize_leading_indent(text)
     text = _wrap_tables_in_fences(text)
 
     if len(text) <= max_chars:
@@ -56,6 +59,51 @@ def chunk_message(text: str, max_chars: int = EFFECTIVE_MAX) -> list[str]:
             remaining = f"```{fence_lang}\n{remaining}"
 
     return [c for c in chunks if c.strip()]
+
+
+def _normalize_leading_indent(text: str) -> str:
+    """Strip spurious common leading whitespace from each paragraph.
+
+    Discord (CommonMark) treats ``  - item`` as a nested list item even when
+    there is no parent bullet at less indent. Claude sometimes emits flat
+    bullet lists with leading spaces, which renders as visually nested on
+    Discord. ``textwrap.dedent`` applied per paragraph removes the common
+    indent — real nested lists (parent at col 0 in the same paragraph) have
+    a common min of 0 and stay unchanged, while flat indented lists collapse
+    to col 0.
+
+    Lines inside fenced code blocks (``` ... ```) are passed through verbatim.
+    """
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    result: list[str] = []
+    in_fence = False
+    paragraph: list[str] = []
+
+    def flush() -> None:
+        if paragraph:
+            block = "\n".join(paragraph)
+            result.extend(textwrap.dedent(block).split("\n"))
+            paragraph.clear()
+
+    for line in lines:
+        if line.lstrip().startswith("```"):
+            flush()
+            result.append(line)
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            result.append(line)
+            continue
+        if line.strip() == "":
+            flush()
+            result.append(line)
+        else:
+            paragraph.append(line)
+    flush()
+    return "\n".join(result)
 
 
 def _wrap_tables_in_fences(text: str) -> str:
