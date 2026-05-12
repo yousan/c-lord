@@ -26,6 +26,32 @@ class TestRenderDiscordReplySkill:
         body = render_discord_reply_skill(thread_id=42, api_url="http://x")
         assert '"thread_id": 42' in body
 
+    def test_no_multipart_examples(self) -> None:
+        """The endpoint is JSON-only — SKILL.md must not show -F multipart."""
+        body = render_discord_reply_skill(thread_id=1, api_url="http://x")
+        # `-F` would mean multipart form-data which /api/reply does NOT accept.
+        # `-d` (data) is JSON which it does accept.
+        assert " -F " not in body, "SKILL.md must not advertise multipart form-data"
+
+    def test_progress_file_uses_absolute_path(self) -> None:
+        """`progress_file` is an absolute server-side path, not @local-file."""
+        body = render_discord_reply_skill(thread_id=7, api_url="http://x")
+        assert "progress_file" in body
+        # Make sure we don't suggest the multipart `@path` upload syntax.
+        assert '"progress_file": "@' not in body
+        assert '"progress_file": "/' in body
+
+    def test_renders_bearer_header_when_secret_set(self) -> None:
+        body = render_discord_reply_skill(
+            thread_id=1, api_url="http://x", api_secret="s3cret-xyz"
+        )
+        assert "Authorization: Bearer s3cret-xyz" in body
+
+    def test_omits_bearer_header_when_no_secret(self) -> None:
+        body = render_discord_reply_skill(thread_id=1, api_url="http://x")
+        assert "Bearer" not in body
+        assert "Authorization" not in body
+
 
 class TestInjectSkills:
     def test_writes_discord_reply_skill_md(self, tmp_path: Path) -> None:
@@ -72,6 +98,31 @@ class TestInjectSkills:
         inject_skills(session_dir, thread_id=1)
         body = (session_dir / ".claude" / "skills" / "discord-reply" / "SKILL.md").read_text()
         assert "http://127.0.0.1:8080" in body
+
+    def test_reads_api_secret_from_env(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("CLORD_API_SECRET", "env-secret-99")
+        session_dir = tmp_path / "1"
+        session_dir.mkdir()
+        inject_skills(session_dir, thread_id=1, api_url="http://x")
+        body = (session_dir / ".claude" / "skills" / "discord-reply" / "SKILL.md").read_text()
+        assert "Authorization: Bearer env-secret-99" in body
+
+    def test_explicit_api_secret_overrides_env(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("CLORD_API_SECRET", "from-env")
+        session_dir = tmp_path / "1"
+        session_dir.mkdir()
+        inject_skills(session_dir, thread_id=1, api_url="http://x", api_secret="explicit")
+        body = (session_dir / ".claude" / "skills" / "discord-reply" / "SKILL.md").read_text()
+        assert "Bearer explicit" in body
+        assert "from-env" not in body
+
+    def test_no_auth_header_when_no_secret(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("CLORD_API_SECRET", raising=False)
+        session_dir = tmp_path / "1"
+        session_dir.mkdir()
+        inject_skills(session_dir, thread_id=1, api_url="http://x")
+        body = (session_dir / ".claude" / "skills" / "discord-reply" / "SKILL.md").read_text()
+        assert "Authorization" not in body
 
 
 class TestSkillsEnabled:

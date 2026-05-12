@@ -113,40 +113,45 @@ class SessionDirManager:
         """Create (or return existing) session directory for a thread.
 
         Idempotent: if the directory already exists, returns its path
-        without re-cloning.
+        without re-cloning. The skill bundle (#52) is (re)injected on every
+        call when the flag is enabled — this keeps SKILL.md in sync with the
+        current ``CLORD_API_URL`` / ``CLORD_API_SECRET`` even if the operator
+        changes them between sessions.
 
         Returns:
             Absolute path to the session directory.
         """
         target = str(Path(self._base_dir) / str(thread_id))
-        if Path(target).is_dir():
-            logger.info("Session dir already exists: %s", target)
-            return target
+        already_existed = Path(target).is_dir()
 
-        Path(self._base_dir).mkdir(parents=True, exist_ok=True)
+        if not already_existed:
+            Path(self._base_dir).mkdir(parents=True, exist_ok=True)
 
-        args = ["git", "clone"]
-        if _is_local_repo(self._source_repo):
-            args.append("--local")
+            args = ["git", "clone"]
+            if _is_local_repo(self._source_repo):
+                args.append("--local")
+            else:
+                args.extend(["--depth=1", "--single-branch"])
+
+            args.extend([self._source_repo, target])
+
+            result = _run(args)
+            if result.returncode != 0:
+                logger.error(
+                    "git clone failed for thread %d: %s",
+                    thread_id,
+                    result.stderr.strip(),
+                )
+                raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
+
+            logger.info("Created session dir for thread %d: %s", thread_id, target)
         else:
-            args.extend(["--depth=1", "--single-branch"])
+            logger.info("Session dir already exists: %s", target)
 
-        args.extend([self._source_repo, target])
-
-        result = _run(args)
-        if result.returncode != 0:
-            logger.error(
-                "git clone failed for thread %d: %s",
-                thread_id,
-                result.stderr.strip(),
-            )
-            raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
-
-        logger.info("Created session dir for thread %d: %s", thread_id, target)
-
-        # Issue #52 Phase 1: inject discord-reply skill so Claude can push
+        # Issue #52 Phase 1: (re)inject discord-reply skill so Claude can push
         # final answers via REST API instead of relying on capture-pane
         # scraping. Gated by USE_SKILL_REPLY env so old path stays default.
+        # Runs on every call to keep api_url / api_secret in sync.
         from .skills.injector import inject_skills, skills_enabled
 
         if skills_enabled():
