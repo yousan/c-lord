@@ -146,6 +146,48 @@ class TestCreateSessionDir:
         assert result == str(session_dir)
         mock_run.assert_not_called()
 
+    def test_injects_skills_when_flag_enabled(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Issue #52: with USE_SKILL_REPLY=true the discord-reply SKILL.md
+        is dropped into the freshly cloned session dir."""
+        monkeypatch.setenv("USE_SKILL_REPLY", "true")
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+            # Simulate git clone success by creating the target dir.
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(987)
+
+        skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert skill.exists(), "discord-reply SKILL.md should be injected"
+        assert "987" in skill.read_text()
+
+    def test_does_not_inject_skills_when_flag_disabled(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(123)
+
+        skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert not skill.exists(), "skills should be opt-in via env flag"
+
     def test_clone_failure_raises(self, tmp_path: Path) -> None:
         base = str(tmp_path / "sessions")
 

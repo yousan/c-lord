@@ -143,6 +143,19 @@ class SessionDirManager:
             raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
 
         logger.info("Created session dir for thread %d: %s", thread_id, target)
+
+        # Issue #52 Phase 1: inject discord-reply skill so Claude can push
+        # final answers via REST API instead of relying on capture-pane
+        # scraping. Gated by USE_SKILL_REPLY env so old path stays default.
+        from .skills.injector import inject_skills, skills_enabled
+
+        if skills_enabled():
+            try:
+                inject_skills(target, thread_id=thread_id)
+            except OSError as exc:
+                # Don't fail session creation on a skill write error.
+                logger.warning("Failed to inject skills for thread %d: %s", thread_id, exc)
+
         return target
 
     def find_session_dirs(self) -> list[SessionDirInfo]:

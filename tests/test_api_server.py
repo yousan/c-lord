@@ -562,3 +562,133 @@ class TestPostThreadMessage:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status == 400
+
+
+class TestReplyEndpoint:
+    """Tests for POST /api/reply — Skill-based final reply (#52 Phase 1)."""
+
+    @pytest.fixture
+    def thread_mock(self) -> MagicMock:
+        import discord
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555666777
+        thread.send = AsyncMock()
+        return thread
+
+    @pytest.fixture
+    def bot_with_thread(self, thread_mock: MagicMock) -> MagicMock:
+        b = MagicMock()
+        b.get_channel.return_value = thread_mock
+        return b
+
+    @pytest.fixture
+    async def reply_client(
+        self, repo: NotificationRepository, bot_with_thread: MagicMock
+    ) -> TestClient:
+        api = ApiServer(repo=repo, bot=bot_with_thread, default_channel_id=12345)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        yield client
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_plain_content_posts_to_thread(
+        self, reply_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        resp = await reply_client.post(
+            "/api/reply",
+            json={"thread_id": 555666777, "content": "final answer here"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "sent"
+        thread_mock.send.assert_called_once()
+        kwargs = thread_mock.send.call_args.kwargs
+        args = thread_mock.send.call_args.args
+        sent = kwargs.get("content") if "content" in kwargs else (args[0] if args else "")
+        assert "final answer here" in sent
+        # Unlike post_thread_message, /api/reply MUST NOT add a "-# 💻 (cli)" prefix.
+        assert "💻" not in sent
+        assert not sent.startswith("-# ")
+
+    @pytest.mark.asyncio
+    async def test_missing_content_returns_400(self, reply_client: TestClient) -> None:
+        resp = await reply_client.post("/api/reply", json={"thread_id": 555666777})
+        assert resp.status == 400
+        assert "content" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_thread_id_returns_400(self, reply_client: TestClient) -> None:
+        resp = await reply_client.post("/api/reply", json={"content": "hi"})
+        assert resp.status == 400
+        assert "thread_id" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_400(self, reply_client: TestClient) -> None:
+        resp = await reply_client.post(
+            "/api/reply",
+            data=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_thread_not_found_returns_404(
+        self, repo: NotificationRepository
+    ) -> None:
+        b = MagicMock()
+        b.get_channel.return_value = None
+        b.fetch_channel = AsyncMock(side_effect=Exception("not found"))
+        api = ApiServer(repo=repo, bot=b, default_channel_id=1)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 999, "content": "x"},
+            )
+            assert resp.status == 404
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_attachment_via_progress_file(
+        self,
+        reply_client: TestClient,
+        thread_mock: MagicMock,
+        tmp_path,
+    ) -> None:
+        """When `progress_file` is given, it is attached to the Discord message."""
+        progress = tmp_path / "progress.txt"
+        progress.write_text("step1\nstep2\n")
+
+        resp = await reply_client.post(
+            "/api/reply",
+            json={
+                "thread_id": 555666777,
+                "content": "done",
+                "progress_file": str(progress),
+            },
+        )
+        assert resp.status == 200
+        thread_mock.send.assert_called_once()
+        kwargs = thread_mock.send.call_args.kwargs
+        # Discord.py's send(file=...) — verify a file was passed
+        assert "file" in kwargs or "files" in kwargs
+
+    @pytest.mark.asyncio
+    async def test_missing_progress_file_returns_400(
+        self, reply_client: TestClient
+    ) -> None:
+        resp = await reply_client.post(
+            "/api/reply",
+            json={
+                "thread_id": 555666777,
+                "content": "x",
+                "progress_file": "/no/such/path.txt",
+            },
+        )
+        assert resp.status == 400
