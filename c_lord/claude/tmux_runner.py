@@ -250,26 +250,15 @@ class TmuxClaudeRunner:
                     self._thread_id,
                 )
 
+            # Issue #53: text events are no longer yielded — Claude posts its
+            # own final answer via the discord-reply skill. We still track
+            # response stability here purely as a completion signal.
             if response == last_response:
-                # No change from already-yielded state — accumulate stability.
                 stable_seconds += _POLL_INTERVAL
             elif response and response == prev_capture_response:
-                # Confirmed by two consecutive captures — debounced yield.
-                # Adds ~_POLL_INTERVAL latency per change, but drops transient
-                # TUI redraw artifacts (e.g. mid-frame ".pypy" corruptions
-                # caused by capture-pane snapping a cursor-back rewrite).
                 stable_seconds = 0.0
                 last_response = response
-                yield StreamEvent(
-                    raw={},
-                    message_type=MessageType.ASSISTANT,
-                    text=last_response,
-                    is_partial=True,
-                )
             else:
-                # First sighting of this response — hold for one more poll.
-                # If the next capture confirms it, we yield; otherwise it is
-                # dropped as a transient artifact.
                 stable_seconds = 0.0
 
             prev_capture_response = response
@@ -311,7 +300,6 @@ class TmuxClaudeRunner:
                 raw={},
                 message_type=MessageType.RESULT,
                 is_complete=True,
-                text=last_response or None,
                 error=None if self._silent_stop else "Stopped by user",
             )
         elif elapsed >= self.timeout_seconds:
@@ -322,20 +310,13 @@ class TmuxClaudeRunner:
                 error=f"Timed out after {self.timeout_seconds} seconds",
             )
         else:
-            # Normal completion — yield the final full text as non-partial,
-            # then the result event.
-            if last_response:
-                yield StreamEvent(
-                    raw={},
-                    message_type=MessageType.ASSISTANT,
-                    text=last_response,
-                    is_partial=False,
-                )
+            # Normal completion — emit RESULT only. The text is intentionally
+            # dropped (#53): Claude posts its own final answer via the
+            # discord-reply skill, not through the runner stream.
             yield StreamEvent(
                 raw={},
                 message_type=MessageType.RESULT,
                 is_complete=True,
-                text=last_response or None,
             )
 
     async def interrupt(self, *, silent: bool = False) -> None:

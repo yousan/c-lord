@@ -28,10 +28,10 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 
 ## Key Design Decisions
 
-1. **CLI spawn, not API**: We invoke `claude -p --output-format stream-json` as a subprocess, not the Anthropic API directly. This gives us all Claude Code features (CLAUDE.md, skills, tools, memory) for free.
+1. **Claude pushes its own answer via Skill, not scraped from TUI** (#53): Each session dir gets a `.claude/skills/discord-reply/SKILL.md` (with `thread_id`, `api_url`, optional `Authorization: Bearer` baked in) that tells Claude to `curl POST /api/reply` at the end of every turn. c-lord no longer extracts Claude's response from `tmux capture-pane`. The tmux pane is kept solely for human visibility (`tmux attach -t <session>:<work>`) and for `send-keys` input. **This is what structurally prevents the TUI-chrome-leak class of bugs** (#23, #27, #28, #29, #30, #32, #34, #35, #39, #41, #43, #45, #49, #50): there is no text-from-TUI codepath that reaches Discord anymore, so a new chrome element can no longer leak. The legacy `USE_SKILL_REPLY` env remains as an opt-out switch (`USE_SKILL_REPLY=0`) but disabling it does **not** restore the old scrape path — it simply stops the skill from being injected, leaving Claude with no path to Discord. See `c_lord/skills/`.
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
 3. **Emoji reactions for status**: Non-intrusive progress indication on the user's message. Debounced to avoid Discord rate limits.
-4. **Fence-aware chunking**: Never split Discord messages inside a code block.
+4. **Tool-use embeds are still driven by the tmux event stream**: `tmux_runner.py` still polls `capture-pane` and emits SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events. Only the ASSISTANT text events were removed (#53). So Discord still gets live "Bash(...)" / "Read(...)" embeds, status emoji, plan-approval buttons, etc. — none of that goes through the (removed) text-post path.
 5. **Installable package**: `c_lord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
 6. **Shared run helper**: `cogs/_run_helper.py` centralizes Claude CLI execution logic used by both ClaudeChatCog and SkillCommandCog.
 7. **REST API as the control plane**: Claude Code subprocesses communicate back to c-lord via REST API (`CLORD_API_URL` env var), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
@@ -187,10 +187,11 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 1. **作成** — ユーザーがチャンネルにメッセージ → `ClaudeChatCog` がスレッドを作成
 2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)
 3. **tmux window 作成** — `tmux.py::resolve_tmux_manager(channel_id)` で per-channel session を取得し、新規 window (`work1`, `work2`, ...) を立てる
-4. **Claude CLI 起動** — `claude/tmux_runner.py` が tmux window 内で `claude` コマンドを起動。stream-json で stdout を読みつつ Discord にストリーミング表示
-5. **応答完了** — `EventProcessor.finalize()` で最終応答を post、reaction 更新、registry から unregister
-6. **継続** — 同じスレッドへの reply は session_id を `--resume` で渡して同一セッションを継続
-7. **クリーンアップ (任意)** — `_cleanup_session_dir` / `_cleanup_tmux_session` (現状はコマンド経由で明示的にトリガ。スレッド close 時の自動クリーンアップは未実装)
+4. **Claude CLI 起動 + Skill 注入** — `claude/tmux_runner.py` が tmux window 内で `claude` を起動 (`send-keys`)。同時に `session_dir.py` が `<session_dir>/.claude/skills/discord-reply/SKILL.md` を注入 — Claude はこれを読み取り、応答末尾で `curl POST /api/reply` で **自身が** Discord へ最終回答を投稿する (#53)。
+5. **ツール embed / 状態 emoji** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events を yield。 `EventProcessor` がそれぞれの embed/reaction を Discord に post する。**最終回答テキストはここを通らない** — Skill 経由のみ。
+6. **応答完了** — `RESULT` event で `EventProcessor.finalize()` を呼び、reaction 更新 + registry から unregister
+7. **継続** — 同じスレッドへの reply は session_id を `--resume` で渡して同一セッションを継続
+8. **クリーンアップ (任意)** — `_cleanup_session_dir` / `_cleanup_tmux_session` (現状はコマンド経由で明示的にトリガ。スレッド close 時の自動クリーンアップは未実装)
 
 **よくある問題と確認手順**:
 
@@ -280,8 +281,13 @@ c_lord/          # Installable Python package
     _run_helper.py       # Shared Claude CLI execution logic (DRY)
   claude/
     config.py            # ClaudeConfig dataclass (CLI settings)
-    tmux_runner.py       # Claude Code tmux TUI runner (capture-pane)
+    tmux_runner.py       # tmux pane runner — yields SYSTEM/RESULT/tool-use/
+                         # permission/plan/elicitation/todo events ONLY.
+                         # ASSISTANT text events are no longer yielded (#53).
     types.py             # Type definitions for SDK messages
+  skills/                # Per-session SKILL.md generator (#52, #53)
+    discord_reply.py     # SKILL.md template (curl POST /api/reply pattern)
+    injector.py          # Writes SKILL.md into <session_dir>/.claude/skills/
   database/
     models.py            # SQLite schema
     repository.py        # Session CRUD operations
@@ -289,11 +295,14 @@ c_lord/          # Installable Python package
     task_repo.py         # Scheduled task CRUD (SchedulerCog)
   discord_ui/
     status.py            # Emoji reaction status manager (debounced)
-    chunker.py           # Fence-aware message splitting
     embeds.py            # Discord embed builders
+                         # NOTE: chunker.py / streaming_manager.py /
+                         # tui_strip.py / progress_buffer.py were removed in
+                         # #53 — the scrape→post path they served is gone.
   ext/
-    api_server.py        # REST API server (optional, requires aiohttp)
-                         # Includes /api/tasks endpoints for SchedulerCog
+    api_server.py        # REST API server (always on when bot starts).
+                         # POST /api/reply is the path Claude uses (via the
+                         # injected skill) to post its final answer.
   utils/
     logger.py            # Logging setup
 tests/                   # pytest test suite

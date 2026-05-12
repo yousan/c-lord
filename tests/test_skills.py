@@ -126,16 +126,27 @@ class TestInjectSkills:
 
 
 class TestSkillsEnabled:
+    """Issue #53: skill path is now the ONLY path → default ON.
+
+    USE_SKILL_REPLY remains as an opt-out emergency switch. Empty string
+    keeps the default (= ON) rather than disabling, so accidentally
+    setting USE_SKILL_REPLY= does not silently kill Discord output.
+    """
+
     @pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "on"])
-    def test_truthy_values(self, value: str, monkeypatch) -> None:
+    def test_truthy_values_enabled(self, value: str, monkeypatch) -> None:
         monkeypatch.setenv("USE_SKILL_REPLY", value)
         assert skills_enabled() is True
 
-    @pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
-    def test_falsy_values(self, value: str, monkeypatch) -> None:
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+    def test_explicit_disable(self, value: str, monkeypatch) -> None:
         monkeypatch.setenv("USE_SKILL_REPLY", value)
         assert skills_enabled() is False
 
-    def test_unset(self, monkeypatch) -> None:
+    def test_empty_value_keeps_default(self, monkeypatch) -> None:
+        monkeypatch.setenv("USE_SKILL_REPLY", "")
+        assert skills_enabled() is True
+
+    def test_unset_defaults_to_enabled(self, monkeypatch) -> None:
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
-        assert skills_enabled() is False
+        assert skills_enabled() is True

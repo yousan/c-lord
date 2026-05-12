@@ -65,6 +65,13 @@ def inject_skills(
 
 
 def skills_enabled() -> bool:
-    """Return True if skill-based reply is enabled via env var (#52 flag)."""
+    """Return True unless explicitly disabled via env var.
+
+    Skill-based reply is the only path for posting Claude's answers to Discord
+    (#53). The legacy capture-pane scrape→post pipeline has been removed.
+    The env var remains for emergency control — setting ``USE_SKILL_REPLY=0``
+    stops the skill from being injected but does NOT restore the scrape path.
+    Default is ON.
+    """
     value = os.getenv("USE_SKILL_REPLY", "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    return value not in {"0", "false", "no", "off"}

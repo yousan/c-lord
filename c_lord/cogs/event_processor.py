@@ -13,10 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 
-import discord
-
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
-from ..discord_ui.chunker import chunk_message
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from ..discord_ui.embeds import (
     elicitation_embed,
@@ -31,10 +28,7 @@ from ..discord_ui.embeds import (
 )
 from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
-from ..discord_ui.progress_buffer import ProgressBuffer
-from ..discord_ui.streaming_manager import StreamingMessageManager
 from ..discord_ui.tool_timer import LiveToolTimer
-from ..discord_ui.tui_strip import strip_tool_noise
 from .run_config import RunConfig
 
 logger = logging.getLogger(__name__)
@@ -87,22 +81,13 @@ class EventProcessor:
             session_id=config.session_id,
             thread_id=config.thread.id,
         )
-        self._streamer = StreamingMessageManager(config.thread)
 
         # Guards against duplicate embeds/messages in the same run.
         self._session_start_sent: bool = False
-        self._assistant_text_sent: bool = False
 
         # Set when AskUserQuestion is detected. Caller should drain the runner
         # (skip events) then handle the ask after the stream ends.
         self._pending_ask: list[AskQuestion] | None = None
-
-        # Accumulates events for progress.txt attachment (Issue #38).
-        self._progress = ProgressBuffer()
-
-        # The last Discord message we sent assistant text to. ``_on_complete``
-        # edits this with the progress.txt attachment when tools were used.
-        self._last_assistant_message: discord.Message | None = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -125,8 +110,8 @@ class EventProcessor:
 
     @property
     def assistant_text_sent(self) -> bool:
-        """True if assistant text was already streamed to Discord."""
-        return self._assistant_text_sent
+        """Kept for API compat; always False since Claude posts via the skill."""
+        return False
 
     # ------------------------------------------------------------------
     # Public methods
@@ -134,7 +119,6 @@ class EventProcessor:
 
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
-        self._progress.add(event)
         if event.message_type == MessageType.SYSTEM:
             await self._on_system(event)
         elif event.message_type == MessageType.ASSISTANT:
@@ -203,9 +187,10 @@ class EventProcessor:
         if event.has_redacted_thinking and not event.is_partial:
             await self._config.thread.send(embed=redacted_thinking_embed())
 
-        # Text streaming — compute delta from last partial, edit in place.
-        if event.text:
-            await self._handle_text(event)
+        # Text events are no longer posted to Discord (#53) — Claude pushes
+        # its final answer via the discord-reply skill instead. The scrape
+        # path that produced these events is retained only for completion
+        # detection and tool-use embeds.
 
         # Tool use — post embed and start live timer.
         if event.tool_use:
@@ -255,84 +240,37 @@ class EventProcessor:
             self._config.status._reset_stall_timer()
 
     async def _on_complete(self, event: StreamEvent) -> None:
-        """Handle RESULT events — finalize streaming, mark done."""
-        from ..discord_ui.streaming_manager import StreamingMessageManager
-        from ._run_helper import _make_error_embed
+        """Handle RESULT events — update status, save session_id.
 
-        # Finalize any in-progress streaming message.
-        if self._streamer.has_content:
-            await self._streamer.finalize()
-            self._assistant_text_sent = True
-            if self._streamer.last_message is not None:
-                self._last_assistant_message = self._streamer.last_message
+        Final response text used to flow through this method into Discord
+        via chunk_message + thread.send. Since #53 Claude posts its own
+        final answer via the ``discord-reply`` skill (REST API), so we no
+        longer post ``event.text`` here. Only the side-effects c-lord still
+        owns are kept: error embed, status reaction, session_id persistence.
+        """
+        from ._run_helper import _make_error_embed
 
         if event.error:
             await self._config.thread.send(embed=_make_error_embed(event.error))
             if self._config.status:
                 await self._config.status.set_error()
         else:
-            # Post final result text only if no assistant text was already sent.
-            response_text = event.text
-            if response_text and not self._assistant_text_sent:
-                for chunk in chunk_message(response_text):
-                    sent = await self._config.thread.send(chunk)
-                    self._last_assistant_message = sent
-
             if self._config.status:
                 await self._config.status.set_done()
-
-        # Attach progress.txt to the final message (Issue #38).
-        await self._maybe_attach_progress()
 
         if event.session_id:
             if self._config.repo:
                 await self._config.repo.save(self._config.thread.id, event.session_id)
             self._state.session_id = event.session_id
 
-        # Reset for potential next streamer
-        self._streamer = StreamingMessageManager(self._config.thread)
-
     # ------------------------------------------------------------------
     # Text streaming helpers
     # ------------------------------------------------------------------
-
-    async def _handle_text(self, event: StreamEvent) -> None:
-        """Stream text to Discord, computing deltas for partial events."""
-        assert event.text is not None
-
-        if event.is_partial:
-            delta = event.text[len(self._state.partial_text) :]
-            self._state.partial_text = event.text
-            if delta:
-                await self._streamer.append(delta)
-        else:
-            # Complete text block: flush the streamer with any remaining delta.
-            delta = event.text[len(self._state.partial_text) :]
-            if self._streamer.has_content:
-                if delta:
-                    await self._streamer.append(delta)
-                await self._streamer.finalize()
-                if self._streamer.last_message is not None:
-                    self._last_assistant_message = self._streamer.last_message
-                self._streamer = StreamingMessageManager(self._config.thread)
-            else:
-                # No partial events arrived — post the full text directly.
-                for chunk in chunk_message(event.text):
-                    sent = await self._config.thread.send(chunk)
-                    self._last_assistant_message = sent
-            self._state.partial_text = ""
-            self._state.accumulated_text = event.text
-            self._assistant_text_sent = True
-            await self._bump_stop()
 
     async def _handle_tool_use(self, event: StreamEvent) -> None:
         """Post tool use embed and start the live timer."""
         assert event.tool_use is not None
 
-        # Finalize any in-progress streaming text before the tool embed.
-        if self._streamer.has_content:
-            await self._streamer.finalize()
-            self._streamer = StreamingMessageManager(self._config.thread)
         self._state.partial_text = ""
 
         if self._config.status:
@@ -412,58 +350,6 @@ class EventProcessor:
             # Subsequent updates: edit in-place.
             with contextlib.suppress(Exception):
                 await self._state.todo_message.edit(embed=embed)
-
-    async def _maybe_attach_progress(self) -> None:
-        """Edit the last assistant message: clean the body + attach ``progress-*.txt`` (Issue #38).
-
-        Two transformations applied together when tools were used:
-
-        1. **Body cleanup** — strip ``ToolName(arg)`` headers and the indented
-           output that follows, so the user sees only Claude's final answer.
-        2. **Attachment** — attach ``progress-*.txt`` (JSONL of stream events)
-           for users who want the raw progress.
-
-        Skips silently when there was no assistant message or no tool use
-        (``ProgressBuffer.should_attach`` is False).
-        """
-        if self._last_assistant_message is None:
-            return
-        progress_file = self._progress.to_discord_file()
-        if progress_file is None:
-            return
-
-        # ``discord.Message.content`` may be stale after several edits — fetch
-        # the latest server-side state so the stripper sees what the user sees.
-        try:
-            refreshed = await self._config.thread.fetch_message(self._last_assistant_message.id)
-            original_content = refreshed.content or ""
-            self._last_assistant_message = refreshed
-        except discord.HTTPException:
-            original_content = self._last_assistant_message.content or ""
-        cleaned_content = strip_tool_noise(original_content)
-        should_replace_content = bool(cleaned_content) and cleaned_content != original_content
-
-        try:
-            if should_replace_content:
-                await self._last_assistant_message.edit(
-                    content=cleaned_content, attachments=[progress_file]
-                )
-            else:
-                await self._last_assistant_message.edit(attachments=[progress_file])
-            logger.info(
-                "Attached %s to final message (events=%d, tools=%d, stripped=%d→%d chars)",
-                progress_file.filename,
-                len(self._progress._events),
-                self._progress.tool_count,
-                len(original_content),
-                len(cleaned_content),
-            )
-        except discord.HTTPException:
-            logger.warning(
-                "Failed to finalize assistant message in thread %d",
-                self._config.thread.id,
-                exc_info=True,
-            )
 
     async def _bump_stop(self) -> None:
         """Move the Stop button to the bottom of the thread if configured."""
