@@ -79,16 +79,54 @@ async def main() -> None:
         coordination_channel_id=coordination_channel_id,
     )
 
+    # Issue #52: optional REST API for skill-based reply path.
+    # Enabled when USE_SKILL_REPLY is truthy or CLORD_API_PORT is set.
+    from .skills.injector import skills_enabled
+
+    api_server = None
+    api_port_env = os.getenv("CLORD_API_PORT", "")
+    if skills_enabled() or api_port_env:
+        try:
+            from .database.notification_repo import NotificationRepository
+            from .ext.api_server import ApiServer
+        except ImportError:
+            logger.warning(
+                "USE_SKILL_REPLY/CLORD_API_PORT set but aiohttp is not installed; "
+                "API server will NOT start. Install with `uv add aiohttp`."
+            )
+        else:
+            notif_db = str(data_dir / "notifications.db")
+            notif_repo = NotificationRepository(notif_db)
+            await notif_repo.init_db()
+            api_port = int(api_port_env) if api_port_env.isdigit() else 8080
+            api_server = ApiServer(
+                repo=notif_repo,
+                bot=bot,
+                default_channel_id=int(config["channel_id"]),
+                host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
+                port=api_port,
+                api_secret=os.getenv("CLORD_API_SECRET") or None,
+            )
+
     async with bot:
         components = await setup_bridge(
             bot,
             runner,
+            api_server=api_server,
             session_db_path=db_path,
             allowed_user_ids=allowed_user_ids,
             allowed_role_name=allowed_role_name,
             claude_channel_id=int(config["channel_id"]),
             enable_scheduler=True,
         )
+
+        if api_server is not None:
+            await api_server.start()
+            logger.info(
+                "REST API enabled (host=%s port=%d) — discord-reply skill ready",
+                api_server.host,
+                api_server.port,
+            )
 
         # Cleanup old sessions on startup
         deleted = await components.session_repo.cleanup_old(days=30)
@@ -97,8 +135,14 @@ async def main() -> None:
 
         # Handle signals
         loop = asyncio.get_running_loop()
+
+        async def _shutdown() -> None:
+            if api_server is not None:
+                await api_server.stop()
+            await bot.close()
+
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown()))
 
         await bot.start(config["token"])
 

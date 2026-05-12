@@ -146,6 +146,72 @@ class TestCreateSessionDir:
         assert result == str(session_dir)
         mock_run.assert_not_called()
 
+    def test_injects_skills_when_flag_enabled(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Issue #52: with USE_SKILL_REPLY=true the discord-reply SKILL.md
+        is dropped into the freshly cloned session dir."""
+        monkeypatch.setenv("USE_SKILL_REPLY", "true")
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+            # Simulate git clone success by creating the target dir.
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(987)
+
+        skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert skill.exists(), "discord-reply SKILL.md should be injected"
+        assert "987" in skill.read_text()
+
+    def test_reinjects_skills_on_existing_session_dir(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """When the dir already exists, the skill is still (re)written so
+        api_url / api_secret stay in sync with current env values."""
+        monkeypatch.setenv("USE_SKILL_REPLY", "true")
+        base = str(tmp_path / "sessions")
+        existing = Path(base) / "555"
+        existing.mkdir(parents=True)
+
+        # First call with one URL
+        monkeypatch.setenv("CLORD_API_URL", "http://first:1")
+        mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+        mgr.create_session_dir(555)
+        skill = existing / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert "http://first:1" in skill.read_text()
+
+        # Second call with a different URL — skill must reflect the new value
+        monkeypatch.setenv("CLORD_API_URL", "http://second:2")
+        mgr.create_session_dir(555)
+        body = skill.read_text()
+        assert "http://second:2" in body
+        assert "http://first:1" not in body
+
+    def test_does_not_inject_skills_when_flag_disabled(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(123)
+
+        skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert not skill.exists(), "skills should be opt-in via env flag"
+
     def test_clone_failure_raises(self, tmp_path: Path) -> None:
         base = str(tmp_path / "sessions")
 
