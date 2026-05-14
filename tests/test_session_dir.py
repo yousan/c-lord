@@ -193,10 +193,11 @@ class TestCreateSessionDir:
         assert "http://second:2" in body
         assert "http://first:1" not in body
 
-    def test_does_not_inject_skills_when_flag_disabled(
+    def test_skips_inject_when_flag_explicitly_disabled(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        """Issue #53: opt-out via USE_SKILL_REPLY=0 stops injection."""
+        monkeypatch.setenv("USE_SKILL_REPLY", "0")
         base = str(tmp_path / "sessions")
 
         def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
@@ -210,7 +211,25 @@ class TestCreateSessionDir:
             target = mgr.create_session_dir(123)
 
         skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
-        assert not skill.exists(), "skills should be opt-in via env flag"
+        assert not skill.exists(), "skills must not be injected when explicitly opted out"
+
+    def test_injects_skills_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        """Issue #53: with the env unset, skill injection is on by default."""
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(456)
+
+        skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert skill.exists(), "skill should be injected by default (#53)"
 
     def test_clone_failure_raises(self, tmp_path: Path) -> None:
         base = str(tmp_path / "sessions")

@@ -149,43 +149,53 @@ class TestOnSystem:
 
 
 class TestOnAssistantText:
-    """ASSISTANT text streaming handling."""
+    """Issue #53: assistant text is no longer posted to Discord — Claude
+    pushes its final answer via the discord-reply skill. The processor
+    receives ASSISTANT text events but must NOT call ``thread.send`` for
+    them, and ``assistant_text_sent`` is hard-wired to False.
+    """
 
     @pytest.mark.asyncio
-    async def test_complete_text_sends_message(self, thread: MagicMock, runner: MagicMock) -> None:
+    async def test_complete_text_does_not_send(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
         config = _make_config(thread, runner)
         p = EventProcessor(config)
 
-        event = StreamEvent(message_type=MessageType.ASSISTANT, text="Hello!", is_partial=False)
-        await p.process(event)
+        await p.process(
+            StreamEvent(message_type=MessageType.ASSISTANT, text="Hello!", is_partial=False)
+        )
 
         text_sends = [
             c for c in thread.send.call_args_list if c.args and isinstance(c.args[0], str)
         ]
-        assert any("Hello!" in c.args[0] for c in text_sends)
+        assert text_sends == []
 
     @pytest.mark.asyncio
-    async def test_complete_text_marks_assistant_text_sent(
+    async def test_partial_text_does_not_send(
         self, thread: MagicMock, runner: MagicMock
     ) -> None:
         config = _make_config(thread, runner)
         p = EventProcessor(config)
 
-        event = StreamEvent(message_type=MessageType.ASSISTANT, text="Hello!", is_partial=False)
-        await p.process(event)
+        await p.process(
+            StreamEvent(message_type=MessageType.ASSISTANT, text="Hel", is_partial=True)
+        )
 
-        assert p.assistant_text_sent is True
+        text_sends = [
+            c for c in thread.send.call_args_list if c.args and isinstance(c.args[0], str)
+        ]
+        assert text_sends == []
 
     @pytest.mark.asyncio
-    async def test_partial_text_does_not_mark_sent(
+    async def test_assistant_text_sent_stays_false(
         self, thread: MagicMock, runner: MagicMock
     ) -> None:
         config = _make_config(thread, runner)
         p = EventProcessor(config)
-
-        event = StreamEvent(message_type=MessageType.ASSISTANT, text="Hel", is_partial=True)
-        await p.process(event)
-
+        await p.process(
+            StreamEvent(message_type=MessageType.ASSISTANT, text="Hello", is_partial=False)
+        )
         assert p.assistant_text_sent is False
 
 
@@ -372,20 +382,13 @@ class TestOnComplete:
         assert len(embed_sends) >= 1
 
     @pytest.mark.asyncio
-    async def test_complete_result_text_not_repeated_if_already_sent(
+    async def test_result_text_not_posted(
         self, thread: MagicMock, runner: MagicMock
     ) -> None:
-        """If assistant text was streamed, RESULT text must not duplicate it."""
+        """Issue #53: RESULT.text is dropped — never posted to Discord."""
         config = _make_config(thread, runner)
         p = EventProcessor(config)
 
-        # Simulate assistant text having been sent already
-        assistant_event = StreamEvent(
-            message_type=MessageType.ASSISTANT, text="Answer.", is_partial=False
-        )
-        await p.process(assistant_event)
-
-        # RESULT also has text — should NOT re-send it
         result_event = _make_result_event(text="Answer.", session_id="s1")
         await p.process(result_event)
 
@@ -393,7 +396,7 @@ class TestOnComplete:
             c for c in thread.send.call_args_list if c.args and isinstance(c.args[0], str)
         ]
         answer_sends = [c for c in text_sends if "Answer." in c.args[0]]
-        assert len(answer_sends) == 1  # Sent exactly once, not twice
+        assert answer_sends == [], "RESULT text must not reach Discord post-#53"
 
 
 class TestConnectionErrorResilience:

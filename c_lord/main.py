@@ -79,20 +79,21 @@ async def main() -> None:
         coordination_channel_id=coordination_channel_id,
     )
 
-    # Issue #52: optional REST API for skill-based reply path.
-    # Enabled when USE_SKILL_REPLY is truthy or CLORD_API_PORT is set.
+    # Issue #53: REST API is the only path Claude has for reaching Discord
+    # (the legacy capture-pane scrape→post pipeline was removed). Always start
+    # the API server unless skills are explicitly disabled via USE_SKILL_REPLY=0.
     from .skills.injector import skills_enabled
 
     api_server = None
     api_port_env = os.getenv("CLORD_API_PORT", "")
-    if skills_enabled() or api_port_env:
+    if skills_enabled():
         try:
             from .database.notification_repo import NotificationRepository
             from .ext.api_server import ApiServer
         except ImportError:
             logger.warning(
-                "USE_SKILL_REPLY/CLORD_API_PORT set but aiohttp is not installed; "
-                "API server will NOT start. Install with `uv add aiohttp`."
+                "aiohttp is not installed; API server will NOT start and "
+                "Claude has no path to Discord. Install with `uv add aiohttp`."
             )
         else:
             notif_db = str(data_dir / "notifications.db")
