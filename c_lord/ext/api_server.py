@@ -107,6 +107,8 @@ class ApiServer:
         self.app.router.add_post("/api/threads/{thread_id}/messages", self.post_thread_message)
         # Issue #52: Skill-based final reply (clean content, no source prefix)
         self.app.router.add_post("/api/reply", self.reply)
+        # Issue #63: Skill-based interactive choice prompt
+        self.app.router.add_post("/api/prompt-choice", self.prompt_choice)
         # Startup resume routes
         self.app.router.add_post("/api/mark-resume", self.mark_resume)
 
@@ -721,6 +723,80 @@ class ApiServer:
 
         record_reply(thread_id)
 
+        return web.json_response({"status": "sent"})
+
+    async def prompt_choice(self, request: web.Request) -> web.Response:
+        """POST /api/prompt-choice — Skill-based interactive choice (#63).
+
+        Used by the ``discord-prompt-choice`` skill so Claude can push a
+        numbered choice menu to the Discord thread. Without this path,
+        post-#58 the user never sees TUI-rendered option lists.
+
+        Body (JSON):
+            thread_id: Target Discord thread ID (required, int).
+            question: Prompt text shown above the choices (required, non-empty).
+            choices: Non-empty list of ``{"label": str, "description"?: str}``.
+
+        Returns:
+            200 ``{"status": "sent"}`` on success.
+            400 on validation errors.
+            404 if the thread cannot be resolved.
+        """
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        thread_id_raw = data.get("thread_id")
+        if thread_id_raw is None:
+            return web.json_response({"error": "thread_id is required"}, status=400)
+        try:
+            thread_id = int(thread_id_raw)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "thread_id must be an integer"}, status=400)
+
+        question = (data.get("question") or "").strip()
+        if not question:
+            return web.json_response({"error": "question is required"}, status=400)
+
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return web.json_response({"error": "choices must be a non-empty array"}, status=400)
+
+        # Validate each choice has at least a label.
+        normalized: list[tuple[str, str]] = []
+        for i, ch in enumerate(choices):
+            if not isinstance(ch, dict):
+                return web.json_response({"error": f"choices[{i}] must be an object"}, status=400)
+            label = str(ch.get("label", "")).strip()
+            if not label:
+                return web.json_response({"error": f"choices[{i}].label is required"}, status=400)
+            desc = str(ch.get("description", "")).strip()
+            normalized.append((label, desc))
+
+        raw = self.bot.get_channel(thread_id)
+        if raw is None:
+            try:
+                raw = await self.bot.fetch_channel(thread_id)
+            except Exception:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+        if not hasattr(raw, "send"):
+            return web.json_response({"error": "Channel is not messageable"}, status=400)
+
+        # Format the message. Bullets use the raw label so the user can copy
+        # it verbatim; description (if present) gives context.
+        lines = [f"🤔 **{question}**", ""]
+        for label, desc in normalized:
+            if desc:
+                lines.append(f"- `{label}` — {desc}")
+            else:
+                lines.append(f"- `{label}`")
+        lines.append("")
+        lines.append("_Reply with the label to continue._")
+        content = "\n".join(lines)
+
+        await raw.send(content=content)  # type: ignore[union-attr]
         return web.json_response({"status": "sent"})
 
     async def _send_lounge_to_discord(self, label: str, message: str, posted_at: str) -> None:
