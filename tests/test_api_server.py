@@ -635,9 +635,7 @@ class TestReplyEndpoint:
         assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_thread_not_found_returns_404(
-        self, repo: NotificationRepository
-    ) -> None:
+    async def test_thread_not_found_returns_404(self, repo: NotificationRepository) -> None:
         b = MagicMock()
         b.get_channel.return_value = None
         b.fetch_channel = AsyncMock(side_effect=Exception("not found"))
@@ -680,9 +678,7 @@ class TestReplyEndpoint:
         assert "file" in kwargs or "files" in kwargs
 
     @pytest.mark.asyncio
-    async def test_missing_progress_file_returns_400(
-        self, reply_client: TestClient
-    ) -> None:
+    async def test_missing_progress_file_returns_400(self, reply_client: TestClient) -> None:
         resp = await reply_client.post(
             "/api/reply",
             json={
@@ -692,3 +688,36 @@ class TestReplyEndpoint:
             },
         )
         assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_successful_reply_records_in_tracker(self, reply_client: TestClient) -> None:
+        """Issue #67: api_server records each /api/reply call so run_helper
+        can detect turns where the skill was never invoked."""
+        import time
+
+        from c_lord.skills.reply_tracker import reset_tracker, was_replied_since
+
+        reset_tracker()
+        before = time.monotonic()
+        resp = await reply_client.post(
+            "/api/reply",
+            json={"thread_id": 555666777, "content": "answered"},
+        )
+        assert resp.status == 200
+        assert was_replied_since(thread_id=555666777, since=before) is True
+
+    @pytest.mark.asyncio
+    async def test_failed_reply_does_not_record(self, reply_client: TestClient) -> None:
+        """A 400 (missing content) MUST NOT be recorded as a successful reply."""
+        import time
+
+        from c_lord.skills.reply_tracker import reset_tracker, was_replied_since
+
+        reset_tracker()
+        before = time.monotonic()
+        resp = await reply_client.post(
+            "/api/reply",
+            json={"thread_id": 555666777},  # missing content
+        )
+        assert resp.status == 400
+        assert was_replied_since(thread_id=555666777, since=before) is False

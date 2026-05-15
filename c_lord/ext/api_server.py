@@ -715,6 +715,12 @@ class ApiServer:
             send_kwargs["file"] = attachment
         await raw.send(**send_kwargs)  # type: ignore[union-attr]
 
+        # Issue #67: record the successful reply so run_helper can detect
+        # turns where Claude never invoked the discord-reply skill.
+        from ..skills.reply_tracker import record_reply
+
+        record_reply(thread_id)
+
         return web.json_response({"status": "sent"})
 
     async def _send_lounge_to_discord(self, label: str, message: str, posted_at: str) -> None:
