@@ -11,7 +11,12 @@ When tmux is not installed, operations degrade gracefully (log warning, skip).
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
+
+# Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
+# unrelated trailing-numeric path components (PIDs, ports, etc.).
+_THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,13 @@ class TmuxSessionManager:
     def _rebuild_mapping(self) -> None:
         """Rebuild ``_thread_to_window`` from live tmux state.
 
+        Primary key is the ``@thread_id`` window option. When that option
+        is missing — which happens after a tmux server restart, because
+        tmux-resurrect (and similar) restore window names but not user
+        options — fall back to extracting the thread_id from the pane's
+        current path (``<session_dir_base>/<thread_id>``) and repair the
+        ``@thread_id`` option so future lookups stay cheap. (Issue #69.)
+
         Also updates ``_next_work_id`` to be one past the highest existing
         work window number.
         """
@@ -139,18 +151,24 @@ class TmuxSessionManager:
                 "-t",
                 self.session_name,
                 "-F",
-                "#{window_name}",
+                "#{window_name}\t#{pane_current_path}",
             ]
         )
         if result.returncode != 0:
             return
 
         max_id = 0
-        for window_name in result.stdout.strip().splitlines():
+        for line in result.stdout.strip().splitlines():
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            window_name = parts[0]
+            pane_path = parts[1] if len(parts) > 1 else ""
             if not window_name:
                 continue
 
-            # Read the @thread_id option for this window
+            thread_id: int | None = None
+
             opt_result = _run(
                 [
                     "tmux",
@@ -165,9 +183,33 @@ class TmuxSessionManager:
             if opt_result.returncode == 0:
                 tid_str = opt_result.stdout.strip()
                 if tid_str.isdigit():
-                    self._thread_to_window[int(tid_str)] = window_name
+                    thread_id = int(tid_str)
 
-            # Track highest work ID
+            if thread_id is None and pane_path:
+                m = _THREAD_ID_FROM_PATH_RE.search(pane_path)
+                if m:
+                    thread_id = int(m.group(1))
+                    _run(
+                        [
+                            "tmux",
+                            "set-option",
+                            "-w",
+                            "-t",
+                            f"{self.session_name}:{window_name}",
+                            "@thread_id",
+                            str(thread_id),
+                        ]
+                    )
+                    logger.info(
+                        "Recovered thread_id %d for window %s from pane path %s",
+                        thread_id,
+                        window_name,
+                        pane_path,
+                    )
+
+            if thread_id is not None:
+                self._thread_to_window[thread_id] = window_name
+
             if window_name.startswith(WINDOW_PREFIX):
                 suffix = window_name[len(WINDOW_PREFIX) :]
                 if suffix.isdigit():
