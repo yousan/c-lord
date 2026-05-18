@@ -76,6 +76,4 @@ def skills_enabled() -> bool:
     value = os.getenv("USE_SKILL_REPLY", "").strip().lower()
     if value in {"0", "false", "no", "off"}:
         return False
-    if os.getenv("CLORD_BRIDGE_MODE", "skill").strip().lower() == "jsonl":
-        return False
-    return True
+    return os.getenv("CLORD_BRIDGE_MODE", "skill").strip().lower() != "jsonl"
