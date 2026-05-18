@@ -721,3 +721,150 @@ class TestReplyEndpoint:
         )
         assert resp.status == 400
         assert was_replied_since(thread_id=555666777, since=before) is False
+
+
+class TestPromptChoiceEndpoint:
+    """Issue #63: POST /api/prompt-choice — Skill posts a choice prompt."""
+
+    @pytest.fixture
+    def thread_mock(self) -> MagicMock:
+        import discord
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 777888999
+        thread.send = AsyncMock()
+        return thread
+
+    @pytest.fixture
+    def bot_with_thread(self, thread_mock: MagicMock) -> MagicMock:
+        b = MagicMock()
+        b.get_channel.return_value = thread_mock
+        return b
+
+    @pytest.fixture
+    async def choice_client(
+        self, repo: NotificationRepository, bot_with_thread: MagicMock
+    ) -> TestClient:
+        api = ApiServer(repo=repo, bot=bot_with_thread, default_channel_id=12345)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        yield client
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_posts_formatted_choice_message(
+        self, choice_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            json={
+                "thread_id": 777888999,
+                "question": "Which approach do you prefer?",
+                "choices": [
+                    {"label": "1", "description": "Refactor in place"},
+                    {"label": "2", "description": "Rewrite from scratch"},
+                    {"label": "3", "description": "Leave as-is"},
+                ],
+            },
+        )
+        assert resp.status == 200, await resp.text()
+        data = await resp.json()
+        assert data["status"] == "sent"
+        thread_mock.send.assert_called_once()
+        kwargs = thread_mock.send.call_args.kwargs
+        args = thread_mock.send.call_args.args
+        sent = kwargs.get("content") if "content" in kwargs else (args[0] if args else "")
+        assert "Which approach" in sent
+        assert "Refactor in place" in sent
+        assert "Rewrite from scratch" in sent
+        assert "Leave as-is" in sent
+        # Each label is shown so the user can reply with it.
+        assert "1" in sent and "2" in sent and "3" in sent
+
+    @pytest.mark.asyncio
+    async def test_missing_question_returns_400(self, choice_client: TestClient) -> None:
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            json={"thread_id": 777888999, "choices": [{"label": "a", "description": "x"}]},
+        )
+        assert resp.status == 400
+        assert "question" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_choices_returns_400(self, choice_client: TestClient) -> None:
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            json={"thread_id": 777888999, "question": "q?"},
+        )
+        assert resp.status == 400
+        assert "choices" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_empty_choices_returns_400(self, choice_client: TestClient) -> None:
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            json={"thread_id": 777888999, "question": "q?", "choices": []},
+        )
+        assert resp.status == 400
+        assert "choices" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_thread_id_returns_400(self, choice_client: TestClient) -> None:
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            json={
+                "question": "q?",
+                "choices": [{"label": "1", "description": "x"}],
+            },
+        )
+        assert resp.status == 400
+        assert "thread_id" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_400(self, choice_client: TestClient) -> None:
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            data=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_thread_not_found_returns_404(self, repo: NotificationRepository) -> None:
+        b = MagicMock()
+        b.get_channel.return_value = None
+        b.fetch_channel = AsyncMock(side_effect=Exception("not found"))
+        api = ApiServer(repo=repo, bot=b, default_channel_id=1)
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/prompt-choice",
+                json={
+                    "thread_id": 999,
+                    "question": "q?",
+                    "choices": [{"label": "1", "description": "x"}],
+                },
+            )
+            assert resp.status == 404
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_label_only_choice_accepted(
+        self, choice_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        """A choice without description still posts the label."""
+        resp = await choice_client.post(
+            "/api/prompt-choice",
+            json={
+                "thread_id": 777888999,
+                "question": "Yes or no?",
+                "choices": [{"label": "yes"}, {"label": "no"}],
+            },
+        )
+        assert resp.status == 200
+        sent = thread_mock.send.call_args.kwargs.get("content", "")
+        assert "yes" in sent and "no" in sent

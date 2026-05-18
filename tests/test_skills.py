@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from c_lord.skills import inject_skills, render_discord_reply_skill
+from c_lord.skills import (
+    inject_skills,
+    render_discord_prompt_choice_skill,
+    render_discord_reply_skill,
+)
 from c_lord.skills.injector import skills_enabled
 
 
@@ -42,13 +46,56 @@ class TestRenderDiscordReplySkill:
         assert '"progress_file": "/' in body
 
     def test_renders_bearer_header_when_secret_set(self) -> None:
-        body = render_discord_reply_skill(
-            thread_id=1, api_url="http://x", api_secret="s3cret-xyz"
-        )
+        body = render_discord_reply_skill(thread_id=1, api_url="http://x", api_secret="s3cret-xyz")
         assert "Authorization: Bearer s3cret-xyz" in body
 
     def test_omits_bearer_header_when_no_secret(self) -> None:
         body = render_discord_reply_skill(thread_id=1, api_url="http://x")
+        assert "Bearer" not in body
+        assert "Authorization" not in body
+
+
+class TestRenderDiscordPromptChoiceSkill:
+    """Issue #63: Skill that lets Claude post a choice prompt to Discord."""
+
+    def test_substitutes_thread_id_and_api_url(self) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=123456, api_url="http://x:1111")
+        assert "123456" in body
+        assert "http://x:1111" in body
+        assert body.startswith("---\nname: discord-prompt-choice")
+        assert "{thread_id}" not in body
+        assert "{api_url}" not in body
+
+    def test_curl_targets_prompt_choice_endpoint(self) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=1, api_url="http://x")
+        assert "/api/prompt-choice" in body
+        assert "Content-Type: application/json" in body
+        assert " -F " not in body  # JSON only, no multipart
+
+    def test_documents_question_and_choices_fields(self) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=1, api_url="http://x")
+        assert "question" in body
+        assert "choices" in body
+        # Each choice has label + description (numbered options pattern)
+        assert "label" in body
+        assert "description" in body
+
+    def test_documents_when_to_invoke(self) -> None:
+        """Skill description must direct Claude to use it for choice prompts."""
+        body = render_discord_prompt_choice_skill(thread_id=1, api_url="http://x")
+        # The frontmatter description must clearly signal *when* to invoke.
+        # We deliberately don't pin exact wording — just key concepts.
+        head = body.split("---\n", 2)[1].lower()
+        assert "choice" in head or "選択" in head or "option" in head
+
+    def test_renders_bearer_header_when_secret_set(self) -> None:
+        body = render_discord_prompt_choice_skill(
+            thread_id=1, api_url="http://x", api_secret="sk-cc"
+        )
+        assert "Authorization: Bearer sk-cc" in body
+
+    def test_omits_bearer_header_when_no_secret(self) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=1, api_url="http://x")
         assert "Bearer" not in body
         assert "Authorization" not in body
 
@@ -123,6 +170,20 @@ class TestInjectSkills:
         inject_skills(session_dir, thread_id=1, api_url="http://x")
         body = (session_dir / ".claude" / "skills" / "discord-reply" / "SKILL.md").read_text()
         assert "Authorization" not in body
+
+    def test_also_writes_prompt_choice_skill_md(self, tmp_path: Path) -> None:
+        """Issue #63: prompt-choice skill is injected alongside discord-reply."""
+        session_dir = tmp_path / "thr"
+        session_dir.mkdir()
+        paths = inject_skills(session_dir, thread_id=88, api_url="http://x:2222")
+
+        choice_md = session_dir / ".claude" / "skills" / "discord-prompt-choice" / "SKILL.md"
+        assert choice_md.exists()
+        assert str(choice_md) in paths
+        body = choice_md.read_text()
+        assert "88" in body
+        assert "http://x:2222" in body
+        assert "/api/prompt-choice" in body
 
 
 class TestSkillsEnabled:

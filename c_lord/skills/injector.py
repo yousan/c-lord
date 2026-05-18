@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 
+from .discord_prompt_choice import render_discord_prompt_choice_skill
 from .discord_reply import render_discord_reply_skill
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,24 @@ def inject_skills(
         skill_path,
         api_url,
         "bearer" if api_secret else "none",
+    )
+
+    # Issue #63: prompt-choice skill — lets Claude push a numbered menu to
+    # Discord when it would otherwise stall waiting for the user to pick.
+    choice_dir = skills_root / "discord-prompt-choice"
+    choice_dir.mkdir(parents=True, exist_ok=True)
+    choice_path = choice_dir / "SKILL.md"
+    choice_path.write_text(
+        render_discord_prompt_choice_skill(
+            thread_id=thread_id, api_url=api_url, api_secret=api_secret
+        ),
+        encoding="utf-8",
+    )
+    written.append(str(choice_path))
+    logger.info(
+        "Injected discord-prompt-choice skill for thread %d at %s",
+        thread_id,
+        choice_path,
     )
     return written
 

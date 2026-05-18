@@ -19,7 +19,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from c_lord.database.notification_repo import NotificationRepository
 from c_lord.ext.api_server import ApiServer
-from c_lord.skills import render_discord_reply_skill
+from c_lord.skills import (
+    render_discord_prompt_choice_skill,
+    render_discord_reply_skill,
+)
 
 THREAD_ID = 444555666
 
@@ -115,9 +118,7 @@ def bot_with_thread(thread_mock: MagicMock) -> MagicMock:
 
 
 @pytest.fixture
-async def client(
-    repo: NotificationRepository, bot_with_thread: MagicMock
-) -> TestClient:
+async def client(repo: NotificationRepository, bot_with_thread: MagicMock) -> TestClient:
     api = ApiServer(repo=repo, bot=bot_with_thread, default_channel_id=1)
     server = TestServer(api.app)
     client = TestClient(server)
@@ -127,12 +128,8 @@ async def client(
 
 
 @pytest.fixture
-async def auth_client(
-    repo: NotificationRepository, bot_with_thread: MagicMock
-) -> TestClient:
-    api = ApiServer(
-        repo=repo, bot=bot_with_thread, default_channel_id=1, api_secret="sk-abc"
-    )
+async def auth_client(repo: NotificationRepository, bot_with_thread: MagicMock) -> TestClient:
+    api = ApiServer(repo=repo, bot=bot_with_thread, default_channel_id=1, api_secret="sk-abc")
     server = TestServer(api.app)
     client = TestClient(server)
     await client.start_server()
@@ -142,9 +139,7 @@ async def auth_client(
 
 class TestSkillMdRoundtripsAgainstEndpoint:
     @pytest.mark.asyncio
-    async def test_plain_payload_accepted(
-        self, client: TestClient, thread_mock: MagicMock
-    ) -> None:
+    async def test_plain_payload_accepted(self, client: TestClient, thread_mock: MagicMock) -> None:
         body = render_discord_reply_skill(thread_id=THREAD_ID, api_url="http://x")
         plain, *_ = _extract_json_payloads(body)
 
@@ -191,6 +186,72 @@ class TestSkillMdRoundtripsAgainstEndpoint:
         resp = await auth_client.post(
             "/api/reply",
             json=plain,
+            headers={"Authorization": "Bearer sk-abc"},
+        )
+        assert resp.status == 200, await resp.text()
+
+
+# ---------------------------------------------------------------------------
+# discord-prompt-choice contract (#63)
+# ---------------------------------------------------------------------------
+
+
+class TestPromptChoiceSkillMdStaticContract:
+    def test_every_curl_targets_prompt_choice(self) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=THREAD_ID, api_url="http://x")
+        blocks = _curl_blocks(body)
+        assert blocks, "no curl blocks found in prompt-choice SKILL.md"
+        for block in blocks:
+            assert "/api/prompt-choice" in block, (
+                f"curl example targets wrong endpoint: {block[:80]!r}"
+            )
+            assert " -F " not in block
+            assert "Content-Type: application/json" in block
+
+    def test_payload_includes_question_and_choices(self) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=THREAD_ID, api_url="http://x")
+        payloads = _extract_json_payloads(body)
+        assert payloads, "no JSON payloads found in prompt-choice SKILL.md"
+        for payload in payloads:
+            assert payload["thread_id"] == THREAD_ID
+            assert isinstance(payload["question"], str) and payload["question"]
+            assert isinstance(payload["choices"], list) and payload["choices"]
+            for ch in payload["choices"]:
+                assert "label" in ch
+
+    def test_bearer_block_present_when_secret_set(self) -> None:
+        body = render_discord_prompt_choice_skill(
+            thread_id=THREAD_ID, api_url="http://x", api_secret="sk-pc"
+        )
+        for block in _curl_blocks(body):
+            assert "Authorization: Bearer sk-pc" in block
+
+
+class TestPromptChoiceRoundtripsAgainstEndpoint:
+    @pytest.mark.asyncio
+    async def test_payload_accepted(self, client: TestClient, thread_mock: MagicMock) -> None:
+        body = render_discord_prompt_choice_skill(thread_id=THREAD_ID, api_url="http://x")
+        payload, *_ = _extract_json_payloads(body)
+        resp = await client.post("/api/prompt-choice", json=payload)
+        assert resp.status == 200, await resp.text()
+        thread_mock.send.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_bearer_payload_authenticated(
+        self, auth_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        # auth_client fixture is configured with api_secret="sk-abc".
+        body = render_discord_prompt_choice_skill(
+            thread_id=THREAD_ID, api_url="http://x", api_secret="sk-abc"
+        )
+        payload, *_ = _extract_json_payloads(body)
+
+        unauth = await auth_client.post("/api/prompt-choice", json=payload)
+        assert unauth.status == 401
+
+        resp = await auth_client.post(
+            "/api/prompt-choice",
+            json=payload,
             headers={"Authorization": "Bearer sk-abc"},
         )
         assert resp.status == 200, await resp.text()
