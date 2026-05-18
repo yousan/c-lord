@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -125,7 +125,6 @@ class TestChannelRepoCogResolveManager:
         m1 = await cog.resolve_manager(100)
         m2 = await cog.resolve_manager(100)
         assert m1 is m2  # same object from cache
-
 
 
 # ===========================================================================
@@ -317,9 +316,7 @@ class TestResolveManagerThreadOverride:
     async def test_thread_bind_without_channel_bind(
         self, cog: ChannelRepoCog, thread_repo: ThreadRepository
     ) -> None:
-        await thread_repo.save(
-            thread_id=999, source_repo="https://github.com/org/thread.git"
-        )
+        await thread_repo.save(thread_id=999, source_repo="https://github.com/org/thread.git")
         manager = await cog.resolve_manager(channel_id=100, thread_id=999)
         assert manager is not None
         assert manager.source_repo == "https://github.com/org/thread.git"
@@ -333,9 +330,7 @@ class TestResolveManagerThreadOverride:
         cog: ChannelRepoCog,
         thread_repo: ThreadRepository,
     ) -> None:
-        await thread_repo.save(
-            thread_id=999, source_repo="https://github.com/org/thread.git"
-        )
+        await thread_repo.save(thread_id=999, source_repo="https://github.com/org/thread.git")
         m1 = await cog.resolve_manager(channel_id=100, thread_id=999)
         m2 = await cog.resolve_manager(channel_id=100, thread_id=999)
         assert m1 is m2
@@ -345,10 +340,78 @@ class TestResolveManagerThreadOverride:
         cog: ChannelRepoCog,
         thread_repo: ThreadRepository,
     ) -> None:
-        await thread_repo.save(
-            thread_id=999, source_repo="https://github.com/org/thread.git"
-        )
+        await thread_repo.save(thread_id=999, source_repo="https://github.com/org/thread.git")
         await cog.resolve_manager(channel_id=100, thread_id=999)
         assert 999 in cog._thread_manager_cache
         cog.evict_thread_cache(999)
         assert 999 not in cog._thread_manager_cache
+
+
+# ===========================================================================
+# /clord-thread-init access check tests
+# ===========================================================================
+
+
+def _make_thread_interaction(
+    thread_id: int = 9001,
+    parent_id: int = 5000,
+    *,
+    bot_can_access: bool = True,
+) -> MagicMock:
+    """Return a mock Interaction inside a discord.Thread."""
+    import discord
+
+    bot = MagicMock()
+    if bot_can_access:
+        bot.get_channel = MagicMock(return_value=MagicMock(spec=discord.TextChannel))
+    else:
+        bot.get_channel = MagicMock(return_value=None)
+        bot.fetch_channel = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "Missing Access"))
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.user = MagicMock()
+    interaction.user.id = 42
+    interaction.client = bot
+
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
+    thread.parent_id = parent_id
+    interaction.channel = thread
+    interaction.channel_id = thread_id
+
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+    return interaction
+
+
+class TestClordThreadInitAccessCheck:
+    async def test_bind_succeeds_when_bot_has_access(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        interaction = _make_thread_interaction(bot_can_access=True)
+        await cog.clord_thread_init.callback(
+            cog, interaction, repo="https://github.com/org/repo.git", remove=False
+        )
+        binding = await thread_repo.get(9001)
+        assert binding is not None
+        assert binding["source_repo"] == "https://github.com/org/repo.git"
+        interaction.response.send_message.assert_called_once()
+        msg = interaction.response.send_message.call_args[0][0]
+        assert "Missing Access" not in msg
+
+    async def test_bind_fails_when_bot_has_no_access(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        interaction = _make_thread_interaction(bot_can_access=False)
+        await cog.clord_thread_init.callback(
+            cog, interaction, repo="https://github.com/org/repo.git", remove=False
+        )
+        # Nothing saved to DB
+        binding = await thread_repo.get(9001)
+        assert binding is None
+        # Error message shown
+        interaction.response.send_message.assert_called_once()
+        msg = interaction.response.send_message.call_args[1].get(
+            "content", interaction.response.send_message.call_args[0][0]
+        )
+        assert "アクセス" in msg or "access" in msg.lower()

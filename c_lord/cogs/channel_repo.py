@@ -293,6 +293,21 @@ class ChannelRepoCog(commands.Cog):
                 )
             return
 
+        # --- Access check: verify bot can read the thread's parent channel ---
+        bot_channel = interaction.client.get_channel(channel_id)
+        if bot_channel is None:
+            try:
+                await interaction.client.fetch_channel(channel_id)
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"⚠️ Bot がこのスレッドの親チャンネル (<#{channel_id}>) にアクセスできません。\n"
+                    "先に Bot をそのチャンネルに追加してください。",
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                pass  # 他のエラーは無視してbindを続行
+
         # --- Bind thread to repo ---
         await self._thread_repo.save(thread_id=thread_id, source_repo=repo, channel_id=channel_id)
         self.evict_thread_cache(thread_id)
