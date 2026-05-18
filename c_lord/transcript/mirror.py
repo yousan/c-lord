@@ -129,9 +129,7 @@ class TranscriptMirror:
         finally:
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
 
-    async def _handle_minimal(
-        self, rendered: RenderedEvent, progress_buf: list[str]
-    ) -> None:
+    async def _handle_minimal(self, rendered: RenderedEvent, progress_buf: list[str]) -> None:
         """Route one event in minimal mode."""
         if rendered.kind in _BUFFERED_KINDS:
             progress_buf.append(_format_body(rendered))
