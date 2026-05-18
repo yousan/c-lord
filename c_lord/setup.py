@@ -133,6 +133,7 @@ async def setup_bridge(
     from .database.resume_repo import PendingResumeRepository
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
+    from .database.thread_repo import ThreadRepository
 
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:
@@ -201,12 +202,15 @@ async def setup_bridge(
     await bot.add_cog(session_manage_cog)
     logger.info("Registered SessionManageCog")
 
-    # --- ChannelRepoCog (per-channel repo bindings, zero-config) ---
+    # --- ChannelRepoCog (per-channel and per-thread repo bindings, zero-config) ---
     channel_repo = ChannelRepository(session_db_path)
     await channel_repo.init_db()
+    thread_repo = ThreadRepository(session_db_path)
+    await thread_repo.init_db()
     channel_repo_cog = ChannelRepoCog(
         bot,
         repo=channel_repo,
+        thread_repo=thread_repo,
         allowed_user_ids=allowed_user_ids,
         allowed_role_name=allowed_role_name,
         session_dir_base=session_dir_base,

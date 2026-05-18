@@ -66,6 +66,15 @@ CREATE TABLE IF NOT EXISTS channel_repo_bindings (
     created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+-- Per-thread repository bindings (overrides channel binding for that thread)
+CREATE TABLE IF NOT EXISTS thread_repo_bindings (
+    thread_id   INTEGER PRIMARY KEY,
+    source_repo TEXT    NOT NULL,
+    channel_id  INTEGER,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 # Migrations for existing databases that lack new columns.
@@ -106,6 +115,15 @@ _MIGRATIONS = [
     # Drop unused columns (requires SQLite 3.35.0+; suppressed on older versions)
     "ALTER TABLE channel_repo_bindings DROP COLUMN clone_branch",
     "ALTER TABLE channel_repo_bindings DROP COLUMN tmux_session_name",
+    # thread_repo_bindings added for /clord-thread-init (per-thread repo override)
+    (
+        "CREATE TABLE IF NOT EXISTS thread_repo_bindings ("
+        "thread_id INTEGER PRIMARY KEY, "
+        "source_repo TEXT NOT NULL, "
+        "channel_id INTEGER, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
+        "updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
+    ),
 ]
 
 
