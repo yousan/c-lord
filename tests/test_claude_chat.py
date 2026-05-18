@@ -937,7 +937,8 @@ class TestStartSessionCommand:
     @pytest.mark.asyncio
     async def test_thread_execution_calls_run_claude(self) -> None:
         """Running /claude inside a thread continues the session via _run_claude."""
-        cog = _make_cog()
+        cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
         interaction = MagicMock(spec=discord.Interaction)
         interaction.user = MagicMock()
         interaction.user.id = 42
@@ -967,7 +968,8 @@ class TestStartSessionCommand:
     @pytest.mark.asyncio
     async def test_thread_execution_no_existing_session(self) -> None:
         """Running /claude in a thread with no DB record passes session_id=None."""
-        cog = _make_cog()
+        cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
         interaction = MagicMock(spec=discord.Interaction)
         interaction.user = MagicMock()
         interaction.user.id = 42

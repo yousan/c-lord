@@ -137,13 +137,13 @@ class ClaudeChatCog(commands.Cog):
         return self._dashboard
 
     async def _resolve_session_dir_manager(
-        self, channel_id: int | None
+        self, channel_id: int | None, thread_id: int | None = None
     ) -> SessionDirManager | None:
-        """Resolve a SessionDirManager for the given channel.
+        """Resolve a SessionDirManager for the given channel (and optional thread).
 
-        Returns the per-channel manager from ChannelRepoCog if a binding exists,
-        or None. Does NOT fall back to a global bot.session_dir_manager —
-        channels without a ``/clord-init`` binding get no manager.
+        Lookup order: thread binding → channel binding → None.
+        Does NOT fall back to a global bot.session_dir_manager —
+        channels without a ``/clord-init`` or ``/clord-thread-init`` binding get no manager.
         """
         if channel_id is None:
             return None
@@ -151,7 +151,7 @@ class ClaudeChatCog(commands.Cog):
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_manager(channel_id)
+            return await channel_cog.resolve_manager(channel_id, thread_id=thread_id)
         return None
 
     async def _resolve_tmux_manager(self, channel_id: int | None) -> TmuxSessionManager | None:
@@ -204,9 +204,13 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
-        # Ignore bot messages (but allow webhook messages through for testing)
+        # Ignore bot messages (but allow webhook messages and trusted bots through).
+        # CLORD_TRUSTED_BOT_IDS env: comma-separated bot user IDs to treat like humans.
         if message.author.bot and not message.webhook_id:
-            return
+            trusted_raw = os.getenv("CLORD_TRUSTED_BOT_IDS", "")
+            trusted_ids = {int(x.strip()) for x in trusted_raw.split(",") if x.strip().isdigit()}
+            if message.author.id not in trusted_ids:
+                return
 
         # Authorization check — user must match allowed_user_ids or have
         # the allowed role.  When neither is configured, everyone is allowed.
@@ -240,9 +244,21 @@ class ClaudeChatCog(commands.Cog):
             )
             return
 
-        # Unbound channel check: verify /clord-init binding before proceeding
+        # Unbound channel check: verify /clord-init or /clord-thread-init binding
         channel = interaction.channel
-        if not isinstance(channel, discord.Thread):
+        if isinstance(channel, discord.Thread):
+            parent_channel_id = channel.parent_id or channel.id
+            sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
+            tmux = await self._resolve_tmux_manager(parent_channel_id)
+            if sdm is None and tmux is None:
+                await interaction.response.send_message(
+                    "⚠️ このスレッドにはリポジトリが紐づけられていません。\n"
+                    "先に `/clord-thread-init repo:<URL>` または"
+                    " `/clord-init repo:<URL>` で設定してください。",
+                    ephemeral=True,
+                )
+                return
+        else:
             channel_id = channel.id if channel else interaction.channel_id
             sdm = await self._resolve_session_dir_manager(channel_id)
             tmux = await self._resolve_tmux_manager(channel_id)
@@ -694,9 +710,11 @@ class ClaudeChatCog(commands.Cog):
         image_paths: list[str] | None = None,
     ) -> None:
         """Execute Claude Code CLI and stream results to the thread."""
-        # Unbound channel check: verify /clord-init binding before proceeding
+        # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
-        session_dir_manager = await self._resolve_session_dir_manager(parent_channel_id)
+        session_dir_manager = await self._resolve_session_dir_manager(
+            parent_channel_id, thread_id=thread.id
+        )
         tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
 
         if session_dir_manager is None and tmux_manager is None:

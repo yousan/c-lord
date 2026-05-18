@@ -110,10 +110,17 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Sync slash commands
+        # Sync slash commands — guild sync first for instant propagation,
+        # then global sync so commands are available outside the guild too.
         try:
+            channel = self.get_channel(self.channel_id)
+            guild = getattr(channel, "guild", None)
+            if guild is not None:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("Synced slash commands to guild %d (instant)", guild.id)
             synced = await self.tree.sync()
-            logger.info("Synced %d slash commands", len(synced))
+            logger.info("Synced %d slash commands (global)", len(synced))
         except Exception:
             logger.exception("Failed to sync slash commands")
 
