@@ -107,7 +107,18 @@ class TestOnSystem:
 
         await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
 
-        repo.save.assert_called_once_with(thread.id, "s1")
+        repo.save.assert_called_once_with(thread.id, "s1", working_dir=None)
+
+    @pytest.mark.asyncio
+    async def test_saves_working_dir_to_repo(self, thread: MagicMock, runner: MagicMock) -> None:
+        repo = MagicMock()
+        repo.save = AsyncMock()
+        config = _make_config(thread, runner, repo=repo, working_dir="/tmp/session/123")
+        p = EventProcessor(config)
+
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+
+        repo.save.assert_called_once_with(thread.id, "s1", working_dir="/tmp/session/123")
 
     @pytest.mark.asyncio
     async def test_sends_start_embed_for_new_session(
@@ -156,9 +167,7 @@ class TestOnAssistantText:
     """
 
     @pytest.mark.asyncio
-    async def test_complete_text_does_not_send(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
+    async def test_complete_text_does_not_send(self, thread: MagicMock, runner: MagicMock) -> None:
         config = _make_config(thread, runner)
         p = EventProcessor(config)
 
@@ -172,9 +181,7 @@ class TestOnAssistantText:
         assert text_sends == []
 
     @pytest.mark.asyncio
-    async def test_partial_text_does_not_send(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
+    async def test_partial_text_does_not_send(self, thread: MagicMock, runner: MagicMock) -> None:
         config = _make_config(thread, runner)
         p = EventProcessor(config)
 
@@ -382,9 +389,7 @@ class TestOnComplete:
         assert len(embed_sends) >= 1
 
     @pytest.mark.asyncio
-    async def test_result_text_not_posted(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
+    async def test_result_text_not_posted(self, thread: MagicMock, runner: MagicMock) -> None:
         """Issue #53: RESULT.text is dropped — never posted to Discord."""
         config = _make_config(thread, runner)
         p = EventProcessor(config)
@@ -397,6 +402,19 @@ class TestOnComplete:
         ]
         answer_sends = [c for c in text_sends if "Answer." in c.args[0]]
         assert answer_sends == [], "RESULT text must not reach Discord post-#53"
+
+    @pytest.mark.asyncio
+    async def test_result_saves_working_dir_to_repo(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        repo = MagicMock()
+        repo.save = AsyncMock()
+        config = _make_config(thread, runner, repo=repo, working_dir="/sessions/456")
+        p = EventProcessor(config)
+
+        await p.process(_make_result_event(session_id="s2"))
+
+        repo.save.assert_called_once_with(thread.id, "s2", working_dir="/sessions/456")
 
 
 class TestConnectionErrorResilience:

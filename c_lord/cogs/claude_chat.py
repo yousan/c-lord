@@ -829,6 +829,7 @@ class ClaudeChatCog(commands.Cog):
                         session_dir_manager=session_dir_manager,
                         tmux_manager=tmux_manager,
                         image_paths=image_paths,
+                        working_dir=working_dir or None,
                     )
                 )
             finally:

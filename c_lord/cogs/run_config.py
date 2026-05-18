@@ -70,6 +70,10 @@ class RunConfig:
     # Paths to downloaded image tempfiles passed via --image flags.
     # Cleaned up in run_claude_with_config() finally block.
     image_paths: list[str] | None = None
+    # Absolute path of the session's working directory. Persisted to the
+    # sessions DB so TranscriptMirrorCog can restart mirrors after a bot
+    # restart (CLORD_BRIDGE_MODE=jsonl). None when no session_dir_manager.
+    working_dir: str | None = None
 
     # Prevent accidental field mutation — RunConfig is a value object.
     # Use dataclasses.replace() to create modified copies.

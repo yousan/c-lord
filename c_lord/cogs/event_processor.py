@@ -179,7 +179,11 @@ class EventProcessor:
 
         self._state.session_id = event.session_id
         if self._config.repo:
-            await self._config.repo.save(self._config.thread.id, self._state.session_id)
+            await self._config.repo.save(
+                self._config.thread.id,
+                self._state.session_id,
+                working_dir=self._config.working_dir,
+            )
 
         # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
         if not self._config.session_id and not self._session_start_sent:
@@ -279,7 +283,11 @@ class EventProcessor:
 
         if event.session_id:
             if self._config.repo:
-                await self._config.repo.save(self._config.thread.id, event.session_id)
+                await self._config.repo.save(
+                    self._config.thread.id,
+                    event.session_id,
+                    working_dir=self._config.working_dir,
+                )
             self._state.session_id = event.session_id
 
     # ------------------------------------------------------------------
