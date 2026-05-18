@@ -275,6 +275,58 @@ class TestTmuxSessionManager:
         assert mgr._thread_to_window == {111: "work1", 333: "work3"}
         assert mgr._next_work_id == 4  # one past highest (3)
 
+    def test_rebuild_mapping_recovers_from_pane_path(self) -> None:
+        """When @thread_id is missing (e.g. after tmux server restart wiped
+        user options), thread_id is recovered from the pane's current path.
+
+        Regression for #69: tmux-resurrect restores window names but not
+        ``@thread_id`` window options, so the lookup had to fall back to
+        the working directory, which contains the thread ID by convention
+        (``<base>/<thread_id>``).
+        """
+        mgr = TmuxSessionManager()
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # list-windows with pane_current_path
+                MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "work1\t/home/u/c-lord-sessions/999/1501841644457300038\n"
+                        "work2\t/home/u/other\n"
+                    ),
+                ),
+                # show-option @thread_id for work1 → option unset (rc=1)
+                MagicMock(returncode=1, stdout=""),
+                # set-option to repair @thread_id for work1
+                MagicMock(returncode=0),
+                # show-option @thread_id for work2 → option unset (rc=1)
+                MagicMock(returncode=1, stdout=""),
+            ]
+            mgr._rebuild_mapping()
+
+        # Recovered from path
+        assert mgr._thread_to_window == {1501841644457300038: "work1"}
+        # work2 has no recoverable thread_id → not mapped
+        assert 2 not in mgr._thread_to_window
+
+    def test_rebuild_mapping_prefers_option_over_path(self) -> None:
+        """When @thread_id is set, it wins over pane_current_path inference."""
+        mgr = TmuxSessionManager()
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(
+                    returncode=0,
+                    stdout="work1\t/home/u/c-lord-sessions/999/1501841644457300038\n",
+                ),
+                # show-option returns the authoritative thread_id
+                MagicMock(returncode=0, stdout="42\n"),
+            ]
+            mgr._rebuild_mapping()
+
+        assert mgr._thread_to_window == {42: "work1"}
+
     def test_rebuild_mapping_empty(self) -> None:
         """_rebuild_mapping with no windows results in empty state."""
         mgr = TmuxSessionManager()
