@@ -794,6 +794,14 @@ class ClaudeChatCog(commands.Cog):
 
             self._active_runners[thread.id] = runner
 
+            # Issue #71: when CLORD_BRIDGE_MODE=jsonl, kick off a per-thread
+            # transcript mirror so JSONL events flow to this Discord thread
+            # without going through the discord-reply skill.  No-op otherwise.
+            transcript_cog = getattr(self.bot, "transcript_mirror_cog", None)
+            if transcript_cog is not None and working_dir:
+                with contextlib.suppress(Exception):
+                    transcript_cog.start_for(thread.id, working_dir)
+
             stop_view = StopView(runner)
             if window_name:
                 stop_msg = await thread.send(

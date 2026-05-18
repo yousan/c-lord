@@ -67,11 +67,13 @@ def inject_skills(
 def skills_enabled() -> bool:
     """Return True unless explicitly disabled via env var.
 
-    Skill-based reply is the only path for posting Claude's answers to Discord
-    (#53). The legacy capture-pane scrape→post pipeline has been removed.
-    The env var remains for emergency control — setting ``USE_SKILL_REPLY=0``
-    stops the skill from being injected but does NOT restore the scrape path.
-    Default is ON.
+    Skill-based reply has historically been the only path for posting Claude's
+    answers to Discord (#53).  Issue #71 introduces the JSONL transcript
+    mirror as a replacement; while it is enabled (``CLORD_BRIDGE_MODE=jsonl``)
+    the skill must NOT be injected — otherwise every event would be posted
+    twice.  ``USE_SKILL_REPLY=0`` remains available as a manual override.
     """
     value = os.getenv("USE_SKILL_REPLY", "").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return os.getenv("CLORD_BRIDGE_MODE", "skill").strip().lower() != "jsonl"

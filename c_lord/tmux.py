@@ -456,8 +456,17 @@ class TmuxSessionManager:
 
         target = f"{self.session_name}:{window}"
 
-        # Send the text literally (no tmux key interpretation)
-        result = _run(["tmux", "send-keys", "-l", "-t", target, text])
+        # Send the text literally (no tmux key interpretation).  Under
+        # CLORD_BRIDGE_MODE=jsonl the text is prefixed with a zero-width-space
+        # marker so the JSONL ``user`` event Claude Code subsequently writes
+        # is recognised as c-lord-originated and skipped by the transcript
+        # mirror (Issue #71) — prevents double-posting Discord input back to
+        # the same thread.
+        from .transcript.formatter import ZWSP_MARKER
+        from .transcript.mirror import bridge_mode_jsonl
+
+        payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
+        result = _run(["tmux", "send-keys", "-l", "-t", target, payload])
         if result.returncode != 0:
             logger.warning("send_input: send-keys -l failed: %s", result.stderr.strip())
             return False
