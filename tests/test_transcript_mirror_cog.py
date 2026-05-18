@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
@@ -160,3 +161,107 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     assert channel.send.called
     sent_bodies = [c[0][0] for c in channel.send.call_args_list]
     assert any("via cog" in b for b in sent_bodies)
+
+
+# ---------------------------------------------------------------------------
+# Issue #85: observability — sink failures must be logged, not suppressed
+# ---------------------------------------------------------------------------
+
+
+async def test_sink_logs_warning_on_http_exception(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """HTTPException in sink must produce a WARNING log, not be silently swallowed."""
+    import logging
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=403), "Forbidden"))
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(42)
+
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        await sink("test message")
+
+    assert any("42" in r.message for r in caplog.records), "thread_id missing from log"
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), "no WARNING logged"
+
+
+async def test_sink_log_includes_body_length(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Log message should include body length so we can triage truncation issues."""
+    import logging
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=400), "Bad"))
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(99)
+
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        await sink("hello world")
+
+    combined = " ".join(r.message for r in caplog.records)
+    assert "99" in combined, "thread_id not in log"
+
+
+async def test_file_sink_falls_back_to_plain_on_http_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When file attachment send fails, file_sink must retry with plain text."""
+    bot = MagicMock()
+    channel = MagicMock()
+    call_count = 0
+
+    async def send_side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if "file" in kwargs:
+            raise discord.HTTPException(MagicMock(status=413), "Too large")
+        # Plain text succeeds
+
+    channel.send = AsyncMock(side_effect=send_side_effect)
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(10)
+    await file_sink("final answer", str(progress_file))
+
+    # send called twice: once with file (failed), once without (fallback)
+    assert call_count == 2
+    # Last call was plain text (no file kwarg)
+    last_kwargs = channel.send.call_args_list[-1][1]
+    assert "file" not in last_kwargs
+
+
+async def test_file_sink_logs_warning_on_http_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """HTTPException in file_sink must produce a WARNING log."""
+    import logging
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=500), "Error"))
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("some tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(77)
+
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        await file_sink("body", str(progress_file))
+
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+    combined = " ".join(r.message for r in caplog.records)
+    assert "77" in combined, "thread_id missing from log"
