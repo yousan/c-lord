@@ -125,6 +125,7 @@ async def setup_bridge(
     from .cogs.scheduler import SchedulerCog
     from .cogs.session_manage import SessionManageCog
     from .cogs.skill_command import SkillCommandCog
+    from .cogs.transcript_mirror import TranscriptMirrorCog
     from .database.ask_repo import PendingAskRepository
     from .database.channel_repo import ChannelRepository
     from .database.lounge_repo import LoungeRepository
@@ -226,6 +227,12 @@ async def setup_bridge(
         )
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")
+
+    # --- TranscriptMirrorCog (Issue #71, gated by CLORD_BRIDGE_MODE=jsonl) ---
+    transcript_cog = TranscriptMirrorCog(bot, session_repo=session_repo)
+    await bot.add_cog(transcript_cog)
+    bot.transcript_mirror_cog = transcript_cog  # type: ignore[attr-defined]
+    logger.info("Registered TranscriptMirrorCog (active when CLORD_BRIDGE_MODE=jsonl)")
 
     # --- SchedulerCog (optional) ---
     task_repo: TaskRepository | None = None
