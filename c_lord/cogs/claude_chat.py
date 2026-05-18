@@ -51,10 +51,13 @@ _ALLOWED_MIME_PREFIXES = (
 )
 _IMAGE_MIME_PREFIXES = ("image/",)
 _MAX_ATTACHMENT_BYTES = 50_000  # 50 KB per file
-_MAX_IMAGE_BYTES = 5_000_000  # 5 MB per image
 _MAX_TOTAL_BYTES = 100_000  # 100 KB across all text attachments
 _MAX_ATTACHMENTS = 5
-_MAX_IMAGES = 4  # Claude supports up to 4 images per prompt
+
+# Discord CDN URLs are signed and valid for ~24 hours.
+_ATTACHMENT_URL_NOTE = (
+    "(This is a signed CDN URL valid for ~24 hours. Use the WebFetch tool or curl to retrieve it.)"
+)
 
 
 class ClaudeChatCog(commands.Cog):
@@ -622,69 +625,49 @@ class ClaudeChatCog(commands.Cog):
         return prompt
 
     async def _build_prompt_and_images(self, message: discord.Message) -> tuple[str, list[str]]:
-        """Build the prompt string and download image attachments to tempfiles.
+        """Build the prompt string from message content and attachments.
 
         Text attachments (text/*, application/json, application/xml) are appended
-        inline to the prompt.  Image attachments (image/*) are downloaded to
-        temporary files and returned as paths for the ``--image`` flag.
+        inline to the prompt.
 
-        Both binary-file types that exceed size limits and unsupported types are
-        silently skipped — never raise an error to the user.
+        Image and other binary attachments are embedded as CDN URLs with a note
+        explaining that Claude can fetch them via WebFetch or curl.  Discord CDN
+        URLs are signed and valid for ~24 hours — no download or tempfile needed.
 
         Returns:
-            (prompt_text, image_temp_paths) — callers must delete tempfiles.
+            (prompt_text, []) — image_paths is always empty (URL embedding, not
+            local download).  The second element is kept for API compatibility.
         """
-        import tempfile
-
         prompt = message.content or ""
         if not message.attachments:
             return prompt, []
 
         total_bytes = 0
         sections: list[str] = []
-        image_paths: list[str] = []
 
         for attachment in message.attachments[:_MAX_ATTACHMENTS]:
             content_type = attachment.content_type or ""
 
-            # ---- Image attachments → tempfile for --image flag ----
-            if content_type.startswith(_IMAGE_MIME_PREFIXES):
-                if len(image_paths) >= _MAX_IMAGES:
-                    logger.debug("Skipping image %s: max images reached", attachment.filename)
-                    continue
-                if attachment.size > _MAX_IMAGE_BYTES:
-                    logger.debug(
-                        "Skipping image %s: too large (%d bytes)",
-                        attachment.filename,
-                        attachment.size,
-                    )
-                    continue
-                try:
-                    data = await attachment.read()
-                    suffix = f"_{attachment.filename}"
-                    with tempfile.NamedTemporaryFile(
-                        delete=False, suffix=suffix, prefix="clord_img_"
-                    ) as f:
-                        f.write(data)
-                        image_paths.append(f.name)
-                    logger.debug("Downloaded image %s → %s", attachment.filename, f.name)
-                except Exception:
-                    logger.debug("Failed to download image %s", attachment.filename, exc_info=True)
+            # ---- Image and binary attachments → embed CDN URL in prompt ----
+            if content_type.startswith(_IMAGE_MIME_PREFIXES) or not content_type.startswith(
+                _ALLOWED_MIME_PREFIXES
+            ):
+                sections.append(
+                    f"\n\n--- Attached file: {attachment.filename} ---\n"
+                    f"URL: {attachment.url}\n"
+                    f"{_ATTACHMENT_URL_NOTE}"
+                )
+                logger.debug(
+                    "Embedded attachment URL for %s (%s)", attachment.filename, content_type
+                )
                 continue
 
-            # ---- Text attachments → inline in prompt ----
+            # ---- Text attachments → inline content in prompt ----
             if attachment.size > _MAX_ATTACHMENT_BYTES:
                 logger.debug(
                     "Skipping attachment %s: too large (%d bytes)",
                     attachment.filename,
                     attachment.size,
-                )
-                continue
-            if not content_type.startswith(_ALLOWED_MIME_PREFIXES):
-                logger.debug(
-                    "Skipping attachment %s: unsupported type %s",
-                    attachment.filename,
-                    content_type,
                 )
                 continue
             total_bytes += attachment.size
@@ -699,7 +682,7 @@ class ClaudeChatCog(commands.Cog):
                 logger.debug("Failed to read attachment %s", attachment.filename, exc_info=True)
                 continue
 
-        return prompt + "".join(sections), image_paths
+        return prompt + "".join(sections), []
 
     async def _run_claude(
         self,

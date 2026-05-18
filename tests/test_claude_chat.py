@@ -195,11 +195,13 @@ class TestBuildPrompt:
         content_type: str = "text/plain",
         size: int = 100,
         content: bytes = b"hello world",
+        url: str = "https://cdn.discordapp.com/attachments/123/456/test.txt?ex=abc&is=def&hm=xyz",
     ) -> MagicMock:
         att = MagicMock(spec=discord.Attachment)
         att.filename = filename
         att.content_type = content_type
         att.size = size
+        att.url = url
         att.read = AsyncMock(return_value=content)
         return att
 
@@ -230,45 +232,88 @@ class TestBuildPrompt:
         assert "file content here" in result
 
     @pytest.mark.asyncio
-    async def test_image_attachment_not_inlined_in_prompt(self) -> None:
-        """Images are downloaded to tempfiles, NOT inlined into the prompt text."""
-        import os
-
+    async def test_image_attachment_url_embedded_in_prompt(self) -> None:
+        """Images are NOT downloaded; their CDN URL is embedded in the prompt."""
+        image_url = "https://cdn.discordapp.com/attachments/1/2/image.png?ex=abc&is=def&hm=xyz"
         cog = _make_cog()
         att = self._make_attachment(
             filename="image.png",
             content_type="image/png",
             size=100,
             content=b"\x89PNG...",
+            url=image_url,
         )
         msg = self._make_message(content="see image", attachments=[att])
 
         prompt, image_paths = await cog._build_prompt_and_images(msg)
 
-        # Prompt text stays clean — no image content inlined.
-        assert prompt == "see image"
-        # One tempfile created for the image.
-        assert len(image_paths) == 1
-        assert os.path.exists(image_paths[0])
-        # Clean up.
-        for p in image_paths:
-            os.unlink(p)
+        # URL is embedded in the prompt text.
+        assert image_url in prompt
+        assert "image.png" in prompt
+        # No tempfiles — images are not downloaded.
+        assert image_paths == []
+        att.read.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_binary_non_image_skipped(self) -> None:
-        """Non-image binary files (e.g. zip) are still silently skipped."""
+    async def test_binary_non_image_url_embedded(self) -> None:
+        """Non-image binary files (e.g. zip, PDF) have their URL embedded."""
+        file_url = "https://cdn.discordapp.com/attachments/1/2/archive.zip?ex=abc&is=def&hm=xyz"
         cog = _make_cog()
         att = self._make_attachment(
             filename="archive.zip",
             content_type="application/zip",
             content=b"PK...",
+            url=file_url,
         )
         msg = self._make_message(content="see zip", attachments=[att])
 
         result = await cog._build_prompt(msg)
 
-        assert result == "see zip"
+        assert file_url in result
+        assert "archive.zip" in result
         att.read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_all_urls_embedded(self) -> None:
+        """Multiple image attachments all get their URLs embedded."""
+        cog = _make_cog()
+        images = [
+            self._make_attachment(
+                filename=f"img{i}.png",
+                content_type="image/png",
+                url=f"https://cdn.discordapp.com/attachments/1/2/img{i}.png?ex=abc",
+            )
+            for i in range(3)
+        ]
+        msg = self._make_message(content="three images", attachments=images)
+
+        prompt, image_paths = await cog._build_prompt_and_images(msg)
+
+        for i in range(3):
+            assert f"img{i}.png" in prompt
+            assert f"img{i}.png?ex=abc" in prompt
+        assert image_paths == []
+        for att in images:
+            att.read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_image_and_text_attachment_combined(self) -> None:
+        """Image URL + text file content both appear in the prompt."""
+        image_url = "https://cdn.discordapp.com/attachments/1/2/photo.jpg?ex=abc"
+        cog = _make_cog()
+        img_att = self._make_attachment(
+            filename="photo.jpg",
+            content_type="image/jpeg",
+            url=image_url,
+        )
+        txt_att = self._make_attachment(filename="notes.txt", content=b"my notes")
+        msg = self._make_message(content="check these", attachments=[img_att, txt_att])
+
+        prompt, image_paths = await cog._build_prompt_and_images(msg)
+
+        assert image_url in prompt
+        assert "my notes" in prompt
+        assert image_paths == []
 
     @pytest.mark.asyncio
     async def test_oversized_attachment_skipped(self) -> None:
