@@ -114,13 +114,29 @@ class TranscriptMirrorCog(commands.Cog):
                     type(channel).__name__,
                 )
                 return
-            with contextlib.suppress(discord.HTTPException):
+            try:
                 await send(body)
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "TranscriptMirror sink failed: thread=%d body_len=%d status=%s — %s",
+                    thread_id,
+                    len(body),
+                    getattr(exc, "status", "?"),
+                    exc,
+                    exc_info=True,
+                )
 
         return sink
 
     def _make_file_sink(self, thread_id: int):
-        """Return an awaitable callable that posts text + progress.txt attachment."""
+        """Return an awaitable callable that posts text + progress.txt attachment.
+
+        Fallback strategy:
+        1. Send with progress.txt attached.
+        2. If that raises HTTPException (e.g. 413 Payload Too Large), retry
+           with plain text only and log a warning.
+        3. If the plain-text retry also fails, log a warning.
+        """
         bot = self.bot
 
         async def file_sink(text: str, file_path: str) -> None:
@@ -131,8 +147,32 @@ class TranscriptMirrorCog(commands.Cog):
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            with contextlib.suppress(discord.HTTPException):
+            try:
                 await send(body, file=discord.File(file_path, filename="progress.txt"))
+                return
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "TranscriptMirror file_sink failed (with attachment): "
+                    "thread=%d body_len=%d status=%s — retrying without attachment — %s",
+                    thread_id,
+                    len(body),
+                    getattr(exc, "status", "?"),
+                    exc,
+                    exc_info=True,
+                )
+            # Fallback: plain text without attachment
+            try:
+                await send(body)
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "TranscriptMirror file_sink fallback also failed: "
+                    "thread=%d body_len=%d status=%s — %s",
+                    thread_id,
+                    len(body),
+                    getattr(exc, "status", "?"),
+                    exc,
+                    exc_info=True,
+                )
 
         return file_sink
 
