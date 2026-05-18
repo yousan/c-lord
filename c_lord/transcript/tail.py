@@ -65,7 +65,7 @@ async def tail_events(
             last_mtime = -1.0
 
         try:
-            stat = current_path.stat()
+            stat = active.stat()
         except FileNotFoundError:
             current_path = None
             await asyncio.sleep(poll_interval)
@@ -86,7 +86,7 @@ async def tail_events(
         last_mtime = mtime
 
         if size > offset:
-            with current_path.open("r", encoding="utf-8", errors="replace") as f:
+            with active.open("r", encoding="utf-8", errors="replace") as f:
                 f.seek(offset)
                 chunk = f.read()
                 offset = f.tell()
