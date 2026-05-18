@@ -38,6 +38,19 @@ FileSink = Callable[[str, str], Awaitable[None]]
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
 
+# Maximum byte size for progress.txt content.  Caps runaway tool output so
+# that progress.txt stays well within Discord's 8 MB file-upload limit.
+_PROGRESS_MAX_BYTES = 50_000  # 50 KB
+
+
+def _truncate_progress(content: str) -> str:
+    """Truncate *content* to ``_PROGRESS_MAX_BYTES`` bytes if needed."""
+    encoded = content.encode("utf-8")
+    if len(encoded) <= _PROGRESS_MAX_BYTES:
+        return content
+    truncated = encoded[: _PROGRESS_MAX_BYTES - 30].decode("utf-8", errors="ignore")
+    return truncated + "\n… [truncated]"
+
 
 def bridge_mode_jsonl() -> bool:
     """Return True iff ``CLORD_BRIDGE_MODE`` is set to ``jsonl``."""
@@ -159,7 +172,7 @@ class TranscriptMirror:
                 delete=False,
                 encoding="utf-8",
             ) as f:
-                f.write("\n".join(progress_buf))
+                f.write(_truncate_progress("\n".join(progress_buf)))
                 tmp_path = f.name
             try:
                 await self._file_sink(body, tmp_path)
