@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 api = ["aiohttp>=3.9"]
+table = [
+    "matplotlib>=3.10.9",
+]
 
 [project.scripts]
 c-lord = "c_lord.cli:main"

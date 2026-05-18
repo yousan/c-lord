@@ -712,9 +712,26 @@ class ApiServer:
         if not hasattr(raw, "send"):
             return web.json_response({"error": "Channel is not messageable"}, status=400)
 
+        # Optional table-image rendering (CLORD_RENDER_TABLE_IMAGES=true)
+        table_files: list[discord.File] = []
+        if os.getenv("CLORD_RENDER_TABLE_IMAGES", "").lower() in ("1", "true", "yes"):
+            from ..discord_ui.table_renderer import detect_tables, render_table_image
+
+            for i, table_md in enumerate(detect_tables(content), start=1):
+                img_bytes = render_table_image(table_md)
+                if img_bytes:
+                    import io
+
+                    table_files.append(
+                        discord.File(io.BytesIO(img_bytes), filename=f"table_{i}.png")
+                    )
+
+        all_files = table_files + ([attachment] if attachment else [])
         send_kwargs: dict = {"content": content}
-        if attachment is not None:
-            send_kwargs["file"] = attachment
+        if len(all_files) == 1:
+            send_kwargs["file"] = all_files[0]
+        elif len(all_files) > 1:
+            send_kwargs["files"] = all_files
         await raw.send(**send_kwargs)  # type: ignore[union-attr]
 
         # Issue #67: record the successful reply so run_helper can detect
