@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
-from ..transcript.mirror import TranscriptMirror, bridge_mode_jsonl
+from ..transcript.mirror import TranscriptMirror, bridge_mode_jsonl, verbosity_mode
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -71,7 +71,14 @@ class TranscriptMirrorCog(commands.Cog):
 
         project_dir = derive_project_dir(working_dir)
         sink = self._make_sink(thread_id)
-        mirror = TranscriptMirror(thread_id=thread_id, project_dir=project_dir, sink=sink)
+        file_sink = self._make_file_sink(thread_id)
+        mirror = TranscriptMirror(
+            thread_id=thread_id,
+            project_dir=project_dir,
+            sink=sink,
+            file_sink=file_sink,
+            verbosity=verbosity_mode(),
+        )
         mirror.start()
         self._mirrors[thread_id] = mirror
         logger.info(
@@ -95,21 +102,9 @@ class TranscriptMirrorCog(commands.Cog):
         bot = self.bot
 
         async def sink(text: str) -> None:
-            channel = bot.get_channel(thread_id)
+            channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
-                # Thread may not be in cache after a restart — try fetching.
-                with contextlib.suppress(discord.HTTPException, discord.NotFound):
-                    channel = await bot.fetch_channel(thread_id)
-            if channel is None:
-                logger.warning(
-                    "TranscriptMirror sink: channel %d not found, dropping post",
-                    thread_id,
-                )
                 return
-            # Discord caps a single message at 2000 chars; the formatter does
-            # not pre-chunk so we hard-truncate here.  When this PR lands the
-            # chunk + .txt-attach policy from Issue #71 §2 will live behind a
-            # dedicated helper.
             body = text if len(text) <= 1990 else text[:1985] + "…"
             send = getattr(channel, "send", None)
             if send is None:
@@ -123,3 +118,34 @@ class TranscriptMirrorCog(commands.Cog):
                 await send(body)
 
         return sink
+
+    def _make_file_sink(self, thread_id: int):
+        """Return an awaitable callable that posts text + progress.txt attachment."""
+        bot = self.bot
+
+        async def file_sink(text: str, file_path: str) -> None:
+            channel = await self._resolve_channel(bot, thread_id)
+            if channel is None:
+                return
+            body = text if len(text) <= 1990 else text[:1985] + "…"
+            send = getattr(channel, "send", None)
+            if send is None:
+                return
+            with contextlib.suppress(discord.HTTPException):
+                await send(body, file=discord.File(file_path, filename="progress.txt"))
+
+        return file_sink
+
+    @staticmethod
+    async def _resolve_channel(bot, thread_id: int):
+        """Fetch the channel/thread from cache or Discord API."""
+        channel = bot.get_channel(thread_id)
+        if channel is None:
+            with contextlib.suppress(discord.HTTPException, discord.NotFound):
+                channel = await bot.fetch_channel(thread_id)
+        if channel is None:
+            logger.warning(
+                "TranscriptMirror sink: channel %d not found, dropping post",
+                thread_id,
+            )
+        return channel
