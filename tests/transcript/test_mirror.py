@@ -427,3 +427,92 @@ async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path)
     # file_sink only called once (turn 1), not for turn 2 (no buffered tools)
     assert len(file_sink_calls) == 1
     assert file_sink_calls[0][0] == "turn1 done"
+
+
+# ---------------------------------------------------------------------------
+# Issue #86: regression tests for markdown-table + tool events scenario
+# ---------------------------------------------------------------------------
+
+
+async def test_mirror_minimal_markdown_table_with_tools_reaches_file_sink(
+    tmp_path: Path,
+) -> None:
+    """Issue #86 regression: markdown table in assistant_text after tool events
+    must reach file_sink (not be silently dropped)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    sink_calls: list[str] = []
+    file_sink_calls: list[tuple[str, str]] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def file_sink(text: str, file_path: str) -> None:
+        file_sink_calls.append((text, file_path))
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        file_sink=file_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    markdown_table_body = (
+        "まとめると：\n\n"
+        "| テーブル | フィールド | 件数 | 内容 |\n"
+        "|---|---|---|---|\n"
+        "| `konishis_postmeta` | `mw-wp-form` | 1件 | **設定** |\n\n"
+        "進めますか？"
+    )
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(jsonl, _assistant_tool_use("Bash", "mysql -e 'SELECT ...'"))
+        _write_event(jsonl, _user_tool_result("<persisted-output>\nOutput too large (301KB)."))
+        _write_event(jsonl, _assistant_tool_use("Bash", "mysql -e 'SELECT tbl ...'"))
+        _write_event(jsonl, _user_tool_result("tbl\tfield\nextra\t1"))
+        _write_event(
+            jsonl,
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": markdown_table_body}],
+                },
+            },
+        )
+        await asyncio.sleep(0.5)
+    finally:
+        await mirror.stop()
+
+    # The markdown table body must have reached file_sink (not been dropped)
+    assert len(file_sink_calls) == 1, f"expected 1 file_sink call, got {len(file_sink_calls)}"
+    assert markdown_table_body in file_sink_calls[0][0]
+    # Progress file must exist (or have existed) and contain tool output
+    assert not sink_calls or not any(markdown_table_body in c for c in sink_calls)
+
+
+def test_progress_content_truncated_when_over_limit(tmp_path: Path) -> None:
+    """Progress buffer content must be truncated to _PROGRESS_MAX_BYTES to
+    prevent oversized progress.txt from causing 413 errors."""
+    from c_lord.transcript.mirror import _PROGRESS_MAX_BYTES, _truncate_progress
+
+    large_content = "x" * (_PROGRESS_MAX_BYTES + 1000)
+    result = _truncate_progress(large_content)
+    assert len(result.encode()) <= _PROGRESS_MAX_BYTES
+    assert "[truncated]" in result or len(result) < len(large_content)
+
+
+def test_progress_content_not_truncated_when_within_limit(tmp_path: Path) -> None:
+    """Small progress content must pass through unchanged."""
+    from c_lord.transcript.mirror import _truncate_progress
+
+    small = "tool output line"
+    assert _truncate_progress(small) == small
