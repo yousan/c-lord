@@ -105,8 +105,6 @@ class ApiServer:
         self.app.router.add_post("/api/spawn", self.spawn)
         # Thread message route (CLI input forwarding)
         self.app.router.add_post("/api/threads/{thread_id}/messages", self.post_thread_message)
-        # Issue #52: Skill-based final reply (clean content, no source prefix)
-        self.app.router.add_post("/api/reply", self.reply)
         # Startup resume routes
         self.app.router.add_post("/api/mark-resume", self.mark_resume)
 
@@ -645,81 +643,6 @@ class ApiServer:
         # from bot/Claude messages but doesn't overwhelm the thread.
         formatted = f"-# \U0001f4bb ({source}) {content}"
         await raw.send(formatted)  # type: ignore[union-attr]
-
-        return web.json_response({"status": "sent"})
-
-    async def reply(self, request: web.Request) -> web.Response:
-        """POST /api/reply — Skill-based final reply (#52 Phase 1).
-
-        Used by the ``discord-reply`` skill that c-lord injects into each
-        Claude session directory. Unlike ``post_thread_message``, the content
-        is posted *as-is* (no ``-# 💻 (cli)`` prefix) because this represents
-        Claude's actual answer, not a CLI forwarding decoration.
-
-        Body (JSON):
-            thread_id: Target Discord thread ID (required).
-            content: Message body, Discord markdown OK (required, non-empty).
-            progress_file: Absolute path on the server to a file to attach
-                (optional). Used for progress.txt-style detail dumps (#38).
-
-        Returns:
-            200 ``{"status": "sent"}`` on success.
-            400 on validation errors (missing / empty fields, missing file).
-            404 if the thread cannot be resolved.
-        """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
-
-        thread_id_raw = data.get("thread_id")
-        if thread_id_raw is None:
-            return web.json_response({"error": "thread_id is required"}, status=400)
-        try:
-            thread_id = int(thread_id_raw)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "thread_id must be an integer"}, status=400)
-
-        content = (data.get("content") or "").strip()
-        if not content:
-            return web.json_response({"error": "content is required"}, status=400)
-
-        # Optional attachment — resolve and validate before touching Discord.
-        progress_file = data.get("progress_file")
-        attachment = None
-        if progress_file:
-            from pathlib import Path
-
-            path = Path(str(progress_file))
-            if not path.is_file():
-                return web.json_response(
-                    {"error": f"progress_file not found: {progress_file}"},
-                    status=400,
-                )
-            import discord
-
-            attachment = discord.File(str(path), filename=path.name)
-
-        raw = self.bot.get_channel(thread_id)
-        if raw is None:
-            try:
-                raw = await self.bot.fetch_channel(thread_id)
-            except Exception:
-                return web.json_response({"error": "Thread not found"}, status=404)
-
-        if not hasattr(raw, "send"):
-            return web.json_response({"error": "Channel is not messageable"}, status=400)
-
-        send_kwargs: dict = {"content": content}
-        if attachment is not None:
-            send_kwargs["file"] = attachment
-        await raw.send(**send_kwargs)  # type: ignore[union-attr]
-
-        # Issue #67: record the successful reply so run_helper can detect
-        # turns where Claude never invoked the discord-reply skill.
-        from ..skills.reply_tracker import record_reply
-
-        record_reply(thread_id)
 
         return web.json_response({"status": "sent"})
 

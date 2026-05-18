@@ -228,11 +228,11 @@ async def setup_bridge(
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")
 
-    # --- TranscriptMirrorCog (Issue #71, gated by CLORD_BRIDGE_MODE=jsonl) ---
+    # --- TranscriptMirrorCog (Issue #71) ---
     transcript_cog = TranscriptMirrorCog(bot, session_repo=session_repo)
     await bot.add_cog(transcript_cog)
     bot.transcript_mirror_cog = transcript_cog  # type: ignore[attr-defined]
-    logger.info("Registered TranscriptMirrorCog (active when CLORD_BRIDGE_MODE=jsonl)")
+    logger.info("Registered TranscriptMirrorCog")
 
     # --- SchedulerCog (optional) ---
     task_repo: TaskRepository | None = None

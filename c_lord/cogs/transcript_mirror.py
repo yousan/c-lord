@@ -1,10 +1,9 @@
 """Cog: JSONL transcript → Discord thread mirror (Issue #71).
 
-When ``CLORD_BRIDGE_MODE=jsonl``, this Cog tails ``~/.claude/projects/<slug>/``
-for every thread that has a stored ``working_dir`` and forwards rendered events
-to the corresponding Discord thread.  It coexists with the legacy skill-based
-reply path: the skill injection itself is suppressed under jsonl mode so each
-event is posted at most once.
+This Cog tails ``~/.claude/projects/<slug>/`` for every thread with a stored
+``working_dir`` and forwards rendered events to the corresponding Discord
+thread.  It is the sole bridge from Claude Code to Discord — the legacy
+``discord-reply`` skill injection has been retired (Issue #71 step 5).
 
 Lifecycle:
 - ``on_ready``: walk the sessions table and start a mirror task for every row
@@ -24,7 +23,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
-from ..transcript.mirror import TranscriptMirror, bridge_mode_jsonl
+from ..transcript.mirror import TranscriptMirror
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -43,9 +42,6 @@ class TranscriptMirrorCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        if not bridge_mode_jsonl():
-            logger.info("TranscriptMirrorCog: CLORD_BRIDGE_MODE != jsonl — staying idle")
-            return
         # Sessions are bounded by Discord usage; 10k is well above realistic.
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
@@ -61,11 +57,8 @@ class TranscriptMirrorCog(commands.Cog):
     def start_for(self, thread_id: int, working_dir: str) -> bool:
         """Spawn a mirror for ``thread_id`` if one is not already running.
 
-        Returns True if a new mirror was started, False if one already exists
-        or bridge mode is not jsonl.
+        Returns True if a new mirror was started, False if one already exists.
         """
-        if not bridge_mode_jsonl():
-            return False
         if thread_id in self._mirrors:
             return False
 

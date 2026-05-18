@@ -6,9 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
-import pytest
-
-from c_lord.transcript.mirror import TranscriptMirror, bridge_mode_jsonl
+from c_lord.transcript.mirror import TranscriptMirror
 
 
 def _write_event(path: Path, payload: dict) -> None:
@@ -142,15 +140,3 @@ async def test_mirror_sink_errors_do_not_kill_task(tmp_path: Path) -> None:
     assert calls >= 2
 
 
-def test_bridge_mode_jsonl_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
-    assert bridge_mode_jsonl() is False
-
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
-    assert bridge_mode_jsonl() is False
-
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
-    assert bridge_mode_jsonl() is True
-
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "JSONL")
-    assert bridge_mode_jsonl() is True

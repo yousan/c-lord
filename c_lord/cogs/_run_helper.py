@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-import time
 
 import discord
 
@@ -179,21 +178,14 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
 
     runner = config.runner
     processor = EventProcessor(config)
-    # Issue #67: capture turn start so we can detect whether Claude ever
-    # invoked the discord-reply skill before the runner finished.
-    turn_started_at = time.monotonic()
-    run_errored = False
 
     try:
         async for event in runner.run(config.prompt, session_id=config.session_id):
             if processor.should_drain:
                 continue
             await processor.process(event)
-            if event.is_complete and event.error:
-                run_errored = True
     except Exception:
         logger.exception("%s Error running Claude CLI", ctx)
-        run_errored = True
         # Wrap Discord sends in suppress — the connection may already be closed
         # (e.g. ServerDisconnectedError on bot shutdown), and sending would fail too.
         with contextlib.suppress(Exception):
@@ -208,23 +200,6 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             config.registry.unregister(config.thread.id)
         if config.image_paths:
             await _cleanup_image_tempfiles(config.image_paths)
-
-    # Issue #67: surface a fallback notice when the turn finished cleanly but
-    # Claude never called the discord-reply skill — otherwise the user is left
-    # staring at silence (only the "no activity 30s" stall warning).
-    if not run_errored and not processor.pending_ask:
-        from ..skills.reply_tracker import was_replied_since
-
-        if not was_replied_since(config.thread.id, turn_started_at):
-            logger.warning(
-                "%s Claude finished without calling discord-reply — posting fallback notice",
-                ctx,
-            )
-            with contextlib.suppress(Exception):
-                await config.thread.send(
-                    "-# ⚠️ Claude finished without calling the `discord-reply` skill. "
-                    "Check the tmux pane for the response, or retry the turn."
-                )
 
     # After the stream ends, handle pending AskUserQuestion by showing Discord
     # UI and resuming the session with the user's answer.

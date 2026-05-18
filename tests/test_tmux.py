@@ -423,77 +423,38 @@ class TestTmuxSessionManager:
 
         assert result is True
 
-        # Verify send-keys -l was called with the text
+        # Verify send-keys -l was called with the text (ZWSP marker prefix is
+        # added by send_input — see test_send_input_prefixes_zwsp_marker).
         text_call = mock_run.call_args_list[1]
         args = text_call[0][0]
         assert "send-keys" in args
         assert "-l" in args
-        assert "my prompt" in args
+        assert any("my prompt" in a for a in args)
 
         # Verify Enter was sent
         enter_call = mock_run.call_args_list[2]
         args = enter_call[0][0]
         assert "Enter" in args
 
-    def test_send_input_prefixes_zwsp_marker_under_jsonl_mode(
-        self, monkeypatch=None
-    ) -> None:
-        # In CLORD_BRIDGE_MODE=jsonl the input must be prefixed with a
-        # zero-width-space so the resulting JSONL ``user`` event is recognised
-        # as c-lord-originated and not double-posted back to Discord (#71).
-        import os
+    def test_send_input_prefixes_zwsp_marker(self) -> None:
+        # The input is always prefixed with a zero-width-space (U+200B) so the
+        # resulting JSONL ``user`` event is recognised as c-lord-originated
+        # and not double-posted back to Discord (#71).
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
 
-        prev = os.environ.get("CLORD_BRIDGE_MODE")
-        os.environ["CLORD_BRIDGE_MODE"] = "jsonl"
-        try:
-            mgr = TmuxSessionManager()
-            mgr._available = True
-            mgr._thread_to_window[12345] = "work1"
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+            ]
+            assert mgr.send_input(12345, "hi") is True
 
-            with patch("c_lord.tmux._run") as mock_run:
-                mock_run.side_effect = [
-                    MagicMock(returncode=0, stdout="12345\n"),
-                    MagicMock(returncode=0),
-                    MagicMock(returncode=0),
-                ]
-                assert mgr.send_input(12345, "hi") is True
-
-            text_call = mock_run.call_args_list[1]
-            args = text_call[0][0]
-            # ZWSP (U+200B) is prepended to the literal text.
-            assert "​hi" in args
-        finally:
-            if prev is None:
-                os.environ.pop("CLORD_BRIDGE_MODE", None)
-            else:
-                os.environ["CLORD_BRIDGE_MODE"] = prev
-
-    def test_send_input_no_marker_under_skill_mode(self) -> None:
-        import os
-
-        prev = os.environ.get("CLORD_BRIDGE_MODE")
-        os.environ.pop("CLORD_BRIDGE_MODE", None)
-        try:
-            mgr = TmuxSessionManager()
-            mgr._available = True
-            mgr._thread_to_window[12345] = "work1"
-
-            with patch("c_lord.tmux._run") as mock_run:
-                mock_run.side_effect = [
-                    MagicMock(returncode=0, stdout="12345\n"),
-                    MagicMock(returncode=0),
-                    MagicMock(returncode=0),
-                ]
-                assert mgr.send_input(12345, "hi") is True
-
-            text_call = mock_run.call_args_list[1]
-            args = text_call[0][0]
-            assert "hi" in args
-            # No ZWSP under default mode (backward compat with skill path).
-            assert "​hi" not in args
-        finally:
-            if prev is not None:
-                os.environ["CLORD_BRIDGE_MODE"] = prev
+        text_call = mock_run.call_args_list[1]
+        args = text_call[0][0]
+        assert "​hi" in args
 
     def test_send_input_no_window(self) -> None:
         mgr = TmuxSessionManager()

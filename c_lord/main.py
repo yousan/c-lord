@@ -79,35 +79,33 @@ async def main() -> None:
         coordination_channel_id=coordination_channel_id,
     )
 
-    # Issue #53: REST API is the only path Claude has for reaching Discord
-    # (the legacy capture-pane scrape→post pipeline was removed). Always start
-    # the API server unless skills are explicitly disabled via USE_SKILL_REPLY=0.
-    from .skills.injector import skills_enabled
-
+    # Issue #71: c-lord mirrors the Claude Code JSONL transcript directly into
+    # Discord — no skill injection.  The REST API server is still started so
+    # external systems (CI / webhooks / schedulers) can talk to the bot, but
+    # the legacy ``/api/reply`` endpoint and ``discord-reply`` skill are gone.
     api_server = None
     api_port_env = os.getenv("CLORD_API_PORT", "")
-    if skills_enabled():
-        try:
-            from .database.notification_repo import NotificationRepository
-            from .ext.api_server import ApiServer
-        except ImportError:
-            logger.warning(
-                "aiohttp is not installed; API server will NOT start and "
-                "Claude has no path to Discord. Install with `uv add aiohttp`."
-            )
-        else:
-            notif_db = str(data_dir / "notifications.db")
-            notif_repo = NotificationRepository(notif_db)
-            await notif_repo.init_db()
-            api_port = int(api_port_env) if api_port_env.isdigit() else 8080
-            api_server = ApiServer(
-                repo=notif_repo,
-                bot=bot,
-                default_channel_id=int(config["channel_id"]),
-                host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
-                port=api_port,
-                api_secret=os.getenv("CLORD_API_SECRET") or None,
-            )
+    try:
+        from .database.notification_repo import NotificationRepository
+        from .ext.api_server import ApiServer
+    except ImportError:
+        logger.warning(
+            "aiohttp is not installed; API server will NOT start. "
+            "Install with `uv add aiohttp` to enable /api/* endpoints."
+        )
+    else:
+        notif_db = str(data_dir / "notifications.db")
+        notif_repo = NotificationRepository(notif_db)
+        await notif_repo.init_db()
+        api_port = int(api_port_env) if api_port_env.isdigit() else 8080
+        api_server = ApiServer(
+            repo=notif_repo,
+            bot=bot,
+            default_channel_id=int(config["channel_id"]),
+            host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
+            port=api_port,
+            api_secret=os.getenv("CLORD_API_SECRET") or None,
+        )
 
     async with bot:
         components = await setup_bridge(
@@ -124,7 +122,7 @@ async def main() -> None:
         if api_server is not None:
             await api_server.start()
             logger.info(
-                "REST API enabled (host=%s port=%d) — discord-reply skill ready",
+                "REST API enabled (host=%s port=%d)",
                 api_server.host,
                 api_server.port,
             )

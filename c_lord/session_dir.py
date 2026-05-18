@@ -148,19 +148,6 @@ class SessionDirManager:
         else:
             logger.info("Session dir already exists: %s", target)
 
-        # Issue #52 Phase 1: (re)inject discord-reply skill so Claude can push
-        # final answers via REST API instead of relying on capture-pane
-        # scraping. Gated by USE_SKILL_REPLY env so old path stays default.
-        # Runs on every call to keep api_url / api_secret in sync.
-        from .skills.injector import inject_skills, skills_enabled
-
-        if skills_enabled():
-            try:
-                inject_skills(target, thread_id=thread_id)
-            except OSError as exc:
-                # Don't fail session creation on a skill write error.
-                logger.warning("Failed to inject skills for thread %d: %s", thread_id, exc)
-
         return target
 
     def find_session_dirs(self) -> list[SessionDirInfo]:

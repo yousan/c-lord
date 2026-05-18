@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -22,14 +21,6 @@ from .tail import tail_events
 logger = logging.getLogger(__name__)
 
 Sink = Callable[[str], Awaitable[None]]
-
-
-def bridge_mode_jsonl() -> bool:
-    """Return True iff ``CLORD_BRIDGE_MODE`` is set to ``jsonl``.
-
-    Defaults to False (the legacy skill-based reply path stays in charge).
-    """
-    return os.getenv("CLORD_BRIDGE_MODE", "skill").strip().lower() == "jsonl"
 
 
 _KIND_PREFIX = {
