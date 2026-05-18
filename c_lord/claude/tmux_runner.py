@@ -120,6 +120,48 @@ _STRIP_PATTERNS = (
 )
 
 
+# OSC 8 hyperlink: ESC ] 8 ; <params> ; <URL> ESC \ <TEXT> ESC ] 8 ; ; ESC \
+# Captured by ``tmux capture-pane -e``. Issue #47: without unpacking these,
+# the URL portion is lost and Discord users only see the visible text.
+_OSC8_RE = re.compile(
+    r"\x1b\]8;[^;]*;(?P<url>[^\x1b\x07]*)(?:\x1b\\|\x07)"
+    r"(?P<text>.*?)"
+    r"\x1b\]8;;(?:\x1b\\|\x07)",
+    re.DOTALL,
+)
+
+# ANSI CSI sequences (colors, cursor control). After OSC 8 rewrite we strip
+# everything else so the existing line-based chrome filters see plain text.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[\d;?]*[A-Za-z]")
+_ANSI_OSC_REMNANT_RE = re.compile(r"\x1b\][^\x1b\x07]*(?:\x1b\\|\x07)?")
+
+
+def _normalize_capture(text: str) -> str:
+    """Rewrite OSC 8 hyperlinks to plain text and strip ANSI escapes.
+
+    OSC 8 ``\\x1b]8;;URL\\x1b\\TEXT\\x1b]8;;\\x1b\\`` becomes:
+      - ``TEXT (URL)`` for http(s) URLs
+      - ``URL`` alone when visible text already equals the URL
+      - ``TEXT`` for file:// (URL is local to bot, useless on Discord)
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        url = match.group("url")
+        visible = _ANSI_CSI_RE.sub("", match.group("text"))
+        if url.startswith("file://"):
+            return visible
+        if visible == url:
+            return url
+        if not url:
+            return visible
+        return f"{visible} ({url})"
+
+    text = _OSC8_RE.sub(_replace, text)
+    text = _ANSI_CSI_RE.sub("", text)
+    text = _ANSI_OSC_REMNANT_RE.sub("", text)
+    return text
+
+
 class TmuxClaudeRunner:
     """Runs Claude Code inside a tmux window and streams output via capture-pane.
 
@@ -417,6 +459,10 @@ class TmuxClaudeRunner:
         - User prompt: ``❯ <user message>``
         - (previous exchanges, banner, shell noise above)
         """
+        # Issue #47: capture-pane is invoked with ``-e`` so terminal hyperlinks
+        # (OSC 8) survive. Rewrite them to plain text + bare URL and strip
+        # remaining ANSI before the line-based chrome filters run.
+        pane_text = _normalize_capture(pane_text)
         lines = pane_text.splitlines()
 
         # Step 1: Strip bottom TUI chrome (status bar, separators, input

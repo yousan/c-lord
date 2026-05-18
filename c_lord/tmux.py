@@ -538,10 +538,16 @@ class TmuxSessionManager:
             return ""
 
         target = f"{self.session_name}:{window}"
+        # -e: preserve escape sequences (ANSI colors, OSC 8 hyperlinks).
+        # tmux_runner._normalize_capture rewrites OSC 8 to bare URLs and
+        # strips remaining color codes before line-based chrome filters run.
+        # Without -e, terminal hyperlinks from Claude TUI lose the URL
+        # portion entirely (issue #47).
         result = _run(
             [
                 "tmux",
                 "capture-pane",
+                "-e",
                 "-p",
                 "-J",
                 "-t",
