@@ -70,6 +70,7 @@ async def _invoke_claude_haiku(first_message: str) -> str | None:
             "-p",
             "--model",
             "haiku",
+            "--",
             prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
