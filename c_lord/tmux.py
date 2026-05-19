@@ -337,6 +337,78 @@ class TmuxSessionManager:
         logger.info("Remapped window %s → thread %d", window_name, thread_id)
         return True
 
+    def get_window_info(self, thread_id: int) -> tuple[str, int] | None:
+        """Return ``(window_id, window_index)`` for the thread, or None.
+
+        ``window_id`` is tmux's internal immutable id (e.g. ``@7``).
+        ``window_index`` is the volatile per-session integer index
+        shown in the tmux status line. Used by the thread-name builder
+        as the trailing ``#N`` hint.
+
+        Returns None if tmux is unavailable or no window is mapped to
+        the thread.
+        """
+        if not self._check_available():
+            return None
+        window_name = self._find_window_for_thread(thread_id)
+        if window_name is None:
+            return None
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{window_name}\t#{window_id}\t#{window_index}",
+            ]
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[0] == window_name:
+                idx_str = parts[2]
+                if idx_str.isdigit():
+                    return parts[1], int(idx_str)
+        return None
+
+    def list_windows_full(self) -> list[dict[str, str]]:
+        """Return one dict per window with name / window_id / window_index / @thread_id.
+
+        Used by the state-sync loop to cross-reference live tmux state
+        with DB rows.  Returns an empty list when tmux is unavailable
+        or the session does not exist.
+        """
+        if not self._check_available():
+            return []
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{window_name}\t#{window_id}\t#{window_index}\t#{@thread_id}",
+            ]
+        )
+        if result.returncode != 0:
+            return []
+        windows: list[dict[str, str]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            windows.append(
+                {
+                    "window_name": parts[0],
+                    "window_id": parts[1],
+                    "window_index": parts[2],
+                    "thread_id": parts[3] if len(parts) > 3 else "",
+                }
+            )
+        return windows
+
     def session_exists(self, thread_id: int) -> bool:
         """Return True if a tmux window exists for the given thread."""
         if not self._check_available():

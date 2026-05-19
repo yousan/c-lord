@@ -108,6 +108,12 @@ class ClaudeChatCog(commands.Cog):
         self._resume_repo = resume_repo or getattr(bot, "resume_repo", None)
         # Settings repo for dynamic model lookup (optional — falls back to runner.model)
         self._settings_repo = settings_repo or getattr(bot, "settings_repo", None)
+        # Issue #95: pending topic writes for sessions whose row hasn't been
+        # saved yet (event_processor saves the row only after Claude emits
+        # its first session_id).  Drained by _apply_thread_naming on the
+        # next call once the row exists.
+        self._pending_topic: dict[int, tuple[str, str]] = {}
+        self._pending_tmux_window_id: dict[int, str] = {}
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
         """Check if a member/user is authorized to use the bot.
@@ -203,6 +209,81 @@ class ClaudeChatCog(commands.Cog):
                 channel_id = int(channel_id_str) if channel_id_str.isdigit() else None
                 self._coordination = CoordinationService(self.bot, channel_id)
         return self._coordination
+
+    async def _apply_thread_naming(
+        self,
+        *,
+        thread: discord.Thread,
+        tmux_manager: TmuxSessionManager,
+        first_message: str,
+    ) -> None:
+        """Apply the Issue #95 naming scheme to ``thread``.
+
+        - Generates and persists ``topic`` on first use (unless the
+          thread is ``auto_topic_locked`` from a previous manual rename).
+        - Persists the tmux ``window_id`` (immutable) on the row.
+        - Renames the Discord thread to
+          ``<status_emoji> <topic>[ #<window_index>]`` capped at 30 chars,
+          but only if the current name differs (minimises API calls).
+
+        All errors are swallowed by the caller; this helper raises only
+        on truly unexpected programmer mistakes.
+        """
+        from ..thread_name import build_name, parse_topic_from_name
+        from ..topic import generate_topic, heuristic_topic
+
+        record = await self.repo.get(thread.id)
+        topic = record.topic if record else None
+        locked = bool(record.auto_topic_locked) if record else False
+        state = (record.state if record else None) or "alive"
+
+        # Drain any topic / window-id pending from a previous call where
+        # the session row did not yet exist.
+        if record is not None:
+            pending = self._pending_topic.pop(thread.id, None)
+            if pending and not record.topic and not locked:
+                await self.repo.set_topic(thread.id, pending[0], source=pending[1])
+                topic = pending[0]
+            pending_win = self._pending_tmux_window_id.pop(thread.id, None)
+            if pending_win and record.tmux_window_id != pending_win:
+                await self.repo.set_tmux_window_id(thread.id, pending_win)
+
+        # Resolve tmux window-id / window-index.
+        info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
+        if info is not None:
+            window_id, window_index = info
+            if record is not None and record.tmux_window_id != window_id:
+                await self.repo.set_tmux_window_id(thread.id, window_id)
+            elif record is None:
+                self._pending_tmux_window_id[thread.id] = window_id
+        else:
+            window_index = None
+
+        # Derive topic if missing and not locked.
+        if not topic and not locked:
+            try:
+                topic, source = await generate_topic(first_message or "")
+            except Exception:
+                logger.warning("topic generation failed", exc_info=True)
+                topic, source = heuristic_topic(first_message or ""), "heuristic"
+            if record is not None:
+                await self.repo.set_topic(thread.id, topic, source=source)
+            else:
+                # Save row doesn't exist yet — stash and persist on next call
+                # (event_processor saves the row after Claude's first event).
+                self._pending_topic[thread.id] = (topic, source)
+
+        if not topic:
+            # Last-resort fallback — should never happen since heuristic
+            # is non-empty, but guards against odd states (e.g. row was
+            # just deleted concurrently).
+            topic = parse_topic_from_name(thread.name) or "新しいスレッド"
+
+        new_name = build_name(topic, state, window_index)
+        if (thread.name or "") == new_name:
+            return
+        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
+            await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -763,19 +844,20 @@ class ClaudeChatCog(commands.Cog):
                 )
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
 
-                # Prefix thread name with tmux window name (e.g. "work3: hi")
-                # Skip if the prefix is already present to avoid duplication
-                # (e.g. "work2: work2: work2: ...").
-                # Use a short timeout to avoid blocking on 429 rate limits
-                # (discord.py silently waits retry_after seconds before raising).
-                current_name = thread.name or ""
-                prefix = f"{window_name}: "
-                if not current_name.startswith(prefix):
-                    with contextlib.suppress(discord.HTTPException, asyncio.TimeoutError):
-                        await asyncio.wait_for(
-                            thread.edit(name=f"{prefix}{current_name}"[:100]),
-                            timeout=5.0,
-                        )
+                # Issue #95: redesigned thread naming.
+                # Apply "<emoji> <topic> #<index>" to the Discord thread.
+                # - Generate the stable topic once (on the first message that
+                #   reaches a session row without a topic), persist it, and
+                #   then keep it immutable unless the user renames manually
+                #   (auto_topic_locked=1).
+                # - The tmux window-index is a *hint* shown at the end of the
+                #   name; the immutable tmux window-id is stored in the DB.
+                with contextlib.suppress(Exception):
+                    await self._apply_thread_naming(
+                        thread=thread,
+                        tmux_manager=tmux_manager,
+                        first_message=prompt,
+                    )
 
             # Create a TmuxClaudeRunner for this thread.
             # TUI mode cannot handle interactive permission prompts,
