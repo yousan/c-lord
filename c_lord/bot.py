@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import TYPE_CHECKING
 
 import discord
@@ -77,6 +78,28 @@ class ClaudeDiscordBot(commands.Bot):
             return
         ctx = await self.get_context(message)
         await self.invoke(ctx)
+
+    async def on_error(self, event_method: str, /, *args: object, **kwargs: object) -> None:
+        """Handle uncaught exceptions in event handlers.
+
+        Issue #91: if the error is ``RuntimeError("Session is closed")``, the
+        aiohttp session died during shutdown and the bot is likely a zombie
+        (process alive, Discord connection dead).  Exit with non-zero code so
+        that a supervisor (systemd, nohup wrapper) can restart the process.
+        """
+        import traceback
+
+        exc_info = sys.exc_info()
+        exc = exc_info[1]
+        if isinstance(exc, RuntimeError) and "Session is closed" in str(exc):
+            logger.error(
+                "on_error[%s]: aiohttp session closed — bot is in zombie state, exiting",
+                event_method,
+                exc_info=True,
+            )
+            sys.exit(1)
+        logger.error("Unhandled exception in %s", event_method, exc_info=True)
+        traceback.print_exc()
 
     async def on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError

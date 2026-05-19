@@ -161,6 +161,38 @@ class TestStopViewDisable:
 
         await view.disable()  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_disable_suppresses_runtime_error_session_closed(self) -> None:
+        """Issue #91: disable() must not raise RuntimeError('Session is closed').
+
+        During bot shutdown the aiohttp session may already be closed when
+        the _run_claude finally block calls disable().  Previously this
+        RuntimeError propagated and turned the bot into a zombie.
+        """
+        runner = _make_runner()
+        view = StopView(runner)
+        msg = _make_message()
+        msg.delete = AsyncMock(side_effect=RuntimeError("Session is closed"))
+
+        await view.disable(msg)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_disable_logs_warning_on_runtime_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """RuntimeError in disable() must produce a WARNING log (not silently swallowed)."""
+        import logging
+
+        runner = _make_runner()
+        view = StopView(runner)
+        msg = _make_message()
+        msg.delete = AsyncMock(side_effect=RuntimeError("Session is closed"))
+
+        with caplog.at_level(logging.WARNING, logger="c_lord.discord_ui.views"):
+            await view.disable(msg)
+
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
 
 def _make_thread() -> MagicMock:
     thread = MagicMock(spec=discord.Thread)

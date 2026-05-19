@@ -833,18 +833,22 @@ class ClaudeChatCog(commands.Cog):
                     )
                 )
             finally:
-                await stop_view.disable()
+                # Issue #91: wrap every Discord call so that RuntimeError("Session is
+                # closed") during bot shutdown doesn't propagate and turn the bot into
+                # a zombie.  The individual helpers already log errors internally.
+                with contextlib.suppress(Exception):
+                    await stop_view.disable()
                 self._active_runners.pop(thread.id, None)
                 self._active_tasks.pop(thread.id, None)
 
-                # Announce session end to coordination channel (no-op if unconfigured)
-                await coordination.post_session_end(thread)
+                with contextlib.suppress(Exception):
+                    await coordination.post_session_end(thread)
 
-                # Transition to WAITING_INPUT so owner knows a reply is needed
                 if dashboard is not None:
-                    await dashboard.set_state(
-                        thread.id,
-                        ThreadState.WAITING_INPUT,
-                        description,
-                        thread=thread,
-                    )
+                    with contextlib.suppress(Exception):
+                        await dashboard.set_state(
+                            thread.id,
+                            ThreadState.WAITING_INPUT,
+                            description,
+                            thread=thread,
+                        )
