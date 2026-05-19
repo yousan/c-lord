@@ -580,7 +580,7 @@ class TestInterruptOnNewMessage:
 class TestZeroConfigCoordination:
     """_get_coordination() must work without any consumer wiring (Zero-Config Principle).
 
-    Consumers (like EbiBot) must get new features by updating the package alone —
+    Consumers must get new features by updating the package alone —
     no code changes, no bot.coordination wiring required.
     """
 

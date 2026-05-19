@@ -50,7 +50,7 @@ This document captures the "why" behind key architectural choices. Each decision
 **Why shared function:**
 - **DRY without coupling**: Both Cogs call `run_claude_in_thread()` but remain independent in how they receive input (message listener vs slash command)
 - **Single place to fix bugs**: Status emoji logic, chunking, error handling — all in one place
-- **Easy to extend**: New Cogs that need Claude execution just call the same function (see EbiBot's docs-sync Cog for an example of a consumer that chose to implement its own streaming logic for different requirements)
+- **Easy to extend**: New Cogs that need Claude execution just call the same function (e.g. a consumer docs-sync Cog can implement its own streaming logic on top of the shared function for different requirements)
 
 ## 4. Emoji Reactions for Status
 
@@ -105,7 +105,7 @@ This document captures the "why" behind key architectural choices. Each decision
 - **Separation of concerns**: The framework handles Discord↔CLI bridging. The consumer handles project-specific config, secrets, and custom Cogs
 - **Upgrade path**: `uv lock --upgrade-package c-lord && uv sync` gets you the latest framework without touching your custom code
 - **No conflict**: Your bot's `pyproject.toml` pins the framework version. Multiple bots can use different versions
-- **Real-world validation**: EbiBot proves this works — it imports `ClaudeChatCog`, `ClaudeRunner`, `SkillCommandCog`, and adds its own Cogs (reminders, watchdog, docs-sync, auto-upgrade)
+- **Real-world validation**: Consumer bots demonstrate this works — they import `ClaudeChatCog`, `ClaudeRunner`, `SkillCommandCog`, and add their own Cogs (reminders, watchdog, docs-sync, auto-upgrade) without touching the framework
 
 ## 7. No Custom AI Logic
 

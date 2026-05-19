@@ -126,7 +126,7 @@ Both Cogs only respond to messages in the configured channel (`channel_id`) and 
 
 ## Webhook Security (Consumer Cog Pattern)
 
-When building custom Cogs that respond to webhooks (like EbiBot's docs-sync), follow this pattern:
+When building custom Cogs that respond to webhooks (for example, a docs-sync trigger), follow this pattern:
 
 ```python
 # Only respond to webhook messages
