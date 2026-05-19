@@ -8,6 +8,7 @@ Controlled by the ``CLORD_RENDER_TABLE_IMAGES`` environment variable.
 
 from __future__ import annotations
 
+import os
 import re
 from io import BytesIO
 
@@ -129,3 +130,20 @@ def render_table_image(table_md: str) -> bytes | None:
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+def get_table_images(content: str) -> list[tuple[str, bytes]]:
+    """Return (filename, png_bytes) pairs for all tables in *content*.
+
+    Returns an empty list when ``CLORD_RENDER_TABLE_IMAGES`` is not enabled
+    or matplotlib is unavailable.  Callers wrap each pair into a
+    ``discord.File(BytesIO(png_bytes), filename=filename)``.
+    """
+    if os.getenv("CLORD_RENDER_TABLE_IMAGES", "").lower() not in ("1", "true", "yes"):
+        return []
+    result = []
+    for i, table_md in enumerate(detect_tables(content), start=1):
+        img_bytes = render_table_image(table_md)
+        if img_bytes:
+            result.append((f"table_{i}.png", img_bytes))
+    return result

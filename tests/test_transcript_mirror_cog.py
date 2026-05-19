@@ -265,3 +265,86 @@ async def test_file_sink_logs_warning_on_http_exception(
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
     combined = " ".join(r.message for r in caplog.records)
     assert "77" in combined, "thread_id missing from log"
+
+
+# ---------------------------------------------------------------------------
+# Table image attachment tests
+# ---------------------------------------------------------------------------
+
+TABLE_CONTENT = """\
+Here is some output:
+
+| Name  | Score |
+|-------|-------|
+| Alice | 100   |
+| Bob   | 85    |
+
+That was the table.
+"""
+
+NO_TABLE_CONTENT = "Just plain text with no table here."
+
+
+async def test_sink_attaches_table_image_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When CLORD_RENDER_TABLE_IMAGES=true, sink sends with files= for table content."""
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(42)
+    await sink(TABLE_CONTENT)
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    assert "files" in call_kwargs or "file" in call_kwargs, "no file attachment"
+    files = call_kwargs.get("files") or [call_kwargs.get("file")]
+    assert len(files) >= 1
+    assert any(getattr(f, "filename", "").startswith("table_") for f in files)
+
+
+async def test_sink_no_attachment_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When CLORD_RENDER_TABLE_IMAGES is not set, sink sends without files."""
+    monkeypatch.delenv("CLORD_RENDER_TABLE_IMAGES", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(42)
+    await sink(TABLE_CONTENT)
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    assert "files" not in call_kwargs
+    assert "file" not in call_kwargs
+
+
+async def test_sink_no_attachment_when_no_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When content has no table, no file attachment even if rendering is enabled."""
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(42)
+    await sink(NO_TABLE_CONTENT)
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    assert "files" not in call_kwargs
+    assert "file" not in call_kwargs

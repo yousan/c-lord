@@ -114,8 +114,18 @@ class TranscriptMirrorCog(commands.Cog):
                     type(channel).__name__,
                 )
                 return
+            from io import BytesIO
+
+            from ..discord_ui.table_renderer import get_table_images
+
+            table_files = [
+                discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
+            ]
+            send_kwargs: dict = {"content": body} if table_files else {}
+            if table_files:
+                send_kwargs["files"] = table_files
             try:
-                await send(body)
+                await send(**send_kwargs) if send_kwargs else await send(body)
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror sink failed: thread=%d body_len=%d status=%s — %s",
