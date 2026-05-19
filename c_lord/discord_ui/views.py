@@ -96,5 +96,10 @@ class StopView(discord.ui.View):
         self.stop()
 
         if target:
-            with contextlib.suppress(discord.HTTPException):
+            try:
                 await target.delete()
+            except discord.HTTPException:
+                pass
+            except RuntimeError as exc:
+                # aiohttp session already closed during bot shutdown (#91)
+                logger.warning("StopView.disable: could not delete message — %s", exc)

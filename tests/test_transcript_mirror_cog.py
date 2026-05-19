@@ -288,7 +288,12 @@ NO_TABLE_CONTENT = "Just plain text with no table here."
 async def test_sink_attaches_table_image_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When CLORD_RENDER_TABLE_IMAGES=true, sink sends with files= for table content."""
+    """When CLORD_RENDER_TABLE_IMAGES=true, sink sends with files= for table content.
+
+    render_table_image is mocked so this test does not require matplotlib.
+    """
+    from unittest.mock import patch
+
     monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
 
     bot = MagicMock()
@@ -298,7 +303,13 @@ async def test_sink_attaches_table_image_when_enabled(
 
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
     sink = cog._make_sink(42)
-    await sink(TABLE_CONTENT)
+
+    # Mock the renderer so the test works without matplotlib installed
+    with patch(
+        "c_lord.discord_ui.table_renderer.render_table_image",
+        return_value=b"\x89PNG\r\n",
+    ):
+        await sink(TABLE_CONTENT)
 
     channel.send.assert_called_once()
     call_kwargs = channel.send.call_args.kwargs

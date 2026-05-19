@@ -81,3 +81,59 @@ class TestOnAppCommandError:
             await bot.on_app_command_error(interaction, error)
 
         assert any("test failure" in record.message for record in caplog.records)
+
+
+class TestOnError:
+    """on_error zombie-detection tests (Issue #91)."""
+
+    @pytest.mark.asyncio
+    async def test_session_closed_exits_process(self) -> None:
+        """RuntimeError('Session is closed') must trigger sys.exit(1)."""
+        import sys
+        from unittest.mock import patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+
+        with patch.object(sys, "exit") as mock_exit:
+            try:
+                raise RuntimeError("Session is closed")
+            except RuntimeError:
+                await bot.on_error("on_message")
+
+        mock_exit.assert_called_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_other_runtime_error_does_not_exit(self) -> None:
+        """Non-zombie RuntimeError must NOT call sys.exit."""
+        import sys
+        from unittest.mock import patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+
+        with patch.object(sys, "exit") as mock_exit:
+            try:
+                raise RuntimeError("something else")
+            except RuntimeError:
+                await bot.on_error("on_message")
+
+        mock_exit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_session_closed_logs_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """RuntimeError('Session is closed') must log at ERROR level."""
+        import sys
+        from unittest.mock import patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+
+        with caplog.at_level(logging.ERROR, logger="c_lord.bot"):
+            with patch.object(sys, "exit"):
+                try:
+                    raise RuntimeError("Session is closed")
+                except RuntimeError:
+                    await bot.on_error("on_message")
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+        assert any("zombie" in r.message.lower() for r in caplog.records)
