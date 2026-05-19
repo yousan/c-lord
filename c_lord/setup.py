@@ -248,6 +248,22 @@ async def setup_bridge(
         await bot.add_cog(scheduler_cog)
         logger.info("Registered SchedulerCog")
 
+    # --- Thread state sync loop (Issue #95) ---
+    # Refreshes the leading status emoji + trailing #window-index hint on each
+    # Discord thread once per minute.  Topic body is never touched.
+    if os.getenv("CLORD_THREAD_STATE_SYNC", "1") not in ("0", "false", "no"):
+        from .thread_state_sync import ThreadStateSyncLoop
+
+        interval_env = os.getenv("CLORD_THREAD_STATE_SYNC_INTERVAL", "60")
+        try:
+            interval = float(interval_env)
+        except ValueError:
+            interval = 60.0
+        sync_loop = ThreadStateSyncLoop(bot, session_repo, interval_seconds=interval)
+        sync_loop.start()
+        bot.thread_state_sync = sync_loop  # type: ignore[attr-defined]
+        logger.info("Started ThreadStateSyncLoop (interval=%.0fs)", interval)
+
     components = BridgeComponents(
         session_repo=session_repo,
         task_repo=task_repo,

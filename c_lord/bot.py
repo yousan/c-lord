@@ -124,6 +124,51 @@ class ClaudeDiscordBot(commands.Bot):
         except Exception:
             logger.exception("Failed to sync slash commands")
 
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread) -> None:
+        """Detect manual renames in the Discord UI (Issue #95).
+
+        When a user changes the thread name themselves, extract the
+        topic body (strip the leading status emoji + trailing ``#N``
+        suffix) and persist it as the new stable topic with
+        ``auto_topic_locked = 1`` so c-lord stops auto-rewriting it.
+        """
+        if before.name == after.name:
+            return
+
+        session_repo = getattr(self, "session_repo", None)
+        if session_repo is None:
+            return
+
+        try:
+            record = await session_repo.get(after.id)
+        except Exception:
+            logger.debug("on_thread_update: lookup failed for %d", after.id, exc_info=True)
+            return
+        if record is None:
+            return  # not a c-lord thread
+
+        from .thread_name import parse_topic_from_name
+
+        body = parse_topic_from_name(after.name)
+        if not body:
+            return
+        # Avoid recursive renames: if our own state-sync loop just changed
+        # only the emoji or the #N suffix, the body will still match the
+        # stored topic — no need to lock or rewrite.
+        if record.topic == body and record.auto_topic_locked:
+            return
+
+        try:
+            await session_repo.set_topic(after.id, body, source="manual")
+            await session_repo.lock_topic(after.id)
+            logger.info("Manual rename detected for thread %d: topic=%r (locked)", after.id, body)
+        except Exception:
+            logger.warning(
+                "on_thread_update: failed to persist manual rename for %d",
+                after.id,
+                exc_info=True,
+            )
+
     async def _cleanup_orphaned_session_dirs(self) -> None:
         """Remove leftover clean session directories from previous bot runs.
 

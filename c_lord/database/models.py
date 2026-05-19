@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     origin TEXT NOT NULL DEFAULT 'discord',
     summary TEXT,
+    topic TEXT,
+    state TEXT DEFAULT 'alive',
+    tmux_window_id TEXT,
+    auto_topic_locked INTEGER NOT NULL DEFAULT 0,
+    topic_source TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -124,6 +129,12 @@ _MIGRATIONS = [
         "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
         "updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
     ),
+    # Issue #95: thread naming redesign — stable topic + volatile state
+    "ALTER TABLE sessions ADD COLUMN topic TEXT",
+    "ALTER TABLE sessions ADD COLUMN state TEXT DEFAULT 'alive'",
+    "ALTER TABLE sessions ADD COLUMN tmux_window_id TEXT",
+    "ALTER TABLE sessions ADD COLUMN auto_topic_locked INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN topic_source TEXT",
 ]
 
 
