@@ -22,6 +22,12 @@ class SessionRecord:
     summary: str | None
     created_at: str
     last_used_at: str
+    # Issue #95: thread naming redesign
+    topic: str | None = None
+    state: str | None = "alive"
+    tmux_window_id: str | None = None
+    auto_topic_locked: int = 0
+    topic_source: str | None = None
 
 
 class SessionRepository:
@@ -98,6 +104,58 @@ class SessionRepository:
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    # ── Issue #95: thread naming redesign helpers ─────────────────────
+
+    async def get_by_thread_id(self, thread_id: int) -> SessionRecord | None:
+        """Alias for ``get``. Provided for naming consistency."""
+        return await self.get(thread_id)
+
+    async def set_topic(self, thread_id: int, topic: str, source: str = "llm") -> None:
+        """Set the stable topic and topic_source for a thread."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET topic = ?, topic_source = ? WHERE thread_id = ?",
+                (topic, source, thread_id),
+            )
+            await db.commit()
+
+    async def set_state(self, thread_id: int, state: str) -> None:
+        """Set the session state (alive/pending/dead)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET state = ? WHERE thread_id = ?",
+                (state, thread_id),
+            )
+            await db.commit()
+
+    async def set_tmux_window_id(self, thread_id: int, window_id: str | None) -> None:
+        """Store the tmux internal window-id (e.g. '@7') for the thread."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET tmux_window_id = ? WHERE thread_id = ?",
+                (window_id, thread_id),
+            )
+            await db.commit()
+
+    async def lock_topic(self, thread_id: int) -> None:
+        """Mark the topic as user-locked (no further auto-rewrite)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
+                (thread_id,),
+            )
+            await db.commit()
+
+    async def list_alive(self) -> list[SessionRecord]:
+        """List sessions whose state is 'alive'."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM sessions WHERE state = 'alive' ORDER BY last_used_at DESC"
+            )
+            rows = await cursor.fetchall()
+            return [SessionRecord(**dict(row)) for row in rows]
 
     async def cleanup_old(self, days: int = 30) -> int:
         """Delete sessions older than N days. Returns count deleted."""
