@@ -17,7 +17,6 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -98,8 +97,14 @@ class TranscriptMirrorCog(commands.Cog):
             channel = bot.get_channel(thread_id)
             if channel is None:
                 # Thread may not be in cache after a restart — try fetching.
-                with contextlib.suppress(discord.HTTPException, discord.NotFound):
+                try:
                     channel = await bot.fetch_channel(thread_id)
+                except (discord.HTTPException, discord.NotFound) as exc:
+                    logger.warning(
+                        "TranscriptMirror sink: fetch_channel %d failed: %s",
+                        thread_id,
+                        exc,
+                    )
             if channel is None:
                 logger.warning(
                     "TranscriptMirror sink: channel %d not found, dropping post",
@@ -119,7 +124,6 @@ class TranscriptMirrorCog(commands.Cog):
                     type(channel).__name__,
                 )
                 return
-            with contextlib.suppress(discord.HTTPException):
-                await send(body)
+            await send(body)
 
         return sink

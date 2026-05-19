@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
@@ -160,3 +162,39 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     assert channel.send.called
     sent_bodies = [c[0][0] for c in channel.send.call_args_list]
     assert any("via cog" in b for b in sent_bodies)
+
+
+async def test_sink_http_exception_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTPException from send() must propagate out of the sink so _run() can log it."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    resp = MagicMock()
+    resp.status = 400
+    resp.reason = "Bad Request"
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock(side_effect=discord.HTTPException(resp, "bad"))
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(7)
+    with pytest.raises(discord.HTTPException):
+        await sink("hello")
+
+
+async def test_sink_fetch_failure_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """fetch_channel failure must be logged, not silently dropped."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    resp = MagicMock()
+    resp.status = 404
+    resp.reason = "Not Found"
+    bot = MagicMock()
+    bot.get_channel.return_value = None
+    bot.fetch_channel = AsyncMock(side_effect=discord.NotFound(resp, "not found"))
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(7)
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        await sink("hello")
+    assert any("fetch_channel" in r.message for r in caplog.records)
