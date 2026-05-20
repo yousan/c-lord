@@ -1,7 +1,4 @@
-"""Tests for the ThreadStatusDashboard — live session status embed.
-
-Issue: https://github.com/ebibibi/c-lord/issues/67
-"""
+"""Tests for the ThreadStatusDashboard — live session status embed."""
 
 from __future__ import annotations
 

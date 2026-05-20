@@ -624,7 +624,7 @@ uv run pytest tests/ -v --cov=c_lord
 
 ## How This Project Was Built
 
-**This codebase is developed by [Claude Code](https://docs.anthropic.com/en/docs/claude-code)**, Anthropic's AI coding agent, under the direction of [@ebibibi](https://github.com/ebibibi). The human author defines requirements, reviews pull requests, and approves all changes — Claude Code does the implementation.
+**This codebase is developed by [Claude Code](https://docs.anthropic.com/en/docs/claude-code)**, Anthropic's AI coding agent. The original foundation, [`claude-code-discord-bridge`](https://github.com/ebibibi/claude-code-discord-bridge), was created by [@ebibibi](https://github.com/ebibibi) (Masahiko Ebisuda) and provided this project with its initial architecture under the MIT License. This derivative is now maintained by [@yousan](https://github.com/yousan), who defines requirements, reviews pull requests, and approves all changes — Claude Code does the implementation.
 
 This means:
 
@@ -637,14 +637,9 @@ The project started on 2026-02-18 and continues to evolve through iterative conv
 
 ---
 
-## Real-World Example
-
-**[EbiBot](https://github.com/ebibibi/discord-bot)** — A personal Discord bot built on this framework. Includes automated documentation sync (English + Japanese), push notifications, Todoist watchdog, scheduled health checks, and GitHub Actions CI/CD. Use it as a reference for building your own bot.
-
----
-
 ## Inspired By
 
+- [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge) by [@ebibibi](https://github.com/ebibibi) — The upstream foundation this project is based on. See [EbiBot](https://github.com/ebibibi/discord-bot) for ebibibi's personal bot built on the same framework (docs sync, push notifications, Todoist watchdog, scheduled health checks, GitHub Actions CI/CD).
 - [OpenClaw](https://github.com/openclaw/openclaw) — Emoji status reactions, message debouncing, fence-aware chunking
 - [claude-code-discord-bot](https://github.com/timoconnellaus/claude-code-discord-bot) — CLI spawn + stream-json approach
 - [claude-code-discord](https://github.com/zebbern/claude-code-discord) — Permission control patterns

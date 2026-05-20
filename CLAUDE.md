@@ -7,7 +7,7 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 ## Framework vs Instance
 
 - **c-lord** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
-- Personal instances (e.g. EbiBot) install this as a package and import the Cog. The instance repo handles server-specific config, additional Cogs, and secrets.
+- Personal instances (e.g. a personal Discord bot) install this as a package and import the Cog. The instance repo handles server-specific config, additional Cogs, and secrets.
 - When adding features: if it's useful to anyone → add here. If it's personal workflow → add in the instance repo.
 
 ### Zero-Config Principle (Critical)

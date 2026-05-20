@@ -25,7 +25,7 @@ def bot() -> MagicMock:
 def config() -> UpgradeConfig:
     return UpgradeConfig(
         package_name="c-lord",
-        trigger_prefix="🔄 ebibot-upgrade",
+        trigger_prefix="🔄 upgrade",
         working_dir="/home/user/bot",
     )
 
@@ -36,7 +36,7 @@ def cog(bot: MagicMock, config: UpgradeConfig) -> AutoUpgradeCog:
 
 
 def _make_message(
-    content: str = "🔄 ebibot-upgrade",
+    content: str = "🔄 upgrade",
     webhook_id: int | None = 12345,
     channel_id: int = 999,
 ) -> MagicMock:
@@ -122,7 +122,7 @@ class TestFiltering:
         cog: AutoUpgradeCog,
     ) -> None:
         """Trigger prefix must be exact match."""
-        msg = _make_message(content="🔄 ebibot-upgrade extra")
+        msg = _make_message(content="🔄 upgrade extra")
         msg.create_thread = AsyncMock()
         await cog.on_message(msg)
         msg.create_thread.assert_not_called()
