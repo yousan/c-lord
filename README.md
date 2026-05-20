@@ -357,19 +357,20 @@ uv lock --upgrade-package c-lord && uv sync
 
 ## GitHub + Claude Code Automation
 
-### Example: Automated Documentation Sync
+### Example: Automated Documentation Sync (implement in your own bot)
 
-On every push to `main`, Claude Code:
-1. Pulls the latest changes and analyzes the diff
-2. Updates English documentation
-3. Translates to Japanese (or any target languages)
-4. Creates a PR with a bilingual summary
-5. Enables auto-merge — merges automatically when CI passes
+> **Note:** This is a pattern you can implement in your own bot — c-lord does not bundle documentation-sync workflows. For a reference implementation, see [EbiBot](https://github.com/ebibibi/discord-bot).
 
-**GitHub Actions:**
+On every push to `main`, your bot can trigger Claude Code to:
+1. Pull the latest changes and analyze the diff
+2. Update English documentation
+3. Translate to Japanese (or any target languages)
+4. Create a PR with a bilingual summary
+5. Enable auto-merge — merges automatically when CI passes
+
+**GitHub Actions (add to your repo):**
 
 ```yaml
-# .github/workflows/docs-sync.yml
 name: Documentation Sync
 on:
   push:
