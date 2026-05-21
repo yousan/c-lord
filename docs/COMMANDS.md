@@ -47,8 +47,11 @@ Skills are predefined prompts stored in `~/.claude/skills/`. The `name` paramete
 | `/clord-init` | Show all channel-to-repo bindings | Any channel |
 | `/clord-init repo:<url>` | Bind this channel to a git repository | Any channel |
 | `/clord-init remove:True` | Remove the binding for this channel | Any channel |
+| `/clord-thread-init` | Show thread-level binding for this thread | Thread only |
+| `/clord-thread-init repo:<url>` | Bind this thread to a git repository (overrides channel binding) | Thread only |
+| `/clord-thread-init remove:True` | Remove the thread-level binding | Thread only |
 
-Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory.
+Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory. A thread-level binding set via `/clord-thread-init` takes precedence over the channel binding.
 
 ### Model Management
 
