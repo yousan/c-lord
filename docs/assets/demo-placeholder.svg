@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" role="img" aria-label="c-lord demo placeholder">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e1f29"/>
+      <stop offset="100%" stop-color="#0d0e14"/>
+    </linearGradient>
+  </defs>
+  <rect width="720" height="360" fill="url(#bg)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" fill="#e3e4ec" text-anchor="middle">
+    <text x="360" y="140" font-size="28" font-weight="700">Demo coming soon</text>
+    <text x="360" y="180" font-size="16" fill="#9ea0b3">Discord  →  parent session  →  parallel child sessions  →  shared lounge</text>
+    <text x="360" y="230" font-size="14" fill="#7c7f95">Tracking: github.com/yousan/c-lord/issues/100</text>
+  </g>
+  <g fill="none" stroke="#4a4d63" stroke-width="1.5">
+    <rect x="40" y="260" width="170" height="60" rx="8"/>
+    <rect x="275" y="260" width="170" height="60" rx="8"/>
+    <rect x="510" y="260" width="170" height="60" rx="8"/>
+    <line x1="210" y1="290" x2="275" y2="290"/>
+    <line x1="445" y1="290" x2="510" y2="290"/>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#c7c9da" text-anchor="middle">
+    <text x="125" y="295">Discord thread</text>
+    <text x="360" y="295">Claude Code sessions</text>
+    <text x="595" y="295">#ai-lounge</text>
+  </g>
+</svg>

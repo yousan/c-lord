@@ -4,9 +4,16 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Use Claude Code on your phone. Multiple threads. All at once. Real development included.**
+**Run multiple Claude Code sessions in parallel from Discord — each in its own git worktree, coordinating through a shared lounge so they never clobber each other.**
 
-Open Claude Code from your smartphone's Discord app, spin up multiple threads, and run parallel development sessions — all without touching a keyboard. Each Discord thread becomes a fully isolated Claude Code session. Work on a feature in one thread, review a PR in another, and run a background task in a third — simultaneously. The bridge handles all the coordination so sessions never clobber each other.
+<!-- TODO(#100): replace this placeholder with a ~30s demo GIF showing parent → parallel child sessions → shared lounge → consolidated reply. -->
+<p align="center">
+  <a href="https://github.com/yousan/c-lord/issues/100">
+    <img src="docs/assets/demo-placeholder.svg" alt="c-lord demo (coming soon)" width="720">
+  </a>
+</p>
+
+Each Discord thread becomes a fully isolated Claude Code session. Work on a feature in one thread, review a PR in another, and run a background task in a third — simultaneously, from your phone, tablet, or desktop. The bridge handles all the coordination so sessions never clobber each other.
 
 **[日本語](docs/ja/README.md)** | **[简体中文](docs/zh-CN/README.md)** | **[한국어](docs/ko/README.md)** | **[Español](docs/es/README.md)** | **[Português](docs/pt-BR/README.md)** | **[Français](docs/fr/README.md)**
 
