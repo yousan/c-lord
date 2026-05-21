@@ -882,8 +882,14 @@ class ClaudeChatCog(commands.Cog):
             # without going through the discord-reply skill.  No-op otherwise.
             transcript_cog = getattr(self.bot, "transcript_mirror_cog", None)
             if transcript_cog is not None and working_dir:
-                with contextlib.suppress(Exception):
+                try:
                     transcript_cog.start_for(thread.id, working_dir)
+                except Exception:
+                    logger.warning(
+                        "Failed to start TranscriptMirror for thread=%d",
+                        thread.id,
+                        exc_info=True,
+                    )
 
             stop_view = StopView(runner)
             if window_name:
