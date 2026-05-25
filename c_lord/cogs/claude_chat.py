@@ -473,13 +473,24 @@ class ClaudeChatCog(commands.Cog):
             )
             return
 
+        thread_id = interaction.channel.id
+
         # Kill active runner if any
-        runner = self._active_runners.get(interaction.channel.id)
+        runner = self._active_runners.get(thread_id)
         if runner:
             await runner.kill()
-            del self._active_runners[interaction.channel.id]
+            del self._active_runners[thread_id]
 
-        reset = await self.repo.reset(interaction.channel.id)
+        # Kill the tmux window unconditionally — even for idle sessions where the
+        # runner has already been removed from _active_runners (issue #123).
+        # This ensures `is_claude_running` returns False next time, preventing
+        # old context from being resumed via send_input.
+        parent_id = getattr(interaction.channel, "parent_id", None) or thread_id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        if tmux_manager is not None:
+            await asyncio.to_thread(tmux_manager.kill_session, thread_id)
+
+        reset = await self.repo.reset(thread_id)
         if reset:
             await interaction.response.send_message(
                 "\U0001f504 Session cleared. Next message will start a fresh session."
