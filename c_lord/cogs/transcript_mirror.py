@@ -157,8 +157,16 @@ class TranscriptMirrorCog(commands.Cog):
             send = getattr(channel, "send", None)
             if send is None:
                 return
+            from io import BytesIO
+
+            from ..discord_ui.table_renderer import get_table_images
+
+            table_files = [
+                discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
+            ]
+            files = [discord.File(file_path, filename="progress.txt")] + table_files
             try:
-                await send(body, file=discord.File(file_path, filename="progress.txt"))
+                await send(content=body, files=files)
                 return
             except discord.HTTPException as exc:
                 logger.warning(

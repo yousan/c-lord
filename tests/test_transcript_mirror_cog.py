@@ -173,7 +173,6 @@ async def test_sink_logs_warning_on_http_exception(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """HTTPException in sink must produce a WARNING log, not be silently swallowed."""
-    import logging
 
     bot = MagicMock()
     channel = MagicMock()
@@ -194,7 +193,6 @@ async def test_sink_log_includes_body_length(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Log message should include body length so we can triage truncation issues."""
-    import logging
 
     bot = MagicMock()
     channel = MagicMock()
@@ -222,7 +220,7 @@ async def test_file_sink_falls_back_to_plain_on_http_exception(
     async def send_side_effect(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if "file" in kwargs:
+        if "files" in kwargs or "file" in kwargs:
             raise discord.HTTPException(MagicMock(status=413), "Too large")
         # Plain text succeeds
 
@@ -236,18 +234,17 @@ async def test_file_sink_falls_back_to_plain_on_http_exception(
     file_sink = cog._make_file_sink(10)
     await file_sink("final answer", str(progress_file))
 
-    # send called twice: once with file (failed), once without (fallback)
+    # send called twice: once with files (failed), once without (fallback)
     assert call_count == 2
     # Last call was plain text (no file kwarg)
     last_kwargs = channel.send.call_args_list[-1][1]
-    assert "file" not in last_kwargs
+    assert "files" not in last_kwargs and "file" not in last_kwargs
 
 
 async def test_file_sink_logs_warning_on_http_exception(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """HTTPException in file_sink must produce a WARNING log."""
-    import logging
 
     bot = MagicMock()
     channel = MagicMock()
@@ -360,3 +357,67 @@ async def test_sink_no_attachment_when_no_table(
     call_kwargs = channel.send.call_args.kwargs
     assert "files" not in call_kwargs
     assert "file" not in call_kwargs
+
+
+# ---------------------------------------------------------------------------
+# file_sink table image attachment tests
+# ---------------------------------------------------------------------------
+
+
+async def test_file_sink_attaches_table_image_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """file_sink sends table image alongside progress.txt when rendering is enabled."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(42)
+
+    with patch(
+        "c_lord.discord_ui.table_renderer.render_table_image",
+        return_value=b"\x89PNG\r\n",
+    ):
+        await file_sink(TABLE_CONTENT, str(progress_file))
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    files = call_kwargs.get("files", [])
+    filenames = [getattr(f, "filename", "") for f in files]
+    assert any(n.startswith("table_") for n in filenames), f"no table image in {filenames}"
+    assert any(n == "progress.txt" for n in filenames), f"no progress.txt in {filenames}"
+
+
+async def test_file_sink_no_table_image_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """file_sink sends only progress.txt when table rendering is disabled."""
+    monkeypatch.delenv("CLORD_RENDER_TABLE_IMAGES", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(42)
+    await file_sink(TABLE_CONTENT, str(progress_file))
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args
+    # Only progress.txt, no table image
+    files = call_kwargs.kwargs.get("files", [])
+    filenames = [getattr(f, "filename", "") for f in files]
+    assert not any(n.startswith("table_") for n in filenames)

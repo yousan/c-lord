@@ -75,16 +75,39 @@ def render_table_image(table_md: str) -> bytes | None:
     except ImportError:
         return None
 
-    # Try to use a Japanese-capable font if available
-    jp_fonts = ["Noto Sans CJK JP", "IPAexGothic", "Hiragino Sans", "Yu Gothic"]
-    font_prop = None
-    for fname in jp_fonts:
-        candidates = [
-            f for f in font_manager.fontManager.ttflist if fname.lower() in f.name.lower()
-        ]
-        if candidates:
-            font_prop = candidates[0].name
+    # Try to use a Japanese-capable font if available.
+    # Check well-known file paths first (faster than scanning the full ttflist),
+    # then fall back to name-based lookup.
+    import os
+
+    jp_font_paths = [
+        os.path.expanduser("~/.local/share/fonts/NotoSansJP.ttf"),
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    ]
+    jp_font_names = [
+        "Noto Sans JP",
+        "Noto Sans CJK JP",
+        "IPAexGothic",
+        "Hiragino Sans",
+        "Yu Gothic",
+    ]
+
+    # font_prop_obj is a FontProperties instance used to set per-cell fonts.
+    font_prop_obj = None
+    for path in jp_font_paths:
+        if os.path.exists(path):
+            font_manager.fontManager.addfont(path)
+            font_prop_obj = font_manager.FontProperties(fname=path)
             break
+    if font_prop_obj is None:
+        for fname in jp_font_names:
+            candidates = [
+                f for f in font_manager.fontManager.ttflist if fname.lower() in f.name.lower()
+            ]
+            if candidates:
+                font_prop_obj = font_manager.FontProperties(family=candidates[0].name)
+                break
 
     n_cols = len(headers)
     n_rows = len(rows)
@@ -108,9 +131,9 @@ def render_table_image(table_md: str) -> bytes | None:
     tbl.set_fontsize(11)
     tbl.auto_set_column_width(range(n_cols))
 
-    if font_prop:
+    if font_prop_obj:
         for cell in tbl.get_celld().values():
-            cell.get_text().set_fontfamily(font_prop)
+            cell.get_text().set_font_properties(font_prop_obj)
 
     # Style header row
     for col in range(n_cols):

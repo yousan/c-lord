@@ -344,6 +344,41 @@ uv lock --upgrade-package c-lord && uv sync
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
+| `CLORD_BRIDGE_MODE` | Set to `jsonl` to enable TranscriptMirror (tails Claude Code JSONL transcripts and forwards events to Discord threads) | (optional) |
+| `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
+
+### Table Image Rendering (CLORD_RENDER_TABLE_IMAGES)
+
+When enabled, Markdown pipe tables in Claude's responses are rendered as PNG images using [matplotlib](https://matplotlib.org/) and attached to the Discord message alongside the text.
+
+**Installation:**
+
+```bash
+uv add "c-lord[table]"
+# or: pip install "c-lord[table]"
+```
+
+**Non-Latin / CJK font support:**
+
+By default matplotlib uses DejaVu Sans, which does not include Japanese, Chinese, Korean, or other non-Latin glyphs — they will render as blank boxes. c-lord automatically looks for the following fonts at startup and uses the first one found:
+
+| Font file path | Notes |
+|---|---|
+| `~/.local/share/fonts/NotoSansJP.ttf` | Recommended for Japanese |
+| `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | Covers JP / ZH / KO |
+| `/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc` | Alternative system path |
+
+If none of these paths exist, c-lord falls back to a name-based search for Noto Sans JP, Noto Sans CJK JP, IPAexGothic, Hiragino Sans, or Yu Gothic.
+
+**Quick install for Japanese (Linux):**
+```bash
+mkdir -p ~/.local/share/fonts
+curl -Lo ~/.local/share/fonts/NotoSansJP.ttf \
+  https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJK-Regular.ttc
+fc-cache -fv
+```
+
+> **Note for other CJK languages (Chinese, Korean, Arabic, Thai, etc.):** The same DejaVu Sans limitation applies. To render those languages correctly, install a font that covers the target script (e.g. Noto Sans SC for Simplified Chinese, Noto Sans KR for Korean) and add its path to the `jp_font_paths` list in `c_lord/discord_ui/table_renderer.py`, or set `matplotlib.rcParams['font.sans-serif']` in your instance configuration. Contributions adding multi-language font detection are welcome.
 
 ---
 
