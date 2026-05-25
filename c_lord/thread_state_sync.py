@@ -1,13 +1,16 @@
-"""Periodic state-sync loop for Discord thread names (Issue #95).
+"""Periodic state-sync loop for Discord thread names (Issue #95, #120).
 
 Every ``poll_interval`` seconds:
 
 1. Snapshot the live tmux state with ``tmux list-windows -a`` —
    gives us each window's ``window_id`` (immutable), ``window_index``
-   (volatile hint), and the ``@thread_id`` window option.
+   (volatile hint), ``window_name``, ``session_name``, and the
+   ``@thread_id`` window option.
 2. For each session row in the DB, compute the new ``state``:
-   * ``alive``  → a tmux window still exists for this thread
-   * ``dead``   → no tmux window exists
+   * ``running``  → tmux window exists and Claude is actively executing
+   * ``waiting``  → tmux window exists and the ❯ input prompt is visible
+   * ``error``    → tmux window exists and error indicators found in pane
+   * ``dead``     → no tmux window exists
    * ``pending`` is reserved for explicit external setters and is
      never produced by this loop.
 3. If the state changed (or the volatile window-index moved, or the
@@ -17,7 +20,7 @@ Every ``poll_interval`` seconds:
 
 The loop deliberately never touches the ``topic`` body — that is
 the user-visible stable identity. Only the leading status emoji and
-the trailing ``#N`` window-index hint are kept fresh.
+the trailing ``W<N> │`` window-index hint are kept fresh.
 """
 
 from __future__ import annotations
@@ -39,10 +42,80 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Format: <session_name>|<window_id>|<window_index>|<@thread_id>
-_LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_id}"
+# Format: <session_name>|<window_id>|<window_index>|<@thread_id>|<window_name>
+_LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_id}|#{window_name}"
 
 _DEFAULT_INTERVAL_SECONDS = 60.0
+
+# How many bottom lines of the pane to check for prompt/error indicators.
+_PANE_PROBE_LINES = 6
+
+# Characters that indicate Claude Code's input prompt (waiting for user).
+_WAITING_PROMPTS = frozenset({"❯", ">"})
+
+# Substrings that indicate an error state (checked in the bottom pane lines).
+_ERROR_INDICATORS = (
+    "APIError",
+    "Error:",
+    "error:",
+    "Fatal error",
+    "Traceback (most recent",
+)
+
+# Number of pane lines to capture for state detection (kept small for speed).
+_PANE_CAPTURE_LINES = 20
+
+
+def _pane_lamp_state(pane_text: str) -> str:
+    """Determine lamp state from captured pane content.
+
+    Returns one of ``'running'``, ``'waiting'``, or ``'error'``.
+    Error takes highest priority; waiting is detected from the bare
+    ``❯``/``>`` prompt; otherwise the state is ``'running'``.
+    """
+    if not pane_text:
+        return "running"
+    lines = pane_text.rstrip().splitlines()
+    tail = lines[-_PANE_PROBE_LINES:]
+
+    for line in tail:
+        for indicator in _ERROR_INDICATORS:
+            if indicator in line:
+                return "error"
+
+    for line in tail:
+        if line.strip() in _WAITING_PROMPTS:
+            return "waiting"
+
+    return "running"
+
+
+def _capture_pane_text(
+    session_name: str, window_name: str, lines: int = _PANE_CAPTURE_LINES
+) -> str:
+    """Run ``tmux capture-pane`` for the given session:window and return raw text."""
+    if not session_name or not window_name:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                f"{session_name}:{window_name}",
+                "-S",
+                f"-{lines}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout
 
 
 def _list_all_windows() -> list[dict[str, str]]:
@@ -72,6 +145,7 @@ def _list_all_windows() -> list[dict[str, str]]:
                 "window_id": parts[1],
                 "window_index": parts[2],
                 "thread_id": parts[3] if len(parts) > 3 else "",
+                "window_name": parts[4] if len(parts) > 4 else "",
             }
         )
     return out
@@ -151,10 +225,15 @@ class ThreadStateSyncLoop:
         window_info = by_tid.get(thread_id)
 
         if window_info is not None:
-            new_state = "alive"
             window_id = window_info["window_id"] or None
             idx_str = window_info.get("window_index") or ""
             window_index: int | None = int(idx_str) if idx_str.isdigit() else None
+
+            # Detect fine-grained lamp state from pane content (#120).
+            session_name = window_info.get("session_name", "")
+            window_name = window_info.get("window_name", "")
+            pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
+            new_state = _pane_lamp_state(pane_text)
         else:
             new_state = "dead"
             window_id = record.tmux_window_id

@@ -10,6 +10,25 @@ def test_build_name_alive_with_index():
     assert build_name("c-lord命名検討", "alive", 5) == "🟢 W5 │ c-lord命名検討"
 
 
+def test_build_name_running_with_index():
+    # "running" maps to 🟢 same as "alive"
+    assert build_name("c-lord命名検討", "running", 5) == "🟢 W5 │ c-lord命名検討"
+
+
+def test_build_name_waiting_with_index():
+    out = build_name("topic", "waiting", 3)
+    assert out.startswith(STATUS_EMOJI["waiting"])  # 🟡
+    assert "W3 │" in out
+    assert "topic" in out
+
+
+def test_build_name_error_with_index():
+    out = build_name("topic", "error", 2)
+    assert out.startswith(STATUS_EMOJI["error"])  # 🔴
+    assert "W2 │" in out
+    assert "topic" in out
+
+
 def test_build_name_pending_with_index():
     out = build_name("topic", "pending", 3)
     assert out.startswith(STATUS_EMOJI["pending"])
@@ -31,6 +50,11 @@ def test_build_name_no_index():
     assert out == "🟢 topic"
 
 
+def test_build_name_running_no_index():
+    out = build_name("topic", "running", None)
+    assert out == "🟢 topic"
+
+
 def test_build_name_truncates_long_topic():
     long = "あ" * 100
     out = build_name(long, "alive", 12)
@@ -44,10 +68,12 @@ def test_build_name_unknown_state_falls_back_to_alive_emoji():
 
 
 def test_parse_strips_leading_emoji_and_work_prefix():
-    # New format
+    # New format — includes new emojis
     assert parse_topic_from_name("🟢 W5 │ c-lord命名検討") == "c-lord命名検討"
     assert parse_topic_from_name("⚪ 絵本") == "絵本"
     assert parse_topic_from_name("🟠 W12 │ t") == "t"
+    assert parse_topic_from_name("🟡 W3 │ 入力待ちtopic") == "入力待ちtopic"
+    assert parse_topic_from_name("🔴 W1 │ エラーtopic") == "エラーtopic"
 
 
 def test_parse_handles_old_trailing_index_format():
@@ -71,6 +97,12 @@ def test_parse_returns_empty_for_emoji_only():
 def test_build_then_parse_roundtrip():
     topic = "やること整理"
     name = build_name(topic, "alive", 3)
+    assert parse_topic_from_name(name) == topic
+
+
+def test_build_then_parse_roundtrip_waiting():
+    topic = "入力待ちwork"
+    name = build_name(topic, "waiting", 2)
     assert parse_topic_from_name(name) == topic
 
 
