@@ -217,6 +217,32 @@ class TmuxSessionManager:
 
         self._next_work_id = max_id + 1
 
+    def _find_window_by_working_dir(self, working_dir: str) -> str | None:
+        """Return the first window name whose pane_current_path matches working_dir.
+
+        Pre-creation guard for create_session — prevents twin windows for the
+        same session directory when @thread_id options are cleared on tmux
+        restart. (Issue #111.)
+        """
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{window_name}\t#{pane_current_path}",
+            ]
+        )
+        if result.returncode != 0:
+            return None
+        target = working_dir.rstrip("/")
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[1].rstrip("/") == target:
+                return parts[0]
+        return None
+
     # ── Public API ────────────────────────────────────────────────────
 
     def create_session(self, thread_id: int, working_dir: str) -> str:
@@ -236,6 +262,32 @@ class TmuxSessionManager:
 
         if not self._ensure_session():
             return f"{WINDOW_PREFIX}0"
+
+        # Guard: if any window is already sitting in working_dir, adopt it
+        # instead of creating a duplicate. This covers the post-tmux-restart
+        # case where @thread_id options were cleared but the pane hasn't moved.
+        # (Issue #111.)
+        adopted = self._find_window_by_working_dir(working_dir)
+        if adopted is not None:
+            _run(
+                [
+                    "tmux",
+                    "set-option",
+                    "-w",
+                    "-t",
+                    f"{self.session_name}:{adopted}",
+                    "@thread_id",
+                    str(thread_id),
+                ]
+            )
+            self._thread_to_window[thread_id] = adopted
+            logger.info(
+                "Adopted window %s for thread %d by dir match: %s",
+                adopted,
+                thread_id,
+                working_dir,
+            )
+            return adopted
 
         window_name = self._next_window_name()
 

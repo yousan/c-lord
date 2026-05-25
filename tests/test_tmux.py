@@ -23,6 +23,8 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
+                # _find_window_by_working_dir → list-windows (no windows yet)
+                MagicMock(returncode=1, stdout=""),
                 # new-window
                 MagicMock(returncode=0),
                 # set-option @thread_id
@@ -34,7 +36,7 @@ class TestTmuxSessionManager:
         assert mgr._thread_to_window[12345] == "work1"
 
         # Verify new-window was called correctly
-        new_window_call = mock_run.call_args_list[3]
+        new_window_call = mock_run.call_args_list[4]
         args = new_window_call[0][0]
         assert "new-window" in args
         assert SESSION_NAME in args
@@ -42,7 +44,7 @@ class TestTmuxSessionManager:
         assert "/work/dir" in args
 
         # Verify set-option was called to store thread_id
-        set_opt_call = mock_run.call_args_list[4]
+        set_opt_call = mock_run.call_args_list[5]
         args = set_opt_call[0][0]
         assert "set-option" in args
         assert "@thread_id" in args
@@ -84,6 +86,7 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
+                MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
             ]
@@ -95,6 +98,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout="work1\n"),  # list-windows
                 MagicMock(returncode=0, stdout="111\n"),  # show-option work1
                 MagicMock(returncode=0),  # has-session (exists)
+                MagicMock(returncode=0, stdout="work1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
             ]
@@ -849,3 +853,48 @@ class TestTmuxSessionManager:
 
         assert result is False
         assert 77777 not in mgr._thread_to_window
+
+    # ── Issue #111: duplicate window prevention after tmux restart ───
+
+    def test_create_session_adopts_window_by_dir_on_restart(self) -> None:
+        """After tmux restart, create_session must adopt existing window by dir match.
+
+        Regression for #111: when @thread_id is cleared (tmux restart) and the
+        pane is still in the original working_dir, create_session must re-use
+        the existing window rather than creating a duplicate (2:1 twin window).
+        """
+        mgr = TmuxSessionManager()
+        mgr._available = True
+        # Path with no 10+-digit suffix so _rebuild_mapping path-regex won't recover it.
+        WORKING_DIR = "/tmp/c-lord-test/mydir"
+        THREAD_ID = 12345
+
+        recorded_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], *_args: object, **_kwargs: object) -> MagicMock:
+            recorded_calls.append(list(argv))
+            cmd = argv[1] if len(argv) > 1 else ""
+            if cmd == "list-windows":
+                # work1 exists; pane is still at WORKING_DIR (post-restart, pane not moved)
+                return MagicMock(returncode=0, stdout=f"work1\t{WORKING_DIR}\n")
+            if cmd == "show-option":
+                # @thread_id was cleared by tmux restart
+                return MagicMock(returncode=1, stdout="")
+            if cmd == "has-session":
+                return MagicMock(returncode=0, stdout="")
+            # new-window and set-option both succeed
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            name = mgr.create_session(THREAD_ID, WORKING_DIR)
+
+        # Must adopt work1 — NOT create a new work2
+        assert name == "work1"
+        assert mgr._thread_to_window[THREAD_ID] == "work1"
+        new_window_calls = [c for c in recorded_calls if "new-window" in c]
+        assert new_window_calls == [], f"new-window was unexpectedly called: {new_window_calls}"
+        # @thread_id must be re-attached to work1
+        set_option_calls = [c for c in recorded_calls if "set-option" in c and "@thread_id" in c]
+        assert any(str(THREAD_ID) in c for c in set_option_calls), (
+            "@thread_id was not set on the adopted window"
+        )
