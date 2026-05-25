@@ -28,6 +28,8 @@ class SessionRecord:
     tmux_window_id: str | None = None
     auto_topic_locked: int = 0
     topic_source: str | None = None
+    # Issue #115: trigger message for reply threading
+    trigger_message_id: int | None = None
 
 
 class SessionRepository:
@@ -160,6 +162,19 @@ class SessionRepository:
             await db.execute(
                 "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
                 (thread_id,),
+            )
+            await db.commit()
+
+    async def update_trigger_message(self, thread_id: int, message_id: int) -> None:
+        """Persist the Discord message ID that triggered the current Claude turn.
+
+        Used by ApiServer to thread the /api/reply response back to the
+        user's message (Issue #115).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
+                (message_id, thread_id),
             )
             await db.commit()
 

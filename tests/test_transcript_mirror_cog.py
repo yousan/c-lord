@@ -96,7 +96,7 @@ async def test_sink_truncates_long_messages(
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
     sink = cog._make_sink(7)
     await sink("a" * 3000)
-    sent = channel.send.call_args[0][0]
+    sent = channel.send.call_args.kwargs.get("content") or channel.send.call_args[0][0]
     assert len(sent) <= 2000
     assert sent.endswith("…")
 
@@ -114,7 +114,8 @@ async def test_sink_falls_back_to_fetch_channel(
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
     sink = cog._make_sink(7)
     await sink("hello")
-    fetched.send.assert_called_once_with("hello")
+    fetched.send.assert_called_once()
+    assert fetched.send.call_args.kwargs.get("content") == "hello"
 
 
 async def test_end_to_end_jsonl_event_posts_to_discord(
@@ -160,7 +161,10 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
         await cog.cog_unload()
 
     assert channel.send.called
-    sent_bodies = [c[0][0] for c in channel.send.call_args_list]
+    sent_bodies = [
+        c.kwargs.get("content") or (c.args[0] if c.args else "")
+        for c in channel.send.call_args_list
+    ]
     assert any("via cog" in b for b in sent_bodies)
 
 
@@ -283,16 +287,18 @@ That was the table.
 NO_TABLE_CONTENT = "Just plain text with no table here."
 
 
-async def test_sink_attaches_table_image_when_enabled(
+async def test_reply_sink_attaches_table_image_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When CLORD_RENDER_TABLE_IMAGES=true, sink sends with files= for table content.
+    """When CLORD_RENDER_TABLE_IMAGES=true, reply_sink sends with files= for table content.
 
     render_table_image is mocked so this test does not require matplotlib.
+    reply_sink is used for final assistant_text responses.
     """
     from unittest.mock import patch
 
     monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
 
     bot = MagicMock()
     channel = MagicMock()
@@ -300,14 +306,14 @@ async def test_sink_attaches_table_image_when_enabled(
     bot.get_channel.return_value = channel
 
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
-    sink = cog._make_sink(42)
+    reply_sink = cog._make_reply_sink(42)
 
     # Mock the renderer so the test works without matplotlib installed
     with patch(
         "c_lord.discord_ui.table_renderer.render_table_image",
         return_value=b"\x89PNG\r\n",
     ):
-        await sink(TABLE_CONTENT)
+        await reply_sink(TABLE_CONTENT)
 
     channel.send.assert_called_once()
     call_kwargs = channel.send.call_args.kwargs
@@ -421,3 +427,134 @@ async def test_file_sink_no_table_image_when_disabled(
     files = call_kwargs.kwargs.get("files", [])
     filenames = [getattr(f, "filename", "") for f in files]
     assert not any(n.startswith("table_") for n in filenames)
+
+
+# ---------------------------------------------------------------------------
+# Issue #115: silent posts + reply threading
+# ---------------------------------------------------------------------------
+
+
+async def test_sink_sends_silent_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Intermediate (non-final) sends should be silent by default."""
+    monkeypatch.delenv("CLORD_SILENT_POSTS", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(1)
+    await sink("hello")
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert call_kwargs.get("silent") is True
+
+
+async def test_sink_not_silent_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When CLORD_SILENT_POSTS=0, sink sends without silent flag."""
+    monkeypatch.setenv("CLORD_SILENT_POSTS", "0")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(1)
+    await sink("hello")
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert call_kwargs.get("silent") is not True
+
+
+async def test_reply_sink_uses_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """reply_sink uses reference to trigger message and mention_author=False."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog.set_trigger_message(42, 9999)
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert call_kwargs.get("mention_author") is False
+    ref = call_kwargs.get("reference")
+    assert ref is not None
+    assert ref.message_id == 9999
+
+
+async def test_reply_sink_no_reference_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When CLORD_REPLY_TO_TRIGGER=0, reply_sink sends without reference."""
+    monkeypatch.setenv("CLORD_REPLY_TO_TRIGGER", "0")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog.set_trigger_message(42, 9999)
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert "reference" not in call_kwargs
+
+
+async def test_reply_sink_no_reference_when_no_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """reply_sink works without reference if trigger message is unknown."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    # No set_trigger_message call
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    assert "reference" not in call_kwargs
+
+
+async def test_set_trigger_message_stores_per_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_trigger_message stores independently per thread."""
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog.set_trigger_message(1, 111)
+    cog.set_trigger_message(2, 222)
+    assert cog._trigger_messages[1] == 111
+    assert cog._trigger_messages[2] == 222
+
+
+async def test_file_sink_uses_reference(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """file_sink (final answer with progress.txt) uses reference to trigger message."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog.set_trigger_message(5, 8888)
+    file_sink = cog._make_file_sink(5)
+    await file_sink("final answer", str(progress_file))
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert call_kwargs.get("mention_author") is False
+    ref = call_kwargs.get("reference")
+    assert ref is not None
+    assert ref.message_id == 8888

@@ -135,6 +135,8 @@ _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN tmux_window_id TEXT",
     "ALTER TABLE sessions ADD COLUMN auto_topic_locked INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN topic_source TEXT",
+    # Issue #115: silent posts + reply threading
+    "ALTER TABLE sessions ADD COLUMN trigger_message_id INTEGER",
 ]
 
 
