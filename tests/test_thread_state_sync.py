@@ -36,9 +36,27 @@ class _Rec:
 
 def test_index_by_thread_id_keeps_only_digit_tids():
     windows = [
-        {"session_name": "s", "window_id": "@1", "window_index": "0", "thread_id": "12345", "window_name": "work1"},
-        {"session_name": "s", "window_id": "@2", "window_index": "1", "thread_id": "", "window_name": "work2"},
-        {"session_name": "s", "window_id": "@3", "window_index": "2", "thread_id": "abc", "window_name": "work3"},
+        {
+            "session_name": "s",
+            "window_id": "@1",
+            "window_index": "0",
+            "thread_id": "12345",
+            "window_name": "work1",
+        },
+        {
+            "session_name": "s",
+            "window_id": "@2",
+            "window_index": "1",
+            "thread_id": "",
+            "window_name": "work2",
+        },
+        {
+            "session_name": "s",
+            "window_id": "@3",
+            "window_index": "2",
+            "thread_id": "abc",
+            "window_name": "work3",
+        },
     ]
     out = _index_by_thread_id(windows)
     assert list(out.keys()) == [12345]
@@ -68,6 +86,7 @@ def test_list_all_windows_parses_pipe_format():
 
 # ── _pane_lamp_state tests ────────────────────────────────────────────────────
 
+
 def test_pane_lamp_state_waiting_when_bare_prompt():
     pane = "Some content\n❯\n"
     assert _pane_lamp_state(pane) == "waiting"
@@ -78,9 +97,22 @@ def test_pane_lamp_state_waiting_gt_prompt():
     assert _pane_lamp_state(pane) == "waiting"
 
 
-def test_pane_lamp_state_running_when_no_prompt():
-    pane = "✻ Running bash...\n● Some response text\n"
+def test_pane_lamp_state_running_when_esc_to_interrupt():
+    # Positive signal: "esc to interrupt" line present → running
+    pane = "✻ Running bash...\nesc to interrupt\n"
     assert _pane_lamp_state(pane) == "running"
+
+
+def test_pane_lamp_state_waiting_without_running_signal():
+    # No "esc to interrupt" → default waiting even with tool output
+    pane = "✻ Running bash...\n● Some response text\n"
+    assert _pane_lamp_state(pane) == "waiting"
+
+
+def test_pane_lamp_state_waiting_with_nbsp_draft_text():
+    # Real Claude Code pane: ❯\xa0draft text — NBSP not stripped by .strip()
+    pane = "Some content\n❯\xa0PR #122 マージして\n"
+    assert _pane_lamp_state(pane) == "waiting"
 
 
 def test_pane_lamp_state_error_when_api_error():
@@ -93,8 +125,8 @@ def test_pane_lamp_state_error_colon_pattern():
     assert _pane_lamp_state(pane) == "error"
 
 
-def test_pane_lamp_state_empty_returns_running():
-    assert _pane_lamp_state("") == "running"
+def test_pane_lamp_state_empty_returns_waiting():
+    assert _pane_lamp_state("") == "waiting"
 
 
 def test_pane_lamp_state_error_takes_priority_over_waiting():
@@ -104,6 +136,7 @@ def test_pane_lamp_state_error_takes_priority_over_waiting():
 
 
 # ── _sync_one tests ───────────────────────────────────────────────────────────
+
 
 async def test_sync_one_marks_dead_and_renames():
     repo = MagicMock()
@@ -121,7 +154,7 @@ async def test_sync_one_marks_dead_and_renames():
     repo.set_state.assert_awaited_once_with(111, "dead")
 
 
-async def test_sync_one_running_when_no_prompt_in_pane():
+async def test_sync_one_running_when_esc_to_interrupt_in_pane():
     repo = MagicMock()
     repo.set_state = AsyncMock()
     repo.set_tmux_window_id = AsyncMock()
@@ -137,11 +170,24 @@ async def test_sync_one_running_when_no_prompt_in_pane():
         bot.get_channel.return_value = fake_thread
         loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
         rec = _Rec(thread_id=222, state="dead", topic="やること", tmux_window_id=None)
-        by_tid = {222: {"window_id": "@9", "window_index": "4", "thread_id": "222",
-                        "session_name": "clord", "window_name": "work1"}}
+        by_tid = {
+            222: {
+                "window_id": "@9",
+                "window_index": "4",
+                "thread_id": "222",
+                "session_name": "clord",
+                "window_name": "work1",
+            }
+        }
 
-        with patch.object(thread_state_sync, "discord") as discord_mock, \
-             patch.object(thread_state_sync, "_capture_pane_text", return_value="● response text\n") as _cap:
+        with (
+            patch.object(thread_state_sync, "discord") as discord_mock,
+            patch.object(
+                thread_state_sync,
+                "_capture_pane_text",
+                return_value="● response text\nesc to interrupt\n",
+            ),
+        ):
             discord_mock.Thread = fake_thread.__class__
             discord_mock.HTTPException = Exception
             await loop._sync_one(rec, by_tid)
@@ -170,11 +216,20 @@ async def test_sync_one_waiting_when_prompt_visible():
         bot.get_channel.return_value = fake_thread
         loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
         rec = _Rec(thread_id=333, state="running", topic="入力待ち", tmux_window_id=None)
-        by_tid = {333: {"window_id": "@5", "window_index": "2", "thread_id": "333",
-                        "session_name": "clord", "window_name": "work2"}}
+        by_tid = {
+            333: {
+                "window_id": "@5",
+                "window_index": "2",
+                "thread_id": "333",
+                "session_name": "clord",
+                "window_name": "work2",
+            }
+        }
 
-        with patch.object(thread_state_sync, "discord") as discord_mock, \
-             patch.object(thread_state_sync, "_capture_pane_text", return_value="● done\n❯\n"):
+        with (
+            patch.object(thread_state_sync, "discord") as discord_mock,
+            patch.object(thread_state_sync, "_capture_pane_text", return_value="● done\n❯\n"),
+        ):
             discord_mock.Thread = fake_thread.__class__
             discord_mock.HTTPException = Exception
             await loop._sync_one(rec, by_tid)
@@ -198,11 +253,22 @@ async def test_sync_one_error_when_error_in_pane():
         bot.get_channel.return_value = fake_thread
         loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
         rec = _Rec(thread_id=444, state="running", topic="エラー発生", tmux_window_id=None)
-        by_tid = {444: {"window_id": "@6", "window_index": "3", "thread_id": "444",
-                        "session_name": "clord", "window_name": "work3"}}
+        by_tid = {
+            444: {
+                "window_id": "@6",
+                "window_index": "3",
+                "thread_id": "444",
+                "session_name": "clord",
+                "window_name": "work3",
+            }
+        }
 
-        with patch.object(thread_state_sync, "discord") as discord_mock, \
-             patch.object(thread_state_sync, "_capture_pane_text", return_value="APIError: rate limit\n"):
+        with (
+            patch.object(thread_state_sync, "discord") as discord_mock,
+            patch.object(
+                thread_state_sync, "_capture_pane_text", return_value="APIError: rate limit\n"
+            ),
+        ):
             discord_mock.Thread = fake_thread.__class__
             discord_mock.HTTPException = Exception
             await loop._sync_one(rec, by_tid)

@@ -50,8 +50,9 @@ _DEFAULT_INTERVAL_SECONDS = 60.0
 # How many bottom lines of the pane to check for prompt/error indicators.
 _PANE_PROBE_LINES = 6
 
-# Characters that indicate Claude Code's input prompt (waiting for user).
-_WAITING_PROMPTS = frozenset({"❯", ">"})
+# Substring that signals Claude Code is actively executing a tool/task.
+# Visible in the pane only while Claude is running (not at the input prompt).
+_RUNNING_SIGNAL = "esc to interrupt"
 
 # Substrings that indicate an error state (checked in the bottom pane lines).
 _ERROR_INDICATORS = (
@@ -70,11 +71,15 @@ def _pane_lamp_state(pane_text: str) -> str:
     """Determine lamp state from captured pane content.
 
     Returns one of ``'running'``, ``'waiting'``, or ``'error'``.
-    Error takes highest priority; waiting is detected from the bare
-    ``❯``/``>`` prompt; otherwise the state is ``'running'``.
+    Priority: error > running (positive signal) > waiting (default).
+
+    Default is ``'waiting'`` because the idle state (user prompt visible,
+    draft text in input, ``-- INSERT --`` etc.) is far more common than
+    active execution.  Only the ``'esc to interrupt'`` line — shown by
+    Claude Code while a tool/task is executing — signals ``'running'``.
     """
     if not pane_text:
-        return "running"
+        return "waiting"
     lines = pane_text.rstrip().splitlines()
     tail = lines[-_PANE_PROBE_LINES:]
 
@@ -84,10 +89,10 @@ def _pane_lamp_state(pane_text: str) -> str:
                 return "error"
 
     for line in tail:
-        if line.strip() in _WAITING_PROMPTS:
-            return "waiting"
+        if _RUNNING_SIGNAL in line.lower():
+            return "running"
 
-    return "running"
+    return "waiting"
 
 
 def _capture_pane_text(
