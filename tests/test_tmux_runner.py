@@ -952,25 +952,19 @@ class TestTmuxClaudeRunnerRun:
 
     @pytest.mark.asyncio
     async def test_start_claude_fresh(self, runner, tmux_manager) -> None:
-        """When Claude is not running, start_claude(try_continue=True) is called first.
-
-        If --continue succeeds (is_claude_running returns True after the delay),
-        only one start_claude call is made.
-        """
+        """Default runner: when Claude is not running, start_claude with try_continue=False."""
         pane = _make_pane(["● Hello!"])
         call_idx = 0
 
         def capture_fn(tid):
             nonlocal call_idx
             call_idx += 1
-            # First few calls are during _handle_startup_prompts.
             if call_idx <= 2:
                 return "Loading..."
             return pane
 
         tmux_manager.capture_pane.side_effect = capture_fn
-        # Simulate: cold start (not running) → --continue succeeds
-        tmux_manager.is_claude_running.side_effect = [False, True]
+        tmux_manager.is_claude_running.return_value = False
         tmux_manager._find_window_for_thread.return_value = "work1"
 
         events = []
@@ -979,19 +973,18 @@ class TestTmuxClaudeRunnerRun:
             patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.06),
             patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.09),
             patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
-            patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
         ):
             async for event in runner.run("test prompt"):
                 events.append(event)
 
-        # Only one start_claude call (--continue succeeded)
+        # Exactly one start_claude call with try_continue=False (direct fresh)
         tmux_manager.start_claude.assert_called_once_with(
             12345,
             "test prompt",
             "sonnet",
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
-            try_continue=True,
+            try_continue=False,
         )
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
@@ -1382,21 +1375,28 @@ class TestExtractResponsePreservesHyperlinks:
 
 
 class TestContinueFallback:
-    """Tests for the --continue → fresh-start fallback (issue #123 Part 2).
+    """Tests for the --continue → fresh-start fallback (issue #123 Part 2, fix #128).
 
-    When Claude is not running in the tmux window (e.g. after a bot restart),
-    run() first tries ``claude --continue <prompt>`` to recover context.
-    If that fails (Claude exits immediately — no session to continue), it falls
-    back to a plain fresh ``claude <prompt>``.
+    --continue is ONLY used when the runner is explicitly constructed with
+    try_continue=True (restart-resume path, triggered from on_ready).
+
+    Normal cold starts (new threads, post-/clear) always use fresh start.
     """
 
+    # ── Restart-resume path (try_continue=True) ────────────────────────
+
     @pytest.mark.asyncio
-    async def test_continue_called_first_on_cold_start(
-        self, runner, tmux_manager
-    ) -> None:
-        """run() calls start_claude(try_continue=True) first when Claude is not running."""
+    async def test_restart_resume_uses_continue(self, tmux_manager) -> None:
+        """Restart-resume runner (try_continue=True) sends --continue first."""
+        resume_runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=12345,
+            model="sonnet",
+            timeout_seconds=10,
+            try_continue=True,
+        )
         tmux_manager.is_claude_running.side_effect = [
-            False,  # initial check — Claude not running
+            False,  # initial check
             True,   # after --continue delay — Claude started successfully
         ]
         pane = _make_pane(["● Resumed."])
@@ -1410,88 +1410,38 @@ class TestContinueFallback:
             patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
             patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
         ):
-            async for event in runner.run("hello"):
+            async for event in resume_runner.run("hello"):
                 events.append(event)
 
-        # First call must use try_continue=True
-        first_call = tmux_manager.start_claude.call_args_list[0]
-        assert first_call.kwargs.get("try_continue") is True or (
-            len(first_call.args) >= 4 and "--continue" in str(first_call)
-        ), f"Expected try_continue=True in first call, got: {first_call}"
-        # Only one start_claude call (--continue succeeded)
-        assert tmux_manager.start_claude.call_count == 1
+        # Only one start_claude call: try_continue=True (--continue succeeded)
+        tmux_manager.start_claude.assert_called_once_with(
+            12345, "hello", "sonnet",
+            permission_mode="acceptEdits",
+            dangerously_skip_permissions=False,
+            try_continue=True,
+        )
 
     @pytest.mark.asyncio
-    async def test_fallback_to_fresh_when_continue_fails(
-        self, runner, tmux_manager
-    ) -> None:
-        """Issue #123 Part 2: when --continue fails, fresh start is used as fallback.
-
-        --continue failure is detected by is_claude_running returning False after
-        _CONTINUE_CHECK_DELAY seconds (Claude exited immediately).
-        """
+    async def test_restart_resume_fallback_when_continue_fails(self, tmux_manager) -> None:
+        """If --continue fails (no session), restart-resume runner falls back to fresh."""
+        resume_runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=12345,
+            model="sonnet",
+            timeout_seconds=10,
+            try_continue=True,
+        )
         pane = _make_pane(["● Fresh start response."])
         call_idx = 0
 
         def capture_fn(tid):
             nonlocal call_idx
             call_idx += 1
-            if call_idx <= 2:
-                return "Loading..."
-            return pane
+            return "Loading..." if call_idx <= 2 else pane
 
         tmux_manager.capture_pane.side_effect = capture_fn
         tmux_manager.is_claude_running.side_effect = [
-            False,  # initial check — not running
-            False,  # after --continue delay — still not running (--continue failed)
-        ]
-        tmux_manager._find_window_for_thread.return_value = "work1"
-
-        events = []
-        with (
-            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
-            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.06),
-            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.09),
-            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
-            patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
-        ):
-            async for event in runner.run("hello"):
-                events.append(event)
-
-        assert tmux_manager.start_claude.call_count == 2
-        # First call: try_continue=True
-        first_call = tmux_manager.start_claude.call_args_list[0]
-        assert first_call.kwargs.get("try_continue") is True
-        # Second call: try_continue=False (fresh)
-        second_call = tmux_manager.start_claude.call_args_list[1]
-        assert second_call.kwargs.get("try_continue") is False
-        assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
-
-    @pytest.mark.asyncio
-    async def test_clear_path_uses_fresh_only(self, runner, tmux_manager) -> None:
-        """Regression: /clear kills the window; next run() must use fresh, NOT --continue.
-
-        After kill_session, create_session creates a NEW window with no conversation
-        history. --continue would fail immediately and fallback to fresh anyway —
-        but this test verifies the fallback path is correctly triggered (not that
-        --continue is skipped altogether, since the try-then-fallback is structural).
-        The key regression check: the final start_claude call uses try_continue=False
-        (fresh) so a cleared session always starts fresh.
-        """
-        # Simulate: window exists but Claude not running (new window after /clear)
-        pane = _make_pane(["● Hello, I'm fresh!"])
-        call_idx = 0
-
-        def capture_fn(tid):
-            nonlocal call_idx
-            call_idx += 1
-            if call_idx <= 2:
-                return "Loading..."
-            return pane
-
-        tmux_manager.capture_pane.side_effect = capture_fn
-        tmux_manager.is_claude_running.side_effect = [
-            False,  # initial check — not running (new window)
+            False,  # initial check
             False,  # after --continue delay — failed (no history)
         ]
         tmux_manager._find_window_for_thread.return_value = "work1"
@@ -1504,10 +1454,56 @@ class TestContinueFallback:
             patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
             patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
         ):
+            async for event in resume_runner.run("hello"):
+                events.append(event)
+
+        assert tmux_manager.start_claude.call_count == 2
+        assert tmux_manager.start_claude.call_args_list[0].kwargs["try_continue"] is True
+        assert tmux_manager.start_claude.call_args_list[1].kwargs["try_continue"] is False
+        assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
+
+    # ── Default (fresh) path — /clear, new threads ─────────────────────
+
+    @pytest.mark.asyncio
+    async def test_default_runner_never_uses_continue(self, runner, tmux_manager) -> None:
+        """Issue #123 fix: default runner (try_continue=False) must NOT send --continue.
+
+        This is the regression test for the /clear path. After /clear, the window is
+        killed and recreated. In the new window, --continue would find ~/.claude history
+        and successfully resume the supposedly-cleared context. The fix prevents this
+        by never attaching --continue unless the runner was explicitly constructed with
+        try_continue=True (restart-resume path only).
+        """
+        pane = _make_pane(["● Hello, I'm fresh!"])
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            return "Loading..." if call_idx <= 2 else pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        # Only ONE is_claude_running call expected (no --continue check delay)
+        tmux_manager.is_claude_running.return_value = False
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.05),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.09),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
             async for event in runner.run("hello"):
                 events.append(event)
 
-        # Final (second) start_claude call MUST be fresh (try_continue=False)
-        final_call = tmux_manager.start_claude.call_args_list[-1]
-        assert final_call.kwargs.get("try_continue") is False
+        # Exactly ONE start_claude call — direct fresh, no --continue attempt
+        tmux_manager.start_claude.assert_called_once_with(
+            12345, "hello", "sonnet",
+            permission_mode="acceptEdits",
+            dangerously_skip_permissions=False,
+            try_continue=False,
+        )
+        # Only one is_claude_running call (no post-continue check)
+        assert tmux_manager.is_claude_running.call_count == 1
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)

@@ -669,6 +669,7 @@ class ClaudeChatCog(commands.Cog):
                         thread,
                         resume_prompt,
                         session_id=entry.session_id,
+                        try_continue=True,
                     )
                 )
             except Exception:
@@ -783,6 +784,7 @@ class ClaudeChatCog(commands.Cog):
         prompt: str,
         session_id: str | None,
         image_paths: list[str] | None = None,
+        try_continue: bool = False,
     ) -> None:
         """Execute Claude Code CLI and stream results to the thread."""
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
@@ -884,6 +886,7 @@ class ClaudeChatCog(commands.Cog):
                 working_dir=working_dir,
                 timeout_seconds=self.runner.timeout_seconds,
                 dangerously_skip_permissions=True,
+                try_continue=try_continue,
             )
 
             self._active_runners[thread.id] = runner
