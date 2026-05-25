@@ -108,7 +108,7 @@ async def test_sync_one_alive_with_index_renames_when_name_differs():
     fake_thread.edit.assert_awaited_once()
     kwargs = fake_thread.edit.await_args.kwargs
     assert "やること" in kwargs["name"]
-    assert "#4" in kwargs["name"]
+    assert "W4" in kwargs["name"]
 
 
 async def test_sync_one_skips_rename_when_no_topic():
