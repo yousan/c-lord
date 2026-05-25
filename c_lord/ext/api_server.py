@@ -727,6 +727,21 @@ class ApiServer:
             send_kwargs["file"] = all_files[0]
         elif len(all_files) > 1:
             send_kwargs["files"] = all_files
+
+        # Issue #115: reply to the trigger message that started this Claude turn.
+        from ..transcript.mirror import reply_to_trigger_enabled
+
+        if reply_to_trigger_enabled() and self.session_repo is not None:
+            record = await self.session_repo.get(thread_id)
+            trigger_id = getattr(record, "trigger_message_id", None) if record else None
+            if trigger_id is not None:
+                send_kwargs["reference"] = discord.MessageReference(
+                    message_id=trigger_id,
+                    channel_id=thread_id,
+                    fail_if_not_exists=False,
+                )
+                send_kwargs["mention_author"] = False
+
         await raw.send(**send_kwargs)  # type: ignore[union-attr]
 
         # Issue #67: record the successful reply so run_helper can detect

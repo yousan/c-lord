@@ -918,6 +918,13 @@ class ClaudeChatCog(commands.Cog):
                         thread.id,
                         exc_info=True,
                     )
+            # Record the trigger message so TranscriptMirror / ApiServer can
+            # thread the final answer back as a Discord reply (Issue #115).
+            if transcript_cog is not None:
+                with contextlib.suppress(Exception):
+                    transcript_cog.set_trigger_message(thread.id, user_message.id)
+            with contextlib.suppress(Exception):
+                await self.repo.update_trigger_message(thread.id, user_message.id)
 
             stop_view = StopView(runner)
             if window_name:

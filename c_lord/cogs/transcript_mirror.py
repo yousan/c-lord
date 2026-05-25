@@ -24,7 +24,13 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
-from ..transcript.mirror import TranscriptMirror, bridge_mode_jsonl, verbosity_mode
+from ..transcript.mirror import (
+    TranscriptMirror,
+    bridge_mode_jsonl,
+    reply_to_trigger_enabled,
+    silent_posts_enabled,
+    verbosity_mode,
+)
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -40,6 +46,15 @@ class TranscriptMirrorCog(commands.Cog):
         self.bot = bot
         self._session_repo = session_repo
         self._mirrors: dict[int, TranscriptMirror] = {}
+        self._trigger_messages: dict[int, int] = {}
+
+    def set_trigger_message(self, thread_id: int, message_id: int) -> None:
+        """Record the Discord message ID that triggered the current Claude turn.
+
+        Called by ClaudeChatCog before each run so that the reply_sink can
+        thread the final answer back to the user's message.
+        """
+        self._trigger_messages[thread_id] = message_id
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -71,11 +86,13 @@ class TranscriptMirrorCog(commands.Cog):
 
         project_dir = derive_project_dir(working_dir)
         sink = self._make_sink(thread_id)
+        reply_sink = self._make_reply_sink(thread_id)
         file_sink = self._make_file_sink(thread_id)
         mirror = TranscriptMirror(
             thread_id=thread_id,
             project_dir=project_dir,
             sink=sink,
+            reply_sink=reply_sink,
             file_sink=file_sink,
             verbosity=verbosity_mode(),
         )
@@ -98,7 +115,7 @@ class TranscriptMirrorCog(commands.Cog):
         self._mirrors.clear()
 
     def _make_sink(self, thread_id: int):
-        """Return an awaitable callable that posts a string to the given thread."""
+        """Return an awaitable callable that posts intermediate messages silently."""
         bot = self.bot
 
         async def sink(text: str) -> None:
@@ -114,18 +131,11 @@ class TranscriptMirrorCog(commands.Cog):
                     type(channel).__name__,
                 )
                 return
-            from io import BytesIO
-
-            from ..discord_ui.table_renderer import get_table_images
-
-            table_files = [
-                discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
-            ]
-            send_kwargs: dict = {"content": body} if table_files else {}
-            if table_files:
-                send_kwargs["files"] = table_files
+            send_kwargs: dict = {"content": body}
+            if silent_posts_enabled():
+                send_kwargs["silent"] = True
             try:
-                await send(**send_kwargs) if send_kwargs else await send(body)
+                await send(**send_kwargs)
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror sink failed: thread=%d body_len=%d status=%s — %s",
@@ -138,14 +148,59 @@ class TranscriptMirrorCog(commands.Cog):
 
         return sink
 
-    def _make_file_sink(self, thread_id: int):
-        """Return an awaitable callable that posts text + progress.txt attachment.
+    def _make_reply_sink(self, thread_id: int):
+        """Return an awaitable callable for final assistant text (no progress.txt).
 
-        Fallback strategy:
-        1. Send with progress.txt attached.
-        2. If that raises HTTPException (e.g. 413 Payload Too Large), retry
-           with plain text only and log a warning.
-        3. If the plain-text retry also fails, log a warning.
+        Sends without silent flag (notifies user) and includes a reference to
+        the trigger message so the reply threads visually in Discord.
+        """
+        bot = self.bot
+
+        async def reply_sink(text: str) -> None:
+            channel = await self._resolve_channel(bot, thread_id)
+            if channel is None:
+                return
+            body = text if len(text) <= 1990 else text[:1985] + "…"
+            send = getattr(channel, "send", None)
+            if send is None:
+                return
+            from io import BytesIO
+
+            from ..discord_ui.table_renderer import get_table_images
+
+            table_files = [
+                discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
+            ]
+            send_kwargs: dict = {"content": body}
+            if table_files:
+                send_kwargs["files"] = table_files
+            trigger_id = self._trigger_messages.get(thread_id)
+            if trigger_id is not None and reply_to_trigger_enabled():
+                send_kwargs["reference"] = discord.MessageReference(
+                    message_id=trigger_id,
+                    channel_id=thread_id,
+                    fail_if_not_exists=False,
+                )
+                send_kwargs["mention_author"] = False
+            try:
+                await send(**send_kwargs)
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "TranscriptMirror reply_sink failed: thread=%d body_len=%d status=%s — %s",
+                    thread_id,
+                    len(body),
+                    getattr(exc, "status", "?"),
+                    exc,
+                    exc_info=True,
+                )
+
+        return reply_sink
+
+    def _make_file_sink(self, thread_id: int):
+        """Return an awaitable callable for final answers with progress.txt attachment.
+
+        Sends without silent flag (notifies user) and includes a reference to
+        the trigger message. Falls back to plain text if the attachment send fails.
         """
         bot = self.bot
 
@@ -165,8 +220,17 @@ class TranscriptMirrorCog(commands.Cog):
                 discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
             ]
             files = [discord.File(file_path, filename="progress.txt")] + table_files
+            send_kwargs: dict = {"content": body, "files": files}
+            trigger_id = self._trigger_messages.get(thread_id)
+            if trigger_id is not None and reply_to_trigger_enabled():
+                send_kwargs["reference"] = discord.MessageReference(
+                    message_id=trigger_id,
+                    channel_id=thread_id,
+                    fail_if_not_exists=False,
+                )
+                send_kwargs["mention_author"] = False
             try:
-                await send(content=body, files=files)
+                await send(**send_kwargs)
                 return
             except discord.HTTPException as exc:
                 logger.warning(

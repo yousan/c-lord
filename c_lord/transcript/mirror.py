@@ -66,6 +66,23 @@ def verbosity_mode() -> str:
     return os.getenv("CLORD_MIRROR_VERBOSITY", "minimal").strip().lower()
 
 
+def silent_posts_enabled() -> bool:
+    """Return True unless ``CLORD_SILENT_POSTS`` is explicitly ``0/false/no``.
+
+    Defaults to True — intermediate posts do not trigger push notifications.
+    """
+    return os.getenv("CLORD_SILENT_POSTS", "1").strip().lower() not in ("0", "false", "no")
+
+
+def reply_to_trigger_enabled() -> bool:
+    """Return True unless ``CLORD_REPLY_TO_TRIGGER`` is explicitly ``0/false/no``.
+
+    Defaults to True — final answers are sent as Discord replies to the
+    message that triggered the Claude turn, so they thread visually.
+    """
+    return os.getenv("CLORD_REPLY_TO_TRIGGER", "1").strip().lower() not in ("0", "false", "no")
+
+
 _KIND_PREFIX = {
     "assistant_text": "",
     "tool_use": "",  # tool_use bodies already start with the 🔧 emoji
@@ -88,6 +105,7 @@ class TranscriptMirror:
         thread_id: int,
         project_dir: Path,
         sink: Sink,
+        reply_sink: Sink | None = None,
         file_sink: FileSink | None = None,
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
@@ -95,6 +113,7 @@ class TranscriptMirror:
         self.thread_id = thread_id
         self.project_dir = project_dir
         self._sink = sink
+        self._reply_sink = reply_sink
         self._file_sink = file_sink
         self._verbosity = verbosity
         self._poll_interval = poll_interval
@@ -152,6 +171,8 @@ class TranscriptMirror:
             body = _format_body(rendered)
             if progress_buf and self._file_sink is not None:
                 await self._flush_with_progress(body, progress_buf)
+            elif self._reply_sink is not None:
+                await self._try_reply_sink(body)
             else:
                 await self._try_sink(body)
             progress_buf.clear()
@@ -201,6 +222,19 @@ class TranscriptMirror:
         except Exception:
             logger.warning(
                 "TranscriptMirror sink failed for thread=%d",
+                self.thread_id,
+                exc_info=True,
+            )
+
+    async def _try_reply_sink(self, body: str) -> None:
+        assert self._reply_sink is not None
+        try:
+            await self._reply_sink(body)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "TranscriptMirror reply_sink failed for thread=%d",
                 self.thread_id,
                 exc_info=True,
             )
