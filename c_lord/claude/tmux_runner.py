@@ -184,6 +184,7 @@ class TmuxClaudeRunner:
         timeout_seconds: int = 300,
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
+        try_continue: bool = False,
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
@@ -192,6 +193,10 @@ class TmuxClaudeRunner:
         self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
+        # True only for the restart-resume path (on_ready → pending_resumes).
+        # /clear and normal new threads must remain False to prevent --continue
+        # from recovering cleared conversation history (issue #123 Part 2 fix).
+        self._try_continue = try_continue
         self._stopped = False
         self._silent_stop = False
         self._last_capture: str = ""
@@ -237,37 +242,59 @@ class TmuxClaudeRunner:
                 )
                 return
         else:
-            # Try --continue first to recover context after a bot restart.
-            # If Claude exits immediately (no session to resume), fall back to
-            # a plain fresh start (issue #123 Part 2).
-            ok = await asyncio.to_thread(
-                self._tmux.start_claude,
-                self._thread_id,
-                prompt,
-                self.model,
-                permission_mode=self._permission_mode,
-                dangerously_skip_permissions=self._dangerously_skip_permissions,
-                try_continue=True,
-            )
-            if not ok:
-                yield StreamEvent(
-                    raw={},
-                    message_type=MessageType.RESULT,
-                    is_complete=True,
-                    error="Failed to start Claude in tmux",
-                )
-                return
-
-            # Wait briefly and check whether --continue actually started Claude.
-            await asyncio.sleep(_CONTINUE_CHECK_DELAY)
-            still_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)
-            if not still_running:
-                # --continue failed (no session to resume); start fresh.
-                logger.info(
-                    "start_claude --continue found no session for thread %d; "
-                    "falling back to fresh start",
+            if self._try_continue:
+                # Restart-resume path only (on_ready → pending_resumes).
+                # Try --continue first; if Claude exits immediately (no session),
+                # fall back to a fresh start (issue #123 Part 2).
+                ok = await asyncio.to_thread(
+                    self._tmux.start_claude,
                     self._thread_id,
+                    prompt,
+                    self.model,
+                    permission_mode=self._permission_mode,
+                    dangerously_skip_permissions=self._dangerously_skip_permissions,
+                    try_continue=True,
                 )
+                if not ok:
+                    yield StreamEvent(
+                        raw={},
+                        message_type=MessageType.RESULT,
+                        is_complete=True,
+                        error="Failed to start Claude in tmux",
+                    )
+                    return
+
+                # Wait briefly; if Claude still not running, --continue failed.
+                await asyncio.sleep(_CONTINUE_CHECK_DELAY)
+                still_running = await asyncio.to_thread(
+                    self._tmux.is_claude_running, self._thread_id
+                )
+                if not still_running:
+                    logger.info(
+                        "start_claude --continue found no session for thread %d; "
+                        "falling back to fresh start",
+                        self._thread_id,
+                    )
+                    ok = await asyncio.to_thread(
+                        self._tmux.start_claude,
+                        self._thread_id,
+                        prompt,
+                        self.model,
+                        permission_mode=self._permission_mode,
+                        dangerously_skip_permissions=self._dangerously_skip_permissions,
+                        try_continue=False,
+                    )
+                    if not ok:
+                        yield StreamEvent(
+                            raw={},
+                            message_type=MessageType.RESULT,
+                            is_complete=True,
+                            error="Failed to start Claude in tmux",
+                        )
+                        return
+            else:
+                # Normal cold start: /clear, new thread, any non-resume path.
+                # Always fresh — never --continue (would recover cleared history).
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,
