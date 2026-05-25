@@ -35,14 +35,23 @@ logger = logging.getLogger(__name__)
 # count, which matches Python's len() for the BMP characters we care about).
 _TOPIC_MAX_LEN = 20
 _LLM_TIMEOUT_SECONDS = 30.0
+
+# <message> tags isolate user content so haiku cannot misinterpret action-like
+# messages (e.g. "〜してください") as instructions to the model itself (#138).
 _LLM_PROMPT_TEMPLATE = (
-    "次の発言を20字以内の日本語トピックに要約してください。記号や絵文字は使わず簡潔に。: {msg}"
+    "あなたはDiscordスレッドのタイトル生成器です。"
+    "<message>タグ内のテキストを読み、20字以内の日本語で内容を要約してください。"
+    "タイトルのみ返してください。記号・絵文字・説明文は不要です。"
+    "\n<message>\n{msg}\n</message>"
 )
 _RETITLE_PROMPT_TEMPLATE = (
-    "前のタイトル「{current_topic}」。"
-    "次のメッセージを見て、このWorkのタイトルとしてまだ適切なら「{current_topic}」を一字一句そのまま返せ。"
-    "Workの内容が根本的に変わった場合のみ20字以内の日本語で新タイトルを返せ。"
-    "余計な説明・記号・絵文字は不要。タイトルだけ返せ。: {msg}"
+    "あなたはDiscordスレッドのタイトル管理者です。"
+    "現在のタイトル:「{current_topic}」\n"
+    "<message>タグ内の新しいメッセージを読み、"
+    "このWorkのタイトルとしてまだ適切なら「{current_topic}」を一字一句そのまま返してください。"
+    "Workの内容が根本的に変わった場合のみ20字以内の日本語で新タイトルを返してください。"
+    "タイトルのみ返してください。余計な説明・記号・絵文字は不要です。"
+    "\n<message>\n{msg}\n</message>"
 )
 
 _URL_RE = re.compile(r"https?://\S+")
