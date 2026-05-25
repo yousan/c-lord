@@ -10,7 +10,9 @@ When tmux is not installed, operations degrade gracefully (log warning, skip).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import subprocess
 
@@ -47,11 +49,19 @@ class TmuxSessionManager:
     window option.
     """
 
-    def __init__(self, session_name: str | None = None) -> None:
+    def __init__(self, session_name: str | None = None, mapping_path: str | None = None) -> None:
         self.session_name: str = session_name or SESSION_NAME
         self._available: bool | None = None
         self._next_work_id: int = 1
         self._thread_to_window: dict[int, str] = {}
+        # Persistent thread→window mapping file. Survives tmux restarts; used
+        # as fallback in _rebuild_mapping when pane has cd'd away (issue #113).
+        if mapping_path is not None:
+            self._mapping_path: str = mapping_path
+        else:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "c-lord")
+            os.makedirs(cache_dir, exist_ok=True)
+            self._mapping_path = os.path.join(cache_dir, f"{self.session_name}-window-map.json")
 
     def _check_available(self) -> bool:
         """Check and cache tmux availability."""
@@ -157,6 +167,12 @@ class TmuxSessionManager:
         if result.returncode != 0:
             return
 
+        # Pass 0: restore from persistent mapping file for windows whose
+        # @thread_id was cleared and whose pane has cd'd away (issue #113 Fix-B).
+        # Must run after we know the session exists but before the window scan,
+        # so that subsequent @thread_id reads in the scan pick up the repaired values.
+        self._load_from_mapping_file()
+
         max_id = 0
         for line in result.stdout.strip().splitlines():
             if not line:
@@ -217,6 +233,96 @@ class TmuxSessionManager:
 
         self._next_work_id = max_id + 1
 
+    def _save_mapping(self) -> None:
+        """Persist the current thread→window mapping to disk (issue #113).
+
+        No-op when mapping_path is empty (disabled or test mode).
+        """
+        if not self._mapping_path:
+            return
+        try:
+            data = {str(tid): win for tid, win in self._thread_to_window.items()}
+            with open(self._mapping_path, "w") as f:
+                json.dump(data, f)
+        except OSError as exc:
+            logger.warning("Failed to save window mapping to %s: %s", self._mapping_path, exc)
+
+    def _load_from_mapping_file(self) -> None:
+        """Restore @thread_id from the persistent mapping file.
+
+        Called at the start of _rebuild_mapping to recover mappings that were
+        cleared by a tmux restart, even when the pane has cd'd away from the
+        session directory (issue #113 Fix-B).
+        No-op when mapping_path is empty (disabled or test mode).
+        """
+        if not self._mapping_path:
+            return
+        try:
+            with open(self._mapping_path) as f:
+                data: dict[str, str] = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+
+        for tid_str, window_name in data.items():
+            if not tid_str.isdigit():
+                continue
+            thread_id = int(tid_str)
+            if thread_id in self._thread_to_window:
+                continue  # already resolved by @thread_id option or path regex
+
+            # Verify the window still exists in the session
+            list_result = _run(
+                [
+                    "tmux",
+                    "list-windows",
+                    "-t",
+                    self.session_name,
+                    "-F",
+                    "#{window_name}",
+                ]
+            )
+            if list_result.returncode != 0:
+                return
+            existing_windows = {
+                line.split("\t", 1)[0] for line in list_result.stdout.splitlines() if line
+            }
+            if window_name not in existing_windows:
+                continue
+
+            # Check if @thread_id is already set (another thread adopted this window)
+            opt_result = _run(
+                [
+                    "tmux",
+                    "show-option",
+                    "-w",
+                    "-v",
+                    "-t",
+                    f"{self.session_name}:{window_name}",
+                    "@thread_id",
+                ]
+            )
+            if opt_result.returncode == 0 and opt_result.stdout.strip():
+                continue  # window already has a different @thread_id
+
+            # Restore @thread_id
+            _run(
+                [
+                    "tmux",
+                    "set-option",
+                    "-w",
+                    "-t",
+                    f"{self.session_name}:{window_name}",
+                    "@thread_id",
+                    str(thread_id),
+                ]
+            )
+            self._thread_to_window[thread_id] = window_name
+            logger.info(
+                "Restored thread_id %d for window %s from mapping file",
+                thread_id,
+                window_name,
+            )
+
     def _find_window_by_working_dir(self, working_dir: str) -> str | None:
         """Return the first window name whose pane_current_path matches working_dir.
 
@@ -239,8 +345,13 @@ class TmuxSessionManager:
         target = working_dir.rstrip("/")
         for line in result.stdout.strip().splitlines():
             parts = line.split("\t", 1)
-            if len(parts) == 2 and parts[1].rstrip("/") == target:
-                return parts[0]
+            if len(parts) == 2:
+                pane_path = parts[1].rstrip("/")
+                # Exact match (pane still at session dir) OR pane is inside a
+                # subdirectory of working_dir (Claude cd'd into a subdir — Fix-A
+                # for issue #113).
+                if pane_path == target or pane_path.startswith(target + "/"):
+                    return parts[0]
         return None
 
     # ── Public API ────────────────────────────────────────────────────
@@ -287,6 +398,7 @@ class TmuxSessionManager:
                 thread_id,
                 working_dir,
             )
+            self._save_mapping()
             return adopted
 
         window_name = self._next_window_name()
@@ -325,6 +437,7 @@ class TmuxSessionManager:
         )
 
         self._thread_to_window[thread_id] = window_name
+        self._save_mapping()
         logger.info(
             "Created tmux window: %s (thread=%d, dir=%s)",
             window_name,
@@ -488,6 +601,7 @@ class TmuxSessionManager:
         )
         if result.returncode == 0:
             self._thread_to_window.pop(thread_id, None)
+            self._save_mapping()
             logger.info("Killed tmux window: %s (thread=%d)", window_name, thread_id)
             return True
         else:
