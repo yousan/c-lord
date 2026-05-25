@@ -179,3 +179,38 @@ This document captures the "why" behind key architectural choices. Each decision
 - **Network issues**: If the subprocess hangs or the stream stalls, stall indicators help distinguish "thinking" from "broken"
 - **Soft vs hard**: Two levels let users know the difference between "this is taking a while" and "something might be wrong"
 - **Non-blocking**: The stall monitor runs as an asyncio task alongside the event stream, not blocking any I/O
+
+## 12. DoD & merge gate (single source of truth)
+
+**Decision:** CLAUDE.md carries one authoritative "Definition of Done" list,
+the PR template mirrors it verbatim, and a PR may close an Issue only when 100%
+of that Issue's Acceptance Criteria are met. Issues must be one-concern with
+binary, unambiguous ACs.
+
+**Why (the incident that motivated this):**
+
+While fixing `/clear`, we filed Issue #123 bundling two things: a concrete bug
+(Part 1: `/clear` left the tmux window alive on idle threads, so the next
+message resumed old context) and an open-ended design task (Part 2: bot-restart
+loses context because `start_claude` never uses `--resume`/`--continue`, and the
+stored `session_id` is a synthetic `tmux-{thread_id}` so `--resume` cannot work
+anyway). PR #124 fixed Part 1 only, wrote `Closes #123`, and on merge GitHub
+auto-closed the Issue as "completed". Part 2 silently vanished.
+
+Root cause was **not** lax rules in prose — CLAUDE.md already said staging
+verification was mandatory. The cause was a gap between the *enforced* gate and
+the *aspirational* prose:
+
+- The only hard gate (CI) runs `ruff`/`pyright`/`pytest`, all of which pass with
+  **mocked** tests. Real tmux/Discord behavior is never exercised. Green CI ≠ works.
+- Staging verification was honor-system, and the **PR template didn't even list
+  it** — so the artifact the author actually fills out never surfaced it.
+- The Definition of Done was scattered across the TDD section, the flow section,
+  the staging section, and the PR template, and they disagreed. The weakest one won.
+- A single multi-concern Issue + `Closes #N` auto-close let a partial PR mark the
+  whole Issue done with no check that all ACs were satisfied.
+
+**Fix:** Move the strictness from prose into the artifact the author touches.
+One DoD list; the PR template is a verbatim copy; ACs are copied into the PR and
+all must be checked; `Closes` is gated on 100% AC completion (else `Refs`);
+Issues are kept one-concern with binary ACs so they cannot be half-satisfied.

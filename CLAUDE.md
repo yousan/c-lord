@@ -325,6 +325,41 @@ CONTRIBUTING.md          # Contribution guidelines
 2. Export from `__init__.py` if it's part of the public API
 3. Test edge cases (empty strings, very long strings, Unicode, code blocks)
 
+## Definition of Done (DoD) — single source of truth
+
+**A change is "done" only when every box below is checked. This list is the one
+authoritative completion definition; the PR template
+(`.github/pull_request_template.md`) mirrors it verbatim. If the two ever
+disagree, this section wins — fix the template.**
+
+Why this exists: CI only runs `ruff` + `pyright` + `pytest`, all of which pass
+with mocked tests. Real behavior (tmux, Discord, restart continuity) is **not**
+exercised by CI. So "green CI" ≠ "works". The boxes below force the evidence CI
+cannot produce. See `docs/DESIGN_DECISIONS.md` → "DoD & merge gate" for the
+incident that motivated this.
+
+A PR may be merged only when:
+
+- [ ] **Every Acceptance Criterion of the linked Issue is copied into the PR body and checked.** Not "most" — every one.
+- [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
+- [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed on staging, with log excerpts pasted under a `## Staging Evidence` heading. **An empty Staging Evidence section = not done.**
+- [ ] **No unrelated changes** in the diff; self-review done.
+- [ ] **Closes gating**: use `Closes #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. Never let a partial PR auto-close an Issue.
+
+If you cannot check a box, the change is not done — do not merge. State the
+blocker in the PR instead of silently dropping it.
+
+### Issue authoring rules (write the Issue so it *can't* be half-done)
+
+Most "completed but actually missing half" failures start at the Issue, not the
+PR. When you (or Opus) author an Issue:
+
+- **One Issue = one concern.** Do not bundle a bug fix with a design/enhancement task, or two unrelated behaviors, in one Issue. Bundling lets an agent satisfy the easy/testable half, write `Closes`, and auto-close the rest into oblivion. Split into separate Issues.
+- **Acceptance Criteria must be binary and unambiguous** — each AC is a checkbox that is objectively true or false (a command to run, an observable output, a state to assert). No "should probably", no "consider", no open options ("A案 or B案") left in the AC. Decide before filing; move discussion out of the AC list.
+- **Keep scope narrow.** If the Issue's title needs an "and", it is probably two Issues. A wide守備範囲 is where definitions go soft and items leak.
+- **Deferred work is escalated, never implied.** If something is explicitly out of scope, say so in the Issue and link the follow-up. Silence is not a decision.
+
 ## Git & PR Workflow
 
 - **Branch from `main`**: `feature/description`, `fix/description`, `docs/description`
@@ -342,7 +377,7 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 3. **PR 作成** — Closes #N で Issue と連動、CI green を確認
 4. **動作確認 (E2E on staging)** ← **必須** — 下記のスキーム
 5. **セルフレビュー** — diff を読み返す / 不要な変更がないか / セキュリティ監査 (`security-audit` skill)
-6. **Merge** (squash + delete branch)
+6. **Merge** (squash + delete branch) — **only after every [Definition of Done](#definition-of-done-dod--single-source-of-truth) box is checked.** A green CI is necessary but not sufficient.
 7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && pgrep -f c_lord.main | xargs -r kill && sleep 3 && nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &`
 
 ### 動作確認スキーム (必須)
