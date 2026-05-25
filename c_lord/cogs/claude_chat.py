@@ -20,6 +20,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .. import topic as topic_module
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
@@ -230,7 +231,6 @@ class ClaudeChatCog(commands.Cog):
         on truly unexpected programmer mistakes.
         """
         from ..thread_name import build_name, parse_topic_from_name
-        from ..topic import generate_topic, heuristic_topic
 
         record = await self.repo.get(thread.id)
         topic = record.topic if record else None
@@ -259,13 +259,27 @@ class ClaudeChatCog(commands.Cog):
         else:
             window_index = None
 
-        # Derive topic if missing and not locked.
+        # Re-summarize title on subsequent messages (#121).
+        # Only runs when a topic already exists and the thread is not manually
+        # renamed (locked).  Returns None when the LLM deems the current topic
+        # still valid (verbatim match) — so no rename API call is triggered.
+        if topic and not locked:
+            with contextlib.suppress(Exception):
+                new_topic = await topic_module.maybe_retitle(first_message or "", topic)
+                if new_topic is not None:
+                    if record is not None:
+                        await self.repo.set_topic(thread.id, new_topic, source="llm_retitle")
+                    else:
+                        self._pending_topic[thread.id] = (new_topic, "llm_retitle")
+                    topic = new_topic
+
+        # Derive topic if missing and not locked (first message).
         if not topic and not locked:
             try:
-                topic, source = await generate_topic(first_message or "")
+                topic, source = await topic_module.generate_topic(first_message or "")
             except Exception:
                 logger.warning("topic generation failed", exc_info=True)
-                topic, source = heuristic_topic(first_message or ""), "heuristic"
+                topic, source = topic_module.heuristic_topic(first_message or ""), "heuristic"
             if record is not None:
                 await self.repo.set_topic(thread.id, topic, source=source)
             else:
