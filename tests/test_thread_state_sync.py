@@ -97,15 +97,26 @@ def test_pane_lamp_state_waiting_gt_prompt():
     assert _pane_lamp_state(pane) == "waiting"
 
 
-def test_pane_lamp_state_running_when_esc_to_interrupt():
-    # Positive signal: "esc to interrupt" line present → running
-    pane = "✻ Running bash...\nesc to interrupt\n"
+def test_pane_lamp_state_running_when_tool_executing():
+    # ✻ in the pane means a tool (Bash/Read/etc.) is actively running
+    pane = "✻ Running bash...\n"
     assert _pane_lamp_state(pane) == "running"
 
 
-def test_pane_lamp_state_waiting_without_running_signal():
-    # No "esc to interrupt" → default waiting even with tool output
-    pane = "✻ Running bash...\n● Some response text\n"
+def test_pane_lamp_state_running_when_actualizing():
+    # ✢ appears during Claude response generation (Actualizing/Synthesizing)
+    pane = "✢ Actualizing… (1m 13s · ↓ 3.6k tokens)\n\n❯\n"
+    assert _pane_lamp_state(pane) == "running"
+
+
+def test_pane_lamp_state_running_when_synthesizing():
+    pane = "✢ Synthesizing… (1m 43s · ↓ 5.5k tokens)\n\n❯\n"
+    assert _pane_lamp_state(pane) == "running"
+
+
+def test_pane_lamp_state_waiting_without_running_chars():
+    # No ✢ or ✻ → default waiting
+    pane = "● Some completed tool output\n❯\n"
     assert _pane_lamp_state(pane) == "waiting"
 
 
@@ -154,7 +165,7 @@ async def test_sync_one_marks_dead_and_renames():
     repo.set_state.assert_awaited_once_with(111, "dead")
 
 
-async def test_sync_one_running_when_esc_to_interrupt_in_pane():
+async def test_sync_one_running_when_tool_executing_in_pane():
     repo = MagicMock()
     repo.set_state = AsyncMock()
     repo.set_tmux_window_id = AsyncMock()
@@ -185,7 +196,7 @@ async def test_sync_one_running_when_esc_to_interrupt_in_pane():
             patch.object(
                 thread_state_sync,
                 "_capture_pane_text",
-                return_value="● response text\nesc to interrupt\n",
+                return_value="✻ Running bash...\n● response text\n",
             ),
         ):
             discord_mock.Thread = fake_thread.__class__

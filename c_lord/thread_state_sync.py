@@ -50,9 +50,11 @@ _DEFAULT_INTERVAL_SECONDS = 60.0
 # How many bottom lines of the pane to check for prompt/error indicators.
 _PANE_PROBE_LINES = 6
 
-# Substring that signals Claude Code is actively executing a tool/task.
-# Visible in the pane only while Claude is running (not at the input prompt).
-_RUNNING_SIGNAL = "esc to interrupt"
+# Characters that signal active Claude Code execution in the pane content area.
+# ✢ (U+2722) appears during response generation (Actualizing/Synthesizing/…).
+# ✻ (U+273B) appears during tool execution (Running bash / Reading file / …).
+# Both are specific to the Claude Code TUI and absent from idle panes.
+_RUNNING_CHARS = frozenset({"✢", "✻"})
 
 # Substrings that indicate an error state (checked in the bottom pane lines).
 _ERROR_INDICATORS = (
@@ -75,8 +77,11 @@ def _pane_lamp_state(pane_text: str) -> str:
 
     Default is ``'waiting'`` because the idle state (user prompt visible,
     draft text in input, ``-- INSERT --`` etc.) is far more common than
-    active execution.  Only the ``'esc to interrupt'`` line — shown by
-    Claude Code while a tool/task is executing — signals ``'running'``.
+    active execution.
+
+    Running is detected by the Claude Code TUI characters that appear only
+    during active work: ``✢`` (response generation) and ``✻`` (tool execution).
+    These are absent from idle panes — verified against live pane captures.
     """
     if not pane_text:
         return "waiting"
@@ -89,7 +94,7 @@ def _pane_lamp_state(pane_text: str) -> str:
                 return "error"
 
     for line in tail:
-        if _RUNNING_SIGNAL in line.lower():
+        if any(ch in line for ch in _RUNNING_CHARS):
             return "running"
 
     return "waiting"
