@@ -1441,3 +1441,86 @@ class TestThreadLockSerialization:
         # With serialization, call_log should be [start, end, start, end]
         # Without it, it would be [start, start, end, end]
         assert call_log == ["start", "end", "start", "end"]
+
+
+class TestClearCommand:
+    """Tests for /clear command (issue #117, #123)."""
+
+    @pytest.mark.asyncio
+    async def test_clear_outside_thread_sends_ephemeral(self) -> None:
+        """/clear outside a thread sends an ephemeral error."""
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+
+        await cog.clear_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_clear_kills_active_runner(self) -> None:
+        """/clear kills an active runner when one is present."""
+        tmux_manager = MagicMock()
+        tmux_manager.kill_session = MagicMock(return_value=True)
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+
+        runner = AsyncMock()
+        cog._active_runners[thread_id] = runner
+        cog.repo.reset = AsyncMock(return_value=True)
+
+        interaction = _make_thread_interaction(thread_id)
+        thread = interaction.channel
+        thread.parent_id = 999
+
+        await cog.clear_session.callback(cog, interaction)
+
+        runner.kill.assert_called_once()
+        assert thread_id not in cog._active_runners
+
+    @pytest.mark.asyncio
+    async def test_clear_kills_tmux_window_for_idle_session(self) -> None:
+        """Issue #123: /clear on idle thread (no active runner) must still kill the tmux window.
+
+        Before the fix, kill_session was only called when runner was in _active_runners.
+        After the fix, it is called unconditionally when tmux_manager is available.
+        """
+        tmux_manager = MagicMock()
+        tmux_manager.kill_session = MagicMock(return_value=True)
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+
+        # No active runner — this is the "idle session" case
+        assert thread_id not in cog._active_runners
+        cog.repo.reset = AsyncMock(return_value=True)
+
+        interaction = _make_thread_interaction(thread_id)
+        thread = interaction.channel
+        thread.parent_id = 999
+
+        await cog.clear_session.callback(cog, interaction)
+
+        # tmux window must be killed even though there was no active runner
+        tmux_manager.kill_session.assert_called_once_with(thread_id)
+
+    @pytest.mark.asyncio
+    async def test_clear_no_session_sends_ephemeral(self) -> None:
+        """/clear when no DB row exists sends an ephemeral 'not found' reply."""
+        tmux_manager = MagicMock()
+        tmux_manager.kill_session = MagicMock(return_value=False)
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 99999
+
+        cog.repo.reset = AsyncMock(return_value=False)
+
+        interaction = _make_thread_interaction(thread_id)
+        thread = interaction.channel
+        thread.parent_id = 999
+
+        await cog.clear_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
