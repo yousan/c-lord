@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # 20 characters is the upper bound for the topic body (Japanese full-width
 # count, which matches Python's len() for the BMP characters we care about).
 _TOPIC_MAX_LEN = 20
-_LLM_TIMEOUT_SECONDS = 10.0
+_LLM_TIMEOUT_SECONDS = 30.0
 _LLM_PROMPT_TEMPLATE = (
     "次の発言を20字以内の日本語トピックに要約してください。記号や絵文字は使わず簡潔に。: {msg}"
 )

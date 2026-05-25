@@ -89,6 +89,7 @@ async def test_generate_topic_never_raises_on_internal_exception():
 
 # ── _looks_like_instruction tests ─────────────────────────────────────────────
 
+
 def test_looks_like_instruction_short_returns_false():
     assert topic._looks_like_instruction("OK") is False
     assert topic._looks_like_instruction("ありがとう") is False
@@ -111,6 +112,7 @@ def test_looks_like_instruction_medium_length_instruction():
 
 # ── maybe_retitle tests ────────────────────────────────────────────────────────
 
+
 async def test_maybe_retitle_skips_short_message():
     result = await topic.maybe_retitle("OK", "認証リファクタ")
     assert result is None
@@ -127,7 +129,9 @@ async def test_maybe_retitle_verbatim_returns_none():
         return "認証リファクタ"
 
     with patch.object(topic, "_call_claude_p", fake_call):
-        result = await topic.maybe_retitle("認証のリファクタを続けて進めてください", "認証リファクタ")
+        result = await topic.maybe_retitle(
+            "認証のリファクタを続けて進めてください", "認証リファクタ"
+        )
     assert result is None  # verbatim → no change
 
 
@@ -174,6 +178,11 @@ async def test_maybe_retitle_passes_current_topic_in_prompt():
 
     assert captured, "LLM should have been called"
     assert "認証リファクタ" in captured[0], "current topic must appear in prompt"
+
+
+def test_llm_timeout_is_at_least_30_seconds():
+    # Measured haiku latency: 9.4s, 12.9s, 15.9s, 17.9s — 10s was too tight.
+    assert topic._LLM_TIMEOUT_SECONDS >= 30.0
 
 
 if __name__ == "__main__":  # pragma: no cover
