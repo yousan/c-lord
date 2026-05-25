@@ -1,4 +1,4 @@
-"""Stable-topic generator for Discord threads (Issue #95).
+"""Stable-topic generator for Discord threads (Issue #95, #121).
 
 Given the first user message of a new thread, derive a short Japanese
 topic body (≤20 chars) that will be stored as the thread's stable
@@ -12,6 +12,14 @@ identity.  Two paths:
 The caller stores the returned ``(topic, source)`` tuple in the
 ``sessions`` table — ``source`` is one of ``"llm"`` / ``"heuristic"``
 and is kept for debugging.
+
+Re-summarization (#121):
+``maybe_retitle(message, current_topic)`` runs on subsequent messages
+to detect work changes.  It:
+  1. Gates on instruction-like messages (skips questions / short replies).
+  2. Asks haiku to return the current topic verbatim if still applicable,
+     or a new ≤20-char topic if the work changed.
+  3. Returns None when the output equals ``current_topic`` (no rename needed).
 """
 
 from __future__ import annotations
@@ -30,6 +38,12 @@ _LLM_TIMEOUT_SECONDS = 10.0
 _LLM_PROMPT_TEMPLATE = (
     "次の発言を20字以内の日本語トピックに要約してください。記号や絵文字は使わず簡潔に。: {msg}"
 )
+_RETITLE_PROMPT_TEMPLATE = (
+    "前のタイトル「{current_topic}」。"
+    "次のメッセージを見て、このWorkのタイトルとしてまだ適切なら「{current_topic}」を一字一句そのまま返せ。"
+    "Workの内容が根本的に変わった場合のみ20字以内の日本語で新タイトルを返せ。"
+    "余計な説明・記号・絵文字は不要。タイトルだけ返せ。: {msg}"
+)
 
 _URL_RE = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"<[@#!&][^>]+>|@\w+")
@@ -37,6 +51,9 @@ _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 _WHITESPACE_RE = re.compile(r"\s+")
 _FALLBACK_TOPIC = "新しいスレッド"
+
+# Minimum length for a message to be considered instruction-like.
+_INSTRUCTION_MIN_LEN = 15
 
 
 def heuristic_topic(first_message: str) -> str:
@@ -57,13 +74,26 @@ def heuristic_topic(first_message: str) -> str:
     return text[:_TOPIC_MAX_LEN]
 
 
-async def _invoke_claude_haiku(first_message: str) -> str | None:
-    """Call ``claude -p --model haiku`` and return its trimmed stdout.
+def _looks_like_instruction(message: str) -> bool:
+    """Return True when the message is instruction-like (not a question/short reply).
 
-    Returns None on any failure (non-zero exit, timeout, empty output,
-    OSError when the binary is missing, etc.). Never raises.
+    Used as a lightweight gate before invoking the retitle LLM — skips
+    short messages and clear questions so the LLM is not called on every
+    back-and-forth exchange.
     """
-    prompt = _LLM_PROMPT_TEMPLATE.format(msg=first_message)
+    msg = message.strip()
+    if len(msg) < _INSTRUCTION_MIN_LEN:
+        return False
+    # Questions typically end with ? or ？
+    return not (msg.endswith("?") or msg.endswith("？"))
+
+
+async def _call_claude_p(prompt: str) -> str | None:
+    """Call ``claude -p --model haiku`` with the given raw prompt string.
+
+    Returns the trimmed, quote-stripped response or None on any failure.
+    Never raises.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude",
@@ -96,13 +126,21 @@ async def _invoke_claude_haiku(first_message: str) -> str | None:
         return None
 
     raw = (stdout or b"").decode("utf-8", errors="replace").strip()
-    # The model sometimes wraps output in quotes or adds trailing punctuation.
     raw = raw.strip("「」\"' \n\r\t　。.")
     if not raw:
         return None
-    # Collapse any internal whitespace and clip to the limit.
     raw = _WHITESPACE_RE.sub(" ", raw)
     return raw[:_TOPIC_MAX_LEN]
+
+
+async def _invoke_claude_haiku(first_message: str) -> str | None:
+    """Call ``_call_claude_p`` with the standard topic-generation prompt.
+
+    Returns None on any failure.  Preserved as a named function so that
+    existing tests can patch it by name.
+    """
+    prompt = _LLM_PROMPT_TEMPLATE.format(msg=first_message)
+    return await _call_claude_p(prompt)
 
 
 async def generate_topic(first_message: str) -> tuple[str, str]:
@@ -123,3 +161,29 @@ async def generate_topic(first_message: str) -> tuple[str, str]:
     if llm:
         return llm, "llm"
     return heuristic_topic(first_message), "heuristic"
+
+
+async def maybe_retitle(message: str, current_topic: str) -> str | None:
+    """Return a new topic if the message warrants a retitle, else None (#121).
+
+    Gate: skips short messages and questions (returns None immediately).
+    LLM: asked to return ``current_topic`` verbatim if still applicable,
+    or a new ≤20-char topic when the work has fundamentally changed.
+    Comparison: returns None when LLM output equals ``current_topic``
+    byte-for-byte (no Discord rename needed).
+
+    On any LLM failure, returns None (no retitle — safe default).
+    """
+    if not _looks_like_instruction(message):
+        return None
+
+    prompt = _RETITLE_PROMPT_TEMPLATE.format(current_topic=current_topic, msg=message)
+    try:
+        new_topic = await _call_claude_p(prompt)
+    except Exception:
+        logger.debug("maybe_retitle: LLM call failed", exc_info=True)
+        return None
+
+    if not new_topic or new_topic == current_topic:
+        return None
+    return new_topic
