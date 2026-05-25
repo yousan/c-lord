@@ -12,7 +12,7 @@ class TestTmuxSessionManager:
 
     def test_create_session_new_window(self) -> None:
         """First call creates global session + new window with @thread_id."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -52,7 +52,7 @@ class TestTmuxSessionManager:
 
     def test_create_session_already_exists(self) -> None:
         """When a window already exists for the thread, re-use it."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -67,7 +67,7 @@ class TestTmuxSessionManager:
 
     def test_create_session_tmux_unavailable(self) -> None:
         """When tmux is not installed, return a fallback name."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -78,7 +78,7 @@ class TestTmuxSessionManager:
 
     def test_create_session_increments_counter(self) -> None:
         """Each new window gets an incrementing work number."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -108,7 +108,7 @@ class TestTmuxSessionManager:
         assert name2 == "work2"
 
     def test_session_exists_true(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -117,7 +117,7 @@ class TestTmuxSessionManager:
             assert mgr.session_exists(12345) is True
 
     def test_session_exists_false(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -126,7 +126,7 @@ class TestTmuxSessionManager:
             assert mgr.session_exists(99999) is False
 
     def test_kill_session(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -147,7 +147,7 @@ class TestTmuxSessionManager:
         assert f"{SESSION_NAME}:work1" in args
 
     def test_kill_session_not_found(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -156,7 +156,7 @@ class TestTmuxSessionManager:
             assert mgr.kill_session(99999) is False
 
     def test_list_sessions(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -182,7 +182,7 @@ class TestTmuxSessionManager:
         assert windows[1]["thread_id"] == "222"
 
     def test_list_sessions_empty(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -192,7 +192,7 @@ class TestTmuxSessionManager:
         assert windows == []
 
     def test_cleanup_orphaned(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -223,7 +223,7 @@ class TestTmuxSessionManager:
         assert killed == 2
 
     def test_cleanup_orphaned_tmux_unavailable(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
 
         killed = mgr.cleanup_orphaned(active_thread_ids=set())
@@ -231,7 +231,7 @@ class TestTmuxSessionManager:
 
     def test_find_window_for_thread_cache_hit(self) -> None:
         """Cache hit with valid verification returns the window name."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work3"
 
@@ -243,7 +243,7 @@ class TestTmuxSessionManager:
 
     def test_find_window_for_thread_stale_cache(self) -> None:
         """Stale cache entry triggers rebuild from tmux."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -263,7 +263,7 @@ class TestTmuxSessionManager:
 
     def test_rebuild_mapping(self) -> None:
         """_rebuild_mapping populates _thread_to_window and updates _next_work_id."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -288,7 +288,7 @@ class TestTmuxSessionManager:
         the working directory, which contains the thread ID by convention
         (``<base>/<thread_id>``).
         """
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -316,7 +316,7 @@ class TestTmuxSessionManager:
 
     def test_rebuild_mapping_prefers_option_over_path(self) -> None:
         """When @thread_id is set, it wins over pane_current_path inference."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -333,7 +333,7 @@ class TestTmuxSessionManager:
 
     def test_rebuild_mapping_empty(self) -> None:
         """_rebuild_mapping with no windows results in empty state."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="")
@@ -344,7 +344,7 @@ class TestTmuxSessionManager:
 
     def test_ensure_session_already_exists(self) -> None:
         """_ensure_session returns True when session already exists."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
@@ -355,7 +355,7 @@ class TestTmuxSessionManager:
 
     def test_ensure_session_creates_new(self) -> None:
         """_ensure_session creates session when it doesn't exist."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -366,7 +366,7 @@ class TestTmuxSessionManager:
 
     def test_ensure_session_creation_fails(self) -> None:
         """_ensure_session returns False when creation fails."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -376,7 +376,7 @@ class TestTmuxSessionManager:
             assert mgr._ensure_session() is False
 
     def test_graceful_degrade_when_not_installed(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         with patch("c_lord.tmux._tmux_available", return_value=False):
             mgr._available = None  # Reset to trigger check
             assert mgr.session_exists(12345) is False
@@ -387,7 +387,7 @@ class TestTmuxSessionManager:
 
     def test_start_claude_sends_command_with_prompt(self) -> None:
         """start_claude sends the claude command with the prompt as CLI arg."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -412,7 +412,7 @@ class TestTmuxSessionManager:
         assert "Enter" in args
 
     def test_start_claude_no_window_returns_false(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -422,14 +422,14 @@ class TestTmuxSessionManager:
         assert result is False
 
     def test_start_claude_tmux_unavailable(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
 
         assert mgr.start_claude(12345, "hello") is False
 
     def test_start_claude_dangerously_skip_permissions(self) -> None:
         """start_claude uses --dangerously-skip-permissions flag."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -447,7 +447,7 @@ class TestTmuxSessionManager:
 
     def test_start_claude_escapes_single_quotes(self) -> None:
         """Prompt with single quotes is properly escaped."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -465,7 +465,7 @@ class TestTmuxSessionManager:
         assert "'" in cmd_str
 
     def test_send_input_sends_text_and_enter(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -502,7 +502,7 @@ class TestTmuxSessionManager:
         prev = os.environ.get("CLORD_BRIDGE_MODE")
         os.environ["CLORD_BRIDGE_MODE"] = "jsonl"
         try:
-            mgr = TmuxSessionManager()
+            mgr = TmuxSessionManager(mapping_path="")
             mgr._available = True
             mgr._thread_to_window[12345] = "work1"
 
@@ -530,7 +530,7 @@ class TestTmuxSessionManager:
         prev = os.environ.get("CLORD_BRIDGE_MODE")
         os.environ.pop("CLORD_BRIDGE_MODE", None)
         try:
-            mgr = TmuxSessionManager()
+            mgr = TmuxSessionManager(mapping_path="")
             mgr._available = True
             mgr._thread_to_window[12345] = "work1"
 
@@ -552,7 +552,7 @@ class TestTmuxSessionManager:
                 os.environ["CLORD_BRIDGE_MODE"] = prev
 
     def test_send_input_no_window(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -560,12 +560,12 @@ class TestTmuxSessionManager:
             assert mgr.send_input(99999, "hello") is False
 
     def test_send_input_tmux_unavailable(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
         assert mgr.send_input(12345, "hello") is False
 
     def test_capture_pane_returns_text(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -587,7 +587,7 @@ class TestTmuxSessionManager:
         assert "-S" in args
 
     def test_capture_pane_custom_history(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -603,7 +603,7 @@ class TestTmuxSessionManager:
         assert "-100" in args
 
     def test_capture_pane_no_window(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -611,12 +611,12 @@ class TestTmuxSessionManager:
             assert mgr.capture_pane(99999) == ""
 
     def test_capture_pane_tmux_unavailable(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
         assert mgr.capture_pane(12345) == ""
 
     def test_send_interrupt_sends_ctrl_c(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -635,7 +635,7 @@ class TestTmuxSessionManager:
         assert "C-c" in args
 
     def test_send_interrupt_no_window(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -643,12 +643,12 @@ class TestTmuxSessionManager:
             assert mgr.send_interrupt(99999) is False
 
     def test_send_interrupt_tmux_unavailable(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
         assert mgr.send_interrupt(12345) is False
 
     def test_is_claude_running_true(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -660,7 +660,7 @@ class TestTmuxSessionManager:
             assert mgr.is_claude_running(12345) is True
 
     def test_is_claude_running_false_other_command(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -672,7 +672,7 @@ class TestTmuxSessionManager:
             assert mgr.is_claude_running(12345) is False
 
     def test_is_claude_running_no_window(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -680,7 +680,7 @@ class TestTmuxSessionManager:
             assert mgr.is_claude_running(99999) is False
 
     def test_is_claude_running_tmux_unavailable(self) -> None:
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
         assert mgr.is_claude_running(12345) is False
 
@@ -688,17 +688,17 @@ class TestTmuxSessionManager:
 
     def test_default_session_name(self) -> None:
         """Default session name is the SESSION_NAME constant."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         assert mgr.session_name == SESSION_NAME
 
     def test_custom_session_name(self) -> None:
         """Custom session name is used."""
-        mgr = TmuxSessionManager(session_name="mybot")
+        mgr = TmuxSessionManager(session_name="mybot", mapping_path="")
         assert mgr.session_name == "mybot"
 
     def test_custom_session_name_used_in_commands(self) -> None:
         """Custom session name appears in tmux commands."""
-        mgr = TmuxSessionManager(session_name="mybot")
+        mgr = TmuxSessionManager(session_name="mybot", mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
 
@@ -716,7 +716,7 @@ class TestTmuxSessionManager:
 
     def test_custom_session_name_in_ensure_session(self) -> None:
         """Custom session name is used when creating the tmux session."""
-        mgr = TmuxSessionManager(session_name="custom")
+        mgr = TmuxSessionManager(session_name="custom", mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -735,14 +735,14 @@ class TestTmuxSessionManager:
 
     def test_none_session_name_uses_default(self) -> None:
         """Passing None as session_name uses the default."""
-        mgr = TmuxSessionManager(session_name=None)
+        mgr = TmuxSessionManager(session_name=None, mapping_path="")
         assert mgr.session_name == SESSION_NAME
 
     # ── remap_window ────────────────────────────────────────────────
 
     def test_remap_window_success(self) -> None:
         """remap_window updates @thread_id and cache for an existing window."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -766,7 +766,7 @@ class TestTmuxSessionManager:
 
     def test_remap_window_not_found(self) -> None:
         """remap_window returns False when the window does not exist."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
@@ -779,7 +779,7 @@ class TestTmuxSessionManager:
 
     def test_remap_window_updates_cache(self) -> None:
         """remap_window removes old mapping and adds new one."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         # Pre-existing mapping: thread 11111 → work1
         mgr._thread_to_window[11111] = "work1"
@@ -799,7 +799,7 @@ class TestTmuxSessionManager:
 
     def test_remap_window_tmux_unavailable(self) -> None:
         """remap_window returns False when tmux is not installed."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = False
 
         result = mgr.remap_window(12345, "work1")
@@ -814,7 +814,7 @@ class TestTmuxSessionManager:
         returns rc=1 ("no such option"). Existence must instead be checked via
         ``list-windows``.
         """
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         def fake_run(argv: list[str], *args, **kwargs) -> MagicMock:
@@ -837,7 +837,7 @@ class TestTmuxSessionManager:
 
     def test_remap_window_truly_missing(self) -> None:
         """remap_window returns False when window genuinely does not exist."""
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
         def fake_run(argv: list[str], *args, **kwargs) -> MagicMock:
@@ -854,6 +854,162 @@ class TestTmuxSessionManager:
         assert result is False
         assert 77777 not in mgr._thread_to_window
 
+    # ── Issue #113: Fix A — subdirectory cd + restart ────────────────
+
+    def test_create_session_adopts_window_pane_in_subdir(self) -> None:
+        """After tmux restart, adopt window even when pane has cd'd into a subdir.
+
+        Regression for #113 / Fix-A: pane_current_path == working_dir/subdir
+        must still be recognised as the same session window.
+        """
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        WORKING_DIR = "/tmp/c-lord-test/mydir"
+        SUBDIR = f"{WORKING_DIR}/src/components"
+        THREAD_ID = 22222
+
+        recorded_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], *_args: object, **_kwargs: object) -> MagicMock:
+            recorded_calls.append(list(argv))
+            cmd = argv[1] if len(argv) > 1 else ""
+            if cmd == "list-windows":
+                # pane has cd'd into a subdirectory
+                return MagicMock(returncode=0, stdout=f"work1\t{SUBDIR}\n")
+            if cmd == "show-option":
+                return MagicMock(returncode=1, stdout="")
+            if cmd == "has-session":
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            name = mgr.create_session(THREAD_ID, WORKING_DIR)
+
+        assert name == "work1", f"Expected work1 (adopted), got {name}"
+        assert mgr._thread_to_window[THREAD_ID] == "work1"
+        new_window_calls = [c for c in recorded_calls if "new-window" in c]
+        assert new_window_calls == [], f"new-window was unexpectedly called: {new_window_calls}"
+
+    def test_create_session_does_not_adopt_unrelated_dir(self) -> None:
+        """A window cd'd to a completely different directory must NOT be adopted."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        WORKING_DIR = "/tmp/c-lord-test/mydir"
+        THREAD_ID = 33333
+
+        recorded_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], *_args: object, **_kwargs: object) -> MagicMock:
+            recorded_calls.append(list(argv))
+            cmd = argv[1] if len(argv) > 1 else ""
+            if cmd == "list-windows":
+                # pane is at a completely unrelated path
+                return MagicMock(returncode=0, stdout="work1\t/home/user/other-project\n")
+            if cmd == "show-option":
+                return MagicMock(returncode=1, stdout="")
+            if cmd == "has-session":
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            name = mgr.create_session(THREAD_ID, WORKING_DIR)
+
+        # Must create a new window, not adopt the unrelated one
+        new_window_calls = [c for c in recorded_calls if "new-window" in c]
+        assert new_window_calls != [], "new-window should have been called for unrelated dir"
+        assert name == "work2"
+
+    # ── Issue #113: Fix B — persistent window mapping file ───────────
+
+    def test_rebuild_mapping_restores_from_file(self) -> None:
+        """_rebuild_mapping restores @thread_id from persistent mapping file.
+
+        Regression for #113 / Fix-B: when @thread_id is cleared (tmux restart)
+        and the pane has cd'd away from the session dir, the mapping file is the
+        fallback source of truth. _rebuild_mapping must read it and repair
+        @thread_id so create_session can find the window without creating a twin.
+        """
+        import json
+        import tempfile
+
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"22222": "work1"}, f)
+            mapping_path = f.name
+
+        mgr._mapping_path = mapping_path
+
+        recorded_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], *_args: object, **_kwargs: object) -> MagicMock:
+            recorded_calls.append(list(argv))
+            cmd = argv[1] if len(argv) > 1 else ""
+            if cmd == "list-windows":
+                # pane is at /tmp (totally different from session dir)
+                return MagicMock(returncode=0, stdout="work1\t/tmp\n")
+            if cmd == "show-option":
+                return MagicMock(returncode=1, stdout="")
+            if cmd == "set-option":
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            mgr._rebuild_mapping()
+
+        # thread_id 22222 must have been restored from file
+        assert mgr._thread_to_window.get(22222) == "work1"
+        set_calls = [c for c in recorded_calls if "set-option" in c and "@thread_id" in c]
+        assert any("22222" in c for c in set_calls), "@thread_id not restored from file"
+
+        import os
+        os.unlink(mapping_path)
+
+    def test_create_session_adopts_window_via_mapping_file(self) -> None:
+        """create_session finds the window via mapping file when pane has cd'd away.
+
+        Regression for #113 / Fix-B end-to-end: @thread_id cleared, pane at /tmp,
+        but mapping file has the correct thread→window entry.
+        """
+        import json
+        import tempfile
+
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        WORKING_DIR = "/tmp/c-lord-test/session"
+        THREAD_ID = 44444
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({str(THREAD_ID): "work1"}, f)
+            mapping_path = f.name
+
+        mgr._mapping_path = mapping_path
+
+        recorded_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], *_args: object, **_kwargs: object) -> MagicMock:
+            recorded_calls.append(list(argv))
+            cmd = argv[1] if len(argv) > 1 else ""
+            if cmd == "list-windows":
+                # pane at /tmp, not WORKING_DIR (cd'd away) — but file has the mapping
+                return MagicMock(returncode=0, stdout="work1\t/tmp\n")
+            if cmd == "show-option":
+                return MagicMock(returncode=1, stdout="")
+            if cmd == "has-session":
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run):
+            name = mgr.create_session(THREAD_ID, WORKING_DIR)
+
+        assert name == "work1", f"Expected work1 (found via mapping file), got {name}"
+        new_window_calls = [c for c in recorded_calls if "new-window" in c]
+        assert new_window_calls == [], f"new-window was called despite mapping file entry"
+
+        import os
+        os.unlink(mapping_path)
+
     # ── Issue #111: duplicate window prevention after tmux restart ───
 
     def test_create_session_adopts_window_by_dir_on_restart(self) -> None:
@@ -863,7 +1019,7 @@ class TestTmuxSessionManager:
         pane is still in the original working_dir, create_session must re-use
         the existing window rather than creating a duplicate (2:1 twin window).
         """
-        mgr = TmuxSessionManager()
+        mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         # Path with no 10+-digit suffix so _rebuild_mapping path-regex won't recover it.
         WORKING_DIR = "/tmp/c-lord-test/mydir"
