@@ -105,6 +105,22 @@ class SessionRepository:
             await db.commit()
             return cursor.rowcount > 0
 
+    async def reset(self, thread_id: int) -> bool:
+        """Clear the session_id but keep the row, so the next message starts fresh.
+
+        Used by /clear: the row's existence is what allows on_message to route
+        future messages into _handle_thread_reply (issue #117).
+        Returns True if a row was updated, False if no row existed.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE sessions SET session_id = '', last_used_at = datetime('now', 'localtime')"
+                " WHERE thread_id = ?",
+                (thread_id,),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     # ── Issue #95: thread naming redesign helpers ─────────────────────
 
     async def get_by_thread_id(self, thread_id: int) -> SessionRecord | None:
