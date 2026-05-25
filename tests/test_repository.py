@@ -54,6 +54,32 @@ class TestSessionRepository:
     async def test_delete_nonexistent(self, repo):
         assert await repo.delete(99999) is False
 
+    # ── Issue #117: reset (clear) ─────────────────────────────────────
+
+    async def test_reset_clears_session_id(self, repo):
+        """reset() keeps the row but empties session_id so next message starts fresh."""
+        await repo.save(thread_id=500, session_id="sess-active")
+        result = await repo.reset(500)
+        assert result is True
+        record = await repo.get(500)
+        # Row still exists (on_message can find it)
+        assert record is not None
+        # session_id is falsy — treated as "no active session" by callers
+        assert not record.session_id
+
+    async def test_reset_nonexistent(self, repo):
+        """reset() on a row that does not exist returns False."""
+        assert await repo.reset(99999) is False
+
+    async def test_reset_preserves_other_fields(self, repo):
+        """reset() keeps working_dir and model intact."""
+        await repo.save(thread_id=600, session_id="sess-1", working_dir="/proj", model="opus")
+        await repo.reset(600)
+        record = await repo.get(600)
+        assert record is not None
+        assert record.working_dir == "/proj"
+        assert record.model == "opus"
+
     async def test_cleanup_old(self, repo):
         # Create a session (it will be "now")
         await repo.save(thread_id=400, session_id="recent")

@@ -359,7 +359,7 @@ class ClaudeChatCog(commands.Cog):
         if isinstance(channel, discord.Thread):
             # Continue in existing thread
             record = await self.repo.get(channel.id)
-            session_id = record.session_id if record else None
+            session_id = (record.session_id or None) if record else None
             seed_message = await channel.send(prompt)
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
             await interaction.followup.send("Session completed.", silent=True)
@@ -479,8 +479,8 @@ class ClaudeChatCog(commands.Cog):
             await runner.kill()
             del self._active_runners[interaction.channel.id]
 
-        deleted = await self.repo.delete(interaction.channel.id)
-        if deleted:
+        reset = await self.repo.reset(interaction.channel.id)
+        if reset:
             await interaction.response.send_message(
                 "\U0001f504 Session cleared. Next message will start a fresh session."
             )
@@ -681,7 +681,7 @@ class ClaudeChatCog(commands.Cog):
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             record = await self.repo.get(thread.id)
-            session_id = record.session_id if record else None
+            session_id = (record.session_id or None) if record else None
             prompt, image_paths = await self._build_prompt_and_images(message)
 
             # Interrupt any active session in this thread before starting a new one.
