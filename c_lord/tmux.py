@@ -672,6 +672,7 @@ class TmuxSessionManager:
         *,
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
+        try_continue: bool = False,
     ) -> bool:
         """Start Claude Code inside the tmux window for *thread_id*.
 
@@ -698,7 +699,10 @@ class TmuxSessionManager:
             return False
 
         target = f"{self.session_name}:{window}"
-        cmd_parts = ["env", "-u", "CLAUDECODE", "claude", "--model", model]
+        cmd_parts = ["env", "-u", "CLAUDECODE", "claude"]
+        if try_continue:
+            cmd_parts.append("--continue")
+        cmd_parts.extend(["--model", model])
         if dangerously_skip_permissions:
             cmd_parts.append("--dangerously-skip-permissions")
         else:

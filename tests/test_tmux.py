@@ -464,6 +464,43 @@ class TestTmuxSessionManager:
         # Single quote should be escaped
         assert "'" in cmd_str
 
+    def test_start_claude_with_try_continue_flag(self) -> None:
+        """start_claude with try_continue=True includes --continue in the command."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            result = mgr.start_claude(12345, "hello", try_continue=True)
+
+        assert result is True
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--continue" in cmd_str
+
+    def test_start_claude_default_no_try_continue(self) -> None:
+        """start_claude by default does NOT include --continue (fresh start)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            mgr.start_claude(12345, "hello")
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--continue" not in cmd_str
+
     def test_send_input_sends_text_and_enter(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True

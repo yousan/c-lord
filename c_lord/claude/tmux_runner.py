@@ -41,6 +41,12 @@ _STARTUP_TIMEOUT = 30.0
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
 
+# How long to wait after sending ``claude --continue`` before checking whether
+# Claude actually started (issue #123 Part 2).  If Claude is still not running
+# after this delay, ``--continue`` failed (no session to resume) and we fall
+# back to a plain fresh start.
+_CONTINUE_CHECK_DELAY = 3.0
+
 # Patterns that indicate a trust/safety prompt that needs Enter to dismiss.
 _TRUST_PROMPT_MARKERS = (
     "Yes, I trust this folder",
@@ -231,6 +237,9 @@ class TmuxClaudeRunner:
                 )
                 return
         else:
+            # Try --continue first to recover context after a bot restart.
+            # If Claude exits immediately (no session to resume), fall back to
+            # a plain fresh start (issue #123 Part 2).
             ok = await asyncio.to_thread(
                 self._tmux.start_claude,
                 self._thread_id,
@@ -238,6 +247,7 @@ class TmuxClaudeRunner:
                 self.model,
                 permission_mode=self._permission_mode,
                 dangerously_skip_permissions=self._dangerously_skip_permissions,
+                try_continue=True,
             )
             if not ok:
                 yield StreamEvent(
@@ -247,6 +257,34 @@ class TmuxClaudeRunner:
                     error="Failed to start Claude in tmux",
                 )
                 return
+
+            # Wait briefly and check whether --continue actually started Claude.
+            await asyncio.sleep(_CONTINUE_CHECK_DELAY)
+            still_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)
+            if not still_running:
+                # --continue failed (no session to resume); start fresh.
+                logger.info(
+                    "start_claude --continue found no session for thread %d; "
+                    "falling back to fresh start",
+                    self._thread_id,
+                )
+                ok = await asyncio.to_thread(
+                    self._tmux.start_claude,
+                    self._thread_id,
+                    prompt,
+                    self.model,
+                    permission_mode=self._permission_mode,
+                    dangerously_skip_permissions=self._dangerously_skip_permissions,
+                    try_continue=False,
+                )
+                if not ok:
+                    yield StreamEvent(
+                        raw={},
+                        message_type=MessageType.RESULT,
+                        is_complete=True,
+                        error="Failed to start Claude in tmux",
+                    )
+                    return
 
             # Handle trust prompt if it appears.
             await self._handle_startup_prompts()
