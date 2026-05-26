@@ -1,0 +1,12 @@
+❯ git push --force origin main
+
+● Bash(command: "git push --force origin main")
+
+  remote: Resolving deltas: 100% (3/3), done.
+
+  ⚠ Security warning: force push will overwrite remote history.
+  Continue anyway? [y/N]
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+-- INSERT --   ⏵⏵ bypass permissions on /home/yousan/c-lord

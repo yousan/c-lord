@@ -72,6 +72,24 @@ _YN_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]", re.IGNORECASE)
 # Used to detect interactive menus regardless of whether the question text is known.
 _INTERACTIVE_MENU_RE = re.compile(r"^\s*❯\s+\d+\.", re.MULTILINE)
 
+# Number of lines from the bottom of the pane to scan for interactive prompts.
+# Real Claude Code prompts always appear right before the input area (❯) at the
+# bottom of the terminal.  Conversation text higher up in the scrollback must
+# not trigger auto-accept (#156).
+_PERMISSION_SCAN_LINES = 15
+
+
+def _permission_zone(text: str) -> str:
+    """Return the bottom N lines of the pane where real prompts appear.
+
+    Only this zone is scanned for permission / y/N / unknown-interactive markers.
+    Conversation text in the scrollback above is excluded, preventing false
+    positives when Claude's own output contains marker phrases (#156).
+    """
+    lines = text.splitlines()
+    return "\n".join(lines[-_PERMISSION_SCAN_LINES:])
+
+
 # Regex for separator lines (all box-drawing horizontal characters).
 _SEPARATOR_RE = re.compile(r"^[─━═─\s]{10,}$")
 
@@ -529,13 +547,22 @@ class TmuxClaudeRunner:
 
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
-        """Check if the pane shows a permission/approval prompt."""
-        return any(marker in text for marker in _PERMISSION_PROMPT_MARKERS)
+        """Check if the pane shows a permission/approval prompt.
+
+        Only scans the bottom N lines (_PERMISSION_SCAN_LINES) to avoid
+        false positives from conversation text containing marker phrases (#156).
+        """
+        zone = _permission_zone(text)
+        return any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS)
 
     @staticmethod
     def _is_yn_prompt(text: str) -> bool:
-        """Return True if the pane contains a [y/N] or [Y/n] inline prompt."""
-        return bool(_YN_PROMPT_RE.search(text))
+        """Return True if the pane contains a [y/N] or [Y/n] inline prompt.
+
+        Only scans the bottom N lines to avoid matching [y/N] in conversation (#156).
+        """
+        zone = _permission_zone(text)
+        return bool(_YN_PROMPT_RE.search(zone))
 
     @staticmethod
     def _has_unknown_interactive(text: str) -> bool:
@@ -544,16 +571,20 @@ class TmuxClaudeRunner:
         Detects numbered-menu cursors (❯ 1. ...) and [y/N] prompts that do NOT
         match any known trust or permission marker. Used to surface unknown prompts
         to Discord rather than letting the session stall silently.
+
+        Only scans the bottom N lines (_PERMISSION_SCAN_LINES) to avoid false
+        positives from conversation text (#156).
         """
         if not text:
             return False
-        has_menu = bool(_INTERACTIVE_MENU_RE.search(text)) or bool(_YN_PROMPT_RE.search(text))
+        zone = _permission_zone(text)
+        has_menu = bool(_INTERACTIVE_MENU_RE.search(zone)) or bool(_YN_PROMPT_RE.search(zone))
         if not has_menu:
             return False
         # Exclude already-handled prompts so they don't double-fire.
-        if any(marker in text for marker in _TRUST_PROMPT_MARKERS):
+        if any(marker in zone for marker in _TRUST_PROMPT_MARKERS):
             return False
-        return not any(marker in text for marker in _PERMISSION_PROMPT_MARKERS)
+        return not any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS)
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.

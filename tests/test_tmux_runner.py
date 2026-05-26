@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1397,7 +1398,7 @@ class TestContinueFallback:
         )
         tmux_manager.is_claude_running.side_effect = [
             False,  # initial check
-            True,   # after --continue delay — Claude started successfully
+            True,  # after --continue delay — Claude started successfully
         ]
         pane = _make_pane(["● Resumed."])
         tmux_manager.capture_pane.return_value = pane
@@ -1415,7 +1416,9 @@ class TestContinueFallback:
 
         # Only one start_claude call: try_continue=True (--continue succeeded)
         tmux_manager.start_claude.assert_called_once_with(
-            12345, "hello", "sonnet",
+            12345,
+            "hello",
+            "sonnet",
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=True,
@@ -1499,7 +1502,9 @@ class TestContinueFallback:
 
         # Exactly ONE start_claude call — direct fresh, no --continue attempt
         tmux_manager.start_claude.assert_called_once_with(
-            12345, "hello", "sonnet",
+            12345,
+            "hello",
+            "sonnet",
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=False,
@@ -1507,7 +1512,6 @@ class TestContinueFallback:
         # Only one is_claude_running call (no post-continue check)
         assert tmux_manager.is_claude_running.call_count == 1
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
-
 
 
 # -- Tests for new permission markers (v2.1+) ---------------------------------
@@ -1547,7 +1551,7 @@ class TestYesNoPromptDetection:
         text = "Continue anyway? [y/N]"
         assert TmuxClaudeRunner._is_yn_prompt(text) is True
 
-    def test_detects_yn_uppercase_Y(self) -> None:
+    def test_detects_yn_uppercase_y(self) -> None:
         text = "Security warning. Continue anyway? [Y/n]"
         assert TmuxClaudeRunner._is_yn_prompt(text) is True
 
@@ -1593,10 +1597,7 @@ class TestUnknownTuiInteractive:
         assert TmuxClaudeRunner._has_unknown_interactive(text) is True
 
     def test_update_prompt_detected(self) -> None:
-        text = (
-            "A new version of Claude Code is available.\n"
-            "Update now? [y/N]"
-        )
+        text = "A new version of Claude Code is available.\nUpdate now? [y/N]"
         assert TmuxClaudeRunner._has_unknown_interactive(text) is True
 
     def test_yn_unknown_prompt_detected(self) -> None:
@@ -1633,3 +1634,45 @@ class TestAcceptPermissionPromptYN:
             mock_run.assert_called_once()
             args = mock_run.call_args[0][0]
             assert "Enter" in args
+
+
+# -- Regression tests for #156 (y-spam bug: conversation text triggers auto-accept) ----
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "panes"
+
+
+def _load_fixture(name: str) -> str:
+    return (_FIXTURES_DIR / name).read_text()
+
+
+class TestPermissionPromptTailAnchor:
+    """Regression suite for #156: detection must not fire on conversation-body markers.
+
+    Each test loads a real captured pane fixture so that future breakage is
+    immediately reproducible ('this pane snapshot broke things').
+    """
+
+    def test_bug156_yn_in_conversation_no_permission_trigger(self) -> None:
+        """Conversation text containing [y/N] MUST NOT trigger _has_permission_prompt."""
+        pane = _load_fixture("bug_156_yn_in_conversation.txt")
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+
+    def test_bug156_yn_in_conversation_no_yn_trigger(self) -> None:
+        """Conversation text containing [y/N] MUST NOT trigger _is_yn_prompt."""
+        pane = _load_fixture("bug_156_yn_in_conversation.txt")
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+
+    def test_real_yn_prompt_at_bottom_still_detected(self) -> None:
+        """A real [y/N] prompt at the bottom of the pane MUST be detected."""
+        pane = _load_fixture("real_yn_prompt_at_bottom.txt")
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is True
+
+    def test_real_yn_prompt_is_yn(self) -> None:
+        """A real [y/N] prompt at the bottom MUST be identified as y/N style."""
+        pane = _load_fixture("real_yn_prompt_at_bottom.txt")
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is True
+
+    def test_bug156_conversation_unknown_interactive_not_triggered(self) -> None:
+        """Conversation-body markers must not trigger unknown-interactive detection."""
+        pane = _load_fixture("bug_156_yn_in_conversation.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
