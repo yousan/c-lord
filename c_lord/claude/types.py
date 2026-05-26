@@ -168,6 +168,7 @@ class StreamEvent:
     is_plan_approval: bool = False
     permission_request: PermissionRequest | None = None
     elicitation: ElicitationRequest | None = None
+    unknown_tui_prompt: str | None = None
     is_compact: bool = False
     compact_trigger: str | None = None
     compact_pre_tokens: int | None = None
