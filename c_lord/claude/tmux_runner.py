@@ -17,7 +17,7 @@ import re
 from collections.abc import AsyncGenerator
 
 from ..tmux import TmuxSessionManager
-from .types import MessageType, StreamEvent
+from .types import AskOption, AskQuestion, MessageType, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,11 @@ _STARTUP_TIMEOUT = 30.0
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
 _UNKNOWN_ALERT_DELAY = 5.0
+
+# How long an AskUserQuestion menu must be stable before bridging it to Discord
+# buttons (seconds).  Shorter than the unknown delay — it is a definite,
+# expected prompt — but still guards against a half-drawn menu frame (#166).
+_ASK_ALERT_DELAY = 1.5
 
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
@@ -131,6 +136,79 @@ def _unknown_prompt_signature(text: str) -> str:
 
 # Regex for separator lines (all box-drawing horizontal characters).
 _SEPARATOR_RE = re.compile(r"^[─━═─\s]{10,}$")
+
+# -- AskUserQuestion TUI menu parsing (#166) ----------------------------------
+# The AskUserQuestion tool renders a numbered menu in the pane that c-lord
+# bridges to Discord buttons.  Recent Claude Code (v2.1.150) appends two
+# meta-affordances — "Type something." and "Chat about this" — instead of the
+# older "Other".  "Chat about this" is the most stable signature of the menu.
+_ASK_SIGNATURE = "Chat about this"
+_ASK_META_LABELS = ("Type something.", "Chat about this")
+_ASK_HEADER_RE = re.compile(r"^\s*☐\s+(.+?)\s*$")
+# A numbered option line, with or without the leading ❯ cursor.
+_ASK_OPTION_RE = re.compile(r"^\s*❯?\s*\d+\.\s+(.+?)\s*$", re.MULTILINE)
+
+
+def _is_ask_question(text: str) -> bool:
+    """True iff the pane shows an AskUserQuestion TUI menu (current variant)."""
+    return _ASK_SIGNATURE in text and bool(_ASK_OPTION_RE.search(text))
+
+
+def _parse_ask_from_pane(text: str) -> AskQuestion | None:
+    """Parse an AskUserQuestion TUI menu from the pane into an ``AskQuestion``.
+
+    Returns ``None`` when the pane is not an AskUserQuestion menu (e.g. a Plan
+    approval menu, an idle prompt, or an unrelated numbered list).
+
+    The returned ``options`` list holds only the *real* choices in display
+    order, with meta-affordances excluded.  Because the TUI numbers real
+    options ``1..M`` contiguously before the meta-options, the 0-based index of
+    an option in this list equals the number of ``Down`` presses needed to land
+    the cursor on it from the top (see ``TmuxClaudeRunner.answer_menu``).
+    """
+    if _ASK_SIGNATURE not in text:
+        return None
+
+    lines = text.splitlines()
+
+    header = ""
+    header_idx = -1
+    for i, line in enumerate(lines):
+        m = _ASK_HEADER_RE.match(line)
+        if m:
+            header = m.group(1).strip()
+            header_idx = i
+            break
+
+    options: list[AskOption] = []
+    first_opt_idx: int | None = None
+    scan_from = header_idx + 1 if header_idx >= 0 else 0
+    for i in range(scan_from, len(lines)):
+        m = _ASK_OPTION_RE.match(lines[i])
+        if not m:
+            continue
+        label = m.group(1).strip()
+        if label in _ASK_META_LABELS:
+            continue
+        if first_opt_idx is None:
+            first_opt_idx = i
+        options.append(AskOption(label=label))
+
+    if not options:
+        return None
+
+    # The question is the last non-empty, non-separator line between the header
+    # and the first option (it sits closest to the options).
+    question = ""
+    end = first_opt_idx if first_opt_idx is not None else len(lines)
+    for line in lines[scan_from:end]:
+        s = line.strip()
+        if not s or _SEPARATOR_RE.match(line):
+            continue
+        question = s
+
+    return AskQuestion(question=question, header=header, options=options)
+
 
 # TUI status bar patterns at the very bottom.
 # Use prefix-only ("-- INSERT") because the TUI sometimes omits the closing "--"
@@ -409,6 +487,10 @@ class TmuxClaudeRunner:
         # lingers we must NOT re-alert every poll (#165); we re-alert only when
         # the menu changes or after it clears (reset to None below).
         last_alerted_unknown: str | None = None
+        # AskUserQuestion (#166): seconds the menu has been stable, and the
+        # signature of the menu we already bridged to Discord (dedup).
+        ask_stable = 0.0
+        last_bridged_ask: str | None = None
 
         while not self._stopped and elapsed < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
@@ -420,8 +502,35 @@ class TmuxClaudeRunner:
             if self._has_permission_prompt(current):
                 unknown_interactive_stable = 0.0
                 last_alerted_unknown = None
+                ask_stable = 0.0
+                last_bridged_ask = None
                 await self._accept_permission_prompt(current)
                 continue
+
+            # AskUserQuestion menu → bridge to Discord buttons (#166).
+            # Yielding pane_ask suspends this generator while the EventProcessor
+            # shows the buttons and waits for a click; it then sends the menu
+            # keystrokes back via answer_menu(), after which polling resumes and
+            # the (now-closed) menu no longer matches.
+            ask_q = _parse_ask_from_pane(current)
+            if ask_q is not None:
+                ask_stable += _POLL_INTERVAL
+                ask_sig = "\n".join(o.label for o in ask_q.options)
+                if ask_stable >= _ASK_ALERT_DELAY and ask_sig != last_bridged_ask:
+                    last_bridged_ask = ask_sig
+                    logger.info(
+                        "AskUserQuestion menu detected, bridging to Discord (thread=%d)",
+                        self._thread_id,
+                    )
+                    yield StreamEvent(
+                        raw={},
+                        message_type=MessageType.SYSTEM,
+                        pane_ask=ask_q,
+                    )
+                continue
+            else:
+                ask_stable = 0.0
+                last_bridged_ask = None
 
             # Detect unknown TUI interactive menus (not covered by known markers).
             # Alert Discord so the session doesn't stall silently.
@@ -635,7 +744,14 @@ class TmuxClaudeRunner:
             return False
         if any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS):
             return False
-        # Exclude Plan approval (ExitPlanMode) and AskUserQuestion menus (#153).
+        # Exclude AskUserQuestion menus (#166): the current Claude Code variant
+        # uses "Type something." / "Chat about this" instead of the older
+        # "Other", so the #153 markers below no longer match it.  These menus are
+        # bridged to Discord buttons; flagging them as "unknown" would duplicate
+        # the real UI with a spurious warning.
+        if _is_ask_question(zone):
+            return False
+        # Exclude Plan approval (ExitPlanMode) and (legacy) AskUserQuestion menus (#153).
         # These are handled via Discord buttons; surfacing them as "unknown" would
         # confuse users with a duplicate warning alongside the real Discord UI.
         return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
@@ -657,6 +773,42 @@ class TmuxClaudeRunner:
             target = f"{self._tmux.session_name}:{window}"
             key = "y" if self._is_yn_prompt(pane_text) else "Enter"
             _run(["tmux", "send-keys", "-t", target, key])
+
+    async def answer_menu(self, index: int) -> None:
+        """Select option *index* (0-based) of an open AskUserQuestion menu (#166).
+
+        The cursor always starts on the first option, so landing on option
+        ``index`` takes ``index`` Down presses, then Enter to confirm.  ``index``
+        equals the option's position in the list returned by
+        :func:`_parse_ask_from_pane`.
+        """
+        logger.info(
+            "Answering AskUserQuestion menu: option index=%d (thread=%d)",
+            index,
+            self._thread_id,
+        )
+        keys: list[str] = ["Down"] * max(0, index) + ["Enter"]
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, *keys)
+
+    async def answer_menu_text(self, text_option_index: int, text: str) -> None:
+        """Answer via the free-text ("Type something.") affordance (#166).
+
+        Navigates to the text option at ``text_option_index`` (the meta-option
+        that follows the real options), confirms with Enter to open the input,
+        then types *text* literally and submits.
+        """
+        logger.info(
+            "Answering AskUserQuestion with free text (thread=%d)",
+            self._thread_id,
+        )
+        keys: list[str] = ["Down"] * max(0, text_option_index) + ["Enter"]
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, *keys)
+        await asyncio.sleep(0.3)
+        await asyncio.to_thread(self._tmux.send_input, self._thread_id, text)
+
+    async def cancel_menu(self) -> None:
+        """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape")
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:

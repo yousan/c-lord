@@ -5,6 +5,11 @@ Handles the full lifecycle of AskUserQuestion tool calls from Claude Code:
 - Showing Discord buttons via AskView
 - Waiting for user answers (up to 24 hours)
 - Returning the formatted answer prompt for Claude to resume
+
+It also bridges the *in-pane* AskUserQuestion menu in jsonl/tmux mode
+(``bridge_pane_ask``): there Claude is blocked on a TUI menu, so the answer is
+delivered by sending menu keystrokes back to the pane rather than resuming with
+a new prompt (#166).
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import TYPE_CHECKING
 
 import discord
 
@@ -21,11 +27,62 @@ from .ask_bus import ask_bus as _ask_bus
 from .ask_view import AskView
 from .embeds import ask_embed
 
+if TYPE_CHECKING:
+    from ..claude.tmux_runner import TmuxClaudeRunner
+
 logger = logging.getLogger(__name__)
 
 # How long to wait for the user to answer (seconds).  24 hours lets users
 # step away for the day and come back without "Interaction Failed" errors.
 ASK_ANSWER_TIMEOUT = 86_400  # 24 h
+
+
+async def bridge_pane_ask(
+    thread: discord.Thread,
+    question: AskQuestion,
+    runner: TmuxClaudeRunner,
+    ask_repo: PendingAskRepository | None = None,
+) -> None:
+    """Bridge one in-pane AskUserQuestion menu to Discord buttons (#166).
+
+    Shows an :class:`AskView`, waits for the user's choice, then answers the
+    still-open TUI menu by sending keystrokes via *runner*:
+
+    - a real option → ``runner.answer_menu(index)`` (Down×index + Enter)
+    - free text ("✏️ Other") → ``runner.answer_menu_text`` on the
+      "Type something." affordance that follows the real options
+    - timeout / no answer → ``runner.cancel_menu()`` (Esc)
+    """
+    answer_queue = _ask_bus.register(thread.id)
+    view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
+    msg = await thread.send(embed=ask_embed(question.question, question.header), view=view)
+
+    try:
+        selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)
+    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+        with contextlib.suppress(discord.HTTPException):
+            await msg.edit(
+                content="-# ⏰ Question timed out — send a new message to continue.",
+                embed=None,
+                view=None,
+            )
+        await runner.cancel_menu()
+        return
+    finally:
+        _ask_bus.unregister(thread.id)
+
+    if not selected:
+        await runner.cancel_menu()
+        return
+
+    label = selected[0]
+    labels = [opt.label for opt in question.options]
+    if label in labels:
+        await runner.answer_menu(labels.index(label))
+    else:
+        # Free text from the "Other" modal → use the "Type something." option,
+        # which the TUI numbers immediately after the real options.
+        await runner.answer_menu_text(len(question.options), label)
 
 
 async def collect_ask_answers(
