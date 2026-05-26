@@ -35,7 +35,10 @@ GREEN (after):
 
 ## Definition of Done checklist
 
-See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked:
+See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked.
+
+> **Label exemptions** (`no-runtime-change` or `documentation` label): items 1–2 and 5 below are waived.
+> `Closes` discipline (item 7) is **always enforced**, regardless of label.
 
 - [ ] Every Acceptance Criterion above is checked
 - [ ] TDD: test failed before (RED) and passes after (GREEN) — RED line pasted
