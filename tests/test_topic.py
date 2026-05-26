@@ -186,6 +186,146 @@ def test_llm_timeout_is_at_least_30_seconds():
     assert topic._LLM_TIMEOUT_SECONDS >= 30.0
 
 
+# ── Output validation tests ────────────────────────────────────────────────────
+
+
+def test_is_valid_topic_rejects_none() -> None:
+    assert topic._is_valid_topic(None, "何かメッセージ") is False
+
+
+def test_is_valid_topic_rejects_empty() -> None:
+    assert topic._is_valid_topic("", "何かメッセージ") is False
+
+
+def test_is_valid_topic_rejects_forbidden_markers() -> None:
+    assert topic._is_valid_topic("許可が必要です", "ファイルを削除して") is False
+    assert topic._is_valid_topic("Permission denied", "ファイルを削除して") is False
+    assert topic._is_valid_topic("権限がありません", "ファイルを削除して") is False
+    assert topic._is_valid_topic("申し訳ありません", "ファイルを削除して") is False
+    assert topic._is_valid_topic("--- ただし注意", "ファイルを削除して") is False
+
+
+def test_is_valid_topic_rejects_verbatim_copy() -> None:
+    msg = "ランプの状態検出がおかしいので直して"
+    # Exact first 20 chars of the input = verbatim copy
+    assert topic._is_valid_topic(msg[:20], msg) is False
+
+
+def test_is_valid_topic_accepts_good_summary() -> None:
+    assert (
+        topic._is_valid_topic("ランプ状態検出の修正", "ランプの状態検出がおかしいので直して")
+        is True
+    )
+    assert topic._is_valid_topic("認証リファクタ", "認証まわりのリファクタをしてください") is True
+
+
+# ── Retry logic tests ──────────────────────────────────────────────────────────
+
+
+async def test_generate_topic_retries_once_on_none() -> None:
+    """LLM fails first, succeeds on retry → source is 'llm'."""
+    calls: list[int] = []
+
+    async def fake_invoke(_msg: str) -> str | None:
+        calls.append(1)
+        if len(calls) == 1:
+            return None  # first attempt: failure
+        return "認証リファクタ"  # retry: success
+
+    with patch.object(topic, "_invoke_claude_haiku", fake_invoke):
+        body, source = await topic.generate_topic("認証まわりのリファクタをしてください")
+
+    assert source == "llm"
+    assert body == "認証リファクタ"
+    assert len(calls) == 2, "must have called LLM exactly twice"
+
+
+async def test_generate_topic_retries_once_on_invalid_output() -> None:
+    """LLM returns verbatim input first, valid summary on retry."""
+    msg = "ランプの状態検出がおかしいので直して"
+    calls: list[str] = []
+
+    async def fake_invoke(_m: str) -> str | None:
+        calls.append(_m)
+        if len(calls) == 1:
+            return msg[:20]  # verbatim copy — invalid
+        return "ランプ状態検出の修正"  # retry: valid
+
+    with patch.object(topic, "_invoke_claude_haiku", fake_invoke):
+        body, source = await topic.generate_topic(msg)
+
+    assert source == "llm"
+    assert body == "ランプ状態検出の修正"
+    assert len(calls) == 2
+
+
+async def test_generate_topic_falls_back_after_two_invalid() -> None:
+    """Both attempts return invalid → heuristic fallback."""
+    msg = "ランプの状態検出がおかしいので直して"
+    calls: list[int] = []
+
+    async def fake_invoke(_m: str) -> str | None:
+        calls.append(1)
+        return None  # always fails
+
+    with patch.object(topic, "_invoke_claude_haiku", fake_invoke):
+        body, source = await topic.generate_topic(msg)
+
+    assert source == "heuristic"
+    assert body  # must be non-empty (heuristic_topic result)
+    assert len(calls) == 2, "must try exactly twice"
+
+
+async def test_generate_topic_does_not_retry_more_than_once() -> None:
+    """Only one retry allowed — LLM called at most twice."""
+    calls: list[int] = []
+
+    async def fake_invoke(_m: str) -> str | None:
+        calls.append(1)
+        return None
+
+    with patch.object(topic, "_invoke_claude_haiku", fake_invoke):
+        await topic.generate_topic("テスト")
+
+    assert len(calls) == 2
+
+
+async def test_maybe_retitle_retries_once_on_invalid_output() -> None:
+    """maybe_retitle retries once when LLM returns invalid output."""
+    calls: list[str] = []
+
+    async def fake_call(prompt: str) -> str | None:
+        calls.append(prompt)
+        if len(calls) == 1:
+            return "許可が必要です"  # forbidden — invalid
+        return "Dockerfile最適化"  # retry: valid
+
+    with patch.object(topic, "_call_claude_p", fake_call):
+        result = await topic.maybe_retitle(
+            "次はDockerfileを最適化してCI/CDを改善してください", "認証リファクタ"
+        )
+
+    assert result == "Dockerfile最適化"
+    assert len(calls) == 2
+
+
+async def test_maybe_retitle_returns_none_after_two_invalid() -> None:
+    """Both retitle attempts invalid → None (safe: no rename)."""
+    calls: list[int] = []
+
+    async def fake_call(_prompt: str) -> str | None:
+        calls.append(1)
+        return "許可が必要です"  # always invalid
+
+    with patch.object(topic, "_call_claude_p", fake_call):
+        result = await topic.maybe_retitle(
+            "次はDockerfileを最適化してCI/CDを改善してください", "認証リファクタ"
+        )
+
+    assert result is None
+    assert len(calls) == 2
+
+
 # ── Prompt structure tests (#138) ─────────────────────────────────────────────
 # The prompts must clearly separate the instruction from user content so haiku
 # cannot misinterpret action-like messages as commands to execute.
@@ -320,6 +460,7 @@ _LIVE_CORPUS = [
 ]
 
 _LIVE_MIN_PASS_RATE = 0.90  # 90% of runs must be clean
+_LIVE_MIN_LLM_RATE = 0.80  # ≥80% must use LLM source (not heuristic fallback)
 
 
 @pytest.mark.live_llm
@@ -337,6 +478,22 @@ async def test_generate_topic_live_llm_corpus() -> None:
     report = "\n".join(f"  {m!r} → {b!r}" for m, b in failures)
     assert pass_rate >= _LIVE_MIN_PASS_RATE, (
         f"pass rate {pass_rate:.0%} < {_LIVE_MIN_PASS_RATE:.0%}\nfailures:\n{report}"
+    )
+
+
+@pytest.mark.live_llm
+@pytestmark_live
+async def test_generate_topic_live_llm_fallback_rate() -> None:
+    """Concurrent calls; LLM success rate must be ≥80% (not heuristic fallback)."""
+    import asyncio as _asyncio
+
+    results = await _asyncio.gather(*[topic.generate_topic(m) for m in _LIVE_CORPUS])
+    llm_count = sum(1 for _, src in results if src == "llm")
+    llm_rate = llm_count / len(results)
+    heuristic_msgs = [_LIVE_CORPUS[i] for i, (_, src) in enumerate(results) if src != "llm"]
+    assert llm_rate >= _LIVE_MIN_LLM_RATE, (
+        f"LLM success rate {llm_rate:.0%} < {_LIVE_MIN_LLM_RATE:.0%}\n"
+        f"heuristic fallbacks: {heuristic_msgs}"
     )
 
 

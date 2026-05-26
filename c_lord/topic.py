@@ -64,6 +64,10 @@ _FALLBACK_TOPIC = "新しいスレッド"
 # Minimum length for a message to be considered instruction-like.
 _INSTRUCTION_MIN_LEN = 15
 
+# Substrings that indicate an invalid LLM response (refusal, safety notice, etc.).
+# Outputs containing these are rejected and trigger a retry.
+_INVALID_TOPIC_MARKERS = ("許可", "Permission", "権限", "申し訳", "---")
+
 
 def heuristic_topic(first_message: str) -> str:
     """Derive a topic from ``first_message`` without invoking any LLM.
@@ -97,6 +101,20 @@ def _looks_like_instruction(message: str) -> bool:
     return not (msg.endswith("?") or msg.endswith("？"))
 
 
+def _is_valid_topic(result: str | None, original_msg: str) -> bool:
+    """Return True when *result* looks like a genuine ≤20-char summary.
+
+    Rejects None, empty strings, outputs containing refusal/safety markers,
+    and exact verbatim copies of the beginning of the original message.
+    """
+    if not result:
+        return False
+    if any(m in result for m in _INVALID_TOPIC_MARKERS):
+        return False
+    # Exact first-20-chars copy = haiku echoed the input instead of summarising.
+    return result != original_msg[:_TOPIC_MAX_LEN]
+
+
 async def _call_claude_p(prompt: str) -> str | None:
     """Call ``claude -p --model haiku`` with the given raw prompt string.
 
@@ -111,6 +129,7 @@ async def _call_claude_p(prompt: str) -> str | None:
             "haiku",
             "--",
             prompt,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -159,17 +178,25 @@ async def generate_topic(first_message: str) -> tuple[str, str]:
     Claude CLI succeeded, or ``"heuristic"`` otherwise. The returned
     topic is always a non-empty string ≤20 chars; this function never
     raises.
-    """
-    llm = None
-    try:
-        llm = await _invoke_claude_haiku(first_message)
-    except Exception:  # pragma: no cover — defensive
-        logger.warning("topic LLM: unexpected error", exc_info=True)
-        llm = None
 
-    if llm:
-        return llm, "llm"
-    return heuristic_topic(first_message), "heuristic"
+    Retries once on invalid/None output before falling back to heuristic.
+    """
+    for attempt in range(2):
+        llm = None
+        try:
+            llm = await _invoke_claude_haiku(first_message)
+        except Exception:  # pragma: no cover — defensive
+            logger.warning("topic LLM: unexpected error (attempt=%d)", attempt + 1, exc_info=True)
+
+        if _is_valid_topic(llm, first_message):
+            return llm, "llm"  # type: ignore[return-value]
+
+        if attempt == 0:
+            logger.debug("topic LLM: attempt 1 invalid (%r), retrying", llm)
+
+    fallback = heuristic_topic(first_message)
+    logger.info("topic LLM: both attempts failed — heuristic fallback %r", fallback)
+    return fallback, "heuristic"
 
 
 async def maybe_retitle(message: str, current_topic: str) -> str | None:
@@ -181,18 +208,28 @@ async def maybe_retitle(message: str, current_topic: str) -> str | None:
     Comparison: returns None when LLM output equals ``current_topic``
     byte-for-byte (no Discord rename needed).
 
-    On any LLM failure, returns None (no retitle — safe default).
+    Retries once when the output is invalid. On any exception or after two
+    invalid outputs, returns None (safe default — no retitle).
     """
     if not _looks_like_instruction(message):
         return None
 
     prompt = _RETITLE_PROMPT_TEMPLATE.format(current_topic=current_topic, msg=message)
-    try:
-        new_topic = await _call_claude_p(prompt)
-    except Exception:
-        logger.debug("maybe_retitle: LLM call failed", exc_info=True)
-        return None
 
-    if not new_topic or new_topic == current_topic:
-        return None
-    return new_topic
+    for attempt in range(2):
+        try:
+            new_topic = await _call_claude_p(prompt)
+        except Exception:
+            logger.debug("maybe_retitle: LLM call failed (attempt=%d)", attempt + 1, exc_info=True)
+            return None
+
+        if not new_topic or new_topic == current_topic:
+            return None  # "no change" signal — valid, stop here
+
+        if _is_valid_topic(new_topic, message):
+            return new_topic
+
+        if attempt == 0:
+            logger.debug("maybe_retitle: invalid output %r, retrying", new_topic)
+
+    return None
