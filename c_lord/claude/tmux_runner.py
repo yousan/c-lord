@@ -54,10 +54,23 @@ _TRUST_PROMPT_MARKERS = (
 )
 
 # Patterns that indicate a permission/approval prompt that needs "Yes".
+# Sources: existing c-lord markers + Claude Code v2.1+ npm package strings.
 _PERMISSION_PROMPT_MARKERS = (
     "Do you want to proceed?",
     "This command requires approval",
+    "Do you want to continue?",
+    "Do you want to allow Claude to fetch this content?",
+    "Do you want to allow this connection?",
+    "Continue anyway?",
 )
+
+# Regex matching [y/N] or [Y/n] inline yes/no prompts (Claude Code v2.1+).
+# These need "y" + Enter instead of just Enter (Enter selects the default, N).
+_YN_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]", re.IGNORECASE)
+
+# Regex matching a numbered-menu cursor line: "❯ 1. ..." or y/N inline prompt.
+# Used to detect interactive menus regardless of whether the question text is known.
+_INTERACTIVE_MENU_RE = re.compile(r"^\s*❯\s+\d+\.", re.MULTILINE)
 
 # Regex for separator lines (all box-drawing horizontal characters).
 _SEPARATOR_RE = re.compile(r"^[─━═─\s]{10,}$")
@@ -331,6 +344,11 @@ class TmuxClaudeRunner:
         # changes so that transient TUI redraw artifacts (e.g. mid-frame cursor
         # rewrites that produce text like "claude_chat.pypy") are not yielded.
         prev_capture_response = ""
+        # Seconds the unknown-interactive pattern has been continuously visible.
+        # We require it to be stable for this long before alerting Discord,
+        # to avoid false positives from transient TUI redraws.
+        unknown_interactive_stable = 0.0
+        unknown_interactive_alert_delay = 5.0
 
         while not self._stopped and elapsed < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
@@ -340,8 +358,28 @@ class TmuxClaudeRunner:
 
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
-                await self._accept_permission_prompt()
+                unknown_interactive_stable = 0.0
+                await self._accept_permission_prompt(current)
                 continue
+
+            # Detect unknown TUI interactive menus (not covered by known markers).
+            # Alert Discord so the session doesn't stall silently.
+            if self._has_unknown_interactive(current):
+                unknown_interactive_stable += _POLL_INTERVAL
+                if unknown_interactive_stable >= unknown_interactive_alert_delay:
+                    logger.warning(
+                        "Unknown TUI interactive prompt detected (thread=%d)",
+                        self._thread_id,
+                    )
+                    yield StreamEvent(
+                        raw={},
+                        message_type=MessageType.SYSTEM,
+                        unknown_tui_prompt=current[-800:],
+                    )
+                    unknown_interactive_stable = 0.0  # reset to avoid spam
+                continue
+            else:
+                unknown_interactive_stable = 0.0
 
             # Extract the clean response from the TUI pane.
             response = self._extract_response(current)
@@ -494,8 +532,35 @@ class TmuxClaudeRunner:
         """Check if the pane shows a permission/approval prompt."""
         return any(marker in text for marker in _PERMISSION_PROMPT_MARKERS)
 
-    async def _accept_permission_prompt(self) -> None:
-        """Auto-accept a permission prompt by pressing Enter."""
+    @staticmethod
+    def _is_yn_prompt(text: str) -> bool:
+        """Return True if the pane contains a [y/N] or [Y/n] inline prompt."""
+        return bool(_YN_PROMPT_RE.search(text))
+
+    @staticmethod
+    def _has_unknown_interactive(text: str) -> bool:
+        """Return True if the pane shows an interactive menu not covered by known markers.
+
+        Detects numbered-menu cursors (❯ 1. ...) and [y/N] prompts that do NOT
+        match any known trust or permission marker. Used to surface unknown prompts
+        to Discord rather than letting the session stall silently.
+        """
+        if not text:
+            return False
+        has_menu = bool(_INTERACTIVE_MENU_RE.search(text)) or bool(_YN_PROMPT_RE.search(text))
+        if not has_menu:
+            return False
+        # Exclude already-handled prompts so they don't double-fire.
+        if any(marker in text for marker in _TRUST_PROMPT_MARKERS):
+            return False
+        return not any(marker in text for marker in _PERMISSION_PROMPT_MARKERS)
+
+    async def _accept_permission_prompt(self, pane_text: str = "") -> None:
+        """Auto-accept a permission prompt.
+
+        Numbered-menu prompts (❯ 1. Yes / 2. No) accept with Enter (selects highlighted).
+        Inline [y/N] prompts send "y" explicitly, because Enter selects the default N.
+        """
         logger.info(
             "Permission prompt detected, auto-accepting (thread=%d)",
             self._thread_id,
@@ -505,7 +570,8 @@ class TmuxClaudeRunner:
         window = self._tmux._find_window_for_thread(self._thread_id)
         if window:
             target = f"{self._tmux.session_name}:{window}"
-            _run(["tmux", "send-keys", "-t", target, "Enter"])
+            key = "y" if self._is_yn_prompt(pane_text) else "Enter"
+            _run(["tmux", "send-keys", "-t", target, key])
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:

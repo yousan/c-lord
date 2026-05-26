@@ -189,6 +189,27 @@ def redacted_thinking_embed() -> discord.Embed:
     )
 
 
+def unknown_tui_prompt_embed(pane_snapshot: str) -> discord.Embed:
+    """Create a warning embed for an unknown TUI interactive prompt.
+
+    Posted when the TUI shows a selection menu that c-lord doesn't recognise,
+    so the session would otherwise stall silently. Includes the raw pane
+    snapshot to help identify the new prompt type for cataloging.
+    """
+    truncated = pane_snapshot[-800:] if len(pane_snapshot) > 800 else pane_snapshot
+    return discord.Embed(
+        title="⚠️ Unknown TUI prompt detected — session may be waiting for input",
+        description=(
+            "Claude Code is showing an interactive menu that c-lord doesn't handle yet.\n\n"
+            "**What to do:**\n"
+            "• Use `/attach` (or tmux) to respond manually\n"
+            "• Consider filing a GitHub issue to add support for this prompt\n\n"
+            f"**Pane snapshot:**\n```\n{truncated}\n```"
+        ),
+        color=0xF1C40F,  # Yellow-warning
+    )
+
+
 def error_embed(error: str) -> discord.Embed:
     """Create an embed for errors."""
     return discord.Embed(

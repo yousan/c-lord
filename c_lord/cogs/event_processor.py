@@ -25,6 +25,7 @@ from ..discord_ui.embeds import (
     todo_embed,
     tool_result_embed,
     tool_use_embed,
+    unknown_tui_prompt_embed,
 )
 from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
@@ -172,6 +173,14 @@ class EventProcessor:
         # MCP elicitation — show form or URL button
         if event.elicitation is not None:
             await self._handle_elicitation(event)
+            return
+
+        # Unknown TUI interactive prompt — warn Discord so the session doesn't stall silently
+        if event.unknown_tui_prompt is not None:
+            with contextlib.suppress(Exception):
+                await self._config.thread.send(
+                    embed=unknown_tui_prompt_embed(event.unknown_tui_prompt)
+                )
             return
 
         if not event.session_id:

@@ -1507,3 +1507,129 @@ class TestContinueFallback:
         # Only one is_claude_running call (no post-continue check)
         assert tmux_manager.is_claude_running.call_count == 1
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
+
+
+
+# -- Tests for new permission markers (v2.1+) ---------------------------------
+
+
+class TestPermissionPromptNewMarkers:
+    """_has_permission_prompt must detect all known Claude Code v2.1+ variants."""
+
+    def test_do_you_want_to_continue(self) -> None:
+        text = "Some context\nDo you want to continue?\n❯ 1. Yes\n  2. No"
+        assert TmuxClaudeRunner._has_permission_prompt(text) is True
+
+    def test_allow_fetch_content(self) -> None:
+        text = "Do you want to allow Claude to fetch this content?\n❯ 1. Yes\n  2. No"
+        assert TmuxClaudeRunner._has_permission_prompt(text) is True
+
+    def test_allow_connection(self) -> None:
+        text = "Do you want to allow this connection?\n❯ 1. Yes\n  2. No"
+        assert TmuxClaudeRunner._has_permission_prompt(text) is True
+
+    def test_continue_anyway_yn(self) -> None:
+        text = "Security warnings found.\nContinue anyway? [y/N]"
+        assert TmuxClaudeRunner._has_permission_prompt(text) is True
+
+    def test_existing_proceed_still_detected(self) -> None:
+        text = "Do you want to proceed?\n❯ 1. Yes"
+        assert TmuxClaudeRunner._has_permission_prompt(text) is True
+
+
+# -- Tests for y/N prompt detection -------------------------------------------
+
+
+class TestYesNoPromptDetection:
+    """_is_yn_prompt distinguishes [y/N] style from numbered-menu style."""
+
+    def test_detects_yn_format(self) -> None:
+        text = "Continue anyway? [y/N]"
+        assert TmuxClaudeRunner._is_yn_prompt(text) is True
+
+    def test_detects_yn_uppercase_Y(self) -> None:
+        text = "Security warning. Continue anyway? [Y/n]"
+        assert TmuxClaudeRunner._is_yn_prompt(text) is True
+
+    def test_numbered_menu_is_not_yn(self) -> None:
+        text = "Do you want to proceed?\n❯ 1. Yes\n  2. No"
+        assert TmuxClaudeRunner._is_yn_prompt(text) is False
+
+
+# -- Tests for unknown TUI interactive detection ------------------------------
+
+
+class TestUnknownTuiInteractive:
+    """_has_unknown_interactive detects menu cursors not matching known prompts."""
+
+    def test_detects_unknown_numbered_menu(self) -> None:
+        # A numbered menu that does NOT match any known marker
+        text = (
+            "Would you like to stash these changes and continue with teleport?\n"
+            "❯ 1. Yes, stash and continue\n"
+            "  2. No, abort"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is True
+
+    def test_known_permission_prompt_is_not_unknown(self) -> None:
+        # Known prompt — should NOT trigger unknown detection
+        text = "Do you want to proceed?\n❯ 1. Yes\n  2. No"
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is False
+
+    def test_known_trust_prompt_is_not_unknown(self) -> None:
+        text = "Yes, I trust this folder\nEnter to confirm"
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is False
+
+    def test_normal_idle_prompt_is_not_unknown(self) -> None:
+        # The bare ❯ input prompt (idle state) — NOT an interactive menu
+        text = "● Some response\n\n────────\n❯\n────────\n-- INSERT --"
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is False
+
+    def test_empty_text_is_not_unknown(self) -> None:
+        assert TmuxClaudeRunner._has_unknown_interactive("") is False
+
+    def test_install_prompt_detected(self) -> None:
+        text = "Would you like to install this LSP plugin?\n❯ 1. Yes\n  2. No"
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is True
+
+    def test_update_prompt_detected(self) -> None:
+        text = (
+            "A new version of Claude Code is available.\n"
+            "Update now? [y/N]"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is True
+
+    def test_yn_unknown_prompt_detected(self) -> None:
+        # A y/N prompt that doesn't match any known marker
+        text = "Would you like to enable auto-connect to IDE? [y/N]"
+        assert TmuxClaudeRunner._has_unknown_interactive(text) is True
+
+
+# -- Tests for y/N auto-accept ------------------------------------------------
+
+
+class TestAcceptPermissionPromptYN:
+    """_accept_permission_prompt sends 'y' for [y/N] prompts, Enter for numbered menus."""
+
+    @pytest.mark.asyncio
+    async def test_yn_prompt_sends_y(self, runner, tmux_manager) -> None:
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        pane_with_yn = "Continue anyway? [y/N]"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            await runner._accept_permission_prompt(pane_with_yn)
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            # Should send "y" not bare Enter
+            assert "y" in args
+
+    @pytest.mark.asyncio
+    async def test_numbered_menu_sends_enter(self, runner, tmux_manager) -> None:
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        pane_numbered = "Do you want to proceed?\n❯ 1. Yes\n  2. No"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            await runner._accept_permission_prompt(pane_numbered)
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            assert "Enter" in args
