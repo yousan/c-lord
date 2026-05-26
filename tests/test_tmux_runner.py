@@ -1771,6 +1771,40 @@ class TestParseAskFromPane:
         pane = _load_fixture("plan_approval_menu.txt")
         assert _parse_ask_from_pane(pane) is None
 
+    def test_only_active_bottom_menu_parsed_not_scrollback(self) -> None:
+        """Regression (#166 staging): old menus in scrollback must be ignored.
+
+        capture-pane returns 500 lines of history; a previous AskUserQuestion
+        menu still sits above the current one.  Parsing the whole buffer pulled
+        in stale options and produced duplicate Discord Select values (400 Bad
+        Request).  Only the active (bottom-most) menu must be parsed.
+        """
+        old_menu = (
+            " ☐ OldHeader\n"
+            "Old question?\n"
+            "❯ 1. AlphaOld\n"
+            "  2. BetaOld\n"
+            "  3. Type something.\n"
+            "  4. Chat about this\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        new_menu = (
+            " ☐ Region\n"
+            "Which region?\n"
+            "❯ 1. Tokyo\n"
+            "  2. Osaka\n"
+            "  3. Type something.\n"
+            "  4. Chat about this\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        pane = "old conversation\n" + old_menu + "\nmore output\n" + new_menu
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.header == "Region"
+        assert q.question == "Which region?"
+        labels = [o.label for o in q.options]
+        assert labels == ["Tokyo", "Osaka"], f"leaked scrollback options: {labels}"
+
     def test_idle_pane_is_not_ask(self) -> None:
         pane = "● Some response\n\n────────\n❯\n────────\n-- INSERT --"
         assert _parse_ask_from_pane(pane) is None

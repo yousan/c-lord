@@ -171,19 +171,29 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
 
     lines = text.splitlines()
 
+    # capture-pane returns up to 500 scrollback lines, which may contain OLD
+    # AskUserQuestion menus.  Anchor to the *active* (bottom-most) menu: the last
+    # "Chat about this" line marks its end, and the nearest ☐ header above it
+    # marks its start (#166 staging fix — stale options caused duplicate Select
+    # values → Discord 400).
+    end_idx = max(i for i, line in enumerate(lines) if _ASK_SIGNATURE in line)
+
     header = ""
     header_idx = -1
-    for i, line in enumerate(lines):
-        m = _ASK_HEADER_RE.match(line)
+    for i in range(end_idx, -1, -1):
+        m = _ASK_HEADER_RE.match(lines[i])
         if m:
             header = m.group(1).strip()
             header_idx = i
             break
 
+    # Bound the scan: from the header (or, if it scrolled off, a small window
+    # above the menu end) down to the menu end — never the whole buffer.
+    scan_from = header_idx + 1 if header_idx >= 0 else max(0, end_idx - 20)
+
     options: list[AskOption] = []
     first_opt_idx: int | None = None
-    scan_from = header_idx + 1 if header_idx >= 0 else 0
-    for i in range(scan_from, len(lines)):
+    for i in range(scan_from, end_idx + 1):
         m = _ASK_OPTION_RE.match(lines[i])
         if not m:
             continue
@@ -200,7 +210,7 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     # The question is the last non-empty, non-separator line between the header
     # and the first option (it sits closest to the options).
     question = ""
-    end = first_opt_idx if first_opt_idx is not None else len(lines)
+    end = first_opt_idx if first_opt_idx is not None else end_idx
     for line in lines[scan_from:end]:
         s = line.strip()
         if not s or _SEPARATOR_RE.match(line):
