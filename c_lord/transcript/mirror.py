@@ -83,6 +83,16 @@ def reply_to_trigger_enabled() -> bool:
     return os.getenv("CLORD_REPLY_TO_TRIGGER", "1").strip().lower() not in ("0", "false", "no")
 
 
+def _is_turn_end(event: dict) -> bool:
+    """Return True for JSONL events that signal the end of a Claude turn.
+
+    Handles both ``{"type": "result"}`` (older Claude Code builds) and
+    ``{"type": "system", "subtype": "turn_duration"}`` (current production).
+    """
+    t = event.get("type")
+    return t == "result" or (t == "system" and event.get("subtype") == "turn_duration")
+
+
 _KIND_PREFIX = {
     "assistant_text": "",
     "tool_use": "",  # tool_use bodies already start with the 🔧 emoji
@@ -144,42 +154,79 @@ class TranscriptMirror:
         )
         # Buffer for tool_use / tool_result lines in minimal mode.
         progress_buf: list[str] = []
+        # Pending assistant_text held until we know if it's intermediate or final.
+        # When a subsequent event arrives we can decide: another assistant_text or
+        # tool event → flush silently; result/user_input/stop → flush as reply.
+        _pending_text: str | None = None
+        _pending_progress: list[str] = []  # snapshot of progress_buf at capture time
+
+        async def _flush_pending_silently() -> None:
+            nonlocal _pending_text, _pending_progress
+            if _pending_text is None:
+                return
+            await self._try_sink(_pending_text)
+            # Merge the snapshot back so subsequent tool output accumulates.
+            progress_buf[:0] = _pending_progress
+            _pending_text = None
+            _pending_progress = []
+
+        async def _flush_pending_as_reply() -> None:
+            nonlocal _pending_text, _pending_progress
+            if _pending_text is None:
+                return
+            await self._flush_as_reply(_pending_text, _pending_progress)
+            _pending_text = None
+            _pending_progress = []
 
         try:
             async for event in tail_events(self.project_dir, poll_interval=self._poll_interval):
+                if self._verbosity == "minimal" and _is_turn_end(event):
+                    # Turn boundary: flush pending as the final reply.
+                    await _flush_pending_as_reply()
+                    continue
+
                 rendered = render_event(event)
                 if rendered is None:
                     continue
 
                 if self._verbosity == "minimal":
-                    await self._handle_minimal(rendered, progress_buf)
+                    if rendered.kind in _BUFFERED_KINDS:
+                        # Tool event: if there's pending text, it was intermediate.
+                        await _flush_pending_silently()
+                        progress_buf.append(_format_body(rendered))
+                    elif rendered.kind == "assistant_text":
+                        # Another text while one is pending → previous was intermediate.
+                        if _pending_text is not None:
+                            await _flush_pending_silently()
+                        _pending_text = _format_body(rendered)
+                        _pending_progress = list(progress_buf)
+                        progress_buf.clear()
+                    elif rendered.kind == "user_input":
+                        # Human turn: previous assistant turn is over → flush as reply.
+                        await _flush_pending_as_reply()
+                        await self._post(rendered)
+                    else:
+                        await _flush_pending_silently()
+                        await self._post(rendered)
                 else:
                     await self._post(rendered)
 
         except asyncio.CancelledError:
             pass
         finally:
+            if self._verbosity == "minimal":
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _flush_pending_as_reply()
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
 
-    async def _handle_minimal(self, rendered: RenderedEvent, progress_buf: list[str]) -> None:
-        """Route one event in minimal mode."""
-        if rendered.kind in _BUFFERED_KINDS:
-            progress_buf.append(_format_body(rendered))
-            return
-
-        if rendered.kind == "assistant_text":
-            body = _format_body(rendered)
-            if progress_buf and self._file_sink is not None:
-                await self._flush_with_progress(body, progress_buf)
-            elif self._reply_sink is not None:
-                await self._try_reply_sink(body)
-            else:
-                await self._try_sink(body)
-            progress_buf.clear()
-            return
-
-        # user_input and any future kinds: post directly.
-        await self._post(rendered)
+    async def _flush_as_reply(self, text: str, progress: list[str]) -> None:
+        """Flush pending text as the final reply for the current turn."""
+        if progress and self._file_sink is not None:
+            await self._flush_with_progress(text, progress)
+        elif self._reply_sink is not None:
+            await self._try_reply_sink(text)
+        else:
+            await self._try_sink(text)
 
     async def _flush_with_progress(self, body: str, progress_buf: list[str]) -> None:
         """Write buffered tool lines to a tempfile and call file_sink."""
