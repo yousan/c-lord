@@ -83,6 +83,16 @@ def reply_to_trigger_enabled() -> bool:
     return os.getenv("CLORD_REPLY_TO_TRIGGER", "1").strip().lower() not in ("0", "false", "no")
 
 
+def _is_turn_end(event: dict) -> bool:
+    """Return True for JSONL events that signal the end of a Claude turn.
+
+    Handles both ``{"type": "result"}`` (older Claude Code builds) and
+    ``{"type": "system", "subtype": "turn_duration"}`` (current production).
+    """
+    t = event.get("type")
+    return t == "result" or (t == "system" and event.get("subtype") == "turn_duration")
+
+
 _KIND_PREFIX = {
     "assistant_text": "",
     "tool_use": "",  # tool_use bodies already start with the 🔧 emoji
@@ -170,7 +180,7 @@ class TranscriptMirror:
 
         try:
             async for event in tail_events(self.project_dir, poll_interval=self._poll_interval):
-                if self._verbosity == "minimal" and event.get("type") == "result":
+                if self._verbosity == "minimal" and _is_turn_end(event):
                     # Turn boundary: flush pending as the final reply.
                     await _flush_pending_as_reply()
                     continue

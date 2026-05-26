@@ -426,7 +426,7 @@ async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path)
         # Turn 1: tool + final text → result event triggers reply flush via file_sink
         _write_event(jsonl, _assistant_tool_use("Bash", "ls"))
         _write_event(jsonl, _assistant_text("turn1 done"))
-        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
         await asyncio.sleep(0.3)
         # Turn 2: no tools, just final text → reply_sink (no file_sink, buffer was cleared)
         _write_event(jsonl, _assistant_text("turn2 done"))
@@ -522,7 +522,7 @@ async def test_mirror_result_event_flushes_pending_as_reply(tmp_path: Path) -> N
     try:
         await asyncio.sleep(0.1)
         _write_event(jsonl, _assistant_text("turn answer"))
-        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
         # Give time for events to be processed; don't stop yet.
         await asyncio.sleep(0.3)
         # reply_sink must have been called before stop().
@@ -566,11 +566,11 @@ async def test_mirror_multiple_turns_each_final_text_as_reply(tmp_path: Path) ->
         await asyncio.sleep(0.1)
         # Turn 1
         _write_event(jsonl, _assistant_text("answer1"))
-        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
         await asyncio.sleep(0.2)
         # Turn 2
         _write_event(jsonl, _assistant_text("answer2"))
-        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
         await asyncio.sleep(0.3)
     finally:
         await mirror.stop()
