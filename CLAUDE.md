@@ -340,8 +340,8 @@ incident that motivated this.
 
 **Label-based exemptions** (enforced by `dod-gate` CI — see `.github/workflows/dod-gate.yml`):
 
-- `no-runtime-change` or `documentation` label: **exempts TDD evidence and Staging verification** (items 1, 2, 4 below). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
-- **Closes discipline (item 5) is always enforced**, regardless of labels.
+- `no-runtime-change` or `documentation` label: **exempts TDD evidence and Staging verification** (items 2 and 4 below). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
+- **Closes discipline (item 6) is always enforced**, regardless of labels.
 
 A PR may be merged only when:
 
