@@ -372,6 +372,7 @@ PR. When you (or Opus) author an Issue:
 - **No direct push to main**: Always create a PR
 - **Squash merge preferred**: Keeps main history clean
 - **Commit style**: `<type>: <description>` — types: feat, fix, refactor, docs, test, chore, security
+- **Required checks**: `dod-gate` and `test (3.10/3.11/3.12)` are required status checks on `main`. **A PR with a red `dod-gate` cannot be merged — not by humans, not by sub-Claude.** If `dod-gate` is red, fix the PR body or the issue before merging. `enforce_admins=true` means the admin account is also blocked.
 
 ### Standard Development Flow (Mandatory)
 
