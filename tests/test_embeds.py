@@ -2,14 +2,53 @@
 
 from __future__ import annotations
 
-from c_lord.claude.types import ToolCategory, ToolUseEvent
+from c_lord.claude.types import AskOption, ToolCategory, ToolUseEvent
 from c_lord.discord_ui.embeds import (
+    ask_embed,
     redacted_thinking_embed,
     session_complete_embed,
     thinking_embed,
     tool_result_embed,
     tool_use_embed,
 )
+
+
+class TestAskEmbedLegend:
+    """#169: option descriptions must reach Discord.  Buttons (≤4 options) can't
+    show descriptions, so ask_embed appends a `**label** — description` legend.
+    """
+
+    def _opts(self) -> list[AskOption]:
+        return [
+            AskOption(label="Production", description="本番"),
+            AskOption(label="Staging", description="検証"),
+        ]
+
+    def test_button_mode_appends_legend(self) -> None:
+        e = ask_embed("Which env?", "Deploy", self._opts(), multi_select=False)
+        assert "**Production** — 本番" in e.description
+        assert "**Staging** — 検証" in e.description
+        assert e.description.startswith("Which env?")
+
+    def test_select_mode_no_legend(self) -> None:
+        """≥5 options → Select menu shows descriptions itself; no embed legend."""
+        opts = [AskOption(label=f"O{i}", description=f"d{i}") for i in range(5)]
+        e = ask_embed("Pick", "H", opts, multi_select=False)
+        assert e.description == "Pick"
+
+    def test_multiselect_no_legend(self) -> None:
+        """multi_select renders a Select menu → no legend."""
+        e = ask_embed("Pick", "H", self._opts(), multi_select=True)
+        assert e.description == "Pick"
+
+    def test_options_without_descriptions_no_legend(self) -> None:
+        opts = [AskOption(label="Yes"), AskOption(label="No")]
+        e = ask_embed("OK?", "H", opts)
+        assert e.description == "OK?"
+
+    def test_no_options_unchanged(self) -> None:
+        e = ask_embed("Just a question", "H")
+        assert e.description == "Just a question"
 
 
 class TestThinkingEmbed:

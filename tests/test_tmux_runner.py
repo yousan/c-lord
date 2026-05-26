@@ -1766,6 +1766,16 @@ class TestParseAskFromPane:
         assert "Type something." not in labels
         assert "Chat about this" not in labels
 
+    def test_captures_option_descriptions(self) -> None:
+        """#169: each option's indented description line must be captured so it
+        can be shown in the embed (Discord buttons can't display descriptions).
+        """
+        pane = _load_fixture("ask_user_question_3options.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        descriptions = [o.description for o in q.options]
+        assert descriptions == ["本番", "検証", "ローカル"]
+
     def test_plan_approval_is_not_ask(self) -> None:
         """A Plan-approval menu is NOT an AskUserQuestion → returns None."""
         pane = _load_fixture("plan_approval_menu.txt")
