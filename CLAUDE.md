@@ -347,6 +347,7 @@ A PR may be merged only when:
 
 - [ ] **Every Acceptance Criterion of the linked Issue is copied into the PR body and checked.** Not "most" — every one.
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
+- [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
 - [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed on staging, with log excerpts pasted under a `## Staging Evidence` heading. **An empty Staging Evidence section = not done.**
 - [ ] **No unrelated changes** in the diff; self-review done.

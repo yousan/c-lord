@@ -1709,3 +1709,25 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
             "-- INSERT --"
         )
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+
+class TestGhostTextInputNotFlagged:
+    """Regression for #62: ghost text in the ❯ input area (tmux INSERT mode)
+    must not trigger any detection function.  The pane shows user-typed text
+    in the input zone but no real interactive prompt from Claude.
+    """
+
+    def test_ghost_text_no_permission_prompt(self) -> None:
+        """Ghost text in input area MUST NOT trigger _has_permission_prompt."""
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+
+    def test_ghost_text_no_yn_prompt(self) -> None:
+        """Ghost text in input area MUST NOT trigger _is_yn_prompt."""
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+
+    def test_ghost_text_no_unknown_interactive(self) -> None:
+        """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
