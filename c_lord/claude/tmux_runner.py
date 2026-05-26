@@ -33,7 +33,12 @@ _RESPONSE_STABLE_TIMEOUT = 3.0
 _RESPONSE_STABLE_FALLBACK = 30.0
 
 # If no response appears at all for this long, give up (idle timeout).
-_IDLE_TIMEOUT = 15.0
+# Generous because Claude can spend a while "thinking" before it emits anything
+# visible — notably before an AskUserQuestion menu renders (#166), where
+# extended thinking shows a static frame that defeats the raw-pane-activity
+# guard.  The hard ``timeout_seconds`` (300s) is the real backstop; this only
+# governs how long a genuinely silent turn waits before the fallback notice.
+_IDLE_TIMEOUT = 60.0
 
 # How long to wait for Claude to become ready (show input prompt).
 _STARTUP_TIMEOUT = 30.0
