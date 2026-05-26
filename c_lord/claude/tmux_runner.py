@@ -613,8 +613,12 @@ class TmuxClaudeRunner:
             ):
                 break
 
-            # Idle timeout: no response received for too long.
-            if not last_response and stable_seconds >= _IDLE_TIMEOUT:
+            # Idle timeout: no response received for too long.  Never give up
+            # while Claude is visibly working (✻ …) — otherwise a long thinking
+            # phase before an AskUserQuestion menu would stop polling and the
+            # menu would surface in an unmonitored pane (#166).  The outer
+            # ``timeout_seconds`` (300s) remains the hard backstop.
+            if not last_response and stable_seconds >= _IDLE_TIMEOUT and not is_gen:
                 # During a fresh start, allow extra time for Claude to load.
                 if not claude_running and elapsed < _STARTUP_TIMEOUT:
                     continue

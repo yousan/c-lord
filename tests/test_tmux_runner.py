@@ -1855,6 +1855,45 @@ class TestRunYieldsPaneAsk:
         assert labels == ["Production", "Staging", "Local"]
 
     @pytest.mark.asyncio
+    async def test_no_idle_timeout_while_generating_then_ask(self, runner, tmux_manager) -> None:
+        """The run must not idle-timeout while Claude is still thinking (#166).
+
+        AskUserQuestion can appear only after a long 'Cogitating…' phase.  If the
+        idle timeout fires during generation the runner stops polling and never
+        sees the menu — exactly what happened on staging.
+        """
+        ask_pane = _load_fixture("ask_user_question_3options.txt")
+        # Spinner line ends with … → _is_generating() True; no response text.
+        gen_pane = "\n✻ Cogitating…\n────────\n❯\n────────\n-- INSERT --"
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 10:  # "thinking" far longer than the (patched) idle timeout
+                return gen_pane
+            return ask_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+                if event.pane_ask is not None:
+                    break
+
+        ask_events = [e for e in events if e.pane_ask is not None]
+        assert len(ask_events) == 1, "idle timeout fired during generation; menu never bridged"
+
+    @pytest.mark.asyncio
     async def test_answer_menu_sends_down_then_enter(self, runner, tmux_manager) -> None:
         """answer_menu(2) navigates Down twice and confirms with Enter."""
         await runner.answer_menu(2)
