@@ -47,6 +47,15 @@ _LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_i
 
 _DEFAULT_INTERVAL_SECONDS = 60.0
 
+# Timeout for a single rename HTTP call.  Long enough for normal API response;
+# short enough not to block the tick when discord.py's rate-limit sleep fires.
+_RENAME_TIMEOUT_SECONDS = 30.0
+
+# Conservative backoff applied when a rename times out (likely discord.py's
+# rate-limit retry-sleep being cancelled by wait_for) — matches Discord's
+# ~10-minute rename window per channel.
+_DEFAULT_RENAME_BACKOFF_SECONDS = 600.0
+
 # How many bottom lines of the pane to check for prompt/error indicators.
 _PANE_PROBE_LINES = 6
 
@@ -187,6 +196,8 @@ class ThreadStateSyncLoop:
         self._repo = session_repo
         self._interval = interval_seconds
         self._task: asyncio.Task[None] | None = None
+        # Per-thread rate-limit backoff: thread_id → monotonic time until next rename is allowed.
+        self._rename_backoff: dict[int, float] = {}
 
     def start(self) -> None:
         """Spawn the loop task. Idempotent — second call is a no-op."""
@@ -276,13 +287,49 @@ class ThreadStateSyncLoop:
         if (channel.name or "") == new_name:
             return
 
+        # Per-thread rate-limit backoff: skip rename if still within back-off window.
+        now = asyncio.get_event_loop().time()
+        backoff_until = self._rename_backoff.get(thread_id, 0.0)
+        if now < backoff_until:
+            logger.debug(
+                "state-sync: rename skipped thread %d (rate-limited, retry in %.0fs)",
+                thread_id,
+                backoff_until - now,
+            )
+            return
+
         try:
-            await asyncio.wait_for(channel.edit(name=new_name), timeout=5.0)
+            await asyncio.wait_for(channel.edit(name=new_name), timeout=_RENAME_TIMEOUT_SECONDS)
             logger.info(
                 "state-sync: renamed thread %d → %r (state=%s)",
                 thread_id,
                 new_name,
                 new_state,
             )
-        except (discord.HTTPException, TimeoutError) as exc:
-            logger.debug("state-sync: rename failed for thread %d: %s", thread_id, exc)
+            self._rename_backoff.pop(thread_id, None)
+        except discord.HTTPException as exc:
+            if exc.status == 429:
+                retry_after = float(
+                    getattr(exc, "retry_after", _DEFAULT_RENAME_BACKOFF_SECONDS)
+                    or _DEFAULT_RENAME_BACKOFF_SECONDS
+                )
+                self._rename_backoff[thread_id] = asyncio.get_event_loop().time() + retry_after
+                logger.warning(
+                    "state-sync: rename rate-limited thread %d, backing off %.0fs",
+                    thread_id,
+                    retry_after,
+                )
+            else:
+                logger.debug("state-sync: rename failed for thread %d: %s", thread_id, exc)
+        except TimeoutError:
+            # discord.py's rate-limit sleep (retry_after) is cancelled by wait_for's timeout.
+            # Apply conservative backoff to prevent rapid PATCH retries.
+            self._rename_backoff[thread_id] = (
+                asyncio.get_event_loop().time() + _DEFAULT_RENAME_BACKOFF_SECONDS
+            )
+            logger.warning(
+                "state-sync: rename timed out for thread %d"
+                " (suspected rate-limit), backing off %.0fs",
+                thread_id,
+                _DEFAULT_RENAME_BACKOFF_SECONDS,
+            )
