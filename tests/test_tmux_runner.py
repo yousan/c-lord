@@ -1676,3 +1676,36 @@ class TestPermissionPromptTailAnchor:
         """Conversation-body markers must not trigger unknown-interactive detection."""
         pane = _load_fixture("bug_156_yn_in_conversation.txt")
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+# -- Regression tests for #153 (plan/ask menus flagged as unknown) ---------------
+
+
+class TestKnownInteractiveMenusNotFlaggedAsUnknown:
+    """Regression for #153: ExitPlanMode and AskUserQuestion menus must not
+    trigger unknown_tui_prompt_embed.  These are KNOWN prompts handled
+    elsewhere (Discord buttons via EventProcessor / TranscriptMirrorCog).
+    """
+
+    def test_plan_approval_not_unknown(self) -> None:
+        """ExitPlanMode 'Would you like to proceed?' menu MUST NOT be flagged."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_ask_user_question_not_unknown(self) -> None:
+        """AskUserQuestion numbered menu MUST NOT be flagged as unknown."""
+        pane = _load_fixture("ask_user_question_menu.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_real_unknown_menu_still_detected(self) -> None:
+        """A truly unknown menu (e.g. LSP install) MUST still be detected."""
+        pane = (
+            "Would you like to install the LSP plugin?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────\n"
+            "-- INSERT --"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
