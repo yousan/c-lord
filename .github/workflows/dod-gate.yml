@@ -26,8 +26,9 @@ jobs:
             const labels = (pr.labels || []).map(l => l.name.toLowerCase());
             const errors = [];
 
-            // pure-docs PR は DoD チェック完了要件をスキップ（Closes規律は適用し続ける）
-            const docsOnly = labels.includes("documentation");
+            // documentation / no-runtime-change ラベル付き PR は Rule 1（DoD完了要件）を免除。
+            // Rule 2（Closes規律）は常に適用。
+            const ruleOneExempt = labels.includes("documentation") || labels.includes("no-runtime-change");
 
             // --- セクション抽出ヘルパ ---
             const section = (heading) => {
@@ -45,8 +46,8 @@ jobs:
               errors.push("PR本文に『Definition of Done checklist』セクションが無い。PRテンプレートを使うこと。");
             }
 
-            // Rule 1: DoD チェックリストが全部チェック済みか（docs PRは免除）
-            if (!docsOnly) {
+            // Rule 1: DoD チェックリストが全部チェック済みか（免除ラベルがあればスキップ）
+            if (!ruleOneExempt) {
               const n = countUnchecked(dodSection);
               if (n > 0) errors.push(`DoDチェックリストに未チェック項目が ${n} 件。全部 [x] になるまでマージ不可。`);
             }
@@ -64,5 +65,6 @@ jobs:
             if (errors.length) {
               core.setFailed("DoD Gate 失敗:\n- " + errors.join("\n- "));
             } else {
-              core.info("DoD Gate 通過" + (docsOnly ? "（documentation ラベルによりDoD完了要件は免除）" : ""));
+              const exemptMsg = ruleOneExempt ? `（${labels.includes("no-runtime-change") ? "no-runtime-change" : "documentation"} ラベルによりRule 1免除）` : "";
+              core.info("DoD Gate 通過" + exemptMsg);
             }
