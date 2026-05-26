@@ -359,7 +359,7 @@ class TmuxClaudeRunner:
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
                 unknown_interactive_stable = 0.0
-                await self._accept_permission_prompt()
+                await self._accept_permission_prompt(current)
                 continue
 
             # Detect unknown TUI interactive menus (not covered by known markers).
@@ -555,8 +555,12 @@ class TmuxClaudeRunner:
             return False
         return not any(marker in text for marker in _PERMISSION_PROMPT_MARKERS)
 
-    async def _accept_permission_prompt(self) -> None:
-        """Auto-accept a permission prompt by pressing Enter."""
+    async def _accept_permission_prompt(self, pane_text: str = "") -> None:
+        """Auto-accept a permission prompt.
+
+        Numbered-menu prompts (❯ 1. Yes / 2. No) accept with Enter (selects highlighted).
+        Inline [y/N] prompts send "y" explicitly, because Enter selects the default N.
+        """
         logger.info(
             "Permission prompt detected, auto-accepting (thread=%d)",
             self._thread_id,
@@ -566,7 +570,8 @@ class TmuxClaudeRunner:
         window = self._tmux._find_window_for_thread(self._thread_id)
         if window:
             target = f"{self._tmux.session_name}:{window}"
-            _run(["tmux", "send-keys", "-t", target, "Enter"])
+            key = "y" if self._is_yn_prompt(pane_text) else "Enter"
+            _run(["tmux", "send-keys", "-t", target, key])
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:

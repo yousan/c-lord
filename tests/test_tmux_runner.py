@@ -1603,3 +1603,33 @@ class TestUnknownTuiInteractive:
         # A y/N prompt that doesn't match any known marker
         text = "Would you like to enable auto-connect to IDE? [y/N]"
         assert TmuxClaudeRunner._has_unknown_interactive(text) is True
+
+
+# -- Tests for y/N auto-accept ------------------------------------------------
+
+
+class TestAcceptPermissionPromptYN:
+    """_accept_permission_prompt sends 'y' for [y/N] prompts, Enter for numbered menus."""
+
+    @pytest.mark.asyncio
+    async def test_yn_prompt_sends_y(self, runner, tmux_manager) -> None:
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        pane_with_yn = "Continue anyway? [y/N]"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            await runner._accept_permission_prompt(pane_with_yn)
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            # Should send "y" not bare Enter
+            assert "y" in args
+
+    @pytest.mark.asyncio
+    async def test_numbered_menu_sends_enter(self, runner, tmux_manager) -> None:
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        pane_numbered = "Do you want to proceed?\n❯ 1. Yes\n  2. No"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            await runner._accept_permission_prompt(pane_numbered)
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            assert "Enter" in args
