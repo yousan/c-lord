@@ -1298,6 +1298,7 @@ class TestOnMessageSkipsTextCommands:
         msg.author.bot = False
         msg.author.id = 42
         msg.webhook_id = None
+        msg.type = discord.MessageType.default
 
         # DB session must exist for opt-in response
         record = MagicMock()
@@ -1309,6 +1310,94 @@ class TestOnMessageSkipsTextCommands:
         mock_ctx.valid = False
         cog.bot.get_context = AsyncMock(return_value=mock_ctx)
 
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_called_once_with(msg)
+
+
+class TestOnMessageSkipsSystemMessages:
+    """on_message must not send Discord system messages to _handle_thread_reply."""
+
+    def _make_thread_msg(self, msg_type: discord.MessageType) -> MagicMock:
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        thread.parent_id = 999
+
+        msg = MagicMock(spec=discord.Message)
+        msg.channel = thread
+        msg.content = ""
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+        msg.author.id = 99
+        msg.webhook_id = None
+        msg.type = msg_type
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_channel_name_change_not_forwarded(self) -> None:
+        """スレッド名変更通知は _handle_thread_reply に到達しない。"""
+        cog = _make_cog()
+        cog._handle_thread_reply = AsyncMock()
+        record = MagicMock()
+        cog.repo.get = AsyncMock(return_value=record)
+        mock_ctx = MagicMock()
+        mock_ctx.valid = False
+        cog.bot.get_context = AsyncMock(return_value=mock_ctx)
+
+        msg = self._make_thread_msg(discord.MessageType.channel_name_change)
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pins_add_not_forwarded(self) -> None:
+        """ピン留め通知は _handle_thread_reply に到達しない。"""
+        cog = _make_cog()
+        cog._handle_thread_reply = AsyncMock()
+        record = MagicMock()
+        cog.repo.get = AsyncMock(return_value=record)
+        mock_ctx = MagicMock()
+        mock_ctx.valid = False
+        cog.bot.get_context = AsyncMock(return_value=mock_ctx)
+
+        msg = self._make_thread_msg(discord.MessageType.pins_add)
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_default_message_forwarded(self) -> None:
+        """default タイプは従来どおり _handle_thread_reply に到達する。"""
+        cog = _make_cog()
+        cog._handle_thread_reply = AsyncMock()
+        record = MagicMock()
+        record.session_id = "sess-123"
+        cog.repo.get = AsyncMock(return_value=record)
+        mock_ctx = MagicMock()
+        mock_ctx.valid = False
+        cog.bot.get_context = AsyncMock(return_value=mock_ctx)
+
+        msg = self._make_thread_msg(discord.MessageType.default)
+        msg.content = "hello"
+        await cog.on_message(msg)
+
+        cog._handle_thread_reply.assert_called_once_with(msg)
+
+    @pytest.mark.asyncio
+    async def test_reply_message_forwarded(self) -> None:
+        """reply タイプは従来どおり _handle_thread_reply に到達する。"""
+        cog = _make_cog()
+        cog._handle_thread_reply = AsyncMock()
+        record = MagicMock()
+        record.session_id = "sess-456"
+        cog.repo.get = AsyncMock(return_value=record)
+        mock_ctx = MagicMock()
+        mock_ctx.valid = False
+        cog.bot.get_context = AsyncMock(return_value=mock_ctx)
+
+        msg = self._make_thread_msg(discord.MessageType.reply)
+        msg.content = "a reply"
         await cog.on_message(msg)
 
         cog._handle_thread_reply.assert_called_once_with(msg)
@@ -1329,6 +1418,7 @@ class TestMultiChannelOnMessage:
         msg.author = MagicMock()
         msg.author.bot = False
         msg.webhook_id = None
+        msg.type = discord.MessageType.default
         return msg
 
     @pytest.mark.asyncio
