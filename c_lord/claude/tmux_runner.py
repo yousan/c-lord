@@ -519,13 +519,21 @@ class TmuxClaudeRunner:
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 
-            current = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            raw_current = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
 
-            if current != last_raw:
+            # Raw-pane activity is tracked on the un-normalised capture so that
+            # spinner-frame / elapsed-counter changes count as "still working".
+            if raw_current != last_raw:
                 raw_static_seconds = 0.0
-                last_raw = current
+                last_raw = raw_current
             else:
                 raw_static_seconds += _POLL_INTERVAL
+
+            # All prompt detection runs on the NORMALISED text.  The Claude TUI
+            # renders menus with per-token ANSI colour codes that split "❯" from
+            # "1." — leaving the escapes in place makes the menu regexes (and the
+            # AskUserQuestion parser) silently miss real menus (#166).
+            current = _normalize_capture(raw_current)
 
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):

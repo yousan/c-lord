@@ -1894,6 +1894,45 @@ class TestRunYieldsPaneAsk:
         assert len(ask_events) == 1, "idle timeout fired during generation; menu never bridged"
 
     @pytest.mark.asyncio
+    async def test_run_normalises_ansi_capture_before_detect(self, runner, tmux_manager) -> None:
+        """Regression (#166 staging): the Claude TUI emits ANSI colour codes
+        that split "❯" from "1.".  The run loop must normalise the capture
+        before parsing, or the menu is never detected.  This fixture is the
+        real escape-coded pane that failed on staging.
+        """
+        ansi_pane = _load_fixture("ask_user_question_ansi_raw.txt")
+        # Sanity: the raw fixture really does defeat the parser.
+        assert _parse_ask_from_pane(ansi_pane) is None
+
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 8:
+                return ansi_pane
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+                if event.pane_ask is not None:
+                    break
+
+        ask_events = [e for e in events if e.pane_ask is not None]
+        assert len(ask_events) == 1, "ANSI capture not normalised → menu missed"
+        assert [o.label for o in ask_events[0].pane_ask.options] == ["Coffee", "Tea", "Water"]
+
+    @pytest.mark.asyncio
     async def test_answer_menu_sends_down_then_enter(self, runner, tmux_manager) -> None:
         """answer_menu(2) navigates Down twice and confirms with Enter."""
         await runner.answer_menu(2)
