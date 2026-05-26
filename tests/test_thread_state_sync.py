@@ -304,6 +304,173 @@ async def test_sync_one_skips_rename_when_no_topic():
     fake_thread.edit.assert_not_called()
 
 
+class _FakeHTTPException(Exception):
+    """Minimal discord.HTTPException stand-in for rate-limit tests."""
+
+    def __init__(self, status: int, retry_after: float = 300.0) -> None:
+        self.status = status
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {status}")
+
+
+# ── per-thread 429 backoff tests ─────────────────────────────────────────────
+
+
+async def test_sync_one_429_sets_per_thread_backoff():
+    """429 HTTPException should set per-thread backoff and log a warning."""
+    import asyncio
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock(side_effect=_FakeHTTPException(429, retry_after=300.0))
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(thread_id=777, state="waiting", topic="rate-limit test")
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    assert 777 in loop._rename_backoff
+    now = asyncio.get_event_loop().time()
+    assert loop._rename_backoff[777] > now + 299.0
+
+
+async def test_sync_one_skips_rename_during_backoff():
+    """While thread is in backoff window, rename PATCH must not be sent."""
+    import asyncio
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+
+    # Pre-set backoff for thread 888 far into the future.
+    loop._rename_backoff[888] = asyncio.get_event_loop().time() + 600.0
+
+    rec = _Rec(thread_id=888, state="waiting", topic="backoff test")
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    fake_thread.edit.assert_not_called()
+
+
+async def test_sync_one_timeout_sets_conservative_backoff():
+    """TimeoutError during rename should set a conservative per-thread backoff."""
+    import asyncio
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(thread_id=999, state="waiting", topic="timeout test")
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    assert 999 in loop._rename_backoff
+    now = asyncio.get_event_loop().time()
+    assert loop._rename_backoff[999] > now + 59.0
+
+
+async def test_sync_one_429_not_immediately_retried():
+    """After a 429, a second tick within backoff window must not call edit again."""
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock(side_effect=_FakeHTTPException(429, retry_after=300.0))
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(thread_id=1001, state="waiting", topic="no retry test")
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        # First tick — hits 429.
+        await loop._sync_one(rec, by_tid={})
+        assert fake_thread.edit.call_count == 1
+
+        # Simulate same-loop second tick (backoff already set).
+        fake_thread.edit.reset_mock()
+        await loop._sync_one(rec, by_tid={})
+        fake_thread.edit.assert_not_called()
+
+
+async def test_sync_one_backoff_cleared_on_success():
+    """Successful rename should clear the backoff entry for that thread."""
+    import asyncio
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+
+    # Pre-set an expired backoff.
+    loop._rename_backoff[1002] = asyncio.get_event_loop().time() - 1.0  # expired
+
+    rec = _Rec(thread_id=1002, state="waiting", topic="backoff clear test")
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    # edit was called (backoff expired), and backoff entry cleared.
+    fake_thread.edit.assert_awaited_once()
+    assert 1002 not in loop._rename_backoff
+
+
 async def test_loop_start_is_idempotent():
     repo = MagicMock()
     bot = MagicMock()
