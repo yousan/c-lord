@@ -1731,3 +1731,100 @@ class TestGhostTextInputNotFlagged:
         """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
         pane = _load_fixture("bug_62_ghost_text_input.txt")
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+# -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------
+
+_UNKNOWN_MENU_A = (
+    "● Bash(python3 menu.py)\n"
+    "  ⎿  Select deployment target:\n"
+    "     ❯ 1. Production\n"
+    "       2. Staging\n"
+    "       3. Cancel\n"
+    "✻ Cogitated for {n}s\n"
+    "────────\n❯\n────────\n-- INSERT --"
+)
+
+_UNKNOWN_MENU_B = (
+    "● Bash(python3 other.py)\n"
+    "  ⎿  Choose a branch:\n"
+    "     ❯ 1. main\n"
+    "       2. develop\n"
+    "✻ Cogitated for {n}s\n"
+    "────────\n❯\n────────\n-- INSERT --"
+)
+
+_DONE_PANE = "● All done!\n\n────────\n❯\n────────\n-- INSERT --"
+
+
+class TestUnknownPromptDedup:
+    """Regression for #165: an unknown menu that lingers in the pane must
+    trigger the unknown_tui_prompt embed only ONCE, not every ~5s.  The
+    volatile chrome (spinner / elapsed seconds) must not defeat the dedup.
+    A *different* menu, or the same menu reappearing after it cleared, must
+    alert again.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_menu_fires_once(self, runner, tmux_manager) -> None:
+        """A lingering unknown menu yields exactly one unknown_tui_prompt event."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Same menu for many polls (volatile spinner seconds change each poll),
+            # then a completed pane so the run loop can finish.
+            if call_idx <= 12:
+                return _UNKNOWN_MENU_A.format(n=call_idx)
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._UNKNOWN_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        unknown_events = [e for e in events if e.unknown_tui_prompt is not None]
+        assert len(unknown_events) == 1, (
+            f"expected exactly 1 unknown_tui_prompt event, got {len(unknown_events)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_different_menu_fires_again(self, runner, tmux_manager) -> None:
+        """A second, distinct unknown menu must alert again (not be suppressed)."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 6:
+                return _UNKNOWN_MENU_A.format(n=call_idx)
+            if call_idx <= 12:
+                return _UNKNOWN_MENU_B.format(n=call_idx)
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._UNKNOWN_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        unknown_events = [e for e in events if e.unknown_tui_prompt is not None]
+        assert len(unknown_events) == 2, (
+            f"expected 2 unknown_tui_prompt events (menu A then B), got {len(unknown_events)}"
+        )
