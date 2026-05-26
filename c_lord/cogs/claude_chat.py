@@ -320,6 +320,10 @@ class ClaudeChatCog(commands.Cog):
         if message.channel.id == self.bot.channel_id:
             return
 
+        # System messages (thread rename, pin, etc.) must not reach Claude
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
+
         # Text commands (e.g. !attach) are handled by process_commands — skip here
         ctx = await self.bot.get_context(message)
         if ctx.valid:
