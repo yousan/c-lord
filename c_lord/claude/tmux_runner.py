@@ -501,12 +501,26 @@ class TmuxClaudeRunner:
         # signature of the menu we already bridged to Discord (dedup).
         ask_stable = 0.0
         last_bridged_ask: str | None = None
+        # Raw pane activity (#166): while Claude works the pane changes every
+        # poll (spinner frame, elapsed-seconds tick), even when no response text
+        # is extracted yet.  We only treat the session as idle once the raw pane
+        # has been frozen for the idle window — otherwise a long thinking phase
+        # before an AskUserQuestion menu trips the idle timeout and we stop
+        # polling before the menu appears.
+        last_raw = ""
+        raw_static_seconds = 0.0
 
         while not self._stopped and elapsed < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 
             current = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+
+            if current != last_raw:
+                raw_static_seconds = 0.0
+                last_raw = current
+            else:
+                raw_static_seconds += _POLL_INTERVAL
 
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
@@ -613,12 +627,17 @@ class TmuxClaudeRunner:
             ):
                 break
 
-            # Idle timeout: no response received for too long.  Never give up
-            # while Claude is visibly working (✻ …) — otherwise a long thinking
-            # phase before an AskUserQuestion menu would stop polling and the
-            # menu would surface in an unmonitored pane (#166).  The outer
-            # ``timeout_seconds`` (300s) remains the hard backstop.
-            if not last_response and stable_seconds >= _IDLE_TIMEOUT and not is_gen:
+            # Idle timeout: no response and the pane has been completely frozen
+            # for the idle window.  Requiring raw-pane staleness (not just empty
+            # response text) means a long "thinking" phase before an
+            # AskUserQuestion menu — where the spinner/elapsed counter keeps the
+            # pane changing — does not trip the timeout and stop polling before
+            # the menu appears (#166).  ``timeout_seconds`` (300s) is the backstop.
+            if (
+                not last_response
+                and stable_seconds >= _IDLE_TIMEOUT
+                and raw_static_seconds >= _IDLE_TIMEOUT
+            ):
                 # During a fresh start, allow extra time for Claude to load.
                 if not claude_running and elapsed < _STARTUP_TIMEOUT:
                     continue

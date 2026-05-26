@@ -1863,8 +1863,6 @@ class TestRunYieldsPaneAsk:
         sees the menu — exactly what happened on staging.
         """
         ask_pane = _load_fixture("ask_user_question_3options.txt")
-        # Spinner line ends with … → _is_generating() True; no response text.
-        gen_pane = "\n✻ Cogitating…\n────────\n❯\n────────\n-- INSERT --"
         tmux_manager.is_claude_running.return_value = True
         call_idx = 0
 
@@ -1872,7 +1870,9 @@ class TestRunYieldsPaneAsk:
             nonlocal call_idx
             call_idx += 1
             if call_idx <= 10:  # "thinking" far longer than the (patched) idle timeout
-                return gen_pane
+                # The pane keeps changing each poll (elapsed-seconds tick) — no
+                # response text yet.  This is what must keep the run alive.
+                return f"\n✻ Cogitating for {call_idx}s\n────────\n❯\n────────\n-- INSERT --"
             return ask_pane
 
         tmux_manager.capture_pane.side_effect = capture_fn
