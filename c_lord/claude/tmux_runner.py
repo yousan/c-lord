@@ -53,6 +53,19 @@ _TRUST_PROMPT_MARKERS = (
     "Enter to confirm",
 )
 
+# Patterns from Plan approval (ExitPlanMode) and AskUserQuestion TUI menus.
+# These are KNOWN prompt types handled via Discord buttons; they must NOT be
+# flagged as "unknown" interactive prompts (#153).
+# Sources: Claude Code TUI catalog (docs/tui-prompts.md).
+_KNOWN_INTERACTIVE_MARKERS = (
+    # ExitPlanMode (Plan approval) — docs/tui-prompts.md §2-2
+    "Would you like to proceed?",
+    "No, keep planning",
+    # AskUserQuestion — always adds "Other" as the last option (no number prefix)
+    "\nOther",
+    "\n  Other",
+)
+
 # Patterns that indicate a permission/approval prompt that needs "Yes".
 # Sources: existing c-lord markers + Claude Code v2.1+ npm package strings.
 _PERMISSION_PROMPT_MARKERS = (
@@ -584,7 +597,12 @@ class TmuxClaudeRunner:
         # Exclude already-handled prompts so they don't double-fire.
         if any(marker in zone for marker in _TRUST_PROMPT_MARKERS):
             return False
-        return not any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS)
+        if any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS):
+            return False
+        # Exclude Plan approval (ExitPlanMode) and AskUserQuestion menus (#153).
+        # These are handled via Discord buttons; surfacing them as "unknown" would
+        # confuse users with a duplicate warning alongside the real Discord UI.
+        return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.
