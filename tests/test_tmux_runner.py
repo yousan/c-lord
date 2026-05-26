@@ -1676,3 +1676,155 @@ class TestPermissionPromptTailAnchor:
         """Conversation-body markers must not trigger unknown-interactive detection."""
         pane = _load_fixture("bug_156_yn_in_conversation.txt")
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+# -- Regression tests for #153 (plan/ask menus flagged as unknown) ---------------
+
+
+class TestKnownInteractiveMenusNotFlaggedAsUnknown:
+    """Regression for #153: ExitPlanMode and AskUserQuestion menus must not
+    trigger unknown_tui_prompt_embed.  These are KNOWN prompts handled
+    elsewhere (Discord buttons via EventProcessor / TranscriptMirrorCog).
+    """
+
+    def test_plan_approval_not_unknown(self) -> None:
+        """ExitPlanMode 'Would you like to proceed?' menu MUST NOT be flagged."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_ask_user_question_not_unknown(self) -> None:
+        """AskUserQuestion numbered menu MUST NOT be flagged as unknown."""
+        pane = _load_fixture("ask_user_question_menu.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_real_unknown_menu_still_detected(self) -> None:
+        """A truly unknown menu (e.g. LSP install) MUST still be detected."""
+        pane = (
+            "Would you like to install the LSP plugin?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────\n"
+            "-- INSERT --"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+
+class TestGhostTextInputNotFlagged:
+    """Regression for #62: ghost text in the ❯ input area (tmux INSERT mode)
+    must not trigger any detection function.  The pane shows user-typed text
+    in the input zone but no real interactive prompt from Claude.
+    """
+
+    def test_ghost_text_no_permission_prompt(self) -> None:
+        """Ghost text in input area MUST NOT trigger _has_permission_prompt."""
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+
+    def test_ghost_text_no_yn_prompt(self) -> None:
+        """Ghost text in input area MUST NOT trigger _is_yn_prompt."""
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+
+    def test_ghost_text_no_unknown_interactive(self) -> None:
+        """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+# -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------
+
+_UNKNOWN_MENU_A = (
+    "● Bash(python3 menu.py)\n"
+    "  ⎿  Select deployment target:\n"
+    "     ❯ 1. Production\n"
+    "       2. Staging\n"
+    "       3. Cancel\n"
+    "✻ Cogitated for {n}s\n"
+    "────────\n❯\n────────\n-- INSERT --"
+)
+
+_UNKNOWN_MENU_B = (
+    "● Bash(python3 other.py)\n"
+    "  ⎿  Choose a branch:\n"
+    "     ❯ 1. main\n"
+    "       2. develop\n"
+    "✻ Cogitated for {n}s\n"
+    "────────\n❯\n────────\n-- INSERT --"
+)
+
+_DONE_PANE = "● All done!\n\n────────\n❯\n────────\n-- INSERT --"
+
+
+class TestUnknownPromptDedup:
+    """Regression for #165: an unknown menu that lingers in the pane must
+    trigger the unknown_tui_prompt embed only ONCE, not every ~5s.  The
+    volatile chrome (spinner / elapsed seconds) must not defeat the dedup.
+    A *different* menu, or the same menu reappearing after it cleared, must
+    alert again.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_menu_fires_once(self, runner, tmux_manager) -> None:
+        """A lingering unknown menu yields exactly one unknown_tui_prompt event."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Same menu for many polls (volatile spinner seconds change each poll),
+            # then a completed pane so the run loop can finish.
+            if call_idx <= 12:
+                return _UNKNOWN_MENU_A.format(n=call_idx)
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._UNKNOWN_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        unknown_events = [e for e in events if e.unknown_tui_prompt is not None]
+        assert len(unknown_events) == 1, (
+            f"expected exactly 1 unknown_tui_prompt event, got {len(unknown_events)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_different_menu_fires_again(self, runner, tmux_manager) -> None:
+        """A second, distinct unknown menu must alert again (not be suppressed)."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 6:
+                return _UNKNOWN_MENU_A.format(n=call_idx)
+            if call_idx <= 12:
+                return _UNKNOWN_MENU_B.format(n=call_idx)
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._UNKNOWN_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        unknown_events = [e for e in events if e.unknown_tui_prompt is not None]
+        assert len(unknown_events) == 2, (
+            f"expected 2 unknown_tui_prompt events (menu A then B), got {len(unknown_events)}"
+        )

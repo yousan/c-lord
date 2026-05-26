@@ -1,0 +1,18 @@
+❯ 実装計画を立ててから実行してください
+
+● 計画を検討しています...
+
+● これが実装計画です：
+
+  1. `c_lord/claude/tmux_runner.py` に `_permission_zone()` を追加
+  2. `_has_permission_prompt` と `_is_yn_prompt` を修正
+  3. テストを追加
+
+Would you like to proceed?
+❯ 1. Yes
+  2. Yes, and auto-accept edits
+  3. No, keep planning
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+-- INSERT --   ⏵⏵ bypass permissions on /home/yousan/c-lord

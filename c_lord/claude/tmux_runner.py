@@ -38,6 +38,10 @@ _IDLE_TIMEOUT = 15.0
 # How long to wait for Claude to become ready (show input prompt).
 _STARTUP_TIMEOUT = 30.0
 
+# How long an unknown interactive menu must be continuously visible before we
+# alert Discord (seconds).  Guards against transient TUI redraws.
+_UNKNOWN_ALERT_DELAY = 5.0
+
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
 
@@ -51,6 +55,19 @@ _CONTINUE_CHECK_DELAY = 3.0
 _TRUST_PROMPT_MARKERS = (
     "Yes, I trust this folder",
     "Enter to confirm",
+)
+
+# Patterns from Plan approval (ExitPlanMode) and AskUserQuestion TUI menus.
+# These are KNOWN prompt types handled via Discord buttons; they must NOT be
+# flagged as "unknown" interactive prompts (#153).
+# Sources: Claude Code TUI catalog (docs/tui-prompts.md).
+_KNOWN_INTERACTIVE_MARKERS = (
+    # ExitPlanMode (Plan approval) — docs/tui-prompts.md §2-2
+    "Would you like to proceed?",
+    "No, keep planning",
+    # AskUserQuestion — always adds "Other" as the last option (no number prefix)
+    "\nOther",
+    "\n  Other",
 )
 
 # Patterns that indicate a permission/approval prompt that needs "Yes".
@@ -88,6 +105,28 @@ def _permission_zone(text: str) -> str:
     """
     lines = text.splitlines()
     return "\n".join(lines[-_PERMISSION_SCAN_LINES:])
+
+
+# Matches a numbered menu item line, with or without the leading ❯ cursor:
+# "❯ 1. Production", "  2. Staging".  Used to build a stable signature of an
+# unknown menu so duplicate alerts can be suppressed (#165).
+_MENU_ITEM_RE = re.compile(r"^\s*❯?\s*(\d+\..*\S)\s*$", re.MULTILINE)
+
+
+def _unknown_prompt_signature(text: str) -> str:
+    """Stable identity of an unknown interactive prompt, ignoring volatile chrome.
+
+    The pane's spinner, elapsed-seconds and cost rows change on every poll, so
+    comparing raw captures would defeat dedup.  We key on the menu's option
+    lines (cursor stripped) plus any inline [y/N] line — the parts that stay
+    constant while the same menu lingers (#165).
+    """
+    zone = _permission_zone(text)
+    sig_lines = [m.strip() for m in _MENU_ITEM_RE.findall(zone)]
+    for line in zone.splitlines():
+        if _YN_PROMPT_RE.search(line):
+            sig_lines.append(line.strip())
+    return "\n".join(sig_lines)
 
 
 # Regex for separator lines (all box-drawing horizontal characters).
@@ -366,7 +405,10 @@ class TmuxClaudeRunner:
         # We require it to be stable for this long before alerting Discord,
         # to avoid false positives from transient TUI redraws.
         unknown_interactive_stable = 0.0
-        unknown_interactive_alert_delay = 5.0
+        # Signature of the last menu we already alerted on.  While the same menu
+        # lingers we must NOT re-alert every poll (#165); we re-alert only when
+        # the menu changes or after it clears (reset to None below).
+        last_alerted_unknown: str | None = None
 
         while not self._stopped and elapsed < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
@@ -377,6 +419,7 @@ class TmuxClaudeRunner:
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
                 unknown_interactive_stable = 0.0
+                last_alerted_unknown = None
                 await self._accept_permission_prompt(current)
                 continue
 
@@ -384,20 +427,26 @@ class TmuxClaudeRunner:
             # Alert Discord so the session doesn't stall silently.
             if self._has_unknown_interactive(current):
                 unknown_interactive_stable += _POLL_INTERVAL
-                if unknown_interactive_stable >= unknown_interactive_alert_delay:
-                    logger.warning(
-                        "Unknown TUI interactive prompt detected (thread=%d)",
-                        self._thread_id,
-                    )
-                    yield StreamEvent(
-                        raw={},
-                        message_type=MessageType.SYSTEM,
-                        unknown_tui_prompt=current[-800:],
-                    )
-                    unknown_interactive_stable = 0.0  # reset to avoid spam
+                if unknown_interactive_stable >= _UNKNOWN_ALERT_DELAY:
+                    signature = _unknown_prompt_signature(current)
+                    if signature != last_alerted_unknown:
+                        logger.warning(
+                            "Unknown TUI interactive prompt detected (thread=%d)",
+                            self._thread_id,
+                        )
+                        yield StreamEvent(
+                            raw={},
+                            message_type=MessageType.SYSTEM,
+                            unknown_tui_prompt=current[-800:],
+                        )
+                        last_alerted_unknown = signature
+                    # Reset the stability timer either way so we re-evaluate the
+                    # signature on the next dwell window rather than every poll.
+                    unknown_interactive_stable = 0.0
                 continue
             else:
                 unknown_interactive_stable = 0.0
+                last_alerted_unknown = None
 
             # Extract the clean response from the TUI pane.
             response = self._extract_response(current)
@@ -584,7 +633,12 @@ class TmuxClaudeRunner:
         # Exclude already-handled prompts so they don't double-fire.
         if any(marker in zone for marker in _TRUST_PROMPT_MARKERS):
             return False
-        return not any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS)
+        if any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS):
+            return False
+        # Exclude Plan approval (ExitPlanMode) and AskUserQuestion menus (#153).
+        # These are handled via Discord buttons; surfacing them as "unknown" would
+        # confuse users with a duplicate warning alongside the real Discord UI.
+        return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.
