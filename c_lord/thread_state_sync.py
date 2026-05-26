@@ -321,7 +321,7 @@ class ThreadStateSyncLoop:
                 )
             else:
                 logger.debug("state-sync: rename failed for thread %d: %s", thread_id, exc)
-        except TimeoutError:
+        except asyncio.TimeoutError:  # noqa: UP041 — asyncio.TimeoutError != TimeoutError on Py3.10
             # discord.py's rate-limit sleep (retry_after) is cancelled by wait_for's timeout.
             # Apply conservative backoff to prevent rapid PATCH retries.
             self._rename_backoff[thread_id] = (
