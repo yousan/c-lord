@@ -55,7 +55,12 @@ async def bridge_pane_ask(
     """
     answer_queue = _ask_bus.register(thread.id)
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
-    msg = await thread.send(embed=ask_embed(question.question, question.header), view=view)
+    msg = await thread.send(
+        embed=ask_embed(
+            question.question, question.header, question.options, question.multi_select
+        ),
+        view=view,
+    )
 
     try:
         selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)
@@ -129,7 +134,9 @@ async def collect_ask_answers(
         answer_queue = _ask_bus.register(thread.id)
 
         view = AskView(q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo)
-        msg = await thread.send(embed=ask_embed(q.question, q.header), view=view)
+        msg = await thread.send(
+            embed=ask_embed(q.question, q.header, q.options, q.multi_select), view=view
+        )
 
         try:
             selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)

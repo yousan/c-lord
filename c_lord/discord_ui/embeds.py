@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import discord
 
-from ..claude.types import TodoItem, ToolCategory, ToolUseEvent
+from ..claude.types import AskOption, TodoItem, ToolCategory, ToolUseEvent
 
 # Colors
 COLOR_INFO = 0x5865F2  # Discord blurple
@@ -233,12 +233,29 @@ def timeout_embed(seconds: int) -> discord.Embed:
     )
 
 
-def ask_embed(question: str, header: str = "") -> discord.Embed:
-    """Create an embed for an AskUserQuestion interactive prompt."""
+def ask_embed(
+    question: str,
+    header: str = "",
+    options: list[AskOption] | None = None,
+    multi_select: bool = False,
+) -> discord.Embed:
+    """Create an embed for an AskUserQuestion interactive prompt.
+
+    When *options* render as buttons (≤4 options, single-select), a legend of
+    ``**label** — description`` lines is appended to the body: Discord buttons
+    cannot show option descriptions, so without this a viewer sees only opaque
+    labels (#169).  The Select-menu case (≥5 options) shows descriptions in the
+    dropdown itself, so no legend is added there.
+    """
     title = f"❓ {header}" if header else "❓ Claude needs your input"
+    body = question
+    if options and not multi_select and len(options) <= 4:
+        legend = "\n".join(f"**{o.label}** — {o.description}" for o in options if o.description)
+        if legend:
+            body = f"{question}\n\n{legend}"
     return discord.Embed(
         title=title[:256],
-        description=question[:4096],
+        description=body[:4096],
         color=COLOR_ASK,
     )
 

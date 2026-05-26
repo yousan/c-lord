@@ -196,18 +196,30 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     # above the menu end) down to the menu end — never the whole buffer.
     scan_from = header_idx + 1 if header_idx >= 0 else max(0, end_idx - 20)
 
+    # Indices of every numbered line (including meta-options) within the menu —
+    # used to bound the region from which each real option's description is read.
+    all_opt_indices = [i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(lines[i])]
+
     options: list[AskOption] = []
     first_opt_idx: int | None = None
-    for i in range(scan_from, end_idx + 1):
-        m = _ASK_OPTION_RE.match(lines[i])
-        if not m:
-            continue
-        label = m.group(1).strip()
+    for pos, i in enumerate(all_opt_indices):
+        label = _ASK_OPTION_RE.match(lines[i]).group(1).strip()  # type: ignore[union-attr]
         if label in _ASK_META_LABELS:
             continue
         if first_opt_idx is None:
             first_opt_idx = i
-        options.append(AskOption(label=label))
+        # Description (#169): the first non-empty, non-separator line between this
+        # option and the next numbered line — Claude renders it indented below
+        # the option.  Empty when the option has no description.
+        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx + 1
+        description = ""
+        for j in range(i + 1, next_i):
+            s = lines[j].strip()
+            if not s or _SEPARATOR_RE.match(lines[j]):
+                continue
+            description = s
+            break
+        options.append(AskOption(label=label, description=description))
 
     if not options:
         return None
