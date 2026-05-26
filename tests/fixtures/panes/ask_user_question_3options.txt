@@ -1,0 +1,24 @@
+
+✻ Baked for 2s
+
+❯ AskUserQuestionツールで質問してください: header「Deploy」、question「Which
+  environment?」、options=[{label:Production, description:本番},
+  {label:Staging, description:検証}, {label:Local,
+  description:ローカル}]。質問だけして、回答を待ってください。
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Deploy
+
+Which environment?
+
+❯ 1. Production
+     本番
+  2. Staging
+     検証
+  3. Local
+     ローカル
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+

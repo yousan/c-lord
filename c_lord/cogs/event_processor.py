@@ -175,6 +175,12 @@ class EventProcessor:
             await self._handle_elicitation(event)
             return
 
+        # In-pane AskUserQuestion (jsonl/tmux mode) — show Discord buttons and
+        # answer the open TUI menu by sending keystrokes back to the pane (#166).
+        if event.pane_ask is not None:
+            await self._handle_pane_ask(event)
+            return
+
         # Unknown TUI interactive prompt — warn Discord so the session doesn't stall silently
         if event.unknown_tui_prompt is not None:
             with contextlib.suppress(Exception):
@@ -353,6 +359,32 @@ class EventProcessor:
             "Permission request posted: %s (request_id=%s)",
             event.permission_request.tool_name,
             event.permission_request.request_id,
+        )
+
+    async def _handle_pane_ask(self, event: StreamEvent) -> None:
+        """Bridge an in-pane AskUserQuestion menu to Discord buttons (#166).
+
+        Blocks until the user answers (or the view times out); the runner is
+        suspended at its ``yield`` meanwhile, so the pane is not re-polled.  The
+        chosen option is delivered back to the open TUI menu as keystrokes.
+        """
+        assert event.pane_ask is not None
+        runner = self._config.runner
+        if not hasattr(runner, "answer_menu"):
+            # Non-tmux runner — nothing to answer in a pane.  Skip gracefully.
+            logger.warning("pane_ask received but runner cannot answer menus; skipping")
+            return
+        from ..discord_ui.ask_handler import bridge_pane_ask
+
+        await bridge_pane_ask(
+            self._config.thread,
+            event.pane_ask,
+            runner,
+            ask_repo=self._config.ask_repo,
+        )
+        logger.info(
+            "AskUserQuestion bridged and answered for thread %d",
+            self._config.thread.id,
         )
 
     async def _handle_elicitation(self, event: StreamEvent) -> None:

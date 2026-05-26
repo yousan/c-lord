@@ -164,6 +164,10 @@ class StreamEvent:
     thinking: str | None = None
     has_redacted_thinking: bool = False
     ask_questions: list[AskQuestion] | None = None
+    # AskUserQuestion menu parsed from the tmux pane (jsonl/tmux mode, #166).
+    # Distinct from ``ask_questions`` (SDK-mode resume-via-prompt): a pane_ask is
+    # answered in-place by sending menu keystrokes back to the still-open TUI.
+    pane_ask: AskQuestion | None = None
     todo_list: list[TodoItem] | None = None
     is_plan_approval: bool = False
     permission_request: PermissionRequest | None = None

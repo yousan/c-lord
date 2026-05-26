@@ -759,6 +759,33 @@ class TmuxSessionManager:
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         return result.returncode == 0
 
+    def send_keys(self, thread_id: int, *keys: str) -> bool:
+        """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).
+
+        Unlike :meth:`send_input`, the arguments are passed to ``tmux send-keys``
+        *without* ``-l``, so tmux interprets them as key names rather than
+        literal text.  Used to drive TUI menus such as AskUserQuestion (#166):
+        navigate with ``"Down"`` then confirm with ``"Enter"``.
+
+        Returns True on success.
+        """
+        if not keys:
+            return True
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("send_keys: no window for thread %d", thread_id)
+            return False
+
+        target = f"{self.session_name}:{window}"
+        result = _run(["tmux", "send-keys", "-t", target, *keys])
+        if result.returncode != 0:
+            logger.warning("send_keys: send-keys failed: %s", result.stderr.strip())
+            return False
+        return True
+
     def capture_pane(self, thread_id: int, history_lines: int = 500) -> str:
         """Capture the current pane text from the tmux window.
 

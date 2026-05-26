@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from c_lord.claude.tmux_runner import TmuxClaudeRunner, _clean_tui_lines, _normalize_capture
+from c_lord.claude.tmux_runner import (
+    TmuxClaudeRunner,
+    _clean_tui_lines,
+    _normalize_capture,
+    _parse_ask_from_pane,
+)
 from c_lord.claude.types import MessageType
 
 
@@ -1731,6 +1736,213 @@ class TestGhostTextInputNotFlagged:
         """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
         pane = _load_fixture("bug_62_ghost_text_input.txt")
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+# -- Tests for #166 (AskUserQuestion → Discord buttons in tmux/jsonl mode) -----
+
+
+class TestParseAskFromPane:
+    """#166: parse the AskUserQuestion TUI menu from a real captured pane into
+    a structured AskQuestion (question, header, real options) so it can be
+    rendered as Discord buttons.  Meta-options ('Type something.', 'Chat about
+    this') are excluded — they are TUI affordances, not real choices.
+    """
+
+    def test_parses_question_header_and_options(self) -> None:
+        pane = _load_fixture("ask_user_question_3options.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.header == "Deploy"
+        assert q.question == "Which environment?"
+        labels = [o.label for o in q.options]
+        assert labels == ["Production", "Staging", "Local"]
+
+    def test_meta_options_excluded(self) -> None:
+        """'Type something.' / 'Chat about this' must not become buttons."""
+        pane = _load_fixture("ask_user_question_3options.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        labels = [o.label for o in q.options]
+        assert "Type something." not in labels
+        assert "Chat about this" not in labels
+
+    def test_plan_approval_is_not_ask(self) -> None:
+        """A Plan-approval menu is NOT an AskUserQuestion → returns None."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        assert _parse_ask_from_pane(pane) is None
+
+    def test_only_active_bottom_menu_parsed_not_scrollback(self) -> None:
+        """Regression (#166 staging): old menus in scrollback must be ignored.
+
+        capture-pane returns 500 lines of history; a previous AskUserQuestion
+        menu still sits above the current one.  Parsing the whole buffer pulled
+        in stale options and produced duplicate Discord Select values (400 Bad
+        Request).  Only the active (bottom-most) menu must be parsed.
+        """
+        old_menu = (
+            " ☐ OldHeader\n"
+            "Old question?\n"
+            "❯ 1. AlphaOld\n"
+            "  2. BetaOld\n"
+            "  3. Type something.\n"
+            "  4. Chat about this\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        new_menu = (
+            " ☐ Region\n"
+            "Which region?\n"
+            "❯ 1. Tokyo\n"
+            "  2. Osaka\n"
+            "  3. Type something.\n"
+            "  4. Chat about this\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        pane = "old conversation\n" + old_menu + "\nmore output\n" + new_menu
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.header == "Region"
+        assert q.question == "Which region?"
+        labels = [o.label for o in q.options]
+        assert labels == ["Tokyo", "Osaka"], f"leaked scrollback options: {labels}"
+
+    def test_idle_pane_is_not_ask(self) -> None:
+        pane = "● Some response\n\n────────\n❯\n────────\n-- INSERT --"
+        assert _parse_ask_from_pane(pane) is None
+
+    def test_ask_menu_not_flagged_as_unknown(self) -> None:
+        """Regression: the current AskUserQuestion variant (Type something. /
+        Chat about this, no 'Other') must NOT trip the unknown-prompt warning —
+        #153's markers were stale for Claude Code v2.1.150.
+        """
+        pane = _load_fixture("ask_user_question_3options.txt")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+class TestRunYieldsPaneAsk:
+    """#166: the run() loop must surface an AskUserQuestion menu as a single
+    pane_ask StreamEvent so the EventProcessor can show Discord buttons.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_yields_single_pane_ask(self, runner, tmux_manager) -> None:
+        ask_pane = _load_fixture("ask_user_question_3options.txt")
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Menu lingers for several polls, then resolves to a done pane.
+            if call_idx <= 8:
+                return ask_pane
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        ask_events = [e for e in events if e.pane_ask is not None]
+        assert len(ask_events) == 1, f"expected 1 pane_ask event, got {len(ask_events)}"
+        labels = [o.label for o in ask_events[0].pane_ask.options]
+        assert labels == ["Production", "Staging", "Local"]
+
+    @pytest.mark.asyncio
+    async def test_no_idle_timeout_while_generating_then_ask(self, runner, tmux_manager) -> None:
+        """The run must not idle-timeout while Claude is still thinking (#166).
+
+        AskUserQuestion can appear only after a long 'Cogitating…' phase.  If the
+        idle timeout fires during generation the runner stops polling and never
+        sees the menu — exactly what happened on staging.
+        """
+        ask_pane = _load_fixture("ask_user_question_3options.txt")
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 10:  # "thinking" far longer than the (patched) idle timeout
+                # The pane keeps changing each poll (elapsed-seconds tick) — no
+                # response text yet.  This is what must keep the run alive.
+                return f"\n✻ Cogitating for {call_idx}s\n────────\n❯\n────────\n-- INSERT --"
+            return ask_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+                if event.pane_ask is not None:
+                    break
+
+        ask_events = [e for e in events if e.pane_ask is not None]
+        assert len(ask_events) == 1, "idle timeout fired during generation; menu never bridged"
+
+    @pytest.mark.asyncio
+    async def test_run_normalises_ansi_capture_before_detect(self, runner, tmux_manager) -> None:
+        """Regression (#166 staging): the Claude TUI emits ANSI colour codes
+        that split "❯" from "1.".  The run loop must normalise the capture
+        before parsing, or the menu is never detected.  This fixture is the
+        real escape-coded pane that failed on staging.
+        """
+        ansi_pane = _load_fixture("ask_user_question_ansi_raw.txt")
+        # Sanity: the raw fixture really does defeat the parser.
+        assert _parse_ask_from_pane(ansi_pane) is None
+
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 8:
+                return ansi_pane
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+                if event.pane_ask is not None:
+                    break
+
+        ask_events = [e for e in events if e.pane_ask is not None]
+        assert len(ask_events) == 1, "ANSI capture not normalised → menu missed"
+        assert [o.label for o in ask_events[0].pane_ask.options] == ["Coffee", "Tea", "Water"]
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_sends_down_then_enter(self, runner, tmux_manager) -> None:
+        """answer_menu(2) navigates Down twice and confirms with Enter."""
+        await runner.answer_menu(2)
+        tmux_manager.send_keys.assert_called_once_with(12345, "Down", "Down", "Enter")
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_zero_just_enter(self, runner, tmux_manager) -> None:
+        """answer_menu(0) selects the first (already-highlighted) option."""
+        await runner.answer_menu(0)
+        tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
 
 
 # -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------

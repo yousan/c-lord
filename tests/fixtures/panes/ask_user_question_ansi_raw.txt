@@ -1,0 +1,64 @@
+[38;5;246m  ⎿  · Which environment? → Staging[39m                                         
+
+[38;5;231m●[39m [1mStaging[0m（検証環境）が選択されました。
+                                                                                
+[38;5;246m✻[39m [38;5;246mBaked for 5s[39m                                                                  
+
+[38;5;239m[48;5;237m❯ [38;5;231mAskUserQuestionツールで質問してください: header「Region」、question「Which [39m   
+  [38;5;231mregion to deploy?」、options=[{label:Tokyo, description:東京}, {label:Osaka, [39m 
+  [38;5;231mdescription:大阪}, {label:Nagoya, [39m                                            
+  [38;5;231mdescription:名古屋}]。質問だけして回答を待ってください。[39m                      
+
+[38;5;231m[49m● [39mUser declined to answer questions                                             
+[38;5;246m  ⎿  · Which region to deploy? (Tokyo / Osaka / Nagoya)[39m                     
+
+[38;5;239m[48;5;237m❯ [38;5;231mAskUserQuestionツールで質問してください: header「Fruit」、question「Pick a [39m   
+  [38;5;231mfruit」、options=[{label:Apple, description:りんご}, {label:Banana, [39m          
+  [38;5;231mdescription:ばなな}, {label:Cherry, [39m                                          
+  [38;5;231mdescription:さくらんぼ}]。質問だけして回答を待ってください。[39m                  
+
+[38;5;231m[49m● [39mUser declined to answer questions                                             
+[38;5;246m  ⎿  · Pick a fruit (Apple / Banana / Cherry)[39m                               
+
+[38;5;239m[48;5;237m❯ [38;5;231mAskUserQuestionツールで質問してください: header「Color」、question「Pick a [39m   
+  [38;5;231mcolor」、options=[{label:Red, description:あか}, {label:Green, [39m               
+  [38;5;231mdescription:みどり}, {label:Blue, [39m                                            
+  [38;5;231mdescription:あお}]。質問だけして回答を待ってください。[39m                        
+
+[38;5;231m[49m● [39mUser declined to answer questions                                             
+[38;5;246m  ⎿  · Pick a color (Red / Green / Blue)[39m                                    
+
+[38;5;239m[48;5;237m❯ [38;5;231mAskUserQuestionツールで質問してください: header「Pet」、question「Pick a [39m     
+  [38;5;231mpet」、options=[{label:Cat, description:ねこ}, {label:Dog, description:いぬ},[39m 
+  [38;5;231m {label:Bird, description:とり}]。質問だけして回答を待ってください。[39m          
+
+[38;5;231m[49m● [39mUser declined to answer questions                                         
+[38;5;246m  ⎿  · Pick a pet (Cat / Dog / Bird)
+
+[38;5;239m[48;5;237m❯ [38;5;231m5まで数えてから「done」と言って。急いで。[39m                                     
+
+[38;5;231m[49m●[39m 1, 2, 3, 4, 5 — done.                                                         
+                                                                            
+[38;5;246m✻[39m [38;5;246mSautéed for 2s[39m                                                                
+
+[38;5;239m[48;5;237m❯ [38;5;231mskUserQuestionツールで質問してください: header「Drink」、question「Pick a [39m    
+  [38;5;231mdrink」、options=[{label:Coffee, description:コーヒー}, {label:Tea, [39m          
+  [38;5;231mdescription:お茶}, {label:Water, [39m                                             
+  [38;5;231mdescription:水}]。質問だけして回答を待ってください。[39m                          
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────
+[38;5;16m[48;5;153m ☐ Drink [39m[49m                                                                       
+                                                                            
+[1m[38;5;231mPick a drink[0m                                                                    
+
+[38;5;153m❯[39m [38;5;246m1.[39m [38;5;153mCoffee[39m                                                                     
+     [38;5;246mコーヒー[39m                                                               
+  [38;5;246m2.[39m Tea                                                                    
+     [38;5;246mお茶[39m                                                                   
+  [38;5;246m3.[39m Water                                                  
+     [38;5;246m水
+[39m  [38;5;246m4.[39m [38;5;246mType[39m [38;5;246msomething.
+────────────────────────────────────────────────────────────────────────────────
+[39m  5. Chat about this
+
+[38;5;246mEnter[39m [38;5;246mto[39m [38;5;246mselect[39m [38;5;246m·[39m [38;5;246m↑/↓[39m [38;5;246mto[39m [38;5;246mnavigate[39m [38;5;246m·[39m [38;5;246mEsc[39m [38;5;246mto[39m [38;5;246mcancel
+
