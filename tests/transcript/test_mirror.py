@@ -386,7 +386,11 @@ async def test_mirror_full_mode_posts_tool_events_directly(tmp_path: Path) -> No
 
 
 async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path) -> None:
-    """Buffer is reset after each assistant_text so second turn starts fresh."""
+    """Buffer is reset after each assistant_text so second turn starts fresh.
+
+    A ``result`` event between turns signals the turn boundary; each turn's
+    final text is flushed as a reply on that event.
+    """
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
@@ -396,9 +400,13 @@ async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path)
     os.utime(jsonl, (1, 1))
 
     file_sink_calls: list[tuple[str, str]] = []
+    reply_sink_calls: list[str] = []
 
     async def sink(text: str) -> None:
         pass
+
+    async def reply_sink(text: str) -> None:
+        reply_sink_calls.append(text)
 
     async def file_sink(text: str, file_path: str) -> None:
         file_sink_calls.append((text, file_path))
@@ -407,6 +415,7 @@ async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path)
         thread_id=1,
         project_dir=project,
         sink=sink,
+        reply_sink=reply_sink,
         file_sink=file_sink,
         verbosity="minimal",
         poll_interval=0.05,
@@ -414,19 +423,162 @@ async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path)
     mirror.start()
     try:
         await asyncio.sleep(0.1)
-        # Turn 1: tool + final text → file_sink called
+        # Turn 1: tool + final text → result event triggers reply flush via file_sink
         _write_event(jsonl, _assistant_tool_use("Bash", "ls"))
         _write_event(jsonl, _assistant_text("turn1 done"))
+        _write_event(jsonl, {"type": "result", "subtype": "success"})
         await asyncio.sleep(0.3)
-        # Turn 2: no tools, just final text → plain sink, NOT file_sink
+        # Turn 2: no tools, just final text → reply_sink (no file_sink, buffer was cleared)
         _write_event(jsonl, _assistant_text("turn2 done"))
         await asyncio.sleep(0.3)
     finally:
         await mirror.stop()
 
-    # file_sink only called once (turn 1), not for turn 2 (no buffered tools)
+    # Turn 1: file_sink called (tools were buffered)
     assert len(file_sink_calls) == 1
     assert file_sink_calls[0][0] == "turn1 done"
+    # Turn 2: reply_sink called (no tools buffered)
+    assert any("turn2 done" in s for s in reply_sink_calls)
+
+
+# ---------------------------------------------------------------------------
+# Issue #143: intermediate assistant_text must be silent; only last gets reply
+# ---------------------------------------------------------------------------
+
+
+async def test_mirror_multiple_assistant_texts_intermediate_silent(tmp_path: Path) -> None:
+    """Issue #143: when multiple assistant_text events arrive in one turn,
+    intermediate ones must go to sink (no reference), only the last to reply_sink."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    sink_calls: list[str] = []
+    reply_sink_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def reply_sink(text: str) -> None:
+        reply_sink_calls.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(jsonl, _assistant_text("intermediate text"))
+        _write_event(jsonl, _assistant_text("final text"))
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    # intermediate → silent sink
+    assert any("intermediate text" in s for s in sink_calls), f"sink={sink_calls}"
+    # final → reply_sink (not silent)
+    assert any("final text" in s for s in reply_sink_calls), f"reply={reply_sink_calls}"
+    # final must NOT appear in the silent sink
+    assert not any("final text" in s for s in sink_calls), f"final leaked to sink={sink_calls}"
+
+
+async def test_mirror_result_event_flushes_pending_as_reply(tmp_path: Path) -> None:
+    """Issue #143: a ``result`` JSONL event signals turn end and flushes
+    the pending assistant_text as a reply (not waiting for mirror stop)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    reply_sink_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        reply_sink_calls.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(jsonl, _assistant_text("turn answer"))
+        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        # Give time for events to be processed; don't stop yet.
+        await asyncio.sleep(0.3)
+        # reply_sink must have been called before stop().
+        assert any("turn answer" in s for s in reply_sink_calls), (
+            f"reply_sink not called before stop: {reply_sink_calls}"
+        )
+    finally:
+        await mirror.stop()
+
+
+async def test_mirror_multiple_turns_each_final_text_as_reply(tmp_path: Path) -> None:
+    """Issue #143: with explicit result events between turns, each turn's
+    final assistant_text is posted as reply (not silenced)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    reply_sink_calls: list[str] = []
+    sink_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def reply_sink(text: str) -> None:
+        reply_sink_calls.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        # Turn 1
+        _write_event(jsonl, _assistant_text("answer1"))
+        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        await asyncio.sleep(0.2)
+        # Turn 2
+        _write_event(jsonl, _assistant_text("answer2"))
+        _write_event(jsonl, {"type": "result", "subtype": "success"})
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    assert any("answer1" in s for s in reply_sink_calls), f"turn1 not in reply={reply_sink_calls}"
+    assert any("answer2" in s for s in reply_sink_calls), f"turn2 not in reply={reply_sink_calls}"
+    assert not any("answer1" in s for s in sink_calls), f"turn1 leaked to sink={sink_calls}"
+    assert not any("answer2" in s for s in sink_calls), f"turn2 leaked to sink={sink_calls}"
 
 
 # ---------------------------------------------------------------------------
