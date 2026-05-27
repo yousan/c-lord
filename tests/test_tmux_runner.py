@@ -1063,6 +1063,78 @@ class TestTmuxClaudeRunnerRun:
         assert len(result_events) == 1
 
 
+class TestInactivityTimeout:
+    """#94: the hard ``timeout_seconds`` backstop must be inactivity-based.
+
+    The old loop killed any turn whose total wall-clock exceeded
+    ``timeout_seconds`` — even while Claude was actively thinking / running
+    tools (the pane spinner + elapsed counter ticking every poll).  That
+    posted a bogus "Session timed out" notice on live sessions.  The timeout
+    now fires only after the pane has been *frozen* for ``timeout_seconds``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_does_not_timeout_while_pane_active(self, runner, tmux_manager) -> None:
+        """A long but ACTIVE turn must complete, not emit a 'Timed out' RESULT."""
+        tmux_manager.is_claude_running.return_value = True
+        done_pane = _make_pane(["● All done!"], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Pane changes every poll (elapsed-seconds tick) for far longer
+            # than timeout_seconds — Claude is alive — then finishes.
+            if call_idx <= 20:
+                return f"\n✻ Cogitating for {call_idx}s\n────────\n❯\n────────\n-- INSERT --"
+            return done_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        runner.timeout_seconds = 0.2  # ~10 polls @ 0.02; the active phase outlasts it
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None, (
+            f"active turn was killed by the timeout: {result_events[0].error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_fires_when_pane_frozen(self, runner, tmux_manager) -> None:
+        """A genuinely hung (frozen-pane) session is still killed by the backstop."""
+        tmux_manager.is_claude_running.return_value = True
+        # A response is on screen (so the empty-response idle break does not
+        # apply) but the pane never changes again — a real hang.
+        frozen = _make_pane(["● Partial answer, then hung"], user_prompt="q")
+        tmux_manager.capture_pane.return_value = frozen
+
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            # Push the other exits out so only the inactivity backstop can fire.
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 100.0),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("q"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "Timed out" in result_events[0].error
+
+
 class TestTmuxClaudeRunnerInterrupt:
     """Tests for interrupt() and kill()."""
 

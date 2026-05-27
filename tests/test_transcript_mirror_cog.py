@@ -558,3 +558,155 @@ async def test_file_sink_uses_reference(monkeypatch: pytest.MonkeyPatch, tmp_pat
     ref = call_kwargs.get("reference")
     assert ref is not None
     assert ref.message_id == 8888
+
+
+# ---------------------------------------------------------------------------
+# Issue #149: DB fallback for trigger_message_id when in-memory is absent
+# ---------------------------------------------------------------------------
+
+
+def _make_repo_with_trigger(trigger_message_id: int | None) -> MagicMock:
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=[])
+    record = MagicMock()
+    record.trigger_message_id = trigger_message_id
+    repo.get = AsyncMock(return_value=record)
+    return repo
+
+
+async def test_reply_sink_falls_back_to_db_trigger_when_inmemory_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-memory absent + DB has trigger_message_id → reply_sink attaches reference."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo_with_trigger(7777))
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert call_kwargs.get("mention_author") is False
+    ref = call_kwargs.get("reference")
+    assert ref is not None
+    assert ref.message_id == 7777
+
+
+async def test_reply_sink_inmemory_takes_priority_over_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When in-memory is registered, it is used (DB is not consulted)."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _make_repo_with_trigger(9999)
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    cog.set_trigger_message(42, 1234)
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    ref = channel.send.call_args.kwargs.get("reference")
+    assert ref is not None
+    assert ref.message_id == 1234
+    repo.get.assert_not_called()
+
+
+async def test_reply_sink_no_reference_when_db_also_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When in-memory is absent and DB has no trigger_message_id, sends normally."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo_with_trigger(None))
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert "reference" not in call_kwargs
+
+
+async def test_reply_sink_no_reference_when_db_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB error in fallback does not crash reply_sink — sends normally."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=[])
+    repo.get = AsyncMock(side_effect=Exception("DB exploded"))
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("final answer")
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    assert "reference" not in call_kwargs
+
+
+async def test_file_sink_falls_back_to_db_trigger_when_inmemory_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In-memory absent + DB has trigger_message_id → file_sink attaches reference."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo_with_trigger(5555))
+    file_sink = cog._make_file_sink(55)
+    await file_sink("final answer", str(progress_file))
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert call_kwargs.get("mention_author") is False
+    ref = call_kwargs.get("reference")
+    assert ref is not None
+    assert ref.message_id == 5555
+
+
+async def test_file_sink_no_reference_when_db_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """DB error in file_sink fallback does not crash — sends normally."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=[])
+    repo.get = AsyncMock(side_effect=Exception("DB exploded"))
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    file_sink = cog._make_file_sink(55)
+    await file_sink("final answer", str(progress_file))
+
+    channel.send.assert_called_once()
+    call_kwargs = channel.send.call_args.kwargs
+    assert "reference" not in call_kwargs
