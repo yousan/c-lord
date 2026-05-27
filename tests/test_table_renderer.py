@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from c_lord.discord_ui.table_renderer import detect_tables, has_tables, render_table_image
+from c_lord.discord_ui.table_renderer import (
+    _display_width,
+    _wrap_cell,
+    detect_tables,
+    has_tables,
+    render_table_image,
+)
 
 # ---------------------------------------------------------------------------
 # Sample fixtures
@@ -85,6 +91,67 @@ class TestHasTables:
 
     def test_false_when_no_table(self) -> None:
         assert has_tables(NO_TABLE) is False
+
+
+# ===========================================================================
+# _display_width
+# ===========================================================================
+
+
+class TestDisplayWidth:
+    def test_ascii_counts_one_each(self) -> None:
+        assert _display_width("abc") == 3
+
+    def test_empty_is_zero(self) -> None:
+        assert _display_width("") == 0
+
+    def test_cjk_counts_two_each(self) -> None:
+        assert _display_width("あい") == 4
+
+    def test_mixed_ascii_and_cjk(self) -> None:
+        # "AB漢" -> 1 + 1 + 2
+        assert _display_width("AB漢") == 4
+
+
+# ===========================================================================
+# _wrap_cell
+# ===========================================================================
+
+
+class TestWrapCell:
+    def test_short_text_unchanged(self) -> None:
+        assert _wrap_cell("hello", 40) == "hello"
+
+    def test_zero_width_disables_wrap(self) -> None:
+        long = "x" * 100
+        assert _wrap_cell(long, 0) == long
+
+    def test_wraps_on_spaces(self) -> None:
+        result = _wrap_cell("alpha beta gamma", 10)
+        for line in result.split("\n"):
+            assert _display_width(line) <= 10
+        # round-trips back to the original words
+        assert result.replace("\n", " ") == "alpha beta gamma"
+
+    def test_hard_breaks_long_token(self) -> None:
+        # A long unbroken token (e.g. a URL) must still be split.
+        url = "https://github.com/yousan/c-lord/pull/188"
+        result = _wrap_cell(url, 15)
+        lines = result.split("\n")
+        assert len(lines) > 1
+        for line in lines:
+            assert _display_width(line) <= 15
+        assert "".join(lines) == url
+
+    def test_wraps_cjk_by_display_width(self) -> None:
+        # No spaces in CJK text -> must break by character width.
+        text = "これはとても長い日本語のテキストです"
+        result = _wrap_cell(text, 8)
+        lines = result.split("\n")
+        assert len(lines) > 1
+        for line in lines:
+            assert _display_width(line) <= 8
+        assert "".join(lines) == text
 
 
 # ===========================================================================
