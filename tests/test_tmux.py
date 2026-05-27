@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from c_lord.tmux import SESSION_NAME, TmuxSessionManager
+from c_lord.tmux import SESSION_NAME, TmuxSessionManager, _pane_in_insert_mode
 
 
 class TestTmuxSessionManager:
@@ -509,6 +509,7 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
             ]
@@ -517,14 +518,14 @@ class TestTmuxSessionManager:
         assert result is True
 
         # Verify send-keys -l was called with the text
-        text_call = mock_run.call_args_list[1]
+        text_call = mock_run.call_args_list[2]
         args = text_call[0][0]
         assert "send-keys" in args
         assert "-l" in args
         assert "my prompt" in args
 
         # Verify Enter was sent
-        enter_call = mock_run.call_args_list[2]
+        enter_call = mock_run.call_args_list[3]
         args = enter_call[0][0]
         assert "Enter" in args
 
@@ -546,12 +547,13 @@ class TestTmuxSessionManager:
             with patch("c_lord.tmux._run") as mock_run:
                 mock_run.side_effect = [
                     MagicMock(returncode=0, stdout="12345\n"),
+                    MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
-            text_call = mock_run.call_args_list[1]
+            text_call = mock_run.call_args_list[2]
             args = text_call[0][0]
             # ZWSP (U+200B) is prepended to the literal text.
             assert "​hi" in args
@@ -574,12 +576,13 @@ class TestTmuxSessionManager:
             with patch("c_lord.tmux._run") as mock_run:
                 mock_run.side_effect = [
                     MagicMock(returncode=0, stdout="12345\n"),
+                    MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
-            text_call = mock_run.call_args_list[1]
+            text_call = mock_run.call_args_list[2]
             args = text_call[0][0]
             assert "hi" in args
             # No ZWSP under default mode (backward compat with skill path).
@@ -587,6 +590,84 @@ class TestTmuxSessionManager:
         finally:
             if prev is not None:
                 os.environ["CLORD_BRIDGE_MODE"] = prev
+
+    # -- #147: vim NORMAL-mode correction before literal input --------------
+    #
+    # Claude Code runs with ``editorMode: vim``. When the input box is in
+    # NORMAL mode, ``send-keys -l`` characters are interpreted as vim commands
+    # and the message is corrupted. This Claude version (v2.1.150) shows
+    # ``-- INSERT`` in the status bar only in INSERT mode; NORMAL omits it
+    # entirely (no ``-- NORMAL`` marker). So send_input must capture the pane,
+    # and if not in INSERT, press ``i`` to enter INSERT before the literal text.
+
+    _INSERT_PANE = (
+        "❯ \n"
+        "─────────────────────────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "   ⎇ no git  cwd: /tmp  Skill: none\n"
+        "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+    _NORMAL_PANE = (
+        "❯ \n"
+        "─────────────────────────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "   ⎇ no git  cwd: /tmp  Skill: none\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+
+    def test_send_input_enters_insert_when_normal_mode(self) -> None:
+        """NORMAL mode → press ``i`` (key) before sending the literal text (#147)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout=self._NORMAL_PANE),  # capture-pane (mode)
+                MagicMock(returncode=0),  # send-keys i
+                MagicMock(returncode=0),  # send-keys -l (text)
+                MagicMock(returncode=0),  # send-keys Enter
+            ]
+            assert mgr.send_input(12345, "melon") is True
+
+        calls = mock_run.call_args_list
+        # The bare ``i`` keypress (NON-literal) must precede the literal text.
+        i_call = calls[2][0][0]
+        assert i_call[:2] == ["tmux", "send-keys"]
+        assert "-l" not in i_call  # ``i`` is a key, not literal
+        assert i_call[-1] == "i"
+        # Then the literal text.
+        text_call = calls[3][0][0]
+        assert "-l" in text_call and "melon" in text_call
+        # Then Enter.
+        assert "Enter" in calls[4][0][0]
+
+    def test_send_input_no_extra_i_when_insert_mode(self) -> None:
+        """INSERT mode → no extra ``i`` injected (AC2: no regression / double-i) (#147)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
+                MagicMock(returncode=0),  # send-keys -l (text)
+                MagicMock(returncode=0),  # send-keys Enter
+            ]
+            assert mgr.send_input(12345, "melon") is True
+
+        calls = mock_run.call_args_list
+        # No bare ``i`` keypress anywhere — the text goes out literally first.
+        for c in calls:
+            args = c[0][0]
+            if args[:2] == ["tmux", "send-keys"] and "-l" not in args and args[-1] == "i":
+                raise AssertionError("unexpected bare 'i' sent while already in INSERT mode")
+        # send-keys -l with the text comes right after the capture.
+        text_call = calls[2][0][0]
+        assert "-l" in text_call and "melon" in text_call
+        assert "Enter" in calls[3][0][0]
 
     def test_send_input_no_window(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -1091,3 +1172,45 @@ class TestTmuxSessionManager:
         assert any(str(THREAD_ID) in c for c in set_option_calls), (
             "@thread_id was not set on the adopted window"
         )
+
+
+class TestPaneInsertModeDetection:
+    """#147: detect vim INSERT vs NORMAL from the pane status bar.
+
+    Claude Code (v2.1.150) shows ``-- INSERT`` in the status bar only in
+    INSERT mode. NORMAL mode omits it — there is NO ``-- NORMAL`` marker —
+    so detection keys on the presence of ``-- INSERT`` plus a recognisable
+    status-bar anchor for the NORMAL case.
+    """
+
+    _INSERT = (
+        "❯ some text\n"
+        "──────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+    _NORMAL = (
+        "❯ some text\n"
+        "──────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+
+    def test_insert_marker_present(self) -> None:
+        assert _pane_in_insert_mode(self._INSERT) is True
+
+    def test_normal_no_insert_marker(self) -> None:
+        assert _pane_in_insert_mode(self._NORMAL) is False
+
+    def test_old_insert_in_scrollback_ignored(self) -> None:
+        """A stale ``-- INSERT`` far above the current status bar must not win.
+
+        Only the bottom status zone decides the mode; an old INSERT frame in
+        scrollback above a current NORMAL status bar should read as NORMAL.
+        """
+        stale = "  -- INSERT -- ⏵⏵ old frame\n" + ("filler\n" * 30) + self._NORMAL
+        assert _pane_in_insert_mode(stale) is False
+
+    def test_empty_or_unknown_returns_none(self) -> None:
+        assert _pane_in_insert_mode("") is None
+        assert _pane_in_insert_mode("just some\nresponse text\n") is None
