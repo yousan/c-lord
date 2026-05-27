@@ -1943,16 +1943,43 @@ class TestRunYieldsPaneAsk:
         assert [o.label for o in ask_events[0].pane_ask.options] == ["Coffee", "Tea", "Water"]
 
     @pytest.mark.asyncio
-    async def test_answer_menu_sends_down_then_enter(self, runner, tmux_manager) -> None:
-        """answer_menu(2) navigates Down twice and confirms with Enter."""
-        await runner.answer_menu(2)
-        tmux_manager.send_keys.assert_called_once_with(12345, "Down", "Down", "Enter")
+    async def test_answer_menu_sends_each_key_separately(self, runner, tmux_manager) -> None:
+        """#171: keys must be sent ONE PER send_keys call (with delays between),
+        not batched — a single `send-keys Down Down Enter` is too fast and the
+        TUI drops the Down navigations, selecting the wrong (first) option.
+        """
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu(2)
+        assert tmux_manager.send_keys.call_args_list == [
+            call(12345, "Down"),
+            call(12345, "Down"),
+            call(12345, "Enter"),
+        ]
 
     @pytest.mark.asyncio
     async def test_answer_menu_zero_just_enter(self, runner, tmux_manager) -> None:
         """answer_menu(0) selects the first (already-highlighted) option."""
-        await runner.answer_menu(0)
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu(0)
         tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_text_navigates_then_types(self, runner, tmux_manager) -> None:
+        """#171: free-text path navigates to 'Type something.' one key at a time,
+        then sends the literal text via send_input.
+        """
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_text(2, "melon")
+        assert tmux_manager.send_keys.call_args_list == [
+            call(12345, "Down"),
+            call(12345, "Down"),
+            call(12345, "Enter"),
+        ]
+        tmux_manager.send_input.assert_called_once_with(12345, "melon")
 
 
 # -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------

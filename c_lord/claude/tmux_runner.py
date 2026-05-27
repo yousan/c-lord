@@ -52,6 +52,12 @@ _UNKNOWN_ALERT_DELAY = 5.0
 # expected prompt — but still guards against a half-drawn menu frame (#166).
 _ASK_ALERT_DELAY = 1.5
 
+# Delay between individual menu-navigation keystrokes (seconds).  Keys must be
+# sent one at a time with a gap — batching `Down Down Enter` into one send-keys
+# call is too fast and the TUI drops the navigations, selecting the wrong
+# option (#171).
+_MENU_NAV_DELAY = 0.25
+
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
 
@@ -832,6 +838,19 @@ class TmuxClaudeRunner:
             key = "y" if self._is_yn_prompt(pane_text) else "Enter"
             _run(["tmux", "send-keys", "-t", target, key])
 
+    async def _navigate_menu(self, index: int) -> None:
+        """Move the menu cursor down *index* times then confirm with Enter.
+
+        Each key is sent as a SEPARATE ``send-keys`` call with a delay between
+        them (#171): batching them into one ``send-keys Down Down Enter`` is too
+        fast — the TUI drops the Down navigations and Enter selects the wrong
+        (first) option.
+        """
+        for _ in range(max(0, index)):
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+
     async def answer_menu(self, index: int) -> None:
         """Select option *index* (0-based) of an open AskUserQuestion menu (#166).
 
@@ -845,8 +864,7 @@ class TmuxClaudeRunner:
             index,
             self._thread_id,
         )
-        keys: list[str] = ["Down"] * max(0, index) + ["Enter"]
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, *keys)
+        await self._navigate_menu(index)
 
     async def answer_menu_text(self, text_option_index: int, text: str) -> None:
         """Answer via the free-text ("Type something.") affordance (#166).
@@ -859,9 +877,8 @@ class TmuxClaudeRunner:
             "Answering AskUserQuestion with free text (thread=%d)",
             self._thread_id,
         )
-        keys: list[str] = ["Down"] * max(0, text_option_index) + ["Enter"]
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, *keys)
-        await asyncio.sleep(0.3)
+        await self._navigate_menu(text_option_index)
+        await asyncio.sleep(_MENU_NAV_DELAY)
         await asyncio.to_thread(self._tmux.send_input, self._thread_id, text)
 
     async def cancel_menu(self) -> None:
