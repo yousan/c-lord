@@ -1385,6 +1385,83 @@ class TestToolExecutionCompletion:
         assert results[0].error is None
 
 
+class TestGeneratingDoesNotCompleteEarly:
+    """Regression for #179: a stable intermediate response while Claude is still
+    generating (the indicator line carries trailing token stats, e.g.
+    ``✽ Generating… (7m 45s · ↑ 23.2k tokens)``) must NOT finalize the turn.
+
+    Incident: the turn finalized while Claude kept working, so the poll loop
+    stopped before a later AskUserQuestion menu rendered — leaving it unbridged
+    and the session stuck with no way to answer from Discord.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generating_with_token_stats_does_not_complete_early(
+        self, runner, tmux_manager
+    ) -> None:
+        tmux_manager.is_claude_running.return_value = True
+
+        # Stable intermediate response + active generation indicator (trailing
+        # stats) + the always-present bare ❯ input box.
+        generating_pane = "\n".join(
+            [
+                "❯ fix the bug",
+                "",
+                "● Analyzing the failure and drafting a fix…",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "✽ Generating… (7m 45s · ↑ 23.2k tokens)",
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        # Claude actually finishes: same response text, generation line gone.
+        done_pane = "\n".join(
+            [
+                "❯ fix the bug",
+                "",
+                "● Analyzing the failure and drafting a fix…",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+
+        generating_polls = 12
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= generating_polls:
+                return generating_pane
+            return done_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.05),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 0.1),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("fix the bug"):
+                events.append(event)
+
+        results = [e for e in events if e.message_type == MessageType.RESULT]
+        assert len(results) == 1
+        assert results[0].is_complete is True
+        # The turn must keep polling through the generating phase and finalize
+        # only once the done pane appears.  With the bug, is_gen is False on the
+        # generating pane (indicator does not end with '…'), so the quick-exit
+        # (or fallback) fires early and call_count never exceeds generating_polls.
+        assert tmux_manager.capture_pane.call_count > generating_polls
+
+
 # -- Tests for OSC 8 hyperlink normalization (issue #47) --------------------
 
 
@@ -1753,6 +1830,22 @@ class TestPermissionPromptTailAnchor:
         """Conversation-body markers must not trigger unknown-interactive detection."""
         pane = _load_fixture("bug_156_yn_in_conversation.txt")
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+
+# -- Regression test for #179 (generating indicator carries trailing stats) ------
+
+
+class TestIsGeneratingWithStats:
+    """Regression for #179: the live generation indicator is rendered as
+    ``✽ Generating… (7m 45s · ↑ 23.2k tokens)`` — the ``…`` is followed by an
+    elapsed/token suffix, so it is NOT at the end of the line.  Detection that
+    only matched ``endswith('…')`` missed it, so c-lord treated an actively
+    generating session as idle and finalized the turn early.
+    """
+
+    def test_generating_with_trailing_token_stats_detected(self) -> None:
+        pane = _load_fixture("bug_179_generating_with_stats.txt")
+        assert TmuxClaudeRunner._is_generating(pane) is True
 
 
 # -- Regression tests for #153 (plan/ask menus flagged as unknown) ---------------
