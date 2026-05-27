@@ -1,0 +1,74 @@
+
+● Full suite still running; I'll commit once it completes and reports green.                                                     
+                                                                                                                                 
+✻ Churned for 3m 52s · 1 shell still running                                                                                         
+
+● Background command "Run full test suite before commit" completed (exit code 0)                                                     
+
+  Read 1 file (ctrl+o to expand)                                                                                                     
+
+● All 1167 tests pass (exit 0). Committing the fix on the feature branch.                                                            
+
+● Bash(cd /home/yousan/c-lord && git add c_lord/session_dir.py c_lord/skills/__init__.py c_lord/skills/injector.py                   
+      tests/test_session_dir.py tests/test_skills.py && gi…)
+  ⎿  pre-commit: ruff format...                                                                                                      
+     5 files left unchanged
+     pre-commit: ruff check --fix...                                                                                                 
+     … +9 lines (ctrl+o to expand)                                                                                               
+  ⎿  Shell cwd was reset to /home/yousan/c-lord-sessions/1475756095887773877/1499664870948339834                                     
+
+● The commit landed on main, not my feature branch — the branch checkout was reset (likely by the bot's git handling between         
+  operations). CLAUDE.md requires no direct commits to main. Let me check state and move the commit onto a feature branch, restoring
+  main.                                                                                                                              
+
+● Bash(cd /home/yousan/c-lord                                                                                                        
+      echo "=== current branch ==="; git branch --show-current…)                                                                 
+  ⎿  === current branch ===                                                                                                          
+     main
+     === all branches ===                                                                                                            
+     … +18 lines (ctrl+o to expand)                                                                                              
+  ⎿  Shell cwd was reset to /home/yousan/c-lord-sessions/1475756095887773877/1499664870948339834                                     
+
+● I can see what happened: the bot restart pulled main forward (new commit 9d96941 #175) and switched HEAD back to main, so my commit
+   47dad73 landed on main on top of the latest. The good news: it's a clean commit on current main, and my fix/... branch still  
+  points at the old base. I'll move the commit onto the feature branch and reset main's pointer back to origin/main —                
+  non-destructively (no reset --hard, just repoint while checked out elsewhere).                                                 
+
+● Bash(cd /home/yousan/c-lord                                                                                                    
+      git branch -f fix/scrub-stale-skills-in-jsonl-mode main && echo "feature branch repointed to my commit"…)                  
+  ⎿  feature branch repointed to my commit                                                                                           
+     Switched to branch 'fix/scrub-stale-skills-in-jsonl-mode'
+     switched to feature branch                                                                                                      
+     … +14 lines (ctrl+o to expand)                                                                                              
+  ⎿  Shell cwd was reset to /home/yousan/c-lord-sessions/1475756095887773877/1499664870948339834                                     
+
+● 状態がクリーンになりました:                                                                                                        
+  - fix/scrub-stale-skills-in-jsonl-mode = 47dad73(私の修正、最新main 9d96941 の上)                                              
+  - main = origin/main と完全一致(ズレ 0/0)                                                                                          
+  - 作業ツリーは feature ブランチで修正を含む
+
+  完了した残作業                                                                                                                     
+
+  再起動でワークツリーがリセットされ消えていた修正を再適用・検証・コミットしました。                                                 
+
+  - 原因: jsonlブリッジモードでは REST API も discord-reply スキルも使われない設計だが、旧 skill モード時代に注入された discord-reply
+   SKILL.md が残り、死んだAPIへ誘導していた。                                                                                    
+  - 修正: remove_injected_skills() を追加し、skills_enabled() が偽のとき create_session_dir()
+  が毎回これを呼んで残骸を掃除(c-lord管理スキルのみ削除、ユーザースキルは温存)。                                                     
+  - 検証: ruff check/ruff format --check(CI対象の c_lord/)パス、全 1167 テスト pass。
+  - コミット 47dad73 を feature ブランチに退避し、ローカル main は origin/main に戻しました(誤って main に乗っていたため)。
+
+  確認(リモート操作なので指示待ち)                                                                                                   
+
+  コミットはローカルのみです。再起動で再び失われないよう、git push して PR を作成してよいですか? よければ                            
+  fix/scrub-stale-skills-in-jsonl-mode を push して PR を立てます。                                                              
+
+✻ Brewed for 1m 20s                                                                                                              
+                                                                                                                                 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ push it and open the PR                                   
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 4.7  v2.1.150  Style: default  Ctx: 141.6k  Context: [██░░░░░░░░░░░░░░] 142k/1000k (14%)  Ctx Used: 14.0%  Ctx(...
+   Cost: $7.12  Session: 36.0%  Weekly: 45.0%  Session: 3hr 1m  Reset: 3hr 1m  Weekly Reset: 2d 6hr 1m  Block: 1hr 58m  In: 14...
+   ⎇ main  (+0,-0)  +0  -0  1499664870948339834  𖠰 main  cwd: /home/yousan/c-lord-sessions/1475756095887773877/149966487094833...
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
