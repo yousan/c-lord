@@ -118,6 +118,12 @@ _INTERACTIVE_MENU_RE = re.compile(r"^\s*❯\s+\d+\.", re.MULTILINE)
 # not trigger auto-accept (#156).
 _PERMISSION_SCAN_LINES = 15
 
+# Number of lines from the bottom to scan for the live input box (#62).  Must be
+# generous: the box sits above the bottom chrome (separator + user-configurable
+# ccstatusline rows + ``-- INSERT --`` status bar + effort/tip footer), which
+# is commonly 6–8 lines tall, so a smaller window misses the ``❯`` box line.
+_INPUT_PROMPT_SCAN_LINES = 15
+
 
 def _permission_zone(text: str) -> str:
     """Return the bottom N lines of the pane where real prompts appear.
@@ -1099,13 +1105,39 @@ class TmuxClaudeRunner:
 
         The TUI shows a status bar (``-- INSERT --``, separator lines) below
         the ``❯`` prompt, so we cannot simply check ``endswith``.  Instead,
-        look at the last few lines for a line that is *only* the prompt
-        character (with optional whitespace).
+        look at the last few lines for the input box.
+
+        A bare ``❯`` means an empty input box.  But Claude Code also renders
+        ghost/placeholder text — and any unsent text the user typed — right
+        after the prompt glyph in the live input box, e.g.
+        ``❯\\xa0Try "create a util ..."`` or ``❯\\xa0A で 3回試して`` (#62).  That
+        still means Claude is idle and waiting, so it counts as a ready prompt;
+        without this the input box is misread as "still busy" until the 30s
+        fallback fires.
+
+        The discriminator (verified against real ``capture-pane -e`` output):
+        the **live input box** puts a non-breaking space (``\\xa0``) after the
+        glyph, while a **sent/confirmed user message** in the scrollback uses a
+        regular space (``❯ 2+2 は？``).  A bare ``❯`` and the ``❯\\xa0`` form are
+        therefore unique to the live box, so an old sent message scrolled near
+        the bottom is never mistaken for the live prompt.  A numbered-menu
+        cursor (``❯ 1. ...``) is excluded — it is an interactive menu, not a
+        ready prompt, and treating it as one would complete the turn before the
+        menu is answered.
+
+        We scan a generous bottom window rather than just the last few lines:
+        the box sits above the bottom chrome (separator + the user-configurable
+        ccstatusline rows + ``-- INSERT --`` + effort/tip footer), which can be
+        ~6–8 lines tall, so a 6-line window misses the box entirely (#62).
         """
         lines = text.rstrip().splitlines()
-        for line in lines[-6:]:
+        for line in lines[-_INPUT_PROMPT_SCAN_LINES:]:
             stripped_line = line.strip()
             if stripped_line in ("❯", ">"):
+                return True
+            if (
+                stripped_line.startswith("❯\xa0") or stripped_line.startswith(">\xa0")
+            ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
                 return True
         return False
 

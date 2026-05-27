@@ -98,6 +98,49 @@ async def test_setup_bridge_returns_components(tmp_path: object) -> None:
     assert result.session_repo.db_path == str(tmp_path / "sessions.db")  # type: ignore[operator]
 
 
+def _find_chat_cog(bot: MagicMock) -> object:
+    return next(
+        call.args[0]
+        for call in bot.add_cog.call_args_list
+        if call.args[0].__class__.__name__ == "ClaudeChatCog"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_bridge_forwards_max_concurrent(tmp_path: object) -> None:
+    """setup_bridge(max_concurrent=N) must reach ClaudeChatCog's semaphore limit."""
+    bot = _make_bot()
+    runner = _make_runner()
+
+    await setup_bridge(
+        bot,
+        runner,
+        session_db_path=str(tmp_path / "sessions.db"),  # type: ignore[operator]
+        enable_scheduler=False,
+        max_concurrent=30,
+    )
+
+    chat_cog = _find_chat_cog(bot)
+    assert chat_cog._max_concurrent == 30  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_setup_bridge_max_concurrent_defaults_to_3(tmp_path: object) -> None:
+    """Omitting max_concurrent keeps the backward-compatible default of 3."""
+    bot = _make_bot()
+    runner = _make_runner()
+
+    await setup_bridge(
+        bot,
+        runner,
+        session_db_path=str(tmp_path / "sessions.db"),  # type: ignore[operator]
+        enable_scheduler=False,
+    )
+
+    chat_cog = _find_chat_cog(bot)
+    assert chat_cog._max_concurrent == 3  # type: ignore[attr-defined]
+
+
 @pytest.mark.asyncio
 async def test_setup_bridge_skips_skill_cog_without_channel_id(tmp_path: object) -> None:
     """setup_bridge should skip SkillCommandCog when claude_channel_id is None."""
