@@ -214,3 +214,48 @@ the *aspirational* prose:
 One DoD list; the PR template is a verbatim copy; ACs are copied into the PR and
 all must be checked; `Closes` is gated on 100% AC completion (else `Refs`);
 Issues are kept one-concern with binary ACs so they cannot be half-satisfied.
+
+## 13. Restarting the bot: filter by venv path, kill by PID, launch detached
+
+**Decision:** Process control for the prod/staging bots follows three rules:
+
+1. **Target by venv path, never the bare module name.** Stop prod with
+   `pgrep -f "/home/yousan/c-lord/.venv/bin/python3 -m c_lord.main"` (staging:
+   `c-lord-parallel-3/.venv/...`). The unfiltered `pgrep -f c_lord.main` matches
+   *every* c-lord on the host.
+2. **Count with `ps`, not `pgrep -fc`.** Use
+   `ps -eo pid,lstart,args | grep "<venv-path>/bin/python3 -m c_lord.main" | grep -v grep`.
+   A healthy env has exactly one python (with one `uv run` parent).
+3. **Launch detached with `setsid -f`, never a session-tracked background runner.**
+   `setsid -f bash -c 'cd <dir> && exec uv run python -m c_lord.main >> <log> 2>&1' < /dev/null`
+   reparents the daemon to `systemd --user` so it outlives the launching session.
+
+**Why (the incident that motivated this):**
+
+During the #62 / #182 prod redeploy, following the documented
+`pgrep -f c_lord.main | xargs kill` plus a session-tracked background launch
+produced **2–3 duplicate prod bot instances** that fought over the same Discord
+token. Each new same-token gateway login forces Discord to close the previous
+one, which the bot handles as a graceful `bot_shutdown` — so the instances
+churned, dropped sessions, and double-posted (Discord rate-limited the
+duplicated thread renames).
+
+Three compounding root causes, none of them "the bot is buggy":
+
+- **`pgrep -f c_lord.main` matched the operator's own shell.** When the kill
+  command's own command line contains the string `c_lord.main`, `pkill`/`pgrep`
+  match the shell running it. `pkill` then killed its own shell mid-command
+  (observed as exit code 144), leaving the kill half-done — so the next launch
+  stacked an instance on top of survivors.
+- **The bot was launched via a session-tracked background runner.** Because the
+  daemon never exits, the task never "completes"; it lingers as a child of the
+  launching session and can be retried/duplicated, and it dies if that session ends.
+- **Repeated launches while kills were incomplete** stacked up. The unfiltered
+  pattern also meant a "prod restart" could take down the staging clone, and
+  vice-versa.
+
+**Fix:** The prod-restart command in CLAUDE.md is scoped to the prod venv path
+(so it can't hit the staging clone), the E2E-restart snippet carries the same
+caution, and the operational rules above (kill by explicit PID, count with
+`ps`, launch with `setsid -f`) are the standard procedure. Net: one bot per
+env, no token churn, no cross-clone collateral.
