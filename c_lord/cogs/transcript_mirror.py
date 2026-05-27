@@ -175,6 +175,11 @@ class TranscriptMirrorCog(commands.Cog):
             if table_files:
                 send_kwargs["files"] = table_files
             trigger_id = self._trigger_messages.get(thread_id)
+            if trigger_id is None:
+                with contextlib.suppress(Exception):
+                    record = await self._session_repo.get(thread_id)
+                    if record is not None:
+                        trigger_id = record.trigger_message_id
             if trigger_id is not None and reply_to_trigger_enabled():
                 send_kwargs["reference"] = discord.MessageReference(
                     message_id=trigger_id,
@@ -222,6 +227,11 @@ class TranscriptMirrorCog(commands.Cog):
             files = [discord.File(file_path, filename="progress.txt")] + table_files
             send_kwargs: dict = {"content": body, "files": files}
             trigger_id = self._trigger_messages.get(thread_id)
+            if trigger_id is None:
+                with contextlib.suppress(Exception):
+                    record = await self._session_repo.get(thread_id)
+                    if record is not None:
+                        trigger_id = record.trigger_message_id
             if trigger_id is not None and reply_to_trigger_enabled():
                 send_kwargs["reference"] = discord.MessageReference(
                     message_id=trigger_id,
