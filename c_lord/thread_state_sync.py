@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -56,14 +57,29 @@ _RENAME_TIMEOUT_SECONDS = 30.0
 # ~10-minute rename window per channel.
 _DEFAULT_RENAME_BACKOFF_SECONDS = 600.0
 
-# How many bottom lines of the pane to check for prompt/error indicators.
+# How many bottom lines of the pane to check for error indicators.
 _PANE_PROBE_LINES = 6
 
-# Characters that signal active Claude Code execution in the pane content area.
-# ✢ (U+2722) appears during response generation (Actualizing/Synthesizing/…).
-# ✻ (U+273B) appears during tool execution (Running bash / Reading file / …).
-# Both are specific to the Claude Code TUI and absent from idle panes.
-_RUNNING_CHARS = frozenset({"✢", "✻"})
+# How many bottom lines to scan for the live working spinner. The spinner
+# renders just above the input box, but the box + status footer (~8 lines) and
+# any in-progress tool-result preview push it 10–20 lines off the bottom — so a
+# narrow window misses it. Verified against live captures (#190).
+_RUNNING_PROBE_LINES = 30
+
+# The live working spinner shows a "(<elapsed> · …)" timer that only exists
+# while Claude is actively generating/executing, e.g.
+#   ✢ Swirling… (2m 29s · ↓ 9.3k tokens)
+#   ✶ Creating PR… (11m 57s · ↑ 36.5k tokens)
+#   ✻ Running… (12s · esc to interrupt)
+# A completed turn collapses to "<char> <Word> for <N>s" (no parenthetical), so
+# matching the timer — not the spinner glyph — avoids false-positives on stale
+# completed spinners left in scrollback (#190). It is also independent of which
+# glyph the spinner is cycling through (✢ ✻ ✶ · …), which the old glyph set missed.
+_RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
+
+# Spinner glyphs that, at the very bottom of the pane, still signal active work.
+# Kept as a narrow fallback for panes where the spinner has no timer line yet.
+_RUNNING_CHARS = frozenset({"✢", "✻", "✶"})
 
 # Substrings that indicate an error state (checked in the bottom pane lines).
 _ERROR_INDICATORS = (
@@ -88,9 +104,10 @@ def _pane_lamp_state(pane_text: str) -> str:
     draft text in input, ``-- INSERT --`` etc.) is far more common than
     active execution.
 
-    Running is detected by the Claude Code TUI characters that appear only
-    during active work: ``✢`` (response generation) and ``✻`` (tool execution).
-    These are absent from idle panes — verified against live pane captures.
+    Running is detected by the live working spinner's ``(<elapsed> · …)`` timer
+    (see :data:`_RUNNING_SPINNER_RE`), scanned across a wide bottom window since
+    the input box + footer + tool-result preview push it well off the bottom
+    (#190). A narrow bottom-glyph check remains as a fallback.
     """
     if not pane_text:
         return "waiting"
@@ -101,6 +118,10 @@ def _pane_lamp_state(pane_text: str) -> str:
         for indicator in _ERROR_INDICATORS:
             if indicator in line:
                 return "error"
+
+    for line in lines[-_RUNNING_PROBE_LINES:]:
+        if _RUNNING_SPINNER_RE.search(line):
+            return "running"
 
     for line in tail:
         if any(ch in line for ch in _RUNNING_CHARS):
