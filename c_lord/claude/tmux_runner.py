@@ -73,6 +73,13 @@ _TRUST_PROMPT_MARKERS = (
     "Enter to confirm",
 )
 
+# The trust dialog's distinctive *menu option line*: "❯ 1. Yes, I trust this
+# folder".  Detection keys on this anchored line rather than a loose substring
+# of the marker phrases anywhere in the pane: the runner captures ~500 lines of
+# scrollback, so a session that merely *mentions* the dialog's wording (e.g. a
+# chat about this very feature) must not trip a spurious Enter into the input.
+_TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*1\.\s+Yes, I trust this folder\s*$", re.MULTILINE)
+
 # Patterns from Plan approval (ExitPlanMode) and AskUserQuestion TUI menus.
 # These are KNOWN prompt types handled via Discord buttons; they must NOT be
 # flagged as "unknown" interactive prompts (#153).
@@ -787,13 +794,14 @@ class TmuxClaudeRunner:
     def _has_trust_prompt(text: str) -> bool:
         """Check if the pane shows the folder-trust dialog.
 
-        The dialog is top-anchored (its markers are near the top of the pane,
+        The dialog is top-anchored (its content is near the top of the pane,
         bottom rows blank), so this scans the WHOLE pane rather than the bottom
-        permission zone.  It requires *all* markers — the actionable menu option
-        AND the confirm line — so prose that merely mentions one phrase (e.g. a
-        chat about this very feature) does not trip a spurious Enter.
+        permission zone.  To stay robust against the ~500 lines of scrollback the
+        runner captures, it keys on the *menu option line* "❯ 1. Yes, I trust
+        this folder" — a structure prose does not reproduce — instead of a loose
+        substring of the marker phrases.
         """
-        return all(marker in text for marker in _TRUST_PROMPT_MARKERS)
+        return bool(_TRUST_PROMPT_RE.search(text))
 
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
