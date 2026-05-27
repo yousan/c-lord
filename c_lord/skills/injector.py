@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from .discord_prompt_choice import render_discord_prompt_choice_skill
@@ -12,6 +13,10 @@ from .discord_reply import render_discord_reply_skill
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://127.0.0.1:8080"
+
+# Skill directories inject_skills writes. Kept here so remove_injected_skills
+# stays symmetric with what we create.
+INJECTED_SKILL_NAMES: tuple[str, ...] = ("discord-reply", "discord-prompt-choice")
 
 
 def inject_skills(
@@ -81,6 +86,28 @@ def inject_skills(
         choice_path,
     )
     return written
+
+
+def remove_injected_skills(session_dir: str | os.PathLike[str]) -> list[str]:
+    """Remove c-lord skill dirs previously written by :func:`inject_skills`.
+
+    Used when skill-based reply is disabled (e.g. ``CLORD_BRIDGE_MODE=jsonl``)
+    so a stale skill left over from an earlier skill-mode session can't mislead
+    Claude into POSTing to a REST API that is no longer running. Idempotent and
+    only touches c-lord-managed skill dirs — user skills are left untouched.
+
+    Returns:
+        Absolute paths of the skill dirs that were removed.
+    """
+    skills_root = Path(session_dir) / ".claude" / "skills"
+    removed: list[str] = []
+    for name in INJECTED_SKILL_NAMES:
+        skill_dir = skills_root / name
+        if skill_dir.is_dir():
+            shutil.rmtree(skill_dir, ignore_errors=True)
+            removed.append(str(skill_dir))
+            logger.info("Removed injected skill %s (skill reply disabled)", skill_dir)
+    return removed
 
 
 def skills_enabled() -> bool:
