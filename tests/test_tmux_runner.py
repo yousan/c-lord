@@ -1717,42 +1717,69 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
 
 
 class TestGhostTextInputNotFlagged:
-    """Regression for #62: ghost text in the ❯ input area (tmux INSERT mode)
-    must not trigger any detection function.  The pane shows user-typed text
-    in the input zone but no real interactive prompt from Claude.
+    """Regression for #62: a real ``capture-pane -e`` snapshot of the Claude
+    Code TUI showing ghost/placeholder text in the input box.
+
+    The fixture was captured live from ``claude`` v2.1.152 (not hand-written):
+    the input box renders ``❯`` + a non-breaking space (``\\xa0``) + dim
+    placeholder text (``Try "create a util ..."``).  A hand-made fixture used a
+    regular space and so hid the real structure — the live box uses ``\\xa0``
+    while a *sent* user message uses a regular space.  Detection runs on the
+    NORMALISED capture, exactly as the run loop does.
     """
+
+    FIXTURE = "bug_62_ghost_text_real.txt"
+
+    def _norm(self) -> str:
+        return _normalize_capture(_load_fixture(self.FIXTURE))
 
     def test_ghost_text_no_permission_prompt(self) -> None:
         """Ghost text in input area MUST NOT trigger _has_permission_prompt."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._has_permission_prompt(self._norm()) is False
 
     def test_ghost_text_no_yn_prompt(self) -> None:
         """Ghost text in input area MUST NOT trigger _is_yn_prompt."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(self._norm()) is False
 
     def test_ghost_text_no_unknown_interactive(self) -> None:
         """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(self._norm()) is False
 
     def test_ghost_text_recognized_as_ready_prompt(self) -> None:
         """#62: ghost/placeholder text in the input box still means Claude is
         idle and waiting at the prompt.  ``_has_input_prompt`` MUST return True
         so the turn completes promptly instead of misreading the input box as
         "still busy" until the 30s fallback fires.
+
+        This is the RED case: the box line is ``❯\\xa0Try "..."`` sitting above a
+        tall bottom chrome (separator + 3 ccstatusline rows + ``-- INSERT --`` +
+        effort footer), so the old bare-``❯``/6-line-window logic returns False.
         """
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_input_prompt(pane) is True
+        assert TmuxClaudeRunner._has_input_prompt(self._norm()) is True
 
     def test_ghost_text_not_leaked_into_response(self) -> None:
         """#62: the input-box ghost text must never be read as confirmed input,
         i.e. it must not leak into the extracted response posted to Discord.
         """
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        response = TmuxClaudeRunner._extract_response(pane)
-        assert "A で 3回試して" not in response
+        response = TmuxClaudeRunner._extract_response(_load_fixture(self.FIXTURE))
+        assert "Try" not in response
+        assert "logging.py" not in response
+
+    def test_sent_message_is_not_a_live_prompt(self) -> None:
+        """A *sent* user message (``❯ <text>`` with a regular space) near the
+        bottom must NOT be treated as the live input box — only the ``❯\\xa0``
+        (NBSP) form or a bare ``❯`` is the live prompt.
+        """
+        pane = (
+            "● answer\n"
+            "────────────────────────\n"
+            "❯ 2+2 は？ 数字だけ答えて\n"  # sent message: regular space after ❯
+            "────────────────────────\n"
+            "Model: Sonnet\nCost: $0\n⎇ main\n"
+            "-- INSERT --\n"
+            "● high · /effort\n"
+        )
+        assert TmuxClaudeRunner._has_input_prompt(pane) is False
 
 
 # -- Tests for #166 (AskUserQuestion → Discord buttons in tmux/jsonl mode) -----
