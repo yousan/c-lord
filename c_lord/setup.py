@@ -77,6 +77,7 @@ async def setup_bridge(
     session_dir_base: str | None = None,
     session_source_repo: str | None = None,
     enable_tmux: bool = True,
+    max_concurrent: int = 3,
 ) -> BridgeComponents:
     """Initialize and register all c-lord Cogs in one call.
 
@@ -116,6 +117,9 @@ async def setup_bridge(
         enable_tmux: Whether to enable tmux session management. Enabled by
                      default (degrades gracefully if tmux is not installed).
                      Set CLORD_TMUX_ENABLED to "false"/"0"/"no" to disable.
+        max_concurrent: Maximum number of Claude sessions processed at once
+                        (the semaphore limit behind the "Waiting for a free
+                        session slot" message). Defaults to 3.
 
     Returns:
         BridgeComponents with references to initialized repositories.
@@ -184,6 +188,7 @@ async def setup_bridge(
         bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
         repo=session_repo,
         runner=runner,
+        max_concurrent=max_concurrent,
         allowed_user_ids=allowed_user_ids,
         allowed_role_name=allowed_role_name,
         ask_repo=ask_repo,
@@ -192,7 +197,7 @@ async def setup_bridge(
         settings_repo=settings_repo,
     )
     await bot.add_cog(chat_cog)
-    logger.info("Registered ClaudeChatCog")
+    logger.info("Registered ClaudeChatCog (max_concurrent=%d)", max_concurrent)
 
     # --- SessionManageCog ---
     session_manage_cog = SessionManageCog(

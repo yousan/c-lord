@@ -18,7 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 api = ["aiohttp>=3.9"]
 table = [
-    "matplotlib>=3.10.9",
+    "pillow>=10.0",
+    "emoji>=2.0",
 ]
 
 [project.scripts]
@@ -56,7 +57,7 @@ line-length = 100
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
-# table_renderer.py uses matplotlib as an optional dependency (c-lord[table]).
+# table_renderer.py uses Pillow + emoji as optional dependencies (c-lord[table]).
 # Exclude from strict type checking so CI passes without the optional install.
 ignore = ["c_lord/discord_ui/table_renderer.py"]
 

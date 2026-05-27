@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
+from discord import app_commands
 
 from c_lord.cogs.session_manage import (
     SETTING_CLAUDE_MODEL,
@@ -202,3 +203,41 @@ class TestModelSet:
         interaction = _make_channel_interaction()
         await cog.model_set.callback(cog, interaction, model=model)
         cog.settings_repo.set.assert_awaited_once_with(SETTING_CLAUDE_MODEL, model)
+
+
+class TestModelCommandGrouping:
+    """The model commands must be a `/model` group with `show`/`set` subcommands (#164)."""
+
+    def _model_group(self) -> app_commands.Group:
+        group = SessionManageCog.__cog_app_commands__  # type: ignore[attr-defined]
+        for cmd in group:
+            if isinstance(cmd, app_commands.Group) and cmd.name == "model":
+                return cmd
+        raise AssertionError("no `/model` app_commands.Group registered on the cog")
+
+    def test_model_group_exists(self):
+        group = self._model_group()
+        assert isinstance(group, app_commands.Group)
+        assert group.name == "model"
+
+    def test_model_group_has_show_and_set_subcommands(self):
+        group = self._model_group()
+        names = {c.name for c in group.commands}
+        assert names == {"show", "set"}
+
+    def test_no_flat_model_commands_registered(self):
+        """Flat `/model-show` and `/model-set` must no longer be top-level commands."""
+        top_level = {
+            c.name
+            for c in SessionManageCog.__cog_app_commands__  # type: ignore[attr-defined]
+        }
+        assert "model-show" not in top_level
+        assert "model-set" not in top_level
+
+    def test_opus_choice_label_is_current(self):
+        """The Opus choice label must reflect the current model version (Opus 4.7), not 4.6."""
+        from c_lord.cogs.session_manage import _MODEL_CHOICES
+
+        opus = next(c for c in _MODEL_CHOICES if c.value == "opus")
+        assert "4.6" not in opus.name
+        assert "4.7" in opus.name

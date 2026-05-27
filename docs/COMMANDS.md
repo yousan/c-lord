@@ -57,8 +57,8 @@ Requires **Manage Server** permission. When a channel is bound to a repo, all se
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/model-show` | Show the current Claude model | Anywhere |
-| `/model-set <model>` | Change the global model for new sessions | Anywhere |
+| `/model show` | Show the current Claude model | Anywhere |
+| `/model set <model>` | Change the global model for new sessions | Anywhere |
 
 Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful).
 
