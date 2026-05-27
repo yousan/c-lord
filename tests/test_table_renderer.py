@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
 from c_lord.discord_ui.table_renderer import (
+    _JP_FONT_PATHS,
     _display_width,
+    _first_existing,
+    _segment_runs,
     _wrap_cell,
     detect_tables,
     has_tables,
@@ -187,20 +192,52 @@ class TestWrapCell:
 
 
 # ===========================================================================
+# _segment_runs
+# ===========================================================================
+
+# The emoji library ships with the [table] extra; CI runs without it, in which
+# case _segment_runs degrades to a single text run. Gate the split assertions.
+EMOJI_LIB_AVAILABLE = importlib.util.find_spec("emoji") is not None
+_needs_emoji = pytest.mark.skipif(not EMOJI_LIB_AVAILABLE, reason="emoji library not installed")
+
+
+class TestSegmentRuns:
+    def test_plain_text_single_run(self) -> None:
+        assert _segment_runs("hello world") == [("hello world", False)]
+
+    def test_empty_text(self) -> None:
+        assert _segment_runs("") == []
+
+    @_needs_emoji
+    def test_splits_emoji_from_text(self) -> None:
+        runs = _segment_runs("🟢 OK")
+        assert runs == [("🟢", True), (" OK", False)]
+
+    @_needs_emoji
+    def test_multiple_emoji(self) -> None:
+        runs = _segment_runs("🟢🔴 NG")
+        assert runs == [("🟢", True), ("🔴", True), (" NG", False)]
+
+    @_needs_emoji
+    def test_emoji_in_middle(self) -> None:
+        runs = _segment_runs("RED 🟢 GREEN")
+        assert runs == [("RED ", False), ("🟢", True), (" GREEN", False)]
+
+    def test_reassembles_to_original(self) -> None:
+        text = "状態 🟢 OK / 🔴 NG ✅"
+        assert "".join(s for s, _ in _segment_runs(text)) == text
+
+
+# ===========================================================================
 # render_table_image
 # ===========================================================================
 
-pytest_plugins: list[str] = []
-
-try:
-    import matplotlib  # noqa: F401
-
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
+RENDER_AVAILABLE = (
+    importlib.util.find_spec("PIL") is not None and _first_existing(_JP_FONT_PATHS) is not None
+)
 
 
-@pytest.mark.skipif(not MATPLOTLIB_AVAILABLE, reason="matplotlib not installed")
+@pytest.mark.skipif(not RENDER_AVAILABLE, reason="Pillow or a usable font not installed")
 class TestRenderTableImage:
     def test_returns_bytes(self) -> None:
         result = render_table_image(SIMPLE_TABLE)
@@ -217,6 +254,12 @@ class TestRenderTableImage:
         assert result is not None
         assert len(result) > 0
 
+    def test_emoji_table_renders(self) -> None:
+        table = "| 項目 | 状態 |\n|------|------|\n| ビルド | 🟢 OK |\n| テスト | 🔴 NG |\n"
+        result = render_table_image(table)
+        assert result is not None
+        assert result[:4] == b"\x89PNG"
+
     def test_aligned_table_renders(self) -> None:
         result = render_table_image(ALIGNED_TABLE)
         assert result is not None
@@ -226,19 +269,19 @@ class TestRenderTableImage:
         assert result is None
 
 
-class TestRenderTableImageNoMatplotlib:
-    def test_returns_none_without_matplotlib(self, monkeypatch) -> None:
+class TestRenderTableImageNoPillow:
+    def test_returns_none_without_pillow(self, monkeypatch) -> None:
         import sys
 
-        monkeypatch.setitem(sys.modules, "matplotlib", None)
-        monkeypatch.setitem(sys.modules, "matplotlib.pyplot", None)
-        # Re-import to trigger ImportError path
+        monkeypatch.setitem(sys.modules, "PIL", None)
+        monkeypatch.setitem(sys.modules, "PIL.Image", None)
         import importlib
 
         import c_lord.discord_ui.table_renderer as mod
 
         importlib.reload(mod)
-        result = mod.render_table_image(SIMPLE_TABLE)
-        assert result is None
-        # Restore
-        importlib.reload(mod)
+        try:
+            result = mod.render_table_image(SIMPLE_TABLE)
+            assert result is None
+        finally:
+            importlib.reload(mod)
