@@ -1737,6 +1737,23 @@ class TestGhostTextInputNotFlagged:
         pane = _load_fixture("bug_62_ghost_text_input.txt")
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
 
+    def test_ghost_text_recognized_as_ready_prompt(self) -> None:
+        """#62: ghost/placeholder text in the input box still means Claude is
+        idle and waiting at the prompt.  ``_has_input_prompt`` MUST return True
+        so the turn completes promptly instead of misreading the input box as
+        "still busy" until the 30s fallback fires.
+        """
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        assert TmuxClaudeRunner._has_input_prompt(pane) is True
+
+    def test_ghost_text_not_leaked_into_response(self) -> None:
+        """#62: the input-box ghost text must never be read as confirmed input,
+        i.e. it must not leak into the extracted response posted to Discord.
+        """
+        pane = _load_fixture("bug_62_ghost_text_input.txt")
+        response = TmuxClaudeRunner._extract_response(pane)
+        assert "A で 3回試して" not in response
+
 
 # -- Tests for #166 (AskUserQuestion → Discord buttons in tmux/jsonl mode) -----
 

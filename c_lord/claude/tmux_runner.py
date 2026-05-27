@@ -1038,13 +1038,25 @@ class TmuxClaudeRunner:
 
         The TUI shows a status bar (``-- INSERT --``, separator lines) below
         the ``❯`` prompt, so we cannot simply check ``endswith``.  Instead,
-        look at the last few lines for a line that is *only* the prompt
-        character (with optional whitespace).
+        look at the last few lines for the input box.
+
+        A bare ``❯`` means an empty input box.  But Claude Code also renders
+        ghost/placeholder text (and any unsent text the user typed) right after
+        the ``❯`` in the input box — e.g. ``❯ A で 3回試して`` (#62).  That still
+        means Claude is idle and waiting at the prompt, so it counts as a ready
+        prompt; without this the input box is misread as "still busy" until the
+        30s fallback fires.  A numbered-menu cursor (``❯ 1. ...``) is excluded —
+        that is an interactive menu, not a ready prompt, and treating it as one
+        would complete the turn before the menu is answered.
         """
         lines = text.rstrip().splitlines()
         for line in lines[-6:]:
             stripped_line = line.strip()
             if stripped_line in ("❯", ">"):
+                return True
+            if (stripped_line.startswith("❯ ") or stripped_line.startswith("> ")) and not (
+                _INTERACTIVE_MENU_RE.match(stripped_line)
+            ):
                 return True
         return False
 
