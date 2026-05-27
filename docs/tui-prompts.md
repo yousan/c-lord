@@ -96,10 +96,11 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | 項目 | 内容 |
 |------|------|
 | **トリガ** | Claude が `AskUserQuestion` ツールを呼んだとき |
-| **画面シグネチャ** | TUI に選択メニュー。ただし cooperative 経路なので TUI と Discord が並存 |
-| **操作** | 数字 + Enter（TUI）/ Discord ボタン・セレクト（Discord） |
-| **JSONL** | ✅ `StreamEvent.ask_questions: list[AskQuestion]`（`AskUserQuestion` ツール呼び出し） |
-| **現在の c-lord 対応** | ✅ `AskView` + `AskAnswerBus` で Discord ボタン表示・回答ルーティング済み |
+| **画面シグネチャ** | TUI に選択メニュー（`☐ header` / `❯ N. label` / `Type something.` / `Chat about this`） |
+| **操作** | ↑/↓ + Enter（TUI）/ Discord ボタン・セレクト（Discord） |
+| **JSONL** | ⚠️ `StreamEvent.ask_questions` は **SDK ストリーミング経路でのみ** 埋まる。jsonl/tmux モードの tmux runner は埋めない |
+| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。**自由記入 ✏️Other は未対応（#172）** |
+| **詳細** | [`askuserquestion-bridge.md`](./askuserquestion-bridge.md)（変換表・画像・制限） |
 
 ### 2-4. Elicitation（MCP サーバーからの入力要求）
 
