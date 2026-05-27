@@ -533,7 +533,14 @@ class TmuxClaudeRunner:
         last_raw = ""
         raw_static_seconds = 0.0
 
-        while not self._stopped and elapsed < self.timeout_seconds:
+        # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
+        # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
+        # — easily runs past 300s while the pane keeps changing every poll
+        # (spinner frame, elapsed-seconds tick).  Gating on ``raw_static_seconds``
+        # means an actively-working turn is never killed mid-flight; the timeout
+        # fires only once the pane has been frozen (Claude truly hung) for the
+        # whole window.  ``elapsed`` is kept for logging and the startup grace.
+        while not self._stopped and raw_static_seconds < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 
@@ -687,7 +694,7 @@ class TmuxClaudeRunner:
                 is_complete=True,
                 error=None if self._silent_stop else "Stopped by user",
             )
-        elif elapsed >= self.timeout_seconds:
+        elif raw_static_seconds >= self.timeout_seconds:
             yield StreamEvent(
                 raw={},
                 message_type=MessageType.RESULT,
