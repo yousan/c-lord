@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -146,6 +147,40 @@ def test_pane_lamp_state_error_takes_priority_over_waiting():
     assert _pane_lamp_state(pane) == "error"
 
 
+# ── #190: lamp stuck yellow — real-capture regression fixtures ─────────────────
+
+_PANES_DIR = Path(__file__).parent / "fixtures" / "panes"
+
+
+def _load_pane(name: str) -> str:
+    return (_PANES_DIR / name).read_text()
+
+
+def test_pane_lamp_state_running_when_spinner_above_footer():
+    """#190: live spinner sits ~15 lines above the bottom (input box + status
+    footer + a tool-result preview push it up). Real captured pane where the
+    old bottom-6 probe returned ``waiting`` despite ``✢ Swirling… (2m 29s · …)``
+    being live. Must be ``running``."""
+    pane = _load_pane("running_spinner_above_footer.txt")
+    assert _pane_lamp_state(pane) == "running"
+
+
+def test_pane_lamp_state_waiting_with_completed_spinner_no_timer():
+    """#190 inverse: an idle pane whose last turn collapsed to
+    ``✻ Brewed for 1m 20s`` (a spinner char, but no live ``(Ns · …)`` timer).
+    A char-only detector widened to clear the footer would false-positive here
+    and get stuck green — must stay ``waiting``."""
+    pane = _load_pane("waiting_completed_spinner_no_timer.txt")
+    assert _pane_lamp_state(pane) == "waiting"
+
+
+def test_pane_lamp_state_running_with_alternate_spinner_chars():
+    """#190: real spinners also use ✶ and · (not just ✢/✻). Detection must be
+    spinner-charset-independent via the live ``(Ns · …)`` timer."""
+    assert _pane_lamp_state("✶ Creating PR… (11m 57s · ↑ 36.5k tokens)\n\n❯\n") == "running"
+    assert _pane_lamp_state("· Precipitating… (3m 4s · ↑ 10.6k tokens)\n\n❯\n") == "running"
+
+
 # ── _sync_one tests ───────────────────────────────────────────────────────────
 
 
@@ -181,6 +216,8 @@ async def test_sync_one_running_when_tool_executing_in_pane():
         bot.get_channel.return_value = fake_thread
         loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
         rec = _Rec(thread_id=222, state="dead", topic="やること", tmux_window_id=None)
+        # Divergence case: tmux window_index (4) != work-name number (1).
+        # The W<N> label must follow the stable work{N} name, not the volatile index.
         by_tid = {
             222: {
                 "window_id": "@9",
@@ -208,7 +245,9 @@ async def test_sync_one_running_when_tool_executing_in_pane():
     fake_thread.edit.assert_awaited_once()
     kwargs = fake_thread.edit.await_args.kwargs
     assert "やること" in kwargs["name"]
-    assert "W4" in kwargs["name"]
+    # W1 from window_name "work1", NOT W4 from the volatile window_index.
+    assert "W1" in kwargs["name"]
+    assert "W4" not in kwargs["name"]
 
 
 async def test_sync_one_waiting_when_prompt_visible():

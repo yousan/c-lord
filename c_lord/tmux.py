@@ -44,6 +44,25 @@ _STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸", "-- NORMAL")
 _INSERT_SETTLE = 0.15
 
 
+def parse_work_number(window_name: str) -> int | None:
+    """Extract the ``N`` from a ``work{N}`` window name.
+
+    Returns ``None`` for windows that don't follow the ``work{N}`` convention
+    (e.g. the session's initial shell window, or a window adopted by dir-match).
+
+    This number is the *stable* window identifier shown as the ``W<N>`` thread
+    name prefix. It deliberately is NOT tmux's ``#{window_index}``, which is
+    volatile — the index shifts when other windows are killed/renumbered and is
+    offset by ``base-index``, so using it would make the Discord ``W<N>`` label
+    disagree with the window's own ``work{N}`` name.
+    """
+    if window_name.startswith(WINDOW_PREFIX):
+        suffix = window_name[len(WINDOW_PREFIX) :]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
     return subprocess.run(
@@ -542,13 +561,16 @@ class TmuxSessionManager:
         logger.info("Remapped window %s → thread %d", window_name, thread_id)
         return True
 
-    def get_window_info(self, thread_id: int) -> tuple[str, int] | None:
-        """Return ``(window_id, window_index)`` for the thread, or None.
+    def get_window_info(self, thread_id: int) -> tuple[str, int | None] | None:
+        """Return ``(window_id, work_number)`` for the thread, or None.
 
         ``window_id`` is tmux's internal immutable id (e.g. ``@7``).
-        ``window_index`` is the volatile per-session integer index
-        shown in the tmux status line. Used by the thread-name builder
-        as the trailing ``#N`` hint.
+        ``work_number`` is the ``N`` in the window's ``work{N}`` name — the
+        stable identifier shown as the ``W<N>`` thread-name prefix. It is
+        ``None`` for windows that don't follow the ``work{N}`` convention.
+
+        Note: this is intentionally NOT tmux's volatile ``#{window_index}``.
+        See :func:`parse_work_number` for why the stable name is used instead.
 
         Returns None if tmux is unavailable or no window is mapped to
         the thread.
@@ -565,17 +587,15 @@ class TmuxSessionManager:
                 "-t",
                 self.session_name,
                 "-F",
-                "#{window_name}\t#{window_id}\t#{window_index}",
+                "#{window_name}\t#{window_id}",
             ]
         )
         if result.returncode != 0:
             return None
         for line in result.stdout.splitlines():
             parts = line.split("\t")
-            if len(parts) == 3 and parts[0] == window_name:
-                idx_str = parts[2]
-                if idx_str.isdigit():
-                    return parts[1], int(idx_str)
+            if len(parts) == 2 and parts[0] == window_name:
+                return parts[1], parse_work_number(window_name)
         return None
 
     def list_windows_full(self) -> list[dict[str, str]]:
@@ -812,6 +832,37 @@ class TmuxSessionManager:
         # Press Enter to submit
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         return result.returncode == 0
+
+    def send_literal(self, thread_id: int, text: str) -> bool:
+        """Send literal text to the pane WITHOUT submitting (no Enter) (#172).
+
+        Unlike :meth:`send_input`, this does **not** append Enter, and does
+        **not** prepend the jsonl bridge ZWSP marker.  It is used to type free
+        text onto an open TUI menu's "Type something." row, where:
+
+        - typing the literal text directly replaces the highlighted row's label
+          with the text, and
+        - the text must NOT be submitted as a separate message — the caller
+          presses Enter afterwards to record it as the menu answer, and
+        - the answer is not a c-lord-originated *user* turn, so the dedup ZWSP
+          would only corrupt the recorded answer.
+
+        Returns True on success.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("send_literal: no window for thread %d", thread_id)
+            return False
+
+        target = f"{self.session_name}:{window}"
+        result = _run(["tmux", "send-keys", "-l", "-t", target, text])
+        if result.returncode != 0:
+            logger.warning("send_literal: send-keys -l failed: %s", result.stderr.strip())
+            return False
+        return True
 
     def send_keys(self, thread_id: int, *keys: str) -> bool:
         """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).

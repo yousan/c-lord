@@ -924,7 +924,7 @@ class TestTmuxClaudeRunnerHandleStartupPrompts:
     async def test_handles_trust_prompt(self, runner, tmux_manager) -> None:
         capture_sequence = [
             "Loading...",
-            "Yes, I trust this folder\nEnter to confirm",
+            "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm",
             "Processing...",
             "Processing...",
             "Processing...",
@@ -1789,25 +1789,69 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
 
 
 class TestGhostTextInputNotFlagged:
-    """Regression for #62: ghost text in the ❯ input area (tmux INSERT mode)
-    must not trigger any detection function.  The pane shows user-typed text
-    in the input zone but no real interactive prompt from Claude.
+    """Regression for #62: a real ``capture-pane -e`` snapshot of the Claude
+    Code TUI showing ghost/placeholder text in the input box.
+
+    The fixture was captured live from ``claude`` v2.1.152 (not hand-written):
+    the input box renders ``❯`` + a non-breaking space (``\\xa0``) + dim
+    placeholder text (``Try "create a util ..."``).  A hand-made fixture used a
+    regular space and so hid the real structure — the live box uses ``\\xa0``
+    while a *sent* user message uses a regular space.  Detection runs on the
+    NORMALISED capture, exactly as the run loop does.
     """
+
+    FIXTURE = "bug_62_ghost_text_real.txt"
+
+    def _norm(self) -> str:
+        return _normalize_capture(_load_fixture(self.FIXTURE))
 
     def test_ghost_text_no_permission_prompt(self) -> None:
         """Ghost text in input area MUST NOT trigger _has_permission_prompt."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._has_permission_prompt(self._norm()) is False
 
     def test_ghost_text_no_yn_prompt(self) -> None:
         """Ghost text in input area MUST NOT trigger _is_yn_prompt."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(self._norm()) is False
 
     def test_ghost_text_no_unknown_interactive(self) -> None:
         """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(self._norm()) is False
+
+    def test_ghost_text_recognized_as_ready_prompt(self) -> None:
+        """#62: ghost/placeholder text in the input box still means Claude is
+        idle and waiting at the prompt.  ``_has_input_prompt`` MUST return True
+        so the turn completes promptly instead of misreading the input box as
+        "still busy" until the 30s fallback fires.
+
+        This is the RED case: the box line is ``❯\\xa0Try "..."`` sitting above a
+        tall bottom chrome (separator + 3 ccstatusline rows + ``-- INSERT --`` +
+        effort footer), so the old bare-``❯``/6-line-window logic returns False.
+        """
+        assert TmuxClaudeRunner._has_input_prompt(self._norm()) is True
+
+    def test_ghost_text_not_leaked_into_response(self) -> None:
+        """#62: the input-box ghost text must never be read as confirmed input,
+        i.e. it must not leak into the extracted response posted to Discord.
+        """
+        response = TmuxClaudeRunner._extract_response(_load_fixture(self.FIXTURE))
+        assert "Try" not in response
+        assert "logging.py" not in response
+
+    def test_sent_message_is_not_a_live_prompt(self) -> None:
+        """A *sent* user message (``❯ <text>`` with a regular space) near the
+        bottom must NOT be treated as the live input box — only the ``❯\\xa0``
+        (NBSP) form or a bare ``❯`` is the live prompt.
+        """
+        pane = (
+            "● answer\n"
+            "────────────────────────\n"
+            "❯ 2+2 は？ 数字だけ答えて\n"  # sent message: regular space after ❯
+            "────────────────────────\n"
+            "Model: Sonnet\nCost: $0\n⎇ main\n"
+            "-- INSERT --\n"
+            "● high · /effort\n"
+        )
+        assert TmuxClaudeRunner._has_input_prompt(pane) is False
 
 
 # -- Tests for #166 (AskUserQuestion → Discord buttons in tmux/jsonl mode) -----
@@ -2038,20 +2082,50 @@ class TestRunYieldsPaneAsk:
         tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
 
     @pytest.mark.asyncio
-    async def test_answer_menu_text_navigates_then_types(self, runner, tmux_manager) -> None:
-        """#171: free-text path navigates to 'Type something.' one key at a time,
-        then sends the literal text via send_input.
+    async def test_answer_menu_text_types_onto_row_then_confirms(self, runner, tmux_manager) -> None:
+        """#172: free text is typed ONTO the highlighted 'Type something.' row,
+        then confirmed with Enter.
+
+        Verified on a live Claude Code v2.1.150 TUI:
+        - Navigating to 'Type something.' and pressing Enter registers a
+          *decline* (no input field opens).
+        - Submitting the text via send_input would post it as a SEPARATE
+          message, not the AskUserQuestion answer.
+        - Typing literal text while the row is highlighted replaces its label
+          with the text; a final Enter records it as the answer.
+
+        So the order must be: Down×N (NO Enter) → send_literal(text) → Enter.
         """
         from unittest.mock import call
 
         with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
             await runner.answer_menu_text(2, "melon")
-        assert tmux_manager.send_keys.call_args_list == [
-            call(12345, "Down"),
-            call(12345, "Down"),
-            call(12345, "Enter"),
+
+        # Ordered across send_keys + send_literal.
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_keys(12345, "Down"),
+            call.send_keys(12345, "Down"),
+            call.send_literal(12345, "melon"),
+            call.send_keys(12345, "Enter"),
         ]
-        tmux_manager.send_input.assert_called_once_with(12345, "melon")
+        # Must NOT submit via send_input (that adds Enter + posts a separate msg).
+        tmux_manager.send_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_text_index_zero_no_navigation(self, runner, tmux_manager) -> None:
+        """When the text row is already highlighted (index 0): type then Enter."""
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_text(0, "kiwi")
+
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_literal(12345, "kiwi"),
+            call.send_keys(12345, "Enter"),
+        ]
+        tmux_manager.send_input.assert_not_called()
 
 
 # -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------
@@ -2149,3 +2223,87 @@ class TestUnknownPromptDedup:
         assert len(unknown_events) == 2, (
             f"expected 2 unknown_tui_prompt events (menu A then B), got {len(unknown_events)}"
         )
+
+
+# -- Regression tests for the folder-trust dialog (Quick safety check) ---------
+
+
+class TestTrustPromptTopAnchored:
+    """The folder-trust dialog ("Quick safety check…") is a TOP-anchored
+    full-screen prompt: its markers sit near the top of the pane while the
+    bottom rows are blank.  So the bottom 'permission zone' is empty and none
+    of the zone-based detectors see it — which is exactly why a fresh-clone
+    session used to stall at the dialog.  It must be matched against the FULL
+    pane and accepted in the main poll loop.
+    """
+
+    def test_real_trust_prompt_detected(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is True
+
+    def test_zone_detectors_are_blind_to_top_anchored_dialog(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        # All bottom-zone detectors miss the top-anchored dialog: this is the
+        # bug — handling it requires a full-pane check in the main loop.
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_prose_mentioning_the_dialog_does_not_trigger(self) -> None:
+        # Detection keys on the menu OPTION LINE, not a loose substring.  The
+        # runner captures ~500 lines of scrollback, so a session that merely
+        # discusses the dialog — even quoting BOTH marker phrases — must NOT
+        # trip a spurious Enter into the input (regression for the #180 fix).
+        prose = (
+            '● The trust dialog shows "Yes, I trust this folder" as option 1;\n'
+            "  the user presses Enter to confirm to accept it.\n"
+            "────────\n❯\n────────\n-- INSERT -- bypass permissions on"
+        )
+        assert "Yes, I trust this folder" in prose  # both phrases present...
+        assert "Enter to confirm" in prose
+        assert TmuxClaudeRunner._has_trust_prompt(prose) is False  # ...yet not a dialog
+
+    def test_menu_line_without_cursor_still_detected(self) -> None:
+        # The cursor (❯) may render on a different option; the "1." menu line
+        # itself is the stable signature.
+        text = "Quick safety check\n  1. Yes, I trust this folder\n  2. No, exit"
+        assert TmuxClaudeRunner._has_trust_prompt(text) is True
+
+
+class TestRunAutoAcceptsTrustPrompt:
+    """run()'s main poll loop must auto-accept the folder-trust dialog.
+
+    Reproduces the stall: the cold-start handler (_handle_startup_prompts)
+    races the dialog and often bails before it renders, so the main loop is
+    the backstop.  Here is_claude_running=True skips the cold-start path, so
+    the main loop is the *only* thing that can accept the dialog.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_loop_sends_enter_on_trust_prompt(self, runner, tmux_manager) -> None:
+        trust_pane = _load_fixture("trust_prompt_at_top.txt")
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Dialog lingers until accepted, then the session proceeds to done.
+            if call_idx <= 6:
+                return trust_pane
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for _ in runner.run("test"):
+                pass
+
+        # The dialog defaults to option 1 ("Yes, I trust this folder"); Enter
+        # confirms it.
+        enter_calls = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args]
+        assert enter_calls, "main loop did not send Enter to accept the trust dialog"

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from c_lord.tmux import SESSION_NAME, TmuxSessionManager, _pane_in_insert_mode
+from c_lord.tmux import (
+    SESSION_NAME,
+    TmuxSessionManager,
+    _pane_in_insert_mode,
+    parse_work_number,
+)
 
 
 class TestTmuxSessionManager:
@@ -669,6 +674,74 @@ class TestTmuxSessionManager:
         assert "-l" in text_call and "melon" in text_call
         assert "Enter" in calls[3][0][0]
 
+    # -- #172: send_literal (type onto a TUI menu's free-text row) ----------
+    #
+    # The AskUserQuestion "Type something." row is NOT submitted as a message:
+    # typing the literal text replaces the highlighted row's label, then a
+    # separate Enter records it as the answer. send_literal sends raw
+    # ``send-keys -l`` only — no Enter and no jsonl ZWSP marker.
+
+    def test_send_literal_sends_text_without_enter(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys -l (text)
+            ]
+            assert mgr.send_literal(12345, "メロン") is True
+
+        calls = mock_run.call_args_list
+        # Exactly one send-keys after the window verify: the literal text.
+        assert len(calls) == 2
+        text_call = calls[1][0][0]
+        assert text_call[:3] == ["tmux", "send-keys", "-l"]
+        assert "メロン" in text_call
+        # No Enter is sent (the caller confirms separately).
+        for c in calls:
+            assert "Enter" not in c[0][0]
+
+    def test_send_literal_no_zwsp_under_jsonl_mode(self) -> None:
+        """send_literal must NOT prepend the jsonl ZWSP marker (#172).
+
+        The ZWSP exists to dedup c-lord-originated *user* turns; a menu free-text
+        answer is not a user turn, so a stray ZWSP would only corrupt the answer.
+        """
+        import os
+
+        prev = os.environ.get("CLORD_BRIDGE_MODE")
+        os.environ["CLORD_BRIDGE_MODE"] = "jsonl"
+        try:
+            mgr = TmuxSessionManager(mapping_path="")
+            mgr._available = True
+            mgr._thread_to_window[12345] = "work1"
+
+            with patch("c_lord.tmux._run") as mock_run:
+                mock_run.side_effect = [
+                    MagicMock(returncode=0, stdout="12345\n"),
+                    MagicMock(returncode=0),
+                ]
+                assert mgr.send_literal(12345, "hi") is True
+
+            text_call = mock_run.call_args_list[1][0][0]
+            assert "hi" in text_call
+            assert "​hi" not in text_call  # no ZWSP (U+200B) prefix
+        finally:
+            if prev is None:
+                os.environ.pop("CLORD_BRIDGE_MODE", None)
+            else:
+                os.environ["CLORD_BRIDGE_MODE"] = prev
+
+    def test_send_literal_no_window(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.send_literal(99999, "hello") is False
+
     def test_send_input_no_window(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
@@ -1214,3 +1287,55 @@ class TestPaneInsertModeDetection:
     def test_empty_or_unknown_returns_none(self) -> None:
         assert _pane_in_insert_mode("") is None
         assert _pane_in_insert_mode("just some\nresponse text\n") is None
+
+
+class TestParseWorkNumber:
+    """The W<N> thread-name label must track the stable work{N} window name."""
+
+    def test_parses_work_number(self) -> None:
+        assert parse_work_number("work1") == 1
+        assert parse_work_number("work5") == 5
+        assert parse_work_number("work42") == 42
+
+    def test_returns_none_for_non_work_names(self) -> None:
+        assert parse_work_number("zsh") is None
+        assert parse_work_number("bash") is None
+        assert parse_work_number("") is None
+
+    def test_returns_none_for_non_numeric_suffix(self) -> None:
+        assert parse_work_number("work") is None
+        assert parse_work_number("workbench") is None
+
+
+class TestGetWindowInfo:
+    """get_window_info returns the stable work{N} number, not the volatile index."""
+
+    def test_returns_work_number_not_window_index(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work3"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # _find_window_for_thread cache hit → show-option verify
+                MagicMock(returncode=0, stdout="12345\n"),
+                # list-windows for window_id lookup — index 0 diverges from work3
+                MagicMock(returncode=0, stdout="work3\t@7\n"),
+            ]
+            info = mgr.get_window_info(12345)
+
+        assert info == ("@7", 3)
+
+    def test_returns_none_work_number_for_non_work_window(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "adopted-window"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),
+                MagicMock(returncode=0, stdout="adopted-window\t@2\n"),
+            ]
+            info = mgr.get_window_info(12345)
+
+        assert info == ("@2", None)
