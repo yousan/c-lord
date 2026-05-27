@@ -195,6 +195,11 @@ class TestWrapCell:
 # _segment_runs
 # ===========================================================================
 
+# The emoji library ships with the [table] extra; CI runs without it, in which
+# case _segment_runs degrades to a single text run. Gate the split assertions.
+EMOJI_LIB_AVAILABLE = importlib.util.find_spec("emoji") is not None
+_needs_emoji = pytest.mark.skipif(not EMOJI_LIB_AVAILABLE, reason="emoji library not installed")
+
 
 class TestSegmentRuns:
     def test_plain_text_single_run(self) -> None:
@@ -203,14 +208,17 @@ class TestSegmentRuns:
     def test_empty_text(self) -> None:
         assert _segment_runs("") == []
 
+    @_needs_emoji
     def test_splits_emoji_from_text(self) -> None:
         runs = _segment_runs("🟢 OK")
         assert runs == [("🟢", True), (" OK", False)]
 
+    @_needs_emoji
     def test_multiple_emoji(self) -> None:
         runs = _segment_runs("🟢🔴 NG")
         assert runs == [("🟢", True), ("🔴", True), (" NG", False)]
 
+    @_needs_emoji
     def test_emoji_in_middle(self) -> None:
         runs = _segment_runs("RED 🟢 GREEN")
         assert runs == [("RED ", False), ("🟢", True), (" GREEN", False)]
