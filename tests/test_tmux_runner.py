@@ -924,7 +924,7 @@ class TestTmuxClaudeRunnerHandleStartupPrompts:
     async def test_handles_trust_prompt(self, runner, tmux_manager) -> None:
         capture_sequence = [
             "Loading...",
-            "Yes, I trust this folder\nEnter to confirm",
+            "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm",
             "Processing...",
             "Processing...",
             "Processing...",
@@ -2205,13 +2205,25 @@ class TestTrustPromptTopAnchored:
         assert TmuxClaudeRunner._is_yn_prompt(pane) is False
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
 
-    def test_single_marker_in_prose_does_not_trigger(self) -> None:
-        # The dialog needs BOTH markers; a response that merely mentions one
-        # phrase (e.g. a chat about this very feature) must NOT trip an Enter.
-        only_confirm = "I'll select option 1 and press Enter to confirm the choice."
-        only_trust = 'The dialog reads "Yes, I trust this folder" when you open a new repo.'
-        assert TmuxClaudeRunner._has_trust_prompt(only_confirm) is False
-        assert TmuxClaudeRunner._has_trust_prompt(only_trust) is False
+    def test_prose_mentioning_the_dialog_does_not_trigger(self) -> None:
+        # Detection keys on the menu OPTION LINE, not a loose substring.  The
+        # runner captures ~500 lines of scrollback, so a session that merely
+        # discusses the dialog — even quoting BOTH marker phrases — must NOT
+        # trip a spurious Enter into the input (regression for the #180 fix).
+        prose = (
+            '● The trust dialog shows "Yes, I trust this folder" as option 1;\n'
+            "  the user presses Enter to confirm to accept it.\n"
+            "────────\n❯\n────────\n-- INSERT -- bypass permissions on"
+        )
+        assert "Yes, I trust this folder" in prose  # both phrases present...
+        assert "Enter to confirm" in prose
+        assert TmuxClaudeRunner._has_trust_prompt(prose) is False  # ...yet not a dialog
+
+    def test_menu_line_without_cursor_still_detected(self) -> None:
+        # The cursor (❯) may render on a different option; the "1." menu line
+        # itself is the stable signature.
+        text = "Quick safety check\n  1. Yes, I trust this folder\n  2. No, exit"
+        assert TmuxClaudeRunner._has_trust_prompt(text) is True
 
 
 class TestRunAutoAcceptsTrustPrompt:
