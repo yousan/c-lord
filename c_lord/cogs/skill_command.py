@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,10 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Callbacks the shared skill core uses to stay agnostic of slash vs text entry.
+Responder = Callable[..., Awaitable[None]]
+Acknowledger = Callable[[], Awaitable[None]]
 
 # YAML frontmatter pattern to extract name/description from SKILL.md
 _FRONTMATTER_RE = re.compile(r"^---[ \t]*\n(?P<body>.*?)^---", re.DOTALL | re.MULTILINE)
@@ -198,28 +203,31 @@ class SkillCommandCog(commands.Cog):
         """Check if the channel is a thread under the configured claude channel."""
         return isinstance(channel, discord.Thread) and channel.parent_id == self.claude_channel_id
 
-    @app_commands.command(name="skill", description="Run a Claude Code skill")
-    @app_commands.describe(
-        name="Skill name (type to filter)",
-        args="Optional arguments to pass to the skill",
-    )
-    @app_commands.autocomplete(name=_skill_name_autocomplete)
-    async def run_skill(
+    async def _run_skill_impl(
         self,
-        interaction: discord.Interaction,
+        *,
+        channel: object,
+        user: discord.Member | discord.User,
         name: str,
-        args: str | None = None,
+        args: str | None,
+        respond: Responder,
+        ack: Acknowledger,
     ) -> None:
-        """Run a Claude Code skill by name, optionally with arguments."""
-        if not self._is_authorized(interaction.user):
-            await interaction.response.send_message(
-                "You don't have permission to use this command.", ephemeral=True
-            )
+        """Shared core for the ``/skill`` slash command and the ``!skill`` text twin.
+
+        ``respond`` posts a message the way the caller needs (interaction
+        response/followup vs ``ctx.send``); ``ack`` acknowledges a long-running
+        operation (defer for the slash command, no-op for text).  Keeping the
+        logic here means the slash and text entry points stay behaviourally
+        identical without copy-paste (see #209).
+        """
+        if not self._is_authorized(user):
+            await respond("You don't have permission to use this command.", ephemeral=True)
             return
 
         # Validate skill name — only alphanumeric, hyphens, underscores
         if not re.match(r"^[\w-]+$", name):
-            await interaction.response.send_message(f"Invalid skill name: `{name}`", ephemeral=True)
+            await respond(f"Invalid skill name: `{name}`", ephemeral=True)
             return
 
         # Lazy reload before matching
@@ -227,30 +235,25 @@ class SkillCommandCog(commands.Cog):
 
         matched = next((s for s in self._skills if s["name"] == name), None)
         if not matched:
-            await interaction.response.send_message(
+            await respond(
                 f"Skill `{name}` not found. Use `/skill` with autocomplete.",
                 ephemeral=True,
             )
             return
 
         # Build the prompt: /name [args]
-        prompt = f"/{name}"
-        if args:
-            prompt = f"/{name} {args}"
+        prompt = f"/{name} {args}" if args else f"/{name}"
 
-        await interaction.response.defer()
+        await ack()
 
         # In-thread mode: if invoked inside a thread under the claude channel, resume it
-        channel = interaction.channel
         if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
             parent_channel_id = channel.parent_id or self.claude_channel_id
             sdm = await self._resolve_session_dir_manager(parent_channel_id)
             tmux = await self._resolve_tmux_manager(parent_channel_id)
 
             if tmux is None:
-                await interaction.followup.send(
-                    "⚠️ tmux is not configured for this channel.", ephemeral=True
-                )
+                await respond("⚠️ tmux is not configured for this channel.", ephemeral=True)
                 return
 
             session_id = None
@@ -259,7 +262,7 @@ class SkillCommandCog(commands.Cog):
                 session_id = record.session_id
 
             display = f"`/{name} {args}`" if args else f"`/{name}`"
-            await interaction.followup.send(f"Running {display} in this thread…")
+            await respond(f"Running {display} in this thread…")
 
             runner = self._make_runner(tmux, channel.id)
             await run_claude_with_config(
@@ -277,18 +280,18 @@ class SkillCommandCog(commands.Cog):
             return
 
         # New-thread mode: create a thread in the claude channel
-        channel = self.bot.get_channel(self.claude_channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send("Claude channel not found.", ephemeral=True)
+        claude_channel = self.bot.get_channel(self.claude_channel_id)
+        if not isinstance(claude_channel, discord.TextChannel):
+            await respond("Claude channel not found.", ephemeral=True)
             return
 
         # Resolve per-channel managers
-        sdm = await self._resolve_session_dir_manager(channel.id)
-        tmux = await self._resolve_tmux_manager(channel.id)
+        sdm = await self._resolve_session_dir_manager(claude_channel.id)
+        tmux = await self._resolve_tmux_manager(claude_channel.id)
 
         # Unbound channel check
         if tmux is None:
-            await interaction.followup.send(
+            await respond(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
                 "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
                 ephemeral=True,
@@ -297,13 +300,13 @@ class SkillCommandCog(commands.Cog):
 
         thread_name = f"/{name} {args}" if args else f"/{name}"
         # Discord thread names are max 100 chars
-        thread = await channel.create_thread(
+        thread = await claude_channel.create_thread(
             name=thread_name[:100],
             type=discord.ChannelType.public_thread,
         )
 
         display = f"`/{name} {args}`" if args else f"`/{name}`"
-        await interaction.followup.send(f"Running {display} → {thread.mention}")
+        await respond(f"Running {display} → {thread.mention}")
 
         runner = self._make_runner(tmux, thread.id)
         await run_claude_with_config(
@@ -317,4 +320,90 @@ class SkillCommandCog(commands.Cog):
                 session_dir_manager=sdm,
                 tmux_manager=tmux,
             )
+        )
+
+    @app_commands.command(name="skill", description="Run a Claude Code skill")
+    @app_commands.describe(
+        name="Skill name (type to filter)",
+        args="Optional arguments to pass to the skill",
+    )
+    @app_commands.autocomplete(name=_skill_name_autocomplete)
+    async def run_skill(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        args: str | None = None,
+    ) -> None:
+        """Run a Claude Code skill by name, optionally with arguments."""
+        state = {"acked": False}
+
+        async def ack() -> None:
+            state["acked"] = True
+            await interaction.response.defer()
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            # Before defer, validation errors go on the initial response (instant,
+            # ephemeral).  After defer, everything goes through followup.
+            if state["acked"]:
+                if embed is not None:
+                    await interaction.followup.send(content or "", embed=embed, ephemeral=ephemeral)
+                else:
+                    await interaction.followup.send(content or "", ephemeral=ephemeral)
+            elif embed is not None:
+                await interaction.response.send_message(content, embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._run_skill_impl(
+            channel=interaction.channel,
+            user=interaction.user,
+            name=name,
+            args=args,
+            respond=respond,
+            ack=ack,
+        )
+
+    @commands.command(name="skill")
+    async def run_skill_text(
+        self,
+        ctx: commands.Context,
+        name: str | None = None,
+        *,
+        args: str | None = None,
+    ) -> None:
+        """Text/mention twin of ``/skill`` — invokable from webhooks for E2E (#209).
+
+        Usage: ``!skill <name> [args]`` or ``@bot skill <name> [args]``.
+        """
+        if not name:
+            await ctx.send("Usage: `!skill <name> [args]`")
+            return
+
+        async def ack() -> None:
+            return None
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            # Text channels/threads can't be ephemeral — ``ephemeral`` is ignored.
+            if embed is not None:
+                await ctx.send(content or "", embed=embed)
+            else:
+                await ctx.send(content or "")
+
+        await self._run_skill_impl(
+            channel=ctx.channel,
+            user=ctx.author,
+            name=name,
+            args=args,
+            respond=respond,
+            ack=ack,
         )

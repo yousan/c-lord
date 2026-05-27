@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import discord
@@ -43,6 +44,10 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Posts a reply the way the caller needs (interaction response vs ctx.send),
+# letting /stop, /clear and their !text twins share one implementation (#209).
+_Responder = Callable[..., Awaitable[None]]
 
 # Attachment filtering constants
 _ALLOWED_MIME_PREFIXES = (
@@ -391,6 +396,27 @@ class ClaudeChatCog(commands.Cog):
             thread = await self.spawn_session(channel, prompt)
             await interaction.followup.send(f"Session started → {thread.mention}")
 
+    async def _stop_impl(self, channel: object, respond: _Responder) -> None:
+        """Shared core for /stop and !stop (#209).
+
+        Interrupts the active runner without clearing the session DB so the
+        user can resume by sending a new message.  ``respond`` posts the reply
+        the way the caller needs (interaction response vs ctx.send).
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        runner = self._active_runners.get(channel.id)
+        if not runner:
+            await respond("No active session is running in this thread.", ephemeral=True)
+            return
+
+        await runner.interrupt()
+        # _active_runners cleanup is handled by _run_claude's finally block.
+        # We intentionally do NOT delete from the session DB so the user can resume.
+        await respond(embed=stopped_embed())
+
     @app_commands.command(name="stop", description="Stop the active session (session is preserved)")
     async def stop_session(self, interaction: discord.Interaction) -> None:
         """Stop the active Claude run without clearing the session.
@@ -398,23 +424,36 @@ class ClaudeChatCog(commands.Cog):
         Unlike /clear, this preserves the session ID so the user can
         resume by sending a new message.
         """
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
-            )
-            return
 
-        runner = self._active_runners.get(interaction.channel.id)
-        if not runner:
-            await interaction.response.send_message(
-                "No active session is running in this thread.", ephemeral=True
-            )
-            return
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            if embed is not None:
+                await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
 
-        await runner.interrupt()
-        # _active_runners cleanup is handled by _run_claude's finally block.
-        # We intentionally do NOT delete from the session DB so the user can resume.
-        await interaction.response.send_message(embed=stopped_embed())
+        await self._stop_impl(interaction.channel, respond)
+
+    @commands.command(name="stop")
+    async def stop_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /stop — invokable from webhooks for E2E (#209)."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            if embed is not None:
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send(content or "")
+
+        await self._stop_impl(ctx.channel, respond)
 
     @app_commands.command(
         name="clord-attach",
@@ -482,16 +521,17 @@ class ClaudeChatCog(commands.Cog):
         else:
             await ctx.send(f"Window `{window}` not found in tmux.")
 
-    @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
-    async def clear_session(self, interaction: discord.Interaction) -> None:
-        """Reset the session for the current thread."""
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
-                "This command can only be used in a Claude chat thread.", ephemeral=True
-            )
+    async def _clear_impl(self, channel: object, respond: _Responder) -> None:
+        """Shared core for /clear and !clear (#209).
+
+        Kills the active runner and tmux window, then resets the session row so
+        the next message starts fresh.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
 
-        thread_id = interaction.channel.id
+        thread_id = channel.id
 
         # Kill active runner if any
         runner = self._active_runners.get(thread_id)
@@ -503,20 +543,44 @@ class ClaudeChatCog(commands.Cog):
         # runner has already been removed from _active_runners (issue #123).
         # This ensures `is_claude_running` returns False next time, preventing
         # old context from being resumed via send_input.
-        parent_id = getattr(interaction.channel, "parent_id", None) or thread_id
+        parent_id = getattr(channel, "parent_id", None) or thread_id
         tmux_manager = await self._resolve_tmux_manager(parent_id)
         if tmux_manager is not None:
             await asyncio.to_thread(tmux_manager.kill_session, thread_id)
 
         reset = await self.repo.reset(thread_id)
         if reset:
-            await interaction.response.send_message(
-                "\U0001f504 Session cleared. Next message will start a fresh session."
-            )
+            await respond("\U0001f504 Session cleared. Next message will start a fresh session.")
         else:
-            await interaction.response.send_message(
-                "No active session found for this thread.", ephemeral=True
-            )
+            await respond("No active session found for this thread.", ephemeral=True)
+
+    @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
+    async def clear_session(self, interaction: discord.Interaction) -> None:
+        """Reset the session for the current thread."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._clear_impl(interaction.channel, respond)
+
+    @commands.command(name="clear")
+    async def clear_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /clear — invokable from webhooks for E2E (#209)."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            await ctx.send(content or "")
+
+        await self._clear_impl(ctx.channel, respond)
 
     async def _handle_new_conversation(self, message: discord.Message) -> None:
         """Create a new thread and start a Claude Code session."""
