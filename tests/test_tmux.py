@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from c_lord.tmux import SESSION_NAME, TmuxSessionManager, _pane_in_insert_mode
+from c_lord.tmux import (
+    SESSION_NAME,
+    TmuxSessionManager,
+    _pane_in_insert_mode,
+    parse_work_number,
+)
 
 
 class TestTmuxSessionManager:
@@ -1282,3 +1287,55 @@ class TestPaneInsertModeDetection:
     def test_empty_or_unknown_returns_none(self) -> None:
         assert _pane_in_insert_mode("") is None
         assert _pane_in_insert_mode("just some\nresponse text\n") is None
+
+
+class TestParseWorkNumber:
+    """The W<N> thread-name label must track the stable work{N} window name."""
+
+    def test_parses_work_number(self) -> None:
+        assert parse_work_number("work1") == 1
+        assert parse_work_number("work5") == 5
+        assert parse_work_number("work42") == 42
+
+    def test_returns_none_for_non_work_names(self) -> None:
+        assert parse_work_number("zsh") is None
+        assert parse_work_number("bash") is None
+        assert parse_work_number("") is None
+
+    def test_returns_none_for_non_numeric_suffix(self) -> None:
+        assert parse_work_number("work") is None
+        assert parse_work_number("workbench") is None
+
+
+class TestGetWindowInfo:
+    """get_window_info returns the stable work{N} number, not the volatile index."""
+
+    def test_returns_work_number_not_window_index(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work3"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # _find_window_for_thread cache hit → show-option verify
+                MagicMock(returncode=0, stdout="12345\n"),
+                # list-windows for window_id lookup — index 0 diverges from work3
+                MagicMock(returncode=0, stdout="work3\t@7\n"),
+            ]
+            info = mgr.get_window_info(12345)
+
+        assert info == ("@7", 3)
+
+    def test_returns_none_work_number_for_non_work_window(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "adopted-window"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),
+                MagicMock(returncode=0, stdout="adopted-window\t@2\n"),
+            ]
+            info = mgr.get_window_info(12345)
+
+        assert info == ("@2", None)

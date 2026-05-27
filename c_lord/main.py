@@ -119,6 +119,7 @@ async def main() -> None:
             allowed_role_name=allowed_role_name,
             claude_channel_id=int(config["channel_id"]),
             enable_scheduler=True,
+            max_concurrent=int(config["max_concurrent"]),
         )
 
         if api_server is not None:

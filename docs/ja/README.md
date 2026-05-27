@@ -195,7 +195,7 @@ Bot の再起動中にセッションが中断された場合、Bot が再起動
 - **プログラム的スポーン** — `POST /api/spawn` でスクリプトや Claude サブプロセスから新しい Discord スレッド + Claude セッションを作成。スレッド作成後すぐに非ブロッキング 201 を返す
 - **スレッド ID 注入** — すべての Claude サブプロセスに `DISCORD_THREAD_ID` 環境変数を渡し、セッションから `$CLORD_API_URL/api/spawn` で子セッションを起動可能
 - **Worktree 管理** — `/worktree-list` でアクティブなセッション Worktree を clean/dirty ステータス付きで表示、`/worktree-cleanup` で孤立した clean な Worktree を削除（`dry_run` プレビューあり）
-- **実行時モデル切り替え** — `/model-show` で現在のグローバルモデルとスレッドごとのセッションモデルを表示、`/model-set` で再起動不要のまま全新規セッションのモデルを変更
+- **実行時モデル切り替え** — `/model show` で現在のグローバルモデルとスレッドごとのセッションモデルを表示、`/model set` で再起動不要のまま全新規セッションのモデルを変更
 
 ### セキュリティ
 - **シェルインジェクション防止** — `asyncio.create_subprocess_exec` のみ使用、`shell=True` は一切なし

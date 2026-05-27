@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from io import BytesIO
 
 # GFM pipe table pattern:
@@ -23,6 +24,26 @@ _TABLE_PATTERN = re.compile(
     r"(?:\|[^\n]+\|\n?)+)",  # one or more data rows
 )
 
+# Rendering layout knobs.
+MAX_COL_WIDTH = 48  # max display width (CJK = 2) per column before wrapping
+FONT_SIZE = 12
+CELL_PAD = 0.08  # horizontal text inset as a fraction of cell width
+COL_WIDTH_INCH = 0.10  # figure inches per display-width unit
+LINE_HEIGHT_INCH = 0.46  # figure inches per wrapped text line (vertical padding)
+
+# Font file paths checked before name-based lookup (faster, deterministic).
+_JP_FONT_PATHS = (
+    os.path.expanduser("~/.local/share/fonts/NotoSansJP.ttf"),
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+)
+_JP_FONT_NAMES = ("Noto Sans JP", "Noto Sans CJK JP", "IPAexGothic", "Hiragino Sans", "Yu Gothic")
+_EMOJI_FONT_PATHS = (
+    os.path.expanduser("~/.local/share/fonts/NotoEmoji-Regular.ttf"),
+    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+)
+_EMOJI_FONT_NAMES = ("Noto Emoji", "Symbola")
+
 
 def detect_tables(content: str) -> list[str]:
     """Return all GFM pipe table blocks found in *content*."""
@@ -32,6 +53,47 @@ def detect_tables(content: str) -> list[str]:
 def has_tables(content: str) -> bool:
     """Return True if *content* contains at least one GFM pipe table."""
     return bool(_TABLE_PATTERN.search(content))
+
+
+def _display_width(text: str) -> int:
+    """Display width of *text*, counting East Asian Wide/Fullwidth glyphs as 2."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
+def _wrap_cell(text: str, max_width: int) -> str:
+    """Wrap *text* so no line exceeds *max_width* display units.
+
+    Wraps on spaces where possible; hard-breaks tokens (URLs, unspaced CJK)
+    that are themselves wider than *max_width*. Returns newline-joined lines.
+    """
+    if max_width <= 0 or _display_width(text) <= max_width:
+        return text
+
+    lines: list[str] = []
+    for para in text.split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            if _display_width(word) > max_width:
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                chunk = ""
+                for ch in word:
+                    if chunk and _display_width(chunk + ch) > max_width:
+                        lines.append(chunk)
+                        chunk = ch
+                    else:
+                        chunk += ch
+                cur = chunk
+                continue
+            candidate = f"{cur} {word}" if cur else word
+            if _display_width(candidate) > max_width:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = candidate
+        lines.append(cur)
+    return "\n".join(lines)
 
 
 def _parse_table(table_md: str) -> tuple[list[str], list[list[str]]] | None:
@@ -55,6 +117,37 @@ def _parse_table(table_md: str) -> tuple[list[str], list[list[str]]] | None:
     return headers, rows
 
 
+def _resolve_font(font_manager) -> object | None:
+    """Build a FontProperties with a JP→Emoji→DejaVu fallback chain.
+
+    matplotlib (>=3.6) falls back per glyph through the family list, so a
+    Japanese-capable font handles CJK while an emoji font covers glyphs the JP
+    font lacks (previously rendered as tofu boxes). Returns None only when no
+    custom font is found, leaving matplotlib's default.
+    """
+    families: list[str] = []
+
+    def _register(paths: tuple[str, ...], names: tuple[str, ...]) -> None:
+        for path in paths:
+            if os.path.exists(path):
+                font_manager.fontManager.addfont(path)
+                families.append(font_manager.FontProperties(fname=path).get_name())
+                return
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        for name in names:
+            match = next((n for n in available if name.lower() in n.lower()), None)
+            if match:
+                families.append(match)
+                return
+
+    _register(_JP_FONT_PATHS, _JP_FONT_NAMES)
+    _register(_EMOJI_FONT_PATHS, _EMOJI_FONT_NAMES)
+    if not families:
+        return None
+    families.append("DejaVu Sans")
+    return font_manager.FontProperties(family=families)
+
+
 def render_table_image(table_md: str) -> bytes | None:
     """Render a GFM pipe table as a PNG image.
 
@@ -75,65 +168,55 @@ def render_table_image(table_md: str) -> bytes | None:
     except ImportError:
         return None
 
-    # Try to use a Japanese-capable font if available.
-    # Check well-known file paths first (faster than scanning the full ttflist),
-    # then fall back to name-based lookup.
-    import os
-
-    jp_font_paths = [
-        os.path.expanduser("~/.local/share/fonts/NotoSansJP.ttf"),
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    ]
-    jp_font_names = [
-        "Noto Sans JP",
-        "Noto Sans CJK JP",
-        "IPAexGothic",
-        "Hiragino Sans",
-        "Yu Gothic",
-    ]
-
-    # font_prop_obj is a FontProperties instance used to set per-cell fonts.
-    font_prop_obj = None
-    for path in jp_font_paths:
-        if os.path.exists(path):
-            font_manager.fontManager.addfont(path)
-            font_prop_obj = font_manager.FontProperties(fname=path)
-            break
-    if font_prop_obj is None:
-        for fname in jp_font_names:
-            candidates = [
-                f for f in font_manager.fontManager.ttflist if fname.lower() in f.name.lower()
-            ]
-            if candidates:
-                font_prop_obj = font_manager.FontProperties(family=candidates[0].name)
-                break
+    font_prop = _resolve_font(font_manager)
 
     n_cols = len(headers)
-    n_rows = len(rows)
+    rows_padded = [(r + [""] * max(0, n_cols - len(r)))[:n_cols] for r in rows]
 
-    # Normalize row widths
-    rows_padded = [r + [""] * max(0, n_cols - len(r)) for r in rows]
-    rows_padded = [r[:n_cols] for r in rows_padded]
+    # Wrap every cell so no line exceeds MAX_COL_WIDTH; bounds the figure width.
+    headers_w = [_wrap_cell(h, MAX_COL_WIDTH) for h in headers]
+    rows_w = [[_wrap_cell(c, MAX_COL_WIDTH) for c in r] for r in rows_padded]
+    n_rows = len(rows_w)
+    all_rows = [headers_w, *rows_w]
 
-    fig_w = max(4, n_cols * 1.8)
-    fig_h = max(1.2, (n_rows + 1) * 0.45)
+    # Per-column display width (longest wrapped line) and per-row line count.
+    col_w = [
+        max(1, max(_display_width(line) for r in all_rows for line in r[c].split("\n")))
+        for c in range(n_cols)
+    ]
+    total_w = sum(col_w)
+    line_counts = [max(cell.count("\n") + 1 for cell in r) for r in all_rows]
+    total_lines = sum(line_counts)
+
+    fig_w = max(4.0, total_w * COL_WIDTH_INCH + n_cols * 0.25)
+    fig_h = max(1.0, total_lines * LINE_HEIGHT_INCH)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis("off")
 
     tbl = ax.table(
-        cellText=rows_padded,
-        colLabels=headers,
+        cellText=rows_w,
+        colLabels=headers_w,
         loc="center",
         cellLoc="left",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(11)
-    tbl.auto_set_column_width(range(n_cols))
+    tbl.set_fontsize(FONT_SIZE)
 
-    if font_prop_obj:
+    # Explicit column widths (bounded) and row heights (grow with wrapped lines).
+    for col in range(n_cols):
+        width = col_w[col] / total_w
+        for row in range(n_rows + 1):
+            cell = tbl[row, col]
+            cell.set_width(width)
+            cell.PAD = CELL_PAD
+    for row in range(n_rows + 1):
+        height = line_counts[row] / total_lines
+        for col in range(n_cols):
+            tbl[row, col].set_height(height)
+
+    if font_prop:
         for cell in tbl.get_celld().values():
-            cell.get_text().set_font_properties(font_prop_obj)
+            cell.get_text().set_font_properties(font_prop)
 
     # Style header row
     for col in range(n_cols):
@@ -149,7 +232,7 @@ def render_table_image(table_md: str) -> bytes | None:
             tbl[row, col].set_facecolor(color)
 
     buf = BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight", dpi=150, pad_inches=0.1)
+    plt.savefig(buf, format="png", bbox_inches="tight", dpi=150, pad_inches=0.15)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
