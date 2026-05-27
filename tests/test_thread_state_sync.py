@@ -181,6 +181,8 @@ async def test_sync_one_running_when_tool_executing_in_pane():
         bot.get_channel.return_value = fake_thread
         loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
         rec = _Rec(thread_id=222, state="dead", topic="やること", tmux_window_id=None)
+        # Divergence case: tmux window_index (4) != work-name number (1).
+        # The W<N> label must follow the stable work{N} name, not the volatile index.
         by_tid = {
             222: {
                 "window_id": "@9",
@@ -208,7 +210,9 @@ async def test_sync_one_running_when_tool_executing_in_pane():
     fake_thread.edit.assert_awaited_once()
     kwargs = fake_thread.edit.await_args.kwargs
     assert "やること" in kwargs["name"]
-    assert "W4" in kwargs["name"]
+    # W1 from window_name "work1", NOT W4 from the volatile window_index.
+    assert "W1" in kwargs["name"]
+    assert "W4" not in kwargs["name"]
 
 
 async def test_sync_one_waiting_when_prompt_visible():

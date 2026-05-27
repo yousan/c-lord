@@ -224,7 +224,7 @@ class ClaudeChatCog(commands.Cog):
           thread is ``auto_topic_locked`` from a previous manual rename).
         - Persists the tmux ``window_id`` (immutable) on the row.
         - Renames the Discord thread to
-          ``<status_emoji> <topic>[ #<window_index>]`` capped at 30 chars,
+          ``<status_emoji> W<work_number> │ <topic>`` capped at 30 chars,
           but only if the current name differs (minimises API calls).
 
         All errors are swallowed by the caller; this helper raises only
@@ -248,16 +248,16 @@ class ClaudeChatCog(commands.Cog):
             if pending_win and record.tmux_window_id != pending_win:
                 await self.repo.set_tmux_window_id(thread.id, pending_win)
 
-        # Resolve tmux window-id / window-index.
+        # Resolve tmux window-id / work-number (the stable work{N} number).
         info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
         if info is not None:
-            window_id, window_index = info
+            window_id, window_number = info
             if record is not None and record.tmux_window_id != window_id:
                 await self.repo.set_tmux_window_id(thread.id, window_id)
             elif record is None:
                 self._pending_tmux_window_id[thread.id] = window_id
         else:
-            window_index = None
+            window_number = None
 
         # Re-summarize title on subsequent messages (#121).
         # Only runs when a topic already exists and the thread is not manually
@@ -293,7 +293,7 @@ class ClaudeChatCog(commands.Cog):
             # just deleted concurrently).
             topic = parse_topic_from_name(thread.name) or "新しいスレッド"
 
-        new_name = build_name(topic, state, window_index)
+        new_name = build_name(topic, state, window_number)
         if (thread.name or "") == new_name:
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
