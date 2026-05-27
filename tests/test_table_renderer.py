@@ -54,6 +54,26 @@ Second table:
 {ALIGNED_TABLE}
 """
 
+# Real-world variants that the original strict regex failed to detect, so the
+# table silently fell back to raw pipe text in Discord (#table-rendering).
+
+# GFM allows omitting the outer leading/trailing pipes.
+NO_OUTER_PIPES_TABLE = """\
+Name | Score
+--- | ---
+Alice | 100
+Bob | 85
+"""
+
+# Trailing whitespace after the closing pipe (common from cell-alignment).
+TRAILING_WS_TABLE = "| Name | Score | \n|------|-------| \n| Alice | 100 | \n"
+
+# CRLF line endings (Windows / some clients).
+CRLF_TABLE = "| Name | Score |\r\n|------|-------|\r\n| Alice | 100 |\r\n"
+
+# Leading indentation (e.g. table emitted under a list item).
+INDENTED_TABLE = "  | Name | Score |\n  |------|-------|\n  | Alice | 100 |\n"
+
 
 # ===========================================================================
 # detect_tables
@@ -83,6 +103,18 @@ class TestDetectTables:
     def test_detects_multiple_tables(self) -> None:
         tables = detect_tables(MULTIPLE_TABLES)
         assert len(tables) == 2
+
+    def test_detects_table_without_outer_pipes(self) -> None:
+        assert len(detect_tables(NO_OUTER_PIPES_TABLE)) == 1
+
+    def test_detects_table_with_trailing_whitespace(self) -> None:
+        assert len(detect_tables(TRAILING_WS_TABLE)) == 1
+
+    def test_detects_table_with_crlf(self) -> None:
+        assert len(detect_tables(CRLF_TABLE)) == 1
+
+    def test_detects_indented_table(self) -> None:
+        assert len(detect_tables(INDENTED_TABLE)) == 1
 
 
 class TestHasTables:

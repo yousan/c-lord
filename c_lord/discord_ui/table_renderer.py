@@ -13,15 +13,21 @@ import re
 import unicodedata
 from io import BytesIO
 
-# GFM pipe table pattern:
-#   header row  : | ... |
-#   separator   : | ---  / :--- / ---: / :---: |
-#   1+ data rows: | ... |
+# GFM pipe table pattern. Kept deliberately permissive so real-world tables
+# still render instead of leaking as raw pipe text:
+#   - outer leading/trailing pipes are optional (GFM allows `a | b`)
+#   - leading indentation is tolerated (tables nested under a list item)
+#   - trailing whitespace after a row is tolerated
+#   - CRLF (`\r\n`) line endings are tolerated
+# A row is any line containing at least one pipe; the separator is the anchor.
+# The `(?=[^\n]*\|)` lookahead asserts a pipe exists, then the line is matched
+# once with a single greedy `[^\n]+`. This avoids two unbounded `[^\n]*` around
+# a literal `|`, which backtracks cubically on adversarial pipe-heavy input.
+_HEADER = r"[ \t]*(?=[^\n]*\|)[^\n]+\r?\n"  # line with >=1 pipe, newline required
+_DATA_ROW = r"[ \t]*(?=[^\n]*\|)[^\n]+\r?\n?"  # data row; trailing newline optional
+_SEP = r"[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*\r?\n"
 _TABLE_PATTERN = re.compile(
-    r"(?m)"
-    r"(\|[^\n]+\|\n"  # header row
-    r"\|[-:| ]+\|\n"  # separator row
-    r"(?:\|[^\n]+\|\n?)+)",  # one or more data rows
+    r"(" + _HEADER + _SEP + r"(?:" + _DATA_ROW + r")+)",
 )
 
 # Rendering layout knobs.
