@@ -44,7 +44,7 @@ PAD_X = 20  # horizontal cell padding
 PAD_Y = 14  # vertical cell padding
 LINE_GAP = 8  # extra space between wrapped lines
 EMOJI_GAP = 2  # space after an emoji glyph
-MAX_COL_WIDTH = 44  # max display width (CJK = 2) per column before wrapping
+MAX_COL_WIDTH = 84  # max display width (CJK = 2) per column before wrapping
 
 BORDER_COLOR = (208, 213, 221)
 HEADER_BG = (68, 114, 196)
