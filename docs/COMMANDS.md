@@ -92,11 +92,38 @@ Only available when the bot operator has enabled the upgrade slash command.
 
 ## Text Commands
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `!attach <window>` | Attach this thread to a tmux window | `!attach work13` |
+| Command | Description | Example | Slash equivalent |
+|---------|-------------|---------|------------------|
+| `!attach <window>` | Attach this thread to a tmux window | `!attach work13` | `/clord-attach` |
+| `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
+| `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
+| `!clear` | Reset the session — next message starts fresh | `!clear` | `/clear` |
 
-Text commands use the `!` prefix. `!attach` is functionally identical to `/clord-attach` — it exists for E2E testing and as a fallback when slash commands are unavailable.
+Each text command is **functionally identical to its slash equivalent** — it
+calls the same underlying handler. Text commands accept either prefix:
+
+- `!skill recall` — the `!` prefix
+- `@c-lord skill recall` — a bot mention (`when_mentioned_or`)
+
+### Why text twins exist (E2E / manual QA)
+
+Discord **slash commands cannot be invoked by a bot or a webhook** — only a
+human clicking in the client can fire an application command. The webhook-based
+E2E harness (`tests/e2e/`) and `E2E_TEST_WEBHOOK_URL`-driven manual QA therefore
+have no way to trigger `/skill`, `/stop`, `/clear`, etc. The `!`-prefix / mention
+twins are the webhook-invocable path, so these flows can be verified
+automatically (see `tests/e2e/test_text_command_twins.py`).
+
+> **Note (leading-slash is _not_ a substitute).** Typing `/skill-name` as an
+> ordinary message does **not** run the skill: under `CLORD_BRIDGE_MODE=jsonl`
+> c-lord prefixes every message sent to the Claude TUI with a zero-width-space
+> marker, so the line no longer starts with `/` and the TUI does not treat it as
+> a slash command. Use the `!`/mention twin instead.
+
+> **Auth note.** A webhook author is not a real guild member, so commands gated
+> by an allowlist/role (e.g. `!skill`) are denied for webhook callers when an
+> allowlist is configured. Staging runs with an open allowlist so E2E works;
+> production auth is unchanged.
 
 ---
 

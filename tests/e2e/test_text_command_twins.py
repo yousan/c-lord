@@ -1,0 +1,107 @@
+"""E2E: text / mention command twins via webhook (#209).
+
+Slash commands cannot be invoked by bots or webhooks, so the webhook-based
+E2E harness can only reach them through their ``!``-prefix / mention twins.
+These tests verify each twin fires and the bot replies when triggered the way
+a slash command never could be.
+
+Covered: !skill, !stop, !clear, and a mention-prefixed command.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from .conftest import DiscordE2EClient
+
+
+@pytest.mark.e2e
+def test_skill_twin_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """!skill reaches SkillCommandCog (an unknown skill returns "not found")."""
+    seed = discord_client.create_seed_message("[E2E] !skill command test")
+    thread = discord_client.create_thread(seed["id"], "E2E: !skill test")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post("!skill __e2e_nonexistent_skill__", thread_id=thread_id)
+
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to !skill within 30s"
+    assert "not found" in reply["content"].lower()
+
+
+@pytest.mark.e2e
+def test_stop_twin_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """!stop reaches ClaudeChatCog (no active runner → informative reply)."""
+    seed = discord_client.create_seed_message("[E2E] !stop command test")
+    thread = discord_client.create_thread(seed["id"], "E2E: !stop test")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post("!stop", thread_id=thread_id)
+
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to !stop within 30s"
+    assert reply["content"], "Bot reply was empty"
+
+
+@pytest.mark.e2e
+def test_clear_twin_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """!clear reaches ClaudeChatCog and replies (cleared / nothing to clear)."""
+    seed = discord_client.create_seed_message("[E2E] !clear command test")
+    thread = discord_client.create_thread(seed["id"], "E2E: !clear test")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post("!clear", thread_id=thread_id)
+
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to !clear within 30s"
+    assert reply["content"], "Bot reply was empty"
+
+
+@pytest.mark.e2e
+def test_mention_prefix_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """A bot-mention prefix (when_mentioned_or) triggers the same text twins."""
+    seed = discord_client.create_seed_message("[E2E] mention command test")
+    thread = discord_client.create_thread(seed["id"], "E2E: mention test")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post(f"<@{bot_id}> stop", thread_id=thread_id)
+
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to mention-prefixed command within 30s"
+    assert reply["content"], "Bot reply was empty"
