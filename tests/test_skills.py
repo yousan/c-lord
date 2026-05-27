@@ -8,6 +8,7 @@ import pytest
 
 from c_lord.skills import (
     inject_skills,
+    remove_injected_skills,
     render_discord_prompt_choice_skill,
     render_discord_reply_skill,
 )
@@ -184,6 +185,45 @@ class TestInjectSkills:
         assert "88" in body
         assert "http://x:2222" in body
         assert "/api/prompt-choice" in body
+
+
+class TestRemoveInjectedSkills:
+    """When skill reply is disabled (e.g. CLORD_BRIDGE_MODE=jsonl) a stale skill
+    from a previous skill-mode session must be scrubbed so it can't point Claude
+    at a now-dead REST API."""
+
+    def test_removes_both_injected_skill_dirs(self, tmp_path: Path) -> None:
+        session_dir = tmp_path / "1"
+        session_dir.mkdir()
+        inject_skills(session_dir, thread_id=1, api_url="http://x")
+        reply = session_dir / ".claude" / "skills" / "discord-reply"
+        choice = session_dir / ".claude" / "skills" / "discord-prompt-choice"
+        assert reply.exists() and choice.exists()
+
+        removed = remove_injected_skills(session_dir)
+
+        assert not reply.exists()
+        assert not choice.exists()
+        assert str(reply) in removed
+        assert str(choice) in removed
+
+    def test_idempotent_when_absent(self, tmp_path: Path) -> None:
+        session_dir = tmp_path / "1"
+        session_dir.mkdir()
+        assert remove_injected_skills(session_dir) == []
+
+    def test_leaves_user_skills_intact(self, tmp_path: Path) -> None:
+        session_dir = tmp_path / "1"
+        session_dir.mkdir()
+        inject_skills(session_dir, thread_id=1, api_url="http://x")
+        other = session_dir / ".claude" / "skills" / "my-custom-skill"
+        other.mkdir(parents=True)
+        (other / "SKILL.md").write_text("custom")
+
+        remove_injected_skills(session_dir)
+
+        assert other.exists()
+        assert (other / "SKILL.md").read_text() == "custom"
 
 
 class TestSkillsEnabled:
