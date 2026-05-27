@@ -66,7 +66,7 @@ C案 — いったん保留
 | `☐ <header>` | embed title `❓ <header>` | header extracted |
 | question line | embed body (first line) | question extracted |
 | `❯ N. <label>` + indented description | **button `<label>`** + body legend `<label> — <description>` | label → button; description → legend (#169) |
-| `Type something.` (meta) | **`✏️ Other` button** (free-text modal) | mapped to free text — **broken, see Limitations (#172)** |
+| `Type something.` (meta) | **`✏️ Other` button** (free-text modal) | mapped to free text — typed onto the row, then confirmed (#172) |
 | `Chat about this` (meta) | *(dropped)* | TUI-only affordance |
 | `Enter to select · ↑/↓ · Esc` footer | *(dropped)* | replaced by clicking |
 | ANSI colour codes | *(stripped)* | `_normalize_capture` before detection (#166) |
@@ -98,14 +98,29 @@ verified with the bot's actual `answer_menu` selecting the intended option.
 While the bridge waits for the click, the runner is suspended at its `yield`,
 so the pane is not re-polled and the menu is not re-detected (natural dedup).
 
+## How free text (`✏️ Other`) is answered (#172)
+
+The `Type something.` row is **not** confirmed with Enter. Verified on a live
+Claude Code v2.1.150 TUI, pressing Enter on that row registers a *decline* and
+no input field opens; and typing through `send_input` would post the text as a
+*separate message* rather than the answer. The working sequence is to **type
+onto the highlighted row**, which replaces its label, then confirm:
+
+```
+Down  (×index)            # navigate to "Type something." — NO Enter here
+send_literal(text)        # type the text directly onto the row (no Enter)
+Enter                     # records the typed text as the answer
+```
+
+`index` is the number of real options (the meta-row sits immediately after
+them). `TmuxClaudeRunner.answer_menu_text` implements this; `send_literal`
+(in `tmux.py`) sends raw `send-keys -l` with no Enter and no jsonl ZWSP marker.
+Keystrokes are spaced by `_MENU_NAV_DELAY` for the same timing reason as
+`answer_menu` (#171). Verified end-to-end: the typed text is recorded as
+`<question> → <text>` (not "User declined to answer questions").
+
 ## Limitations
 
-- **Free text (`✏️ Other`) does not work yet (#172).** Selecting
-  `Type something.` via navigate-then-Enter registers as *"User declined to
-  answer questions"* and the typed text arrives as a separate follow-up
-  message rather than the AskUserQuestion answer. The correct TUI interaction
-  for free-text input is still being determined; until then, prefer providing
-  explicit options.
 - **Single question at a time.** A multi-question AskUserQuestion is handled one
   menu at a time as each renders in the pane.
 

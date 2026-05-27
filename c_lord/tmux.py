@@ -759,6 +759,37 @@ class TmuxSessionManager:
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         return result.returncode == 0
 
+    def send_literal(self, thread_id: int, text: str) -> bool:
+        """Send literal text to the pane WITHOUT submitting (no Enter) (#172).
+
+        Unlike :meth:`send_input`, this does **not** append Enter, and does
+        **not** prepend the jsonl bridge ZWSP marker.  It is used to type free
+        text onto an open TUI menu's "Type something." row, where:
+
+        - typing the literal text directly replaces the highlighted row's label
+          with the text, and
+        - the text must NOT be submitted as a separate message — the caller
+          presses Enter afterwards to record it as the menu answer, and
+        - the answer is not a c-lord-originated *user* turn, so the dedup ZWSP
+          would only corrupt the recorded answer.
+
+        Returns True on success.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("send_literal: no window for thread %d", thread_id)
+            return False
+
+        target = f"{self.session_name}:{window}"
+        result = _run(["tmux", "send-keys", "-l", "-t", target, text])
+        if result.returncode != 0:
+            logger.warning("send_literal: send-keys -l failed: %s", result.stderr.strip())
+            return False
+        return True
+
     def send_keys(self, thread_id: int, *keys: str) -> bool:
         """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).
 

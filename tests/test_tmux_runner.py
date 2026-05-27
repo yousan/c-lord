@@ -1966,20 +1966,50 @@ class TestRunYieldsPaneAsk:
         tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
 
     @pytest.mark.asyncio
-    async def test_answer_menu_text_navigates_then_types(self, runner, tmux_manager) -> None:
-        """#171: free-text path navigates to 'Type something.' one key at a time,
-        then sends the literal text via send_input.
+    async def test_answer_menu_text_types_onto_row_then_confirms(self, runner, tmux_manager) -> None:
+        """#172: free text is typed ONTO the highlighted 'Type something.' row,
+        then confirmed with Enter.
+
+        Verified on a live Claude Code v2.1.150 TUI:
+        - Navigating to 'Type something.' and pressing Enter registers a
+          *decline* (no input field opens).
+        - Submitting the text via send_input would post it as a SEPARATE
+          message, not the AskUserQuestion answer.
+        - Typing literal text while the row is highlighted replaces its label
+          with the text; a final Enter records it as the answer.
+
+        So the order must be: Down×N (NO Enter) → send_literal(text) → Enter.
         """
         from unittest.mock import call
 
         with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
             await runner.answer_menu_text(2, "melon")
-        assert tmux_manager.send_keys.call_args_list == [
-            call(12345, "Down"),
-            call(12345, "Down"),
-            call(12345, "Enter"),
+
+        # Ordered across send_keys + send_literal.
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_keys(12345, "Down"),
+            call.send_keys(12345, "Down"),
+            call.send_literal(12345, "melon"),
+            call.send_keys(12345, "Enter"),
         ]
-        tmux_manager.send_input.assert_called_once_with(12345, "melon")
+        # Must NOT submit via send_input (that adds Enter + posts a separate msg).
+        tmux_manager.send_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_text_index_zero_no_navigation(self, runner, tmux_manager) -> None:
+        """When the text row is already highlighted (index 0): type then Enter."""
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_text(0, "kiwi")
+
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_literal(12345, "kiwi"),
+            call.send_keys(12345, "Enter"),
+        ]
+        tmux_manager.send_input.assert_not_called()
 
 
 # -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------
