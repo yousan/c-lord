@@ -669,6 +669,74 @@ class TestTmuxSessionManager:
         assert "-l" in text_call and "melon" in text_call
         assert "Enter" in calls[3][0][0]
 
+    # -- #172: send_literal (type onto a TUI menu's free-text row) ----------
+    #
+    # The AskUserQuestion "Type something." row is NOT submitted as a message:
+    # typing the literal text replaces the highlighted row's label, then a
+    # separate Enter records it as the answer. send_literal sends raw
+    # ``send-keys -l`` only — no Enter and no jsonl ZWSP marker.
+
+    def test_send_literal_sends_text_without_enter(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys -l (text)
+            ]
+            assert mgr.send_literal(12345, "メロン") is True
+
+        calls = mock_run.call_args_list
+        # Exactly one send-keys after the window verify: the literal text.
+        assert len(calls) == 2
+        text_call = calls[1][0][0]
+        assert text_call[:3] == ["tmux", "send-keys", "-l"]
+        assert "メロン" in text_call
+        # No Enter is sent (the caller confirms separately).
+        for c in calls:
+            assert "Enter" not in c[0][0]
+
+    def test_send_literal_no_zwsp_under_jsonl_mode(self) -> None:
+        """send_literal must NOT prepend the jsonl ZWSP marker (#172).
+
+        The ZWSP exists to dedup c-lord-originated *user* turns; a menu free-text
+        answer is not a user turn, so a stray ZWSP would only corrupt the answer.
+        """
+        import os
+
+        prev = os.environ.get("CLORD_BRIDGE_MODE")
+        os.environ["CLORD_BRIDGE_MODE"] = "jsonl"
+        try:
+            mgr = TmuxSessionManager(mapping_path="")
+            mgr._available = True
+            mgr._thread_to_window[12345] = "work1"
+
+            with patch("c_lord.tmux._run") as mock_run:
+                mock_run.side_effect = [
+                    MagicMock(returncode=0, stdout="12345\n"),
+                    MagicMock(returncode=0),
+                ]
+                assert mgr.send_literal(12345, "hi") is True
+
+            text_call = mock_run.call_args_list[1][0][0]
+            assert "hi" in text_call
+            assert "​hi" not in text_call  # no ZWSP (U+200B) prefix
+        finally:
+            if prev is None:
+                os.environ.pop("CLORD_BRIDGE_MODE", None)
+            else:
+                os.environ["CLORD_BRIDGE_MODE"] = prev
+
+    def test_send_literal_no_window(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.send_literal(99999, "hello") is False
+
     def test_send_input_no_window(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True

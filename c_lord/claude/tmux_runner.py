@@ -874,19 +874,35 @@ class TmuxClaudeRunner:
         await self._navigate_menu(index)
 
     async def answer_menu_text(self, text_option_index: int, text: str) -> None:
-        """Answer via the free-text ("Type something.") affordance (#166).
+        """Answer via the free-text ("Type something.") affordance (#172).
 
-        Navigates to the text option at ``text_option_index`` (the meta-option
-        that follows the real options), confirms with Enter to open the input,
-        then types *text* literally and submits.
+        Verified on a live Claude Code v2.1.150 TUI, the correct interaction is:
+
+        1. Navigate to the "Type something." row with ``Down`` × *text_option_index*
+           — **without** pressing Enter.  (Pressing Enter on that row registers a
+           *decline* and closes the menu; no input field opens — this was the #172
+           bug.)
+        2. Type *text* **literally onto the highlighted row**, which replaces the
+           "Type something." label with the typed text.  This must NOT go through
+           :meth:`send_input`, which would append Enter and post the text as a
+           separate message instead of the answer.
+        3. Press ``Enter`` once to record the typed text as the menu answer.
+
+        Keystrokes are spaced by ``_MENU_NAV_DELAY`` for the same reason as
+        :meth:`answer_menu` (#171): the TUI drops keys sent too fast.
         """
         logger.info(
             "Answering AskUserQuestion with free text (thread=%d)",
             self._thread_id,
         )
-        await self._navigate_menu(text_option_index)
+        for _ in range(max(0, text_option_index)):
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        # Type the free text directly onto the highlighted "Type something." row.
+        await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text)
         await asyncio.sleep(_MENU_NAV_DELAY)
-        await asyncio.to_thread(self._tmux.send_input, self._thread_id, text)
+        # Confirm — records the typed text as the AskUserQuestion answer.
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
     async def cancel_menu(self) -> None:
         """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""
