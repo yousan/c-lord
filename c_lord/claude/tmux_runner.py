@@ -560,6 +560,20 @@ class TmuxClaudeRunner:
             # AskUserQuestion parser) silently miss real menus (#166).
             current = _normalize_capture(raw_current)
 
+            # Auto-accept the folder-trust dialog ("Quick safety check…").  Every
+            # thread runs in a freshly-cloned session dir with no trusted ancestor,
+            # so this dialog blocks on first launch — and --dangerously-skip-permissions
+            # does NOT bypass it.  Unlike permission prompts it is a TOP-anchored
+            # full-screen prompt (bottom rows blank), so the zone-based checks below
+            # never see it; it must be matched against the full pane here.  The
+            # cold-start handler (_handle_startup_prompts) races the dialog and often
+            # bails before it renders, so the main loop is the reliable backstop.
+            # c-lord already runs these dirs with --dangerously-skip-permissions, so
+            # trusting the dir it just cloned is consistent with that threat model.
+            if self._has_trust_prompt(current):
+                await self._accept_trust_prompt()
+                continue
+
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
                 unknown_interactive_stable = 0.0
@@ -771,8 +785,15 @@ class TmuxClaudeRunner:
 
     @staticmethod
     def _has_trust_prompt(text: str) -> bool:
-        """Check if the pane shows a trust/safety confirmation prompt."""
-        return any(marker in text for marker in _TRUST_PROMPT_MARKERS)
+        """Check if the pane shows the folder-trust dialog.
+
+        The dialog is top-anchored (its markers are near the top of the pane,
+        bottom rows blank), so this scans the WHOLE pane rather than the bottom
+        permission zone.  It requires *all* markers — the actionable menu option
+        AND the confirm line — so prose that merely mentions one phrase (e.g. a
+        chat about this very feature) does not trip a spurious Enter.
+        """
+        return all(marker in text for marker in _TRUST_PROMPT_MARKERS)
 
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
@@ -826,6 +847,15 @@ class TmuxClaudeRunner:
         # These are handled via Discord buttons; surfacing them as "unknown" would
         # confuse users with a duplicate warning alongside the real Discord UI.
         return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
+
+    async def _accept_trust_prompt(self) -> None:
+        """Accept the folder-trust dialog by confirming option 1 with Enter.
+
+        The dialog's cursor starts on "1. Yes, I trust this folder", so a bare
+        Enter confirms trust and lets Claude proceed with the original prompt.
+        """
+        logger.info("Trust prompt detected, accepting (thread=%d)", self._thread_id)
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.

@@ -2179,3 +2179,75 @@ class TestUnknownPromptDedup:
         assert len(unknown_events) == 2, (
             f"expected 2 unknown_tui_prompt events (menu A then B), got {len(unknown_events)}"
         )
+
+
+# -- Regression tests for the folder-trust dialog (Quick safety check) ---------
+
+
+class TestTrustPromptTopAnchored:
+    """The folder-trust dialog ("Quick safety check…") is a TOP-anchored
+    full-screen prompt: its markers sit near the top of the pane while the
+    bottom rows are blank.  So the bottom 'permission zone' is empty and none
+    of the zone-based detectors see it — which is exactly why a fresh-clone
+    session used to stall at the dialog.  It must be matched against the FULL
+    pane and accepted in the main poll loop.
+    """
+
+    def test_real_trust_prompt_detected(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is True
+
+    def test_zone_detectors_are_blind_to_top_anchored_dialog(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        # All bottom-zone detectors miss the top-anchored dialog: this is the
+        # bug — handling it requires a full-pane check in the main loop.
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_single_marker_in_prose_does_not_trigger(self) -> None:
+        # The dialog needs BOTH markers; a response that merely mentions one
+        # phrase (e.g. a chat about this very feature) must NOT trip an Enter.
+        only_confirm = "I'll select option 1 and press Enter to confirm the choice."
+        only_trust = 'The dialog reads "Yes, I trust this folder" when you open a new repo.'
+        assert TmuxClaudeRunner._has_trust_prompt(only_confirm) is False
+        assert TmuxClaudeRunner._has_trust_prompt(only_trust) is False
+
+
+class TestRunAutoAcceptsTrustPrompt:
+    """run()'s main poll loop must auto-accept the folder-trust dialog.
+
+    Reproduces the stall: the cold-start handler (_handle_startup_prompts)
+    races the dialog and often bails before it renders, so the main loop is
+    the backstop.  Here is_claude_running=True skips the cold-start path, so
+    the main loop is the *only* thing that can accept the dialog.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_loop_sends_enter_on_trust_prompt(self, runner, tmux_manager) -> None:
+        trust_pane = _load_fixture("trust_prompt_at_top.txt")
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Dialog lingers until accepted, then the session proceeds to done.
+            if call_idx <= 6:
+                return trust_pane
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for _ in runner.run("test"):
+                pass
+
+        # The dialog defaults to option 1 ("Yes, I trust this folder"); Enter
+        # confirms it.
+        enter_calls = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args]
+        assert enter_calls, "main loop did not send Enter to accept the trust dialog"
