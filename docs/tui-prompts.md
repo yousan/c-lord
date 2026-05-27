@@ -99,7 +99,7 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **画面シグネチャ** | TUI に選択メニュー（`☐ header` / `❯ N. label` / `Type something.` / `Chat about this`） |
 | **操作** | ↑/↓ + Enter（TUI）/ Discord ボタン・セレクト（Discord） |
 | **JSONL** | ⚠️ `StreamEvent.ask_questions` は **SDK ストリーミング経路でのみ** 埋まる。jsonl/tmux モードの tmux runner は埋めない |
-| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。**自由記入 ✏️Other は未対応（#172）** |
+| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。自由記入 ✏️Other は「Type something. 行に直接タイプ→Enter」で回答（#172） |
 | **詳細** | [`askuserquestion-bridge.md`](./askuserquestion-bridge.md)（変換表・画像・制限） |
 
 ### 2-4. Elicitation（MCP サーバーからの入力要求）
@@ -197,11 +197,19 @@ JSONL に出ない。`tmux capture-pane` でしか検出できない。誤検知
 
 | シグネチャ | 意味 |
 |-----------|------|
-| `-- INSERT ⏵⏵ bypass permissions on` | dangerously-skip-permissions 有効、入力モード |
-| `-- NORMAL` | ノーマルモード |
+| `-- INSERT ⏵⏵ bypass permissions on` | vim INSERT モード（入力可） |
+| ステータスバーに `-- INSERT` が**無い** | vim NORMAL モード。**現行 Claude Code (v2.1.150) は `-- NORMAL` を表示せず、`-- INSERT` プレフィックスが消えるだけ**（`⏵⏵ bypass permissions on …` だけが残る） |
 | `Model: Sonnet 4.6 Style: default` | ccstatusline 行 1 |
 | `Cost: $0.05 Session: 7.0%` | ccstatusline 行 2（コンテキスト使用量） |
 | `⎇ main (+0,-0) cwd: /path` | ccstatusline 行 3（ブランチ） |
+
+> **vim NORMAL モードと `send_input`（#147）**: `editorMode: vim` のため入力欄に NORMAL
+> モードがあり、NORMAL のまま `send-keys -l`（literal）を送ると各文字が vim コマンドとして
+> 解釈されメッセージが壊れる（例: "melon" → `m`/`e`/`l` がカーソル移動、`o` が改行+INSERT 化で
+> `n` だけ入力）。`TmuxSessionManager.send_input` は送信前に `capture-pane` でモードを判定し、
+> INSERT でない（`-- INSERT` 不在）ときだけ `i` を送って INSERT に遷移してから literal を流す。
+> 判定不能なフレーム（生成中・再描画中で status bar 不在）は誤って `i` を混入させないよう無補正。
+> トリガ例: `cancel_menu()` 等が送る `Escape` 後の follow-up 送信。
 
 ### 4-2. 生成中インジケーター
 

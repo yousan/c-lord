@@ -73,6 +73,13 @@ _TRUST_PROMPT_MARKERS = (
     "Enter to confirm",
 )
 
+# The trust dialog's distinctive *menu option line*: "❯ 1. Yes, I trust this
+# folder".  Detection keys on this anchored line rather than a loose substring
+# of the marker phrases anywhere in the pane: the runner captures ~500 lines of
+# scrollback, so a session that merely *mentions* the dialog's wording (e.g. a
+# chat about this very feature) must not trip a spurious Enter into the input.
+_TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*1\.\s+Yes, I trust this folder\s*$", re.MULTILINE)
+
 # Patterns from Plan approval (ExitPlanMode) and AskUserQuestion TUI menus.
 # These are KNOWN prompt types handled via Discord buttons; they must NOT be
 # flagged as "unknown" interactive prompts (#153).
@@ -539,7 +546,14 @@ class TmuxClaudeRunner:
         last_raw = ""
         raw_static_seconds = 0.0
 
-        while not self._stopped and elapsed < self.timeout_seconds:
+        # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
+        # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
+        # — easily runs past 300s while the pane keeps changing every poll
+        # (spinner frame, elapsed-seconds tick).  Gating on ``raw_static_seconds``
+        # means an actively-working turn is never killed mid-flight; the timeout
+        # fires only once the pane has been frozen (Claude truly hung) for the
+        # whole window.  ``elapsed`` is kept for logging and the startup grace.
+        while not self._stopped and raw_static_seconds < self.timeout_seconds:
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 
@@ -558,6 +572,20 @@ class TmuxClaudeRunner:
             # "1." — leaving the escapes in place makes the menu regexes (and the
             # AskUserQuestion parser) silently miss real menus (#166).
             current = _normalize_capture(raw_current)
+
+            # Auto-accept the folder-trust dialog ("Quick safety check…").  Every
+            # thread runs in a freshly-cloned session dir with no trusted ancestor,
+            # so this dialog blocks on first launch — and --dangerously-skip-permissions
+            # does NOT bypass it.  Unlike permission prompts it is a TOP-anchored
+            # full-screen prompt (bottom rows blank), so the zone-based checks below
+            # never see it; it must be matched against the full pane here.  The
+            # cold-start handler (_handle_startup_prompts) races the dialog and often
+            # bails before it renders, so the main loop is the reliable backstop.
+            # c-lord already runs these dirs with --dangerously-skip-permissions, so
+            # trusting the dir it just cloned is consistent with that threat model.
+            if self._has_trust_prompt(current):
+                await self._accept_trust_prompt()
+                continue
 
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
@@ -693,7 +721,7 @@ class TmuxClaudeRunner:
                 is_complete=True,
                 error=None if self._silent_stop else "Stopped by user",
             )
-        elif elapsed >= self.timeout_seconds:
+        elif raw_static_seconds >= self.timeout_seconds:
             yield StreamEvent(
                 raw={},
                 message_type=MessageType.RESULT,
@@ -770,8 +798,16 @@ class TmuxClaudeRunner:
 
     @staticmethod
     def _has_trust_prompt(text: str) -> bool:
-        """Check if the pane shows a trust/safety confirmation prompt."""
-        return any(marker in text for marker in _TRUST_PROMPT_MARKERS)
+        """Check if the pane shows the folder-trust dialog.
+
+        The dialog is top-anchored (its content is near the top of the pane,
+        bottom rows blank), so this scans the WHOLE pane rather than the bottom
+        permission zone.  To stay robust against the ~500 lines of scrollback the
+        runner captures, it keys on the *menu option line* "❯ 1. Yes, I trust
+        this folder" — a structure prose does not reproduce — instead of a loose
+        substring of the marker phrases.
+        """
+        return bool(_TRUST_PROMPT_RE.search(text))
 
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
@@ -826,6 +862,15 @@ class TmuxClaudeRunner:
         # confuse users with a duplicate warning alongside the real Discord UI.
         return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
 
+    async def _accept_trust_prompt(self) -> None:
+        """Accept the folder-trust dialog by confirming option 1 with Enter.
+
+        The dialog's cursor starts on "1. Yes, I trust this folder", so a bare
+        Enter confirms trust and lets Claude proceed with the original prompt.
+        """
+        logger.info("Trust prompt detected, accepting (thread=%d)", self._thread_id)
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.
 
@@ -873,19 +918,35 @@ class TmuxClaudeRunner:
         await self._navigate_menu(index)
 
     async def answer_menu_text(self, text_option_index: int, text: str) -> None:
-        """Answer via the free-text ("Type something.") affordance (#166).
+        """Answer via the free-text ("Type something.") affordance (#172).
 
-        Navigates to the text option at ``text_option_index`` (the meta-option
-        that follows the real options), confirms with Enter to open the input,
-        then types *text* literally and submits.
+        Verified on a live Claude Code v2.1.150 TUI, the correct interaction is:
+
+        1. Navigate to the "Type something." row with ``Down`` × *text_option_index*
+           — **without** pressing Enter.  (Pressing Enter on that row registers a
+           *decline* and closes the menu; no input field opens — this was the #172
+           bug.)
+        2. Type *text* **literally onto the highlighted row**, which replaces the
+           "Type something." label with the typed text.  This must NOT go through
+           :meth:`send_input`, which would append Enter and post the text as a
+           separate message instead of the answer.
+        3. Press ``Enter`` once to record the typed text as the menu answer.
+
+        Keystrokes are spaced by ``_MENU_NAV_DELAY`` for the same reason as
+        :meth:`answer_menu` (#171): the TUI drops keys sent too fast.
         """
         logger.info(
             "Answering AskUserQuestion with free text (thread=%d)",
             self._thread_id,
         )
-        await self._navigate_menu(text_option_index)
+        for _ in range(max(0, text_option_index)):
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        # Type the free text directly onto the highlighted "Type something." row.
+        await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text)
         await asyncio.sleep(_MENU_NAV_DELAY)
-        await asyncio.to_thread(self._tmux.send_input, self._thread_id, text)
+        # Confirm — records the typed text as the AskUserQuestion answer.
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
     async def cancel_menu(self) -> None:
         """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""

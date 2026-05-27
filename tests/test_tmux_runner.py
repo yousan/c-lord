@@ -924,7 +924,7 @@ class TestTmuxClaudeRunnerHandleStartupPrompts:
     async def test_handles_trust_prompt(self, runner, tmux_manager) -> None:
         capture_sequence = [
             "Loading...",
-            "Yes, I trust this folder\nEnter to confirm",
+            "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm",
             "Processing...",
             "Processing...",
             "Processing...",
@@ -1061,6 +1061,78 @@ class TestTmuxClaudeRunnerRun:
 
         result_events = [e for e in events if e.is_complete]
         assert len(result_events) == 1
+
+
+class TestInactivityTimeout:
+    """#94: the hard ``timeout_seconds`` backstop must be inactivity-based.
+
+    The old loop killed any turn whose total wall-clock exceeded
+    ``timeout_seconds`` — even while Claude was actively thinking / running
+    tools (the pane spinner + elapsed counter ticking every poll).  That
+    posted a bogus "Session timed out" notice on live sessions.  The timeout
+    now fires only after the pane has been *frozen* for ``timeout_seconds``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_does_not_timeout_while_pane_active(self, runner, tmux_manager) -> None:
+        """A long but ACTIVE turn must complete, not emit a 'Timed out' RESULT."""
+        tmux_manager.is_claude_running.return_value = True
+        done_pane = _make_pane(["● All done!"], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Pane changes every poll (elapsed-seconds tick) for far longer
+            # than timeout_seconds — Claude is alive — then finishes.
+            if call_idx <= 20:
+                return f"\n✻ Cogitating for {call_idx}s\n────────\n❯\n────────\n-- INSERT --"
+            return done_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        runner.timeout_seconds = 0.2  # ~10 polls @ 0.02; the active phase outlasts it
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None, (
+            f"active turn was killed by the timeout: {result_events[0].error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_fires_when_pane_frozen(self, runner, tmux_manager) -> None:
+        """A genuinely hung (frozen-pane) session is still killed by the backstop."""
+        tmux_manager.is_claude_running.return_value = True
+        # A response is on screen (so the empty-response idle break does not
+        # apply) but the pane never changes again — a real hang.
+        frozen = _make_pane(["● Partial answer, then hung"], user_prompt="q")
+        tmux_manager.capture_pane.return_value = frozen
+
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            # Push the other exits out so only the inactivity backstop can fire.
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 100.0),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("q"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "Timed out" in result_events[0].error
 
 
 class TestTmuxClaudeRunnerInterrupt:
@@ -2010,20 +2082,50 @@ class TestRunYieldsPaneAsk:
         tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
 
     @pytest.mark.asyncio
-    async def test_answer_menu_text_navigates_then_types(self, runner, tmux_manager) -> None:
-        """#171: free-text path navigates to 'Type something.' one key at a time,
-        then sends the literal text via send_input.
+    async def test_answer_menu_text_types_onto_row_then_confirms(self, runner, tmux_manager) -> None:
+        """#172: free text is typed ONTO the highlighted 'Type something.' row,
+        then confirmed with Enter.
+
+        Verified on a live Claude Code v2.1.150 TUI:
+        - Navigating to 'Type something.' and pressing Enter registers a
+          *decline* (no input field opens).
+        - Submitting the text via send_input would post it as a SEPARATE
+          message, not the AskUserQuestion answer.
+        - Typing literal text while the row is highlighted replaces its label
+          with the text; a final Enter records it as the answer.
+
+        So the order must be: Down×N (NO Enter) → send_literal(text) → Enter.
         """
         from unittest.mock import call
 
         with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
             await runner.answer_menu_text(2, "melon")
-        assert tmux_manager.send_keys.call_args_list == [
-            call(12345, "Down"),
-            call(12345, "Down"),
-            call(12345, "Enter"),
+
+        # Ordered across send_keys + send_literal.
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_keys(12345, "Down"),
+            call.send_keys(12345, "Down"),
+            call.send_literal(12345, "melon"),
+            call.send_keys(12345, "Enter"),
         ]
-        tmux_manager.send_input.assert_called_once_with(12345, "melon")
+        # Must NOT submit via send_input (that adds Enter + posts a separate msg).
+        tmux_manager.send_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_text_index_zero_no_navigation(self, runner, tmux_manager) -> None:
+        """When the text row is already highlighted (index 0): type then Enter."""
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_text(0, "kiwi")
+
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_literal(12345, "kiwi"),
+            call.send_keys(12345, "Enter"),
+        ]
+        tmux_manager.send_input.assert_not_called()
 
 
 # -- Regression tests for #165 (unknown_tui_prompt re-fire spam) ---------------
@@ -2121,3 +2223,87 @@ class TestUnknownPromptDedup:
         assert len(unknown_events) == 2, (
             f"expected 2 unknown_tui_prompt events (menu A then B), got {len(unknown_events)}"
         )
+
+
+# -- Regression tests for the folder-trust dialog (Quick safety check) ---------
+
+
+class TestTrustPromptTopAnchored:
+    """The folder-trust dialog ("Quick safety check…") is a TOP-anchored
+    full-screen prompt: its markers sit near the top of the pane while the
+    bottom rows are blank.  So the bottom 'permission zone' is empty and none
+    of the zone-based detectors see it — which is exactly why a fresh-clone
+    session used to stall at the dialog.  It must be matched against the FULL
+    pane and accepted in the main poll loop.
+    """
+
+    def test_real_trust_prompt_detected(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is True
+
+    def test_zone_detectors_are_blind_to_top_anchored_dialog(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        # All bottom-zone detectors miss the top-anchored dialog: this is the
+        # bug — handling it requires a full-pane check in the main loop.
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_prose_mentioning_the_dialog_does_not_trigger(self) -> None:
+        # Detection keys on the menu OPTION LINE, not a loose substring.  The
+        # runner captures ~500 lines of scrollback, so a session that merely
+        # discusses the dialog — even quoting BOTH marker phrases — must NOT
+        # trip a spurious Enter into the input (regression for the #180 fix).
+        prose = (
+            '● The trust dialog shows "Yes, I trust this folder" as option 1;\n'
+            "  the user presses Enter to confirm to accept it.\n"
+            "────────\n❯\n────────\n-- INSERT -- bypass permissions on"
+        )
+        assert "Yes, I trust this folder" in prose  # both phrases present...
+        assert "Enter to confirm" in prose
+        assert TmuxClaudeRunner._has_trust_prompt(prose) is False  # ...yet not a dialog
+
+    def test_menu_line_without_cursor_still_detected(self) -> None:
+        # The cursor (❯) may render on a different option; the "1." menu line
+        # itself is the stable signature.
+        text = "Quick safety check\n  1. Yes, I trust this folder\n  2. No, exit"
+        assert TmuxClaudeRunner._has_trust_prompt(text) is True
+
+
+class TestRunAutoAcceptsTrustPrompt:
+    """run()'s main poll loop must auto-accept the folder-trust dialog.
+
+    Reproduces the stall: the cold-start handler (_handle_startup_prompts)
+    races the dialog and often bails before it renders, so the main loop is
+    the backstop.  Here is_claude_running=True skips the cold-start path, so
+    the main loop is the *only* thing that can accept the dialog.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_loop_sends_enter_on_trust_prompt(self, runner, tmux_manager) -> None:
+        trust_pane = _load_fixture("trust_prompt_at_top.txt")
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Dialog lingers until accepted, then the session proceeds to done.
+            if call_idx <= 6:
+                return trust_pane
+            return _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for _ in runner.run("test"):
+                pass
+
+        # The dialog defaults to option 1 ("Yes, I trust this folder"); Enter
+        # confirms it.
+        enter_calls = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args]
+        assert enter_calls, "main loop did not send Enter to accept the trust dialog"

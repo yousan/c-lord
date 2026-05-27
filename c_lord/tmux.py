@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 
 # Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
 # unrelated trailing-numeric path components (PIDs, ports, etc.).
@@ -25,6 +26,23 @@ logger = logging.getLogger(__name__)
 SESSION_NAME = "clord"
 WINDOW_PREFIX = "work"
 
+# #147: Claude Code runs with ``editorMode: vim``.  Its input box therefore has
+# a vim NORMAL mode in which literal characters (``send-keys -l``) are
+# interpreted as editor commands, corrupting the message.  The TUI status bar
+# shows ``-- INSERT`` only while in INSERT mode; NORMAL mode simply omits the
+# prefix (current Claude Code, v2.1.150, renders NO ``-- NORMAL`` marker).  So
+# we detect mode by the presence of ``-- INSERT`` and anchor the NORMAL case on
+# the always-present permission/plan status indicators.
+_INSERT_MARKER = "-- INSERT"
+# Status-bar anchors that prove the pane is sitting at the input prompt (and so
+# its vim mode is meaningful).  ``⏵⏵``/``⏸⏸`` are the bypass/plan indicators;
+# ``-- NORMAL`` is included for forward-compat in case a future build restores
+# the explicit NORMAL marker.
+_STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸", "-- NORMAL")
+# Pause after pressing ``i`` so the TUI commits the INSERT-mode switch before the
+# literal text arrives (verified on staging: the switch is near-instant).
+_INSERT_SETTLE = 0.15
+
 
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
@@ -33,6 +51,28 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
+
+
+def _pane_in_insert_mode(pane_text: str) -> bool | None:
+    """Return True if the input box is in vim INSERT mode, False for NORMAL.
+
+    Returns ``None`` when the mode cannot be determined (no status bar in the
+    captured frame — e.g. mid-redraw or while Claude is generating).  Callers
+    should treat ``None`` as "leave input untouched" to avoid the double-``i``
+    regression (#147 AC2).
+
+    Only the bottom status zone is inspected, so a stale ``-- INSERT`` lingering
+    in scrollback above a current NORMAL status bar does not win.
+    """
+    lines = [ln for ln in pane_text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    zone = "\n".join(lines[-8:])
+    if _INSERT_MARKER in zone:
+        return True
+    if any(anchor in zone for anchor in _STATUS_BAR_ANCHORS):
+        return False
+    return None
 
 
 def _tmux_available() -> bool:
@@ -749,6 +789,20 @@ class TmuxSessionManager:
         from .transcript.formatter import ZWSP_MARKER
         from .transcript.mirror import bridge_mode_jsonl
 
+        # #147: Claude's vim-mode input box drops to NORMAL after some
+        # operations (e.g. an Escape sent by cancel_menu()).  Sending literal
+        # text in NORMAL makes each character a vim command, corrupting the
+        # message.  Capture the current frame and, if not positively in INSERT,
+        # press ``i`` first.  We only correct when the pane is positively NOT in
+        # INSERT (a recognised status bar without ``-- INSERT``); an
+        # indeterminate frame is left untouched so we never inject a stray ``i``
+        # into an already-INSERT box (AC2).
+        visible = _run(["tmux", "capture-pane", "-p", "-t", target])
+        if visible.returncode == 0 and _pane_in_insert_mode(visible.stdout) is False:
+            logger.debug("send_input: pane in NORMAL mode, entering INSERT (thread=%d)", thread_id)
+            _run(["tmux", "send-keys", "-t", target, "i"])
+            time.sleep(_INSERT_SETTLE)
+
         payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
         result = _run(["tmux", "send-keys", "-l", "-t", target, payload])
         if result.returncode != 0:
@@ -758,6 +812,37 @@ class TmuxSessionManager:
         # Press Enter to submit
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         return result.returncode == 0
+
+    def send_literal(self, thread_id: int, text: str) -> bool:
+        """Send literal text to the pane WITHOUT submitting (no Enter) (#172).
+
+        Unlike :meth:`send_input`, this does **not** append Enter, and does
+        **not** prepend the jsonl bridge ZWSP marker.  It is used to type free
+        text onto an open TUI menu's "Type something." row, where:
+
+        - typing the literal text directly replaces the highlighted row's label
+          with the text, and
+        - the text must NOT be submitted as a separate message — the caller
+          presses Enter afterwards to record it as the menu answer, and
+        - the answer is not a c-lord-originated *user* turn, so the dedup ZWSP
+          would only corrupt the recorded answer.
+
+        Returns True on success.
+        """
+        if not self._check_available():
+            return False
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            logger.warning("send_literal: no window for thread %d", thread_id)
+            return False
+
+        target = f"{self.session_name}:{window}"
+        result = _run(["tmux", "send-keys", "-l", "-t", target, text])
+        if result.returncode != 0:
+            logger.warning("send_literal: send-keys -l failed: %s", result.stderr.strip())
+            return False
+        return True
 
     def send_keys(self, thread_id: int, *keys: str) -> bool:
         """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).
