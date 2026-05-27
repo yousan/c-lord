@@ -1,0 +1,21 @@
+❯ #62 のゴーストテキスト誤検知を直して
+
+● Fix complete and verified. Here's the summary.
+
+  What was wrong (#62)
+
+  When Claude Code's TUI input box shows ghost/placeholder text (or unsent typed text) like ❯ A で 3回試して,
+  _has_input_prompt() only recognized a bare ❯ as a ready prompt. So c-lord misread an idle, ready prompt as
+  "still busy" — the same ghost-text-as-real-input confusion the issue describes.
+
+  Per the repo's DoD, this is a behavior change that still needs staging verification (RED reproduced + GREEN on
+  staging) and a branch/PR before merge — those touch shared systems, so I haven't done them unprompted.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+✽ Generating… (7m 45s · ↑ 23.2k tokens)
+   Model: Opus 4.7  v2.1.150  Style: default  Ctx: 132.3k  Context: [██░░░░░░░░░░░░░░] 132k/1000k (13%)
+   Cost: $4.01  Session: 40.0%  Weekly: 45.0%  Session: 48m  Reset: 2hr 52m  Weekly Reset: 2d 5hr 52m
+   ⎇ fix/62-ghost-text-ready-prompt  +0  -0  1509002899814879292  cwd: /home/yousan/c-lord-sessions/...
+  -- INSERT -- ⏵⏵ bypass permissions on · 1 shell

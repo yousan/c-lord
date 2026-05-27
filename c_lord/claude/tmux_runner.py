@@ -673,10 +673,9 @@ class TmuxClaudeRunner:
 
             prev_capture_response = response
 
-            # Done: non-empty response has been stable long enough.
-            # Two tiers:
-            #  - Quick exit (3s): response stable AND input prompt visible
-            #    AND not actively generating (no ✻ Running… etc.).
+            # Done: non-empty response has been stable long enough AND Claude is
+            # not actively generating.  Two tiers, both gated on ``not is_gen``:
+            #  - Quick exit (3s): response stable AND input prompt visible.
             #    Without the is_gen check, tool execution pauses (where the
             #    pane is stable for several seconds) would trigger false
             #    completion, posting raw tool-call text instead of Claude's
@@ -684,11 +683,19 @@ class TmuxClaudeRunner:
             #  - Fallback exit (30s): response stable but no input prompt
             #    (Claude may have finished but prompt detection failed,
             #    e.g. completion summary text in the prompt area).
+            # The ``not is_gen`` guard on BOTH tiers is what prevents premature
+            # completion during a long thinking phase: an intermediate response
+            # can sit stable for >30s while Claude keeps working toward (say) an
+            # AskUserQuestion menu.  Finalizing then stops the poll loop, so the
+            # menu that renders later is never bridged and the session stalls
+            # (#179).  While the generation indicator is visible the turn stays
+            # open; the inactivity ``timeout_seconds`` backstop still applies.
             is_gen = self._is_generating(current)
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
-                and ((has_prompt and not is_gen) or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
+                and not is_gen
+                and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
             ):
                 break
 
@@ -1088,14 +1095,18 @@ class TmuxClaudeRunner:
         """Check if Claude is actively generating (thinking/tool indicators visible).
 
         Looks at the bottom 6 lines (which contain TUI chrome) for a generation
-        status indicator that ends with ``…`` (U+2026).  Active indicators
-        like ``✻ Running…`` end with ellipsis; completion summaries like
-        ``✻ Cooked for 56s`` do not.
+        status indicator that contains ``…`` (U+2026).  Active indicators carry
+        the ellipsis — sometimes at the end (``✻ Running…``) and sometimes
+        followed by an elapsed/token suffix (``✽ Generating… (7m 45s · ↑ 23.2k
+        tokens)``) — while completion summaries like ``✻ Cooked for 56s`` have
+        no ellipsis at all.  Matching ``…`` anywhere in the line (not only at
+        the end) is what catches the long-thinking case where the suffix pushed
+        the ellipsis off the end and the turn was wrongly finalized early (#179).
         """
         lines = text.rstrip().splitlines()
         for line in lines[-6:]:
             stripped = line.strip()
-            if _GENERATION_STATUS_RE.match(stripped) and stripped.endswith("…"):
+            if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:
                 return True
         return False
 
