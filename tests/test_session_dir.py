@@ -146,9 +146,7 @@ class TestCreateSessionDir:
         assert result == str(session_dir)
         mock_run.assert_not_called()
 
-    def test_injects_skills_when_flag_enabled(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_injects_skills_when_flag_enabled(self, tmp_path: Path, monkeypatch) -> None:
         """Issue #52: with USE_SKILL_REPLY=true the discord-reply SKILL.md
         is dropped into the freshly cloned session dir."""
         monkeypatch.setenv("USE_SKILL_REPLY", "true")
@@ -169,9 +167,7 @@ class TestCreateSessionDir:
         assert skill.exists(), "discord-reply SKILL.md should be injected"
         assert "987" in skill.read_text()
 
-    def test_reinjects_skills_on_existing_session_dir(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_reinjects_skills_on_existing_session_dir(self, tmp_path: Path, monkeypatch) -> None:
         """When the dir already exists, the skill is still (re)written so
         api_url / api_secret stay in sync with current env values."""
         monkeypatch.setenv("USE_SKILL_REPLY", "true")
@@ -193,9 +189,7 @@ class TestCreateSessionDir:
         assert "http://second:2" in body
         assert "http://first:1" not in body
 
-    def test_skips_inject_when_flag_explicitly_disabled(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_skips_inject_when_flag_explicitly_disabled(self, tmp_path: Path, monkeypatch) -> None:
         """Issue #53: opt-out via USE_SKILL_REPLY=0 stops injection."""
         monkeypatch.setenv("USE_SKILL_REPLY", "0")
         base = str(tmp_path / "sessions")
@@ -212,6 +206,22 @@ class TestCreateSessionDir:
 
         skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
         assert not skill.exists(), "skills must not be injected when explicitly opted out"
+
+    def test_removes_stale_skill_when_disabled(self, tmp_path: Path, monkeypatch) -> None:
+        """jsonl bridge mode (skills disabled): a stale skill injected by a
+        previous skill-mode session is scrubbed so Claude isn't told to POST to
+        the now-dead REST API."""
+        monkeypatch.setenv("USE_SKILL_REPLY", "0")
+        base = str(tmp_path / "sessions")
+        existing = Path(base) / "555"
+        skill_dir = existing / ".claude" / "skills" / "discord-reply"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("stale")
+
+        mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+        mgr.create_session_dir(555)
+
+        assert not skill_dir.exists(), "stale skill must be removed when skills disabled"
 
     def test_injects_skills_by_default(self, tmp_path: Path, monkeypatch) -> None:
         """Issue #53: with the env unset, skill injection is on by default."""
