@@ -88,6 +88,9 @@ Bot 再起動は積極的に行ってよい。新しいコードで Bot を再�
 
 ```bash
 # 1. Bot 再起動
+# 注意: 同一ホストで staging clone (c-lord-parallel-3 等) も動かしている場合、
+# 素の pgrep だと staging も巻き添えで kill される。本番だけ狙うなら venv パスで絞る:
+#   pgrep -f "/home/yousan/c-lord/.venv/bin/python3 -m c_lord.main" | xargs -r kill
 pgrep -f "c_lord.main" | xargs kill 2>/dev/null; sleep 2
 nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &
 
@@ -385,7 +388,8 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 4. **動作確認 (E2E on staging)** ← **必須** — 下記のスキーム
 5. **セルフレビュー** — diff を読み返す / 不要な変更がないか / セキュリティ監査 (`security-audit` skill)
 6. **Merge** (squash + delete branch) — **only after every [Definition of Done](#definition-of-done-dod--single-source-of-truth) box is checked.** A green CI is necessary but not sufficient.
-7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && pgrep -f c_lord.main | xargs -r kill && sleep 3 && nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &`
+7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && pgrep -f "/home/yousan/c-lord/.venv/bin/python3 -m c_lord.main" | xargs -r kill && sleep 3 && nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &`
+   - ⚠️ **本番 venv のパスで絞ること。** 素の `pgrep -f c_lord.main` は staging clone (`c-lord-parallel-3` 等) のプロセスにもマッチするため、本番再起動のつもりで staging を巻き添えで kill してしまう。`/home/yousan/c-lord/.venv` を含むパスで絞れば本番プロセスだけに当たる (staging は `c-lord-parallel-3/.venv` なので除外される)。staging 側の再起動コマンド (下記 [動作確認スキーム](#動作確認スキーム-必須)) が `pgrep -f "c-lord-parallel-3.*c_lord.main"` で絞っているのと同じ要領。
 
 ### 動作確認スキーム (必須)
 
