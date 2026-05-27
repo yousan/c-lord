@@ -196,7 +196,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
 - **Worktree management** — `/worktree-list` shows all active session worktrees with clean/dirty status; `/worktree-cleanup` removes orphaned clean worktrees (supports `dry_run` preview)
-- **Runtime model switching** — `/model-show` displays the current global model and per-thread session model; `/model-set` changes the model for all new sessions without restart
+- **Runtime model switching** — `/model show` displays the current global model and per-thread session model; `/model set` changes the model for all new sessions without restart
 
 ### Security
 - **No shell injection** — `asyncio.create_subprocess_exec` only, never `shell=True`

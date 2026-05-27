@@ -53,7 +53,7 @@ _VALID_MODELS = {"haiku", "sonnet", "opus"}
 _MODEL_CHOICES = [
     app_commands.Choice(name="Haiku 4.5 (fast, cost-effective)", value="haiku"),
     app_commands.Choice(name="Sonnet 4.6 (balanced, default)", value="sonnet"),
-    app_commands.Choice(name="Opus 4.6 (powerful, deep reasoning)", value="opus"),
+    app_commands.Choice(name="Opus 4.7 (powerful, deep reasoning)", value="opus"),
 ]
 
 
@@ -96,7 +96,12 @@ class SessionManageCog(commands.Cog):
 
     # ── Model commands ────────────────────────────────────────────────────────
 
-    @app_commands.command(name="model-show", description="Show the current Claude model")
+    model_group = app_commands.Group(
+        name="model",
+        description="View and change the Claude model used for new sessions",
+    )
+
+    @model_group.command(name="show", description="Show the current Claude model")
     async def model_show(self, interaction: discord.Interaction) -> None:
         """Display the current global model and, if in a thread, the per-session model."""
         effective_model = await self._get_effective_model()
@@ -117,7 +122,7 @@ class SessionManageCog(commands.Cog):
         else:
             embed.description = (
                 f"**Default model:** `{runner_model}`\n"
-                "*(no override set — use `/model-set` to change)*"
+                "*(no override set — use `/model set` to change)*"
             )
 
         # Per-thread session model (if inside a thread)
@@ -133,9 +138,7 @@ class SessionManageCog(commands.Cog):
         embed.set_footer(text=f"Effective model for new sessions: {effective_model}")
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(
-        name="model-set", description="Change the global Claude model for new sessions"
-    )  # noqa: E501
+    @model_group.command(name="set", description="Change the global Claude model for new sessions")
     @app_commands.describe(model="Model to use for all new Claude sessions")
     @app_commands.choices(model=_MODEL_CHOICES)
     async def model_set(self, interaction: discord.Interaction, model: str) -> None:
