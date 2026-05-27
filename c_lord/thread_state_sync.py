@@ -13,14 +13,14 @@ Every ``poll_interval`` seconds:
    * ``dead``     → no tmux window exists
    * ``pending`` is reserved for explicit external setters and is
      never produced by this loop.
-3. If the state changed (or the volatile window-index moved, or the
+3. If the state changed (or the work{N} window number changed, or the
    topic is set), build the new thread name with
    :func:`thread_name.build_name` and rename the Discord thread
    when it differs from the current name. Minimises API calls.
 
 The loop deliberately never touches the ``topic`` body — that is
 the user-visible stable identity. Only the leading status emoji and
-the trailing ``W<N> │`` window-index hint are kept fresh.
+the leading ``W<N> │`` work-number hint are kept fresh.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 import discord
 
 from .thread_name import build_name
+from .tmux import parse_work_number
 
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
@@ -268,18 +269,18 @@ class ThreadStateSyncLoop:
 
         if window_info is not None:
             window_id = window_info["window_id"] or None
-            idx_str = window_info.get("window_index") or ""
-            window_index: int | None = int(idx_str) if idx_str.isdigit() else None
 
             # Detect fine-grained lamp state from pane content (#120).
             session_name = window_info.get("session_name", "")
             window_name = window_info.get("window_name", "")
+            # W<N> follows the stable work{N} name, not the volatile window_index.
+            window_number: int | None = parse_work_number(window_name)
             pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
             new_state = _pane_lamp_state(pane_text)
         else:
             new_state = "dead"
             window_id = record.tmux_window_id
-            window_index = None
+            window_number = None
 
         # Persist state and window-id changes.
         if record.state != new_state:
@@ -291,7 +292,7 @@ class ThreadStateSyncLoop:
         if not record.topic:
             return
 
-        new_name = build_name(record.topic, new_state, window_index)
+        new_name = build_name(record.topic, new_state, window_number)
 
         # Fetch the Discord thread and rename if different.
         try:

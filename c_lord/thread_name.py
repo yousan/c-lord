@@ -2,8 +2,8 @@
 
 Format::
 
-    <status_emoji> W<window_index> │ <topic>   (running/waiting/error, with window)
-    <status_emoji> <topic>                      (dead, or no window index)
+    <status_emoji> W<work_number> │ <topic>   (running/waiting/error, with window)
+    <status_emoji> <topic>                     (dead, or no window number)
 
 Examples::
 
@@ -61,19 +61,22 @@ _NO_PREFIX_STATES = frozenset({"dead"})
 def build_name(
     topic: str,
     state: str,
-    tmux_window_index: int | None,
+    window_number: int | None,
 ) -> str:
     """Build a thread name from its parts, capped at 30 characters.
 
-    Format: ``<emoji> W<N> │ <topic>`` when running/waiting/error with a window index.
-    Drops the work prefix for dead state or when window index is unknown.
+    ``window_number`` is the ``N`` from the tmux ``work{N}`` window name (a
+    stable identifier), not tmux's volatile ``#{window_index}``.
+
+    Format: ``<emoji> W<N> │ <topic>`` when running/waiting/error with a window number.
+    Drops the work prefix for dead state or when the window number is unknown.
     Unknown ``state`` falls back to the ``alive``/🟢 emoji.
     When the combination is too long, only the topic is truncated.
     """
     emoji = STATUS_EMOJI.get(state, STATUS_EMOJI["alive"])
 
-    if state not in _NO_PREFIX_STATES and tmux_window_index is not None:
-        fixed = f"{emoji} W{tmux_window_index} │ "
+    if state not in _NO_PREFIX_STATES and window_number is not None:
+        fixed = f"{emoji} W{window_number} │ "
     else:
         fixed = f"{emoji} "
 
