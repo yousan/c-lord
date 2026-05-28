@@ -541,6 +541,81 @@ class TestRecoverMissedPaneAsk:
             if isinstance(content, str):
                 assert "discord-reply" not in content
 
+    @pytest.mark.asyncio
+    async def test_open_menu_bridged_in_jsonl_mode(
+        self, thread: MagicMock, repo: MagicMock, monkeypatch
+    ) -> None:
+        """#222: post-turn menu recovery must run in jsonl bridge mode too.
+
+        The menu is read from the pane, independent of the skill-reply path, so
+        gating it behind skills_enabled() (False in jsonl = production's mode)
+        left prod never recovering a post-turn menu — the user saw no choices.
+        """
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.run = self._make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
+            ]
+        )
+        pending = AskQuestion(
+            question="Which environment?",
+            header="Deploy",
+            options=[AskOption(label="Production", description="本番")],
+        )
+        runner.peek_pending_ask = AsyncMock(return_value=pending)
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_open_menu_bridged_even_after_reply(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """#222: a follow-up menu rendered AFTER discord-reply was called must
+        still be recovered — was_replied_since must not gate menu recovery."""
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import record_reply, reset_tracker
+
+        reset_tracker()
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+
+        async def gen_with_reply(*args, **kwargs):
+            yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
+            record_reply(thread.id)
+            yield StreamEvent(
+                message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"
+            )
+
+        runner.run = gen_with_reply
+        pending = AskQuestion(
+            question="Which environment?",
+            header="Deploy",
+            options=[AskOption(label="Production", description="本番")],
+        )
+        runner.peek_pending_ask = AsyncMock(return_value=pending)
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_awaited_once()
+
 
 class TestMakeErrorEmbed:
     """Unit tests for the _make_error_embed router function."""
