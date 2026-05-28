@@ -1157,6 +1157,74 @@ class TestStartSessionCommand:
         cog.spawn_session.assert_called_once_with(channel, "hello")
 
 
+class TestClordTextCommand:
+    """!clord mirrors /clord but is invokable from webhooks (E2E)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_prompt_shows_usage(self) -> None:
+        cog = _make_cog()
+        ctx = _make_channel_ctx()
+        await cog.clord_text.callback(cog, ctx, prompt=None)
+        ctx.send.assert_called_once()
+        assert "Usage" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_rejected(self) -> None:
+        bot = MagicMock()
+        bot.channel_id = 999
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111})
+        ctx = _make_channel_ctx()  # author.id = 1, not in {111}
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+        ctx.send.assert_called_once()
+        assert "not authorized" in ctx.send.call_args.args[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_channel_spawns_session(self) -> None:
+        cc = _make_channel_cog_mock(tmux_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
+        ctx = _make_channel_ctx()
+        ctx.channel.id = 999
+        thread = MagicMock(spec=discord.Thread)
+        thread.mention = "<#12345>"
+        cog.spawn_session = AsyncMock(return_value=thread)
+
+        await cog.clord_text.callback(cog, ctx, prompt="build a feature")
+
+        cog.spawn_session.assert_called_once_with(ctx.channel, "build a feature")
+        assert "<#12345>" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_thread_continues_session(self) -> None:
+        cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
+        ctx = _make_thread_ctx(thread_id=555, parent_id=999)
+        ctx.channel.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        record = MagicMock()
+        record.session_id = "sess-abc"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog._run_claude = AsyncMock()
+
+        await cog.clord_text.callback(cog, ctx, prompt="continue this")
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs["session_id"] == "sess-abc"
+        assert kwargs["prompt"] == "continue this"
+
+    @pytest.mark.asyncio
+    async def test_unbound_channel_rejected(self) -> None:
+        cc = _make_channel_cog_mock()  # both managers None
+        cog = _make_cog(channel_cog=cc)
+        ctx = _make_channel_ctx()
+        ctx.channel.id = 4242
+        cog.spawn_session = AsyncMock()
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        cog.spawn_session.assert_not_called()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+
 class TestAttachWindowCommand:
     """/clord-attach slash command tests."""
 
