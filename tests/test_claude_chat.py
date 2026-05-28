@@ -167,6 +167,101 @@ class TestStopCommand:
         assert embed.color.value == 0xFFA500
 
 
+def _make_thread_ctx(thread_id: int = 12345, parent_id: int | None = None) -> MagicMock:
+    """Return a mocked commands.Context whose channel is a discord.Thread."""
+    ctx = MagicMock()
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
+    thread.parent_id = parent_id
+    ctx.channel = thread
+    ctx.send = AsyncMock()
+    ctx.author = MagicMock()
+    ctx.author.id = 1
+    return ctx
+
+
+def _make_channel_ctx() -> MagicMock:
+    """Return a mocked commands.Context whose channel is NOT a thread."""
+    ctx = MagicMock()
+    ctx.channel = MagicMock(spec=discord.TextChannel)
+    ctx.send = AsyncMock()
+    ctx.author = MagicMock()
+    ctx.author.id = 1
+    return ctx
+
+
+class TestStopTextCommand:
+    """!stop mirrors /stop but is invokable from webhooks (E2E)."""
+
+    @pytest.mark.asyncio
+    async def test_outside_thread(self) -> None:
+        cog = _make_cog()
+        ctx = _make_channel_ctx()
+        await cog.stop_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_active_runner(self) -> None:
+        cog = _make_cog()
+        ctx = _make_thread_ctx(thread_id=12345)
+        await cog.stop_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_calls_runner_interrupt(self) -> None:
+        cog = _make_cog()
+        ctx = _make_thread_ctx(thread_id=12345)
+        mock_runner = MagicMock()
+        mock_runner.interrupt = AsyncMock()
+        cog._active_runners[12345] = mock_runner
+        await cog.stop_text.callback(cog, ctx)
+        mock_runner.interrupt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_does_not_delete_session(self) -> None:
+        cog = _make_cog()
+        ctx = _make_thread_ctx(thread_id=12345)
+        mock_runner = MagicMock()
+        mock_runner.interrupt = AsyncMock()
+        cog._active_runners[12345] = mock_runner
+        await cog.stop_text.callback(cog, ctx)
+        cog.repo.delete.assert_not_called()
+
+
+class TestClearTextCommand:
+    """!clear mirrors /clear but is invokable from webhooks (E2E)."""
+
+    @pytest.mark.asyncio
+    async def test_outside_thread(self) -> None:
+        cog = _make_cog()
+        ctx = _make_channel_ctx()
+        await cog.clear_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resets_session(self) -> None:
+        cog = _make_cog()
+        cog.repo.reset = AsyncMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        ctx = _make_thread_ctx(thread_id=12345)
+        await cog.clear_text.callback(cog, ctx)
+        cog.repo.reset.assert_called_once_with(12345)
+        ctx.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kills_active_runner(self) -> None:
+        cog = _make_cog()
+        cog.repo.reset = AsyncMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        ctx = _make_thread_ctx(thread_id=12345)
+        mock_runner = MagicMock()
+        mock_runner.kill = AsyncMock()
+        cog._active_runners[12345] = mock_runner
+        await cog.clear_text.callback(cog, ctx)
+        mock_runner.kill.assert_called_once()
+        assert 12345 not in cog._active_runners
+
+
 class TestActiveCountAlias:
     """Tests for ClaudeChatCog.active_count (DrainAware alias)."""
 

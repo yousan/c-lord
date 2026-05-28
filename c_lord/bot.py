@@ -45,7 +45,10 @@ class ClaudeDiscordBot(commands.Bot):
         intents.guilds = True
 
         super().__init__(
-            command_prefix="!",
+            # Accept both "!cmd" and "@bot cmd" so the text-command twins of the
+            # slash commands (#209) can be triggered by a mention as well as the
+            # "!" prefix.  E2E/webhook tests use "!"; humans can use either.
+            command_prefix=commands.when_mentioned_or("!"),
             intents=intents,
         )
         self.channel_id = channel_id

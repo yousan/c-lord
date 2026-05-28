@@ -599,3 +599,74 @@ class TestPerChannelResolution:
         interaction.followup.send.assert_called_once()
         msg = interaction.followup.send.call_args.args[0]
         assert "/clord-init" in msg
+
+
+# ---------------------------------------------------------------------------
+# !skill text/mention twin (E2E-testable via webhook)
+# ---------------------------------------------------------------------------
+
+
+def _make_ctx(channel: MagicMock | None = None, author_id: int = 1) -> MagicMock:
+    """Return a mocked commands.Context for the !skill text twin."""
+    ctx = MagicMock()
+    ctx.send = AsyncMock()
+    ctx.author = MagicMock()
+    ctx.author.id = author_id
+    if channel is not None:
+        ctx.channel = channel
+    else:
+        ctx.channel = MagicMock(spec=discord.TextChannel)
+    return ctx
+
+
+class TestSkillTextCommand:
+    """The !skill text command mirrors /skill but is invokable from webhooks."""
+
+    @pytest.mark.asyncio
+    async def test_missing_name_shows_usage(self) -> None:
+        cog = _make_cog(skills=[])
+        ctx = _make_ctx()
+        await cog.run_skill_text.callback(cog, ctx, name=None, args=None)
+        ctx.send.assert_called_once()
+        assert "Usage" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user(self) -> None:
+        cog = _make_cog(allowed_user_ids={42})
+        ctx = _make_ctx(author_id=99)
+        await cog.run_skill_text.callback(cog, ctx, name="test", args=None)
+        ctx.send.assert_called_once()
+        assert "permission" in ctx.send.call_args.args[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_invalid_skill_name(self) -> None:
+        cog = _make_cog(skills=[])
+        ctx = _make_ctx()
+        await cog.run_skill_text.callback(cog, ctx, name="bad;name", args=None)
+        assert "Invalid" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_skill_not_found(self) -> None:
+        cog = _make_cog(skills=[{"name": "existing", "description": ""}])
+        ctx = _make_ctx()
+        await cog.run_skill_text.callback(cog, ctx, name="missing", args=None)
+        assert "not found" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_in_thread_runs_with_prompt_and_args(self) -> None:
+        cog = _make_cog(skills=[{"name": "recall", "description": ""}])
+        cog._resolve_tmux_manager = AsyncMock(return_value=MagicMock())
+        cog._resolve_session_dir_manager = AsyncMock(return_value=MagicMock())
+        cog._make_runner = MagicMock(return_value=MagicMock())
+        thread = _make_thread(thread_id=5555, parent_id=999)
+        ctx = _make_ctx(channel=thread)
+        cog.repo.get = AsyncMock(return_value=None)
+
+        with patch(
+            "c_lord.cogs.skill_command.run_claude_with_config", new_callable=AsyncMock
+        ) as mock_run:
+            await cog.run_skill_text.callback(cog, ctx, name="recall", args="filter today")
+            config = mock_run.call_args[0][0]
+            assert config.prompt == "/recall filter today"
+            assert config.thread is thread
+            assert config.session_id is None
