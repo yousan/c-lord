@@ -138,6 +138,35 @@ def test_readonly_info_twins_via_webhook(
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize(
+    "command",
+    ["!clord-init", "!clord-thread-init", "!model-set"],
+)
+def test_config_twins_non_mutating_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+    command: str,
+) -> None:
+    """Config twins fire from a webhook (non-mutating forms: show / usage)."""
+    # Bare forms don't change state: clord-init/-thread-init "show", model-set "usage".
+    seed = discord_client.create_seed_message(f"[E2E] {command} test")
+    thread = discord_client.create_thread(seed["id"], f"E2E: {command}")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post(command, thread_id=thread_id)
+
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, f"Bot did not reply to {command} within 30s"
+    assert reply["content"] or reply.get("embeds"), f"Bot reply to {command} was empty"
+
+
+@pytest.mark.e2e
 def test_mention_prefix_via_webhook(
     discord_client: DiscordE2EClient,
     bot_id: str,

@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,9 @@ from ..session_dir import SessionDirManager
 from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Posts a reply for either a slash interaction or a !text twin (#209 follow-up).
+_Responder = Callable[..., Awaitable[None]]
 
 
 class ChannelRepoCog(commands.Cog):
@@ -158,9 +162,78 @@ class ChannelRepoCog(commands.Cog):
             return False  # DM — no role info
         return self._allowed_user_ids is None
 
+    # Lets clord-init / clord-thread-init run from a slash interaction or a
+    # !text twin without duplicating the body (#209 follow-up).
+    @staticmethod
+    def _slash_respond(interaction: discord.Interaction) -> _Responder:
+        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        return respond
+
+    @staticmethod
+    def _ctx_respond(ctx: commands.Context) -> _Responder:
+        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
+            await ctx.send(content or "")
+
+        return respond
+
     # ------------------------------------------------------------------
     # Slash command
     # ------------------------------------------------------------------
+
+    async def _clord_init_impl(
+        self,
+        *,
+        channel_id: int | None,
+        user: discord.Member | discord.User,
+        repo: str | None,
+        remove: bool,
+        respond: _Responder,
+    ) -> None:
+        """Shared core for /clord-init and !clord-init (#209 follow-up)."""
+        if not self._is_allowed(user):
+            await respond("You are not authorized to use this command.", ephemeral=True)
+            return
+
+        assert channel_id is not None
+
+        # --- Remove binding ---
+        if remove:
+            deleted = await self._repo.delete(channel_id)
+            self.evict_cache(channel_id)
+            if deleted:
+                await respond(f"Removed repository binding for <#{channel_id}>.", ephemeral=True)
+            else:
+                await respond("No binding found for this channel.", ephemeral=True)
+            return
+
+        # --- Show bindings (no args) ---
+        if repo is None:
+            channel_bindings = await self._repo.list_all()
+            thread_bindings = (
+                await self._thread_repo.list_all() if self._thread_repo is not None else []
+            )
+            if not channel_bindings and not thread_bindings:
+                await respond("No channel-repo bindings configured.", ephemeral=True)
+                return
+
+            lines = []
+            for b in channel_bindings:
+                tmux_name = derive_session_name(b["source_repo"])
+                lines.append(f"<#{b['channel_id']}> → `{b['source_repo']}` (tmux: `{tmux_name}`)")
+            for b in thread_bindings:
+                ch_ref = f" (channel <#{b['channel_id']}>)" if b.get("channel_id") else ""
+                lines.append(f"  thread <#{b['thread_id']}>{ch_ref} → `{b['source_repo']}`")
+            await respond("\n".join(lines), ephemeral=True)
+            return
+
+        # --- Bind channel to repo ---
+        await self._repo.save(channel_id=channel_id, source_repo=repo)
+        self.evict_cache(channel_id)
+
+        tmux_display = derive_session_name(repo)
+        await respond(f"Bound <#{channel_id}> → `{repo}` (tmux: `{tmux_display}`)", ephemeral=True)
 
     @app_commands.command(
         name="clord-init",
@@ -178,59 +251,100 @@ class ChannelRepoCog(commands.Cog):
         remove: bool = False,
     ) -> None:
         """Bind / unbind / show channel-repo bindings."""
-        if not self._is_allowed(interaction.user):
-            await interaction.response.send_message(
-                "You are not authorized to use this command.", ephemeral=True
-            )
+        await self._clord_init_impl(
+            channel_id=interaction.channel_id,
+            user=interaction.user,
+            repo=repo,
+            remove=remove,
+            respond=self._slash_respond(interaction),
+        )
+
+    @commands.command(name="clord-init")
+    async def clord_init_text(self, ctx: commands.Context, arg: str | None = None) -> None:
+        """Text/mention twin of /clord-init — webhook-invokable for E2E (#209).
+
+        Usage: ``!clord-init`` (show) / ``!clord-init <repo-url>`` (bind) /
+        ``!clord-init remove`` (unbind this channel).
+        Gated by ``_is_allowed`` only (no Discord Manage-Server check, unlike the
+        slash command), so restrict the allowlist in production accordingly.
+        """
+        repo: str | None = None
+        remove = False
+        if arg == "remove":
+            remove = True
+        elif arg:
+            repo = arg
+        await self._clord_init_impl(
+            channel_id=ctx.channel.id,
+            user=ctx.author,
+            repo=repo,
+            remove=remove,
+            respond=self._ctx_respond(ctx),
+        )
+
+    async def _clord_thread_init_impl(
+        self,
+        *,
+        thread_id: int | None,
+        channel: object,
+        client: discord.Client,
+        user: discord.Member | discord.User,
+        repo: str | None,
+        remove: bool,
+        respond: _Responder,
+    ) -> None:
+        """Shared core for /clord-thread-init and !clord-thread-init (#209 follow-up)."""
+        if not self._is_allowed(user):
+            await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
-        channel_id = interaction.channel_id
-        assert channel_id is not None
+        if self._thread_repo is None:
+            await respond("Thread-level bindings are not enabled on this bot.", ephemeral=True)
+            return
+
+        assert thread_id is not None
+        channel_id = channel.parent_id if isinstance(channel, discord.Thread) else thread_id
 
         # --- Remove binding ---
         if remove:
-            deleted = await self._repo.delete(channel_id)
-            self.evict_cache(channel_id)
+            deleted = await self._thread_repo.delete(thread_id)
+            self.evict_thread_cache(thread_id)
             if deleted:
-                await interaction.response.send_message(
-                    f"Removed repository binding for <#{channel_id}>.", ephemeral=True
+                await respond(
+                    f"Removed thread repository binding for <#{thread_id}>.", ephemeral=True
                 )
             else:
-                await interaction.response.send_message(
-                    "No binding found for this channel.", ephemeral=True
-                )
+                await respond("No thread binding found.", ephemeral=True)
             return
 
-        # --- Show bindings (no args) ---
+        # --- Show current thread binding (no args) ---
         if repo is None:
-            channel_bindings = await self._repo.list_all()
-            thread_bindings = (
-                await self._thread_repo.list_all() if self._thread_repo is not None else []
-            )
-            if not channel_bindings and not thread_bindings:
-                await interaction.response.send_message(
-                    "No channel-repo bindings configured.", ephemeral=True
+            binding = await self._thread_repo.get(thread_id)
+            if binding is None:
+                await respond("No thread-level binding for this thread.", ephemeral=True)
+            else:
+                await respond(f"Thread <#{thread_id}> → `{binding['source_repo']}`", ephemeral=True)
+            return
+
+        # --- Access check: verify bot can read the thread's parent channel ---
+        bot_channel = client.get_channel(channel_id)
+        if bot_channel is None:
+            try:
+                await client.fetch_channel(channel_id)
+            except discord.Forbidden:
+                await respond(
+                    f"⚠️ Bot がこのスレッドの親チャンネル (<#{channel_id}>) にアクセスできません。\n"
+                    "先に Bot をそのチャンネルに追加してください。",
+                    ephemeral=True,
                 )
                 return
+            except discord.HTTPException:
+                pass  # 他のエラーは無視してbindを続行
 
-            lines = []
-            for b in channel_bindings:
-                tmux_name = derive_session_name(b["source_repo"])
-                lines.append(f"<#{b['channel_id']}> → `{b['source_repo']}` (tmux: `{tmux_name}`)")
-            for b in thread_bindings:
-                ch_ref = f" (channel <#{b['channel_id']}>)" if b.get("channel_id") else ""
-                lines.append(f"  thread <#{b['thread_id']}>{ch_ref} → `{b['source_repo']}`")
-            await interaction.response.send_message("\n".join(lines), ephemeral=True)
-            return
-
-        # --- Bind channel to repo ---
-        await self._repo.save(channel_id=channel_id, source_repo=repo)
-        self.evict_cache(channel_id)
-
-        tmux_display = derive_session_name(repo)
-        await interaction.response.send_message(
-            f"Bound <#{channel_id}> → `{repo}` (tmux: `{tmux_display}`)", ephemeral=True
-        )
+        # --- Bind thread to repo ---
+        await self._thread_repo.save(thread_id=thread_id, source_repo=repo, channel_id=channel_id)
+        self.evict_thread_cache(thread_id)
+        await respond(f"Bound thread <#{thread_id}> → `{repo}`", ephemeral=True)
 
     @app_commands.command(
         name="clord-thread-init",
@@ -248,69 +362,35 @@ class ChannelRepoCog(commands.Cog):
         remove: bool = False,
     ) -> None:
         """Bind / unbind a thread-level repo override."""
-        if not self._is_allowed(interaction.user):
-            await interaction.response.send_message(
-                "You are not authorized to use this command.", ephemeral=True
-            )
-            return
-
-        if self._thread_repo is None:
-            await interaction.response.send_message(
-                "Thread-level bindings are not enabled on this bot.", ephemeral=True
-            )
-            return
-
-        thread_id = interaction.channel_id
-        assert thread_id is not None
-        channel_id = (
-            interaction.channel.parent_id
-            if isinstance(interaction.channel, discord.Thread)
-            else thread_id
+        await self._clord_thread_init_impl(
+            thread_id=interaction.channel_id,
+            channel=interaction.channel,
+            client=interaction.client,
+            user=interaction.user,
+            repo=repo,
+            remove=remove,
+            respond=self._slash_respond(interaction),
         )
 
-        # --- Remove binding ---
-        if remove:
-            deleted = await self._thread_repo.delete(thread_id)
-            self.evict_thread_cache(thread_id)
-            if deleted:
-                await interaction.response.send_message(
-                    f"Removed thread repository binding for <#{thread_id}>.", ephemeral=True
-                )
-            else:
-                await interaction.response.send_message("No thread binding found.", ephemeral=True)
-            return
+    @commands.command(name="clord-thread-init")
+    async def clord_thread_init_text(self, ctx: commands.Context, arg: str | None = None) -> None:
+        """Text/mention twin of /clord-thread-init — webhook-invokable for E2E (#209).
 
-        # --- Show current thread binding (no args) ---
-        if repo is None:
-            binding = await self._thread_repo.get(thread_id)
-            if binding is None:
-                await interaction.response.send_message(
-                    "No thread-level binding for this thread.", ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"Thread <#{thread_id}> → `{binding['source_repo']}`", ephemeral=True
-                )
-            return
-
-        # --- Access check: verify bot can read the thread's parent channel ---
-        bot_channel = interaction.client.get_channel(channel_id)
-        if bot_channel is None:
-            try:
-                await interaction.client.fetch_channel(channel_id)
-            except discord.Forbidden:
-                await interaction.response.send_message(
-                    f"⚠️ Bot がこのスレッドの親チャンネル (<#{channel_id}>) にアクセスできません。\n"
-                    "先に Bot をそのチャンネルに追加してください。",
-                    ephemeral=True,
-                )
-                return
-            except discord.HTTPException:
-                pass  # 他のエラーは無視してbindを続行
-
-        # --- Bind thread to repo ---
-        await self._thread_repo.save(thread_id=thread_id, source_repo=repo, channel_id=channel_id)
-        self.evict_thread_cache(thread_id)
-        await interaction.response.send_message(
-            f"Bound thread <#{thread_id}> → `{repo}`", ephemeral=True
+        Usage: ``!clord-thread-init`` (show) / ``!clord-thread-init <repo>`` (bind) /
+        ``!clord-thread-init remove``. Gated by ``_is_allowed`` only.
+        """
+        repo: str | None = None
+        remove = False
+        if arg == "remove":
+            remove = True
+        elif arg:
+            repo = arg
+        await self._clord_thread_init_impl(
+            thread_id=ctx.channel.id,
+            channel=ctx.channel,
+            client=ctx.bot,
+            user=ctx.author,
+            repo=repo,
+            remove=remove,
+            respond=self._ctx_respond(ctx),
         )
