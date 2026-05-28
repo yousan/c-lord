@@ -83,6 +83,28 @@ def reply_to_trigger_enabled() -> bool:
     return os.getenv("CLORD_REPLY_TO_TRIGGER", "1").strip().lower() not in ("0", "false", "no")
 
 
+def idle_flush_seconds() -> float:
+    """Return the idle-flush window from ``CLORD_MIRROR_IDLE_FLUSH_SECONDS``.
+
+    In ``minimal`` mode the final assistant text is normally flushed (as a
+    pinging reply) when a turn-end marker is seen.  Current Claude Code builds
+    no longer emit ``result`` and do not reliably emit ``system/turn_duration``
+    (Issue #218), so this idle window is a marker-agnostic safety net: when a
+    pending final answer is held and no new JSONL event arrives within this many
+    seconds, it is flushed as the final reply.  Defaults to ``8.0``.
+    """
+    raw = os.getenv("CLORD_MIRROR_IDLE_FLUSH_SECONDS", "8").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 8.0
+
+
+# Module-level alias so ``TranscriptMirror.__init__`` can read the env default
+# without the ``idle_flush_seconds`` constructor parameter shadowing the helper.
+idle_flush_seconds_env = idle_flush_seconds
+
+
 def _is_turn_end(event: dict) -> bool:
     """Return True for JSONL events that signal the end of a Claude turn.
 
@@ -120,6 +142,7 @@ class TranscriptMirror:
         reply_cursor_sink: Sink | None = None,
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
+        idle_flush_seconds: float | None = None,
     ) -> None:
         self.thread_id = thread_id
         self.project_dir = project_dir
@@ -132,6 +155,9 @@ class TranscriptMirror:
         self._reply_cursor_sink = reply_cursor_sink
         self._verbosity = verbosity
         self._poll_interval = poll_interval
+        self._idle_flush_seconds = (
+            idle_flush_seconds if idle_flush_seconds is not None else idle_flush_seconds_env()
+        )
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -202,8 +228,46 @@ class TranscriptMirror:
             _pending_text = None
             _pending_progress = []
 
-        try:
+        # Drive the tail through a queue so the consumer can apply an idle
+        # timeout (Issue #218) without cancelling the tail generator: a bare
+        # ``async for`` blocks indefinitely between events, leaving no chance to
+        # flush a pending final answer when no turn-end marker is emitted.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _producer() -> None:
             async for event in tail_events(self.project_dir, poll_interval=self._poll_interval):
+                await queue.put(event)
+
+        producer = asyncio.create_task(_producer(), name=f"transcript-tail-{self.thread_id}")
+        idle_timeout = (
+            self._idle_flush_seconds
+            if self._idle_flush_seconds and self._idle_flush_seconds > 0
+            else None
+        )
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
+                # asyncio.TimeoutError is a distinct class from builtin
+                # TimeoutError on Python 3.10 (merged only in 3.11); the project
+                # supports 3.10, so the aliased form is required for correctness.
+                except asyncio.TimeoutError:  # noqa: UP041
+                    # Idle: no new JSONL event within the window. Flush any held
+                    # final answer as a pinging reply — independent of whether a
+                    # ``result`` / ``turn_duration`` marker was ever written.
+                    if self._verbosity == "minimal" and _pending_text is not None:
+                        logger.info(
+                            "TranscriptMirror idle-flush: thread=%d "
+                            "(final answer with no turn-end marker within %.1fs)",
+                            self.thread_id,
+                            idle_timeout,
+                        )
+                        await _flush_pending_as_reply()
+                        # Record delivery (Issue #215) so a restart does not
+                        # re-post this idle-flushed final answer.
+                        await _commit_cursor()
+                    continue
+
                 if self._verbosity == "minimal" and _is_turn_end(event):
                     # Turn boundary: flush pending as the final reply.
                     await _flush_pending_as_reply()
@@ -241,6 +305,9 @@ class TranscriptMirror:
         except asyncio.CancelledError:
             pass
         finally:
+            producer.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await producer
             if self._verbosity == "minimal":
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _flush_pending_as_reply()

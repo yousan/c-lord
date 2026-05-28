@@ -707,3 +707,102 @@ async def test_reply_cursor_sink_records_final_uuid_on_turn_end(tmp_path: Path) 
         await mirror.stop()
 
     assert cursor == ["u-final"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #218: idle flush — final answer must ping even when turn_duration is
+# absent (current Claude Code builds no longer emit `result` and do not
+# reliably emit `system/turn_duration`).
+# ---------------------------------------------------------------------------
+
+
+def test_idle_flush_seconds_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from c_lord.transcript.mirror import idle_flush_seconds
+
+    monkeypatch.delenv("CLORD_MIRROR_IDLE_FLUSH_SECONDS", raising=False)
+    assert idle_flush_seconds() == 8.0
+
+    monkeypatch.setenv("CLORD_MIRROR_IDLE_FLUSH_SECONDS", "3")
+    assert idle_flush_seconds() == 3.0
+
+
+async def test_minimal_idle_flush_pings_without_turn_duration(tmp_path: Path) -> None:
+    """A final assistant_text with no turn_duration must be flushed to the
+    reply_sink (ping path) after the idle window — before stop() is called."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    silent: list[str] = []
+    replies: list[str] = []
+
+    async def sink(text: str) -> None:
+        silent.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replies.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=7,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.2,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(jsonl, _assistant_text("FINAL ANSWER"))
+        # No turn_duration / result follows. Wait past the idle threshold.
+        await asyncio.sleep(0.6)
+        # Assert BEFORE stop(): the idle flush must have fired live, not at stop.
+        assert any("FINAL ANSWER" in r for r in replies), (replies, silent)
+    finally:
+        await mirror.stop()
+
+
+async def test_minimal_idle_does_not_prematurely_flush_intermediate_text(
+    tmp_path: Path,
+) -> None:
+    """assistant_text immediately followed by a tool_use (within the idle
+    window) must NOT be flushed as a reply — it is intermediate narration."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    replies: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        replies.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=8,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.5,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(jsonl, _assistant_text("working on it"))
+        await asyncio.sleep(0.1)  # well within idle window
+        _write_event(jsonl, _assistant_tool_use())
+        await asyncio.sleep(0.1)
+        # Intermediate text must not have been flushed as a reply (no ping).
+        assert not any("working on it" in r for r in replies), replies
+    finally:
+        await mirror.stop()
