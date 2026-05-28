@@ -30,6 +30,8 @@ class SessionRecord:
     topic_source: str | None = None
     # Issue #115: trigger message for reply threading
     trigger_message_id: int | None = None
+    # Issue #215: uuid of the last final answer the mirror delivered
+    mirror_replied_uuid: str | None = None
 
 
 class SessionRepository:
@@ -175,6 +177,19 @@ class SessionRepository:
             await db.execute(
                 "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
                 (message_id, thread_id),
+            )
+            await db.commit()
+
+    async def set_mirror_replied_uuid(self, thread_id: int, uuid: str) -> None:
+        """Persist the uuid of the last final answer the mirror delivered.
+
+        Used by TranscriptMirror (live) and TranscriptMirrorCog (restart
+        recovery) to dedupe re-delivery of a dropped final answer (Issue #215).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET mirror_replied_uuid = ? WHERE thread_id = ?",
+                (uuid, thread_id),
             )
             await db.commit()
 

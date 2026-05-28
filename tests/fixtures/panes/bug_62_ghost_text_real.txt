@@ -1,0 +1,39 @@
+env -u CLAUDECODE claude --model sonnet --dangerously-skip-permissions
+[oh-my-zsh] plugin 'zsh-syntax-highlighting' not found
+No GitHub token for homebrew found.
+Go to https://github.com/settings/tokens and create token with public_repo scope.
+No OPENAI token for homebrew found.
+/home/yousan/.zshrc:236: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:244: command not found: phpenv
+/home/yousan/.zshrc:247: command not found: nodenv
+/home/yousan/.zshrc:297: command not found: direnv
+
+[38;5;21myousan[39m @ [38;5;158mtachikoma1.l2tporg[39m in [38;5;118m/tmp/ghost-repro2[39m ([38;5;81mmaster[39m) 
+$ env -u CLAUDECODE claude --model sonnet --dangerously-skip-permissions
+[38;5;174m╭───[39m [38;5;174mClaude[39m [38;5;174mCode[39m [38;5;246mv2.1.152[39m [38;5;174m───────────────────────────────────────────────────────────────────────────────────╮
+│[39m                                                    [2m[38;5;174m│[0m [1m[38;5;174mTips[0m [1m[38;5;174mfor[0m [1m[38;5;174mgetting[0m [1m[38;5;174mstarted[0m                              [38;5;174m│
+│[39m                [1mWelcome[0m [1mback[0m [1mYousan![0m                [2m[38;5;174m│[0m Run /init to create a CLAUDE.md file with instructio… [38;5;174m│
+│[39m                                                    [2m[38;5;174m│[0m [38;5;174m─────────────────────────────────────────────────────[39m [38;5;174m│
+│[39m                       [38;5;174m▐[48;5;16m▛███▜[49m▌[39m                      [2m[38;5;174m│[0m [1m[38;5;174mWhat's[0m [1m[38;5;174mnew[0m                                            [38;5;174m│
+│[39m                      [38;5;174m▝▜[48;5;16m█████[49m▛▘[39m                     [2m[38;5;174m│[0m `/code-review --fix` now applies review findings to … [38;5;174m│
+│[39m                        [38;5;174m▘▘[39m [38;5;174m▝▝[39m                       [2m[38;5;174m│[0m Skills and slash commands can now set `disallowed-to… [38;5;174m│
+│[39m     [38;5;246mSonnet[39m [38;5;246m4.6[39m [38;5;246mwith[39m [38;5;246mhigh[39m [38;5;246meffort[39m [38;5;246m·[39m [38;5;246mClaude[39m [38;5;246mMax[39m [38;5;246m·[39m     [2m[38;5;174m│[0m Added `/reload-skills` command to re-scan skill dire… [38;5;174m│
+│[39m     [38;5;246muser@example.com's[39m [38;5;246mOrganization[39m                [2m[38;5;174m│[0m [3m[38;5;246m/release-notes[0m [3m[38;5;246mfor[0m [3m[38;5;246mmore[0m                               [38;5;174m│
+│[39m                  [38;5;246m/tmp/ghost-repro2[39m                 [2m[38;5;174m│[0m                                                       [38;5;174m│
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [7mT[0;2mry "create a util logging.py that..."[0m                                                                      
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;231m[48;5;131m Model: Sonnet 4.6 [38;5;16m[48;5;220m v2.1.152 [38;5;231m[48;5;68m Style: default [38;5;16m[48;5;108m Ctx: 0 [48;5;176m Context: [░░░░░░░░░░░░░░░░] 0k/200k (0%) [38;5;231m[48;5;131m Ctx U...[39m[49m  
+  [38;5;231m[48;5;131m Cost: $0.00 [38;5;16m[48;5;220m Session: 45.0% [38;5;231m[48;5;68m Weekly: 47.0% [38;5;16m[48;5;108m Session: <1m [48;5;176m Reset: 2hr 38m [38;5;231m[48;5;131m Weekly Reset: 2d 5hr 38m [38;5;16m[48;5;220m ...
+[39m[49m  [38;5;231m[48;5;131m ⎇ master [38;5;16m[48;5;220m (+0,-0) [38;5;231m[48;5;68m +0 [38;5;16m[48;5;108m -0 [48;5;176m ghost-repro2 [38;5;231m[48;5;131m 𖠰 main [38;5;16m[48;5;220m cwd: /tmp/ghost-repro2 [38;5;231m[48;5;68m Skill: none 
+[39m[49m  [38;5;246m--[39m [38;5;246mINSERT[39m [38;5;246m--[39m [38;5;211m⏵⏵[39m [38;5;211mbypass[39m [38;5;211mpermissions[39m [38;5;211mon[38;5;246m (shift+tab[39m [38;5;246mto[39m [38;5;246mcycle)[39m [38;5;246m·[39m [38;5;246m←[39m [38;5;246mfor[39m [38;5;246magents
+[39m                                                                                            [38;5;246m●[39m [38;5;246mhigh[39m [38;5;246m·[39m [38;5;246m/effort
+
+
+

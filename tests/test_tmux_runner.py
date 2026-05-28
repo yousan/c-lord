@@ -1385,6 +1385,83 @@ class TestToolExecutionCompletion:
         assert results[0].error is None
 
 
+class TestGeneratingDoesNotCompleteEarly:
+    """Regression for #179: a stable intermediate response while Claude is still
+    generating (the indicator line carries trailing token stats, e.g.
+    ``✽ Generating… (7m 45s · ↑ 23.2k tokens)``) must NOT finalize the turn.
+
+    Incident: the turn finalized while Claude kept working, so the poll loop
+    stopped before a later AskUserQuestion menu rendered — leaving it unbridged
+    and the session stuck with no way to answer from Discord.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generating_with_token_stats_does_not_complete_early(
+        self, runner, tmux_manager
+    ) -> None:
+        tmux_manager.is_claude_running.return_value = True
+
+        # Stable intermediate response + active generation indicator (trailing
+        # stats) + the always-present bare ❯ input box.
+        generating_pane = "\n".join(
+            [
+                "❯ fix the bug",
+                "",
+                "● Analyzing the failure and drafting a fix…",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "✽ Generating… (7m 45s · ↑ 23.2k tokens)",
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        # Claude actually finishes: same response text, generation line gone.
+        done_pane = "\n".join(
+            [
+                "❯ fix the bug",
+                "",
+                "● Analyzing the failure and drafting a fix…",
+                "",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+
+        generating_polls = 12
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= generating_polls:
+                return generating_pane
+            return done_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.05),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 0.1),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("fix the bug"):
+                events.append(event)
+
+        results = [e for e in events if e.message_type == MessageType.RESULT]
+        assert len(results) == 1
+        assert results[0].is_complete is True
+        # The turn must keep polling through the generating phase and finalize
+        # only once the done pane appears.  With the bug, is_gen is False on the
+        # generating pane (indicator does not end with '…'), so the quick-exit
+        # (or fallback) fires early and call_count never exceeds generating_polls.
+        assert tmux_manager.capture_pane.call_count > generating_polls
+
+
 # -- Tests for OSC 8 hyperlink normalization (issue #47) --------------------
 
 
@@ -1755,6 +1832,22 @@ class TestPermissionPromptTailAnchor:
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
 
 
+# -- Regression test for #179 (generating indicator carries trailing stats) ------
+
+
+class TestIsGeneratingWithStats:
+    """Regression for #179: the live generation indicator is rendered as
+    ``✽ Generating… (7m 45s · ↑ 23.2k tokens)`` — the ``…`` is followed by an
+    elapsed/token suffix, so it is NOT at the end of the line.  Detection that
+    only matched ``endswith('…')`` missed it, so c-lord treated an actively
+    generating session as idle and finalized the turn early.
+    """
+
+    def test_generating_with_trailing_token_stats_detected(self) -> None:
+        pane = _load_fixture("bug_179_generating_with_stats.txt")
+        assert TmuxClaudeRunner._is_generating(pane) is True
+
+
 # -- Regression tests for #153 (plan/ask menus flagged as unknown) ---------------
 
 
@@ -1789,25 +1882,69 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
 
 
 class TestGhostTextInputNotFlagged:
-    """Regression for #62: ghost text in the ❯ input area (tmux INSERT mode)
-    must not trigger any detection function.  The pane shows user-typed text
-    in the input zone but no real interactive prompt from Claude.
+    """Regression for #62: a real ``capture-pane -e`` snapshot of the Claude
+    Code TUI showing ghost/placeholder text in the input box.
+
+    The fixture was captured live from ``claude`` v2.1.152 (not hand-written):
+    the input box renders ``❯`` + a non-breaking space (``\\xa0``) + dim
+    placeholder text (``Try "create a util ..."``).  A hand-made fixture used a
+    regular space and so hid the real structure — the live box uses ``\\xa0``
+    while a *sent* user message uses a regular space.  Detection runs on the
+    NORMALISED capture, exactly as the run loop does.
     """
+
+    FIXTURE = "bug_62_ghost_text_real.txt"
+
+    def _norm(self) -> str:
+        return _normalize_capture(_load_fixture(self.FIXTURE))
 
     def test_ghost_text_no_permission_prompt(self) -> None:
         """Ghost text in input area MUST NOT trigger _has_permission_prompt."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._has_permission_prompt(self._norm()) is False
 
     def test_ghost_text_no_yn_prompt(self) -> None:
         """Ghost text in input area MUST NOT trigger _is_yn_prompt."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(self._norm()) is False
 
     def test_ghost_text_no_unknown_interactive(self) -> None:
         """Ghost text in input area MUST NOT trigger _has_unknown_interactive."""
-        pane = _load_fixture("bug_62_ghost_text_input.txt")
-        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(self._norm()) is False
+
+    def test_ghost_text_recognized_as_ready_prompt(self) -> None:
+        """#62: ghost/placeholder text in the input box still means Claude is
+        idle and waiting at the prompt.  ``_has_input_prompt`` MUST return True
+        so the turn completes promptly instead of misreading the input box as
+        "still busy" until the 30s fallback fires.
+
+        This is the RED case: the box line is ``❯\\xa0Try "..."`` sitting above a
+        tall bottom chrome (separator + 3 ccstatusline rows + ``-- INSERT --`` +
+        effort footer), so the old bare-``❯``/6-line-window logic returns False.
+        """
+        assert TmuxClaudeRunner._has_input_prompt(self._norm()) is True
+
+    def test_ghost_text_not_leaked_into_response(self) -> None:
+        """#62: the input-box ghost text must never be read as confirmed input,
+        i.e. it must not leak into the extracted response posted to Discord.
+        """
+        response = TmuxClaudeRunner._extract_response(_load_fixture(self.FIXTURE))
+        assert "Try" not in response
+        assert "logging.py" not in response
+
+    def test_sent_message_is_not_a_live_prompt(self) -> None:
+        """A *sent* user message (``❯ <text>`` with a regular space) near the
+        bottom must NOT be treated as the live input box — only the ``❯\\xa0``
+        (NBSP) form or a bare ``❯`` is the live prompt.
+        """
+        pane = (
+            "● answer\n"
+            "────────────────────────\n"
+            "❯ 2+2 は？ 数字だけ答えて\n"  # sent message: regular space after ❯
+            "────────────────────────\n"
+            "Model: Sonnet\nCost: $0\n⎇ main\n"
+            "-- INSERT --\n"
+            "● high · /effort\n"
+        )
+        assert TmuxClaudeRunner._has_input_prompt(pane) is False
 
 
 # -- Tests for #166 (AskUserQuestion → Discord buttons in tmux/jsonl mode) -----

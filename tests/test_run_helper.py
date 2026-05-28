@@ -441,6 +441,39 @@ class TestNoReplyFallback:
             if isinstance(content, str):
                 assert "discord-reply" not in content
 
+    @pytest.mark.asyncio
+    async def test_no_fallback_in_jsonl_mode(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock, monkeypatch
+    ) -> None:
+        """In jsonl bridge mode the reply comes via the transcript mirror, not the
+        discord-reply skill, so the skill-reply tracker is always empty. The #67
+        fallback must be skipped there — otherwise it fires a false notice every turn."""
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+
+        events = [
+            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                session_id="sess-1",
+            ),
+        ]
+        runner.run = self._make_async_gen(events)
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        for call in thread.send.call_args_list:
+            for arg in call.args:
+                if isinstance(arg, str):
+                    assert "discord-reply" not in arg
+            content = call.kwargs.get("content")
+            if isinstance(content, str):
+                assert "discord-reply" not in content
+
 
 class TestMakeErrorEmbed:
     """Unit tests for the _make_error_embed router function."""

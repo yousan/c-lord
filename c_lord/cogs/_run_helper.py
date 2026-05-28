@@ -212,7 +212,13 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # Issue #67: surface a fallback notice when the turn finished cleanly but
     # Claude never called the discord-reply skill — otherwise the user is left
     # staring at silence (only the "no activity 30s" stall warning).
-    if not run_errored and not processor.pending_ask:
+    # Only meaningful when the skill path is active: in jsonl bridge mode the
+    # reply arrives via the transcript mirror (which never calls record_reply),
+    # so the skill-reply tracker is always empty and this would false-fire every
+    # turn. Skip it there.
+    from ..skills.injector import skills_enabled
+
+    if not run_errored and not processor.pending_ask and skills_enabled():
         from ..skills.reply_tracker import was_replied_since
 
         if not was_replied_since(config.thread.id, turn_started_at):

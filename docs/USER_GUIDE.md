@@ -164,8 +164,8 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 | `/sessions` | List sessions (filter by origin, time window) | Available |
 | `/sync-sessions` | Import CLI sessions as Discord threads | Available |
 | `/resume-info` | Show the CLI command to continue this session in a terminal | Available |
-| `/model-show` | Show current model (global + per-thread) | Available |
-| `/model-set <model>` | Change model for all new sessions | Available |
+| `/model show` | Show current model (global + per-thread) | Available |
+| `/model set <model>` | Change model for all new sessions | Available |
 | `/session-dirs` | List all active session directories | Available |
 | `/session-cleanup` | Remove clean orphaned session directories | Available |
 | `/tmux-list` | List all active tmux windows | Available |

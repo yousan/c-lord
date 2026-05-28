@@ -349,7 +349,7 @@ uv lock --upgrade-package c-lord && uv sync
 
 ### Table Image Rendering (CLORD_RENDER_TABLE_IMAGES)
 
-When enabled, Markdown pipe tables in Claude's responses are rendered as PNG images using [matplotlib](https://matplotlib.org/) and attached to the Discord message alongside the text.
+When enabled, Markdown pipe tables in Claude's responses are rendered as PNG images using [Pillow](https://python-pillow.github.io/) and attached to the Discord message alongside the text. Each cell is split into text and emoji runs: **text is drawn with a CJK-capable font and emoji are drawn in full color** from a color emoji font, so 🟢/🔴 status lamps keep their color.
 
 **Installation:**
 
@@ -358,27 +358,36 @@ uv add "c-lord[table]"
 # or: pip install "c-lord[table]"
 ```
 
-**Non-Latin / CJK font support:**
+**Font support (CJK text + color emoji):**
 
-By default matplotlib uses DejaVu Sans, which does not include Japanese, Chinese, Korean, or other non-Latin glyphs — they will render as blank boxes. c-lord automatically looks for the following fonts at startup and uses the first one found:
+c-lord renders text and emoji separately, picking the first font found in each group:
 
-| Font file path | Notes |
+| Font file path | Group / Notes |
 |---|---|
-| `~/.local/share/fonts/NotoSansJP.ttf` | Recommended for Japanese |
-| `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | Covers JP / ZH / KO |
-| `/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc` | Alternative system path |
+| `~/.local/share/fonts/NotoSansJP.ttf` | **Text** — recommended for Japanese |
+| `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | Text — covers JP / ZH / KO |
+| `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` | Text — last-resort (Latin only) |
+| `~/.local/share/fonts/NotoColorEmoji.ttf` | **Color emoji** — 🟢🔴🟡✅⚠️ render in full color |
+| `/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf` | Color emoji — alternative system path |
+| `~/.local/share/fonts/NotoEmoji-Regular.ttf` | Monochrome emoji — fallback if no color font (no color, but no tofu) |
 
-If none of these paths exist, c-lord falls back to a name-based search for Noto Sans JP, Noto Sans CJK JP, IPAexGothic, Hiragino Sans, or Yu Gothic.
+If no color emoji font is present, c-lord falls back to a monochrome emoji font (glyph shapes, no color), then to drawing the raw character. Use the **CBDT** Noto Color Emoji — Pillow renders it with `embedded_color=True`.
 
-**Quick install for Japanese (Linux):**
+**Quick install for Japanese + color emoji (Linux):**
 ```bash
 mkdir -p ~/.local/share/fonts
+# Japanese text
 curl -Lo ~/.local/share/fonts/NotoSansJP.ttf \
   https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJK-Regular.ttc
+# Color emoji (CBDT)
+curl -Lo ~/.local/share/fonts/NotoColorEmoji.ttf \
+  https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf
 fc-cache -fv
 ```
 
-> **Note for other CJK languages (Chinese, Korean, Arabic, Thai, etc.):** The same DejaVu Sans limitation applies. To render those languages correctly, install a font that covers the target script (e.g. Noto Sans SC for Simplified Chinese, Noto Sans KR for Korean) and add its path to the `jp_font_paths` list in `c_lord/discord_ui/table_renderer.py`, or set `matplotlib.rcParams['font.sans-serif']` in your instance configuration. Contributions adding multi-language font detection are welcome.
+Long cells are wrapped to a bounded width (`MAX_COL_WIDTH`, display-width aware so CJK counts double) so wide tables stay readable on mobile.
+
+> **Note for other CJK languages (Chinese, Korean, Arabic, Thai, etc.):** install a font that covers the target script (e.g. Noto Sans SC for Simplified Chinese, Noto Sans KR for Korean) and add its path to the `_JP_FONT_PATHS` list in `c_lord/discord_ui/table_renderer.py`. Contributions adding multi-language font detection are welcome.
 
 ---
 

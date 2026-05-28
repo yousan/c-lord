@@ -118,6 +118,12 @@ _INTERACTIVE_MENU_RE = re.compile(r"^\s*❯\s+\d+\.", re.MULTILINE)
 # not trigger auto-accept (#156).
 _PERMISSION_SCAN_LINES = 15
 
+# Number of lines from the bottom to scan for the live input box (#62).  Must be
+# generous: the box sits above the bottom chrome (separator + user-configurable
+# ccstatusline rows + ``-- INSERT --`` status bar + effort/tip footer), which
+# is commonly 6–8 lines tall, so a smaller window misses the ``❯`` box line.
+_INPUT_PROMPT_SCAN_LINES = 15
+
 
 def _permission_zone(text: str) -> str:
     """Return the bottom N lines of the pane where real prompts appear.
@@ -667,10 +673,9 @@ class TmuxClaudeRunner:
 
             prev_capture_response = response
 
-            # Done: non-empty response has been stable long enough.
-            # Two tiers:
-            #  - Quick exit (3s): response stable AND input prompt visible
-            #    AND not actively generating (no ✻ Running… etc.).
+            # Done: non-empty response has been stable long enough AND Claude is
+            # not actively generating.  Two tiers, both gated on ``not is_gen``:
+            #  - Quick exit (3s): response stable AND input prompt visible.
             #    Without the is_gen check, tool execution pauses (where the
             #    pane is stable for several seconds) would trigger false
             #    completion, posting raw tool-call text instead of Claude's
@@ -678,11 +683,19 @@ class TmuxClaudeRunner:
             #  - Fallback exit (30s): response stable but no input prompt
             #    (Claude may have finished but prompt detection failed,
             #    e.g. completion summary text in the prompt area).
+            # The ``not is_gen`` guard on BOTH tiers is what prevents premature
+            # completion during a long thinking phase: an intermediate response
+            # can sit stable for >30s while Claude keeps working toward (say) an
+            # AskUserQuestion menu.  Finalizing then stops the poll loop, so the
+            # menu that renders later is never bridged and the session stalls
+            # (#179).  While the generation indicator is visible the turn stays
+            # open; the inactivity ``timeout_seconds`` backstop still applies.
             is_gen = self._is_generating(current)
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
-                and ((has_prompt and not is_gen) or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
+                and not is_gen
+                and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
             ):
                 break
 
@@ -1082,14 +1095,18 @@ class TmuxClaudeRunner:
         """Check if Claude is actively generating (thinking/tool indicators visible).
 
         Looks at the bottom 6 lines (which contain TUI chrome) for a generation
-        status indicator that ends with ``…`` (U+2026).  Active indicators
-        like ``✻ Running…`` end with ellipsis; completion summaries like
-        ``✻ Cooked for 56s`` do not.
+        status indicator that contains ``…`` (U+2026).  Active indicators carry
+        the ellipsis — sometimes at the end (``✻ Running…``) and sometimes
+        followed by an elapsed/token suffix (``✽ Generating… (7m 45s · ↑ 23.2k
+        tokens)``) — while completion summaries like ``✻ Cooked for 56s`` have
+        no ellipsis at all.  Matching ``…`` anywhere in the line (not only at
+        the end) is what catches the long-thinking case where the suffix pushed
+        the ellipsis off the end and the turn was wrongly finalized early (#179).
         """
         lines = text.rstrip().splitlines()
         for line in lines[-6:]:
             stripped = line.strip()
-            if _GENERATION_STATUS_RE.match(stripped) and stripped.endswith("…"):
+            if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:
                 return True
         return False
 
@@ -1099,13 +1116,39 @@ class TmuxClaudeRunner:
 
         The TUI shows a status bar (``-- INSERT --``, separator lines) below
         the ``❯`` prompt, so we cannot simply check ``endswith``.  Instead,
-        look at the last few lines for a line that is *only* the prompt
-        character (with optional whitespace).
+        look at the last few lines for the input box.
+
+        A bare ``❯`` means an empty input box.  But Claude Code also renders
+        ghost/placeholder text — and any unsent text the user typed — right
+        after the prompt glyph in the live input box, e.g.
+        ``❯\\xa0Try "create a util ..."`` or ``❯\\xa0A で 3回試して`` (#62).  That
+        still means Claude is idle and waiting, so it counts as a ready prompt;
+        without this the input box is misread as "still busy" until the 30s
+        fallback fires.
+
+        The discriminator (verified against real ``capture-pane -e`` output):
+        the **live input box** puts a non-breaking space (``\\xa0``) after the
+        glyph, while a **sent/confirmed user message** in the scrollback uses a
+        regular space (``❯ 2+2 は？``).  A bare ``❯`` and the ``❯\\xa0`` form are
+        therefore unique to the live box, so an old sent message scrolled near
+        the bottom is never mistaken for the live prompt.  A numbered-menu
+        cursor (``❯ 1. ...``) is excluded — it is an interactive menu, not a
+        ready prompt, and treating it as one would complete the turn before the
+        menu is answered.
+
+        We scan a generous bottom window rather than just the last few lines:
+        the box sits above the bottom chrome (separator + the user-configurable
+        ccstatusline rows + ``-- INSERT --`` + effort/tip footer), which can be
+        ~6–8 lines tall, so a 6-line window misses the box entirely (#62).
         """
         lines = text.rstrip().splitlines()
-        for line in lines[-6:]:
+        for line in lines[-_INPUT_PROMPT_SCAN_LINES:]:
             stripped_line = line.strip()
             if stripped_line in ("❯", ">"):
+                return True
+            if (
+                stripped_line.startswith("❯\xa0") or stripped_line.startswith(">\xa0")
+            ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
                 return True
         return False
 
