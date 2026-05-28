@@ -107,6 +107,8 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
+| `!session-cleanup [dry]` | Remove clean orphaned session dirs (`dry` = preview) | `!session-cleanup dry` | `/session-cleanup` |
+| `!workspace-delete` | Delete this thread's tmux window + session dir | `!workspace-delete` | `/workspace-delete` |
 
 > **Manage-Server note.** `/clord-init` and `/clord-thread-init` are gated by
 > Discord's *Manage Server* permission. Their `!text` twins have **no** such
