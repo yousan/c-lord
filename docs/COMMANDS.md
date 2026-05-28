@@ -99,6 +99,11 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
 | `!clear` | Reset the session — next message starts fresh | `!clear` | `/clear` |
+| `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
+| `!resume-info` | Show the CLI command to resume this thread | `!resume-info` | `/resume-info` |
+| `!sessions` | List all known sessions | `!sessions` | `/sessions` |
+| `!session-dirs` | List active session directories | `!session-dirs` | `/session-dirs` |
+| `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
 
 Each text command is **functionally identical to its slash equivalent** — it
 calls the same underlying handler. Text commands accept either prefix:

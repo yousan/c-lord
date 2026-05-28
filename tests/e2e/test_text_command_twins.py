@@ -5,7 +5,9 @@ E2E harness can only reach them through their ``!``-prefix / mention twins.
 These tests verify each twin fires and the bot replies when triggered the way
 a slash command never could be.
 
-Covered: !clord, !skill, !stop, !clear, and a mention-prefixed command.
+Covered: !clord, !skill, !stop, !clear, the read-only info twins
+(!model-show, !sessions, !session-dirs, !tmux-list, !resume-info), and a
+mention-prefixed command.
 """
 
 from __future__ import annotations
@@ -103,6 +105,36 @@ def test_clear_twin_via_webhook(
     )
     assert reply is not None, "Bot did not reply to !clear within 30s"
     assert reply["content"], "Bot reply was empty"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "command",
+    ["!model-show", "!sessions", "!session-dirs", "!tmux-list", "!resume-info"],
+)
+def test_readonly_info_twins_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+    command: str,
+) -> None:
+    """Each read-only info twin replies when fired from a webhook (like its slash)."""
+    seed = discord_client.create_seed_message(f"[E2E] {command} test")
+    thread = discord_client.create_thread(seed["id"], f"E2E: {command}")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post(command, thread_id=thread_id)
+
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, f"Bot did not reply to {command} within 30s"
+    # A reply (embed or text) means the command reached the cog. Embeds have
+    # empty content, so accept either content or an embed.
+    assert reply["content"] or reply.get("embeds"), f"Bot reply to {command} was empty"
 
 
 @pytest.mark.e2e
