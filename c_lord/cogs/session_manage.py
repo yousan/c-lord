@@ -202,20 +202,17 @@ class SessionManageCog(commands.Cog):
         respond, _ = self._ctx_io(ctx)
         await self._model_show_impl(channel=ctx.channel, respond=respond)
 
-    @model_group.command(name="set", description="Change the global Claude model for new sessions")
-    @app_commands.describe(model="Model to use for all new Claude sessions")
-    @app_commands.choices(model=_MODEL_CHOICES)
-    async def model_set(self, interaction: discord.Interaction, model: str) -> None:
-        """Set the global default model stored in settings_repo."""
+    async def _model_set_impl(self, *, model: str, respond: _Responder) -> None:
+        """Shared core for /model set and !model-set (#209 follow-up)."""
         if model not in _VALID_MODELS:
-            await interaction.response.send_message(
+            await respond(
                 f"❌ Unknown model `{model}`. Valid choices: {', '.join(sorted(_VALID_MODELS))}",
                 ephemeral=True,
             )
             return
 
         if self.settings_repo is None:
-            await interaction.response.send_message(
+            await respond(
                 "❌ Settings repository is unavailable — model cannot be persisted.",
                 ephemeral=True,
             )
@@ -228,7 +225,24 @@ class SessionManageCog(commands.Cog):
             description=f"Global model set to **`{model}`**.\nAll new sessions will use this model.",  # noqa: E501
             color=COLOR_SUCCESS,
         )
-        await interaction.response.send_message(embed=embed)
+        await respond(embed=embed)
+
+    @model_group.command(name="set", description="Change the global Claude model for new sessions")
+    @app_commands.describe(model="Model to use for all new Claude sessions")
+    @app_commands.choices(model=_MODEL_CHOICES)
+    async def model_set(self, interaction: discord.Interaction, model: str) -> None:
+        """Set the global default model stored in settings_repo."""
+        respond, _ = self._slash_io(interaction)
+        await self._model_set_impl(model=model, respond=respond)
+
+    @commands.command(name="model-set")
+    async def model_set_text(self, ctx: commands.Context, model: str | None = None) -> None:
+        """Text/mention twin of /model set — webhook-invokable for E2E (#209)."""
+        if not model:
+            await ctx.send(f"Usage: `!model-set <{'/'.join(sorted(_VALID_MODELS))}>`")
+            return
+        respond, _ = self._ctx_io(ctx)
+        await self._model_set_impl(model=model, respond=respond)
 
     async def _resume_info_impl(self, *, channel: object, respond: _Responder) -> None:
         """Shared core for /resume-info and !resume-info (#209 follow-up)."""

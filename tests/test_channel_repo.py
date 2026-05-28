@@ -415,3 +415,55 @@ class TestClordThreadInitAccessCheck:
             "content", interaction.response.send_message.call_args[0][0]
         )
         assert "アクセス" in msg or "access" in msg.lower()
+
+
+# ===========================================================================
+# Text/mention twins (#209 follow-up) — webhook-invokable config commands
+# ===========================================================================
+
+
+def _make_ctx(channel_id: int = 555, author_id: int = 1) -> MagicMock:
+    ctx = MagicMock()
+    ctx.send = AsyncMock()
+    ctx.author = MagicMock()
+    ctx.author.id = author_id
+    ctx.channel = MagicMock()
+    ctx.channel.id = channel_id
+    ctx.bot = MagicMock()
+    ctx.bot.get_channel = MagicMock(return_value=MagicMock())
+    return ctx
+
+
+class TestClordInitTextTwin:
+    async def test_show_no_bindings(self, cog: ChannelRepoCog) -> None:
+        ctx = _make_ctx()
+        await cog.clord_init_text.callback(cog, ctx, arg=None)
+        ctx.send.assert_called_once()
+
+    async def test_bind(self, cog: ChannelRepoCog, repo: ChannelRepository) -> None:
+        ctx = _make_ctx(channel_id=777)
+        await cog.clord_init_text.callback(cog, ctx, arg="https://github.com/org/r.git")
+        binding = await repo.get(777)
+        assert binding is not None
+        assert "Bound" in ctx.send.call_args.args[0]
+
+    async def test_remove(self, cog: ChannelRepoCog, repo: ChannelRepository) -> None:
+        await repo.save(channel_id=888, source_repo="https://x/y.git")
+        ctx = _make_ctx(channel_id=888)
+        await cog.clord_init_text.callback(cog, ctx, arg="remove")
+        assert await repo.get(888) is None
+
+
+class TestClordThreadInitTextTwin:
+    async def test_show_no_binding(self, cog: ChannelRepoCog) -> None:
+        ctx = _make_ctx(channel_id=5555)
+        await cog.clord_thread_init_text.callback(cog, ctx, arg=None)
+        ctx.send.assert_called_once()
+        assert "thread" in ctx.send.call_args.args[0].lower()
+
+    async def test_bind(self, cog: ChannelRepoCog, thread_repo: ThreadRepository) -> None:
+        ctx = _make_ctx(channel_id=5555)
+        await cog.clord_thread_init_text.callback(cog, ctx, arg="https://github.com/org/t.git")
+        binding = await thread_repo.get(5555)
+        assert binding is not None
+        assert "Bound thread" in ctx.send.call_args.args[0]

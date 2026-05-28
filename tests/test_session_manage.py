@@ -288,6 +288,33 @@ class TestReadonlyTextTwins:
         assert "clord-init" in ctx.send.call_args.args[0]
 
 
+class TestModelSetTextTwin:
+    """!model-set mirrors /model set (E2E-invokable, #209)."""
+
+    async def test_missing_model_shows_usage(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.model_set_text.callback(cog, ctx, model=None)
+        ctx.send.assert_called_once()
+        assert "Usage" in ctx.send.call_args.args[0]
+
+    async def test_invalid_model(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.model_set_text.callback(cog, ctx, model="nope")
+        assert "Unknown model" in ctx.send.call_args.args[0]
+
+    async def test_valid_model_persisted(self):
+        cog = _make_cog()
+        cog.settings_repo = MagicMock()
+        cog.settings_repo.set = AsyncMock()
+        ctx = _make_ctx()
+        await cog.model_set_text.callback(cog, ctx, model="opus")
+        cog.settings_repo.set.assert_called_once()
+        assert cog.settings_repo.set.call_args.args[1] == "opus"
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+
 class TestHelperFunctions:
     """Tests for _is_tmux_session and _format_session_short."""
 
