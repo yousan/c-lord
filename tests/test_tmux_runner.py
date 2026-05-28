@@ -2175,7 +2175,9 @@ class TestRunYieldsPaneAsk:
         tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
 
     @pytest.mark.asyncio
-    async def test_answer_menu_text_types_onto_row_then_confirms(self, runner, tmux_manager) -> None:
+    async def test_answer_menu_text_types_onto_row_then_confirms(
+        self, runner, tmux_manager
+    ) -> None:
         """#172: free text is typed ONTO the highlighted 'Type something.' row,
         then confirmed with Enter.
 
@@ -2400,3 +2402,30 @@ class TestRunAutoAcceptsTrustPrompt:
         # confirms it.
         enter_calls = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args]
         assert enter_calls, "main loop did not send Enter to accept the trust dialog"
+
+
+# -- Regression tests for #219 (missed AskUserQuestion bridge → fallback notice) --
+
+
+class TestPeekPendingAsk:
+    """Regression for #219: when the run loop finalizes a turn just before an
+    AskUserQuestion menu renders, the menu is never bridged to Discord buttons.
+
+    ``peek_pending_ask`` lets ``_run_helper`` re-check the pane after the stream
+    ends and recover such a menu (so it can be bridged instead of posting the
+    misleading 'no discord-reply' fallback notice).  It must parse a real
+    captured pane (including the current separator layout where ``Chat about
+    this`` follows a separator line) and return ``None`` when no menu is open.
+    """
+
+    @pytest.mark.asyncio
+    async def test_peek_returns_question_for_open_menu(self, runner, tmux_manager) -> None:
+        tmux_manager.capture_pane.return_value = _load_fixture("ask_user_question_3options.txt")
+        q = await runner.peek_pending_ask()
+        assert q is not None
+        assert [o.label for o in q.options] == ["Production", "Staging", "Local"]
+
+    @pytest.mark.asyncio
+    async def test_peek_returns_none_when_no_menu(self, runner, tmux_manager) -> None:
+        tmux_manager.capture_pane.return_value = "● Done.\n\n❯\n──────\n-- INSERT --"
+        assert await runner.peek_pending_ask() is None
