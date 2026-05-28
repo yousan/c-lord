@@ -340,25 +340,34 @@ class ClaudeChatCog(commands.Cog):
         ):
             await self._handle_thread_reply(message)
 
-    @app_commands.command(name="clord", description="Start a new Claude Code session")
-    @app_commands.describe(prompt="Message to send to Claude Code")
-    async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
-        """Start a new Claude Code session or continue in an existing thread."""
+    async def _clord_impl(
+        self,
+        *,
+        channel: object,
+        channel_id_fallback: int | None,
+        user: discord.Member | discord.User,
+        prompt: str,
+        respond: _Responder,
+        ack: _Responder,
+    ) -> None:
+        """Shared core for /clord and !clord (#209 follow-up).
+
+        In a thread → continue the session; in a channel → create a new thread
+        via ``spawn_session``. ``ack`` defers (slash) or is a no-op (text); after
+        it, all replies go through ``respond``'s post-ack path.
+        """
         # Authorization check
-        if not self._is_allowed(interaction.user):
-            await interaction.response.send_message(
-                "You are not authorized to use this command.", ephemeral=True
-            )
+        if not self._is_allowed(user):
+            await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
-        channel = interaction.channel
         if isinstance(channel, discord.Thread):
             parent_channel_id = channel.parent_id or channel.id
             sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
             tmux = await self._resolve_tmux_manager(parent_channel_id)
             if sdm is None and tmux is None:
-                await interaction.response.send_message(
+                await respond(
                     "⚠️ このスレッドにはリポジトリが紐づけられていません。\n"
                     "先に `/clord-thread-init repo:<URL>` または"
                     " `/clord-init repo:<URL>` で設定してください。",
@@ -366,18 +375,22 @@ class ClaudeChatCog(commands.Cog):
                 )
                 return
         else:
-            channel_id = channel.id if channel else interaction.channel_id
+            channel_id = (
+                channel.id
+                if isinstance(channel, discord.abc.GuildChannel)
+                else (channel_id_fallback)
+            )
             sdm = await self._resolve_session_dir_manager(channel_id)
             tmux = await self._resolve_tmux_manager(channel_id)
             if sdm is None and tmux is None:
-                await interaction.response.send_message(
+                await respond(
                     "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
                     "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
                     ephemeral=True,
                 )
                 return
 
-        await interaction.response.defer()
+        await ack()
 
         if isinstance(channel, discord.Thread):
             # Continue in existing thread
@@ -385,16 +398,65 @@ class ClaudeChatCog(commands.Cog):
             session_id = (record.session_id or None) if record else None
             seed_message = await channel.send(prompt)
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
-            await interaction.followup.send("Session completed.", silent=True)
+            await respond("Session completed.", silent=True)
         else:
             # Create a new thread via spawn_session (text channels only)
             if not isinstance(channel, discord.TextChannel):
-                await interaction.followup.send(
-                    "This command must be used in a text channel.", ephemeral=True
-                )
+                await respond("This command must be used in a text channel.", ephemeral=True)
                 return
             thread = await self.spawn_session(channel, prompt)
-            await interaction.followup.send(f"Session started → {thread.mention}")
+            await respond(f"Session started → {thread.mention}")
+
+    @app_commands.command(name="clord", description="Start a new Claude Code session")
+    @app_commands.describe(prompt="Message to send to Claude Code")
+    async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
+        """Start a new Claude Code session or continue in an existing thread."""
+        state = {"acked": False}
+
+        async def ack(*_args: object, **_kwargs: object) -> None:
+            state["acked"] = True
+            await interaction.response.defer()
+
+        async def respond(
+            content: str | None = None, *, ephemeral: bool = False, silent: bool = False
+        ) -> None:
+            if state["acked"]:
+                await interaction.followup.send(content or "", ephemeral=ephemeral, silent=silent)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._clord_impl(
+            channel=interaction.channel,
+            channel_id_fallback=interaction.channel_id,
+            user=interaction.user,
+            prompt=prompt,
+            respond=respond,
+            ack=ack,
+        )
+
+    @commands.command(name="clord")
+    async def clord_text(self, ctx: commands.Context, *, prompt: str | None = None) -> None:
+        """Text/mention twin of /clord — invokable from webhooks for E2E (#209)."""
+        if not prompt:
+            await ctx.send("Usage: `!clord <prompt>`")
+            return
+
+        async def ack(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def respond(
+            content: str | None = None, *, ephemeral: bool = False, silent: bool = False
+        ) -> None:
+            await ctx.send(content or "", silent=silent)
+
+        await self._clord_impl(
+            channel=ctx.channel,
+            channel_id_fallback=ctx.channel.id if ctx.channel else None,
+            user=ctx.author,
+            prompt=prompt,
+            respond=respond,
+            ack=ack,
+        )
 
     async def _stop_impl(self, channel: object, respond: _Responder) -> None:
         """Shared core for /stop and !stop (#209).

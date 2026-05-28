@@ -5,7 +5,7 @@ E2E harness can only reach them through their ``!``-prefix / mention twins.
 These tests verify each twin fires and the bot replies when triggered the way
 a slash command never could be.
 
-Covered: !skill, !stop, !clear, and a mention-prefixed command.
+Covered: !clord, !skill, !stop, !clear, and a mention-prefixed command.
 """
 
 from __future__ import annotations
@@ -13,6 +13,27 @@ from __future__ import annotations
 import pytest
 
 from .conftest import DiscordE2EClient
+
+
+@pytest.mark.e2e
+def test_clord_twin_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """!clord in a channel creates a thread + starts a session (like /clord)."""
+    wh_msg = discord_client.webhook_post("!clord [E2E] say hello and stop")
+
+    reply = discord_client.wait_for_bot_reply(
+        discord_client.channel_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to !clord within 30s"
+    # New-thread mode posts "Session started → <#thread>" (or an unbound-channel
+    # / not-authorized notice). Any non-empty reply means the command fired.
+    assert reply["content"], "Bot reply was empty"
 
 
 @pytest.mark.e2e

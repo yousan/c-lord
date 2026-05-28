@@ -94,6 +94,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 
 | Command | Description | Example | Slash equivalent |
 |---------|-------------|---------|------------------|
+| `!clord <prompt>` | Start a new session (channel) / continue (thread) | `!clord build X` | `/clord` |
 | `!attach <window>` | Attach this thread to a tmux window | `!attach work13` | `/clord-attach` |
 | `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
