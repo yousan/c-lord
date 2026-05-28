@@ -492,28 +492,19 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._session_dirs_list_impl(respond=respond, ack=ack)
 
-    @app_commands.command(
-        name="session-cleanup",
-        description="Remove clean orphaned session directories",
-    )
-    @app_commands.describe(
-        dry_run="Preview what would be removed without actually removing anything",
-    )
-    async def session_cleanup(
-        self,
-        interaction: discord.Interaction,
-        dry_run: bool = False,
+    async def _session_cleanup_impl(
+        self, *, dry_run: bool, respond: _Responder, ack: _Acknowledger
     ) -> None:
-        """Remove session directories that have no active session and are clean."""
+        """Shared core for /session-cleanup and !session-cleanup (#209 follow-up)."""
         bindings = await self._get_all_bindings()
         if not bindings:
-            await interaction.response.send_message(
+            await respond(
                 "❌ No channel-repo bindings configured. Use `/clord-init` first.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer()
+        await ack()
 
         import asyncio
 
@@ -530,7 +521,7 @@ class SessionManageCog(commands.Cog):
                 managers.append(sdm)
 
         if not managers:
-            await interaction.followup.send(
+            await respond(
                 embed=discord.Embed(
                     title="📁 Session Cleanup",
                     description="No session directory managers found.",
@@ -575,7 +566,7 @@ class SessionManageCog(commands.Cog):
             if not candidates and not skipped:
                 embed.description = "No session directories found."
             embed.set_footer(text="Re-run without dry_run=True to actually remove.")
-            await interaction.followup.send(embed=embed)
+            await respond(embed=embed)
             return
 
         all_results = []
@@ -619,7 +610,33 @@ class SessionManageCog(commands.Cog):
                 inline=False,
             )
 
-        await interaction.followup.send(embed=embed)
+        await respond(embed=embed)
+
+    @app_commands.command(
+        name="session-cleanup",
+        description="Remove clean orphaned session directories",
+    )
+    @app_commands.describe(
+        dry_run="Preview what would be removed without actually removing anything",
+    )
+    async def session_cleanup(
+        self,
+        interaction: discord.Interaction,
+        dry_run: bool = False,
+    ) -> None:
+        """Remove session directories that have no active session and are clean."""
+        respond, ack = self._slash_io(interaction)
+        await self._session_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
+
+    @commands.command(name="session-cleanup")
+    async def session_cleanup_text(self, ctx: commands.Context, arg: str | None = None) -> None:
+        """Text/mention twin of /session-cleanup — webhook-invokable for E2E (#209).
+
+        Usage: ``!session-cleanup`` (remove) / ``!session-cleanup dry`` (preview).
+        """
+        dry_run = (arg or "").lower() in {"dry", "dry_run", "dry-run", "true", "1"}
+        respond, ack = self._ctx_io(ctx)
+        await self._session_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
 
     async def _tmux_list_impl(self, *, respond: _Responder, ack: _Acknowledger) -> None:
         """Shared core for /tmux-list and !tmux-list (#209 follow-up)."""
@@ -682,22 +699,20 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._tmux_list_impl(respond=respond, ack=ack)
 
-    @app_commands.command(
-        name="workspace-delete",
-        description="Delete the tmux window and session directory for this thread",
-    )
-    async def workspace_delete(self, interaction: discord.Interaction) -> None:
-        """Delete the tmux window and session directory for the current thread."""
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
+    async def _workspace_delete_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /workspace-delete and !workspace-delete (#209 follow-up)."""
+        if not isinstance(channel, discord.Thread):
+            await respond(
                 "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
             return
 
-        thread_id = interaction.channel.id
-        parent_channel_id = interaction.channel.parent_id or thread_id
-        await interaction.response.defer()
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+        await ack()
 
         import asyncio
 
@@ -732,4 +747,19 @@ class SessionManageCog(commands.Cog):
             description="\n".join(results),
             color=COLOR_SUCCESS,
         )
-        await interaction.followup.send(embed=embed)
+        await respond(embed=embed)
+
+    @app_commands.command(
+        name="workspace-delete",
+        description="Delete the tmux window and session directory for this thread",
+    )
+    async def workspace_delete(self, interaction: discord.Interaction) -> None:
+        """Delete the tmux window and session directory for the current thread."""
+        respond, ack = self._slash_io(interaction)
+        await self._workspace_delete_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-delete")
+    async def workspace_delete_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /workspace-delete — webhook-invokable for E2E (#209)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)

@@ -167,6 +167,46 @@ def test_config_twins_non_mutating_via_webhook(
 
 
 @pytest.mark.e2e
+def test_session_cleanup_dryrun_twin_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """!session-cleanup dry (preview, non-destructive) fires from a webhook."""
+    wh_msg = discord_client.webhook_post("!session-cleanup dry")
+    reply = discord_client.wait_for_bot_reply(
+        discord_client.channel_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to !session-cleanup dry within 30s"
+    assert reply["content"] or reply.get("embeds")
+
+
+@pytest.mark.e2e
+def test_workspace_delete_twin_via_webhook(
+    discord_client: DiscordE2EClient,
+    bot_id: str,
+) -> None:
+    """!workspace-delete fires in a fresh thread (no workspace → harmless reply)."""
+    seed = discord_client.create_seed_message("[E2E] !workspace-delete test")
+    thread = discord_client.create_thread(seed["id"], "E2E: !workspace-delete")
+    thread_id = thread["id"]
+
+    wh_msg = discord_client.webhook_post("!workspace-delete", thread_id=thread_id)
+    reply = discord_client.wait_for_bot_reply(
+        thread_id,
+        after_message_id=wh_msg["id"],
+        bot_id=bot_id,
+        timeout=30.0,
+        poll=2.0,
+    )
+    assert reply is not None, "Bot did not reply to !workspace-delete within 30s"
+    assert reply["content"] or reply.get("embeds")
+
+
+@pytest.mark.e2e
 def test_mention_prefix_via_webhook(
     discord_client: DiscordE2EClient,
     bot_id: str,

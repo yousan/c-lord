@@ -315,6 +315,36 @@ class TestModelSetTextTwin:
         assert ctx.send.call_args.kwargs.get("embed") is not None
 
 
+class TestOpsTextTwins:
+    """!session-cleanup / !workspace-delete (destructive, E2E-invokable, #209)."""
+
+    async def test_session_cleanup_text_no_bindings(self):
+        cog = _make_cog()  # bot.get_cog → non-ChannelRepoCog ⇒ no bindings
+        ctx = _make_ctx()
+        await cog.session_cleanup_text.callback(cog, ctx, arg=None)
+        ctx.send.assert_called_once()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+    async def test_workspace_delete_text_outside_thread(self):
+        cog = _make_cog()
+        ctx = _make_ctx()  # not a thread
+        await cog.workspace_delete_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert "thread" in ctx.send.call_args.args[0].lower()
+
+    async def test_workspace_delete_text_in_thread(self):
+        cog = _make_cog()
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        ctx = _make_ctx(channel=thread)
+        await cog.workspace_delete_text.callback(cog, ctx)
+        # Unbound → an embed explaining nothing to delete / clord-init hint
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+
 class TestHelperFunctions:
     """Tests for _is_tmux_session and _format_session_short."""
 
