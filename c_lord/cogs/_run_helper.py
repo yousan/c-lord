@@ -214,48 +214,50 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         if config.image_paths:
             await _cleanup_image_tempfiles(config.image_paths)
 
-    # Issue #67: surface a fallback notice when the turn finished cleanly but
-    # Claude never called the discord-reply skill — otherwise the user is left
-    # staring at silence (only the "no activity 30s" stall warning).
-    # Only meaningful when the skill path is active: in jsonl bridge mode the
-    # reply arrives via the transcript mirror (which never calls record_reply),
-    # so the skill-reply tracker is always empty and this would false-fire every
-    # turn. Skip it there.
     from ..skills.injector import skills_enabled
 
-    if not run_errored and not processor.pending_ask and skills_enabled():
+    # #219/#222: the run loop may have finalized just before an AskUserQuestion
+    # menu rendered (or Claude called discord-reply and then asked a follow-up),
+    # leaving Claude blocked on a TUI menu that was never bridged. Recover it by
+    # re-checking the pane. This is INDEPENDENT of bridge mode and of whether
+    # discord-reply was called — the menu is read from the pane, not the
+    # skill-reply path — so it must run OUTSIDE the skills_enabled()/was_replied
+    # guards that gate the #67 notice below. (Gating it there left prod's jsonl
+    # mode never recovering a post-turn menu, so the user saw no choices — #222.)
+    pending_pane_ask = None
+    if not run_errored and not processor.pending_ask and isinstance(runner, TmuxClaudeRunner):
+        pending_pane_ask = await runner.peek_pending_ask()
+
+    if pending_pane_ask is not None:
+        logger.info(
+            "%s Recovered open AskUserQuestion menu post-turn — bridging to Discord",
+            ctx,
+        )
+        await bridge_pane_ask(
+            config.thread,
+            pending_pane_ask,
+            runner,
+            ask_repo=config.ask_repo,
+        )
+    elif not run_errored and not processor.pending_ask and skills_enabled():
+        # Issue #67: surface a fallback notice when the skill-reply path was
+        # active but Claude never called discord-reply — otherwise the user is
+        # left staring at silence. Skill-mode only: in jsonl bridge mode the
+        # reply arrives via the transcript mirror (which never calls
+        # record_reply), so the tracker is always empty and this would
+        # false-fire every turn.
         from ..skills.reply_tracker import was_replied_since
 
         if not was_replied_since(config.thread.id, turn_started_at):
-            # #219: the run loop may have finalized just before an AskUserQuestion
-            # menu rendered, leaving Claude blocked on a TUI menu that was never
-            # bridged. Re-check the pane: if a menu is open, bridge it to Discord
-            # buttons instead of posting the misleading 'no discord-reply' notice.
-            pending_pane_ask = None
-            if isinstance(runner, TmuxClaudeRunner):
-                pending_pane_ask = await runner.peek_pending_ask()
-
-            if pending_pane_ask is not None:
-                logger.info(
-                    "%s Recovered open AskUserQuestion menu post-turn — bridging to Discord",
-                    ctx,
+            logger.warning(
+                "%s Claude finished without calling discord-reply — posting fallback notice",
+                ctx,
+            )
+            with contextlib.suppress(Exception):
+                await config.thread.send(
+                    "-# ⚠️ Claude finished without calling the `discord-reply` skill. "
+                    "Check the tmux pane for the response, or retry the turn."
                 )
-                await bridge_pane_ask(
-                    config.thread,
-                    pending_pane_ask,
-                    runner,
-                    ask_repo=config.ask_repo,
-                )
-            else:
-                logger.warning(
-                    "%s Claude finished without calling discord-reply — posting fallback notice",
-                    ctx,
-                )
-                with contextlib.suppress(Exception):
-                    await config.thread.send(
-                        "-# ⚠️ Claude finished without calling the `discord-reply` skill. "
-                        "Check the tmux pane for the response, or retry the turn."
-                    )
 
     # After the stream ends, handle pending AskUserQuestion by showing Discord
     # UI and resuming the session with the user's answer.
