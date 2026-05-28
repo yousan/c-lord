@@ -117,6 +117,7 @@ class TranscriptMirror:
         sink: Sink,
         reply_sink: Sink | None = None,
         file_sink: FileSink | None = None,
+        reply_cursor_sink: Sink | None = None,
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
     ) -> None:
@@ -125,6 +126,10 @@ class TranscriptMirror:
         self._sink = sink
         self._reply_sink = reply_sink
         self._file_sink = file_sink
+        # Issue #215: called with the uuid of the last assistant_text of each
+        # completed turn, so a restart can tell whether the final answer was
+        # already delivered and avoid re-posting it.
+        self._reply_cursor_sink = reply_cursor_sink
         self._verbosity = verbosity
         self._poll_interval = poll_interval
         self._task: asyncio.Task[None] | None = None
@@ -159,6 +164,25 @@ class TranscriptMirror:
         # tool event → flush silently; result/user_input/stop → flush as reply.
         _pending_text: str | None = None
         _pending_progress: list[str] = []  # snapshot of progress_buf at capture time
+        # Issue #215: uuid of the most recent assistant_text event of the
+        # current turn. Committed at each turn boundary so a restart knows the
+        # final answer was delivered.
+        _last_text_uuid: str | None = None
+
+        async def _commit_cursor() -> None:
+            nonlocal _last_text_uuid
+            if self._reply_cursor_sink is not None and _last_text_uuid:
+                try:
+                    await self._reply_cursor_sink(_last_text_uuid)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "TranscriptMirror cursor sink failed for thread=%d",
+                        self.thread_id,
+                        exc_info=True,
+                    )
+            _last_text_uuid = None
 
         async def _flush_pending_silently() -> None:
             nonlocal _pending_text, _pending_progress
@@ -183,6 +207,7 @@ class TranscriptMirror:
                 if self._verbosity == "minimal" and _is_turn_end(event):
                     # Turn boundary: flush pending as the final reply.
                     await _flush_pending_as_reply()
+                    await _commit_cursor()
                     continue
 
                 rendered = render_event(event)
@@ -200,10 +225,12 @@ class TranscriptMirror:
                             await _flush_pending_silently()
                         _pending_text = _format_body(rendered)
                         _pending_progress = list(progress_buf)
+                        _last_text_uuid = event.get("uuid") or _last_text_uuid
                         progress_buf.clear()
                     elif rendered.kind == "user_input":
                         # Human turn: previous assistant turn is over → flush as reply.
                         await _flush_pending_as_reply()
+                        await _commit_cursor()
                         await self._post(rendered)
                     else:
                         await _flush_pending_silently()
@@ -217,6 +244,7 @@ class TranscriptMirror:
             if self._verbosity == "minimal":
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _flush_pending_as_reply()
+                    await _commit_cursor()
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
 
     async def _flush_as_reply(self, text: str, progress: list[str]) -> None:

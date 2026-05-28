@@ -710,3 +710,170 @@ async def test_file_sink_no_reference_when_db_raises(
     channel.send.assert_called_once()
     call_kwargs = channel.send.call_args.kwargs
     assert "reference" not in call_kwargs
+
+
+# ── Issue #215: recover undelivered final answer on restart ───────────
+
+
+def _recovery_repo(rows: list, *, trigger_message_id=None) -> MagicMock:
+    """A repo with list_all + get + set_mirror_replied_uuid for recovery tests."""
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=rows)
+    record = MagicMock()
+    record.trigger_message_id = trigger_message_id
+    repo.get = AsyncMock(return_value=record)
+    repo.set_mirror_replied_uuid = AsyncMock()
+    return repo
+
+
+def _session_row(thread_id: int, working_dir: str, replied_uuid):
+    r = MagicMock()
+    r.thread_id = thread_id
+    r.working_dir = working_dir
+    r.mirror_replied_uuid = replied_uuid
+    return r
+
+
+async def test_on_ready_recovers_undelivered_final_answer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #215: a newer completed turn's final answer (uuid != the stored
+    cursor) was written while the bot was down → re-delivered on on_ready."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+    (project / "s.jsonl").write_text(
+        "\n".join(
+            json.dumps(e)
+            for e in [
+                # Previous turn, already delivered (cursor points here).
+                {
+                    "type": "assistant",
+                    "uuid": "u-old",
+                    "message": {"content": [{"type": "text", "text": "previous answer"}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+                # The turn that completed while the bot was down (undelivered).
+                {
+                    "type": "assistant",
+                    "uuid": "u-final",
+                    "message": {"content": [{"type": "text", "text": "the dropped final answer"}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+        )
+        + "\n"
+    )
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _recovery_repo([_session_row(11, "/some/cwd", "u-old")])
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    try:
+        await cog.on_ready()
+    finally:
+        await cog.cog_unload()
+
+    # The dropped final answer was re-delivered exactly once...
+    sent_bodies = [
+        (c.kwargs.get("content") or (c.args[0] if c.args else ""))
+        for c in channel.send.call_args_list
+    ]
+    assert any("the dropped final answer" in b for b in sent_bodies), sent_bodies
+    assert not any("previous answer" in b for b in sent_bodies), sent_bodies
+    # ...and the cursor was advanced so it won't be re-posted next restart.
+    repo.set_mirror_replied_uuid.assert_awaited_once_with(11, "u-final")
+
+
+async def test_on_ready_seeds_cursor_silently_when_null(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """First time a session is tracked (cursor NULL, e.g. right after the
+    migration added the column) the last answer must NOT be re-posted —
+    otherwise every existing thread is spammed on the first deploy. The cursor
+    is seeded silently instead."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+    (project / "s.jsonl").write_text(
+        "\n".join(
+            json.dumps(e)
+            for e in [
+                {
+                    "type": "assistant",
+                    "uuid": "u-final",
+                    "message": {"content": [{"type": "text", "text": "pre-existing last answer"}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+        )
+        + "\n"
+    )
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _recovery_repo([_session_row(11, "/some/cwd", None)])
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    try:
+        await cog.on_ready()
+    finally:
+        await cog.cog_unload()
+
+    sent_bodies = [
+        (c.kwargs.get("content") or (c.args[0] if c.args else ""))
+        for c in channel.send.call_args_list
+    ]
+    assert not any("pre-existing last answer" in b for b in sent_bodies), sent_bodies
+    # Cursor seeded so a genuine drop on the *next* restart can be detected.
+    repo.set_mirror_replied_uuid.assert_awaited_once_with(11, "u-final")
+
+
+async def test_on_ready_does_not_redeliver_when_uuid_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the stored uuid already matches the last final answer, no re-delivery."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+    (project / "s.jsonl").write_text(
+        "\n".join(
+            json.dumps(e)
+            for e in [
+                {
+                    "type": "assistant",
+                    "uuid": "u-final",
+                    "message": {"content": [{"type": "text", "text": "already delivered"}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+        )
+        + "\n"
+    )
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _recovery_repo([_session_row(11, "/some/cwd", "u-final")])
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    try:
+        await cog.on_ready()
+    finally:
+        await cog.cog_unload()
+
+    sent_bodies = [
+        (c.kwargs.get("content") or (c.args[0] if c.args else ""))
+        for c in channel.send.call_args_list
+    ]
+    assert not any("already delivered" in b for b in sent_bodies), sent_bodies
+    repo.set_mirror_replied_uuid.assert_not_awaited()
