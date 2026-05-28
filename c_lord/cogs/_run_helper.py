@@ -22,7 +22,12 @@ import time
 
 import discord
 
-from ..discord_ui.ask_handler import ASK_ANSWER_TIMEOUT, collect_ask_answers  # noqa: F401
+from ..claude.tmux_runner import TmuxClaudeRunner
+from ..discord_ui.ask_handler import (  # noqa: F401
+    ASK_ANSWER_TIMEOUT,
+    bridge_pane_ask,
+    collect_ask_answers,
+)
 from ..discord_ui.embeds import error_embed, timeout_embed
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
@@ -222,15 +227,35 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         from ..skills.reply_tracker import was_replied_since
 
         if not was_replied_since(config.thread.id, turn_started_at):
-            logger.warning(
-                "%s Claude finished without calling discord-reply — posting fallback notice",
-                ctx,
-            )
-            with contextlib.suppress(Exception):
-                await config.thread.send(
-                    "-# ⚠️ Claude finished without calling the `discord-reply` skill. "
-                    "Check the tmux pane for the response, or retry the turn."
+            # #219: the run loop may have finalized just before an AskUserQuestion
+            # menu rendered, leaving Claude blocked on a TUI menu that was never
+            # bridged. Re-check the pane: if a menu is open, bridge it to Discord
+            # buttons instead of posting the misleading 'no discord-reply' notice.
+            pending_pane_ask = None
+            if isinstance(runner, TmuxClaudeRunner):
+                pending_pane_ask = await runner.peek_pending_ask()
+
+            if pending_pane_ask is not None:
+                logger.info(
+                    "%s Recovered open AskUserQuestion menu post-turn — bridging to Discord",
+                    ctx,
                 )
+                await bridge_pane_ask(
+                    config.thread,
+                    pending_pane_ask,
+                    runner,
+                    ask_repo=config.ask_repo,
+                )
+            else:
+                logger.warning(
+                    "%s Claude finished without calling discord-reply — posting fallback notice",
+                    ctx,
+                )
+                with contextlib.suppress(Exception):
+                    await config.thread.send(
+                        "-# ⚠️ Claude finished without calling the `discord-reply` skill. "
+                        "Check the tmux pane for the response, or retry the turn."
+                    )
 
     # After the stream ends, handle pending AskUserQuestion by showing Discord
     # UI and resuming the session with the user's answer.

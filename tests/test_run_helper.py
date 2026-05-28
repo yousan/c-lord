@@ -475,6 +475,73 @@ class TestNoReplyFallback:
                 assert "discord-reply" not in content
 
 
+class TestRecoverMissedPaneAsk:
+    """Issue #219: the run loop can finalize a turn just before an
+    AskUserQuestion menu renders, leaving Claude blocked on a TUI menu that was
+    never bridged to Discord buttons (the user sees no choices).  Before posting
+    the #67 'no discord-reply' fallback, run_claude_with_config must re-check the
+    pane and bridge an open menu instead of posting the misleading notice."""
+
+    @pytest.fixture
+    def thread(self) -> MagicMock:
+        t = MagicMock(spec=discord.Thread)
+        t.id = 219219219
+        t.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        return t
+
+    @pytest.fixture
+    def repo(self) -> MagicMock:
+        r = MagicMock()
+        r.save = AsyncMock()
+        return r
+
+    def _make_async_gen(self, events):
+        async def gen(*args, **kwargs):
+            for e in events:
+                yield e
+
+        return gen
+
+    @pytest.mark.asyncio
+    async def test_open_menu_is_bridged_and_no_fallback(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.run = self._make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
+            ]
+        )
+        pending = AskQuestion(
+            question="Which environment?",
+            header="Deploy",
+            options=[AskOption(label="Production", description="本番")],
+        )
+        runner.peek_pending_ask = AsyncMock(return_value=pending)
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_awaited_once()
+        # The misleading "no discord-reply" fallback must NOT be posted.
+        for call in thread.send.call_args_list:
+            for arg in call.args:
+                if isinstance(arg, str):
+                    assert "discord-reply" not in arg
+            content = call.kwargs.get("content")
+            if isinstance(content, str):
+                assert "discord-reply" not in content
+
+
 class TestMakeErrorEmbed:
     """Unit tests for the _make_error_embed router function."""
 

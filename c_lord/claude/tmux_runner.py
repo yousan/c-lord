@@ -959,6 +959,19 @@ class TmuxClaudeRunner:
         """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""
         await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape")
 
+    async def peek_pending_ask(self) -> AskQuestion | None:
+        """Re-capture the pane and return an open AskUserQuestion menu, if any (#219).
+
+        Post-turn safety net: the ``run`` poll loop only bridges a menu while it
+        is active, so a turn that finalizes just before the menu renders (e.g.
+        the 30s stable-response fallback firing during a silent pre-menu thinking
+        phase) leaves Claude blocked on a TUI menu that was never bridged.
+        ``_run_helper`` calls this after the stream ends to recover such a menu
+        and bridge it instead of posting the misleading 'no discord-reply' notice.
+        """
+        raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        return _parse_ask_from_pane(_normalize_capture(raw))
+
     @staticmethod
     def _extract_response(pane_text: str) -> str:
         """Extract Claude's latest response from the TUI pane text.
