@@ -31,6 +31,7 @@ from ..transcript.mirror import (
     silent_posts_enabled,
     verbosity_mode,
 )
+from ..transcript.recovery import last_completed_final_answer
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -64,14 +65,65 @@ class TranscriptMirrorCog(commands.Cog):
         # Sessions are bounded by Discord usage; 10k is well above realistic.
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
+        recovered = 0
         for row in rows:
-            if row.working_dir and self.start_for(row.thread_id, row.working_dir):
+            if not row.working_dir:
+                continue
+            # Issue #215: re-deliver a final answer that was written to the
+            # jsonl while the bot was down (mirror not tailing). The resumed
+            # mirror tails from EOF and would otherwise skip it forever.
+            try:
+                if await self._recover_final_answer(row.thread_id, row.working_dir, row):
+                    recovered += 1
+            except Exception:
+                logger.warning(
+                    "TranscriptMirrorCog: final-answer recovery failed thread=%d",
+                    row.thread_id,
+                    exc_info=True,
+                )
+            if self.start_for(row.thread_id, row.working_dir):
                 started += 1
         logger.info(
-            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s)",
+            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s), "
+            "recovered %d dropped final answer(s)",
             started,
             len(rows),
+            recovered,
         )
+
+    async def _recover_final_answer(self, thread_id: int, working_dir: str, row) -> bool:
+        """Re-deliver the last completed turn's final answer if it was dropped.
+
+        Returns True if a recovery post was made. Dedup is by the assistant
+        event uuid: a final answer whose uuid already matches the stored
+        ``mirror_replied_uuid`` was delivered live and is left alone.
+        """
+        fa = last_completed_final_answer(derive_project_dir(working_dir))
+        if fa is None:
+            return False
+        stored = getattr(row, "mirror_replied_uuid", None)
+        if fa.uuid == stored:
+            return False  # already delivered live
+        if stored is None:
+            # First time we track this session (e.g. right after the column was
+            # added by migration). We cannot tell whether the pre-fix mirror
+            # delivered this answer, so assume it did and only seed the cursor —
+            # otherwise every existing thread would be spammed with its last
+            # answer on the first deploy. Genuine drops are caught on the *next*
+            # restart, when the cursor is set and a newer turn differs.
+            await self._session_repo.set_mirror_replied_uuid(thread_id, fa.uuid)
+            return False
+        # Cursor is set and a newer completed turn's final answer differs from
+        # it → that answer was written while the mirror was down. Re-deliver it.
+        reply_sink = self._make_reply_sink(thread_id)
+        await reply_sink(fa.text)
+        await self._session_repo.set_mirror_replied_uuid(thread_id, fa.uuid)
+        logger.info(
+            "TranscriptMirrorCog: recovered dropped final answer thread=%d uuid=%s",
+            thread_id,
+            fa.uuid,
+        )
+        return True
 
     def start_for(self, thread_id: int, working_dir: str) -> bool:
         """Spawn a mirror for ``thread_id`` if one is not already running.
@@ -88,12 +140,14 @@ class TranscriptMirrorCog(commands.Cog):
         sink = self._make_sink(thread_id)
         reply_sink = self._make_reply_sink(thread_id)
         file_sink = self._make_file_sink(thread_id)
+        reply_cursor_sink = self._make_cursor_sink(thread_id)
         mirror = TranscriptMirror(
             thread_id=thread_id,
             project_dir=project_dir,
             sink=sink,
             reply_sink=reply_sink,
             file_sink=file_sink,
+            reply_cursor_sink=reply_cursor_sink,
             verbosity=verbosity_mode(),
         )
         mirror.start()
@@ -113,6 +167,19 @@ class TranscriptMirrorCog(commands.Cog):
     async def cog_unload(self) -> None:
         await asyncio.gather(*(m.stop() for m in self._mirrors.values()), return_exceptions=True)
         self._mirrors.clear()
+
+    def _make_cursor_sink(self, thread_id: int):
+        """Return an awaitable that records the delivered final-answer uuid.
+
+        Issue #215: persists ``mirror_replied_uuid`` after each completed turn
+        so a restart can tell the final answer was already delivered.
+        """
+
+        async def cursor_sink(uuid: str) -> None:
+            with contextlib.suppress(Exception):
+                await self._session_repo.set_mirror_replied_uuid(thread_id, uuid)
+
+        return cursor_sink
 
     def _make_sink(self, thread_id: int):
         """Return an awaitable callable that posts intermediate messages silently."""

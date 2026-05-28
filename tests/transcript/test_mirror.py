@@ -668,3 +668,42 @@ def test_progress_content_not_truncated_when_within_limit(tmp_path: Path) -> Non
 
     small = "tool output line"
     assert _truncate_progress(small) == small
+
+
+# ── Issue #215: cursor sink records the final-answer uuid at turn end ──
+
+
+async def test_reply_cursor_sink_records_final_uuid_on_turn_end(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    cursor: list[str] = []
+
+    async def sink(text: str) -> None:  # pragma: no cover - not asserted here
+        pass
+
+    async def reply_cursor_sink(uuid: str) -> None:
+        cursor.append(uuid)
+
+    mirror = TranscriptMirror(
+        thread_id=7,
+        project_dir=project,
+        sink=sink,
+        reply_cursor_sink=reply_cursor_sink,
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, {**_assistant_text("the final answer"), "uuid": "u-final"})
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    assert cursor == ["u-final"]

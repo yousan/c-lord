@@ -137,6 +137,10 @@ _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN topic_source TEXT",
     # Issue #115: silent posts + reply threading
     "ALTER TABLE sessions ADD COLUMN trigger_message_id INTEGER",
+    # Issue #215: uuid of the last final answer the mirror delivered, so a
+    # restart can detect & re-deliver a final answer dropped while the bot
+    # was down (mirror not tailing).
+    "ALTER TABLE sessions ADD COLUMN mirror_replied_uuid TEXT",
 ]
 
 
