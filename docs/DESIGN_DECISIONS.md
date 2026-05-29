@@ -259,3 +259,54 @@ Three compounding root causes, none of them "the bot is buggy":
 caution, and the operational rules above (kill by explicit PID, count with
 `ps`, launch with `setsid -f`) are the standard procedure. Net: one bot per
 env, no token churn, no cross-clone collateral.
+
+## 14. Working agreements (how Issues / PRs / evidence are run)
+
+**Decision:** The maintainer's working conduct is codified in three layers, kept
+separate so commands stay terse and rationale stays traceable:
+
+1. **CLAUDE.md = commands only** — the "開発の行動規範 (Working Conduct)" section
+   plus the Issue/PR/DoD rules. Imperative, short.
+2. **`.github` templates = enforcement by form** — the Issue and PR templates make
+   each rule a field the author must fill (Why, binary ACs, scope-out, Staging
+   Evidence with screenshots, `<details>` for long logs).
+3. **This file = the why** — rationale and the conversation that produced each rule.
+
+The agreed rules:
+
+- **Answer the question first; don't silently turn a question into work.** An
+  opening question ("why is the menu not showing?", "is this spec or a bug?") is a
+  request for a *diagnosis*, not a work order. Diagnose (spec vs bug) from real
+  behaviour + the Why, then act once it's agreed.
+- **Autonomy applies to agreed work only.** Once "we're fixing X" is settled, the
+  agent may self-run through PR → manual QA → merge → prod redeploy → prod
+  measurement. The opening question is *not yet* agreed work.
+- **Soft requests get "answer → then action", in that order.** Heavy/irreversible
+  calls (design changes, destructive ops) get a one-line confirm instead of a guess.
+- **No pandering, no taking the user's hypothesis as fact** — verify against real
+  data and flag mismatches.
+- **Why is the spine of an Issue.** It's read after close to trace intent.
+- **Evidence is real, not asserted.** Green tests / "I implemented it" is a
+  necessary-but-insufficient condition; "done" requires RED→GREEN reproduced **on
+  staging**. Discord-side proof is normally a **user-provided screenshot** (the
+  server-side agent has no GUI), supplemented by tmux captures + REST-fetched text.
+
+**Why (what motivated this):**
+
+A week-long review of the maintainer's own Discord messages (~1900, excluding
+AI-authored Issue/commit text) surfaced a gap between *what was said* and *what
+got recorded*. The records (Issues/PRs/commits) tended to close on "tests green /
+done"; the maintainer repeatedly pushed the opposite: mocks-green-but-broke-on-real-hardware
+had happened, so "done" must mean reproduced-and-fixed on the real bot, with a
+screenshot of the actual Discord behaviour. A second, subtler gap: when the
+maintainer asked "why is X happening?", the agent would read code and jump
+straight to a fix/PR, skipping the diagnosis the maintainer actually wanted
+("is this the intended spec, or a bug?"). A third: some transcript "user"
+messages were polished instruction text the maintainer had an AI draft and
+pasted — not the maintainer's own intent — so they over-weighted a "stop after
+every PR / merge is the user's gate" reading that the maintainer later corrected
+(self-run through merge/deploy is fine for now).
+
+**Fix:** Codify the conduct in CLAUDE.md, enforce the artifact fields via the
+`.github` templates, and record the rationale here. See CLAUDE.md → "開発の行動規範
+(Working Conduct)" and "Definition of Done (DoD)".
