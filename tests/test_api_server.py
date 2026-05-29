@@ -690,6 +690,65 @@ class TestReplyEndpoint:
         assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_long_content_is_chunked_across_multiple_messages(
+        self, reply_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        """Regression: replies longer than Discord's 2000-char limit were cut
+        off. The endpoint must split them into multiple sends, each <= 2000,
+        with no content lost."""
+        long_content = "\n".join(f"sentence number {i} here." for i in range(400))
+        assert len(long_content) > 2000
+
+        resp = await reply_client.post(
+            "/api/reply",
+            json={"thread_id": 555666777, "content": long_content},
+        )
+        assert resp.status == 200
+        assert thread_mock.send.call_count >= 2
+
+        sent_bodies: list[str] = []
+        for call in thread_mock.send.call_args_list:
+            body = call.kwargs.get("content")
+            if body is None and call.args:
+                body = call.args[0]
+            assert body is not None
+            assert len(body) <= 2000
+            sent_bodies.append(body)
+
+        # Every original sentence survives across the chunks, in order.
+        joined = "\n".join(sent_bodies)
+        for i in range(400):
+            assert f"sentence number {i} here." in joined
+
+    @pytest.mark.asyncio
+    async def test_long_content_attaches_files_to_last_chunk_only(
+        self, reply_client: TestClient, thread_mock: MagicMock, tmp_path
+    ) -> None:
+        """When content is chunked, the optional attachment must ride on the
+        final message (not be dropped or duplicated across chunks)."""
+        progress = tmp_path / "progress.txt"
+        progress.write_text("detail\n")
+        long_content = "\n".join(f"row {i}" for i in range(700))
+        assert len(long_content) > 2000
+
+        resp = await reply_client.post(
+            "/api/reply",
+            json={
+                "thread_id": 555666777,
+                "content": long_content,
+                "progress_file": str(progress),
+            },
+        )
+        assert resp.status == 200
+        calls = thread_mock.send.call_args_list
+        assert len(calls) >= 2
+        # Only the final send carries the file.
+        for call in calls[:-1]:
+            assert "file" not in call.kwargs and "files" not in call.kwargs
+        last = calls[-1].kwargs
+        assert "file" in last or "files" in last
+
+    @pytest.mark.asyncio
     async def test_successful_reply_records_in_tracker(self, reply_client: TestClient) -> None:
         """Issue #67: api_server records each /api/reply call so run_helper
         can detect turns where the skill was never invoked."""

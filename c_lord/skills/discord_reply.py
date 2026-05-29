@@ -72,8 +72,10 @@ JSON
 1. Call this skill exactly once per turn, at the very end, with your final answer.
 2. Do not include intermediate progress in `content` — write it to a file and
    pass the absolute path via `progress_file`.
-3. Keep `content` under ~1800 characters (Discord limit is 2000; leave room
-   for chrome). If your answer is longer, paginate or attach it.
+3. Send your full answer in `content` — c-lord splits messages longer than
+   Discord's 2000-char limit into multiple posts automatically, so do NOT
+   truncate or cut off your answer to fit. For very long detail dumps (logs,
+   large diffs) prefer writing to a file and passing `progress_file`.
 4. Markdown is supported (bold, lists, code fences). URLs render as text only
    (no preview embeds, by design).
 """
@@ -140,8 +142,10 @@ JSON
 1. Call this skill exactly once per turn, at the very end, with your final answer.
 2. Do not include intermediate progress in `content` — write it to a file and
    pass the absolute path via `progress_file`.
-3. Keep `content` under ~1800 characters (Discord limit is 2000; leave room
-   for chrome). If your answer is longer, paginate or attach it.
+3. Send your full answer in `content` — c-lord splits messages longer than
+   Discord's 2000-char limit into multiple posts automatically, so do NOT
+   truncate or cut off your answer to fit. For very long detail dumps (logs,
+   large diffs) prefer writing to a file and passing `progress_file`.
 4. Markdown is supported (bold, lists, code fences). URLs render as text only
    (no preview embeds, by design).
 5. The Bearer token above must be sent with every request. Do not log or

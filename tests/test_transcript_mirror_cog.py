@@ -84,9 +84,11 @@ async def test_start_for_noop_when_not_jsonl_mode(
     assert cog.start_for(1, str(tmp_path)) is False
 
 
-async def test_sink_truncates_long_messages(
+async def test_sink_chunks_long_messages_without_truncation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Issue #235: long bodies must be split into multiple sends, not
+    truncated to 1985 chars + '…'."""
     monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     bot = MagicMock()
     channel = MagicMock()
@@ -96,9 +98,64 @@ async def test_sink_truncates_long_messages(
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
     sink = cog._make_sink(7)
     await sink("a" * 3000)
-    sent = channel.send.call_args.kwargs.get("content") or channel.send.call_args[0][0]
-    assert len(sent) <= 2000
-    assert sent.endswith("…")
+    assert channel.send.call_count >= 2
+    bodies = []
+    for call in channel.send.call_args_list:
+        body = call.kwargs.get("content") or (call.args[0] if call.args else "")
+        assert len(body) <= 2000
+        assert not body.endswith("…")  # no lossy truncation
+        bodies.append(body)
+    assert sum(len(b) for b in bodies) == 3000  # full content preserved
+
+
+async def test_reply_sink_chunks_long_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #235: final assistant text longer than 2000 chars is chunked."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    reply_sink = cog._make_reply_sink(7)
+    text = "\n".join(f"answer line {i}" for i in range(300))
+    assert len(text) > 2000
+    await reply_sink(text)
+    assert channel.send.call_count >= 2
+    for call in channel.send.call_args_list:
+        body = call.kwargs.get("content") or (call.args[0] if call.args else "")
+        assert len(body) <= 2000
+        assert not body.endswith("…")
+
+
+async def test_file_sink_chunks_and_attaches_to_last_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #235: when the final answer is chunked, the progress.txt
+    attachment rides on the last message only."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output\n")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(7)
+    text = "\n".join(f"answer line {i}" for i in range(300))
+    assert len(text) > 2000
+    await file_sink(text, str(progress_file))
+
+    calls = channel.send.call_args_list
+    assert len(calls) >= 2
+    for call in calls[:-1]:
+        assert "file" not in call.kwargs and "files" not in call.kwargs
+        body = call.kwargs.get("content") or (call.args[0] if call.args else "")
+        assert len(body) <= 2000
+    assert "files" in calls[-1].kwargs or "file" in calls[-1].kwargs
 
 
 async def test_sink_falls_back_to_fetch_channel(
