@@ -131,6 +131,7 @@ async def main(env_path: Path | None = None) -> None:
             runner,
             api_server=api_server,
             session_db_path=db_path,
+            task_db_path=str(data_dir / "tasks.db"),
             allowed_user_ids=allowed_user_ids,
             allowed_role_name=allowed_role_name,
             claude_channel_id=int(config["channel_id"]),
