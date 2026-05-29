@@ -49,17 +49,20 @@ async def test_version_impl_posts_embed(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_slash_command_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_slash_io_sends_embed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "c_lord.cogs.version_cmd.resolve_version",
         lambda: "v1.0.0-bcafef00-20260529",
     )
     cog = VersionCog(MagicMock())
     interaction = MagicMock()
-    interaction.response.send_message = AsyncMock()
+    send_message = AsyncMock()
+    interaction.response.send_message = send_message
 
-    await cog.version.callback(cog, interaction)
+    # Drive the shared core through the real slash I/O adapter.
+    await cog._version_impl(respond=cog._slash_io(interaction))
 
-    interaction.response.send_message.assert_awaited_once()
-    kwargs = interaction.response.send_message.await_args.kwargs
-    assert "v1.0.0-bcafef00-20260529" in kwargs["embed"].description
+    send_message.assert_awaited_once()
+    call = send_message.await_args
+    assert call is not None
+    assert "v1.0.0-bcafef00-20260529" in call.kwargs["embed"].description
