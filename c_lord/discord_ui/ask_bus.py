@@ -40,6 +40,15 @@ class AskAnswerBus:
         logger.debug("AskAnswerBus: registered waiter for thread %d", thread_id)
         return q
 
+    def is_active(self, thread_id: int) -> bool:
+        """Return True if a bridge is currently waiting for an answer on *thread_id*.
+
+        Used to dedup between the run_claude poll-loop bridge and the always-on
+        transcript-mirror bridge (#232): whichever registers first owns the
+        menu; the other must not show a second set of buttons.
+        """
+        return thread_id in self._waiters
+
     def post_answer(self, thread_id: int, answers: list[str]) -> bool:
         """Deliver *answers* to the coroutine waiting for *thread_id*.
 

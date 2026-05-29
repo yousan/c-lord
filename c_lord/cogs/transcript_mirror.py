@@ -149,6 +149,7 @@ class TranscriptMirrorCog(commands.Cog):
             file_sink=file_sink,
             reply_cursor_sink=reply_cursor_sink,
             verbosity=verbosity_mode(),
+            ask_bridge_cb=self._make_ask_bridge(thread_id),
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -180,6 +181,47 @@ class TranscriptMirrorCog(commands.Cog):
                 await self._session_repo.set_mirror_replied_uuid(thread_id, uuid)
 
         return cursor_sink
+
+    def _make_ask_bridge(self, thread_id: int):
+        """Return an async cb that bridges an AskUserQuestion menu to Discord (#232).
+
+        Builds a TmuxClaudeRunner for the thread's tmux window (to deliver the
+        chosen option as menu keystrokes) and shows Discord buttons via
+        ``bridge_pane_ask`` — so a menu raised outside a bot ``run_claude`` turn
+        (e.g. autonomous task-notification continuation) is no longer leaked.
+        """
+        bot = self.bot
+
+        async def ask_bridge(question) -> None:
+            from ..claude.tmux_runner import TmuxClaudeRunner
+            from ..discord_ui.ask_bus import ask_bus
+            from ..discord_ui.ask_handler import bridge_pane_ask
+            from .channel_repo import ChannelRepoCog
+
+            # Defer to the run_claude poll-loop bridge if it already owns this menu.
+            if ask_bus.is_active(thread_id):
+                return
+            channel = await self._resolve_channel(bot, thread_id)
+            if not isinstance(channel, discord.Thread):
+                return
+            parent_id = getattr(channel, "parent_id", None) or thread_id
+            channel_cog = bot.get_cog("ChannelRepoCog")
+            tmux_manager = None
+            if isinstance(channel_cog, ChannelRepoCog):
+                tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
+            if tmux_manager is None:
+                tmux_manager = getattr(bot, "tmux_manager", None)
+            if tmux_manager is None:
+                logger.warning(
+                    "TranscriptMirror ask-bridge: no tmux manager for thread=%d", thread_id
+                )
+                return
+            runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
+            await bridge_pane_ask(
+                channel, question, runner, ask_repo=getattr(bot, "ask_repo", None)
+            )
+
+        return ask_bridge
 
     def _make_sink(self, thread_id: int):
         """Return an awaitable callable that posts intermediate messages silently."""
