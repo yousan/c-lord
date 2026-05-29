@@ -358,6 +358,18 @@ def cmd_start(env_path: Path = Path(".env")) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cmd_version — print the running build's article-format version
+# ---------------------------------------------------------------------------
+
+
+def cmd_version() -> None:
+    """Entry point for `c-lord version` — prints e.g. v1.4.0-b599631-20251203."""
+    from c_lord.version import resolve_version
+
+    print(resolve_version())
+
+
+# ---------------------------------------------------------------------------
 # main() — argument parsing
 # ---------------------------------------------------------------------------
 
@@ -388,12 +400,17 @@ def main() -> None:
         help="Path to the .env file (default: .env)",
     )
 
+    # version
+    sub.add_parser("version", help="Print the running c-lord build version")
+
     args = parser.parse_args()
 
     if args.command == "setup":
         cmd_setup(Path(args.env))
     elif args.command == "start":
         cmd_start(Path(args.env))
+    elif args.command == "version":
+        cmd_version()
     else:
         parser.print_help()
         sys.exit(0)

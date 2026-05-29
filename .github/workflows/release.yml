@@ -1,0 +1,59 @@
+name: Release
+
+# Tag-triggered: pushing a vX.Y.Z tag (e.g. via scripts/release.sh --apply)
+# publishes a GitHub Release whose notes are the matching CHANGELOG.md section.
+# The tag itself is the single source of truth for the version (hatch-vcs).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes from CHANGELOG
+        id: notes
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          python3 - "$VERSION" <<'PY' > release_notes.md
+          import sys, pathlib
+          sys.path.insert(0, ".")
+          from c_lord.version import extract_changelog_section
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          section = extract_changelog_section(text, version)
+          if section:
+              print(section)
+          else:
+              print(f"Release {version}. See CHANGELOG.md for details.")
+          PY
+          echo "----- release notes -----"
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file release_notes.md

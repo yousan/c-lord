@@ -19,6 +19,7 @@ from .cogs.run_config import RunConfig
 from .cogs.scheduler import SchedulerCog
 from .cogs.session_manage import SessionManageCog
 from .cogs.skill_command import SkillCommandCog
+from .cogs.version_cmd import VersionCog
 from .cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
 from .concurrency import ActiveSession, SessionRegistry
 from .database.channel_repo import ChannelRepository
@@ -38,8 +39,31 @@ from .protocols import DrainAware
 from .session_dir import CleanupResult, SessionDirInfo, SessionDirManager
 from .setup import BridgeComponents, setup_bridge
 from .tmux import TmuxSessionManager
+from .version import resolve_version
+
+
+def _resolve_dist_version() -> str:
+    """Best-effort installed-distribution version for ``__version__``.
+
+    Falls back to "0.0.0" when the package isn't installed (e.g. running from a
+    source tree before the hatch-vcs build hook has run). The richer
+    article-format string is available via ``resolve_version()``.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("c-lord")
+    except PackageNotFoundError:
+        return "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+
+__version__ = _resolve_dist_version()
 
 __all__ = [
+    "__version__",
+    "resolve_version",
     # Core
     "ClaudeConfig",
     "TmuxClaudeRunner",
@@ -54,6 +78,7 @@ __all__ = [
     "SessionRegistry",
     "SessionManageCog",
     "SkillCommandCog",
+    "VersionCog",
     "SessionRepository",
     "SettingsRepository",
     # Webhook & Automation

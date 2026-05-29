@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Versioning & releases** — version is now derived from git tags via `hatch-vcs` (single source of truth; `pyproject.toml` no longer hardcodes it). New `/version` slash command + `!version` text twin and `c-lord version` CLI report the running build in the article format `v1.4.0-b<commit>-<YYYYMMDD>` (semver + short commit + commit date). Tag-triggered `release.yml` publishes a GitHub Release with notes extracted from this changelog; `scripts/release.sh` cuts the tag
+
 ## [1.4.0] - 2026-02-22
 
 ### Added

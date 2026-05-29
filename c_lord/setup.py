@@ -130,6 +130,7 @@ async def setup_bridge(
     from .cogs.session_manage import SessionManageCog
     from .cogs.skill_command import SkillCommandCog
     from .cogs.transcript_mirror import TranscriptMirrorCog
+    from .cogs.version_cmd import VersionCog
     from .database.ask_repo import PendingAskRepository
     from .database.channel_repo import ChannelRepository
     from .database.lounge_repo import LoungeRepository
@@ -242,6 +243,10 @@ async def setup_bridge(
     await bot.add_cog(transcript_cog)
     bot.transcript_mirror_cog = transcript_cog  # type: ignore[attr-defined]
     logger.info("Registered TranscriptMirrorCog (active when CLORD_BRIDGE_MODE=jsonl)")
+
+    # --- VersionCog (read-only /version + !version twin, zero-config) ---
+    await bot.add_cog(VersionCog(bot))
+    logger.info("Registered VersionCog")
 
     # --- SchedulerCog (optional) ---
     task_repo: TaskRepository | None = None
