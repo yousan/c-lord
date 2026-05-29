@@ -781,6 +781,42 @@ class TestReplyEndpoint:
         assert resp.status == 400
         assert was_replied_since(thread_id=555666777, since=before) is False
 
+    @pytest.mark.asyncio
+    async def test_reply_to_trigger_without_progress_file(
+        self, repo: NotificationRepository, bot_with_thread: MagicMock, thread_mock: MagicMock
+    ) -> None:
+        """Issue #201: a plain reply (no progress_file) on a thread that has a
+        trigger_message_id must not raise UnboundLocalError on ``discord``.
+
+        The ``discord`` module used to be imported only inside the
+        ``if progress_file:`` block, so the later ``discord.MessageReference``
+        reference raised ``UnboundLocalError`` -> 500 when progress_file was absent.
+        """
+        session_repo = MagicMock()
+        record = MagicMock()
+        record.trigger_message_id = 111222333
+        session_repo.get = AsyncMock(return_value=record)
+
+        api = ApiServer(
+            repo=repo,
+            bot=bot_with_thread,
+            default_channel_id=12345,
+            session_repo=session_repo,
+        )
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 555666777, "content": "plain answer"},
+            )
+            assert resp.status == 200
+            kwargs = thread_mock.send.call_args.kwargs
+            assert "reference" in kwargs
+        finally:
+            await client.close()
+
 
 class TestPromptChoiceEndpoint:
     """Issue #63: POST /api/prompt-choice — Skill posts a choice prompt."""

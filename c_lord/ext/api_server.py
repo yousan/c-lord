@@ -686,6 +686,12 @@ class ApiServer:
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
+        # Issue #201: import unconditionally — `discord` is referenced later for
+        # MessageReference / table images even when progress_file is absent. A
+        # conditional import made the name a function-local that was unbound on
+        # the no-attachment path, raising UnboundLocalError -> 500.
+        import discord
+
         # Optional attachment — resolve and validate before touching Discord.
         progress_file = data.get("progress_file")
         attachment = None
@@ -698,7 +704,6 @@ class ApiServer:
                     {"error": f"progress_file not found: {progress_file}"},
                     status=400,
                 )
-            import discord
 
             attachment = discord.File(str(path), filename=path.name)
 
