@@ -92,6 +92,46 @@ class TestHardStallCallback:
         await sm.cleanup()
 
 
+class TestReactionLamp:
+    """#246: the message reaction is the 🟢 running / 🟡 waiting lamp."""
+
+    @pytest.mark.asyncio
+    async def test_set_thinking_shows_running_lamp(self) -> None:
+        from c_lord.discord_ui.status import EMOJI_RUNNING
+
+        msg = _make_message()
+        sm = StatusManager(msg)
+        await sm.set_thinking()
+        await asyncio.sleep(1)  # debounce
+        assert sm._target_emoji == EMOJI_RUNNING
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_set_tool_keeps_running_lamp_not_tool_glyph(self) -> None:
+        """While a tool runs the lamp stays 🟢 (tool detail lives in embeds)."""
+        from c_lord.discord_ui.status import EMOJI_RUNNING
+
+        msg = _make_message()
+        sm = StatusManager(msg)
+        await sm.set_thinking()
+        await sm.set_tool(ToolCategory.EDIT)
+        await asyncio.sleep(1)
+        assert sm._target_emoji == EMOJI_RUNNING
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_set_done_shows_waiting_lamp(self) -> None:
+        from c_lord.discord_ui.status import EMOJI_WAITING
+
+        msg = _make_message()
+        sm = StatusManager(msg)
+        await sm.set_thinking()
+        await asyncio.sleep(1)
+        await sm.set_done()
+        assert sm._current_emoji == EMOJI_WAITING
+        msg.add_reaction.assert_awaited_with(EMOJI_WAITING)
+
+
 class TestCompactStatus:
     """Tests for compact status emoji."""
 

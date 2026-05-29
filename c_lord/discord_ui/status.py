@@ -17,6 +17,13 @@ from ..claude.types import ToolCategory
 
 logger = logging.getLogger(__name__)
 
+# Status lamp emoji (#246). The message reaction is the at-a-glance lamp:
+#   🟢 = Claude is working on this turn   🟡 = done, your turn
+# Reactions live on a different Discord rate-limit bucket than thread renames,
+# so this flips reliably per message (unlike the rate-limited thread-name lamp).
+EMOJI_RUNNING = "\U0001f7e2"  # 🟢
+EMOJI_WAITING = "\U0001f7e1"  # 🟡
+
 # Status emoji mapping
 EMOJI_THINKING = "\U0001f9e0"  # 🧠
 EMOJI_TOOL = "\U0001f6e0\ufe0f"  # 🛠️
@@ -66,32 +73,37 @@ class StatusManager:
         self._hard_stall_notified = False
 
     async def set_thinking(self) -> None:
-        """Set status to thinking."""
-        await self._set_status(EMOJI_THINKING)
+        """Lamp → 🟢 running (Claude is working on this turn)."""
+        await self._set_status(EMOJI_RUNNING)
         self._start_stall_timer()
 
     async def set_tool(self, category: ToolCategory) -> None:
-        """Set status based on tool category."""
-        emoji = CATEGORY_EMOJI.get(category, EMOJI_TOOL)
-        await self._set_status(emoji)
+        """Tool activity keeps the lamp 🟢 running (#246).
+
+        The per-tool glyphs (🛠️/💻/🌐) are no longer shown as reactions — the
+        tool-use embeds in the thread already carry that detail, so the reaction
+        stays a stable at-a-glance lamp. ``category`` is kept for API
+        compatibility. Resets the stall timer (activity detected).
+        """
+        await self._set_status(EMOJI_RUNNING)
         self._reset_stall_timer()
 
     async def set_done(self) -> None:
-        """Set status to done — add ✅ and leave it permanently."""
+        """Lamp → 🟡 waiting (turn finished, your turn) and leave it (#246)."""
         self._cancel_stall_timer()
-        # Cancel any pending debounce that might overwrite the done emoji
+        # Cancel any pending debounce that might overwrite the waiting emoji
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
-        # Remove the current status emoji (thinking, tool, etc.) if any
-        if self._current_emoji and self._current_emoji != EMOJI_DONE:
+        # Remove the current status emoji (running, stall, etc.) if any
+        if self._current_emoji and self._current_emoji != EMOJI_WAITING:
             with contextlib.suppress(discord.HTTPException, AttributeError):
                 guild = self._message.guild
                 if guild:
                     await self._message.remove_reaction(self._current_emoji, guild.me)
-        # Add ✅ and leave it
+        # Add 🟡 and leave it until the next turn starts
         with contextlib.suppress(discord.HTTPException):
-            await self._message.add_reaction(EMOJI_DONE)
-        self._current_emoji = EMOJI_DONE
+            await self._message.add_reaction(EMOJI_WAITING)
+        self._current_emoji = EMOJI_WAITING
 
     async def set_compact(self) -> None:
         """Set status to compacting (context compression in progress)."""
