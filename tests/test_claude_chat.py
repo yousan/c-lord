@@ -671,6 +671,16 @@ class TestInterruptOnNewMessage:
         assert isinstance(cog._active_tasks, dict)
         assert len(cog._active_tasks) == 0
 
+    def test_is_processing_reflects_active_tasks(self) -> None:
+        """is_processing() is the lamp's source of truth for 🟢 running (#236):
+        True iff a Claude turn is currently registered for the thread."""
+        cog = _make_cog()
+        assert cog.is_processing(42) is False
+        cog._active_tasks[42] = MagicMock()
+        assert cog.is_processing(42) is True
+        del cog._active_tasks[42]
+        assert cog.is_processing(42) is False
+
 
 class TestZeroConfigCoordination:
     """_get_coordination() must work without any consumer wiring (Zero-Config Principle).
@@ -1821,12 +1831,22 @@ class TestApplyThreadNamingRetitle:
 
         instruction = "次はDockerfileを最適化してCI/CDを改善してください"
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="Dockerfileの最適化")):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message=instruction)
+        with patch.object(
+            cc_module.topic_module,
+            "maybe_retitle",
+            new=AsyncMock(return_value="Dockerfileの最適化"),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message=instruction
+            )
 
-        cog.repo.set_topic.assert_awaited_once_with(55555, "Dockerfileの最適化", source="llm_retitle")
+        cog.repo.set_topic.assert_awaited_once_with(
+            55555, "Dockerfileの最適化", source="llm_retitle"
+        )
         thread.edit.assert_awaited_once()
-        call_name = thread.edit.await_args.kwargs.get("name", thread.edit.await_args.args[0] if thread.edit.await_args.args else "")
+        call_name = thread.edit.await_args.kwargs.get(
+            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
+        )
         assert "Dockerfileの最適化" in call_name
 
     @pytest.mark.asyncio
@@ -1842,8 +1862,12 @@ class TestApplyThreadNamingRetitle:
 
         instruction = "認証リファクタを引き続きお願いします"
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message=instruction)
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message=instruction
+            )
 
         cog.repo.set_topic.assert_not_awaited()
 
@@ -1857,8 +1881,12 @@ class TestApplyThreadNamingRetitle:
         record = self._make_record(topic="認証リファクタ", locked=1)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="new")) as mock_retitle:
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="何か作業してください")
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="new")
+        ) as mock_retitle:
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="何か作業してください"
+            )
 
         mock_retitle.assert_not_awaited()
 
@@ -1872,8 +1900,16 @@ class TestApplyThreadNamingRetitle:
         record = self._make_record(topic=None)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock()) as mock_retitle, \
-             patch.object(cc_module.topic_module, "generate_topic", new=AsyncMock(return_value=("初回トピック", "llm"))):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="初回メッセージです")
+        with (
+            patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock()) as mock_retitle,
+            patch.object(
+                cc_module.topic_module,
+                "generate_topic",
+                new=AsyncMock(return_value=("初回トピック", "llm")),
+            ),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="初回メッセージです"
+            )
 
         mock_retitle.assert_not_awaited()

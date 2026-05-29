@@ -30,6 +30,7 @@ import contextlib
 import logging
 import re
 import subprocess
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import discord
@@ -213,10 +214,17 @@ class ThreadStateSyncLoop:
         session_repo: SessionRepository,
         *,
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
+        is_processing: Callable[[int], bool] | None = None,
     ) -> None:
         self._bot = bot
         self._repo = session_repo
         self._interval = interval_seconds
+        # Optional callback: True while a Claude turn is actively running for the
+        # thread. Lets the poll keep a thread 🟢 running even when it lands in a
+        # brief no-spinner window (session startup, tool gap) instead of rolling
+        # the event-driven lamp back to 🟡 waiting (#236). Default no-op keeps
+        # the loop self-contained for consumers that don't wire it up.
+        self._is_processing: Callable[[int], bool] = is_processing or (lambda _tid: False)
         self._task: asyncio.Task[None] | None = None
         # Per-thread rate-limit backoff: thread_id → monotonic time until next rename is allowed.
         self._rename_backoff: dict[int, float] = {}
@@ -277,6 +285,11 @@ class ThreadStateSyncLoop:
             window_number: int | None = parse_work_number(window_name)
             pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
             new_state = _pane_lamp_state(pane_text)
+            # Don't roll an actively-processing thread back to 🟡 just because the
+            # poll landed in a brief no-spinner window (startup / tool gap). Only
+            # promote waiting→running; error stays error (#236).
+            if new_state == "waiting" and self._is_processing(thread_id):
+                new_state = "running"
         else:
             new_state = "dead"
             window_id = record.tmux_window_id
