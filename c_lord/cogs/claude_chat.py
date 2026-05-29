@@ -35,6 +35,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
+from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -314,6 +315,12 @@ class ClaudeChatCog(commands.Cog):
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
+            logger.info(
+                "%s lamp → %s (event-driven) %r",
+                log_ctx(thread_id=thread.id),
+                state,
+                new_name,
+            )
 
     async def _set_lamp_state(
         self,
@@ -349,6 +356,12 @@ class ClaudeChatCog(commands.Cog):
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
+            logger.info(
+                "%s lamp → %s (event-driven) %r",
+                log_ctx(thread_id=thread.id),
+                state,
+                new_name,
+            )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
