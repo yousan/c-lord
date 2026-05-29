@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands, tasks
 
+from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -131,8 +132,12 @@ class SchedulerCog(commands.Cog):
             # channel.create_thread() without a message only appears in the
             # Threads panel (🧵), not in the channel list.
             starter = await channel.send(f"🔄 **[Scheduled]** `{task['name']}`")
+            archive_minutes = await resolve_auto_archive_duration(
+                getattr(self.bot, "settings_repo", None)
+            )
             thread = await starter.create_thread(
                 name=f"[Scheduled] {task['name']}",
+                auto_archive_duration=archive_minutes,
             )
 
             working_dir = task.get("working_dir") or self.runner.working_dir

@@ -36,6 +36,8 @@ def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
     """Return a ClaudeChatCog with minimal mocked dependencies."""
     bot = MagicMock()
     bot.channel_id = 999
+    # No settings repo → thread auto-archive resolver uses the 3-day default.
+    bot.settings_repo = None
     # Default get_context returns a non-command context (valid=False)
     _default_ctx = MagicMock()
     _default_ctx.valid = False
@@ -751,6 +753,7 @@ class TestSpawnSession:
         channel.create_thread = AsyncMock(return_value=thread)
 
         bot = MagicMock()
+        bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
 
         with patch.object(cog, "_run_claude", new=AsyncMock()):
@@ -761,6 +764,8 @@ class TestSpawnSession:
         call_kwargs = channel.create_thread.call_args.kwargs
         assert call_kwargs["name"] == "Do the thing"
         assert call_kwargs["type"] == discord.ChannelType.public_thread
+        # Defaults to 3 days (4320 min) when no setting is configured.
+        assert call_kwargs["auto_archive_duration"] == 4320
 
     @pytest.mark.asyncio
     async def test_spawn_uses_custom_thread_name(self) -> None:
@@ -776,6 +781,7 @@ class TestSpawnSession:
         channel.create_thread = AsyncMock(return_value=thread)
 
         bot = MagicMock()
+        bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
 
         with patch.object(cog, "_run_claude", new=AsyncMock()):
@@ -799,6 +805,7 @@ class TestSpawnSession:
         channel.create_thread = AsyncMock(return_value=thread)
 
         bot = MagicMock()
+        bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
 
         mock_run = AsyncMock()
