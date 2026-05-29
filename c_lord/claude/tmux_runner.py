@@ -510,6 +510,7 @@ class TmuxClaudeRunner:
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
+        effort: str | None = None,
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
@@ -518,6 +519,7 @@ class TmuxClaudeRunner:
         self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
+        self._effort = effort
         # True only for the restart-resume path (on_ready → pending_resumes).
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
@@ -594,6 +596,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=True,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -623,6 +626,7 @@ class TmuxClaudeRunner:
                         permission_mode=self._permission_mode,
                         dangerously_skip_permissions=self._dangerously_skip_permissions,
                         try_continue=False,
+                        effort=self._effort,
                     )
                     if not ok:
                         yield StreamEvent(
@@ -643,6 +647,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=False,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(

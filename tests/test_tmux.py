@@ -513,6 +513,63 @@ class TestTmuxSessionManager:
         cmd_str = " ".join(args[3:])
         assert "--continue" not in cmd_str
 
+    def test_start_claude_includes_effort_flag(self) -> None:
+        """start_claude passes a valid effort level as --effort <level>."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            mgr.start_claude(12345, "hello", effort="max")
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--effort max" in cmd_str
+
+    def test_start_claude_no_effort_flag_when_none(self) -> None:
+        """effort=None (default) omits the --effort flag entirely."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            mgr.start_claude(12345, "hello")
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--effort" not in cmd_str
+
+    def test_start_claude_invalid_effort_is_skipped(self) -> None:
+        """An effort the --effort flag rejects (e.g. ultracode) is dropped, not
+        passed — passing it would hard-error the claude process and leave the
+        thread with no response. The command is still built without it."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            result = mgr.start_claude(12345, "hello", effort="ultracode")
+
+        assert result is True
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--effort" not in cmd_str
+
     def test_send_input_sends_text_and_enter(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True

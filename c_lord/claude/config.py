@@ -26,3 +26,10 @@ class ClaudeConfig:
     working_dir: str | None = None
     timeout_seconds: int = 300
     dangerously_skip_permissions: bool = False
+    # Reasoning effort for the session, passed to the CLI as ``--effort``.
+    # c-lord raises this above the CLI's own default: every session gets the
+    # deepest level the flag accepts.  Valid values: low, medium, high, xhigh,
+    # max (the ``--effort`` flag rejects anything else; ``ultracode``/``auto``
+    # are only reachable via ``CLAUDE_CODE_EFFORT_LEVEL`` / the ``/effort``
+    # command, not this flag).  Override per instance or via ``CLAUDE_EFFORT``.
+    effort: str = "max"

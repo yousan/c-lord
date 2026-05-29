@@ -174,6 +174,7 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "expected_bot_user_id": expected_bot_user_id,
         "claude_command": os.getenv("CLAUDE_COMMAND", "claude"),
         "claude_model": os.getenv("CLAUDE_MODEL", "sonnet"),
+        "claude_effort": os.getenv("CLAUDE_EFFORT", "max"),
         "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
         "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT_SESSIONS", "3"),
@@ -209,6 +210,7 @@ async def main(env_path: Path | None = None) -> None:
     runner = ClaudeConfig(
         command=config["claude_command"],
         model=config["claude_model"],
+        effort=config["claude_effort"],
         permission_mode=config["claude_permission_mode"],
         working_dir=config["claude_working_dir"] or None,
         timeout_seconds=int(config["timeout"]),
