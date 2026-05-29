@@ -231,7 +231,6 @@ class TranscriptMirrorCog(commands.Cog):
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
-            body = text if len(text) <= 1990 else text[:1985] + "…"
             send = getattr(channel, "send", None)
             if send is None:
                 logger.warning(
@@ -240,16 +239,13 @@ class TranscriptMirrorCog(commands.Cog):
                     type(channel).__name__,
                 )
                 return
-            send_kwargs: dict = {"content": body}
-            if silent_posts_enabled():
-                send_kwargs["silent"] = True
             try:
-                await send(**send_kwargs)
+                await self._send_chunks(send, text, silent=silent_posts_enabled())
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror sink failed: thread=%d body_len=%d status=%s — %s",
                     thread_id,
-                    len(body),
+                    len(text),
                     getattr(exc, "status", "?"),
                     exc,
                     exc_info=True,
@@ -269,7 +265,6 @@ class TranscriptMirrorCog(commands.Cog):
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
-            body = text if len(text) <= 1990 else text[:1985] + "…"
             send = getattr(channel, "send", None)
             if send is None:
                 return
@@ -280,29 +275,14 @@ class TranscriptMirrorCog(commands.Cog):
             table_files = [
                 discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
             ]
-            send_kwargs: dict = {"content": body}
-            if table_files:
-                send_kwargs["files"] = table_files
-            trigger_id = self._trigger_messages.get(thread_id)
-            if trigger_id is None:
-                with contextlib.suppress(Exception):
-                    record = await self._session_repo.get(thread_id)
-                    if record is not None:
-                        trigger_id = record.trigger_message_id
-            if trigger_id is not None and reply_to_trigger_enabled():
-                send_kwargs["reference"] = discord.MessageReference(
-                    message_id=trigger_id,
-                    channel_id=thread_id,
-                    fail_if_not_exists=False,
-                )
-                send_kwargs["mention_author"] = False
+            reference = await self._build_trigger_reference(thread_id)
             try:
-                await send(**send_kwargs)
+                await self._send_chunks(send, text, reference=reference, files=table_files or None)
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror reply_sink failed: thread=%d body_len=%d status=%s — %s",
                     thread_id,
-                    len(body),
+                    len(text),
                     getattr(exc, "status", "?"),
                     exc,
                     exc_info=True,
@@ -322,7 +302,6 @@ class TranscriptMirrorCog(commands.Cog):
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
-            body = text if len(text) <= 1990 else text[:1985] + "…"
             send = getattr(channel, "send", None)
             if send is None:
                 return
@@ -334,48 +313,86 @@ class TranscriptMirrorCog(commands.Cog):
                 discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
             ]
             files = [discord.File(file_path, filename="progress.txt")] + table_files
-            send_kwargs: dict = {"content": body, "files": files}
-            trigger_id = self._trigger_messages.get(thread_id)
-            if trigger_id is None:
-                with contextlib.suppress(Exception):
-                    record = await self._session_repo.get(thread_id)
-                    if record is not None:
-                        trigger_id = record.trigger_message_id
-            if trigger_id is not None and reply_to_trigger_enabled():
-                send_kwargs["reference"] = discord.MessageReference(
-                    message_id=trigger_id,
-                    channel_id=thread_id,
-                    fail_if_not_exists=False,
-                )
-                send_kwargs["mention_author"] = False
+            reference = await self._build_trigger_reference(thread_id)
             try:
-                await send(**send_kwargs)
+                await self._send_chunks(send, text, reference=reference, files=files)
                 return
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror file_sink failed (with attachment): "
                     "thread=%d body_len=%d status=%s — retrying without attachment — %s",
                     thread_id,
-                    len(body),
+                    len(text),
                     getattr(exc, "status", "?"),
                     exc,
                     exc_info=True,
                 )
-            # Fallback: plain text without attachment
+            # Fallback: text without attachment (still chunked so it is not truncated).
             try:
-                await send(body)
+                await self._send_chunks(send, text, reference=reference)
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror file_sink fallback also failed: "
                     "thread=%d body_len=%d status=%s — %s",
                     thread_id,
-                    len(body),
+                    len(text),
                     getattr(exc, "status", "?"),
                     exc,
                     exc_info=True,
                 )
 
         return file_sink
+
+    async def _build_trigger_reference(self, thread_id: int) -> discord.MessageReference | None:
+        """Resolve the trigger message for ``thread_id`` into a reply reference.
+
+        Returns ``None`` when reply-to-trigger is disabled or no trigger id is
+        known. Shared by ``reply_sink`` and ``file_sink``.
+        """
+        if not reply_to_trigger_enabled():
+            return None
+        trigger_id = self._trigger_messages.get(thread_id)
+        if trigger_id is None:
+            with contextlib.suppress(Exception):
+                record = await self._session_repo.get(thread_id)
+                if record is not None:
+                    trigger_id = record.trigger_message_id
+        if trigger_id is None:
+            return None
+        return discord.MessageReference(
+            message_id=trigger_id,
+            channel_id=thread_id,
+            fail_if_not_exists=False,
+        )
+
+    @staticmethod
+    async def _send_chunks(
+        send,
+        text: str,
+        *,
+        silent: bool = False,
+        reference: discord.MessageReference | None = None,
+        files: list[discord.File] | None = None,
+    ) -> None:
+        """Send ``text`` split into Discord-sendable chunks (Issue #235).
+
+        Long bodies are split instead of truncated. The quote-reply
+        ``reference`` rides on the first chunk; ``files`` ride on the last.
+        """
+        from ..discord_ui.reply_chunker import chunk_discord_content
+
+        chunks = chunk_discord_content(text)
+        last = len(chunks) - 1
+        for idx, chunk in enumerate(chunks):
+            kwargs: dict = {"content": chunk}
+            if silent:
+                kwargs["silent"] = True
+            if idx == 0 and reference is not None:
+                kwargs["reference"] = reference
+                kwargs["mention_author"] = False
+            if idx == last and files:
+                kwargs["files"] = files
+            await send(**kwargs)
 
     @staticmethod
     async def _resolve_channel(bot, thread_id: int):

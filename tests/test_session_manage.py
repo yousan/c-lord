@@ -221,6 +221,130 @@ class TestResumeInfoTmux:
         assert "claude --resume def-456" in embed.description
 
 
+def _make_ctx(channel: MagicMock | None = None) -> MagicMock:
+    """Return a mocked commands.Context for the !text twins."""
+    ctx = MagicMock()
+    ctx.send = AsyncMock()
+    ctx.author = MagicMock()
+    ctx.author.id = 1
+    if channel is not None:
+        ctx.channel = channel
+    else:
+        ctx.channel = MagicMock(spec=discord.TextChannel)
+    return ctx
+
+
+def _make_thread_ctx(thread_id: int = 12345) -> MagicMock:
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
+    return _make_ctx(channel=thread)
+
+
+class TestReadonlyTextTwins:
+    """!text twins of the read-only/info slash commands (E2E-invokable, #209)."""
+
+    async def test_model_show_text(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.model_show_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+    async def test_resume_info_text_outside_thread(self):
+        cog = _make_cog()
+        ctx = _make_ctx()  # not a thread
+        await cog.resume_info_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert "thread" in ctx.send.call_args.args[0].lower()
+
+    async def test_resume_info_text_shows_command(self):
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=555, session_id="def-456"))
+        ctx = _make_thread_ctx(thread_id=555)
+        await cog.resume_info_text.callback(cog, ctx)
+        embed = ctx.send.call_args.kwargs.get("embed")
+        assert embed is not None
+        assert "def-456" in embed.description
+
+    async def test_sessions_text_empty(self):
+        cog = _make_cog()
+        cog.repo.list_all = AsyncMock(return_value=[])
+        ctx = _make_ctx()
+        await cog.sessions_list_text.callback(cog, ctx)
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+    async def test_session_dirs_text_no_bindings(self):
+        cog = _make_cog()  # bot.get_cog returns a non-ChannelRepoCog mock → no bindings
+        ctx = _make_ctx()
+        await cog.session_dirs_list_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+    async def test_tmux_list_text_no_bindings(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.tmux_list_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+
+class TestModelSetTextTwin:
+    """!model-set mirrors /model set (E2E-invokable, #209)."""
+
+    async def test_missing_model_shows_usage(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.model_set_text.callback(cog, ctx, model=None)
+        ctx.send.assert_called_once()
+        assert "Usage" in ctx.send.call_args.args[0]
+
+    async def test_invalid_model(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.model_set_text.callback(cog, ctx, model="nope")
+        assert "Unknown model" in ctx.send.call_args.args[0]
+
+    async def test_valid_model_persisted(self):
+        cog = _make_cog()
+        cog.settings_repo = MagicMock()
+        cog.settings_repo.set = AsyncMock()
+        ctx = _make_ctx()
+        await cog.model_set_text.callback(cog, ctx, model="opus")
+        cog.settings_repo.set.assert_called_once()
+        assert cog.settings_repo.set.call_args.args[1] == "opus"
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+
+class TestOpsTextTwins:
+    """!session-cleanup / !workspace-delete (destructive, E2E-invokable, #209)."""
+
+    async def test_session_cleanup_text_no_bindings(self):
+        cog = _make_cog()  # bot.get_cog → non-ChannelRepoCog ⇒ no bindings
+        ctx = _make_ctx()
+        await cog.session_cleanup_text.callback(cog, ctx, arg=None)
+        ctx.send.assert_called_once()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+    async def test_workspace_delete_text_outside_thread(self):
+        cog = _make_cog()
+        ctx = _make_ctx()  # not a thread
+        await cog.workspace_delete_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert "thread" in ctx.send.call_args.args[0].lower()
+
+    async def test_workspace_delete_text_in_thread(self):
+        cog = _make_cog()
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        ctx = _make_ctx(channel=thread)
+        await cog.workspace_delete_text.callback(cog, ctx)
+        # Unbound → an embed explaining nothing to delete / clord-init hint
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+
 class TestHelperFunctions:
     """Tests for _is_tmux_session and _format_session_short."""
 

@@ -1,12 +1,21 @@
+<!-- 30-second summary first. A reviewer should be able to judge this PR from the
+     top: What / Why / Proof / Tests / Scope. Be comprehensive; fold long logs or
+     code into <details><summary>…</summary> so the body stays readable. -->
+
 ## What does this PR do?
 
 <!-- Brief description of the change -->
 
 ## Why?
 
-<!-- What problem does this solve? -->
-<!-- Link the issue. Use "Closes #N" ONLY if this PR satisfies 100% of that
-     issue's Acceptance Criteria. Otherwise use "Refs #N" and keep it open. -->
+<!-- What problem does this solve, from a user's point of view? -->
+
+<!-- Link the issue on ITS OWN LINE (not inside a bullet list — GitHub won't
+     parse the keyword reliably inside a `- ` item). Use "Closes #N" or
+     "Resolves #N" ONLY if this PR satisfies 100% of that issue's Acceptance
+     Criteria. Otherwise use "Refs #N" and keep the issue open. -->
+
+Refs #
 
 ## Acceptance Criteria (copied from the issue)
 
@@ -15,23 +24,39 @@
 - [ ] AC 1: …
 - [ ] AC 2: …
 
-## Staging Evidence
+## Staging Evidence (証跡)
 
 <!-- REQUIRED for behavior changes (bug fixes / features).
      Skip ONLY for pure-docs or provably no-behavior-change refactors —
      and if you skip, write the reason here.
-     Paste log excerpts: RED = problem reproduced before the fix,
-     GREEN = problem gone after the fix, on the staging bot. -->
 
-<!-- RED (before):
+     Show RED→GREEN reproduced ON STAGING (not just mocks):
+       RED  = problem reproduced before the fix
+       GREEN = problem gone after the fix
+     Include timestamp / thread / branch hash, and clickable URLs.
+
+     Discord-side proof: a Discord screenshot is the主役 and is normally
+     USER-PROVIDED (the server-side agent has no GUI and cannot screenshot the
+     Discord client). The agent supplements with tmux pane captures and
+     REST-fetched message text. Fold long excerpts into <details>. -->
+
+<details>
+<summary>RED (before) — reproduced on staging</summary>
+
 ```
-<log excerpt showing the problem on staging>
+<log excerpt / pane capture showing the problem>
 ```
-GREEN (after):
+</details>
+
+<details>
+<summary>GREEN (after) — fixed on staging</summary>
+
 ```
-<log excerpt showing it fixed on staging>
+<log excerpt / pane capture showing it fixed>
 ```
--->
+</details>
+
+Discord screenshot (user-provided): <attach / link>
 
 ## Definition of Done checklist
 
@@ -46,4 +71,4 @@ See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked.
 - [ ] `uv run ruff check c_lord/` + `ruff format --check` + `pyright` pass
 - [ ] Staging Evidence above is filled in (or a skip reason is written)
 - [ ] No unrelated changes in the diff; self-review done
-- [ ] `Closes #N` used only if 100% of the issue's ACs are met (else `Refs #N`)
+- [ ] `Closes`/`Resolves #N` used only if 100% of the issue's ACs are met (else `Refs #N`), and written on its own line

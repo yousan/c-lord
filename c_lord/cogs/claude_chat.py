@@ -35,6 +35,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
+from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -134,6 +135,17 @@ class ClaudeChatCog(commands.Cog):
                 return any(r.name == self._allowed_role_name for r in member.roles)
             return False  # DM — no role info
         return self._allowed_user_ids is None
+
+    def is_processing(self, thread_id: int) -> bool:
+        """True while a Claude turn is actively running for ``thread_id``.
+
+        This is the lamp's source of truth for 🟢 ``running`` (#236): the entry
+        registers in ``_active_tasks`` the moment a turn starts and is popped in
+        the ``finally`` block when it finishes. Consumed by
+        :class:`ThreadStateSyncLoop` so the poll never rolls an in-flight thread
+        back to 🟡 ``waiting`` during a brief no-spinner window.
+        """
+        return thread_id in self._active_tasks
 
     @property
     def active_session_count(self) -> int:
@@ -303,6 +315,53 @@ class ClaudeChatCog(commands.Cog):
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
+            logger.info(
+                "%s lamp → %s (event-driven) %r",
+                log_ctx(thread_id=thread.id),
+                state,
+                new_name,
+            )
+
+    async def _set_lamp_state(
+        self,
+        thread: discord.Thread,
+        state: str,
+        tmux_manager,  # TmuxManager | None
+    ) -> None:
+        """Persist ``state`` and repaint the thread-name lamp immediately (#236).
+
+        Lightweight counterpart to :meth:`_apply_thread_naming` — reuses the
+        already-stored topic (no LLM retitle) and the stable ``work{N}`` window
+        number, so the leading 🟢/🟡 flips the instant a turn starts/ends instead
+        of waiting for the ≤60s state-sync poll. No-op when no topic exists yet
+        (the next user-driven naming pass will catch up).
+        """
+        from ..thread_name import build_name
+
+        await self.repo.set_state(thread.id, state)
+
+        record = await self.repo.get(thread.id)
+        topic = record.topic if record else None
+        if not topic:
+            return
+
+        window_number: int | None = None
+        if tmux_manager is not None:
+            info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
+            if info is not None:
+                window_number = info[1]
+
+        new_name = build_name(topic, state, window_number)
+        if (thread.name or "") == new_name:
+            return
+        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
+            await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
+            logger.info(
+                "%s lamp → %s (event-driven) %r",
+                log_ctx(thread_id=thread.id),
+                state,
+                new_name,
+            )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -340,25 +399,34 @@ class ClaudeChatCog(commands.Cog):
         ):
             await self._handle_thread_reply(message)
 
-    @app_commands.command(name="clord", description="Start a new Claude Code session")
-    @app_commands.describe(prompt="Message to send to Claude Code")
-    async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
-        """Start a new Claude Code session or continue in an existing thread."""
+    async def _clord_impl(
+        self,
+        *,
+        channel: object,
+        channel_id_fallback: int | None,
+        user: discord.Member | discord.User,
+        prompt: str,
+        respond: _Responder,
+        ack: _Responder,
+    ) -> None:
+        """Shared core for /clord and !clord (#209 follow-up).
+
+        In a thread → continue the session; in a channel → create a new thread
+        via ``spawn_session``. ``ack`` defers (slash) or is a no-op (text); after
+        it, all replies go through ``respond``'s post-ack path.
+        """
         # Authorization check
-        if not self._is_allowed(interaction.user):
-            await interaction.response.send_message(
-                "You are not authorized to use this command.", ephemeral=True
-            )
+        if not self._is_allowed(user):
+            await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
-        channel = interaction.channel
         if isinstance(channel, discord.Thread):
             parent_channel_id = channel.parent_id or channel.id
             sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
             tmux = await self._resolve_tmux_manager(parent_channel_id)
             if sdm is None and tmux is None:
-                await interaction.response.send_message(
+                await respond(
                     "⚠️ このスレッドにはリポジトリが紐づけられていません。\n"
                     "先に `/clord-thread-init repo:<URL>` または"
                     " `/clord-init repo:<URL>` で設定してください。",
@@ -366,18 +434,22 @@ class ClaudeChatCog(commands.Cog):
                 )
                 return
         else:
-            channel_id = channel.id if channel else interaction.channel_id
+            channel_id = (
+                channel.id
+                if isinstance(channel, discord.abc.GuildChannel)
+                else (channel_id_fallback)
+            )
             sdm = await self._resolve_session_dir_manager(channel_id)
             tmux = await self._resolve_tmux_manager(channel_id)
             if sdm is None and tmux is None:
-                await interaction.response.send_message(
+                await respond(
                     "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
                     "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
                     ephemeral=True,
                 )
                 return
 
-        await interaction.response.defer()
+        await ack()
 
         if isinstance(channel, discord.Thread):
             # Continue in existing thread
@@ -385,16 +457,65 @@ class ClaudeChatCog(commands.Cog):
             session_id = (record.session_id or None) if record else None
             seed_message = await channel.send(prompt)
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
-            await interaction.followup.send("Session completed.", silent=True)
+            await respond("Session completed.", silent=True)
         else:
             # Create a new thread via spawn_session (text channels only)
             if not isinstance(channel, discord.TextChannel):
-                await interaction.followup.send(
-                    "This command must be used in a text channel.", ephemeral=True
-                )
+                await respond("This command must be used in a text channel.", ephemeral=True)
                 return
             thread = await self.spawn_session(channel, prompt)
-            await interaction.followup.send(f"Session started → {thread.mention}")
+            await respond(f"Session started → {thread.mention}")
+
+    @app_commands.command(name="clord", description="Start a new Claude Code session")
+    @app_commands.describe(prompt="Message to send to Claude Code")
+    async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
+        """Start a new Claude Code session or continue in an existing thread."""
+        state = {"acked": False}
+
+        async def ack(*_args: object, **_kwargs: object) -> None:
+            state["acked"] = True
+            await interaction.response.defer()
+
+        async def respond(
+            content: str | None = None, *, ephemeral: bool = False, silent: bool = False
+        ) -> None:
+            if state["acked"]:
+                await interaction.followup.send(content or "", ephemeral=ephemeral, silent=silent)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._clord_impl(
+            channel=interaction.channel,
+            channel_id_fallback=interaction.channel_id,
+            user=interaction.user,
+            prompt=prompt,
+            respond=respond,
+            ack=ack,
+        )
+
+    @commands.command(name="clord")
+    async def clord_text(self, ctx: commands.Context, *, prompt: str | None = None) -> None:
+        """Text/mention twin of /clord — invokable from webhooks for E2E (#209)."""
+        if not prompt:
+            await ctx.send("Usage: `!clord <prompt>`")
+            return
+
+        async def ack(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def respond(
+            content: str | None = None, *, ephemeral: bool = False, silent: bool = False
+        ) -> None:
+            await ctx.send(content or "", silent=silent)
+
+        await self._clord_impl(
+            channel=ctx.channel,
+            channel_id_fallback=ctx.channel.id if ctx.channel else None,
+            user=ctx.author,
+            prompt=prompt,
+            respond=respond,
+            ack=ack,
+        )
 
     async def _stop_impl(self, channel: object, respond: _Responder) -> None:
         """Shared core for /stop and !stop (#209).
@@ -900,6 +1021,12 @@ class ClaudeChatCog(commands.Cog):
             if current_task is not None:
                 self._active_tasks[thread.id] = current_task
 
+            # Lamp → 🟢 running immediately, event-driven (#236). Persist the
+            # state now so the rename in _apply_thread_naming below paints the
+            # thread green without waiting for the ≤60s state-sync poll.
+            with contextlib.suppress(Exception):
+                await self.repo.set_state(thread.id, "running")
+
             # Mark thread as PROCESSING when Claude starts
             if dashboard is not None:
                 await dashboard.set_state(
@@ -1034,6 +1161,12 @@ class ClaudeChatCog(commands.Cog):
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
+
+                # Lamp → 🟡 waiting the instant the turn finishes (#236). Runs
+                # after _active_tasks.pop above, so is_processing() is already
+                # False and the next state-sync poll stays consistent.
+                with contextlib.suppress(Exception):
+                    await self._set_lamp_state(thread, "waiting", tmux_manager)
 
                 if dashboard is not None:
                     with contextlib.suppress(Exception):

@@ -94,10 +94,26 @@ Only available when the bot operator has enabled the upgrade slash command.
 
 | Command | Description | Example | Slash equivalent |
 |---------|-------------|---------|------------------|
+| `!clord <prompt>` | Start a new session (channel) / continue (thread) | `!clord build X` | `/clord` |
 | `!attach <window>` | Attach this thread to a tmux window | `!attach work13` | `/clord-attach` |
 | `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
 | `!clear` | Reset the session — next message starts fresh | `!clear` | `/clear` |
+| `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
+| `!resume-info` | Show the CLI command to resume this thread | `!resume-info` | `/resume-info` |
+| `!sessions` | List all known sessions | `!sessions` | `/sessions` |
+| `!session-dirs` | List active session directories | `!session-dirs` | `/session-dirs` |
+| `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
+| `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
+| `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
+| `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
+| `!session-cleanup [dry]` | Remove clean orphaned session dirs (`dry` = preview) | `!session-cleanup dry` | `/session-cleanup` |
+| `!workspace-delete` | Delete this thread's tmux window + session dir | `!workspace-delete` | `/workspace-delete` |
+
+> **Manage-Server note.** `/clord-init` and `/clord-thread-init` are gated by
+> Discord's *Manage Server* permission. Their `!text` twins have **no** such
+> Discord-level gate — they are gated only by `_is_allowed` (owner/role
+> allowlist). Keep the allowlist restricted in production.
 
 Each text command is **functionally identical to its slash equivalent** — it
 calls the same underlying handler. Text commands accept either prefix:

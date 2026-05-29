@@ -8,6 +8,7 @@ Provides slash commands for viewing and managing Claude Code sessions:
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import discord
@@ -24,6 +25,11 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Lets each command's core run from either a slash interaction or a !text twin
+# without duplicating the body (#209 follow-up).
+_Responder = Callable[..., Awaitable[None]]
+_Acknowledger = Callable[..., Awaitable[None]]
 
 _ORIGIN_ICON = {
     "discord": "\U0001f4ac",  # 💬
@@ -94,6 +100,53 @@ class SessionManageCog(commands.Cog):
             return runner.model  # type: ignore[return-value]
         return "sonnet"
 
+    # ── Slash/text I/O plumbing (#209 follow-up) ───────────────────────────────
+    # Each read-only command's core takes a (respond, ack) pair so the same body
+    # serves both the slash command and its !text twin.
+
+    def _slash_io(self, interaction: discord.Interaction) -> tuple[_Responder, _Acknowledger]:
+        state = {"acked": False}
+
+        async def ack(*, ephemeral: bool = False) -> None:
+            state["acked"] = True
+            await interaction.response.defer(ephemeral=ephemeral)
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            if state["acked"]:
+                if embed is not None:
+                    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+                else:
+                    await interaction.followup.send(content or "", ephemeral=ephemeral)
+            elif embed is not None:
+                await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        return respond, ack
+
+    def _ctx_io(self, ctx: commands.Context) -> tuple[_Responder, _Acknowledger]:
+        async def ack(*, ephemeral: bool = False) -> None:
+            return None
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            # Text channels can't be ephemeral — ``ephemeral`` is ignored.
+            if embed is not None:
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send(content or "")
+
+        return respond, ack
+
     # ── Model commands ────────────────────────────────────────────────────────
 
     model_group = app_commands.Group(
@@ -101,9 +154,8 @@ class SessionManageCog(commands.Cog):
         description="View and change the Claude model used for new sessions",
     )
 
-    @model_group.command(name="show", description="Show the current Claude model")
-    async def model_show(self, interaction: discord.Interaction) -> None:
-        """Display the current global model and, if in a thread, the per-session model."""
+    async def _model_show_impl(self, *, channel: object, respond: _Responder) -> None:
+        """Shared core for /model show and !model-show (#209 follow-up)."""
         effective_model = await self._get_effective_model()
 
         embed = discord.Embed(
@@ -126,8 +178,8 @@ class SessionManageCog(commands.Cog):
             )
 
         # Per-thread session model (if inside a thread)
-        if isinstance(interaction.channel, discord.Thread):
-            record = await self.repo.get(interaction.channel.id)
+        if isinstance(channel, discord.Thread):
+            record = await self.repo.get(channel.id)
             if record and record.model:
                 embed.add_field(
                     name="This thread's last session",
@@ -136,22 +188,31 @@ class SessionManageCog(commands.Cog):
                 )
 
         embed.set_footer(text=f"Effective model for new sessions: {effective_model}")
-        await interaction.response.send_message(embed=embed)
+        await respond(embed=embed)
 
-    @model_group.command(name="set", description="Change the global Claude model for new sessions")
-    @app_commands.describe(model="Model to use for all new Claude sessions")
-    @app_commands.choices(model=_MODEL_CHOICES)
-    async def model_set(self, interaction: discord.Interaction, model: str) -> None:
-        """Set the global default model stored in settings_repo."""
+    @model_group.command(name="show", description="Show the current Claude model")
+    async def model_show(self, interaction: discord.Interaction) -> None:
+        """Display the current global model and, if in a thread, the per-session model."""
+        respond, _ = self._slash_io(interaction)
+        await self._model_show_impl(channel=interaction.channel, respond=respond)
+
+    @commands.command(name="model-show")
+    async def model_show_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /model show — webhook-invokable for E2E (#209)."""
+        respond, _ = self._ctx_io(ctx)
+        await self._model_show_impl(channel=ctx.channel, respond=respond)
+
+    async def _model_set_impl(self, *, model: str, respond: _Responder) -> None:
+        """Shared core for /model set and !model-set (#209 follow-up)."""
         if model not in _VALID_MODELS:
-            await interaction.response.send_message(
+            await respond(
                 f"❌ Unknown model `{model}`. Valid choices: {', '.join(sorted(_VALID_MODELS))}",
                 ephemeral=True,
             )
             return
 
         if self.settings_repo is None:
-            await interaction.response.send_message(
+            await respond(
                 "❌ Settings repository is unavailable — model cannot be persisted.",
                 ephemeral=True,
             )
@@ -164,24 +225,37 @@ class SessionManageCog(commands.Cog):
             description=f"Global model set to **`{model}`**.\nAll new sessions will use this model.",  # noqa: E501
             color=COLOR_SUCCESS,
         )
-        await interaction.response.send_message(embed=embed)
+        await respond(embed=embed)
 
-    @app_commands.command(
-        name="resume-info",
-        description="Show the CLI command to resume this thread's session",
-    )
-    async def resume_info(self, interaction: discord.Interaction) -> None:
-        """Show the claude --resume command for the current thread."""
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
+    @model_group.command(name="set", description="Change the global Claude model for new sessions")
+    @app_commands.describe(model="Model to use for all new Claude sessions")
+    @app_commands.choices(model=_MODEL_CHOICES)
+    async def model_set(self, interaction: discord.Interaction, model: str) -> None:
+        """Set the global default model stored in settings_repo."""
+        respond, _ = self._slash_io(interaction)
+        await self._model_set_impl(model=model, respond=respond)
+
+    @commands.command(name="model-set")
+    async def model_set_text(self, ctx: commands.Context, model: str | None = None) -> None:
+        """Text/mention twin of /model set — webhook-invokable for E2E (#209)."""
+        if not model:
+            await ctx.send(f"Usage: `!model-set <{'/'.join(sorted(_VALID_MODELS))}>`")
+            return
+        respond, _ = self._ctx_io(ctx)
+        await self._model_set_impl(model=model, respond=respond)
+
+    async def _resume_info_impl(self, *, channel: object, respond: _Responder) -> None:
+        """Shared core for /resume-info and !resume-info (#209 follow-up)."""
+        if not isinstance(channel, discord.Thread):
+            await respond(
                 "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
             return
 
-        record = await self.repo.get(interaction.channel.id)
+        record = await self.repo.get(channel.id)
         if not record:
-            await interaction.response.send_message(
+            await respond(
                 "No session found for this thread.",
                 ephemeral=True,
             )
@@ -189,8 +263,8 @@ class SessionManageCog(commands.Cog):
 
         if _is_tmux_session(record.session_id):
             # tmux session — show tmux attach instructions
-            thread_id = interaction.channel.id
-            tmux_mgr = await self._resolve_tmux_manager(interaction.channel.parent_id or thread_id)
+            thread_id = channel.id
+            tmux_mgr = await self._resolve_tmux_manager(channel.parent_id or thread_id)
             window_name: str | None = None
             session_name: str | None = None
             if tmux_mgr is not None:
@@ -229,17 +303,25 @@ class SessionManageCog(commands.Cog):
         if record.model:
             embed.add_field(name="Model", value=record.model, inline=True)
 
-        await interaction.response.send_message(embed=embed)
+        await respond(embed=embed)
 
     @app_commands.command(
-        name="sessions",
-        description="List all known Claude Code sessions",
+        name="resume-info",
+        description="Show the CLI command to resume this thread's session",
     )
-    async def sessions_list(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        """List all sessions with origin, summary, and last activity."""
+    async def resume_info(self, interaction: discord.Interaction) -> None:
+        """Show the claude --resume command for the current thread."""
+        respond, _ = self._slash_io(interaction)
+        await self._resume_info_impl(channel=interaction.channel, respond=respond)
+
+    @commands.command(name="resume-info")
+    async def resume_info_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /resume-info — webhook-invokable for E2E (#209)."""
+        respond, _ = self._ctx_io(ctx)
+        await self._resume_info_impl(channel=ctx.channel, respond=respond)
+
+    async def _sessions_list_impl(self, *, respond: _Responder) -> None:
+        """Shared core for /sessions and !sessions (#209 follow-up)."""
         records = await self.repo.list_all(limit=25)
 
         if not records:
@@ -248,7 +330,7 @@ class SessionManageCog(commands.Cog):
                 description="No sessions found.",
                 color=COLOR_INFO,
             )
-            await interaction.response.send_message(embed=embed)
+            await respond(embed=embed)
             return
 
         embed = discord.Embed(
@@ -285,7 +367,22 @@ class SessionManageCog(commands.Cog):
 
             embed.add_field(name=name, value=value, inline=False)
 
-        await interaction.response.send_message(embed=embed)
+        await respond(embed=embed)
+
+    @app_commands.command(
+        name="sessions",
+        description="List all known Claude Code sessions",
+    )
+    async def sessions_list(self, interaction: discord.Interaction) -> None:
+        """List all sessions with origin, summary, and last activity."""
+        respond, _ = self._slash_io(interaction)
+        await self._sessions_list_impl(respond=respond)
+
+    @commands.command(name="sessions")
+    async def sessions_list_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /sessions — webhook-invokable for E2E (#209)."""
+        respond, _ = self._ctx_io(ctx)
+        await self._sessions_list_impl(respond=respond)
 
     # ------------------------------------------------------------------
     # Session directory commands
@@ -337,21 +434,17 @@ class SessionManageCog(commands.Cog):
             return await channel_cog._repo.list_all()
         return []
 
-    @app_commands.command(
-        name="session-dirs",
-        description="List all active Claude Code session directories",
-    )
-    async def session_dirs_list(self, interaction: discord.Interaction) -> None:
-        """Show all session directories and their status (across all bindings)."""
+    async def _session_dirs_list_impl(self, *, respond: _Responder, ack: _Acknowledger) -> None:
+        """Shared core for /session-dirs and !session-dirs (#209 follow-up)."""
         bindings = await self._get_all_bindings()
         if not bindings:
-            await interaction.response.send_message(
+            await respond(
                 "❌ No channel-repo bindings configured. Use `/clord-init` first.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await ack(ephemeral=True)
 
         import asyncio
 
@@ -363,7 +456,7 @@ class SessionManageCog(commands.Cog):
                 all_dirs.extend(dirs)
 
         if not all_dirs:
-            await interaction.followup.send(
+            await respond(
                 embed=discord.Embed(
                     title="📁 Session Directories",
                     description="No session directories found.",
@@ -382,30 +475,36 @@ class SessionManageCog(commands.Cog):
             value = f"Path: `{d.path}`\nCommit: `{d.commit or 'unknown'}`\nStatus: {status}"
             embed.add_field(name=name, value=value, inline=False)
 
-        await interaction.followup.send(embed=embed)
+        await respond(embed=embed)
 
     @app_commands.command(
-        name="session-cleanup",
-        description="Remove clean orphaned session directories",
+        name="session-dirs",
+        description="List all active Claude Code session directories",
     )
-    @app_commands.describe(
-        dry_run="Preview what would be removed without actually removing anything",
-    )
-    async def session_cleanup(
-        self,
-        interaction: discord.Interaction,
-        dry_run: bool = False,
+    async def session_dirs_list(self, interaction: discord.Interaction) -> None:
+        """Show all session directories and their status (across all bindings)."""
+        respond, ack = self._slash_io(interaction)
+        await self._session_dirs_list_impl(respond=respond, ack=ack)
+
+    @commands.command(name="session-dirs")
+    async def session_dirs_list_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /session-dirs — webhook-invokable for E2E (#209)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._session_dirs_list_impl(respond=respond, ack=ack)
+
+    async def _session_cleanup_impl(
+        self, *, dry_run: bool, respond: _Responder, ack: _Acknowledger
     ) -> None:
-        """Remove session directories that have no active session and are clean."""
+        """Shared core for /session-cleanup and !session-cleanup (#209 follow-up)."""
         bindings = await self._get_all_bindings()
         if not bindings:
-            await interaction.response.send_message(
+            await respond(
                 "❌ No channel-repo bindings configured. Use `/clord-init` first.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer()
+        await ack()
 
         import asyncio
 
@@ -422,7 +521,7 @@ class SessionManageCog(commands.Cog):
                 managers.append(sdm)
 
         if not managers:
-            await interaction.followup.send(
+            await respond(
                 embed=discord.Embed(
                     title="📁 Session Cleanup",
                     description="No session directory managers found.",
@@ -467,7 +566,7 @@ class SessionManageCog(commands.Cog):
             if not candidates and not skipped:
                 embed.description = "No session directories found."
             embed.set_footer(text="Re-run without dry_run=True to actually remove.")
-            await interaction.followup.send(embed=embed)
+            await respond(embed=embed)
             return
 
         all_results = []
@@ -511,23 +610,45 @@ class SessionManageCog(commands.Cog):
                 inline=False,
             )
 
-        await interaction.followup.send(embed=embed)
+        await respond(embed=embed)
 
     @app_commands.command(
-        name="tmux-list",
-        description="List all active tmux windows for Claude Code",
+        name="session-cleanup",
+        description="Remove clean orphaned session directories",
     )
-    async def tmux_list(self, interaction: discord.Interaction) -> None:
-        """Show all windows across all channel tmux sessions."""
+    @app_commands.describe(
+        dry_run="Preview what would be removed without actually removing anything",
+    )
+    async def session_cleanup(
+        self,
+        interaction: discord.Interaction,
+        dry_run: bool = False,
+    ) -> None:
+        """Remove session directories that have no active session and are clean."""
+        respond, ack = self._slash_io(interaction)
+        await self._session_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
+
+    @commands.command(name="session-cleanup")
+    async def session_cleanup_text(self, ctx: commands.Context, arg: str | None = None) -> None:
+        """Text/mention twin of /session-cleanup — webhook-invokable for E2E (#209).
+
+        Usage: ``!session-cleanup`` (remove) / ``!session-cleanup dry`` (preview).
+        """
+        dry_run = (arg or "").lower() in {"dry", "dry_run", "dry-run", "true", "1"}
+        respond, ack = self._ctx_io(ctx)
+        await self._session_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
+
+    async def _tmux_list_impl(self, *, respond: _Responder, ack: _Acknowledger) -> None:
+        """Shared core for /tmux-list and !tmux-list (#209 follow-up)."""
         bindings = await self._get_all_bindings()
         if not bindings:
-            await interaction.response.send_message(
+            await respond(
                 "❌ No channel-repo bindings configured. Use `/clord-init` first.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await ack(ephemeral=True)
 
         import asyncio
 
@@ -539,7 +660,7 @@ class SessionManageCog(commands.Cog):
                 all_windows.extend(windows)
 
         if not all_windows:
-            await interaction.followup.send(
+            await respond(
                 embed=discord.Embed(
                     title="🖥️ Tmux Windows",
                     description="No tmux windows found.",
@@ -561,24 +682,37 @@ class SessionManageCog(commands.Cog):
                 inline=False,
             )
 
-        await interaction.followup.send(embed=embed)
+        await respond(embed=embed)
 
     @app_commands.command(
-        name="workspace-delete",
-        description="Delete the tmux window and session directory for this thread",
+        name="tmux-list",
+        description="List all active tmux windows for Claude Code",
     )
-    async def workspace_delete(self, interaction: discord.Interaction) -> None:
-        """Delete the tmux window and session directory for the current thread."""
-        if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message(
+    async def tmux_list(self, interaction: discord.Interaction) -> None:
+        """Show all windows across all channel tmux sessions."""
+        respond, ack = self._slash_io(interaction)
+        await self._tmux_list_impl(respond=respond, ack=ack)
+
+    @commands.command(name="tmux-list")
+    async def tmux_list_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /tmux-list — webhook-invokable for E2E (#209)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._tmux_list_impl(respond=respond, ack=ack)
+
+    async def _workspace_delete_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /workspace-delete and !workspace-delete (#209 follow-up)."""
+        if not isinstance(channel, discord.Thread):
+            await respond(
                 "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
             return
 
-        thread_id = interaction.channel.id
-        parent_channel_id = interaction.channel.parent_id or thread_id
-        await interaction.response.defer()
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+        await ack()
 
         import asyncio
 
@@ -613,4 +747,19 @@ class SessionManageCog(commands.Cog):
             description="\n".join(results),
             color=COLOR_SUCCESS,
         )
-        await interaction.followup.send(embed=embed)
+        await respond(embed=embed)
+
+    @app_commands.command(
+        name="workspace-delete",
+        description="Delete the tmux window and session directory for this thread",
+    )
+    async def workspace_delete(self, interaction: discord.Interaction) -> None:
+        """Delete the tmux window and session directory for the current thread."""
+        respond, ack = self._slash_io(interaction)
+        await self._workspace_delete_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-delete")
+    async def workspace_delete_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /workspace-delete — webhook-invokable for E2E (#209)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)

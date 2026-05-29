@@ -671,6 +671,16 @@ class TestInterruptOnNewMessage:
         assert isinstance(cog._active_tasks, dict)
         assert len(cog._active_tasks) == 0
 
+    def test_is_processing_reflects_active_tasks(self) -> None:
+        """is_processing() is the lamp's source of truth for 🟢 running (#236):
+        True iff a Claude turn is currently registered for the thread."""
+        cog = _make_cog()
+        assert cog.is_processing(42) is False
+        cog._active_tasks[42] = MagicMock()
+        assert cog.is_processing(42) is True
+        del cog._active_tasks[42]
+        assert cog.is_processing(42) is False
+
 
 class TestZeroConfigCoordination:
     """_get_coordination() must work without any consumer wiring (Zero-Config Principle).
@@ -1155,6 +1165,74 @@ class TestStartSessionCommand:
 
         interaction.response.defer.assert_called_once()
         cog.spawn_session.assert_called_once_with(channel, "hello")
+
+
+class TestClordTextCommand:
+    """!clord mirrors /clord but is invokable from webhooks (E2E)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_prompt_shows_usage(self) -> None:
+        cog = _make_cog()
+        ctx = _make_channel_ctx()
+        await cog.clord_text.callback(cog, ctx, prompt=None)
+        ctx.send.assert_called_once()
+        assert "Usage" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_rejected(self) -> None:
+        bot = MagicMock()
+        bot.channel_id = 999
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), allowed_user_ids={111})
+        ctx = _make_channel_ctx()  # author.id = 1, not in {111}
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+        ctx.send.assert_called_once()
+        assert "not authorized" in ctx.send.call_args.args[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_channel_spawns_session(self) -> None:
+        cc = _make_channel_cog_mock(tmux_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
+        ctx = _make_channel_ctx()
+        ctx.channel.id = 999
+        thread = MagicMock(spec=discord.Thread)
+        thread.mention = "<#12345>"
+        cog.spawn_session = AsyncMock(return_value=thread)
+
+        await cog.clord_text.callback(cog, ctx, prompt="build a feature")
+
+        cog.spawn_session.assert_called_once_with(ctx.channel, "build a feature")
+        assert "<#12345>" in ctx.send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_thread_continues_session(self) -> None:
+        cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
+        ctx = _make_thread_ctx(thread_id=555, parent_id=999)
+        ctx.channel.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        record = MagicMock()
+        record.session_id = "sess-abc"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog._run_claude = AsyncMock()
+
+        await cog.clord_text.callback(cog, ctx, prompt="continue this")
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs["session_id"] == "sess-abc"
+        assert kwargs["prompt"] == "continue this"
+
+    @pytest.mark.asyncio
+    async def test_unbound_channel_rejected(self) -> None:
+        cc = _make_channel_cog_mock()  # both managers None
+        cog = _make_cog(channel_cog=cc)
+        ctx = _make_channel_ctx()
+        ctx.channel.id = 4242
+        cog.spawn_session = AsyncMock()
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        cog.spawn_session.assert_not_called()
+        assert "clord-init" in ctx.send.call_args.args[0]
 
 
 class TestAttachWindowCommand:
@@ -1753,12 +1831,22 @@ class TestApplyThreadNamingRetitle:
 
         instruction = "次はDockerfileを最適化してCI/CDを改善してください"
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="Dockerfileの最適化")):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message=instruction)
+        with patch.object(
+            cc_module.topic_module,
+            "maybe_retitle",
+            new=AsyncMock(return_value="Dockerfileの最適化"),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message=instruction
+            )
 
-        cog.repo.set_topic.assert_awaited_once_with(55555, "Dockerfileの最適化", source="llm_retitle")
+        cog.repo.set_topic.assert_awaited_once_with(
+            55555, "Dockerfileの最適化", source="llm_retitle"
+        )
         thread.edit.assert_awaited_once()
-        call_name = thread.edit.await_args.kwargs.get("name", thread.edit.await_args.args[0] if thread.edit.await_args.args else "")
+        call_name = thread.edit.await_args.kwargs.get(
+            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
+        )
         assert "Dockerfileの最適化" in call_name
 
     @pytest.mark.asyncio
@@ -1774,8 +1862,12 @@ class TestApplyThreadNamingRetitle:
 
         instruction = "認証リファクタを引き続きお願いします"
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message=instruction)
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message=instruction
+            )
 
         cog.repo.set_topic.assert_not_awaited()
 
@@ -1789,8 +1881,12 @@ class TestApplyThreadNamingRetitle:
         record = self._make_record(topic="認証リファクタ", locked=1)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="new")) as mock_retitle:
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="何か作業してください")
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="new")
+        ) as mock_retitle:
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="何か作業してください"
+            )
 
         mock_retitle.assert_not_awaited()
 
@@ -1804,8 +1900,16 @@ class TestApplyThreadNamingRetitle:
         record = self._make_record(topic=None)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock()) as mock_retitle, \
-             patch.object(cc_module.topic_module, "generate_topic", new=AsyncMock(return_value=("初回トピック", "llm"))):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="初回メッセージです")
+        with (
+            patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock()) as mock_retitle,
+            patch.object(
+                cc_module.topic_module,
+                "generate_topic",
+                new=AsyncMock(return_value=("初回トピック", "llm")),
+            ),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="初回メッセージです"
+            )
 
         mock_retitle.assert_not_awaited()
