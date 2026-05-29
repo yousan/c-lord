@@ -24,9 +24,11 @@ import contextlib
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 
+from ..claude.types import AskQuestion, _parse_ask_questions
+from ..discord_ui.ask_bus import ask_bus
 from .formatter import RenderedEvent, render_event
 from .tail import tail_events
 
@@ -34,6 +36,36 @@ logger = logging.getLogger(__name__)
 
 Sink = Callable[[str], Awaitable[None]]
 FileSink = Callable[[str, str], Awaitable[None]]
+# Called with the first AskUserQuestion of a tool_use to bridge it to Discord
+# buttons (#232). Constructed by TranscriptMirrorCog (knows tmux + thread).
+AskBridgeCb = Callable[[AskQuestion], Coroutine[object, object, None]]
+
+
+def _first_ask_question(event: dict) -> AskQuestion | None:
+    """Extract the first AskUserQuestion menu from a raw transcript event.
+
+    #232: AskUserQuestion is a main-agent tool whose ``tool_use`` always lands
+    in the JSONL transcript (richer than pane scraping). The mirror tails this,
+    so a menu raised outside a bot ``run_claude`` turn (e.g. autonomous
+    task-notification continuation) can still be bridged. Returns ``None`` when
+    the event is not an AskUserQuestion tool_use. Only the first question is
+    returned — the pane answers one menu at a time (multi-question is a known
+    limitation shared with the in-pane bridge).
+    """
+    content = event.get("message", {}).get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") == "AskUserQuestion"
+        ):
+            questions = _parse_ask_questions(block.get("input", {}) or {})
+            if questions and questions[0].options:
+                return questions[0]
+    return None
+
 
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
@@ -143,12 +175,17 @@ class TranscriptMirror:
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
         idle_flush_seconds: float | None = None,
+        ask_bridge_cb: AskBridgeCb | None = None,
     ) -> None:
         self.thread_id = thread_id
         self.project_dir = project_dir
         self._sink = sink
         self._reply_sink = reply_sink
         self._file_sink = file_sink
+        # #232: bridges an AskUserQuestion menu (detected in the transcript) to
+        # Discord buttons even when no run_claude poll loop is active.
+        self._ask_bridge_cb = ask_bridge_cb
+        self._ask_bridge_task: asyncio.Task[None] | None = None
         # Issue #215: called with the uuid of the last assistant_text of each
         # completed turn, so a restart can tell whether the final answer was
         # already delivered and avoid re-posting it.
@@ -175,6 +212,44 @@ class TranscriptMirror:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
         self._task = None
+        await self._cancel_ask_bridge()
+
+    async def _cancel_ask_bridge(self) -> None:
+        t = self._ask_bridge_task
+        if t is None:
+            return
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await t
+        self._ask_bridge_task = None
+
+    def _maybe_bridge_ask(self, event: dict) -> None:
+        """Bridge an AskUserQuestion menu found in *event* to Discord buttons (#232).
+
+        Runs regardless of bridge-trigger source (human / task-notification /
+        autonomous). Dedups against the run_claude poll-loop bridge via
+        ``ask_bus.is_active`` (whoever registers first owns the menu) and against
+        itself via the pending task guard. The bridge is spawned as a background
+        task because it awaits the user's click for up to 24h — awaiting inline
+        would freeze transcript tailing.
+        """
+        if self._ask_bridge_cb is None:
+            return
+        if self._ask_bridge_task is not None and not self._ask_bridge_task.done():
+            return
+        if ask_bus.is_active(self.thread_id):
+            return
+        question = _first_ask_question(event)
+        if question is None:
+            return
+        logger.info(
+            "TranscriptMirror: bridging post-turn AskUserQuestion thread=%d header=%r",
+            self.thread_id,
+            question.header,
+        )
+        self._ask_bridge_task = asyncio.create_task(
+            self._ask_bridge_cb(question), name=f"mirror-ask-bridge-{self.thread_id}"
+        )
 
     async def _run(self) -> None:
         logger.info(
@@ -268,6 +343,10 @@ class TranscriptMirror:
                         await _commit_cursor()
                     continue
 
+                # #232: bridge an open AskUserQuestion menu regardless of
+                # verbosity / turn-end / who triggered the turn.
+                self._maybe_bridge_ask(event)
+
                 if self._verbosity == "minimal" and _is_turn_end(event):
                     # Turn boundary: flush pending as the final reply.
                     await _flush_pending_as_reply()
@@ -308,6 +387,7 @@ class TranscriptMirror:
             producer.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await producer
+            await self._cancel_ask_bridge()
             if self._verbosity == "minimal":
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _flush_pending_as_reply()
