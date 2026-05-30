@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import tempfile
@@ -65,6 +66,60 @@ def _first_ask_question(event: dict) -> AskQuestion | None:
             if questions and questions[0].options:
                 return questions[0]
     return None
+
+
+def _first_ask_tool_use_id(event: dict) -> str | None:
+    """Return the ``tool_use`` id of the first AskUserQuestion block, if any.
+
+    Pairs with :func:`_first_ask_question`: the id is what a later ``tool_result``
+    references (``tool_use_id``), so it lets the mirror tell whether the menu has
+    already been answered (#262).
+    """
+    content = event.get("message", {}).get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") == "AskUserQuestion"
+        ):
+            tool_use_id = block.get("id")
+            return tool_use_id if isinstance(tool_use_id, str) else None
+    return None
+
+
+def _transcript_has_ask_result(project_dir: Path, tool_use_id: str) -> bool:
+    """Return True if any jsonl in *project_dir* answers *tool_use_id* (#262).
+
+    A ``tool_result`` whose ``tool_use_id`` matches means the AskUserQuestion menu
+    is already closed/answered. Scanning is cheap (AskUserQuestion is rare and the
+    id substring pre-filters lines before JSON parsing), so this runs off-thread
+    only when a menu is about to be bridged.
+    """
+    for path in sorted(project_dir.glob("*.jsonl")):
+        try:
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    if tool_use_id not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    content = event.get("message", {}).get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                            and block.get("tool_use_id") == tool_use_id
+                        ):
+                            return True
+        except OSError:
+            continue
+    return False
 
 
 # Kinds that are buffered (not posted individually) in minimal mode.
@@ -234,7 +289,7 @@ class TranscriptMirror:
             await t
         self._ask_bridge_task = None
 
-    def _maybe_bridge_ask(self, event: dict) -> None:
+    async def _maybe_bridge_ask(self, event: dict) -> None:
         """Bridge an AskUserQuestion menu found in *event* to Discord buttons (#232).
 
         Runs regardless of bridge-trigger source (human / task-notification /
@@ -243,6 +298,13 @@ class TranscriptMirror:
         itself via the pending task guard. The bridge is spawned as a background
         task because it awaits the user's click for up to 24h — awaiting inline
         would freeze transcript tailing.
+
+        #262: ``ask_bus.is_active`` is only a point-in-time check. The live bridge
+        releases ``ask_bus`` the instant it gets an answer, so a mirror that tails
+        the ``tool_use`` line late (queue lag / restart replay) would see
+        ``is_active=False`` and re-bridge an already-answered menu — a dead,
+        duplicate set of buttons posted after the answer. Guard against that by
+        skipping when the transcript already contains the menu's ``tool_result``.
         """
         if self._ask_bridge_cb is None:
             return
@@ -252,6 +314,17 @@ class TranscriptMirror:
             return
         question = _first_ask_question(event)
         if question is None:
+            return
+        tool_use_id = _first_ask_tool_use_id(event)
+        if tool_use_id is not None and await asyncio.to_thread(
+            _transcript_has_ask_result, self.project_dir, tool_use_id
+        ):
+            logger.debug(
+                "TranscriptMirror: skipping already-answered AskUserQuestion "
+                "thread=%d tool_use_id=%s",
+                self.thread_id,
+                tool_use_id,
+            )
             return
         logger.info(
             "TranscriptMirror: bridging post-turn AskUserQuestion thread=%d header=%r",
@@ -356,7 +429,7 @@ class TranscriptMirror:
 
                 # #232: bridge an open AskUserQuestion menu regardless of
                 # verbosity / turn-end / who triggered the turn.
-                self._maybe_bridge_ask(event)
+                await self._maybe_bridge_ask(event)
 
                 if self._verbosity == "minimal" and _is_turn_end(event):
                     # Turn boundary: flush pending as the final reply.
