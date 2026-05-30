@@ -119,10 +119,27 @@ Keystrokes are spaced by `_MENU_NAV_DELAY` for the same timing reason as
 `answer_menu` (#171). Verified end-to-end: the typed text is recorded as
 `<question> → <text>` (not "User declined to answer questions").
 
+## Multi-question Submit screen
+
+A multi-question AskUserQuestion is handled one menu at a time as each renders in
+the pane (each question → its own Discord buttons). After the last question is
+answered, the TUI shows a **"Review your answers" / "Submit answers" / "Cancel"**
+confirmation. That screen carries **no `Chat about this` marker**, so
+`_parse_ask_from_pane` does not match it; without explicit handling it fell
+through to the unknown-prompt path and surfaced a spurious *"Unknown TUI prompt
+detected"* warning over an already-answered flow.
+
+c-lord now recognises it (`_is_ask_submit_screen`) and **auto-submits**: the
+cursor defaults to "Submit answers", so the poll loop presses a bare `Enter`
+(after a short stability dwell, with signature dedup so a lingering screen isn't
+Enter-ed twice) — mirroring the auto-accept used for trust/permission prompts.
+The answers are already locked in via the bridge, so no further user input is
+needed.
+
 ## Limitations
 
-- **Single question at a time.** A multi-question AskUserQuestion is handled one
-  menu at a time as each renders in the pane.
+- **Free text on the Submit screen is not re-editable from Discord.** The review
+  screen is auto-submitted as-is; to change an answer, use `/attach`.
 
 ## Source map
 

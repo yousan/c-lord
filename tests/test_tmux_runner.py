@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from c_lord.claude.tmux_runner import (
     TmuxClaudeRunner,
     _clean_tui_lines,
+    _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
 )
@@ -1879,6 +1880,84 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
             "-- INSERT --"
         )
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+
+class TestAskUserQuestionSubmitScreen:
+    """Multi-question AskUserQuestion ends on a 'Review your answers' /
+    'Submit answers' / 'Cancel' confirmation screen.  It carries no
+    'Chat about this' marker, so _parse_ask_from_pane misses it and it used to
+    fall through to _has_unknown_interactive — surfacing a spurious 'Unknown TUI
+    prompt' warning instead of completing the answered questions.  c-lord must
+    recognise it and auto-submit (the answers are already locked via the bridge).
+    """
+
+    def test_submit_screen_detected(self) -> None:
+        pane = _normalize_capture(_load_fixture("ask_user_question_submit_screen.txt"))
+        assert _is_ask_submit_screen(pane) is True
+
+    def test_submit_screen_not_flagged_as_unknown(self) -> None:
+        """RED: the Submit/Review screen must NOT trip the unknown-prompt alert."""
+        pane = _normalize_capture(_load_fixture("ask_user_question_submit_screen.txt"))
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_single_question_menu_is_not_submit_screen(self) -> None:
+        """A normal question menu must not be mistaken for the Submit screen."""
+        pane = _normalize_capture(_load_fixture("ask_user_question_menu.txt"))
+        assert _is_ask_submit_screen(pane) is False
+
+    def test_unknown_menu_is_not_submit_screen(self) -> None:
+        """A truly unknown numbered menu must not be mistaken for Submit."""
+        pane = (
+            "Would you like to install the LSP plugin?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "────────────────────────────────────────\n"
+            "-- INSERT --"
+        )
+        assert _is_ask_submit_screen(pane) is False
+
+    @pytest.mark.asyncio
+    async def test_submit_ask_screen_sends_enter(self, runner, tmux_manager) -> None:
+        """Confirming the review screen presses Enter on 'Submit answers'."""
+        await runner._submit_ask_screen()
+        tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
+
+    @pytest.mark.asyncio
+    async def test_run_loop_auto_submits_review_screen(self, runner, tmux_manager) -> None:
+        """End-to-end: when the Submit/Review screen renders, the poll loop
+        auto-presses Enter once (no 'unknown prompt' event is emitted)."""
+        submit_pane = _load_fixture("ask_user_question_submit_screen.txt")
+        done_pane = _make_pane(["● Done."], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Show the review screen long enough to clear the dwell, then a
+            # completed pane so run() can finalise and the loop exits.
+            return submit_pane if call_idx <= 4 else done_pane
+
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.capture_pane.side_effect = capture_fn
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("follow up"):
+                events.append(event)
+
+        enter_calls = [
+            c for c in tmux_manager.send_keys.call_args_list if c == call(12345, "Enter")
+        ]
+        assert len(enter_calls) >= 1, "review screen should be auto-submitted with Enter"
+        assert not any(e.unknown_tui_prompt for e in events), (
+            "Submit screen must not surface an unknown-prompt warning"
+        )
 
 
 class TestGhostTextInputNotFlagged:
