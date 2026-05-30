@@ -22,6 +22,11 @@ import time
 
 import discord
 
+from ..claude.context_usage import (
+    default_window,
+    format_context_line,
+    read_latest_usage,
+)
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
@@ -31,11 +36,19 @@ from ..discord_ui.ask_handler import (  # noqa: F401
 from ..discord_ui.embeds import error_embed, timeout_embed
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
+from ..transcript.resolver import derive_project_dir
 from ..utils.logger import log_ctx
 from .event_processor import EventProcessor
 from .run_config import RunConfig  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+# Context-window total per session_id, learned via TmuxClaudeRunner's /context
+# probe (or a per-model fallback) and reused for the rest of the session.  The
+# value is ``(model, total)``: when the model in the transcript changes (e.g.
+# the user runs /model in the pane) the window size may change too, so a model
+# mismatch forces a re-probe.  The numerator is re-read every turn regardless.
+_context_window_cache: dict[str, tuple[str | None, int]] = {}
 
 # Max characters for tool result display (re-exported for backward compat).
 TOOL_RESULT_MAX_CHARS = 3000
@@ -165,6 +178,50 @@ async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:
             logger.debug("Deleted image tempfile: %s", path)
 
 
+async def _resolve_context_window(config: RunConfig, session_id: str, model: str | None) -> int:
+    """Return the context-window total for ``session_id`` running ``model``.
+
+    Learned by scraping ``/context`` (Claude is idle at the prompt after a turn
+    completes), then cached.  A re-probe is forced when ``model`` differs from
+    the value cached for this session, since the window size can change with the
+    model.  Falls back to a per-model default when the runner cannot probe or
+    the pane cannot be parsed.
+    """
+    cached = _context_window_cache.get(session_id)
+    if cached is not None and cached[0] == model:
+        return cached[1]
+
+    total: int | None = None
+    probe = getattr(config.runner, "probe_context_window", None)
+    if probe is not None:
+        with contextlib.suppress(Exception):
+            result = await probe()
+            total = result if isinstance(result, int) else None
+    if total is None:
+        total = default_window(model or getattr(config.runner, "model", None))
+    _context_window_cache[session_id] = (model, total)
+    return total
+
+
+async def _post_context_usage(config: RunConfig, session_id: str | None) -> None:
+    """Post a subtle context-window usage line after a completed turn.
+
+    Numerator (tokens in context) comes from the session transcript; the
+    denominator from :func:`_resolve_context_window`.  Best-effort — any failure
+    is swallowed so it never disturbs the turn.
+    """
+    working_dir = getattr(config.runner, "working_dir", None)
+    if not session_id or not working_dir:
+        return
+    jsonl = derive_project_dir(working_dir) / f"{session_id}.jsonl"
+    usage = read_latest_usage(jsonl)
+    if usage is None:
+        return
+    total = await _resolve_context_window(config, session_id, usage.model)
+    with contextlib.suppress(discord.HTTPException):
+        await config.thread.send(format_context_line(usage.used, total))
+
+
 async def run_claude_with_config(config: RunConfig) -> str | None:
     """Execute Claude Code CLI and stream results to a Discord thread.
 
@@ -274,6 +331,9 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
                 log_ctx(thread_id=config.thread.id, session_id=processor.session_id),
             )
             return await run_claude_with_config(config.with_prompt(answer_prompt))
+
+    if not run_errored:
+        await _post_context_usage(config, processor.session_id)
 
     logger.info(
         "%s run_claude: exit",

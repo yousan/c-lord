@@ -71,6 +71,43 @@ def _make_pane(
     return "\n".join(lines)
 
 
+class TestProbeContextWindow:
+    """probe_context_window scrapes /context to learn the real window total."""
+
+    _PANE = (
+        "❯ /context\n"
+        "  ⎿  Context Usage\n"
+        "     claude-opus-4-7[1m]\n"
+        "     11.7k/1m tokens (1%)\n"
+        "──────────────────\n"
+        "❯\n"
+    )
+
+    def test_parses_total_from_context_pane(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_literal.return_value = True
+        tmux_manager.send_keys.return_value = True
+        tmux_manager.capture_pane.return_value = self._PANE
+
+        total = asyncio.run(runner.probe_context_window())
+
+        assert total == 1_000_000
+        # /context must be typed without submitting it as a user turn first.
+        tmux_manager.send_literal.assert_called_once_with(12345, "/context")
+        tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
+
+    def test_returns_none_when_claude_not_running(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = False
+        assert asyncio.run(runner.probe_context_window()) is None
+        tmux_manager.send_literal.assert_not_called()
+
+    def test_returns_none_when_pane_unparseable(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_literal.return_value = True
+        tmux_manager.capture_pane.return_value = "no token info here"
+        assert asyncio.run(runner.probe_context_window()) is None
+
+
 # -- Tests for _extract_response --------------------------------------------
 
 
