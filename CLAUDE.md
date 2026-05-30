@@ -328,6 +328,19 @@ CONTRIBUTING.md          # Contribution guidelines
 2. Export from `__init__.py` if it's part of the public API
 3. Test edge cases (empty strings, very long strings, Unicode, code blocks)
 
+## 開発の行動規範 (Working Conduct) — Issue/PR の前提
+
+このリポジトリで AI が作業するときの上位ルール。Issue/PR/証跡の各規律はこの上に乗る。
+背景と経緯は `docs/DESIGN_DECISIONS.md` → "Working agreements" を参照。
+
+- **質問にはまず答える。質問を黙って作業に変換しない。** 「なぜここで〜なの？」「これは仕様？バグ？」は**診断の依頼**であって作業指示ではない。spec か bug かを、**実機の挙動の証跡**（スクショ / メッセージ URL / 観測）と**経緯 (Why)** で答えてから作業に入る。「コードが X だから」は挙動の説明であって仕様判定の答えにはならない（コードは意図を語れない）。
+- **自走の範囲＝合意済みの作業。** 「やる」と決まった作業は **PR → 手動QA → マージ → 本番デプロイ → 本番実測**まで自走してよい（途中で逐一停止しなくてよい）。ただし起点の問いはまだ作業ではない → 診断して合意してから着手する。
+- **柔らかい依頼（「ここ直ってる？」）は「答え→行動」の順で分離する。** 例:「直っていません。これは仕様ではなくバグです。→ 直しました: PR #NNN / Evidence: <URL>」。先頭で事実に答えれば、相手が「答えだけ欲しかった」場合も意図のズレに気づける。安価で可逆なら先回り可。**設計変更・破壊操作・不可逆な判断は推察で走らず一行確認**。
+- **迎合しない・鵜呑みにしない。** 事実ベースで判断し、報告と食い違えば指摘する。ユーザーの仮説も自分のデータで確認し、違えばその判断を優先して伝える。
+- **コードより先に実機の挙動を見る。** 内部実装を熟知した開発者目線ではなく、**利用者目線で「使って不便か」**を確認する。これが無いと、その Issue/PR が何のためにあるか（Why）が掴めない。
+- **報告は簡潔・日本語・URL はクリッカブルに。** 完了は `#NNN done / PR #MMM / Evidence: <URL>` を1行で。実機未確認なら「テスト緑・実機未確認」と正直に書く（過大申告しない）。
+- **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
+
 ## Definition of Done (DoD) — single source of truth
 
 **A change is "done" only when every box below is checked. This list is the one
@@ -352,9 +365,9 @@ A PR may be merged only when:
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
-- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed on staging, with log excerpts pasted under a `## Staging Evidence` heading. **An empty Staging Evidence section = not done.**
-- [ ] **No unrelated changes** in the diff; self-review done.
-- [ ] **Closes gating**: use `Closes #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. Never let a partial PR auto-close an Issue.
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.**
+- [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
+- [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
 
 If you cannot check a box, the change is not done — do not merge. State the
 blocker in the PR instead of silently dropping it.
@@ -364,6 +377,10 @@ blocker in the PR instead of silently dropping it.
 Most "completed but actually missing half" failures start at the Issue, not the
 PR. When you (or Opus) author an Issue:
 
+- **修正の前に必ず Issue 化し、ブランチを紐付ける。** 勝手に直し始めない（診断と合意が先）。
+- **Why を必ず書く（背骨）。** 「この修正/実装は何のためか」を利用者目線で明記する。Issue は**クローズ後も「どういう考えでそうなったか」を辿る記録**なので、症状だけでなく意図を残す。Why が無いと次の判断ができない。
+- **証跡（スクショ）を Issue にも残す。** テキストログだけでは表出しない問題（レイアウト・UI・ランプ状態など）があるため、**スクリーンショット**（理想は tmux の動作 × Discord の動作を合成した画像）で「リアルな問題」を示す。ユーザー提供のスクショは可能な限り Issue に入れる。網羅性を優先し、長いログ/コードは `<details><summary>` で畳んで可読性を保つ。
+- **本文は常に「現在の真実」に保つ。** 相談で方針が変わったら 概要/原因/AC を実態に書き換える。ただし**重要な書き換えは日付つきコメントで「何を・なぜ変えたか」を一次記録として残す**（後続コメントがどの版の本文を前提にしていたか辿れるように）。積み残しは新規 Issue 乱立ではなく**再オープン＋コメント**で残す。
 - **One Issue = one concern.** Do not bundle a bug fix with a design/enhancement task, or two unrelated behaviors, in one Issue. Bundling lets an agent satisfy the easy/testable half, write `Closes`, and auto-close the rest into oblivion. Split into separate Issues.
 - **Acceptance Criteria must be binary and unambiguous** — each AC is a checkbox that is objectively true or false (a command to run, an observable output, a state to assert). No "should probably", no "consider", no open options ("A案 or B案") left in the AC. Decide before filing; move discussion out of the AC list.
 - **Keep scope narrow.** If the Issue's title needs an "and", it is probably two Issues. A wide守備範囲 is where definitions go soft and items leak.
