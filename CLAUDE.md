@@ -115,7 +115,7 @@ c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) �
 **前提と制約**:
 - `c_lord/cogs/_run_helper.py` は **bot が spawn する子 Claude の env から `DISCORD_BOT_TOKEN` を strip する** (security audit に記載)。bot 経由で立った Claude は環境変数からは token を読めない
 - 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
-- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多いので、デバッグ時は **Discord REST API を curl で叩く方が確実**
+- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多い。**メッセージの読み取りは MCP に頼らず、`.env` の bot token を読んで Discord REST API を `curl` で叩く**のが確実 — MCP が `Missing Access` を返しても**そこで諦めず curl にフォールバックすること**。MCP は c-lord のスタック外（利用者環境にある保証もない）なので読み取りの基盤にしない。読み取り経路を skill + API として c-lord 内に正式実装する作業は #259、設計方針は #234 を参照
 
 **Token 取得**: 各 clone の作業ディレクトリ直下の `.env` を見るのが基本。本体 (bot を起動している c-lord clone) 以外の並行作業 clone (`c-lord-parallel`, `c-lord-parallel-2`, ...) には **`.env` を本体に symlink する規約** にしている:
 
