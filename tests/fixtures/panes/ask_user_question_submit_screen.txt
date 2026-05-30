@@ -1,0 +1,19 @@
+  ← ⊞ 症状 / ✓ Submit →
+
+  Review your answers
+
+   • 「スレッドが読める/読めない」とは、具体的にどの動作のこ
+     とですか？
+     → Botがスレッド内容を取得できない
+   • 本番(c-lord), staging(c-lord-parallel-3)のどちらで
+     起きていますか？
+     → 回答します。
+
+  Ready to submit your answers?
+
+  ❯ 1. Submit answers
+    2. Cancel
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  -- INSERT --   ⏵⏵ bypass permissions on /home/yousan/c-lord
