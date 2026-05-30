@@ -35,6 +35,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
+from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -706,7 +707,10 @@ class ClaudeChatCog(commands.Cog):
     async def _handle_new_conversation(self, message: discord.Message) -> None:
         """Create a new thread and start a Claude Code session."""
         thread_name = message.content[:100] if message.content else "Claude Chat"
-        thread = await message.create_thread(name=thread_name)
+        archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
+        thread = await message.create_thread(
+            name=thread_name, auto_archive_duration=archive_minutes
+        )
         prompt, image_paths = await self._build_prompt_and_images(message)
         await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
 
@@ -739,10 +743,11 @@ class ClaudeChatCog(commands.Cog):
             The newly created :class:`discord.Thread`.
         """
         name = (thread_name or prompt)[:100]
+        archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
         thread = await channel.create_thread(
             name=name,
             type=discord.ChannelType.public_thread,
-            auto_archive_duration=60,
+            auto_archive_duration=archive_minutes,
         )
         # Post the prompt so StatusManager has a Message to add reactions to.
         seed_message = await thread.send(prompt)

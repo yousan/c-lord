@@ -207,6 +207,8 @@ class TestTriggerExecution:
             mock_run.return_value = "session-abc"
             await cog.on_message(msg)
             msg.create_thread.assert_called_once()
+            # Defaults to 3 days (4320 min) when no setting is configured.
+            assert msg.create_thread.call_args.kwargs["auto_archive_duration"] == 4320
 
     @pytest.mark.asyncio
     async def test_success_reaction(
