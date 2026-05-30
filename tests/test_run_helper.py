@@ -38,12 +38,17 @@ class TestPostContextUsage:
         return cfg
 
     def _patch_usage(self, monkeypatch, used: int | None):
+        from pathlib import Path
+
         from c_lord.claude.context_usage import ContextUsage
         from c_lord.cogs import _run_helper
 
         _run_helper._context_window_cache.clear()
         usage = None if used is None else ContextUsage(input_tokens=used)
         monkeypatch.setattr(_run_helper, "read_latest_usage", lambda _p: usage)
+        monkeypatch.setattr(
+            _run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl")
+        )
         return _run_helper
 
     def test_posts_line_with_probed_total(self, monkeypatch) -> None:
@@ -62,6 +67,8 @@ class TestPostContextUsage:
         cfg.runner.probe_context_window.assert_awaited_once()
 
     def test_reprobes_when_model_changes(self, monkeypatch) -> None:
+        from pathlib import Path
+
         from c_lord.claude.context_usage import ContextUsage
         from c_lord.cogs import _run_helper
 
@@ -71,6 +78,9 @@ class TestPostContextUsage:
             _run_helper,
             "read_latest_usage",
             lambda _p: ContextUsage(input_tokens=10_000, model=next(models)),
+        )
+        monkeypatch.setattr(
+            _run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl")
         )
         cfg = self._config(probe_total=1_000_000)
         asyncio.run(_run_helper._post_context_usage(cfg, "sess-m"))

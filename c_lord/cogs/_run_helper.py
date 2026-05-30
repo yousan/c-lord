@@ -36,7 +36,7 @@ from ..discord_ui.ask_handler import (  # noqa: F401
 from ..discord_ui.embeds import error_embed, timeout_embed
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
-from ..transcript.resolver import derive_project_dir
+from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from .event_processor import EventProcessor
 from .run_config import RunConfig  # noqa: F401
@@ -213,7 +213,13 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     working_dir = getattr(config.runner, "working_dir", None)
     if not session_id or not working_dir:
         return
-    jsonl = derive_project_dir(working_dir) / f"{session_id}.jsonl"
+    # The session_id stored by c-lord can be a synthetic ``tmux-<thread>`` (skill
+    # mode) rather than Claude Code's real UUID, so locate the transcript by
+    # picking the most recently written ``*.jsonl`` in the project dir instead
+    # of constructing the path from session_id.
+    jsonl = latest_session_jsonl(derive_project_dir(working_dir))
+    if jsonl is None:
+        return
     usage = read_latest_usage(jsonl)
     if usage is None:
         return
