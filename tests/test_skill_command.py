@@ -28,6 +28,8 @@ def _make_cog(
 ) -> SkillCommandCog:
     """Return a SkillCommandCog with mocked dependencies."""
     bot = MagicMock()
+    # No settings repo → thread auto-archive resolver uses the 3-day default.
+    bot.settings_repo = None
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
@@ -383,6 +385,8 @@ class TestNewThreadMode:
             await cog.run_skill.callback(cog, interaction, name="todoist", args="search work")
         call_kwargs = mock_channel.create_thread.call_args.kwargs
         assert call_kwargs["name"] == "/todoist search work"
+        # Defaults to 3 days (4320 min) when no setting is configured.
+        assert call_kwargs["auto_archive_duration"] == 4320
 
     @pytest.mark.asyncio
     async def test_channel_not_found(self) -> None:

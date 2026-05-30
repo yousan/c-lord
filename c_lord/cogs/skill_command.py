@@ -30,6 +30,7 @@ from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
+from ..thread_settings import resolve_auto_archive_duration
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -300,9 +301,13 @@ class SkillCommandCog(commands.Cog):
 
         thread_name = f"/{name} {args}" if args else f"/{name}"
         # Discord thread names are max 100 chars
+        archive_minutes = await resolve_auto_archive_duration(
+            getattr(self.bot, "settings_repo", None)
+        )
         thread = await claude_channel.create_thread(
             name=thread_name[:100],
             type=discord.ChannelType.public_thread,
+            auto_archive_duration=archive_minutes,
         )
 
         display = f"`/{name} {args}`" if args else f"`/{name}`"

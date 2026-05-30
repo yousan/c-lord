@@ -345,6 +345,55 @@ class TestOpsTextTwins:
         assert ctx.send.call_args.kwargs.get("embed") is not None
 
 
+class TestThreadArchiveCommand:
+    """/thread-archive show + set and their !text twins."""
+
+    async def test_show_text_default(self):
+        cog = _make_cog()
+        cog.settings_repo = MagicMock()
+        cog.settings_repo.get = AsyncMock(return_value=None)
+        ctx = _make_ctx()
+        await cog.thread_archive_show_text.callback(cog, ctx)
+        embed = ctx.send.call_args.kwargs.get("embed")
+        assert embed is not None
+        # Default is 3 days (4320 min) when nothing is stored.
+        assert "4320" in embed.description or "3" in embed.description
+
+    async def test_set_text_invalid_duration(self):
+        cog = _make_cog()
+        cog.settings_repo = MagicMock()
+        cog.settings_repo.set = AsyncMock()
+        ctx = _make_ctx()
+        await cog.thread_archive_set_text.callback(cog, ctx, duration="999")
+        cog.settings_repo.set.assert_not_called()
+        assert "999" in ctx.send.call_args.args[0] or "Invalid" in ctx.send.call_args.args[0]
+
+    async def test_set_text_non_numeric(self):
+        cog = _make_cog()
+        cog.settings_repo = MagicMock()
+        cog.settings_repo.set = AsyncMock()
+        ctx = _make_ctx()
+        await cog.thread_archive_set_text.callback(cog, ctx, duration="garbage")
+        cog.settings_repo.set.assert_not_called()
+
+    async def test_set_text_missing_shows_usage(self):
+        cog = _make_cog()
+        ctx = _make_ctx()
+        await cog.thread_archive_set_text.callback(cog, ctx, duration=None)
+        ctx.send.assert_called_once()
+        assert "Usage" in ctx.send.call_args.args[0]
+
+    async def test_set_text_valid_persisted(self):
+        cog = _make_cog()
+        cog.settings_repo = MagicMock()
+        cog.settings_repo.set = AsyncMock()
+        ctx = _make_ctx()
+        await cog.thread_archive_set_text.callback(cog, ctx, duration="10080")
+        cog.settings_repo.set.assert_called_once()
+        assert cog.settings_repo.set.call_args.args[1] == "10080"
+        assert ctx.send.call_args.kwargs.get("embed") is not None
+
+
 class TestHelperFunctions:
     """Tests for _is_tmux_session and _format_session_short."""
 
