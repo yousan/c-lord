@@ -182,6 +182,8 @@ class TestUpgradeSteps:
         ):
             await cog.on_message(msg)
 
+        # Defaults to 3 days (4320 min) when no setting is configured.
+        assert msg.create_thread.call_args.kwargs["auto_archive_duration"] == 4320
         send_calls = [str(c) for c in thread.send.call_args_list]
         assert any("Upgrade complete" in s for s in send_calls)
 
