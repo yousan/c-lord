@@ -686,6 +686,12 @@ class ApiServer:
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
+        # Issue #201: import unconditionally — `discord` is referenced later for
+        # MessageReference / table images even when progress_file is absent. A
+        # conditional import made the name a function-local that was unbound on
+        # the no-attachment path, raising UnboundLocalError -> 500.
+        import discord
+
         # Optional attachment — resolve and validate before touching Discord.
         progress_file = data.get("progress_file")
         attachment = None
@@ -698,7 +704,6 @@ class ApiServer:
                     {"error": f"progress_file not found: {progress_file}"},
                     status=400,
                 )
-            import discord
 
             attachment = discord.File(str(path), filename=path.name)
 
@@ -722,27 +727,40 @@ class ApiServer:
         ]
 
         all_files = table_files + ([attachment] if attachment else [])
-        send_kwargs: dict = {"content": content}
-        if len(all_files) == 1:
-            send_kwargs["file"] = all_files[0]
-        elif len(all_files) > 1:
-            send_kwargs["files"] = all_files
+
+        # Issue: long replies were cut off at Discord's 2000-char limit. Split
+        # the body into multiple sequential messages. The quote-reply reference
+        # rides on the first chunk; attachments ride on the last.
+        from ..discord_ui.reply_chunker import chunk_discord_content
+
+        chunks = chunk_discord_content(content)
 
         # Issue #115: reply to the trigger message that started this Claude turn.
         from ..transcript.mirror import reply_to_trigger_enabled
 
+        reference = None
         if reply_to_trigger_enabled() and self.session_repo is not None:
             record = await self.session_repo.get(thread_id)
             trigger_id = getattr(record, "trigger_message_id", None) if record else None
             if trigger_id is not None:
-                send_kwargs["reference"] = discord.MessageReference(
+                reference = discord.MessageReference(
                     message_id=trigger_id,
                     channel_id=thread_id,
                     fail_if_not_exists=False,
                 )
-                send_kwargs["mention_author"] = False
 
-        await raw.send(**send_kwargs)  # type: ignore[union-attr]
+        last_idx = len(chunks) - 1
+        for idx, chunk in enumerate(chunks):
+            send_kwargs: dict = {"content": chunk}
+            if idx == 0 and reference is not None:
+                send_kwargs["reference"] = reference
+                send_kwargs["mention_author"] = False
+            if idx == last_idx and all_files:
+                if len(all_files) == 1:
+                    send_kwargs["file"] = all_files[0]
+                else:
+                    send_kwargs["files"] = all_files
+            await raw.send(**send_kwargs)  # type: ignore[union-attr]
 
         # Issue #67: record the successful reply so run_helper can detect
         # turns where Claude never invoked the discord-reply skill.

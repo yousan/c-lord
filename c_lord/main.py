@@ -19,9 +19,25 @@ from .utils.logger import setup_logging
 logger = logging.getLogger(__name__)
 
 
-def load_config() -> dict[str, str]:
+def resolve_data_dir(env_path: Path | None) -> Path:
+    """Resolve the directory that holds sessions.db / notifications.db.
+
+    Issue #202: when launched via ``c-lord start --env <path>``, data files must
+    live next to the given .env — not relative to the CWD — otherwise starting
+    from a different directory silently creates an empty sessions.db and orphans
+    every existing session. Standalone ``python -m c_lord.main`` (env_path=None)
+    keeps the legacy CWD-relative ``data/``.
+    """
+    base = env_path.parent if env_path is not None else Path(".")
+    return base / "data"
+
+
+def load_config(env_path: Path | None = None) -> dict[str, str]:
     """Load and validate configuration from environment."""
-    load_dotenv()
+    if env_path is not None:
+        load_dotenv(env_path)
+    else:
+        load_dotenv()
 
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token:
@@ -47,15 +63,15 @@ def load_config() -> dict[str, str]:
     }
 
 
-async def main() -> None:
+async def main(env_path: Path | None = None) -> None:
     """Start the bot."""
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     setup_logging(log_level)
-    config = load_config()
+    config = load_config(env_path)
 
-    data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
+    data_dir = resolve_data_dir(env_path)
+    data_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(data_dir / "sessions.db")
 
     runner = ClaudeConfig(
@@ -115,6 +131,7 @@ async def main() -> None:
             runner,
             api_server=api_server,
             session_db_path=db_path,
+            task_db_path=str(data_dir / "tasks.db"),
             allowed_user_ids=allowed_user_ids,
             allowed_role_name=allowed_role_name,
             claude_channel_id=int(config["channel_id"]),

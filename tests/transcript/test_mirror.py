@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from c_lord.transcript.mirror import TranscriptMirror, bridge_mode_jsonl, verbosity_mode
+from c_lord.discord_ui.ask_bus import ask_bus
+from c_lord.transcript.mirror import (
+    TranscriptMirror,
+    _first_ask_question,
+    bridge_mode_jsonl,
+    verbosity_mode,
+)
 
 
 def _write_event(path: Path, payload: dict) -> None:
@@ -806,3 +812,131 @@ async def test_minimal_idle_does_not_prematurely_flush_intermediate_text(
         assert not any("working on it" in r for r in replies), replies
     finally:
         await mirror.stop()
+
+
+# -- #232: AskUserQuestion bridge for non-run_claude (mirror-driven) sessions ----
+
+
+def _assistant_ask(header: str = "進め方") -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "AskUserQuestion",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "どの粒度で進めますか?",
+                                "header": header,
+                                "options": [
+                                    {"label": "A案", "description": "その場"},
+                                    {"label": "B案", "description": "新規"},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ],
+        },
+    }
+
+
+def test_first_ask_question_parses_tool_use() -> None:
+    q = _first_ask_question(_assistant_ask())
+    assert q is not None
+    assert q.header == "進め方"
+    assert q.question == "どの粒度で進めますか?"
+    assert [o.label for o in q.options] == ["A案", "B案"]
+
+
+def test_first_ask_question_ignores_non_ask_events() -> None:
+    assert _first_ask_question(_assistant_text("hi")) is None
+    assert _first_ask_question(_assistant_tool_use(name="Bash")) is None
+    assert _first_ask_question({"type": "assistant", "message": {}}) is None
+
+
+def test_ask_bus_is_active_tracks_waiters() -> None:
+    tid = 23223223
+    assert ask_bus.is_active(tid) is False
+    ask_bus.register(tid)
+    try:
+        assert ask_bus.is_active(tid) is True
+    finally:
+        ask_bus.unregister(tid)
+    assert ask_bus.is_active(tid) is False
+
+
+async def test_mirror_bridges_ask_to_cb(tmp_path: Path) -> None:
+    """#232: an AskUserQuestion menu tailed from the transcript is bridged via
+    the callback even with no run_claude turn active."""
+    import os
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    os.utime(jsonl, (1, 1))
+
+    called = asyncio.Event()
+    captured: dict = {}
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def ask_cb(question) -> None:
+        captured["q"] = question
+        called.set()
+
+    mirror = TranscriptMirror(
+        thread_id=2320001, project_dir=project, sink=sink, poll_interval=0.05, ask_bridge_cb=ask_cb
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_ask("進め方"))
+        await asyncio.wait_for(called.wait(), timeout=3)
+    finally:
+        await mirror.stop()
+
+    assert captured["q"].header == "進め方"
+    assert [o.label for o in captured["q"].options] == ["A案", "B案"]
+
+
+async def test_mirror_skips_ask_when_bus_active(tmp_path: Path) -> None:
+    """#232 dedup: when a bridge is already active (run_claude owns the menu via
+    ask_bus), the mirror must NOT spawn a second bridge."""
+    import os
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    os.utime(jsonl, (1, 1))
+
+    tid = 2320002
+    spawned = False
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def ask_cb(question) -> None:
+        nonlocal spawned
+        spawned = True
+
+    ask_bus.register(tid)  # simulate run_claude already bridging
+    mirror = TranscriptMirror(
+        thread_id=tid, project_dir=project, sink=sink, poll_interval=0.05, ask_bridge_cb=ask_cb
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_ask())
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        ask_bus.unregister(tid)
+
+    assert spawned is False
