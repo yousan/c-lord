@@ -100,10 +100,15 @@ def parse_context_total(pane_text: str) -> int | None:
     """Extract the context-window total from ``/context`` output.
 
     Looks for the ``<used>/<total> tokens`` line and returns ``<total>`` in
-    absolute tokens (e.g. ``1m`` → ``1_000_000``).  Returns ``None`` when no
-    such line is present.
+    absolute tokens (e.g. ``1m`` → ``1_000_000``).  Anchors on the latest
+    ``Context Usage`` header so a stray ``X/Y tokens`` string elsewhere in the
+    pane scrollback (e.g. text the bot itself echoed in earlier turns) does
+    not get picked up.  Returns ``None`` when no anchor is present.
     """
-    match = _CONTEXT_TOTAL_RE.search(pane_text)
+    anchor_idx = pane_text.rfind("Context Usage")
+    if anchor_idx == -1:
+        return None
+    match = _CONTEXT_TOTAL_RE.search(pane_text, pos=anchor_idx)
     if match is None:
         return None
     value, suffix = match.group(1), match.group(2)

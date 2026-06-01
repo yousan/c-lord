@@ -118,13 +118,37 @@ class TestParseContextTotal:
         assert parse_context_total(CONTEXT_PANE_200K) == 200_000
 
     def test_parses_inline_line(self) -> None:
-        assert parse_context_total("150.2k/1m tokens (15%)") == 1_000_000
+        assert parse_context_total("Context Usage\n  150.2k/1m tokens (15%)") == 1_000_000
 
     def test_decimal_k_total(self) -> None:
-        assert parse_context_total("1k/12.5k tokens (8%)") == 12_500
+        assert parse_context_total("Context Usage\n  1k/12.5k tokens (8%)") == 12_500
 
     def test_returns_none_without_match(self) -> None:
         assert parse_context_total("no token info in this pane") is None
+
+    def test_anchored_on_context_usage_header(self) -> None:
+        """An unrelated ``X/Y tokens`` line elsewhere in the pane must NOT win.
+
+        Regression: the bot pane scrollback can contain ``56.6k/200k tokens``
+        from prior conversation/PR text, while the freshly-emitted ``/context``
+        block (which is the only authoritative one) sits below a ``Context
+        Usage`` header.  Picking the first regex match in the pane caches the
+        wrong window forever.  parse_context_total must anchor on the latest
+        ``Context Usage`` header and only consider lines that follow it.
+        """
+        pane = (
+            "前の会話: PR 本文に 56.6k/200k tokens (28%) と書いた\n"
+            "...history continues with that text rendered...\n"
+            "❯ /context\n"
+            "  ⎿  Context Usage\n"
+            "     claude-opus-4-7[1m]\n"
+            "     340.5k/1m tokens (34%)\n"
+        )
+        assert parse_context_total(pane) == 1_000_000
+
+    def test_no_context_usage_header_returns_none(self) -> None:
+        """Without the anchor the parse must return None (safer than guessing)."""
+        assert parse_context_total("scrollback: 56.6k/200k tokens (28%)") is None
 
 
 class TestDefaultWindow:

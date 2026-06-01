@@ -197,10 +197,12 @@ async def _resolve_context_window(config: RunConfig, session_id: str, model: str
         with contextlib.suppress(Exception):
             result = await probe()
             total = result if isinstance(result, int) else None
-    if total is None:
-        total = default_window(model or getattr(config.runner, "model", None))
-    _context_window_cache[session_id] = (model, total)
-    return total
+    if total is not None:
+        # Cache only successful probes — a transient pane-parse failure must
+        # not lock the per-model fallback in for the rest of the session.
+        _context_window_cache[session_id] = (model, total)
+        return total
+    return default_window(model or getattr(config.runner, "model", None))
 
 
 async def _post_context_usage(config: RunConfig, session_id: str | None) -> None:
@@ -224,8 +226,24 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     if usage is None:
         return
     total = await _resolve_context_window(config, session_id, usage.model)
+    line = format_context_line(usage.used, total)
+
+    # Prefer appending to Claude's last reply message — keeps the addendum
+    # inside the same bubble (no fresh avatar/timestamp chrome).  Falls back
+    # to a new message when no reply was tracked or the combined content
+    # would exceed Discord's 2000-char limit.
+    from ..skills.reply_tracker import get_last_reply_message
+
+    last_reply = get_last_reply_message(config.thread.id)
+    if last_reply is not None:
+        existing = last_reply.content or ""
+        combined = f"{existing}\n{line}" if existing else line
+        if len(combined) <= 2000:
+            with contextlib.suppress(discord.HTTPException):
+                await last_reply.edit(content=combined)
+            return
     with contextlib.suppress(discord.HTTPException):
-        await config.thread.send(format_context_line(usage.used, total))
+        await config.thread.send(line)
 
 
 async def run_claude_with_config(config: RunConfig) -> str | None:

@@ -750,6 +750,7 @@ class ApiServer:
                 )
 
         last_idx = len(chunks) - 1
+        last_sent: discord.Message | None = None
         for idx, chunk in enumerate(chunks):
             send_kwargs: dict = {"content": chunk}
             if idx == 0 and reference is not None:
@@ -760,13 +761,18 @@ class ApiServer:
                     send_kwargs["file"] = all_files[0]
                 else:
                     send_kwargs["files"] = all_files
-            await raw.send(**send_kwargs)  # type: ignore[union-attr]
+            last_sent = await raw.send(**send_kwargs)  # type: ignore[union-attr]
 
         # Issue #67: record the successful reply so run_helper can detect
-        # turns where Claude never invoked the discord-reply skill.
-        from ..skills.reply_tracker import record_reply
+        # turns where Claude never invoked the discord-reply skill.  Also
+        # record the final message object so post-turn helpers (e.g. the
+        # context-usage line) can edit it in place instead of creating a new
+        # bubble.
+        from ..skills.reply_tracker import record_reply, record_reply_message
 
         record_reply(thread_id)
+        if last_sent is not None:
+            record_reply_message(thread_id, last_sent)
 
         return web.json_response({"status": "sent"})
 

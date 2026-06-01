@@ -277,7 +277,9 @@ class TranscriptMirrorCog(commands.Cog):
             ]
             reference = await self._build_trigger_reference(thread_id)
             try:
-                await self._send_chunks(send, text, reference=reference, files=table_files or None)
+                last_msg = await self._send_chunks(
+                    send, text, reference=reference, files=table_files or None
+                )
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror reply_sink failed: thread=%d body_len=%d status=%s — %s",
@@ -287,6 +289,11 @@ class TranscriptMirrorCog(commands.Cog):
                     exc,
                     exc_info=True,
                 )
+                return
+            if last_msg is not None:
+                from ..skills.reply_tracker import record_reply_message
+
+                record_reply_message(thread_id, last_msg)
 
         return reply_sink
 
@@ -314,8 +321,13 @@ class TranscriptMirrorCog(commands.Cog):
             ]
             files = [discord.File(file_path, filename="progress.txt")] + table_files
             reference = await self._build_trigger_reference(thread_id)
+
+            from ..skills.reply_tracker import record_reply_message
+
             try:
-                await self._send_chunks(send, text, reference=reference, files=files)
+                last_msg = await self._send_chunks(send, text, reference=reference, files=files)
+                if last_msg is not None:
+                    record_reply_message(thread_id, last_msg)
                 return
             except discord.HTTPException as exc:
                 logger.warning(
@@ -329,7 +341,9 @@ class TranscriptMirrorCog(commands.Cog):
                 )
             # Fallback: text without attachment (still chunked so it is not truncated).
             try:
-                await self._send_chunks(send, text, reference=reference)
+                last_msg = await self._send_chunks(send, text, reference=reference)
+                if last_msg is not None:
+                    record_reply_message(thread_id, last_msg)
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror file_sink fallback also failed: "
@@ -373,16 +387,19 @@ class TranscriptMirrorCog(commands.Cog):
         silent: bool = False,
         reference: discord.MessageReference | None = None,
         files: list[discord.File] | None = None,
-    ) -> None:
+    ) -> discord.Message | None:
         """Send ``text`` split into Discord-sendable chunks (Issue #235).
 
         Long bodies are split instead of truncated. The quote-reply
         ``reference`` rides on the first chunk; ``files`` ride on the last.
+        Returns the last sent ``Message`` (so callers can track it for
+        in-place edits — e.g. the context-usage line).
         """
         from ..discord_ui.reply_chunker import chunk_discord_content
 
         chunks = chunk_discord_content(text)
         last = len(chunks) - 1
+        last_sent: discord.Message | None = None
         for idx, chunk in enumerate(chunks):
             kwargs: dict = {"content": chunk}
             if silent:
@@ -392,7 +409,8 @@ class TranscriptMirrorCog(commands.Cog):
                 kwargs["mention_author"] = False
             if idx == last and files:
                 kwargs["files"] = files
-            await send(**kwargs)
+            last_sent = await send(**kwargs)
+        return last_sent
 
     @staticmethod
     async def _resolve_channel(bot, thread_id: int):
