@@ -412,9 +412,7 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 
 **ルール**: バグ修正 / 機能追加の PR は必ず staging 環境で「**修正前 = 再現できる**」「**修正後 = 再現しない (グリーン)**」を webhook 経由で確認する。これを通らないものはマージしない。
 
-**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。詳細は memory `project_staging_env.md` 参照。本番 (`/home/yousan/c-lord`) は kill しない。
-
-⚠️ **staging bot は単一の共有リソース** (`c-lord-parallel-3`, bot user `C-lord-3`)。複数セッション/人間が同時に検証すると、二重起動 (同一トークンが Discord イベントを二重処理) やブランチ切替による他セッションの中断が起きる。staging を借りる前に必ず [Staging bot の占有・解放プロトコル](#staging-bot-の占有解放プロトコル) に従って占有を宣言し、検証後は原状復帰すること。
+**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。詳細は memory `project_staging_env.md` 参照。本番 (`/home/yousan/c-lord`) は kill しない。staging bot は共有リソースで、再起動・ブランチ切替の調整漏れは他セッションの検証を中断させるため、下記レシピ末尾の **原状復帰** を必ず実行する。
 
 **手順** (バグ修正の例):
 ```bash
@@ -427,15 +425,23 @@ curl -X POST -H "Content-Type: application/json" \
 
 # 2. 修正実装 + ユニットテスト
 
-# 3. staging bot を新コードで再起動
+# 3. staging bot を新コードで再起動 (単一インスタンスで起動)
+#    ⚠️ パターン kill は実行中の自分のシェル (eval 中の `c_lord.main` 文字列) にも当たって自滅することがある。
+#       残存 count が 0 にならないときは PID 直指定 (kill <PID>) が安全。
 pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
+echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0 を確認
 nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
+sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1 を確認 (二重起動防止)
 
 # 4. GREEN 確認 — 同じ webhook 入力で問題が再現しないこと
 curl -X POST ... (上と同じ)
 # → ログ + Discord 上の応答が期待通りであることを確認
 
 # 5. PR 本文の "Test plan" にこの再現→修正のログ抜粋を貼る
+
+# 6. 原状復帰 — 検証で切り替えていたなら idle ブランチに戻して上記 (#3) を再実行
+#    idle ブランチは memory project_staging_env.md の "Default branch when idle" 参照
+git checkout fix/wire-max-concurrent-sessions   # 例
 ```
 
 **機能追加の場合**: RED の代わりに「実装前は存在しない挙動」「実装後は期待挙動」を webhook + ログで観測する。例: 構造化ログ追加 PR では `grep "thread=<id>" /tmp/clord-bot-staging.log` で **before = ヒットしない / after = enter/exit ペアが出る** を比較。
@@ -445,74 +451,6 @@ curl -X POST ... (上と同じ)
 - 純粋なリファクタで挙動が変わらないことが自明 (それでも `pytest` は必須)
 
 それ以外で staging 検証を省略するときは PR 本文に省略理由を書く。
-
-### Staging bot の占有・解放プロトコル
-
-staging 検証は **単一の bot** (`/home/yousan/c-lord-parallel-3`, bot user `C-lord-3`) を複数の Claude セッション/人間で共有している。占有の取り決めがないと、(1) 同一トークンの **二重起動** (Discord イベント/スラッシュコマンドを二重処理する有害な状態)、(2) 他セッションが検証中にブランチを切り替えられて **検証が中断** される、といった衝突が起きる (実害: 2026-05-27 の二重起動 + 検証中断)。
-
-仕組みは既にある (AI Lounge `POST /api/lounge` が共有 Discord coordination channel へ転送される)。足りないのは「今どのセッションが staging を握っているか」を宣言・解放する運用ルール。staging を borrow するときは下記 3 ステップを必ず守ること。
-
-#### Step 1 — 占有を宣言する (borrow 開始時)
-
-まず AI Lounge を **読んで** 他セッションが staging を使っていないか確認し、空いていれば占有を宣言する。Lounge は共有 Discord channel に転送されるので、他セッション・人間の双方に見える。
-
-```bash
-# 1a. 直近の Lounge を読む (他セッションが staging を借りていないか確認)
-curl -s "${CLORD_API_URL:-http://127.0.0.1:8080}/api/lounge?limit=20" \
-  | python3 -c "import sys,json;[print(f\"[{m['posted_at']}] {m['label']}: {m['message']}\") for m in json.load(sys.stdin)['messages']]"
-
-# 1b. 空いていれば占有を宣言する (label は自分が分かる名前に)
-curl -s -X POST "${CLORD_API_URL:-http://127.0.0.1:8080}/api/lounge" \
-  -H "Content-Type: application/json" \
-  -d '{"label":"<自分のニックネーム>","message":"staging (c-lord-parallel-3) を borrow します: PR #NNN の検証。完了したら解放通知します。"}'
-```
-
-`CLORD_API_URL` は bot が spawn したセッションには注入済み。手動起動した Claude では prod の `http://127.0.0.1:8080` (staging は `8089`) を直接指定する。誰かが既に borrow 中なら、完了通知を待つか Lounge で調整してから着手する。
-
-#### Step 2 — 単一インスタンスで起動する (kill → 残存確認 → 起動)
-
-起動前に **既存の `c-lord-parallel-3` インスタンスを必ず停止** し、二重起動を防ぐ。素の `pgrep -f c_lord.main` は prod・他 clone・**自分の実行シェルの eval 文字列** にもマッチして自滅・巻き添えの罠がある。staging だけを `c-lord-parallel-3` パスで絞ること。
-
-```bash
-cd /home/yousan/c-lord-parallel-3
-
-# 2a. 既存 staging インスタンスを停止 (parallel-3 パスで限定)
-pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
-
-# 2b. 残存ゼロを確認してから起動する (count が 0 でなければ PID を直指定で kill)
-#     ※ PID 直指定 (kill <PID>) が最も安全。パターン kill が自分のシェルに当たる事故を避けられる
-echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0 であること
-
-# 2c. 単一インスタンスで起動
-nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
-
-# 2d. 起動後、インスタンスが「ちょうど 1 つ」であることを再確認 (二重起動防止)
-sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1 であること
-```
-
-**本番 (`/home/yousan/c-lord`) は絶対に kill しない。** prod の再起動は別パス (`/home/yousan/c-lord/.venv`) で絞る ([Standard Development Flow](#standard-development-flow-mandatory) の Prod redeploy 参照)。
-
-#### Step 3 — 原状復帰して解放を通知する (borrow 終了時)
-
-検証が終わったら staging を **idle ブランチに戻して再起動** し (他セッションが次に借りたとき既知の状態から始められるように)、Lounge へ解放を通知する。idle ブランチは memory `project_staging_env.md` の "Default branch when idle" を参照 (現状 `fix/wire-max-concurrent-sessions`)。
-
-```bash
-cd /home/yousan/c-lord-parallel-3
-
-# 3a. idle ブランチへ戻す (検証で切り替えていた場合)
-git checkout fix/wire-max-concurrent-sessions   # ← project_staging_env.md の idle ブランチ
-
-# 3b. 単一インスタンスで再起動 (Step 2 と同じ kill → 確認 → 起動)
-pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
-echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0
-nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
-sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1
-
-# 3c. Lounge へ解放を通知
-curl -s -X POST "${CLORD_API_URL:-http://127.0.0.1:8080}/api/lounge" \
-  -H "Content-Type: application/json" \
-  -d '{"label":"<自分のニックネーム>","message":"staging を解放しました。idle ブランチに復帰済み。次の人どうぞ。"}'
-```
 
 ## AI Agent Configuration
 
