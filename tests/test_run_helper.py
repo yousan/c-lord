@@ -46,9 +46,7 @@ class TestPostContextUsage:
         _run_helper._context_window_cache.clear()
         usage = None if used is None else ContextUsage(input_tokens=used)
         monkeypatch.setattr(_run_helper, "read_latest_usage", lambda _p: usage)
-        monkeypatch.setattr(
-            _run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl")
-        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
         return _run_helper
 
     def test_posts_line_with_probed_total(self, monkeypatch) -> None:
@@ -79,9 +77,7 @@ class TestPostContextUsage:
             "read_latest_usage",
             lambda _p: ContextUsage(input_tokens=10_000, model=next(models)),
         )
-        monkeypatch.setattr(
-            _run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl")
-        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
         cfg = self._config(probe_total=1_000_000)
         asyncio.run(_run_helper._post_context_usage(cfg, "sess-m"))
         asyncio.run(_run_helper._post_context_usage(cfg, "sess-m"))
@@ -96,11 +92,134 @@ class TestPostContextUsage:
         assert "10%" in msg  # 20k / 200k
         assert "200k" in msg
 
+    def test_does_not_cache_when_probe_fails(self, monkeypatch) -> None:
+        """A transient probe failure must NOT lock the fallback into the cache.
+
+        Regression: caching the fallback caused a 1M-context user to be stuck
+        on the 200k default for the rest of the session (showing "100% full"
+        when actually at 34%).  The next turn must re-probe.
+        """
+        from pathlib import Path
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=10_000),
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        # First turn: probe fails → fallback used → must NOT cache.
+        cfg = self._config(probe_total=None)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-flaky"))
+        assert cfg.runner.probe_context_window.await_count == 1
+
+        # Second turn: probe must be called again (cache was not poisoned).
+        cfg.runner.probe_context_window.return_value = 1_000_000
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-flaky"))
+        assert cfg.runner.probe_context_window.await_count == 2
+        # And this turn's posted line must use the (now-successful) 1M total.
+        msg = cfg.thread.send.await_args.args[0]
+        assert "1.0M" in msg
+
     def test_skips_when_no_working_dir(self, monkeypatch) -> None:
         rh = self._patch_usage(monkeypatch, used=60_000)
         cfg = self._config(working_dir=None)
         asyncio.run(rh._post_context_usage(cfg, "sess-4"))
         cfg.thread.send.assert_not_called()
+
+    def test_edits_last_reply_when_available(self, monkeypatch) -> None:
+        """The context line must be appended to the last reply (no new bubble).
+
+        UX feedback: a separate bot message adds avatar/timestamp chrome that
+        feels obtrusive.  Editing the reply keeps the line inside the same
+        bubble as Claude's answer.
+        """
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+
+        # Simulate the api_server having recorded the assistant reply message.
+        last_msg = MagicMock()
+        last_msg.content = "2"
+        last_msg.edit = AsyncMock()
+        reply_tracker.record_reply_message(12345, last_msg)
+
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=60_000),
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-edit"))
+
+        # Edited the reply (no new send).
+        last_msg.edit.assert_awaited_once()
+        new_content = last_msg.edit.await_args.kwargs.get("content") or (
+            last_msg.edit.await_args.args[0] if last_msg.edit.await_args.args else ""
+        )
+        assert new_content.startswith("2\n")
+        assert "6%" in new_content
+        assert "1.0M" in new_content
+        cfg.thread.send.assert_not_called()
+
+    def test_falls_back_to_send_when_no_tracked_message(self, monkeypatch) -> None:
+        from pathlib import Path
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=60_000),
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-no-track"))
+        cfg.thread.send.assert_awaited_once()
+
+    def test_falls_back_to_send_when_edit_would_exceed_2000(self, monkeypatch) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+        last_msg = MagicMock()
+        last_msg.content = "x" * 1990  # leaves <= 10 chars; context line is longer
+        last_msg.edit = AsyncMock()
+        reply_tracker.record_reply_message(12345, last_msg)
+
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=60_000),
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-toobig"))
+        last_msg.edit.assert_not_called()
+        cfg.thread.send.assert_awaited_once()
 
     def test_skips_when_no_usage_in_transcript(self, monkeypatch) -> None:
         rh = self._patch_usage(monkeypatch, used=None)
