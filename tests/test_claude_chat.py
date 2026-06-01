@@ -684,6 +684,86 @@ class TestInterruptOnNewMessage:
         assert cog.is_processing(42) is False
 
 
+class TestResumeAfterPaneDeath:
+    """#270: a normal thread reply must resume the on-disk session via --continue
+    when the tmux pane has died (bot restart / kill -9 / tmux-server death), instead
+    of starting fresh and discarding the transcript that is still on disk.
+
+    The decision surfaces as ``_run_claude(..., try_continue=...)``:
+      - pane dead + prior session exists → ``try_continue=True``  (resume via --continue)
+      - tmux pane still alive            → ``try_continue=False`` (live send_input)
+      - session cleared (/clear)         → ``try_continue=False`` (stay fresh, #123 Part 1)
+
+    Refs #123 Part 2 — the existing --continue fallback only covers the
+    restart-resume path (on_ready → pending_resumes); the ordinary
+    message-triggered reply path is uncovered.
+    """
+
+    def _make_thread_message(self, thread_id: int = 42) -> MagicMock:
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = 999
+        thread.send = AsyncMock()
+        msg = MagicMock(spec=discord.Message)
+        msg.channel = thread
+        msg.content = "what is my name?"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+        return msg
+
+    def _cog_with_pane(self, *, running: bool) -> ClaudeChatCog:
+        """Cog whose tmux pane for the thread is alive (running) or dead."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.is_claude_running.return_value = running
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._run_claude = AsyncMock()
+        return cog
+
+    @pytest.mark.asyncio
+    async def test_resumes_with_continue_when_pane_dead_and_prior_session(self) -> None:
+        """RED (#270): pane died but a prior session exists → must pass try_continue=True."""
+        cog = self._cog_with_pane(running=False)
+        record = MagicMock()
+        record.session_id = "abc-123"
+        cog.repo.get = AsyncMock(return_value=record)
+
+        await cog._handle_thread_reply(self._make_thread_message())
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs.get("try_continue") is True
+
+    @pytest.mark.asyncio
+    async def test_no_continue_when_session_cleared(self) -> None:
+        """/clear invariant (#123 Part 1): session was reset → stay fresh, never --continue."""
+        cog = self._cog_with_pane(running=False)
+        record = MagicMock()
+        record.session_id = ""  # /clear resets session_id to empty
+        cog.repo.get = AsyncMock(return_value=record)
+
+        await cog._handle_thread_reply(self._make_thread_message())
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert not kwargs.get("try_continue")
+
+    @pytest.mark.asyncio
+    async def test_no_continue_when_pane_alive(self) -> None:
+        """Pane still alive → live send_input continues context; must not force --continue."""
+        cog = self._cog_with_pane(running=True)
+        record = MagicMock()
+        record.session_id = "abc-123"
+        cog.repo.get = AsyncMock(return_value=record)
+
+        await cog._handle_thread_reply(self._make_thread_message())
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert not kwargs.get("try_continue")
+
+
 class TestZeroConfigCoordination:
     """_get_coordination() must work without any consumer wiring (Zero-Config Principle).
 
