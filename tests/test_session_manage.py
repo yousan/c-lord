@@ -345,6 +345,60 @@ class TestOpsTextTwins:
         assert ctx.send.call_args.kwargs.get("embed") is not None
 
 
+class TestCloseWorkspace:
+    """#271: /close-workspace — non-destructive twin of /workspace-delete.
+
+    Kills the tmux window and archives the thread to declutter, but KEEPS the
+    session directory + transcript + DB record so the next message resumes the
+    conversation via --continue (#270).
+    """
+
+    async def test_close_text_outside_thread(self):
+        cog = _make_cog()
+        ctx = _make_ctx()  # not a thread
+        await cog.close_workspace_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+        assert "thread" in ctx.send.call_args.args[0].lower()
+
+    async def test_close_kills_window_but_keeps_session_dir(self):
+        """Core (#271): kill_session IS called, cleanup_for_thread is NOT (dir kept)."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(return_value=True)
+        sdm = MagicMock()
+        sdm.cleanup_for_thread = MagicMock()
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.edit = AsyncMock()
+        ctx = _make_ctx(channel=thread)
+
+        await cog.close_workspace_text.callback(cog, ctx)
+
+        tmux_mgr.kill_session.assert_called_once_with(555)
+        sdm.cleanup_for_thread.assert_not_called()  # ← dir/transcript MUST survive
+
+    async def test_close_archives_thread(self):
+        """#271: the thread is archived to declutter the sidebar (the 'tidy up' goal)."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.edit = AsyncMock()
+        ctx = _make_ctx(channel=thread)
+
+        await cog.close_workspace_text.callback(cog, ctx)
+
+        thread.edit.assert_called_once()
+        assert thread.edit.call_args.kwargs.get("archived") is True
+
+
 class TestThreadArchiveCommand:
     """/thread-archive show + set and their !text twins."""
 
