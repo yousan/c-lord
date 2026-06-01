@@ -916,8 +916,32 @@ class ClaudeChatCog(commands.Cog):
                     with contextlib.suppress(Exception):
                         await existing_task
 
+            # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
+            # death) but a prior session's transcript is still on disk, resume it via
+            # --continue instead of starting fresh and discarding the history.
+            # Conditions:
+            #   - existing_runner is None: an interrupted-but-live session stays alive
+            #     in tmux and should just receive send_input, not --continue.
+            #   - session_id is not None: a /clear'd thread has its session_id reset,
+            #     so it stays fresh — preserving the #123 Part 1 invariant.
+            #   - the tmux pane is actually dead (is_claude_running is False).
+            # This extends the --continue fallback (previously only on the
+            # restart-resume path, #123 Part 2) to the ordinary reply path.
+            try_continue = False
+            if session_id is not None and existing_runner is None:
+                parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+                tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
+                if tmux_manager is not None:
+                    pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
+                    try_continue = not pane_alive
+
             await self._run_claude(
-                message, thread, prompt, session_id=session_id, image_paths=image_paths
+                message,
+                thread,
+                prompt,
+                session_id=session_id,
+                image_paths=image_paths,
+                try_continue=try_continue,
             )
 
     async def _build_prompt(self, message: discord.Message) -> str:
