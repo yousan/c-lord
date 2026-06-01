@@ -23,6 +23,7 @@ from discord.ext import commands
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
+from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -150,7 +151,12 @@ class WebhookTriggerCog(commands.Cog):
         """Execute a matched trigger via Claude Code."""
         from ..claude.tmux_runner import TmuxClaudeRunner
 
-        thread = await message.create_thread(name=prefix[:100])
+        archive_minutes = await resolve_auto_archive_duration(
+            getattr(self.bot, "settings_repo", None)
+        )
+        thread = await message.create_thread(
+            name=prefix[:100], auto_archive_duration=archive_minutes
+        )
 
         tmux = await self._resolve_tmux_manager(message.channel.id)
         if tmux is None:

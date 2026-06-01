@@ -184,6 +184,29 @@ def _is_ask_question(text: str) -> bool:
     return _ASK_SIGNATURE in text and bool(_ASK_OPTION_RE.search(text))
 
 
+# A multi-question AskUserQuestion ends on a "Review your answers" screen with a
+# two-option menu — "Submit answers" / "Cancel" — and the cursor defaulting to
+# "Submit answers".  It carries NO "Chat about this" marker, so _is_ask_question
+# misses it; without explicit handling it falls through to the unknown-prompt
+# alert.  Match the two option labels (cursor optional) anchored to the bottom
+# zone, where real prompts live — the pairing is unique to this screen, so it
+# can't be confused with a normal question menu or an unrelated numbered list.
+_ASK_SUBMIT_RE = re.compile(r"^\s*❯?\s*\d+\.\s+Submit answers\s*$", re.MULTILINE)
+_ASK_CANCEL_RE = re.compile(r"^\s*❯?\s*\d+\.\s+Cancel\s*$", re.MULTILINE)
+
+
+def _is_ask_submit_screen(text: str) -> bool:
+    """True iff the pane shows the AskUserQuestion Submit/Review confirmation.
+
+    All questions were already answered via the Discord bridge; this final
+    screen only needs a bare Enter (cursor starts on "Submit answers") to
+    submit.  Only the bottom zone is scanned so a stale review screen left in
+    the scrollback can't re-trigger a submit.
+    """
+    zone = _permission_zone(text)
+    return bool(_ASK_SUBMIT_RE.search(zone)) and bool(_ASK_CANCEL_RE.search(zone))
+
+
 def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     """Parse an AskUserQuestion TUI menu from the pane into an ``AskQuestion``.
 
@@ -543,6 +566,11 @@ class TmuxClaudeRunner:
         # signature of the menu we already bridged to Discord (dedup).
         ask_stable = 0.0
         last_bridged_ask: str | None = None
+        # AskUserQuestion Submit/Review screen: seconds it has been stable, and
+        # the signature of the screen we already submitted (dedup so a lingering
+        # screen isn't Enter-ed every poll).
+        submit_stable = 0.0
+        last_submitted: str | None = None
         # Raw pane activity (#166): while Claude works the pane changes every
         # poll (spinner frame, elapsed-seconds tick), even when no response text
         # is extracted yet.  We only treat the session as idle once the raw pane
@@ -599,6 +627,8 @@ class TmuxClaudeRunner:
                 last_alerted_unknown = None
                 ask_stable = 0.0
                 last_bridged_ask = None
+                submit_stable = 0.0
+                last_submitted = None
                 await self._accept_permission_prompt(current)
                 continue
 
@@ -626,6 +656,26 @@ class TmuxClaudeRunner:
             else:
                 ask_stable = 0.0
                 last_bridged_ask = None
+
+            # AskUserQuestion multi-question Submit/Review screen (post-bridge).
+            # Once every question was answered via the Discord buttons, the TUI
+            # shows a "Review your answers" confirmation with the cursor on
+            # "Submit answers".  Auto-confirm with Enter so the answered flow
+            # completes instead of stalling as an "unknown" prompt.  A short
+            # dwell guards against acting on a half-drawn frame, and the
+            # signature dedup prevents re-pressing Enter while it lingers.
+            if _is_ask_submit_screen(current):
+                submit_stable += _POLL_INTERVAL
+                if submit_stable >= _ASK_ALERT_DELAY:
+                    sig = _unknown_prompt_signature(current)
+                    if sig != last_submitted:
+                        last_submitted = sig
+                        await self._submit_ask_screen()
+                    submit_stable = 0.0
+                continue
+            else:
+                submit_stable = 0.0
+                last_submitted = None
 
             # Detect unknown TUI interactive menus (not covered by known markers).
             # Alert Discord so the session doesn't stall silently.
@@ -903,6 +953,11 @@ class TmuxClaudeRunner:
         # the real UI with a spurious warning.
         if _is_ask_question(zone):
             return False
+        # Exclude the AskUserQuestion multi-question Submit/Review screen: it is a
+        # known, auto-submitted prompt (handled in the poll loop), not an unknown
+        # one — flagging it would surface a spurious warning over an answered flow.
+        if _is_ask_submit_screen(zone):
+            return False
         # Exclude Plan approval (ExitPlanMode) and (legacy) AskUserQuestion menus (#153).
         # These are handled via Discord buttons; surfacing them as "unknown" would
         # confuse users with a duplicate warning alongside the real Discord UI.
@@ -934,6 +989,19 @@ class TmuxClaudeRunner:
             target = f"{self._tmux.session_name}:{window}"
             key = "y" if self._is_yn_prompt(pane_text) else "Enter"
             _run(["tmux", "send-keys", "-t", target, key])
+
+    async def _submit_ask_screen(self) -> None:
+        """Confirm a multi-question AskUserQuestion Submit/Review screen.
+
+        Every question was already answered via the Discord bridge, so this
+        final screen only needs confirming.  Its cursor starts on "Submit
+        answers", so a bare Enter submits the recorded answers and lets Claude
+        proceed (mirrors the auto-accept used for trust/permission prompts).
+        """
+        logger.info(
+            "AskUserQuestion Submit screen detected, submitting (thread=%d)", self._thread_id
+        )
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
     async def _navigate_menu(self, index: int) -> None:
         """Move the menu cursor down *index* times then confirm with Enter.
