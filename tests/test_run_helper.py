@@ -25,6 +25,90 @@ from c_lord.cogs._run_helper import (
 from c_lord.concurrency import SessionRegistry
 
 
+class TestPostContextUsage:
+    """_post_context_usage posts the context line and caches the denominator."""
+
+    def _config(self, *, working_dir: str | None = "/tmp/x", probe_total: int | None = 1_000_000):
+        cfg = MagicMock()
+        cfg.thread.id = 12345
+        cfg.thread.send = AsyncMock()
+        cfg.runner.working_dir = working_dir
+        cfg.runner.model = "opus"
+        cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        return cfg
+
+    def _patch_usage(self, monkeypatch, used: int | None):
+        from pathlib import Path
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        usage = None if used is None else ContextUsage(input_tokens=used)
+        monkeypatch.setattr(_run_helper, "read_latest_usage", lambda _p: usage)
+        monkeypatch.setattr(
+            _run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl")
+        )
+        return _run_helper
+
+    def test_posts_line_with_probed_total(self, monkeypatch) -> None:
+        rh = self._patch_usage(monkeypatch, used=60_000)
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(rh._post_context_usage(cfg, "sess-1"))
+        cfg.thread.send.assert_awaited_once()
+        msg = cfg.thread.send.await_args.args[0]
+        assert "6%" in msg and "1.0M" in msg
+
+    def test_denominator_probed_once_then_cached(self, monkeypatch) -> None:
+        rh = self._patch_usage(monkeypatch, used=10_000)
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(rh._post_context_usage(cfg, "sess-2"))
+        asyncio.run(rh._post_context_usage(cfg, "sess-2"))
+        cfg.runner.probe_context_window.assert_awaited_once()
+
+    def test_reprobes_when_model_changes(self, monkeypatch) -> None:
+        from pathlib import Path
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        models = iter(["claude-opus-4-7", "claude-sonnet-4-6"])
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=10_000, model=next(models)),
+        )
+        monkeypatch.setattr(
+            _run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl")
+        )
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-m"))
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-m"))
+        # Model changed between turns → denominator must be re-learned.
+        assert cfg.runner.probe_context_window.await_count == 2
+
+    def test_falls_back_to_model_default_when_probe_fails(self, monkeypatch) -> None:
+        rh = self._patch_usage(monkeypatch, used=20_000)
+        cfg = self._config(probe_total=None)  # probe returns None → fallback 200k
+        asyncio.run(rh._post_context_usage(cfg, "sess-3"))
+        msg = cfg.thread.send.await_args.args[0]
+        assert "10%" in msg  # 20k / 200k
+        assert "200k" in msg
+
+    def test_skips_when_no_working_dir(self, monkeypatch) -> None:
+        rh = self._patch_usage(monkeypatch, used=60_000)
+        cfg = self._config(working_dir=None)
+        asyncio.run(rh._post_context_usage(cfg, "sess-4"))
+        cfg.thread.send.assert_not_called()
+
+    def test_skips_when_no_usage_in_transcript(self, monkeypatch) -> None:
+        rh = self._patch_usage(monkeypatch, used=None)
+        cfg = self._config()
+        asyncio.run(rh._post_context_usage(cfg, "sess-5"))
+        cfg.thread.send.assert_not_called()
+
+
 class TestTruncateResult:
     def test_short_content_unchanged(self) -> None:
         assert _truncate_result("hello") == "hello"

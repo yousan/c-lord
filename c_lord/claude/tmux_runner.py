@@ -17,6 +17,7 @@ import re
 from collections.abc import AsyncGenerator
 
 from ..tmux import TmuxSessionManager
+from .context_usage import parse_context_total
 from .types import AskOption, AskQuestion, MessageType, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,11 @@ _UNKNOWN_ALERT_DELAY = 5.0
 # buttons (seconds).  Shorter than the unknown delay — it is a definite,
 # expected prompt — but still guards against a half-drawn menu frame (#166).
 _ASK_ALERT_DELAY = 1.5
+
+# /context probe: how many times to re-capture the pane while waiting for the
+# (locally-rendered) /context output to settle, and the gap between captures.
+_CONTEXT_PROBE_ATTEMPTS = 6
+_CONTEXT_PROBE_INTERVAL = 0.5
 
 # Delay between individual menu-navigation keystrokes (seconds).  Keys must be
 # sent one at a time with a gap — batching `Down Down Enter` into one send-keys
@@ -812,6 +818,39 @@ class TmuxClaudeRunner:
         """Kill the tmux window entirely."""
         self._stopped = True
         await asyncio.to_thread(self._tmux.kill_session, self._thread_id)
+
+    async def probe_context_window(self) -> int | None:
+        """Learn the real context-window total by scraping ``/context``.
+
+        ``/context`` renders locally and consumes no model turn (verified: it
+        writes no ``usage``-bearing assistant entry to the transcript), so it is
+        safe to fire between turns.  It must only be called when Claude is idle
+        at the prompt — the caller is responsible for that ordering.
+
+        Returns the window total in absolute tokens (e.g. ``1_000_000`` for a
+        1M tier), or ``None`` if Claude is not running or the pane could not be
+        parsed (the caller then falls back to a per-model default).
+        """
+        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            return None
+
+        # ``send_literal`` (not ``send_input``) so the jsonl-bridge ZWSP marker
+        # is not prepended — a leading invisible char would stop Claude from
+        # recognising ``/context`` as a slash command.
+        if not await asyncio.to_thread(self._tmux.send_literal, self._thread_id, "/context"):
+            return None
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+
+        for _ in range(_CONTEXT_PROBE_ATTEMPTS):
+            await asyncio.sleep(_CONTEXT_PROBE_INTERVAL)
+            pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            total = parse_context_total(_normalize_capture(pane))
+            if total is not None:
+                logger.info("probe_context_window: total=%d (thread=%d)", total, self._thread_id)
+                return total
+
+        logger.info("probe_context_window: could not parse /context (thread=%d)", self._thread_id)
+        return None
 
     # ------------------------------------------------------------------
     # Private helpers
