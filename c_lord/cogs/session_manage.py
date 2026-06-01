@@ -7,6 +7,7 @@ Provides slash commands for viewing and managing Claude Code sessions:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
@@ -882,3 +883,71 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /workspace-delete — webhook-invokable for E2E (#209)."""
         respond, ack = self._ctx_io(ctx)
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    async def _close_workspace_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /close-workspace and !close-workspace (#271).
+
+        Non-destructive counterpart to ``/workspace-delete``: kills the tmux
+        window and archives the thread to declutter, but **keeps** the session
+        directory, transcript, and DB session record.  The next message resumes
+        the conversation via ``--continue`` (#270) — that is the whole point of
+        "close" vs "delete".  Note this never resolves the session-dir manager,
+        so the directory-removal path is structurally unreachable here.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond(
+                "This command can only be used in a Claude chat thread.",
+                ephemeral=True,
+            )
+            return
+
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+        await ack()
+
+        import asyncio
+
+        results: list[str] = []
+
+        # Kill the tmux window to free the work<N> slot.
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        if tmux_mgr is not None:
+            killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
+            if killed:
+                results.append("✅ Tmux window closed")
+            else:
+                results.append("ℹ️ No tmux window found")
+            results.append("📂 Session directory kept — send a message to resume.")
+        else:
+            results.append(
+                "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
+                " `/clord-init` で設定してください。"
+            )
+
+        embed = discord.Embed(
+            title="🧹 Workspace Closed",
+            description="\n".join(results),
+            color=COLOR_SUCCESS,
+        )
+        await respond(embed=embed)
+
+        # Archive the thread to declutter the sidebar (best-effort).
+        with contextlib.suppress(discord.HTTPException):
+            await channel.edit(archived=True)
+
+    @app_commands.command(
+        name="close-workspace",
+        description="Close the tmux window but keep the session (resumes on next message)",
+    )
+    async def close_workspace(self, interaction: discord.Interaction) -> None:
+        """Close the tmux window + archive the thread, keeping the session dir (#271)."""
+        respond, ack = self._slash_io(interaction)
+        await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="close-workspace")
+    async def close_workspace_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /close-workspace — webhook-invokable for E2E (#271)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)

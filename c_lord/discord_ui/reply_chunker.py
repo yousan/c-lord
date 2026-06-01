@@ -37,6 +37,13 @@ def chunk_discord_content(content: str, limit: int = DISCORD_MAX) -> list[str]:
     chunk re-opens it (preserving the language hint) so each chunk is
     self-contained valid Markdown. Lines longer than ``limit`` are hard-split.
 
+    Fence accounting (#266): a continuation chunk carries **both** the re-opened
+    opening fence at its start *and* a closing fence at its end, so its room for
+    body content is ``limit - len(open_fence) - 1 - _FENCE_RESERVE``. The earlier
+    implementation only reserved for the closing fence, so a single code line
+    longer than ~1996 chars produced a chunk of ``limit + 4`` (rejected by
+    Discord) plus a degenerate empty code block — the code body never arrived.
+
     Args:
         content: The full reply body (may contain newlines / code fences).
         limit: Maximum length of each returned chunk. Defaults to Discord's
@@ -54,20 +61,24 @@ def chunk_discord_content(content: str, limit: int = DISCORD_MAX) -> list[str]:
     if len(content) <= limit:
         return [content]
 
-    # Reserve room so closing/continuation fences never push a chunk over the
-    # hard limit. We reserve unconditionally to keep the accounting simple and
-    # always safe.
-    usable = max(1, limit - _FENCE_RESERVE)
-
     chunks: list[str] = []
     current: list[str] = []
-    cur_len = 0
+    cur_len = 0  # length of "\n".join(current)
     open_fence: str | None = None  # opening fence line text while inside a block
 
-    def finalize() -> None:
+    def flush() -> None:
+        """Emit the in-progress chunk, then re-open the fence for the next one."""
         nonlocal current, cur_len
-        text = "\n".join(current)
-        if open_fence is not None:
+        if not current:
+            return
+        lines = current
+        # If the only thing trailing is the just-opened fence (no body yet),
+        # move it to the next chunk instead of emitting an empty "```\n```".
+        dangling_open = open_fence is not None and lines[-1] == open_fence
+        if dangling_open:
+            lines = lines[:-1]
+        text = "\n".join(lines)
+        if open_fence is not None and not dangling_open:
             text = f"{text}\n{_FENCE}"  # close the fence for this chunk
         if text != "":
             chunks.append(text)
@@ -75,29 +86,51 @@ def chunk_discord_content(content: str, limit: int = DISCORD_MAX) -> list[str]:
         cur_len = 0
         if open_fence is not None:
             # Re-open the fence at the start of the next chunk.
-            current.append(open_fence)
+            current = [open_fence]
             cur_len = len(open_fence)
+
+    def add_line(line: str, reserve: int) -> None:
+        """Append ``line`` to the current chunk, flushing first if it won't fit.
+
+        ``reserve`` is the room to keep free for a trailing close fence so the
+        finished chunk (content + close) never exceeds ``limit``.
+        """
+        nonlocal cur_len
+        sep = 1 if current else 0
+        if current and cur_len + sep + len(line) + reserve > limit:
+            flush()
+            sep = 1 if current else 0
+        current.append(line)
+        cur_len += sep + len(line)
 
     for raw_line in content.split("\n"):
         is_fence = raw_line.lstrip().startswith(_FENCE)
+        # A chunk holding this line needs a trailing close fence iff we're inside
+        # a block (already open, or this line opens one).
+        opening = is_fence and open_fence is None
+        reserve = _FENCE_RESERVE if (open_fence is not None or opening) else 0
 
-        segments = [raw_line] if len(raw_line) <= usable else _hard_split(raw_line, usable)
+        if open_fence is not None and not is_fence:
+            # Body line inside a fence: every continuation chunk also carries the
+            # re-opened fence line + its newline, so shrink the per-piece budget.
+            max_piece = max(1, limit - _FENCE_RESERVE - len(open_fence) - 1)
+        else:
+            max_piece = limit
+
+        segments = [raw_line] if len(raw_line) <= max_piece else _hard_split(raw_line, max_piece)
         for seg in segments:
-            added = (1 if current else 0) + len(seg)
-            if current and cur_len + added > usable:
-                finalize()
-                added = (1 if current else 0) + len(seg)
-            if current:
-                cur_len += 1
-            current.append(seg)
-            cur_len += len(seg)
+            add_line(seg, reserve)
 
         if is_fence:
             open_fence = raw_line if open_fence is None else None
 
     if current:
-        text = "\n".join(current)
-        if open_fence is not None:
+        lines = current
+        dangling_open = open_fence is not None and lines[-1] == open_fence
+        if dangling_open:
+            lines = lines[:-1]
+        text = "\n".join(lines)
+        if open_fence is not None and not dangling_open:
             text = f"{text}\n{_FENCE}"
         if text != "":
             chunks.append(text)
