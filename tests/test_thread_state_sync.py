@@ -634,6 +634,76 @@ async def test_sync_one_backoff_cleared_on_success():
     assert 1002 not in loop._rename_backoff
 
 
+# ── #277: initial-pass must not burst-rename on startup ───────────────────────
+
+
+async def test_initial_tick_does_not_rename(monkeypatch):
+    """#277: the FIRST tick after startup must not call channel.edit for any
+    thread, even when the Discord name diverges from the computed name. It only
+    syncs DB state so the next tick has a baseline. This prevents the startup
+    rename burst that saturates Discord's per-channel rename rate-limit (429)."""
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+    # Three dead threads whose names all diverge → would all be renamed pre-fix.
+    recs = [
+        _Rec(thread_id=tid, state="alive", topic=f"topic{tid}", tmux_window_id="@1")
+        for tid in (101, 102, 103)
+    ]
+    repo.list_all = AsyncMock(return_value=recs)
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"  # diverges from build_name → pre-fix would edit
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+
+    monkeypatch.setattr(thread_state_sync, "_list_all_windows", lambda: [])
+
+    with patch.object(thread_state_sync, "discord") as discord_mock:
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop.tick()
+
+    # Initial pass: NO renames at all …
+    fake_thread.edit.assert_not_called()
+    # … but DB state IS still synced (baseline for the next tick).
+    assert repo.set_state.await_count == 3
+
+
+async def test_second_tick_renames_normally(monkeypatch):
+    """#277: after the initial pass, subsequent ticks rename diverging threads
+    as before. Guards against the fix accidentally disabling all renames."""
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+    rec = _Rec(thread_id=201, state="alive", topic="やること", tmux_window_id="@1")
+    repo.list_all = AsyncMock(return_value=[rec])
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    monkeypatch.setattr(thread_state_sync, "_list_all_windows", lambda: [])
+
+    with patch.object(thread_state_sync, "discord") as discord_mock:
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        # First tick: initial pass — no rename.
+        await loop.tick()
+        fake_thread.edit.assert_not_called()
+        # Second tick: normal behaviour — diverging name is renamed.
+        await loop.tick()
+        fake_thread.edit.assert_awaited_once()
+
+
 async def test_loop_start_is_idempotent():
     repo = MagicMock()
     bot = MagicMock()

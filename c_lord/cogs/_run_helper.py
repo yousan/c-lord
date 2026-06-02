@@ -43,6 +43,13 @@ from .run_config import RunConfig  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# How long to wait for transcript_mirror.reply_sink to register the assistant
+# reply before falling back to a fresh send.  jsonl bridge mode polls the
+# JSONL on a separate loop, so reply_sink may fire slightly after run_claude
+# returns; the line should ride on the same bubble in the common case.
+_REPLY_WAIT_ATTEMPTS = 8
+_REPLY_WAIT_INTERVAL = 0.2  # 8 × 200ms = up to 1.6 s
+
 # Context-window total per session_id, learned via TmuxClaudeRunner's /context
 # probe (or a per-model fallback) and reused for the rest of the session.  The
 # value is ``(model, total)``: when the model in the transcript changes (e.g.
@@ -229,12 +236,20 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     line = format_context_line(usage.used, total)
 
     # Prefer appending to Claude's last reply message — keeps the addendum
-    # inside the same bubble (no fresh avatar/timestamp chrome).  Falls back
-    # to a new message when no reply was tracked or the combined content
-    # would exceed Discord's 2000-char limit.
+    # inside the same bubble (no fresh avatar/timestamp chrome).  In jsonl
+    # bridge mode the transcript_mirror.reply_sink races with run_claude's
+    # loop end, so the message may not be registered yet — poll briefly
+    # before falling back to a fresh send.
+    import asyncio
+
     from ..skills.reply_tracker import get_last_reply_message
 
-    last_reply = get_last_reply_message(config.thread.id)
+    last_reply = None
+    for _ in range(_REPLY_WAIT_ATTEMPTS):
+        last_reply = get_last_reply_message(config.thread.id)
+        if last_reply is not None:
+            break
+        await asyncio.sleep(_REPLY_WAIT_INTERVAL)
     if last_reply is not None:
         existing = last_reply.content or ""
         combined = f"{existing}\n{line}" if existing else line

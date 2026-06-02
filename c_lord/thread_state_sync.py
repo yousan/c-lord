@@ -228,6 +228,11 @@ class ThreadStateSyncLoop:
         self._task: asyncio.Task[None] | None = None
         # Per-thread rate-limit backoff: thread_id → monotonic time until next rename is allowed.
         self._rename_backoff: dict[int, float] = {}
+        # #277: the first tick after startup must only sync DB state — never
+        # rename — so a restart can't burst-PATCH every diverging thread at once
+        # and saturate Discord's per-channel rename rate-limit (429). Set False
+        # once the first full tick completes; subsequent ticks rename normally.
+        self._initial_pass: bool = True
 
     def start(self) -> None:
         """Spawn the loop task. Idempotent — second call is a no-op."""
@@ -264,14 +269,30 @@ class ThreadStateSyncLoop:
 
         sessions = await self._repo.list_all(limit=500)
         for record in sessions:
-            await self._sync_one(record, by_tid)
+            await self._sync_one(record, by_tid, allow_rename=not self._initial_pass)
+
+        # After the first full pass, allow renames on subsequent ticks (#277).
+        if self._initial_pass:
+            logger.info(
+                "thread-state sync: initial pass complete (%d session(s) state-synced, "
+                "no renames sent); renames enabled from next tick",
+                len(sessions),
+            )
+            self._initial_pass = False
 
     async def _sync_one(
         self,
         record,  # SessionRecord
         by_tid: dict[int, dict[str, str]],
+        *,
+        allow_rename: bool = True,
     ) -> None:
-        """Reconcile a single session row with live tmux state."""
+        """Reconcile a single session row with live tmux state.
+
+        When ``allow_rename`` is False, only the DB ``state`` / ``tmux_window_id``
+        are synced and no Discord rename is sent — used for the first tick after
+        startup to avoid the rename burst that saturates the rate-limit (#277).
+        """
         thread_id = record.thread_id
         window_info = by_tid.get(thread_id)
 
@@ -300,6 +321,14 @@ class ThreadStateSyncLoop:
             await self._repo.set_state(thread_id, new_state)
         if window_id and record.tmux_window_id != window_id:
             await self._repo.set_tmux_window_id(thread_id, window_id)
+
+        # #277: on the first tick after startup, sync DB state only — never
+        # rename. A restart resets every in-memory guard, so renaming here would
+        # PATCH every diverging thread at once and saturate Discord's rename
+        # rate-limit (429 within seconds). The next tick renames diverging
+        # threads normally, using the state we just persisted as the baseline.
+        if not allow_rename:
+            return
 
         # Without a topic we can't construct a sensible name yet — skip.
         if not record.topic:
