@@ -174,6 +174,53 @@ class TestPostContextUsage:
         assert "1.0M" in new_content
         cfg.thread.send.assert_not_called()
 
+    def test_waits_briefly_for_reply_sink_then_edits(self, monkeypatch) -> None:
+        """In jsonl bridge mode the reply_sink races with the run-loop end.
+
+        Regression: _post_context_usage ran before transcript_mirror.reply_sink
+        finished posting + calling record_reply_message, so get_last_reply_message
+        returned None and the line was sent as a separate bubble. Wait briefly
+        (poll a few times) so the late reply_sink can still register before we
+        fall back.
+        """
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+
+        # Schedule a late record_reply_message after a few asyncio ticks,
+        # simulating the transcript_mirror reply_sink firing slightly after
+        # _post_context_usage starts.
+        late_msg = MagicMock()
+        late_msg.content = "5"
+        late_msg.edit = AsyncMock()
+
+        async def runner():
+            async def late_register():
+                await asyncio.sleep(0.15)  # ~150ms after _post_context_usage starts
+                reply_tracker.record_reply_message(12345, late_msg)
+
+            asyncio.create_task(late_register())
+            await _run_helper._post_context_usage(cfg, "sess-race")
+
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=60_000),
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(runner())
+
+        # Late-arriving reply was edited; no fresh send happened.
+        late_msg.edit.assert_awaited_once()
+        cfg.thread.send.assert_not_called()
+
     def test_falls_back_to_send_when_no_tracked_message(self, monkeypatch) -> None:
         from pathlib import Path
 
