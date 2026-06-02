@@ -24,11 +24,14 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 | `/clord <prompt>` | Start a new Claude Code session | Channel or thread |
 | `/stop` | Stop the active session (session is preserved for resume) | Thread only |
 | `/clear` | Reset the session — next message starts fresh | Thread only |
+| `/compact [instructions]` | Compact (summarize) the session context to free the window | Thread only |
 | `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
 
 **`/clord`** creates a new thread and sends your prompt to Claude Code. If used inside an existing thread, it continues the same session.
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
+
+**`/compact`** fires the Claude Code TUI's built-in `/compact` for this thread's session, compressing the conversation history into a summary so the context window is freed **without losing continuity** (unlike `/clear`, which discards the session). Pass optional `instructions` to focus the summary (e.g. `/compact keep the open tasks and decisions`). Note: a plain `/compact` typed as a normal message does **not** work under `CLORD_BRIDGE_MODE=jsonl` (the leading-slash note below) — this command exists precisely because it sends `/compact` via the zero-width-space-free `send_literal` path.
 
 **`/clord-attach`** links a thread to a tmux window so you can interact with the same Claude Code session from both Discord and the terminal.
 
@@ -99,6 +102,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
 | `!clear` | Reset the session — next message starts fresh | `!clear` | `/clear` |
+| `!compact [instructions]` | Compact (summarize) the session context | `!compact keep open tasks` | `/compact` |
 | `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
 | `!resume-info` | Show the CLI command to resume this thread | `!resume-info` | `/resume-info` |
 | `!sessions` | List all known sessions | `!sessions` | `/sessions` |

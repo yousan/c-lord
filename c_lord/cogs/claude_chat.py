@@ -704,6 +704,76 @@ class ClaudeChatCog(commands.Cog):
 
         await self._clear_impl(ctx.channel, respond)
 
+    async def _compact_impl(
+        self, channel: object, respond: _Responder, *, instructions: str = ""
+    ) -> None:
+        """Shared core for /compact and !compact (#278).
+
+        Fires the Claude Code TUI's built-in ``/compact`` slash command in the
+        thread's tmux window to compress (summarize) the session context,
+        freeing up the context window without losing history (unlike /clear).
+
+        Sent via ``send_literal`` (NOT ``send_input``): under
+        ``CLORD_BRIDGE_MODE=jsonl`` ``send_input`` prepends a zero-width-space
+        marker, so the line would no longer start with ``/`` and the TUI would
+        not treat it as a slash command (see docs/COMMANDS.md). This mirrors the
+        existing ``/context`` probe in ``tmux_runner.py``. Enter is sent
+        separately via ``send_keys`` since ``send_literal`` does not submit.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        thread_id = channel.id
+        parent_id = getattr(channel, "parent_id", None) or thread_id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        if tmux_manager is None:
+            await respond("tmux is not configured for this thread.", ephemeral=True)
+            return
+
+        if not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
+            await respond("No running Claude session in this thread to compact.", ephemeral=True)
+            return
+
+        instructions = instructions.strip()
+        command = f"/compact {instructions}" if instructions else "/compact"
+
+        # send_literal (not send_input): no ZWSP prefix so the leading "/" is
+        # preserved and the TUI recognises it as a slash command.
+        ok = await asyncio.to_thread(tmux_manager.send_literal, thread_id, command)
+        if not ok:
+            await respond("Failed to send /compact to the session.", ephemeral=True)
+            return
+        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
+
+        await respond("\U0001f5dc️ Compacting context… (`/compact` sent)")
+
+    @app_commands.command(
+        name="compact",
+        description="Compact (summarize) this thread's Claude context to free the window",
+    )
+    @app_commands.describe(
+        instructions="Optional focus for the summary (e.g. 'keep open tasks and decisions')"
+    )
+    async def compact_session(
+        self, interaction: discord.Interaction, instructions: str = ""
+    ) -> None:
+        """Trigger the TUI ``/compact`` for the current thread's session."""
+
+        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._compact_impl(interaction.channel, respond, instructions=instructions)
+
+    @commands.command(name="compact")
+    async def compact_text(self, ctx: commands.Context, *, instructions: str = "") -> None:
+        """Text/mention twin of /compact — invokable from webhooks for E2E (#278)."""
+
+        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
+            await ctx.send(content or "")
+
+        await self._compact_impl(ctx.channel, respond, instructions=instructions)
+
     async def _handle_new_conversation(self, message: discord.Message) -> None:
         """Create a new thread and start a Claude Code session."""
         thread_name = message.content[:100] if message.content else "Claude Chat"
