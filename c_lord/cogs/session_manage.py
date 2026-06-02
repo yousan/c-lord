@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 import discord
@@ -19,6 +20,7 @@ from discord.ext import commands
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
+from ..discord_ui.pane_renderer import render_pane_png
 from ..session_dir import SessionDirManager
 from ..thread_settings import (
     SETTING_THREAD_AUTO_ARCHIVE,
@@ -140,8 +142,20 @@ class SessionManageCog(commands.Cog):
             content: str | None = None,
             *,
             embed: discord.Embed | None = None,
+            file: discord.File | None = None,
             ephemeral: bool = False,
         ) -> None:
+            if file is not None:
+                embed_arg = embed if embed is not None else discord.utils.MISSING
+                if state["acked"]:
+                    await interaction.followup.send(
+                        content or "", embed=embed_arg, file=file, ephemeral=ephemeral
+                    )
+                else:
+                    await interaction.response.send_message(
+                        content, embed=embed_arg, file=file, ephemeral=ephemeral
+                    )
+                return
             if state["acked"]:
                 if embed is not None:
                     await interaction.followup.send(embed=embed, ephemeral=ephemeral)
@@ -162,10 +176,14 @@ class SessionManageCog(commands.Cog):
             content: str | None = None,
             *,
             embed: discord.Embed | None = None,
+            file: discord.File | None = None,
             ephemeral: bool = False,
         ) -> None:
             # Text channels can't be ephemeral — ``ephemeral`` is ignored.
-            if embed is not None:
+            if file is not None:
+                embed_arg = embed if embed is not None else discord.utils.MISSING
+                await ctx.send(content or "", embed=embed_arg, file=file)
+            elif embed is not None:
                 await ctx.send(embed=embed)
             else:
                 await ctx.send(content or "")
@@ -818,6 +836,76 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /tmux-list — webhook-invokable for E2E (#209)."""
         respond, ack = self._ctx_io(ctx)
         await self._tmux_list_impl(respond=respond, ack=ack)
+
+    async def _screenshot_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /tmux-screenshot and !tmux-screenshot (#285).
+
+        Captures the thread's *visible* tmux pane and posts it as a PNG so the
+        colors / layout / Claude TUI status lamps survive — a plain text
+        capture loses them. PNG rendering needs the optional ``c-lord[table]``
+        extra (Pillow); without it we reply with an actionable hint.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond(
+                "This command can only be used in a Claude chat thread.",
+                ephemeral=True,
+            )
+            return
+
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+        await ack()  # capture + render can exceed Discord's 3s ack window
+
+        import asyncio
+
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        if tmux_mgr is None:
+            await respond(
+                "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
+                " `/clord-init` で設定してください。",
+                ephemeral=True,
+            )
+            return
+
+        window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
+        if window is None:
+            await respond("ℹ️ No tmux window found for this thread.", ephemeral=True)
+            return
+
+        ansi = await asyncio.to_thread(tmux_mgr.capture_screen, thread_id)
+        if not ansi.strip():
+            await respond("ℹ️ The tmux pane is currently empty.", ephemeral=True)
+            return
+
+        png = await asyncio.to_thread(render_pane_png, ansi)
+        if png is None:
+            await respond(
+                "⚠️ スクリーンショットのレンダリングに必要な依存が見つかりません。"
+                " `pip install c-lord[table]` (Pillow) を導入してください。",
+                ephemeral=True,
+            )
+            return
+
+        filename = f"tmux-{tmux_mgr.session_name}-{window}.png"
+        file = discord.File(BytesIO(png), filename=filename)
+        await respond(file=file)
+
+    @app_commands.command(
+        name="tmux-screenshot",
+        description="Post a PNG screenshot of this thread's current tmux pane",
+    )
+    async def tmux_screenshot(self, interaction: discord.Interaction) -> None:
+        """Screenshot the current tmux pane and post it as a PNG (#285)."""
+        respond, ack = self._slash_io(interaction)
+        await self._screenshot_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="tmux-screenshot")
+    async def tmux_screenshot_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /tmux-screenshot — webhook-invokable for E2E (#285)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._screenshot_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     async def _workspace_delete_impl(
         self, *, channel: object, respond: _Responder, ack: _Acknowledger
