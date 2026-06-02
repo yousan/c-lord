@@ -1876,6 +1876,114 @@ class TestClearCommand:
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
 
+class TestCompactCommand:
+    """Tests for /compact command — fires the TUI /compact via send_literal (#278).
+
+    The whole point of #278 is that a normal message would go through
+    ``send_input`` which (under ``CLORD_BRIDGE_MODE=jsonl``) prepends a
+    zero-width-space, breaking the leading ``/``. ``/compact`` must therefore
+    use ``send_literal`` (no ZWSP) + a separate Enter, mirroring the existing
+    ``/context`` probe in ``tmux_runner.py``.
+    """
+
+    @staticmethod
+    def _running_tmux() -> MagicMock:
+        tmux_manager = MagicMock()
+        tmux_manager.is_claude_running = MagicMock(return_value=True)
+        tmux_manager.send_literal = MagicMock(return_value=True)
+        tmux_manager.send_keys = MagicMock(return_value=True)
+        tmux_manager.send_input = MagicMock(return_value=True)
+        return tmux_manager
+
+    @pytest.mark.asyncio
+    async def test_compact_outside_thread_sends_ephemeral(self) -> None:
+        """/compact outside a thread sends an ephemeral error."""
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+
+        await cog.compact_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_compact_no_tmux_manager_sends_ephemeral(self) -> None:
+        """/compact with no tmux binding sends an ephemeral error."""
+        cog = _make_cog()  # channel_cog None → _resolve_tmux_manager returns None
+        interaction = _make_thread_interaction(thread_id=12345)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_compact_not_running_sends_ephemeral(self) -> None:
+        """/compact when Claude is not running sends an ephemeral notice (no send)."""
+        tmux_manager = self._running_tmux()
+        tmux_manager.is_claude_running = MagicMock(return_value=False)
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        interaction = _make_thread_interaction(thread_id=12345)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+        tmux_manager.send_literal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compact_uses_send_literal_not_send_input(self) -> None:
+        """AC6: /compact must use send_literal (no ZWSP) + Enter, never send_input."""
+        tmux_manager = self._running_tmux()
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+        interaction = _make_thread_interaction(thread_id)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction)
+
+        tmux_manager.send_literal.assert_called_once_with(thread_id, "/compact")
+        tmux_manager.send_keys.assert_called_once_with(thread_id, "Enter")
+        tmux_manager.send_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compact_passes_instructions(self) -> None:
+        """AC3: instructions are appended as '/compact <instructions>'."""
+        tmux_manager = self._running_tmux()
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+        interaction = _make_thread_interaction(thread_id)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction, instructions="keep open tasks")
+
+        tmux_manager.send_literal.assert_called_once_with(thread_id, "/compact keep open tasks")
+
+    @pytest.mark.asyncio
+    async def test_compact_text_twin_uses_send_literal(self) -> None:
+        """The !compact text twin fires the same send_literal path."""
+        tmux_manager = self._running_tmux()
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+
+        ctx = MagicMock()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = 999
+        ctx.channel = thread
+        ctx.send = AsyncMock()
+
+        await cog.compact_text.callback(cog, ctx)
+
+        tmux_manager.send_literal.assert_called_once_with(thread_id, "/compact")
+
+
 class TestApplyThreadNamingRetitle:
     """Unit tests for the auto-retitle hook in _apply_thread_naming (#121)."""
 
