@@ -962,6 +962,41 @@ class TmuxSessionManager:
 
         return result.stdout
 
+    def list_window_tabs(self) -> list[tuple[int, str, bool]]:
+        """List this session's windows as ``(index, name, is_active)`` tuples.
+
+        Feeds the synthesized tmux-style status bar in the screenshot (#285).
+        Tab-delimited so window names containing spaces survive. Returns an
+        empty list on failure / when tmux is unavailable.
+        """
+        if not self._check_available():
+            return []
+
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{window_index}\t#{window_name}\t#{window_active}",
+            ]
+        )
+        if result.returncode != 0:
+            return []
+
+        tabs: list[tuple[int, str, bool]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                index = int(parts[0])
+            except ValueError:
+                continue
+            tabs.append((index, parts[1], parts[2] == "1"))
+        return tabs
+
     def send_interrupt(self, thread_id: int) -> bool:
         """Send C-c (SIGINT) to the tmux window.
 

@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from c_lord.discord_ui.fonts import first_existing
 from c_lord.discord_ui.pane_renderer import (
     ANSI_16,
     Style,
+    build_status_bar_ansi,
     color_256,
     parse_ansi,
     render_pane_png,
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _strip_ansi(s: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
 def _last_run(line: list[tuple[str, Style]]) -> tuple[str, Style]:
@@ -146,6 +153,45 @@ class TestRenderPanePng:
 
         monkeypatch.setattr(pr, "load_mono_font", lambda size: None)
         assert render_pane_png("hello") is None
+
+
+class TestStatusBar:
+    TABS = [(1, "zsh", False), (5, "work4", False), (7, "work6", True)]
+
+    def test_includes_session_and_window_labels(self) -> None:
+        bar = build_status_bar_ansi("c-lord-parallel-3", self.TABS, "work4", 60)
+        plain = _strip_ansi(bar)
+        assert "[c-lord-parallel-3]" in plain
+        assert "1:zsh" in plain
+        assert "5:work4" in plain
+        assert "7:work6" in plain
+
+    def test_marks_session_active_window_with_star(self) -> None:
+        # work6 is the session-active window (tmux's `*`).
+        plain = _strip_ansi(build_status_bar_ansi("s", self.TABS, "work4", 40))
+        assert "7:work6*" in plain
+        assert "5:work4*" not in plain
+
+    def test_highlights_current_window_with_inverse(self) -> None:
+        # The screenshotted window (current) gets an inverse highlight.
+        bar = build_status_bar_ansi("s", self.TABS, "work4", 40)
+        assert "\x1b[7m" in bar  # inverse on, applied to the current segment
+        assert "\x1b[42m" in bar  # green status-bar background
+
+    def test_padded_to_width(self) -> None:
+        plain = _strip_ansi(build_status_bar_ansi("s", self.TABS, "work4", 80))
+        assert len(plain) >= 80  # padded so the rendered bar spans full width
+
+    def test_render_with_status_bar_returns_png(self) -> None:
+        pytest.importorskip("PIL")
+        png = render_pane_png("hello", status_bar=("sess", self.TABS, "work4"))
+        assert png is not None
+        assert png[:8] == PNG_MAGIC
+
+    def test_render_status_bar_none_still_works(self) -> None:
+        pytest.importorskip("PIL")
+        png = render_pane_png("hi", status_bar=None)
+        assert png is not None and png[:8] == PNG_MAGIC
 
 
 class TestFonts:

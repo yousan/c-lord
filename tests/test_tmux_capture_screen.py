@@ -61,3 +61,32 @@ class TestCaptureScreen:
                 MagicMock(returncode=1, stdout=""),  # capture-pane fails
             ]
             assert mgr.capture_screen(12345) == ""
+
+
+class TestListWindowTabs:
+    def test_parses_index_name_active(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="1\tzsh\t0\n5\twork4\t0\n7\twork6\t1\n"
+            )
+            tabs = mgr.list_window_tabs()
+
+        assert tabs == [(1, "zsh", False), (5, "work4", False), (7, "work6", True)]
+        args = mock_run.call_args[0][0]
+        assert "list-windows" in args
+        assert SESSION_NAME in args
+
+    def test_unavailable_returns_empty(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = False
+        assert mgr.list_window_tabs() == []
+
+    def test_failure_returns_empty(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr.list_window_tabs() == []

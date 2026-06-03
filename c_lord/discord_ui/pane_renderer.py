@@ -270,8 +270,48 @@ def _layout(lines: list[list[tuple[str, Style]]]) -> list[list[tuple[str, int, S
     return grid
 
 
-def render_pane_png(ansi_text: str) -> bytes | None:
+def build_status_bar_ansi(
+    session: str,
+    tabs: list[tuple[int, str, bool]],
+    current_window: str | None,
+    width: int,
+) -> str:
+    """Build a tmux-style status bar as an ANSI string (one full-width line).
+
+    Mirrors tmux's bottom bar: ``[session]`` followed by ``index:name`` window
+    tabs on a green background. The session-active window is suffixed with
+    ``*`` (tmux convention); the *current_window* (the one being screenshotted)
+    is inverse-highlighted so it's obvious which pane the image shows. The line
+    is padded with spaces to *width* display columns so it renders as a solid
+    full-width bar. The result is fed back through :func:`parse_ansi`.
+    """
+    parts: list[tuple[str, bool]] = [(f"[{session}]", False)]
+    for idx, name, active in tabs:
+        label = f" {idx}:{name}" + ("*" if active else "")
+        parts.append((label, name == current_window))
+
+    visible = sum(_display_width(text) for text, _ in parts)
+    pad = max(0, width - visible)
+
+    out = ["\x1b[42m\x1b[30m"]  # tmux default status: green bg, black fg
+    for text, is_current in parts:
+        if is_current:
+            out.append(f"\x1b[1m\x1b[7m{text}\x1b[27m\x1b[22m")  # bold + inverse
+        else:
+            out.append(text)
+    out.append(" " * pad)
+    out.append("\x1b[0m")
+    return "".join(out)
+
+
+def render_pane_png(
+    ansi_text: str,
+    status_bar: tuple[str, list[tuple[int, str, bool]], str | None] | None = None,
+) -> bytes | None:
     """Render *ansi_text* (from ``capture-pane -e -p``) to PNG bytes.
+
+    When *status_bar* is ``(session, tabs, current_window)``, a tmux-style
+    status bar row is appended at the bottom (see :func:`build_status_bar_ansi`).
 
     Returns ``None`` when Pillow or a usable monospace font is unavailable.
     """
@@ -287,6 +327,12 @@ def render_pane_png(ansi_text: str) -> bytes | None:
     emoji_font, emoji_is_color = load_emoji_font(EMOJI_STRIKE, FONT_SIZE)
 
     grid = _layout(parse_ansi(ansi_text))
+
+    if status_bar is not None:
+        session, tabs, current_window = status_bar
+        n_cols_pane = max((sum(w for _, w, _, _ in row) for row in grid), default=1)
+        bar_ansi = build_status_bar_ansi(session, tabs, current_window, max(n_cols_pane, 1))
+        grid = grid + _layout(parse_ansi(bar_ansi))
 
     cell_w = max(1, round(mono.getlength("M")))
     ascent, descent = mono.getmetrics()

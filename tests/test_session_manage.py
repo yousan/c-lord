@@ -515,8 +515,16 @@ class TestTmuxScreenshot:
         tmux_mgr.session_name = "c-lord"
         tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="\x1b[31mhi\x1b[0m")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
-        monkeypatch.setattr(sm, "render_pane_png", lambda text: b"\x89PNG\r\n\x1a\nDATA")
+
+        captured = {}
+
+        def fake_render(text, status_bar=None):
+            captured["status_bar"] = status_bar
+            return b"\x89PNG\r\n\x1a\nDATA"
+
+        monkeypatch.setattr(sm, "render_pane_png", fake_render)
 
         respond, ack, sent = _capture_responder()
         await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
@@ -526,6 +534,10 @@ class TestTmuxScreenshot:
         assert isinstance(files[0], discord.File)
         assert files[0].filename == "tmux-c-lord-work1.png"
         tmux_mgr.capture_screen.assert_called_once_with(123)
+        # Status bar (session, tabs, current window) is passed to the renderer.
+        assert captured["status_bar"] is not None
+        assert captured["status_bar"][0] == "c-lord"
+        assert captured["status_bar"][2] == "work1"
 
     async def test_impl_no_window_sends_ephemeral(self, monkeypatch):
         cog = _make_cog()
@@ -555,8 +567,9 @@ class TestTmuxScreenshot:
         tmux_mgr.session_name = "c-lord"
         tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="hi")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
-        monkeypatch.setattr(sm, "render_pane_png", lambda text: None)
+        monkeypatch.setattr(sm, "render_pane_png", lambda text, status_bar=None: None)
 
         respond, ack, sent = _capture_responder()
         await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)

@@ -879,7 +879,11 @@ class SessionManageCog(commands.Cog):
             await respond("ℹ️ The tmux pane is currently empty.", ephemeral=True)
             return
 
-        png = await asyncio.to_thread(render_pane_png, ansi)
+        # Synthesize a tmux-style status bar (session + window tabs, this
+        # window highlighted) so the screenshot shows which pane it is (#285).
+        tabs = await asyncio.to_thread(tmux_mgr.list_window_tabs)
+        status_bar = (tmux_mgr.session_name, tabs, window) if tabs else None
+        png = await asyncio.to_thread(render_pane_png, ansi, status_bar)
         if png is None:
             await respond(
                 "⚠️ スクリーンショットのレンダリングに必要な依存が見つかりません。"
