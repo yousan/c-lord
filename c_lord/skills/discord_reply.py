@@ -78,6 +78,12 @@ JSON
    large diffs) prefer writing to a file and passing `progress_file`.
 4. Markdown is supported (bold, lists, code fences). URLs render as text only
    (no preview embeds, by design).
+5. Lead with what the user sees, not code. When you finished a task, start the
+   reply with what changed *from the user's point of view* (what to do, and how
+   the result looks here in Discord), THEN put implementation/CI detail
+   (function names, test counts, file paths) after it. The reader may not read
+   code — they should grasp "what changed for me" in one glance. If nothing
+   changes for the user (internal-only work), say so explicitly.
 """
 
 DISCORD_REPLY_SKILL_WITH_AUTH = """\
@@ -148,7 +154,13 @@ JSON
    large diffs) prefer writing to a file and passing `progress_file`.
 4. Markdown is supported (bold, lists, code fences). URLs render as text only
    (no preview embeds, by design).
-5. The Bearer token above must be sent with every request. Do not log or
+5. Lead with what the user sees, not code. When you finished a task, start the
+   reply with what changed *from the user's point of view* (what to do, and how
+   the result looks here in Discord), THEN put implementation/CI detail
+   (function names, test counts, file paths) after it. The reader may not read
+   code — they should grasp "what changed for me" in one glance. If nothing
+   changes for the user (internal-only work), say so explicitly.
+6. The Bearer token above must be sent with every request. Do not log or
    echo it.
 """
 
