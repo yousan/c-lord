@@ -35,3 +35,6 @@ htmlcov/
 # Personal workflow scripts (not part of the OSS framework)
 tmux.sh
 .claude/scheduled_tasks.lock
+
+# Version file generated at build time by hatch-vcs (source of truth = git tags)
+c_lord/_version.py
