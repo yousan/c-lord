@@ -639,8 +639,11 @@ c_lord/
     run_config.py          # RunConfig dataclass — bundles all CLI execution params
     _run_helper.py         # Thin orchestration layer (run_claude_with_config + shim)
   claude/
-    runner.py              # Claude CLI subprocess manager
-    parser.py              # stream-json event parser
+    tmux_runner.py         # tmux pane runner — polls capture-pane, yields
+                           # SYSTEM / RESULT / tool-use / permission / plan /
+                           # elicitation / todo events (no ASSISTANT text; #53)
+    config.py              # ClaudeConfig dataclass (CLI settings)
+    context_usage.py       # Context-window usage parsing
     types.py               # Type definitions for SDK messages
   coordination/
     service.py             # Posts session lifecycle events to shared channel
@@ -654,11 +657,10 @@ c_lord/
     settings_repo.py       # Per-guild settings
   discord_ui/
     status.py              # Emoji reaction manager (debounced)
-    chunker.py             # Fence- and table-aware message splitting
+    reply_chunker.py       # Fence- and table-aware message splitting (Skill reply)
     embeds.py              # Discord embed builders
     ask_view.py            # Buttons/Select Menus for AskUserQuestion
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB lifecycle
-    streaming_manager.py   # StreamingMessageManager — debounced in-place message edits
     tool_timer.py          # LiveToolTimer — elapsed time counter for long-running tools
     thread_dashboard.py    # Live pinned embed showing session states
     plan_view.py           # Approve/Cancel buttons for Plan Mode (ExitPlanMode)

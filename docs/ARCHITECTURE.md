@@ -1,5 +1,17 @@
 # Architecture
 
+> **⚠️ この文書は古い構成（#53 以前）を説明しています。** 当時は `runner.py` が
+> Claude CLI の stdout を読み、`chunker.py` が応答テキストを分割して Discord に
+> 投稿していました。#53 でこの「TUI/stdout を読んで Discord に貼る」経路は撤去され、
+> Claude 自身が Skill 経由で `curl POST /api/reply` して最終回答を投稿する方式に
+> 変わっています。そのため下記の `runner.py` / `parser.py` / `chunker.py` /
+> `streaming_manager.py` などは**現在は存在しません**（実体は `claude/tmux_runner.py`
+> や `discord_ui/reply_chunker.py` などに置き換わっています）。
+>
+> **今のモジュール構成（あるべき動き／実態）を知りたいときは、`CLAUDE.md` の
+> "Project Structure" を一次情報として参照してください。** この文書は当時の設計判断を
+> 残す記録として保存しています（履歴・経緯の参照用）。
+
 ## Overview
 
 c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. It has no AI logic of its own — all intelligence comes from Claude Code's existing capabilities (CLAUDE.md, skills, tools, memory, MCP servers). The bridge's sole responsibility is: accept user input from Discord, spawn the CLI, parse its output, and render results back to Discord.
