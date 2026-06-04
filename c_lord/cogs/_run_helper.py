@@ -23,9 +23,9 @@ import time
 import discord
 
 from ..claude.context_usage import (
-    default_window,
     format_context_line,
     read_latest_usage,
+    resolve_fallback_window,
 )
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..discord_ui.ask_handler import (  # noqa: F401
@@ -185,14 +185,18 @@ async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:
             logger.debug("Deleted image tempfile: %s", path)
 
 
-async def _resolve_context_window(config: RunConfig, session_id: str, model: str | None) -> int:
+async def _resolve_context_window(
+    config: RunConfig, session_id: str, model: str | None, used: int
+) -> int:
     """Return the context-window total for ``session_id`` running ``model``.
 
     Learned by scraping ``/context`` (Claude is idle at the prompt after a turn
     completes), then cached.  A re-probe is forced when ``model`` differs from
     the value cached for this session, since the window size can change with the
-    model.  Falls back to a per-model default when the runner cannot probe or
-    the pane cannot be parsed.
+    model.  Falls back to a ``used``-aware per-model default when the runner
+    cannot probe or the pane cannot be parsed: the fallback denominator is never
+    smaller than ``used`` (a window total below its own contents is impossible),
+    which prevents the spurious "100% full" warning on 1M-tier sessions (#292).
     """
     cached = _context_window_cache.get(session_id)
     if cached is not None and cached[0] == model:
@@ -209,7 +213,7 @@ async def _resolve_context_window(config: RunConfig, session_id: str, model: str
         # not lock the per-model fallback in for the rest of the session.
         _context_window_cache[session_id] = (model, total)
         return total
-    return default_window(model or getattr(config.runner, "model", None))
+    return resolve_fallback_window(model or getattr(config.runner, "model", None), used)
 
 
 async def _post_context_usage(config: RunConfig, session_id: str | None) -> None:
@@ -232,7 +236,7 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     usage = read_latest_usage(jsonl)
     if usage is None:
         return
-    total = await _resolve_context_window(config, session_id, usage.model)
+    total = await _resolve_context_window(config, session_id, usage.model, usage.used)
     line = format_context_line(usage.used, total)
 
     # Prefer appending to Claude's last reply message — keeps the addendum

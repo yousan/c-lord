@@ -17,6 +17,7 @@ from c_lord.claude.context_usage import (
     format_context_line,
     parse_context_total,
     read_latest_usage,
+    resolve_fallback_window,
 )
 
 # A trimmed but faithful capture of a real ``/context`` pane (1M context).
@@ -160,6 +161,53 @@ class TestDefaultWindow:
 
     def test_none_falls_back(self) -> None:
         assert default_window(None) == 200_000
+
+    def test_opus_4_8_is_registered(self) -> None:
+        """AC1: claude-opus-4-8 resolves via MODEL_CONTEXT_WINDOW, not fallback.
+
+        The 1M tier is opt-in and not revealed by the model id, so its registered
+        default window stays at the 200k base; what matters is that the model is
+        *known* (an explicit map entry) rather than silently hitting the unknown
+        fallback.
+        """
+        from c_lord.claude.context_usage import MODEL_CONTEXT_WINDOW
+
+        assert "claude-opus-4-8" in MODEL_CONTEXT_WINDOW
+        assert default_window("claude-opus-4-8") == MODEL_CONTEXT_WINDOW["claude-opus-4-8"]
+
+
+class TestResolveFallbackWindow:
+    def test_used_within_default_keeps_default(self) -> None:
+        # 50k used fits the 200k base window — no promotion.
+        assert resolve_fallback_window("claude-opus-4-8", used=50_000) == 200_000
+
+    def test_used_over_default_promotes_to_next_tier(self) -> None:
+        """AC2: used ≈ 314k exceeds the 200k base → promote to the 1M tier.
+
+        This is the opus-4-8 / 1M-tier regression from #292: when ``/context``
+        cannot be scraped, the denominator must rise to the smallest standard
+        tier that still contains ``used`` so that total >= used always holds.
+        """
+        assert resolve_fallback_window("claude-opus-4-8", used=313_779) == 1_000_000
+
+    def test_total_never_below_used(self) -> None:
+        # AC2: even a pathological numerator larger than every standard tier
+        # must yield total >= used (never a logically-impossible total < used).
+        used = 5_000_000
+        assert resolve_fallback_window("claude-opus-4-8", used=used) >= used
+
+    def test_unknown_model_promotes_too(self) -> None:
+        assert resolve_fallback_window("some-future-model", used=313_779) == 1_000_000
+
+    def test_no_promotion_yields_subtle_line_not_warning(self) -> None:
+        """AC3: with the promoted denominator the line is the subtle ``-#`` form,
+        not the ``⚠️ … 100% full … auto-compact`` warning."""
+        total = resolve_fallback_window("claude-opus-4-8", used=313_779)
+        line = format_context_line(used=313_779, total=total)
+        assert line.startswith("-#")
+        assert "⚠" not in line
+        assert "auto-compact" not in line
+        assert "100%" not in line
 
 
 class TestFormatContextLine:

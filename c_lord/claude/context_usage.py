@@ -24,10 +24,18 @@ from ..discord_ui.embeds import AUTOCOMPACT_THRESHOLD
 # models fall back to ``DEFAULT_CONTEXT_WINDOW``.
 DEFAULT_CONTEXT_WINDOW = 200_000
 MODEL_CONTEXT_WINDOW: dict[str, int] = {
+    "claude-opus-4-8": 200_000,
     "claude-opus-4-7": 200_000,
     "claude-sonnet-4-6": 200_000,
     "claude-haiku-4-5": 200_000,
 }
+
+# Standard context-window tiers, ascending.  Used by ``resolve_fallback_window``
+# to pick the smallest tier that still contains ``used`` when ``/context`` could
+# not be scraped — the 1M tier is opt-in and not revealed by the model id, so a
+# numerator that exceeds the 200k base is itself proof the session is on a larger
+# tier.  See #292.
+STANDARD_TIERS: tuple[int, ...] = (200_000, 1_000_000)
 
 # ``<used>/<total> tokens`` line emitted by ``/context`` (e.g. ``11.7k/1m tokens``).
 _CONTEXT_TOTAL_RE = re.compile(
@@ -123,6 +131,27 @@ def default_window(model: str | None) -> int:
     if model is None:
         return DEFAULT_CONTEXT_WINDOW
     return MODEL_CONTEXT_WINDOW.get(model, DEFAULT_CONTEXT_WINDOW)
+
+
+def resolve_fallback_window(model: str | None, used: int) -> int:
+    """Return a fallback window total that is never smaller than ``used``.
+
+    Used when ``/context`` could not be scraped for this turn.  Starts from the
+    per-model :func:`default_window` and, if the transcript-derived ``used`` is
+    larger than it, promotes the denominator to the smallest standard tier
+    (:data:`STANDARD_TIERS`) that still contains ``used``.  A window total below
+    its own numerator is logically impossible — the real window cannot be smaller
+    than what is already in it — so this guarantees ``result >= used`` and stops
+    the bogus "100% full" warning (#292).  If ``used`` exceeds every standard
+    tier, ``used`` itself is returned so the invariant still holds.
+    """
+    window = default_window(model)
+    if used <= window:
+        return window
+    for tier in STANDARD_TIERS:
+        if tier >= used:
+            return tier
+    return used
 
 
 def _fmt_tokens(n: int) -> str:
