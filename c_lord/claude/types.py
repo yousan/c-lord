@@ -79,6 +79,12 @@ class AskQuestion:
     header: str = ""
     multi_select: bool = False
     options: list[AskOption] = field(default_factory=list)
+    # Whether to offer the free-text "✏️ Other" affordance in AskView.
+    # True for AskUserQuestion (which has a "Type something." row to type onto).
+    # Plan-approval menus (#251) set this False: their free-text option ("Tell
+    # Claude what to change") uses a different keystroke flow, so a generic
+    # Other modal would mis-send keys into the open TUI menu.
+    allow_other: bool = True
 
 
 @dataclass
