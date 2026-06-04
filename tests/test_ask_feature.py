@@ -234,3 +234,45 @@ class TestCollectAskAnswersTimeout:
             result = await collect_ask_answers(thread, [q], session_id="abc123")
 
         assert result is None  # timeout → no answer → returns None
+
+
+# ---------------------------------------------------------------------------
+# AskView — free-text ✏️ Other gating (#251)
+# ---------------------------------------------------------------------------
+
+
+class TestAskViewOtherGating:
+    """#251: plan-approval menus reuse AskView but must suppress the free-text
+    ✏️ Other affordance — plan's "Tell Claude what to change" is a normal
+    numbered option, not AskUserQuestion's "Type something." row, so a generic
+    Other modal would mis-send keystrokes into the open TUI menu.
+    """
+
+    @staticmethod
+    def _other_button_ids(q: AskQuestion) -> list[str]:
+        from c_lord.discord_ui.ask_view import AskView
+
+        view = AskView(q, thread_id=123, q_idx=0)
+        return [
+            cid
+            for c in view.children
+            if (cid := getattr(c, "custom_id", "")) and cid.endswith("_other")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_other_button_present_by_default(self) -> None:
+        q = AskQuestion(
+            question="Pick one",
+            options=[AskOption(label="A"), AskOption(label="B")],
+        )
+        assert q.allow_other is True
+        assert self._other_button_ids(q)  # AskUserQuestion keeps ✏️ Other
+
+    @pytest.mark.asyncio
+    async def test_other_button_suppressed_for_plan(self) -> None:
+        q = AskQuestion(
+            question="Would you like to proceed?",
+            options=[AskOption(label="Yes"), AskOption(label="No")],
+            allow_other=False,
+        )
+        assert self._other_button_ids(q) == []

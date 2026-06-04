@@ -310,3 +310,52 @@ every PR / merge is the user's gate" reading that the maintainer later corrected
 **Fix:** Codify the conduct in CLAUDE.md, enforce the artifact fields via the
 `.github` templates, and record the rationale here. See CLAUDE.md → "開発の行動規範
 (Working Conduct)" and "Definition of Done (DoD)".
+
+## 15. 経路B移行で撤去するのは reply 経路だけ — API サーバ本体と control plane は残す
+
+**決定:** 「経路A→経路B」への移行（#71）で取り除くのは、Claude が Discord に
+最終回答を出すための **reply 経路だけ** です。具体的には:
+
+- `POST /api/reply` というエンドポイント
+- 各セッションに入れている `discord-reply` skill（`.claude/skills/discord-reply/SKILL.md` の注入）
+
+これだけを撤去します。**API サーバ本体（`c_lord/ext/api_server.py`）と、それ以外の
+control plane エンドポイントは残します。** 残すものの例:
+
+| エンドポイント | 役割 |
+|---|---|
+| `/api/lounge` (GET/POST) | AI Lounge。CLAUDE.md の「Staging bot の占有・解放プロトコル」が依存している |
+| `/api/tasks` (POST/GET/DELETE/PATCH) | SchedulerCog へのタスク登録（設計判断 #8 / #9） |
+| `/api/spawn` | 外部トリガからスレッドを作って Claude を起動する |
+| `/api/mark-resume` | bot 再起動後にセッションを復帰させる |
+| `/api/notify` `/api/schedule` `/api/scheduled` | 即時通知・予約通知 |
+
+**この決定は GO 済み（#71、2026-06-04 に経路A→Bへ進めると決定）です。** ただし
+「GO」が指すのは reply 経路の置き換えだけで、API サーバ撤去は含みません。
+
+**なぜ切り分けるか:**
+
+- 「経路を A→B にすれば API サーバはいらなくなる」という見立ては、**reply の部分に
+  限れば正しい**。でもそこから「API サーバ全体がいらない」へは広げられません。
+- reply 経路（A も B も）が運ぶのは **Claude→Discord の最終回答** だけです。
+  一方 API サーバは、それとは別に **Claude→c-lord の操作面（control plane）**
+  をまるごと持っています（設計判断 #7 / #8 / #9）。スケジュール登録、外部トリガ
+  からのスレッド生成、再起動後の復帰、通知、AI Lounge など、reply とは独立した
+  機能です。
+- 経路B（JSONL transcript の透明ミラー）が置き換えるのは **回答の出し方** であって、
+  操作面の代わりにはなりません。だから reply 経路を消しても control plane は残す
+  必要があります。
+- もし control plane を撤去すると巻き添えになるものが出ます。たとえば `/api/lounge`
+  を消すと、CLAUDE.md に書いてある staging bot の占有・解放プロトコル（複数
+  セッションの協調）が壊れます。
+
+**スコープの固定:**
+
+- #71 の実装で「既存の skill push を撤去する」ステップは、**撤去対象を
+  `/api/reply` 経路（エンドポイント＋skill 注入）だけに限定**します。他の
+  エンドポイントには触りません。
+- 将来どこかの control plane エンドポイントを撤去・移設したくなった場合は、
+  **エンドポイントごとに別の Issue を立てて判断**します。本決定の既定は「残す」です。
+
+参照: #71（経路B 本体）/ #238（このスコープ明確化）/ 設計判断 #7（REST API を
+control plane にする）・#8 / #9（SQLite スケジューラ）。

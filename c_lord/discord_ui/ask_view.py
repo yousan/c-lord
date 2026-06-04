@@ -106,14 +106,19 @@ class AskView(discord.ui.View):
                 btn.callback = _make_button_callback(self, opt.label)
                 self.add_item(btn)
 
-        other_btn = discord.ui.Button(
-            label="✏️ Other",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"ask_{thread_id}_{q_idx}_other",
-            row=1,
-        )
-        other_btn.callback = self._other_callback
-        self.add_item(other_btn)
+        # Plan-approval menus (#251) suppress the free-text affordance: their
+        # "Tell Claude what to change" option is selected like any other (and
+        # opens its own TUI feedback field), so a generic Other modal would
+        # mis-send keystrokes into the open menu.
+        if question.allow_other:
+            other_btn = discord.ui.Button(
+                label="✏️ Other",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"ask_{thread_id}_{q_idx}_other",
+                row=1,
+            )
+            other_btn.callback = self._other_callback
+            self.add_item(other_btn)
 
     # ------------------------------------------------------------------
     # Internal helpers

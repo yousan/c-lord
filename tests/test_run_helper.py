@@ -92,6 +92,22 @@ class TestPostContextUsage:
         assert "10%" in msg  # 20k / 200k
         assert "200k" in msg
 
+    def test_promotes_fallback_when_used_exceeds_default(self, monkeypatch) -> None:
+        """#292: probe fails on a 1M-tier session (used > 200k default).
+
+        Regression for the Factorio case: the fallback denominator must be
+        promoted to a tier that contains ``used`` (1M), so the posted line shows
+        the real ~31% rather than a false "100% full / auto-compact" warning.
+        """
+        rh = self._patch_usage(monkeypatch, used=313_779)
+        cfg = self._config(probe_total=None)  # /context scrape failed → fallback
+        asyncio.run(rh._post_context_usage(cfg, "sess-1m-fallback"))
+        msg = cfg.thread.send.await_args.args[0]
+        assert "1.0M" in msg
+        assert "31%" in msg
+        assert "⚠" not in msg
+        assert "compact" not in msg.lower()
+
     def test_does_not_cache_when_probe_fails(self, monkeypatch) -> None:
         """A transient probe failure must NOT lock the fallback into the cache.
 
