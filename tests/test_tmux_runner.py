@@ -14,6 +14,7 @@ from c_lord.claude.tmux_runner import (
     _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
+    _parse_plan_from_pane,
 )
 from c_lord.claude.types import MessageType
 
@@ -1895,10 +1896,16 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
     elsewhere (Discord buttons via EventProcessor / TranscriptMirrorCog).
     """
 
-    def test_plan_approval_not_unknown(self) -> None:
-        """ExitPlanMode 'Would you like to proceed?' menu MUST NOT be flagged."""
+    def test_plan_approval_is_parsed_and_bridged(self) -> None:
+        """#251: ExitPlanMode menu is now BRIDGED (parsed into an AskQuestion),
+        not merely suppressed from the unknown alert.
+
+        The run loop routes a parsed plan menu through the same ``pane_ask``
+        bridge as AskUserQuestion (and ``continue``s before reaching the
+        unknown-interactive check), so the menu reaches Discord as buttons.
+        """
         pane = _load_fixture("plan_approval_menu.txt")
-        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+        assert _parse_plan_from_pane(pane) is not None
 
     def test_ask_user_question_not_unknown(self) -> None:
         """AskUserQuestion numbered menu MUST NOT be flagged as unknown."""
@@ -1995,6 +2002,89 @@ class TestAskUserQuestionSubmitScreen:
         assert not any(e.unknown_tui_prompt for e in events), (
             "Submit screen must not surface an unknown-prompt warning"
         )
+
+
+class TestParsePlanFromPane:
+    """#251: Plan approval (ExitPlanMode) menus are parsed from the pane and
+    bridged to Discord buttons via the same path as AskUserQuestion (#166).
+
+    The v2.1.156 fixture is a real captured pane (not hand-written): the menu
+    no longer offers ``No, keep planning`` — it is ``No, refine with Ultraplan
+    …`` / ``Yes, and use auto mode`` — so the old ``_KNOWN_INTERACTIVE_MARKERS``
+    assumptions are stale.
+    """
+
+    def test_parse_new_format_v2156(self) -> None:
+        """Labels are parsed in display order from the real v2.1.156 pane."""
+        pane = _load_fixture("plan_approval_menu_v2156.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == [
+            "Yes, and use auto mode",
+            "Yes, manually approve edits",
+            "No, refine with Ultraplan on Claude Code on the web",
+            "Tell Claude what to change",
+        ]
+        # Plan free-text feedback uses a different keystroke flow than
+        # AskUserQuestion's "Type something." row, so the ✏️ Other affordance
+        # must be suppressed for plan menus.
+        assert q.allow_other is False
+
+    def test_parse_old_format_backward_compatible(self) -> None:
+        """The legacy ``No, keep planning`` format still parses (AC6)."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == [
+            "Yes",
+            "Yes, and auto-accept edits",
+            "No, keep planning",
+        ]
+
+    def test_plan_body_is_folded_into_question(self) -> None:
+        """The plan markdown is shown in the embed so reviewers don't approve
+        blind (#251): the parsed question carries the plan body, with the
+        box-drawing rule lines stripped.
+        """
+        pane = _load_fixture("plan_approval_menu_v2156.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert "Plan: Add greet(name) to greet.py" in q.question
+        assert "def greet(name):" in q.question
+        # The proceed line still terminates the question.
+        assert q.question.rstrip().endswith("Would you like to proceed?")
+        # Box-drawing rule lines must not leak into the embed body.
+        assert "╌" not in q.question
+
+    def test_askuserquestion_is_not_parsed_as_plan(self) -> None:
+        """An AskUserQuestion menu must NOT be misread as a plan menu."""
+        pane = _load_fixture("ask_user_question_menu.txt")
+        assert _parse_plan_from_pane(pane) is None
+
+    def test_non_menu_pane_is_not_parsed_as_plan(self) -> None:
+        """A pane with no plan menu returns None."""
+        pane = _load_fixture("bug_156_yn_in_conversation.txt")
+        assert _parse_plan_from_pane(pane) is None
+
+    def test_plan_menu_falls_back_to_unknown_when_unparsed(self) -> None:
+        """#251 AC: a plan-ish menu whose labels we fail to parse must still
+        surface (no silent stall).  With the plan markers removed from
+        ``_KNOWN_INTERACTIVE_MARKERS``, an unparsed ``Would you like to
+        proceed?`` menu now trips the unknown-interactive fallback.
+        """
+        pane = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────\n"
+            "-- INSERT --"
+        )
+        # This minimal menu IS parseable as a plan menu (2 Yes/No options), so
+        # it is bridged rather than flagged.  The point of the assertion is that
+        # the plan markers no longer unconditionally suppress the fallback.
+        assert _parse_plan_from_pane(pane) is not None
 
 
 class TestGhostTextInputNotFlagged:
