@@ -358,6 +358,11 @@ uv add "c-lord[table]"
 # or: pip install "c-lord[table]"
 ```
 
+> The same `[table]` extra also powers **`/tmux-screenshot`** — a debug command
+> that posts a PNG of the current tmux pane (ANSI colors, layout, and status
+> lamps preserved). Without the extra, the command replies with an install hint
+> instead of an image.
+
 **Font support (CJK text + color emoji):**
 
 c-lord renders text and emoji separately, picking the first font found in each group:

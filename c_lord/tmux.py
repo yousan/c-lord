@@ -935,6 +935,68 @@ class TmuxSessionManager:
 
         return result.stdout
 
+    def capture_screen(self, thread_id: int) -> str:
+        """Capture the *visible* pane as ANSI text for a screenshot (#285).
+
+        Unlike :meth:`capture_pane` (which pulls scrollback and joins wrapped
+        lines for the event stream), this grabs only the on-screen region with
+        escape sequences preserved (``-e``) and no wrapped-line joining, so the
+        PNG renderer reproduces the exact current screen.
+
+        Returns the raw ANSI text, or empty string on failure / no window.
+        """
+        if not self._check_available():
+            return ""
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return ""
+
+        target = f"{self.session_name}:{window}"
+        # -e: keep ANSI colors/hyperlinks. No -S (visible region only) and no
+        # -J (preserve the exact on-screen layout) — this is a screenshot of
+        # the *current* screen, not a scrollback dump.
+        result = _run(["tmux", "capture-pane", "-e", "-p", "-t", target])
+        if result.returncode != 0:
+            return ""
+
+        return result.stdout
+
+    def list_window_tabs(self) -> list[tuple[int, str, bool]]:
+        """List this session's windows as ``(index, name, is_active)`` tuples.
+
+        Feeds the synthesized tmux-style status bar in the screenshot (#285).
+        Tab-delimited so window names containing spaces survive. Returns an
+        empty list on failure / when tmux is unavailable.
+        """
+        if not self._check_available():
+            return []
+
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{window_index}\t#{window_name}\t#{window_active}",
+            ]
+        )
+        if result.returncode != 0:
+            return []
+
+        tabs: list[tuple[int, str, bool]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                index = int(parts[0])
+            except ValueError:
+                continue
+            tabs.append((index, parts[1], parts[2] == "1"))
+        return tabs
+
     def send_interrupt(self, thread_id: int) -> bool:
         """Send C-c (SIGINT) to the tmux window.
 
