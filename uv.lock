@@ -243,7 +243,6 @@ wheels = [
 
 [[package]]
 name = "c-lord"
-version = "1.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -263,6 +262,7 @@ table = [
 [package.dev-dependencies]
 dev = [
     { name = "aiohttp" },
+    { name = "pillow" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -284,6 +284,7 @@ provides-extras = ["api", "table"]
 [package.metadata.requires-dev]
 dev = [
     { name = "aiohttp", specifier = ">=3.9" },
+    { name = "pillow", specifier = ">=10.0" },
     { name = "pyright", specifier = ">=1.1.408" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
