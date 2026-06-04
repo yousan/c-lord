@@ -12,8 +12,10 @@ import json
 from pathlib import Path
 
 from c_lord.claude.context_usage import (
+    MODEL_CONTEXT_WINDOW,
     ContextUsage,
     default_window,
+    fallback_window,
     format_context_line,
     parse_context_total,
     read_latest_usage,
@@ -160,6 +162,53 @@ class TestDefaultWindow:
 
     def test_none_falls_back(self) -> None:
         assert default_window(None) == 200_000
+
+    def test_current_default_model_is_registered(self) -> None:
+        """#292: the current default model must be in the map, not silently
+        riding the unknown-model fallback (which hides tier drift)."""
+        assert "claude-opus-4-8" in MODEL_CONTEXT_WINDOW
+        assert default_window("claude-opus-4-8") == 200_000
+
+
+class TestFallbackWindow:
+    """#292: when /context can't be scraped, the fallback denominator must never
+    be smaller than the numerator — a real window can't be smaller than what
+    already occupies it. Otherwise a 1M-tier session whose probe failed renders
+    a false "100% full / auto-compact" warning."""
+
+    def test_promotes_to_next_tier_when_used_exceeds_default(self) -> None:
+        # Real Factorio case: opus-4-8 on the 1M tier, used ≈ 314k, probe failed.
+        assert fallback_window("claude-opus-4-8", used=313_779) == 1_000_000
+
+    def test_no_promotion_when_used_fits_default(self) -> None:
+        assert fallback_window("claude-opus-4-8", used=50_000) == 200_000
+
+    def test_zero_used_returns_model_default(self) -> None:
+        assert fallback_window("claude-opus-4-8") == 200_000
+
+    def test_unknown_or_none_model_still_promoted_by_used(self) -> None:
+        assert fallback_window(None, used=300_000) == 1_000_000
+        assert fallback_window("some-future-model", used=300_000) == 1_000_000
+
+    def test_beyond_largest_tier_total_never_below_used(self) -> None:
+        # Pathological: used exceeds even the largest known tier. Invariant holds.
+        assert fallback_window("claude-opus-4-8", used=2_000_000) >= 2_000_000
+
+    def test_invariant_total_geq_used(self) -> None:
+        for used in (0, 199_999, 200_000, 200_001, 999_999, 1_000_001):
+            assert fallback_window("claude-opus-4-8", used=used) >= used
+
+    def test_factorio_line_is_subtle_not_a_false_warning(self) -> None:
+        """End-to-end of the bug: numerator+resolved-fallback must yield the
+        subtle line, NOT the ⚠️ auto-compact warning."""
+        used = 313_779
+        total = fallback_window("claude-opus-4-8", used=used)
+        line = format_context_line(used, total)
+        assert line.startswith("-#")
+        assert "⚠" not in line
+        assert "compact" not in line.lower()
+        assert "1.0M" in line
+        assert "31%" in line
 
 
 class TestFormatContextLine:
