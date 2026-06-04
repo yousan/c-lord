@@ -31,12 +31,23 @@ jobs:
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
           python3 - "$VERSION" <<'PY' > release_notes.md
-          import sys, pathlib
-          sys.path.insert(0, ".")
-          from c_lord.version import extract_changelog_section
+          import importlib.util
+          import pathlib
+          import sys
+
+          # Load c_lord/version.py as a STANDALONE module — importing the
+          # `c_lord` package would run its __init__.py, which pulls in discord.py
+          # (not installed in this lightweight workflow). version.py itself has
+          # no third-party deps, so load it directly by file path.
+          spec = importlib.util.spec_from_file_location(
+              "_clord_version", "c_lord/version.py"
+          )
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
           version = sys.argv[1]
           text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
-          section = extract_changelog_section(text, version)
+          section = mod.extract_changelog_section(text, version)
           if section:
               print(section)
           else:
