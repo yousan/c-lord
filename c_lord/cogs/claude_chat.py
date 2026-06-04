@@ -69,6 +69,15 @@ _ATTACHMENT_URL_NOTE = (
     "(This is a signed CDN URL valid for ~24 hours. Use the WebFetch tool or curl to retrieve it.)"
 )
 
+# Issue #75: shown when the bot lacks send permission (discord.Forbidden / 50001
+# Missing Access) on a channel or thread.  Names the exact permissions to grant
+# so the user can self-diagnose instead of staring at a silent failure.
+_SEND_PERMISSION_HELP = (
+    "❌ このチャンネル/スレッドに書き込み権限がありません。\n"
+    "Bot に「メッセージの送信」「公開スレッドでのメッセージ送信」"
+    "「プライベートスレッドでのメッセージ送信」を付与してください。"
+)
+
 
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
@@ -443,7 +452,18 @@ class ClaudeChatCog(commands.Cog):
             # Continue in existing thread
             record = await self.repo.get(channel.id)
             session_id = (record.session_id or None) if record else None
-            seed_message = await channel.send(prompt)
+            try:
+                seed_message = await channel.send(prompt)
+            except discord.Forbidden:
+                # #75: bot lacks "Send Messages in Threads" → tell the user the
+                # exact missing permission instead of a silent 50001 traceback.
+                logger.warning(
+                    "%s seed send forbidden (missing send permission)",
+                    log_ctx(thread_id=channel.id),
+                    exc_info=True,
+                )
+                await respond(_SEND_PERMISSION_HELP, ephemeral=True)
+                return
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
             await respond("Session completed.", silent=True)
         else:
@@ -808,7 +828,22 @@ class ClaudeChatCog(commands.Cog):
             auto_archive_duration=archive_minutes,
         )
         # Post the prompt so StatusManager has a Message to add reactions to.
-        seed_message = await thread.send(prompt)
+        try:
+            seed_message = await thread.send(prompt)
+        except discord.Forbidden:
+            # #75: bot can create the thread but lacks "Send Messages in
+            # Threads".  The thread itself is unreachable, so surface the
+            # permission guidance in the parent channel where the user can see
+            # it, then re-raise so the caller (/clord, /api/spawn) knows the
+            # spawn failed instead of returning a dead thread.
+            logger.warning(
+                "%s spawn seed send forbidden (missing send permission)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(_SEND_PERMISSION_HELP)
+            raise
         # Run Claude in the background so /api/spawn returns immediately.
         # The caller gets the thread reference without waiting for Claude to finish.
         asyncio.create_task(self._run_claude(seed_message, thread, prompt, session_id=session_id))
