@@ -288,8 +288,13 @@ The agreed rules:
 - **Why is the spine of an Issue.** It's read after close to trace intent.
 - **Evidence is real, not asserted.** Green tests / "I implemented it" is a
   necessary-but-insufficient condition; "done" requires RED→GREEN reproduced **on
-  staging**. Discord-side proof is normally a **user-provided screenshot** (the
-  server-side agent has no GUI), supplemented by tmux captures + REST-fetched text.
+  staging**. Discord-side proof can now be **AI-self-rendered** via
+  `/discord-screenshot` or the turn-completion auto-capture (#243), which redraws
+  the thread from REST data (`docs/specs/discord-screenshot-evidence.md`),
+  supplemented by tmux captures + REST-fetched text. **User-provided screenshots
+  remain authoritative** for bugs in the real client's own rendering — the
+  self-render is a faithful reconstruction, not a literal pixel capture of the
+  user's client.
 
 **Why (what motivated this):**
 

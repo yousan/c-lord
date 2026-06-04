@@ -23,6 +23,7 @@ mirroring :mod:`c_lord.discord_ui.pane_renderer`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -744,8 +745,16 @@ def render_conversation_html_png(
     if browser is None:
         return None
 
-    est_h = 80 + sum(70 + 26 * (m.content.count("\n") + 1) + 70 * len(m.embeds) for m in messages)
-    est_h = max(200, min(est_h, 16000))
+    # Headless screenshot clips to the window height, so bias the estimate HIGH
+    # (code blocks, wrapped lines, and field-heavy embeds all add rows) and let
+    # _autocrop_bottom trim the surplus. Underestimating would clip content.
+    def _msg_h(m: ConvMessage) -> int:
+        lines = m.content.count("\n") + 1 + len(m.content) // 60
+        embed_rows = sum(2 + len(e.fields) + (len(e.description or "") // 60) for e in m.embeds)
+        return 120 + 30 * lines + 90 * len(m.embeds) + 30 * embed_rows
+
+    est_h = 160 + sum(_msg_h(m) for m in messages)
+    est_h = max(400, min(est_h, 24000))
     html_doc = _build_html(messages, title)
 
     tmpdir = tempfile.mkdtemp(prefix="clord-shot-")
@@ -790,6 +799,8 @@ async def _run_browser(args: list[str], out_path: str) -> bytes | None:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
     except TimeoutError:
         proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()  # reap so we don't leave a zombie
         logger.warning("html screenshot timed out")
         return None
     if not os.path.exists(out_path):

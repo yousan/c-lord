@@ -48,7 +48,9 @@ _DEFAULT_LIMIT = 25
 _DEFAULT_DEBOUNCE_S = 12.0
 
 # thread_id → monotonic timestamp of the last capture (debounce state).
+# Bounded so a long-lived bot that sees many threads can't grow it without end.
 _last_capture: dict[int, float] = {}
+_MAX_TRACKED = 4096
 
 
 def _truthy(val: str | None, *, default: bool) -> bool:
@@ -97,6 +99,12 @@ def should_capture(thread_id: int, *, now: float | None = None) -> bool:
     last = _last_capture.get(thread_id)
     if last is not None and ts - last < _debounce_s():
         return False
+    # Bound the debounce map: when it gets large, drop the oldest half so a bot
+    # that has touched thousands of threads doesn't leak memory.
+    if len(_last_capture) >= _MAX_TRACKED and thread_id not in _last_capture:
+        oldest = sorted(_last_capture, key=lambda tid: _last_capture[tid])[: _MAX_TRACKED // 2]
+        for tid in oldest:
+            del _last_capture[tid]
     _last_capture[thread_id] = ts
     return True
 

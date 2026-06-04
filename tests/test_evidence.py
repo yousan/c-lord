@@ -67,6 +67,14 @@ class TestDebounce:
         assert evidence.should_capture(1, now=100.0) is True
         assert evidence.should_capture(2, now=100.0) is True
 
+    def test_debounce_map_is_bounded(self) -> None:
+        # A bot that touches many threads must not grow _last_capture forever.
+        for tid in range(evidence._MAX_TRACKED + 50):
+            evidence.should_capture(tid, now=float(tid))
+        assert len(evidence._last_capture) <= evidence._MAX_TRACKED
+        # The most recent thread is retained.
+        assert (evidence._MAX_TRACKED + 49) in evidence._last_capture
+
 
 class TestCaptureEvidence:
     async def test_renders_saves_and_posts(self, monkeypatch, tmp_path) -> None:
