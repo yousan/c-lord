@@ -302,6 +302,48 @@ async def test_file_sink_falls_back_to_plain_on_http_exception(
     assert "files" not in last_kwargs and "file" not in last_kwargs
 
 
+async def test_file_sink_does_not_resend_earlier_chunks_when_attachment_fails(
+    tmp_path: Path,
+) -> None:
+    """Regression for the dup+drop bug (Issue #282, prod thread 1509030455754625154).
+
+    When the answer spans multiple chunks and the attachment-bearing *last*
+    chunk fails, the already-sent earlier chunks must NOT be re-sent. The old
+    fallback re-ran the whole send sequence from chunk 0, so chunk 0 was posted
+    twice (the visible duplicate) while the rest of the answer was never
+    delivered. The fix retries only the failing chunk, without its attachment.
+
+    (The original 400 trigger — an over-limit chunk — was independently fixed by
+    #266; this guards the file_sink path against *any* attachment-send failure.)
+    """
+    bot = MagicMock()
+    channel = MagicMock()
+    sent_contents: list[str] = []
+
+    async def send_side_effect(*args, **kwargs):
+        # The attachment-bearing send is rejected (mirrors the prod failure).
+        if "files" in kwargs or "file" in kwargs:
+            raise discord.HTTPException(MagicMock(status=400), "Invalid Form Body")
+        sent_contents.append(kwargs.get("content") or (args[0] if args else ""))
+
+    channel.send = AsyncMock(side_effect=send_side_effect)
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(10)
+    text = "\n".join(f"answer line {i}" for i in range(300))  # > 2000 → multi-chunk
+    assert len(text) > 2000
+    await file_sink(text, str(progress_file))
+
+    # No successfully-sent chunk is delivered more than once.
+    assert len(sent_contents) == len(set(sent_contents)), f"duplicate send: {sent_contents}"
+    # And the full answer still lands (every chunk delivered exactly once).
+    assert "".join(sent_contents).replace("\n", "") != ""
+
+
 async def test_file_sink_logs_warning_on_http_exception(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

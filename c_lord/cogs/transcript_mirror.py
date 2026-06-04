@@ -324,30 +324,16 @@ class TranscriptMirrorCog(commands.Cog):
 
             from ..skills.reply_tracker import record_reply_message
 
+            # The attachment-drop retry lives inside _send_chunks and applies
+            # only to the file-bearing chunk, so a rejected attachment no longer
+            # re-sends the earlier chunks that already succeeded (Issue #282).
             try:
                 last_msg = await self._send_chunks(send, text, reference=reference, files=files)
                 if last_msg is not None:
                     record_reply_message(thread_id, last_msg)
-                return
             except discord.HTTPException as exc:
                 logger.warning(
-                    "TranscriptMirror file_sink failed (with attachment): "
-                    "thread=%d body_len=%d status=%s — retrying without attachment — %s",
-                    thread_id,
-                    len(text),
-                    getattr(exc, "status", "?"),
-                    exc,
-                    exc_info=True,
-                )
-            # Fallback: text without attachment (still chunked so it is not truncated).
-            try:
-                last_msg = await self._send_chunks(send, text, reference=reference)
-                if last_msg is not None:
-                    record_reply_message(thread_id, last_msg)
-            except discord.HTTPException as exc:
-                logger.warning(
-                    "TranscriptMirror file_sink fallback also failed: "
-                    "thread=%d body_len=%d status=%s — %s",
+                    "TranscriptMirror file_sink failed: thread=%d body_len=%d status=%s — %s",
                     thread_id,
                     len(text),
                     getattr(exc, "status", "?"),
@@ -394,6 +380,12 @@ class TranscriptMirrorCog(commands.Cog):
         ``reference`` rides on the first chunk; ``files`` ride on the last.
         Returns the last sent ``Message`` (so callers can track it for
         in-place edits — e.g. the context-usage line).
+
+        If sending the file-bearing chunk fails (e.g. the attachment is
+        rejected with a 400), only that chunk is retried without the
+        attachment — the earlier chunks that already succeeded are never
+        re-sent. Restarting the whole sequence on failure was the cause of the
+        duplicate-first-chunk bug (Issue #282).
         """
         from ..discord_ui.reply_chunker import chunk_discord_content
 
@@ -409,7 +401,15 @@ class TranscriptMirrorCog(commands.Cog):
                 kwargs["mention_author"] = False
             if idx == last and files:
                 kwargs["files"] = files
-            last_sent = await send(**kwargs)
+                try:
+                    last_sent = await send(**kwargs)
+                except discord.HTTPException:
+                    # Attachment rejected — retry just this chunk as plain text
+                    # so the body still lands, without re-sending prior chunks.
+                    kwargs.pop("files")
+                    last_sent = await send(**kwargs)
+            else:
+                last_sent = await send(**kwargs)
         return last_sent
 
     @staticmethod
