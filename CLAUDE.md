@@ -4,6 +4,10 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 
 **略称: c-lord** (c-lord)
 
+## 理念 (Philosophy) — 迷ったらここに照らす
+
+C-lord が「何のため・誰のどの痛みを解決するか」を定めた理念は **[docs/PHILOSOPHY.md](docs/PHILOSOPHY.md)** にある。機能や仕様の良し悪しで迷ったとき、コードや好みではなく**まずこの理念に照らして判断する**。理念と現実がぶつかったら「理念を見直す / 例外として記録する / 実装上の制約として切り分ける」のいずれかを明示的に選ぶ。下の各規律（行動規範・DoD 等）はこの理念の手段side。
+
 ## Framework vs Instance
 
 - **c-lord** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
