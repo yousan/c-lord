@@ -344,6 +344,9 @@ CONTRIBUTING.md          # Contribution guidelines
 - **動きを変えたら「あるべき動き」の記述も一緒に直す。** 利用者から見た動きを変える PR は、その動きを説明したドキュメント（仕様・README・docs の該当箇所）も同じ PR で更新する。変えないなら「動きは変えていない」と一言書く（PR 本文に `no-user-visible-change`）。これをしないと「あるべき動き」の記述が実態とズレ（drift し）、後から読んだ人が古い説明を信じてしまう。実際に `docs/ARCHITECTURE.md` / `README.md` には #53 で消したモジュール（`runner.py` / `chunker.py` など）の記述がしばらく残っていた。詳しい書式は DoD のチェック項目を参照。
 - **コードより先に実機の挙動を見る。** 内部実装を熟知した開発者目線ではなく、**利用者目線で「使って不便か」**を確認する。これが無いと、その Issue/PR が何のためにあるか（Why）が掴めない。
 - **報告は簡潔・日本語・URL はクリッカブルに。** 完了は `#NNN done / PR #MMM / Evidence: <URL>` を1行で。実機未確認なら「テスト緑・実機未確認」と正直に書く（過大申告しない）。
+- **完了報告は「これがこうなる」形で書く（利用者目線を先頭・実装/CI を従）。** Discord への完了報告は、まず**「どこで何を操作すると、Discord 上の見え方がどう変わるか」**を先頭に書く。実装の詳細（関数名・`pytest 37/37`・`dod-gate green`・行番号）はその**後ろ（従）**に置く。コードを読まない利用者でも「自分にとって何が変わったか」が一読で分かるようにするため。利用者の見え方が変わらない変更（内部リファクタ等）は `no-user-visible-change` と明記する。
+  - 良い例: 「スレッドに長文を送ると、最後まで複数メッセージで届くようになりました（前は途中で切れていました）。実装: チャンク分割を `_split_reply` に追加 / PR #MMM / pytest green」
+  - 悪い例: 「`_split_reply` を追加し pytest 37/37 green、dod-gate green」（利用者から見て何が変わったか分からない）
 - **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
 
 ## Definition of Done (DoD) — single source of truth
