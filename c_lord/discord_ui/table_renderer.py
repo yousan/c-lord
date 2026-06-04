@@ -17,6 +17,14 @@ import unicodedata
 from io import BytesIO
 from typing import TYPE_CHECKING
 
+# Font path resolution is shared with the pane (screenshot) renderer — see
+# c_lord/discord_ui/fonts.py. Re-exported under the historical private names so
+# existing imports/tests keep working.
+from .fonts import COLOR_EMOJI_PATHS as _COLOR_EMOJI_PATHS
+from .fonts import JP_FONT_PATHS as _JP_FONT_PATHS
+from .fonts import MONO_EMOJI_PATHS as _MONO_EMOJI_PATHS
+from .fonts import first_existing as _first_existing
+
 if TYPE_CHECKING:
     from PIL import ImageFont
 
@@ -52,23 +60,6 @@ HEADER_FG = (255, 255, 255)
 ALT_ROW_BG = (235, 243, 251)
 ROW_BG = (255, 255, 255)
 TEXT_COLOR = (32, 38, 46)
-
-_JP_FONT_PATHS = (
-    os.path.expanduser("~/.local/share/fonts/NotoSansJP.ttf"),
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-)
-# Color emoji fonts (CBDT/COLR) Pillow can render with embedded_color=True.
-_COLOR_EMOJI_PATHS = (
-    os.path.expanduser("~/.local/share/fonts/NotoColorEmoji.ttf"),
-    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-)
-# Monochrome fallback if no color font is present (no color, but no tofu).
-_MONO_EMOJI_PATHS = (
-    os.path.expanduser("~/.local/share/fonts/NotoEmoji-Regular.ttf"),
-    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
-)
 
 
 def detect_tables(content: str) -> list[str]:
@@ -172,10 +163,6 @@ def _parse_table(table_md: str) -> tuple[list[str], list[list[str]]] | None:
     if not headers or not rows:
         return None
     return headers, rows
-
-
-def _first_existing(paths: tuple[str, ...]) -> str | None:
-    return next((p for p in paths if os.path.exists(p)), None)
 
 
 def _emoji_tile(

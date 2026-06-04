@@ -24,10 +24,17 @@ from ..discord_ui.embeds import AUTOCOMPACT_THRESHOLD
 # models fall back to ``DEFAULT_CONTEXT_WINDOW``.
 DEFAULT_CONTEXT_WINDOW = 200_000
 MODEL_CONTEXT_WINDOW: dict[str, int] = {
+    "claude-opus-4-8": 200_000,
     "claude-opus-4-7": 200_000,
     "claude-sonnet-4-6": 200_000,
     "claude-haiku-4-5": 200_000,
 }
+
+# Standard context-window tiers, ascending.  Used as fallback denominators when
+# ``/context`` cannot be scraped: a session whose probe failed but whose
+# ``used`` already exceeds the per-model default must be on a larger tier, so we
+# promote to the smallest tier that can actually contain ``used`` (see #292).
+STANDARD_WINDOW_TIERS: tuple[int, ...] = (200_000, 1_000_000)
 
 # ``<used>/<total> tokens`` line emitted by ``/context`` (e.g. ``11.7k/1m tokens``).
 _CONTEXT_TOTAL_RE = re.compile(
@@ -123,6 +130,30 @@ def default_window(model: str | None) -> int:
     if model is None:
         return DEFAULT_CONTEXT_WINDOW
     return MODEL_CONTEXT_WINDOW.get(model, DEFAULT_CONTEXT_WINDOW)
+
+
+def fallback_window(model: str | None, used: int = 0) -> int:
+    """Return a fallback window total that is never smaller than ``used``.
+
+    Used when ``/context`` cannot be scraped (:func:`parse_context_total`
+    returned ``None``).  Starts from the per-model :func:`default_window`, but a
+    real context window can never be smaller than what already occupies it — so
+    if ``used`` exceeds that default, the session must be on a larger tier and
+    we promote to the smallest :data:`STANDARD_WINDOW_TIERS` entry that contains
+    ``used``.  This prevents a false ``100% full`` / auto-compact warning on a
+    1M-tier session whose probe transiently failed (see #292).
+
+    When ``used`` exceeds even the largest known tier, ``used`` itself is
+    returned so the ``total >= used`` invariant always holds (the session is
+    then genuinely at capacity).
+    """
+    total = default_window(model)
+    if used <= total:
+        return total
+    for tier in STANDARD_WINDOW_TIERS:
+        if tier >= used:
+            return tier
+    return used
 
 
 def _fmt_tokens(n: int) -> str:

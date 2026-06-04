@@ -82,4 +82,5 @@ See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked.
 - [ ] `uv run ruff check c_lord/` + `ruff format --check` + `pyright` pass
 - [ ] Staging Evidence above is filled in (or a skip reason is written)
 - [ ] No unrelated changes in the diff; self-review done
+- [ ] 動きを変えたら「あるべき動き」のドキュメント（仕様 / README / docs）も更新した。変えないなら本文に `no-user-visible-change` と明記した
 - [ ] `Closes`/`Resolves #N` used only if 100% of the issue's ACs are met (else `Refs #N`), and written on its own line

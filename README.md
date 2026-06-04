@@ -358,6 +358,11 @@ uv add "c-lord[table]"
 # or: pip install "c-lord[table]"
 ```
 
+> The same `[table]` extra also powers **`/tmux-screenshot`** — a debug command
+> that posts a PNG of the current tmux pane (ANSI colors, layout, and status
+> lamps preserved). Without the extra, the command replies with an install hint
+> instead of an image.
+
 **Font support (CJK text + color emoji):**
 
 c-lord renders text and emoji separately, picking the first font found in each group:
@@ -603,6 +608,20 @@ curl -X POST http://localhost:8080/api/tasks \
 
 ## Architecture
 
+### How Discord maps to tmux
+
+The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Knowing this 1:1 mapping makes debugging and integration much easier (you can `tmux attach` to watch a session live):
+
+| Discord | tmux         | Mapping |
+|---------|--------------|---------|
+| Channel | tmux session | 1:1     |
+| Thread  | tmux window  | 1:1     |
+
+- **1 Discord channel = 1 tmux session.** All threads in a channel share that one session. The session name is derived from the channel's bound repo (via `/clord-init`); unbound channels fall back to the default `clord` session.
+- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`work1`, `work2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
+
+For the "why" behind this design, see [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
+
 ```
 c_lord/
   main.py                  # Standalone entry point
@@ -620,8 +639,11 @@ c_lord/
     run_config.py          # RunConfig dataclass — bundles all CLI execution params
     _run_helper.py         # Thin orchestration layer (run_claude_with_config + shim)
   claude/
-    runner.py              # Claude CLI subprocess manager
-    parser.py              # stream-json event parser
+    tmux_runner.py         # tmux pane runner — polls capture-pane, yields
+                           # SYSTEM / RESULT / tool-use / permission / plan /
+                           # elicitation / todo events (no ASSISTANT text; #53)
+    config.py              # ClaudeConfig dataclass (CLI settings)
+    context_usage.py       # Context-window usage parsing
     types.py               # Type definitions for SDK messages
   coordination/
     service.py             # Posts session lifecycle events to shared channel
@@ -635,11 +657,10 @@ c_lord/
     settings_repo.py       # Per-guild settings
   discord_ui/
     status.py              # Emoji reaction manager (debounced)
-    chunker.py             # Fence- and table-aware message splitting
+    reply_chunker.py       # Fence- and table-aware message splitting (Skill reply)
     embeds.py              # Discord embed builders
     ask_view.py            # Buttons/Select Menus for AskUserQuestion
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB lifecycle
-    streaming_manager.py   # StreamingMessageManager — debounced in-place message edits
     tool_timer.py          # LiveToolTimer — elapsed time counter for long-running tools
     thread_dashboard.py    # Live pinned embed showing session states
     plan_view.py           # Approve/Cancel buttons for Plan Mode (ExitPlanMode)
