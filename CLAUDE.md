@@ -347,6 +347,7 @@ CONTRIBUTING.md          # Contribution guidelines
 - **完了報告は「これがこうなる」形で書く（利用者目線を先頭・実装/CI を従）。** Discord への完了報告は、まず**「どこで何を操作すると、Discord 上の見え方がどう変わるか」**を先頭に書く。実装の詳細（関数名・`pytest 37/37`・`dod-gate green`・行番号）はその**後ろ（従）**に置く。コードを読まない利用者でも「自分にとって何が変わったか」が一読で分かるようにするため。利用者の見え方が変わらない変更（内部リファクタ等）は `no-user-visible-change` と明記する。
   - 良い例: 「スレッドに長文を送ると、最後まで複数メッセージで届くようになりました（前は途中で切れていました）。実装: チャンク分割を `_split_reply` に追加 / PR #MMM / pytest green」
   - 悪い例: 「`_split_reply` を追加し pytest 37/37 green、dod-gate green」（利用者から見て何が変わったか分からない）
+- **証跡はスクショを主にする（利用者から見た挙動/UI を変えるとき）。** 「直った / こう変わった」を示す証跡は、テキストログではなく**スクショ（Discord 実画面 and/or tmux ペイン）を主証跡**にする。テキストでは表出しない問題（レイアウト・ボタンの出/不出・ランプ状態・別バブル/同一バブル）があるため。利用者に見えない変更（純リファクタ等）はスクショ不要（`no-user-visible-change`）。**暫定（#243 の Discord 実画面キャプチャが入るまで）は、人間提供の Discord スクショ + tmux ペイン PNG（#286）で代替する。** 注釈／before-after 並置の補助ツールは #310。
 - **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
 
 ## Definition of Done (DoD) — single source of truth
@@ -373,7 +374,7 @@ A PR may be merged only when:
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
-- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.**
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.** 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。Discord 実画面キャプチャ（#243）が入るまでは人間提供スクショ + tmux PNG（#286）で代替（証跡規約 #291）。
 - [ ] **動きを変えたら「あるべき動き」も更新する**: 利用者から見た動きを変える PR は、対応する「あるべき動き」を説明したドキュメント（`docs/specs/` などの仕様・`README.md`・`docs/` の該当箇所）も同じ PR で更新する。動きを変えないなら PR 本文に `no-user-visible-change` と明記する（更新不要であることをはっきり宣言する）。**狙い**: ドキュメントが実際の動きとズレる（drift する）のを防ぎ、「あるべき動き」を信用できる状態に保つ。
 - [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
 - [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
