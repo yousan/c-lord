@@ -341,8 +341,12 @@ CONTRIBUTING.md          # Contribution guidelines
 - **自走の範囲＝合意済みの作業。** 「やる」と決まった作業は **PR → 手動QA → マージ → 本番デプロイ → 本番実測**まで自走してよい（途中で逐一停止しなくてよい）。ただし起点の問いはまだ作業ではない → 診断して合意してから着手する。
 - **柔らかい依頼（「ここ直ってる？」）は「答え→行動」の順で分離する。** 例:「直っていません。これは仕様ではなくバグです。→ 直しました: PR #NNN / Evidence: <URL>」。先頭で事実に答えれば、相手が「答えだけ欲しかった」場合も意図のズレに気づける。安価で可逆なら先回り可。**設計変更・破壊操作・不可逆な判断は推察で走らず一行確認**。
 - **迎合しない・鵜呑みにしない。** 事実ベースで判断し、報告と食い違えば指摘する。ユーザーの仮説も自分のデータで確認し、違えばその判断を優先して伝える。
+- **動きを変えたら「あるべき動き」の記述も一緒に直す。** 利用者から見た動きを変える PR は、その動きを説明したドキュメント（仕様・README・docs の該当箇所）も同じ PR で更新する。変えないなら「動きは変えていない」と一言書く（PR 本文に `no-user-visible-change`）。これをしないと「あるべき動き」の記述が実態とズレ（drift し）、後から読んだ人が古い説明を信じてしまう。実際に `docs/ARCHITECTURE.md` / `README.md` には #53 で消したモジュール（`runner.py` / `chunker.py` など）の記述がしばらく残っていた。詳しい書式は DoD のチェック項目を参照。
 - **コードより先に実機の挙動を見る。** 内部実装を熟知した開発者目線ではなく、**利用者目線で「使って不便か」**を確認する。これが無いと、その Issue/PR が何のためにあるか（Why）が掴めない。
 - **報告は簡潔・日本語・URL はクリッカブルに。** 完了は `#NNN done / PR #MMM / Evidence: <URL>` を1行で。実機未確認なら「テスト緑・実機未確認」と正直に書く（過大申告しない）。
+- **完了報告は「これがこうなる」形で書く（利用者目線を先頭・実装/CI を従）。** Discord への完了報告は、まず**「どこで何を操作すると、Discord 上の見え方がどう変わるか」**を先頭に書く。実装の詳細（関数名・`pytest 37/37`・`dod-gate green`・行番号）はその**後ろ（従）**に置く。コードを読まない利用者でも「自分にとって何が変わったか」が一読で分かるようにするため。利用者の見え方が変わらない変更（内部リファクタ等）は `no-user-visible-change` と明記する。
+  - 良い例: 「スレッドに長文を送ると、最後まで複数メッセージで届くようになりました（前は途中で切れていました）。実装: チャンク分割を `_split_reply` に追加 / PR #MMM / pytest green」
+  - 悪い例: 「`_split_reply` を追加し pytest 37/37 green、dod-gate green」（利用者から見て何が変わったか分からない）
 - **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
 
 ## Definition of Done (DoD) — single source of truth
@@ -370,6 +374,7 @@ A PR may be merged only when:
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
 - [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.**
+- [ ] **動きを変えたら「あるべき動き」も更新する**: 利用者から見た動きを変える PR は、対応する「あるべき動き」を説明したドキュメント（`docs/specs/` などの仕様・`README.md`・`docs/` の該当箇所）も同じ PR で更新する。動きを変えないなら PR 本文に `no-user-visible-change` と明記する（更新不要であることをはっきり宣言する）。**狙い**: ドキュメントが実際の動きとズレる（drift する）のを防ぎ、「あるべき動き」を信用できる状態に保つ。
 - [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
 - [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
 

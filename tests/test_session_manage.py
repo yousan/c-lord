@@ -480,3 +480,101 @@ class TestHelperFunctions:
         from c_lord.cogs.session_manage import _format_session_short
 
         assert _format_session_short("abcdef12-3456-7890") == "abcdef12"
+
+
+def _capture_responder():
+    """A (respond, ack, sent) triple that records every respond() call."""
+    sent: list[dict] = []
+
+    async def respond(content=None, *, embed=None, file=None, ephemeral=False):
+        sent.append({"content": content, "embed": embed, "file": file, "ephemeral": ephemeral})
+
+    async def ack(*, ephemeral=False):
+        return None
+
+    return respond, ack, sent
+
+
+class TestTmuxScreenshot:
+    async def test_outside_thread_sends_ephemeral(self):
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        await cog.tmux_screenshot.callback(cog, interaction)
+        call_args = interaction.response.send_message.call_args
+        assert call_args.kwargs.get("ephemeral") is True
+
+    async def test_impl_sends_png_file(self, monkeypatch):
+        import c_lord.cogs.session_manage as sm
+
+        cog = _make_cog()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 123
+        thread.parent_id = 456
+
+        tmux_mgr = MagicMock()
+        tmux_mgr.session_name = "c-lord"
+        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.capture_screen = MagicMock(return_value="\x1b[31mhi\x1b[0m")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+
+        captured = {}
+
+        def fake_render(text, status_bar=None):
+            captured["status_bar"] = status_bar
+            return b"\x89PNG\r\n\x1a\nDATA"
+
+        monkeypatch.setattr(sm, "render_pane_png", fake_render)
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        files = [s["file"] for s in sent if s["file"] is not None]
+        assert len(files) == 1
+        assert isinstance(files[0], discord.File)
+        assert files[0].filename == "tmux-c-lord-work1.png"
+        tmux_mgr.capture_screen.assert_called_once_with(123)
+        # Status bar (session, tabs, current window) is passed to the renderer.
+        assert captured["status_bar"] is not None
+        assert captured["status_bar"][0] == "c-lord"
+        assert captured["status_bar"][2] == "work1"
+
+    async def test_impl_no_window_sends_ephemeral(self, monkeypatch):
+        cog = _make_cog()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 123
+        thread.parent_id = 456
+
+        tmux_mgr = MagicMock()
+        tmux_mgr._find_window_for_thread = MagicMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        assert sent and sent[-1]["ephemeral"] is True
+        assert all(s["file"] is None for s in sent)
+
+    async def test_impl_render_unavailable_sends_ephemeral(self, monkeypatch):
+        import c_lord.cogs.session_manage as sm
+
+        cog = _make_cog()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 123
+        thread.parent_id = 456
+
+        tmux_mgr = MagicMock()
+        tmux_mgr.session_name = "c-lord"
+        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.capture_screen = MagicMock(return_value="hi")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        monkeypatch.setattr(sm, "render_pane_png", lambda text, status_bar=None: None)
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        assert sent and sent[-1]["ephemeral"] is True
+        assert all(s["file"] is None for s in sent)
+        # Hint at the optional extra so consumers know how to enable it.
+        assert "c-lord[table]" in (sent[-1]["content"] or "")

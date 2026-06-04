@@ -17,6 +17,17 @@
 
 Refs #
 
+## 利用者から見た before/after（1行・必須）
+
+<!-- 利用者（Discord を使う人）から見て「この PR で操作したとき、Discord 上の見え方が
+     どう変わるか」を1行で書く。コード語（関数名・`pytest 37/37`・`dod-gate green`・行番号）
+     ではなく、利用者の言葉で。
+     例: 「いまは長い返信が途中で切れる → この PR 後は最後まで複数メッセージで届く」
+     利用者の見え方が変わらない変更（内部リファクタ・ドキュメントなど）なら
+     `no-user-visible-change` と書く（空欄は不可）。 -->
+
+- before（この PR 前）→ after（この PR 後）:
+
 ## Acceptance Criteria (copied from the issue)
 
 <!-- Paste EVERY AC from the linked issue here and check them. Not "most" — every one. -->
@@ -71,4 +82,5 @@ See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked.
 - [ ] `uv run ruff check c_lord/` + `ruff format --check` + `pyright` pass
 - [ ] Staging Evidence above is filled in (or a skip reason is written)
 - [ ] No unrelated changes in the diff; self-review done
+- [ ] 動きを変えたら「あるべき動き」のドキュメント（仕様 / README / docs）も更新した。変えないなら本文に `no-user-visible-change` と明記した
 - [ ] `Closes`/`Resolves #N` used only if 100% of the issue's ACs are met (else `Refs #N`), and written on its own line

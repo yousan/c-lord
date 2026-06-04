@@ -18,6 +18,15 @@ labels: enhancement
 <!-- How would you like it to work? Add a sketch / before-after preview /
      screenshot where it helps the reader picture the result. -->
 
+## 利用者から見た before/after（1行・必須）
+
+<!-- 利用者（Discord を使う人）から見て「いま何ができなくて、入ると何ができるようになるか」を
+     1行で書く。コード語（関数名・テスト件数・行番号）ではなく、Discord 上で見える形で。
+     例: 「いまは予定された通知を Discord から作れない → 入るとスレッドで予定を登録できる」
+     利用者の見え方が変わらない変更（内部のみ）なら `no-user-visible-change` と書く（空欄は不可）。 -->
+
+- before（いま）→ after（入ると）:
+
 ## Acceptance Criteria (二値)
 
 <!-- Each AC must be objectively true/false (a command, an observable output, a

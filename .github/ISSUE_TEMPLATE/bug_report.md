@@ -33,6 +33,15 @@ labels: bug
 
 <!-- What should have happened instead -->
 
+## 利用者から見た before/after（1行・必須）
+
+<!-- 利用者（Discord を使う人）から見て「いま何がこうなっていて、直ると何がこうなる」を
+     1行で書く。コード語（関数名・テスト件数・行番号）ではなく、Discord 上で見える形で。
+     例: 「いまは長い返信が途中で切れて読めない → 直ると最後まで複数メッセージで届く」
+     利用者の見え方が変わらないバグなら `no-user-visible-change` と書く（空欄は不可）。 -->
+
+- before（いま）→ after（直ると）:
+
 ## How to reproduce (再現手順)
 
 <!-- Reproduction is required. Prefer steps that reproduce on STAGING — a fix
