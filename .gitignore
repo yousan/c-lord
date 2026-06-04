@@ -17,6 +17,9 @@ build/
 # Database
 data/
 
+# Auto-evidence screenshots (#243) — generated PR-evidence PNGs, never committed
+.evidence/
+
 # IDE
 .vscode/
 .idea/

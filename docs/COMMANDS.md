@@ -82,6 +82,7 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
+| `/discord-screenshot [engine]` | Post a PNG screenshot of this thread's **Discord** conversation as PR evidence — see [docs/specs/discord-screenshot-evidence.md](specs/discord-screenshot-evidence.md) (#243) | Thread only |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
 
 ### Upgrade
@@ -110,6 +111,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!session-dirs` | List active session directories | `!session-dirs` | `/session-dirs` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
 | `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
+| `!discord-screenshot [engine]` | Post a PNG screenshot of this thread's Discord conversation (evidence) | `!discord-screenshot html` | `/discord-screenshot` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
