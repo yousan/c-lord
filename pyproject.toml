@@ -49,6 +49,9 @@ dev = [
     "ruff>=0.4",
     "aiohttp>=3.9",
     "pyright>=1.1.408",
+    # Dev-only: used by scripts/compose_screenshots.py (Issue #310). NOT a
+    # runtime dependency — kept out of [project.dependencies] on purpose.
+    "pillow>=10.0",
 ]
 
 [tool.pytest.ini_options]
