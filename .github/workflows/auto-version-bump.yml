@@ -1,0 +1,101 @@
+name: Auto Version Bump
+
+# Every push to main (i.e. a merged PR) auto-bumps the PATCH version: it cuts
+# the next vX.Y.(Z+1) tag from the latest tag and publishes a GitHub Release
+# whose notes are the matching CHANGELOG.md section (falling back to the commit
+# subject). minor/major boundaries stay MANUAL via scripts/release.sh.
+#
+# Skipped when the head commit is docs/bot churn or opts out explicitly:
+#   - subject starts with "docs:"  (docs-sync / translation churn)
+#   - subject contains "[skip-release]" or "[skip ci]"
+# This prevents a release -> docs-sync -> release loop.
+#
+# Note: a tag pushed with GITHUB_TOKEN does NOT trigger other workflows
+# (GitHub anti-recursion), so this job creates BOTH the tag and the Release
+# itself rather than relying on release.yml.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-version-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need all tags + history
+
+      - name: Decide whether to release
+        id: gate
+        run: |
+          SUBJECT="$(git log -1 --format=%s)"
+          echo "subject: $SUBJECT"
+          skip=0
+          case "$SUBJECT" in
+            docs:*) skip=1 ;;
+          esac
+          case "$SUBJECT" in
+            *"[skip-release]"*|*"[skip ci]"*) skip=1 ;;
+          esac
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next patch version
+        id: ver
+        if: steps.gate.outputs.skip == '0'
+        run: |
+          LATEST="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+          if [ -z "$LATEST" ]; then
+            NEXT="1.4.0"   # seed when no tag exists yet
+          else
+            NEXT="$(python3 -c "
+          import importlib.util
+          spec = importlib.util.spec_from_file_location('v', 'c_lord/version.py')
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          print(m.bump_version('${LATEST}'.lstrip('v'), 'patch'))
+          ")"
+          fi
+          TAG="v${NEXT}"
+          echo "latest=${LATEST:-<none>}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag + GitHub Release
+        if: steps.gate.outputs.skip == '0' && steps.ver.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+
+          # Release notes: CHANGELOG section if present, else the commit subject.
+          python3 - "$VERSION" <<'PY' > release_notes.md
+          import importlib.util, pathlib, sys
+          spec = importlib.util.spec_from_file_location("_clord_version", "c_lord/version.py")
+          mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          section = mod.extract_changelog_section(text, version)
+          print(section if section else f"Automated release {version}.")
+          PY
+
+          # The runner has no git identity by default; annotated tags need one.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "Release $TAG (auto patch bump)"
+          git push origin "$TAG"
+          gh release create "$TAG" --title "$TAG" --notes-file release_notes.md
+          echo "Released $TAG"

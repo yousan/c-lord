@@ -1,88 +1,82 @@
 ---
 name: release
-description: c-lord のマイナー/メジャーリリース手順。「v1.4.0としてリリースして」等と言われたときに使う。
+description: c-lord のバージョン/リリース手順。「v1.5.0としてリリースして」等と言われたときに使う。
 allowed-tools: Bash, Read, Edit
 ---
 
 # c-lord リリース手順
 
-## バージョン体系
+## 仕組みの要点
+
+- **バージョンの真実源は git タグ `vX.Y.Z`**。`pyproject.toml` に version は書かない（`hatch-vcs` がタグから導出）。**手書きで version を書き換えてはいけない。**
+- **patch は全自動**: main へ PR をマージするたび `.github/workflows/auto-version-bump.yml` が patch を +1 してタグ + GitHub Release を作る（`v1.4.0`→`v1.4.1`→…）。操作不要。
+- **minor / major は手動**: 節目を付けたいときだけ `scripts/release.sh` でタグを打つ（このスキル）。
+- 実行中ボットの版は `c-lord version` / `/version` で `v1.4.0-b<commit7>-<YYYYMMDD>` 形式（記事準拠）で確認できる。
+- リリースノートは `CHANGELOG.md` の該当セクションから自動抽出される。
 
 ```
-v1.3.0  ← 手動マイナーリリース（このスキルの対象）
-v1.3.1  ← PR マージごとに自動インクリメント（普段は何もしない）
-v1.3.2  ← 同上
-...
-v1.4.0  ← 手動マイナーリリース（このスキルの対象）
+v1.4.0 ──(PR merge: 自動 patch)──> v1.4.1 ──(自動)──> v1.4.2 ──(手動 minor)──> v1.5.0
 ```
 
-- **自動パッチバンプ**: 普通の PR をマージするたびに `.1` ずつ自動インクリメント。操作不要
-- **手動リリース**: マイナー/メジャーの区切りを付けたいときに使う（このスキル）
+### 自動 patch bump が走らないケース
+
+`auto-version-bump.yml` は head コミットの subject が次のときスキップ（release→docs-sync→release ループ防止）:
+
+- `docs:` で始まる（翻訳・ドキュメント更新）
+- `[skip-release]` または `[skip ci]` を含む
+
+bump させたくない PR は、squash コミット subject を `docs:` にするか `[skip-release]` を付ける。
 
 ---
 
-## 手動リリース手順（「v1.4.0としてリリースして」）
+## 手動リリース（minor / major、「v1.5.0としてリリースして」）
 
-### Step 1: リポジトリに入る
+### Step 1: main を最新化
 
 ```bash
 cd /home/yousan/c-lord
 git checkout main && git pull
 ```
 
-### Step 2: ブランチを作る
+### Step 2: CHANGELOG.md を更新（PR で）
+
+1. `## [Unreleased]` を `## [1.5.0] - YYYY-MM-DD`（今日）に変更
+2. その上に新しい空の `## [Unreleased]` を追加
+3. 末尾のリンク定義（`[1.5.0]: .../compare/v1.4.0...v1.5.0` 等）も追記
 
 ```bash
-git checkout -b release/v1.4.0   # バージョンは指定されたものに変える
+git checkout -b docs/changelog-v1.5.0
+# CHANGELOG.md を編集
+git add CHANGELOG.md
+git commit -m "docs: changelog for v1.5.0"   # docs: なので自動 patch bump は走らない
+git push -u origin docs/changelog-v1.5.0
+gh pr create --base main --title "docs: changelog for v1.5.0" \
+  --body "Changelog for the v1.5.0 release."
 ```
 
-### Step 3: pyproject.toml のバージョンを更新
+PR をマージ（CHANGELOG をタグより先に main へ入れることで、リリースノートが正しく拾われる）。
 
-`pyproject.toml` の `version = "1.3.x"` を指定バージョンに書き換える:
+### Step 3: タグを打つ（= リリース実行）
 
-```toml
-version = "1.4.0"
-```
-
-### Step 4: CHANGELOG.md を更新
-
-1. `## [Unreleased]` セクションを `## [1.4.0] - YYYY-MM-DD` に変更（今日の日付）
-2. その上に新しい空の `## [Unreleased]` セクションを追加
-
-```markdown
-## [Unreleased]
-
-## [1.4.0] - 2026-02-22   ← 今日の日付
-
-### Added
-...（既存の Unreleased 内容がここに来る）
-```
-
-### Step 5: PR を作成（タイトルに **必ず** `[release]` を含める）
+`scripts/release.sh` を使う。まず dry-run:
 
 ```bash
-PATH="/home/yousan/.local/bin:$PATH" git add pyproject.toml CHANGELOG.md
-PATH="/home/yousan/.local/bin:$PATH" git commit -m "release: v1.4.0 [release]"
-git push -u origin release/v1.4.0
-
-gh pr create \
-  --repo yousan/c-lord \
-  --base main \
-  --title "release: v1.4.0 [release]" \
-  --body "Release v1.4.0
-
-## Changes
-See CHANGELOG.md for details."
+git checkout main && git pull
+./scripts/release.sh --version 1.5.0          # dry-run（打たれるタグを表示）
+./scripts/release.sh --version 1.5.0 --apply  # タグ作成 + push → release.yml が Release 作成
 ```
 
-**⚠️ 重要**: PR タイトルに `[release]` を含めること。これがないと自動パッチバンプが走って v1.4.1 になってしまう。
-
-### Step 6: 確認（数分後）
-
-auto-approve により PR が自動マージされ、タグ `v1.4.0` と GitHub Release が作成される:
+バージョンを明示せず、直近コミットの `[minor]`/`[major]`/`[release]` から自動算出も可能（指定なしは patch）:
 
 ```bash
-gh release view v1.4.0 --repo yousan/c-lord
+./scripts/release.sh --level minor            # dry-run
+./scripts/release.sh --level minor --apply
+```
+
+### Step 4: 確認
+
+```bash
+gh release view v1.5.0 --repo yousan/c-lord
 ```
 
 ---
@@ -90,14 +84,17 @@ gh release view v1.4.0 --repo yousan/c-lord
 ## 仕組み（裏側）
 
 ```
-PR マージ（auto-approve.yml）
-  └── repository_dispatch: pr-merged
-        └── auto-version-bump.yml
-              ├── PR タイトルに [release] あり → 現在バージョンでタグ & Release（バンプなし）
-              └── [release] なし → patch++ してコミット → タグ & Release
+普通の PR を main にマージ
+  └── push: main → auto-version-bump.yml
+        ├── subject が docs: / [skip-release] → 何もしない
+        └── それ以外 → 最新タグ + patch でタグ作成 + GitHub Release
+
+手動 minor/major
+  └── scripts/release.sh --apply → vX.Y.Z タグ push
+        └── push: tags v* → release.yml → GitHub Release（CHANGELOG 抽出）
 ```
 
-docs-sync PR（翻訳・ドキュメント更新）はバンプも Release も発生しない。
+> 注: `GITHUB_TOKEN` で打ったタグは別ワークフローを起動しない（GitHub の再帰防止）。そのため auto-version-bump.yml はタグと Release を同一ジョブで作る。release.sh が打つタグ（個人の認証）は release.yml を起動する。
 
 ---
 
@@ -105,5 +102,7 @@ docs-sync PR（翻訳・ドキュメント更新）はバンプも Release も�
 
 | 状況 | 原因 | 対処 |
 |------|------|------|
-| v1.4.1 になってしまった | PR タイトルに `[release]` がなかった | タグを削除して再度 release PR を作る |
-| タグが既に存在するエラー | 同じバージョンでタグを作ろうとした | タグを削除: `gh api repos/yousan/c-lord/git/refs/tags/v1.4.0 --method DELETE` |
+| Release のノートが空/簡素 | タグより先に CHANGELOG が main に入っていない | CHANGELOG を main へ入れてからタグを打ち直す |
+| タグが既に存在するエラー | 同じバージョンで再実行 | `git push --delete origin v1.5.0` してから再実行 |
+| docs PR なのに patch が上がった | subject が `docs:` 始まりでなかった | subject を `docs:` にするか `[skip-release]` を付ける |
+| 版が `0.0.0` に見える | タグが1つも無い（ブートストラップ前） | 最初の `v1.4.0` タグを打つ（`release.sh` が seed する） |
