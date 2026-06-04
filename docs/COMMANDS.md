@@ -81,6 +81,7 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `/session-dirs` | List all active session directories | Anywhere |
 | `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
+| `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
 
 ### Upgrade
@@ -108,6 +109,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!sessions` | List all known sessions | `!sessions` | `/sessions` |
 | `!session-dirs` | List active session directories | `!session-dirs` | `/session-dirs` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
+| `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
