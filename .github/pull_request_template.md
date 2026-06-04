@@ -37,6 +37,8 @@ Refs #
 
 ## Staging Evidence (証跡)
 
+> 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。Discord 実画面キャプチャ（#243）が入るまでは、人間提供の Discord スクショ + tmux ペイン PNG（#286）で代替する。
+
 <!-- REQUIRED for behavior changes (bug fixes / features).
      Skip ONLY for pure-docs or provably no-behavior-change refactors —
      and if you skip, write the reason here.
