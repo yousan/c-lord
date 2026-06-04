@@ -35,6 +35,8 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
+from ..thread_settings import resolve_auto_archive_duration
+from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -134,6 +136,17 @@ class ClaudeChatCog(commands.Cog):
                 return any(r.name == self._allowed_role_name for r in member.roles)
             return False  # DM — no role info
         return self._allowed_user_ids is None
+
+    def is_processing(self, thread_id: int) -> bool:
+        """True while a Claude turn is actively running for ``thread_id``.
+
+        This is the lamp's source of truth for 🟢 ``running`` (#236): the entry
+        registers in ``_active_tasks`` the moment a turn starts and is popped in
+        the ``finally`` block when it finishes. Consumed by
+        :class:`ThreadStateSyncLoop` so the poll never rolls an in-flight thread
+        back to 🟡 ``waiting`` during a brief no-spinner window.
+        """
+        return thread_id in self._active_tasks
 
     @property
     def active_session_count(self) -> int:
@@ -303,6 +316,53 @@ class ClaudeChatCog(commands.Cog):
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
+            logger.info(
+                "%s lamp → %s (event-driven) %r",
+                log_ctx(thread_id=thread.id),
+                state,
+                new_name,
+            )
+
+    async def _set_lamp_state(
+        self,
+        thread: discord.Thread,
+        state: str,
+        tmux_manager,  # TmuxManager | None
+    ) -> None:
+        """Persist ``state`` and repaint the thread-name lamp immediately (#236).
+
+        Lightweight counterpart to :meth:`_apply_thread_naming` — reuses the
+        already-stored topic (no LLM retitle) and the stable ``work{N}`` window
+        number, so the leading 🟢/🟡 flips the instant a turn starts/ends instead
+        of waiting for the ≤60s state-sync poll. No-op when no topic exists yet
+        (the next user-driven naming pass will catch up).
+        """
+        from ..thread_name import build_name
+
+        await self.repo.set_state(thread.id, state)
+
+        record = await self.repo.get(thread.id)
+        topic = record.topic if record else None
+        if not topic:
+            return
+
+        window_number: int | None = None
+        if tmux_manager is not None:
+            info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
+            if info is not None:
+                window_number = info[1]
+
+        new_name = build_name(topic, state, window_number)
+        if (thread.name or "") == new_name:
+            return
+        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
+            await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
+            logger.info(
+                "%s lamp → %s (event-driven) %r",
+                log_ctx(thread_id=thread.id),
+                state,
+                new_name,
+            )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -644,10 +704,83 @@ class ClaudeChatCog(commands.Cog):
 
         await self._clear_impl(ctx.channel, respond)
 
+    async def _compact_impl(
+        self, channel: object, respond: _Responder, *, instructions: str = ""
+    ) -> None:
+        """Shared core for /compact and !compact (#278).
+
+        Fires the Claude Code TUI's built-in ``/compact`` slash command in the
+        thread's tmux window to compress (summarize) the session context,
+        freeing up the context window without losing history (unlike /clear).
+
+        Sent via ``send_literal`` (NOT ``send_input``): under
+        ``CLORD_BRIDGE_MODE=jsonl`` ``send_input`` prepends a zero-width-space
+        marker, so the line would no longer start with ``/`` and the TUI would
+        not treat it as a slash command (see docs/COMMANDS.md). This mirrors the
+        existing ``/context`` probe in ``tmux_runner.py``. Enter is sent
+        separately via ``send_keys`` since ``send_literal`` does not submit.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        thread_id = channel.id
+        parent_id = getattr(channel, "parent_id", None) or thread_id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        if tmux_manager is None:
+            await respond("tmux is not configured for this thread.", ephemeral=True)
+            return
+
+        if not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
+            await respond("No running Claude session in this thread to compact.", ephemeral=True)
+            return
+
+        instructions = instructions.strip()
+        command = f"/compact {instructions}" if instructions else "/compact"
+
+        # send_literal (not send_input): no ZWSP prefix so the leading "/" is
+        # preserved and the TUI recognises it as a slash command.
+        ok = await asyncio.to_thread(tmux_manager.send_literal, thread_id, command)
+        if not ok:
+            await respond("Failed to send /compact to the session.", ephemeral=True)
+            return
+        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
+
+        await respond("\U0001f5dc️ Compacting context… (`/compact` sent)")
+
+    @app_commands.command(
+        name="compact",
+        description="Compact (summarize) this thread's Claude context to free the window",
+    )
+    @app_commands.describe(
+        instructions="Optional focus for the summary (e.g. 'keep open tasks and decisions')"
+    )
+    async def compact_session(
+        self, interaction: discord.Interaction, instructions: str = ""
+    ) -> None:
+        """Trigger the TUI ``/compact`` for the current thread's session."""
+
+        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._compact_impl(interaction.channel, respond, instructions=instructions)
+
+    @commands.command(name="compact")
+    async def compact_text(self, ctx: commands.Context, *, instructions: str = "") -> None:
+        """Text/mention twin of /compact — invokable from webhooks for E2E (#278)."""
+
+        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
+            await ctx.send(content or "")
+
+        await self._compact_impl(ctx.channel, respond, instructions=instructions)
+
     async def _handle_new_conversation(self, message: discord.Message) -> None:
         """Create a new thread and start a Claude Code session."""
         thread_name = message.content[:100] if message.content else "Claude Chat"
-        thread = await message.create_thread(name=thread_name)
+        archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
+        thread = await message.create_thread(
+            name=thread_name, auto_archive_duration=archive_minutes
+        )
         prompt, image_paths = await self._build_prompt_and_images(message)
         await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
 
@@ -680,10 +813,11 @@ class ClaudeChatCog(commands.Cog):
             The newly created :class:`discord.Thread`.
         """
         name = (thread_name or prompt)[:100]
+        archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
         thread = await channel.create_thread(
             name=name,
             type=discord.ChannelType.public_thread,
-            auto_archive_duration=60,
+            auto_archive_duration=archive_minutes,
         )
         # Post the prompt so StatusManager has a Message to add reactions to.
         seed_message = await thread.send(prompt)
@@ -852,8 +986,32 @@ class ClaudeChatCog(commands.Cog):
                     with contextlib.suppress(Exception):
                         await existing_task
 
+            # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
+            # death) but a prior session's transcript is still on disk, resume it via
+            # --continue instead of starting fresh and discarding the history.
+            # Conditions:
+            #   - existing_runner is None: an interrupted-but-live session stays alive
+            #     in tmux and should just receive send_input, not --continue.
+            #   - session_id is not None: a /clear'd thread has its session_id reset,
+            #     so it stays fresh — preserving the #123 Part 1 invariant.
+            #   - the tmux pane is actually dead (is_claude_running is False).
+            # This extends the --continue fallback (previously only on the
+            # restart-resume path, #123 Part 2) to the ordinary reply path.
+            try_continue = False
+            if session_id is not None and existing_runner is None:
+                parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+                tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
+                if tmux_manager is not None:
+                    pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
+                    try_continue = not pane_alive
+
             await self._run_claude(
-                message, thread, prompt, session_id=session_id, image_paths=image_paths
+                message,
+                thread,
+                prompt,
+                session_id=session_id,
+                image_paths=image_paths,
+                try_continue=try_continue,
             )
 
     async def _build_prompt(self, message: discord.Message) -> str:
@@ -961,6 +1119,12 @@ class ClaudeChatCog(commands.Cog):
             current_task = asyncio.current_task()
             if current_task is not None:
                 self._active_tasks[thread.id] = current_task
+
+            # Lamp → 🟢 running immediately, event-driven (#236). Persist the
+            # state now so the rename in _apply_thread_naming below paints the
+            # thread green without waiting for the ≤60s state-sync poll.
+            with contextlib.suppress(Exception):
+                await self.repo.set_state(thread.id, "running")
 
             # Mark thread as PROCESSING when Claude starts
             if dashboard is not None:
@@ -1096,6 +1260,12 @@ class ClaudeChatCog(commands.Cog):
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
+
+                # Lamp → 🟡 waiting the instant the turn finishes (#236). Runs
+                # after _active_tasks.pop above, so is_processing() is already
+                # False and the next state-sync poll stays consistent.
+                with contextlib.suppress(Exception):
+                    await self._set_lamp_state(thread, "waiting", tmux_manager)
 
                 if dashboard is not None:
                     with contextlib.suppress(Exception):

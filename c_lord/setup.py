@@ -269,7 +269,14 @@ async def setup_bridge(
             interval = float(interval_env)
         except ValueError:
             interval = 60.0
-        sync_loop = ThreadStateSyncLoop(bot, session_repo, interval_seconds=interval)
+        sync_loop = ThreadStateSyncLoop(
+            bot,
+            session_repo,
+            interval_seconds=interval,
+            # Let the poll keep an in-flight thread 🟢 instead of rolling it back
+            # to 🟡 during a brief no-spinner window (#236).
+            is_processing=chat_cog.is_processing,
+        )
         sync_loop.start()
         bot.thread_state_sync = sync_loop  # type: ignore[attr-defined]
         logger.info("Started ThreadStateSyncLoop (interval=%.0fs)", interval)

@@ -345,7 +345,7 @@ async def _run_start(env_path: Path) -> None:
     # Import and run the existing main() from c_lord.main
     from c_lord.main import main as bot_main
 
-    await bot_main()
+    await bot_main(env_path)
 
 
 def cmd_start(env_path: Path = Path(".env")) -> None:

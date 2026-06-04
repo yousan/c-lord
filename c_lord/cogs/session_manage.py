@@ -7,6 +7,7 @@ Provides slash commands for viewing and managing Claude Code sessions:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
@@ -19,6 +20,11 @@ from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..session_dir import SessionDirManager
+from ..thread_settings import (
+    SETTING_THREAD_AUTO_ARCHIVE,
+    VALID_DURATIONS,
+    resolve_auto_archive_duration,
+)
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
@@ -61,6 +67,25 @@ _MODEL_CHOICES = [
     app_commands.Choice(name="Sonnet 4.6 (balanced, default)", value="sonnet"),
     app_commands.Choice(name="Opus 4.7 (powerful, deep reasoning)", value="opus"),
 ]
+
+# Thread auto-archive duration management. Discord only accepts the four values
+# in VALID_DURATIONS (see c_lord/thread_settings.py).
+_ARCHIVE_CHOICES = [
+    app_commands.Choice(name="1 hour", value=60),
+    app_commands.Choice(name="1 day", value=1440),
+    app_commands.Choice(name="3 days (default)", value=4320),
+    app_commands.Choice(name="7 days", value=10080),
+]
+
+
+def _format_duration(minutes: int) -> str:
+    """Human-readable label for a Discord auto-archive duration in minutes."""
+    return {
+        60: "1 hour",
+        1440: "1 day",
+        4320: "3 days",
+        10080: "7 days",
+    }.get(minutes, f"{minutes} min")
 
 
 class SessionManageCog(commands.Cog):
@@ -243,6 +268,101 @@ class SessionManageCog(commands.Cog):
             return
         respond, _ = self._ctx_io(ctx)
         await self._model_set_impl(model=model, respond=respond)
+
+    # ── Thread auto-archive duration commands ──────────────────────────────────
+
+    thread_archive_group = app_commands.Group(
+        name="thread-archive",
+        description="View and change how long c-lord threads stay active before archiving",
+    )
+
+    async def _archive_show_impl(self, *, respond: _Responder) -> None:
+        """Shared core for /thread-archive show and !thread-archive-show."""
+        effective = await resolve_auto_archive_duration(self.settings_repo)
+        stored = (
+            await self.settings_repo.get(SETTING_THREAD_AUTO_ARCHIVE)
+            if self.settings_repo
+            else None
+        )
+
+        embed = discord.Embed(title="🗂️ Thread Auto-Archive Duration", color=COLOR_INFO)
+        if stored:
+            embed.description = f"**Configured:** {_format_duration(effective)} (`{effective}` min)"
+        else:
+            embed.description = (
+                f"**Default:** {_format_duration(effective)} (`{effective}` min)\n"
+                "*(no override set — use `/thread-archive set` to change)*"
+            )
+        embed.set_footer(text="Applies to threads c-lord creates from now on.")
+        await respond(embed=embed)
+
+    @thread_archive_group.command(name="show", description="Show the thread auto-archive duration")
+    async def thread_archive_show(self, interaction: discord.Interaction) -> None:
+        """Display the current thread auto-archive duration."""
+        respond, _ = self._slash_io(interaction)
+        await self._archive_show_impl(respond=respond)
+
+    @commands.command(name="thread-archive-show")
+    async def thread_archive_show_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /thread-archive show — webhook-invokable for E2E."""
+        respond, _ = self._ctx_io(ctx)
+        await self._archive_show_impl(respond=respond)
+
+    async def _archive_set_impl(self, *, duration: int, respond: _Responder) -> None:
+        """Shared core for /thread-archive set and !thread-archive-set."""
+        if duration not in VALID_DURATIONS:
+            valid = ", ".join(str(d) for d in VALID_DURATIONS)
+            await respond(
+                f"❌ Invalid duration `{duration}`. Discord only accepts: {valid} (minutes).",
+                ephemeral=True,
+            )
+            return
+
+        if self.settings_repo is None:
+            await respond(
+                "❌ Settings repository is unavailable — duration cannot be persisted.",
+                ephemeral=True,
+            )
+            return
+
+        await self.settings_repo.set(SETTING_THREAD_AUTO_ARCHIVE, str(duration))
+
+        embed = discord.Embed(
+            title="✅ Thread Auto-Archive Updated",
+            description=(
+                f"New threads will archive after **{_format_duration(duration)}** "
+                f"(`{duration}` min) of inactivity."
+            ),
+            color=COLOR_SUCCESS,
+        )
+        await respond(embed=embed)
+
+    @thread_archive_group.command(
+        name="set", description="Change how long new threads stay active before archiving"
+    )
+    @app_commands.describe(duration="Inactivity period before a thread auto-archives")
+    @app_commands.choices(duration=_ARCHIVE_CHOICES)
+    async def thread_archive_set(self, interaction: discord.Interaction, duration: int) -> None:
+        """Set the global thread auto-archive duration stored in settings_repo."""
+        respond, _ = self._slash_io(interaction)
+        await self._archive_set_impl(duration=duration, respond=respond)
+
+    @commands.command(name="thread-archive-set")
+    async def thread_archive_set_text(
+        self, ctx: commands.Context, duration: str | None = None
+    ) -> None:
+        """Text/mention twin of /thread-archive set — webhook-invokable for E2E."""
+        if not duration:
+            valid = "/".join(str(d) for d in VALID_DURATIONS)
+            await ctx.send(f"Usage: `!thread-archive-set <{valid}>` (minutes)")
+            return
+        respond, _ = self._ctx_io(ctx)
+        try:
+            minutes = int(duration)
+        except (TypeError, ValueError):
+            await respond(f"❌ Invalid duration `{duration}` — must be a number.", ephemeral=True)
+            return
+        await self._archive_set_impl(duration=minutes, respond=respond)
 
     async def _resume_info_impl(self, *, channel: object, respond: _Responder) -> None:
         """Shared core for /resume-info and !resume-info (#209 follow-up)."""
@@ -763,3 +883,71 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /workspace-delete — webhook-invokable for E2E (#209)."""
         respond, ack = self._ctx_io(ctx)
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    async def _close_workspace_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /close-workspace and !close-workspace (#271).
+
+        Non-destructive counterpart to ``/workspace-delete``: kills the tmux
+        window and archives the thread to declutter, but **keeps** the session
+        directory, transcript, and DB session record.  The next message resumes
+        the conversation via ``--continue`` (#270) — that is the whole point of
+        "close" vs "delete".  Note this never resolves the session-dir manager,
+        so the directory-removal path is structurally unreachable here.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond(
+                "This command can only be used in a Claude chat thread.",
+                ephemeral=True,
+            )
+            return
+
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+        await ack()
+
+        import asyncio
+
+        results: list[str] = []
+
+        # Kill the tmux window to free the work<N> slot.
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        if tmux_mgr is not None:
+            killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
+            if killed:
+                results.append("✅ Tmux window closed")
+            else:
+                results.append("ℹ️ No tmux window found")
+            results.append("📂 Session directory kept — send a message to resume.")
+        else:
+            results.append(
+                "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
+                " `/clord-init` で設定してください。"
+            )
+
+        embed = discord.Embed(
+            title="🧹 Workspace Closed",
+            description="\n".join(results),
+            color=COLOR_SUCCESS,
+        )
+        await respond(embed=embed)
+
+        # Archive the thread to declutter the sidebar (best-effort).
+        with contextlib.suppress(discord.HTTPException):
+            await channel.edit(archived=True)
+
+    @app_commands.command(
+        name="close-workspace",
+        description="Close the tmux window but keep the session (resumes on next message)",
+    )
+    async def close_workspace(self, interaction: discord.Interaction) -> None:
+        """Close the tmux window + archive the thread, keeping the session dir (#271)."""
+        respond, ack = self._slash_io(interaction)
+        await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="close-workspace")
+    async def close_workspace_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /close-workspace — webhook-invokable for E2E (#271)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)

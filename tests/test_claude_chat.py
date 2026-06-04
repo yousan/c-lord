@@ -36,6 +36,8 @@ def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
     """Return a ClaudeChatCog with minimal mocked dependencies."""
     bot = MagicMock()
     bot.channel_id = 999
+    # No settings repo → thread auto-archive resolver uses the 3-day default.
+    bot.settings_repo = None
     # Default get_context returns a non-command context (valid=False)
     _default_ctx = MagicMock()
     _default_ctx.valid = False
@@ -671,6 +673,96 @@ class TestInterruptOnNewMessage:
         assert isinstance(cog._active_tasks, dict)
         assert len(cog._active_tasks) == 0
 
+    def test_is_processing_reflects_active_tasks(self) -> None:
+        """is_processing() is the lamp's source of truth for 🟢 running (#236):
+        True iff a Claude turn is currently registered for the thread."""
+        cog = _make_cog()
+        assert cog.is_processing(42) is False
+        cog._active_tasks[42] = MagicMock()
+        assert cog.is_processing(42) is True
+        del cog._active_tasks[42]
+        assert cog.is_processing(42) is False
+
+
+class TestResumeAfterPaneDeath:
+    """#270: a normal thread reply must resume the on-disk session via --continue
+    when the tmux pane has died (bot restart / kill -9 / tmux-server death), instead
+    of starting fresh and discarding the transcript that is still on disk.
+
+    The decision surfaces as ``_run_claude(..., try_continue=...)``:
+      - pane dead + prior session exists → ``try_continue=True``  (resume via --continue)
+      - tmux pane still alive            → ``try_continue=False`` (live send_input)
+      - session cleared (/clear)         → ``try_continue=False`` (stay fresh, #123 Part 1)
+
+    Refs #123 Part 2 — the existing --continue fallback only covers the
+    restart-resume path (on_ready → pending_resumes); the ordinary
+    message-triggered reply path is uncovered.
+    """
+
+    def _make_thread_message(self, thread_id: int = 42) -> MagicMock:
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = 999
+        thread.send = AsyncMock()
+        msg = MagicMock(spec=discord.Message)
+        msg.channel = thread
+        msg.content = "what is my name?"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+        return msg
+
+    def _cog_with_pane(self, *, running: bool) -> ClaudeChatCog:
+        """Cog whose tmux pane for the thread is alive (running) or dead."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.is_claude_running.return_value = running
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._run_claude = AsyncMock()
+        return cog
+
+    @pytest.mark.asyncio
+    async def test_resumes_with_continue_when_pane_dead_and_prior_session(self) -> None:
+        """RED (#270): pane died but a prior session exists → must pass try_continue=True."""
+        cog = self._cog_with_pane(running=False)
+        record = MagicMock()
+        record.session_id = "abc-123"
+        cog.repo.get = AsyncMock(return_value=record)
+
+        await cog._handle_thread_reply(self._make_thread_message())
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert kwargs.get("try_continue") is True
+
+    @pytest.mark.asyncio
+    async def test_no_continue_when_session_cleared(self) -> None:
+        """/clear invariant (#123 Part 1): session was reset → stay fresh, never --continue."""
+        cog = self._cog_with_pane(running=False)
+        record = MagicMock()
+        record.session_id = ""  # /clear resets session_id to empty
+        cog.repo.get = AsyncMock(return_value=record)
+
+        await cog._handle_thread_reply(self._make_thread_message())
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert not kwargs.get("try_continue")
+
+    @pytest.mark.asyncio
+    async def test_no_continue_when_pane_alive(self) -> None:
+        """Pane still alive → live send_input continues context; must not force --continue."""
+        cog = self._cog_with_pane(running=True)
+        record = MagicMock()
+        record.session_id = "abc-123"
+        cog.repo.get = AsyncMock(return_value=record)
+
+        await cog._handle_thread_reply(self._make_thread_message())
+
+        cog._run_claude.assert_called_once()
+        _, kwargs = cog._run_claude.call_args
+        assert not kwargs.get("try_continue")
+
 
 class TestZeroConfigCoordination:
     """_get_coordination() must work without any consumer wiring (Zero-Config Principle).
@@ -741,6 +833,7 @@ class TestSpawnSession:
         channel.create_thread = AsyncMock(return_value=thread)
 
         bot = MagicMock()
+        bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
 
         with patch.object(cog, "_run_claude", new=AsyncMock()):
@@ -751,6 +844,8 @@ class TestSpawnSession:
         call_kwargs = channel.create_thread.call_args.kwargs
         assert call_kwargs["name"] == "Do the thing"
         assert call_kwargs["type"] == discord.ChannelType.public_thread
+        # Defaults to 3 days (4320 min) when no setting is configured.
+        assert call_kwargs["auto_archive_duration"] == 4320
 
     @pytest.mark.asyncio
     async def test_spawn_uses_custom_thread_name(self) -> None:
@@ -766,6 +861,7 @@ class TestSpawnSession:
         channel.create_thread = AsyncMock(return_value=thread)
 
         bot = MagicMock()
+        bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
 
         with patch.object(cog, "_run_claude", new=AsyncMock()):
@@ -789,6 +885,7 @@ class TestSpawnSession:
         channel.create_thread = AsyncMock(return_value=thread)
 
         bot = MagicMock()
+        bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
 
         mock_run = AsyncMock()
@@ -1779,6 +1876,114 @@ class TestClearCommand:
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
 
+class TestCompactCommand:
+    """Tests for /compact command — fires the TUI /compact via send_literal (#278).
+
+    The whole point of #278 is that a normal message would go through
+    ``send_input`` which (under ``CLORD_BRIDGE_MODE=jsonl``) prepends a
+    zero-width-space, breaking the leading ``/``. ``/compact`` must therefore
+    use ``send_literal`` (no ZWSP) + a separate Enter, mirroring the existing
+    ``/context`` probe in ``tmux_runner.py``.
+    """
+
+    @staticmethod
+    def _running_tmux() -> MagicMock:
+        tmux_manager = MagicMock()
+        tmux_manager.is_claude_running = MagicMock(return_value=True)
+        tmux_manager.send_literal = MagicMock(return_value=True)
+        tmux_manager.send_keys = MagicMock(return_value=True)
+        tmux_manager.send_input = MagicMock(return_value=True)
+        return tmux_manager
+
+    @pytest.mark.asyncio
+    async def test_compact_outside_thread_sends_ephemeral(self) -> None:
+        """/compact outside a thread sends an ephemeral error."""
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+
+        await cog.compact_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_compact_no_tmux_manager_sends_ephemeral(self) -> None:
+        """/compact with no tmux binding sends an ephemeral error."""
+        cog = _make_cog()  # channel_cog None → _resolve_tmux_manager returns None
+        interaction = _make_thread_interaction(thread_id=12345)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_compact_not_running_sends_ephemeral(self) -> None:
+        """/compact when Claude is not running sends an ephemeral notice (no send)."""
+        tmux_manager = self._running_tmux()
+        tmux_manager.is_claude_running = MagicMock(return_value=False)
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        interaction = _make_thread_interaction(thread_id=12345)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+        tmux_manager.send_literal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compact_uses_send_literal_not_send_input(self) -> None:
+        """AC6: /compact must use send_literal (no ZWSP) + Enter, never send_input."""
+        tmux_manager = self._running_tmux()
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+        interaction = _make_thread_interaction(thread_id)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction)
+
+        tmux_manager.send_literal.assert_called_once_with(thread_id, "/compact")
+        tmux_manager.send_keys.assert_called_once_with(thread_id, "Enter")
+        tmux_manager.send_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compact_passes_instructions(self) -> None:
+        """AC3: instructions are appended as '/compact <instructions>'."""
+        tmux_manager = self._running_tmux()
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+        interaction = _make_thread_interaction(thread_id)
+        interaction.channel.parent_id = 999
+
+        await cog.compact_session.callback(cog, interaction, instructions="keep open tasks")
+
+        tmux_manager.send_literal.assert_called_once_with(thread_id, "/compact keep open tasks")
+
+    @pytest.mark.asyncio
+    async def test_compact_text_twin_uses_send_literal(self) -> None:
+        """The !compact text twin fires the same send_literal path."""
+        tmux_manager = self._running_tmux()
+        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
+        cog = _make_cog(channel_cog=channel_cog)
+        thread_id = 12345
+
+        ctx = MagicMock()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = 999
+        ctx.channel = thread
+        ctx.send = AsyncMock()
+
+        await cog.compact_text.callback(cog, ctx)
+
+        tmux_manager.send_literal.assert_called_once_with(thread_id, "/compact")
+
+
 class TestApplyThreadNamingRetitle:
     """Unit tests for the auto-retitle hook in _apply_thread_naming (#121)."""
 
@@ -1821,12 +2026,22 @@ class TestApplyThreadNamingRetitle:
 
         instruction = "次はDockerfileを最適化してCI/CDを改善してください"
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="Dockerfileの最適化")):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message=instruction)
+        with patch.object(
+            cc_module.topic_module,
+            "maybe_retitle",
+            new=AsyncMock(return_value="Dockerfileの最適化"),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message=instruction
+            )
 
-        cog.repo.set_topic.assert_awaited_once_with(55555, "Dockerfileの最適化", source="llm_retitle")
+        cog.repo.set_topic.assert_awaited_once_with(
+            55555, "Dockerfileの最適化", source="llm_retitle"
+        )
         thread.edit.assert_awaited_once()
-        call_name = thread.edit.await_args.kwargs.get("name", thread.edit.await_args.args[0] if thread.edit.await_args.args else "")
+        call_name = thread.edit.await_args.kwargs.get(
+            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
+        )
         assert "Dockerfileの最適化" in call_name
 
     @pytest.mark.asyncio
@@ -1842,8 +2057,12 @@ class TestApplyThreadNamingRetitle:
 
         instruction = "認証リファクタを引き続きお願いします"
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message=instruction)
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message=instruction
+            )
 
         cog.repo.set_topic.assert_not_awaited()
 
@@ -1857,8 +2076,12 @@ class TestApplyThreadNamingRetitle:
         record = self._make_record(topic="認証リファクタ", locked=1)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="new")) as mock_retitle:
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="何か作業してください")
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="new")
+        ) as mock_retitle:
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="何か作業してください"
+            )
 
         mock_retitle.assert_not_awaited()
 
@@ -1872,8 +2095,16 @@ class TestApplyThreadNamingRetitle:
         record = self._make_record(topic=None)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock()) as mock_retitle, \
-             patch.object(cc_module.topic_module, "generate_topic", new=AsyncMock(return_value=("初回トピック", "llm"))):
-            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="初回メッセージです")
+        with (
+            patch.object(cc_module.topic_module, "maybe_retitle", new=AsyncMock()) as mock_retitle,
+            patch.object(
+                cc_module.topic_module,
+                "generate_topic",
+                new=AsyncMock(return_value=("初回トピック", "llm")),
+            ),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="初回メッセージです"
+            )
 
         mock_retitle.assert_not_awaited()

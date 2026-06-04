@@ -17,6 +17,7 @@ import re
 from collections.abc import AsyncGenerator
 
 from ..tmux import TmuxSessionManager
+from .context_usage import parse_context_total
 from .types import AskOption, AskQuestion, MessageType, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,11 @@ _UNKNOWN_ALERT_DELAY = 5.0
 # expected prompt — but still guards against a half-drawn menu frame (#166).
 _ASK_ALERT_DELAY = 1.5
 
+# /context probe: how many times to re-capture the pane while waiting for the
+# (locally-rendered) /context output to settle, and the gap between captures.
+_CONTEXT_PROBE_ATTEMPTS = 6
+_CONTEXT_PROBE_INTERVAL = 0.5
+
 # Delay between individual menu-navigation keystrokes (seconds).  Keys must be
 # sent one at a time with a gap — batching `Down Down Enter` into one send-keys
 # call is too fast and the TUI drops the navigations, selecting the wrong
@@ -80,15 +86,20 @@ _TRUST_PROMPT_MARKERS = (
 # chat about this very feature) must not trip a spurious Enter into the input.
 _TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*1\.\s+Yes, I trust this folder\s*$", re.MULTILINE)
 
-# Patterns from Plan approval (ExitPlanMode) and AskUserQuestion TUI menus.
-# These are KNOWN prompt types handled via Discord buttons; they must NOT be
-# flagged as "unknown" interactive prompts (#153).
+# Patterns from legacy AskUserQuestion TUI menus that must NOT be flagged as
+# "unknown" interactive prompts (#153).
+#
+# Plan-approval markers ("Would you like to proceed?", "No, keep planning") were
+# REMOVED here (#251): they are now actively bridged via _parse_plan_from_pane,
+# and the run loop ``continue``s on a parsed plan menu before reaching the
+# unknown-interactive check.  Keeping them in this whitelist would defeat the
+# fallback — an unparsed plan-ish menu (e.g. a future format change the parser
+# misses) must still trip the unknown-TUI notice rather than stall silently.
+# AskUserQuestion's current variant is excluded via _is_ask_question(); these
+# legacy "Other" markers remain only for the older AskUserQuestion layout.
 # Sources: Claude Code TUI catalog (docs/tui-prompts.md).
 _KNOWN_INTERACTIVE_MARKERS = (
-    # ExitPlanMode (Plan approval) — docs/tui-prompts.md §2-2
-    "Would you like to proceed?",
-    "No, keep planning",
-    # AskUserQuestion — always adds "Other" as the last option (no number prefix)
+    # AskUserQuestion (legacy) — adds "Other" as the last option (no number prefix)
     "\nOther",
     "\n  Other",
 )
@@ -178,6 +189,29 @@ def _is_ask_question(text: str) -> bool:
     return _ASK_SIGNATURE in text and bool(_ASK_OPTION_RE.search(text))
 
 
+# A multi-question AskUserQuestion ends on a "Review your answers" screen with a
+# two-option menu — "Submit answers" / "Cancel" — and the cursor defaulting to
+# "Submit answers".  It carries NO "Chat about this" marker, so _is_ask_question
+# misses it; without explicit handling it falls through to the unknown-prompt
+# alert.  Match the two option labels (cursor optional) anchored to the bottom
+# zone, where real prompts live — the pairing is unique to this screen, so it
+# can't be confused with a normal question menu or an unrelated numbered list.
+_ASK_SUBMIT_RE = re.compile(r"^\s*❯?\s*\d+\.\s+Submit answers\s*$", re.MULTILINE)
+_ASK_CANCEL_RE = re.compile(r"^\s*❯?\s*\d+\.\s+Cancel\s*$", re.MULTILINE)
+
+
+def _is_ask_submit_screen(text: str) -> bool:
+    """True iff the pane shows the AskUserQuestion Submit/Review confirmation.
+
+    All questions were already answered via the Discord bridge; this final
+    screen only needs a bare Enter (cursor starts on "Submit answers") to
+    submit.  Only the bottom zone is scanned so a stale review screen left in
+    the scrollback can't re-trigger a submit.
+    """
+    zone = _permission_zone(text)
+    return bool(_ASK_SUBMIT_RE.search(zone)) and bool(_ASK_CANCEL_RE.search(zone))
+
+
 def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     """Parse an AskUserQuestion TUI menu from the pane into an ``AskQuestion``.
 
@@ -254,6 +288,103 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         question = s
 
     return AskQuestion(question=question, header=header, options=options)
+
+
+# -- Plan approval (ExitPlanMode) TUI menu parsing (#251) ---------------------
+# The ExitPlanMode menu ("Claude has written up a plan … Would you like to
+# proceed?") is a numbered Yes/No menu c-lord bridges to Discord buttons via
+# the same path as AskUserQuestion (#166).  Unlike AskUserQuestion it has no
+# "Chat about this" / "Type something." rows, so it needs its own detector.
+# Labels are parsed dynamically — the menu text changes between Claude Code
+# versions (e.g. v2.1.156 dropped "No, keep planning" for "No, refine with
+# Ultraplan …"), so hard-coding them would silently break on the next change.
+# "Would you like to proceed?" is distinct from the permission prompt's "Do you
+# want to proceed?" (_PERMISSION_PROMPT_MARKERS), so it uniquely marks a plan.
+_PLAN_SIGNATURE = "Would you like to proceed?"
+# The plan body is rendered between this header and the menu; we fold it into
+# the question so reviewers see the plan on Discord before approving (#251).
+_PLAN_BODY_START = "Here is Claude's plan:"
+# A line that is purely box-drawing dashes (the plan body's ╌╌╌ / ─── rules).
+_PLAN_RULE_RE = re.compile(r"^[╌─━═┄┈\-\s]+$")
+
+
+def _parse_plan_from_pane(text: str) -> AskQuestion | None:
+    """Parse an ExitPlanMode approval menu from the pane into an ``AskQuestion``.
+
+    Returns ``None`` when the pane is not a plan-approval menu (an
+    AskUserQuestion menu, a permission prompt, or any non-plan screen).  The
+    returned options preserve display order; the 0-based index of each option
+    equals the number of ``Down`` presses needed to land the cursor on it, so
+    the result answers the open menu via :meth:`TmuxClaudeRunner.answer_menu`
+    exactly like a ``pane_ask`` (#166).
+
+    ``allow_other`` is ``False``: the plan menu's free-text option ("Tell Claude
+    what to change") is a normal numbered choice, not AskUserQuestion's "Type
+    something." row, so the generic Other modal must be suppressed.
+    """
+    if not text or _PLAN_SIGNATURE not in text:
+        return None
+    # AskUserQuestion menus are parsed by _parse_ask_from_pane; never here.
+    if _is_ask_question(text):
+        return None
+
+    lines = text.splitlines()
+    # Anchor to the active (bottom-most) menu — scrollback may hold old plans.
+    sig_idx = max(i for i, line in enumerate(lines) if _PLAN_SIGNATURE in line)
+
+    options: list[AskOption] = []
+    started = False
+    for line in lines[sig_idx + 1 :]:
+        m = _ASK_OPTION_RE.match(line)
+        if m:
+            options.append(AskOption(label=m.group(1).strip()))
+            started = True
+        elif started:
+            # First non-numbered line after the options ends the menu (e.g. the
+            # "shift+tab to approve with this feedback" hint under option 4).
+            break
+        elif line.strip() == "":
+            continue  # blank padding between the question and the first option
+        else:
+            break  # unexpected non-option content before any option — bail
+
+    if len(options) < 2:
+        return None
+
+    question = lines[sig_idx].strip()
+    body = _extract_plan_body(lines, sig_idx)
+    if body:
+        question = f"{body}\n\n{question}"
+    return AskQuestion(
+        question=question,
+        header="📋 Plan ready — approve?",
+        options=options,
+        multi_select=False,
+        allow_other=False,
+    )
+
+
+def _extract_plan_body(lines: list[str], sig_idx: int) -> str:
+    """Return the plan markdown shown above the menu, for the Discord embed.
+
+    Reads the lines between the last ``Here is Claude's plan:`` header and the
+    menu signature, dropping the box-drawing rule lines that frame it.  Returns
+    ``""`` when no plan body is present (e.g. the legacy menu format), in which
+    case only the one-line question is shown.
+    """
+    starts = [i for i, line in enumerate(lines[:sig_idx]) if _PLAN_BODY_START in line]
+    if not starts:
+        return ""
+    out: list[str] = []
+    for line in lines[max(starts) + 1 : sig_idx]:
+        s = line.rstrip()
+        # Drop box-drawing rule lines (╌╌╌ / ───) but keep blank lines so the
+        # plan's paragraph structure survives in the embed.
+        if s.strip() and _PLAN_RULE_RE.match(line):
+            continue
+        out.append(s)
+    # Collapse the leading/trailing blank padding the TUI adds.
+    return "\n".join(out).strip()
 
 
 # TUI status bar patterns at the very bottom.
@@ -537,6 +668,11 @@ class TmuxClaudeRunner:
         # signature of the menu we already bridged to Discord (dedup).
         ask_stable = 0.0
         last_bridged_ask: str | None = None
+        # AskUserQuestion Submit/Review screen: seconds it has been stable, and
+        # the signature of the screen we already submitted (dedup so a lingering
+        # screen isn't Enter-ed every poll).
+        submit_stable = 0.0
+        last_submitted: str | None = None
         # Raw pane activity (#166): while Claude works the pane changes every
         # poll (spinner frame, elapsed-seconds tick), even when no response text
         # is extracted yet.  We only treat the session as idle once the raw pane
@@ -593,6 +729,8 @@ class TmuxClaudeRunner:
                 last_alerted_unknown = None
                 ask_stable = 0.0
                 last_bridged_ask = None
+                submit_stable = 0.0
+                last_submitted = None
                 await self._accept_permission_prompt(current)
                 continue
 
@@ -601,14 +739,20 @@ class TmuxClaudeRunner:
             # shows the buttons and waits for a click; it then sends the menu
             # keystrokes back via answer_menu(), after which polling resumes and
             # the (now-closed) menu no longer matches.
-            ask_q = _parse_ask_from_pane(current)
+            # Plan approval (ExitPlanMode) menus are bridged through the SAME
+            # pane_ask path as AskUserQuestion (#251): both are numbered TUI
+            # menus answered by sending Down×index + Enter back to the pane, so
+            # the only difference is detection.  ``_parse_plan_from_pane``
+            # returns an AskQuestion with ``allow_other=False`` (no free-text
+            # row), which AskView renders without the ✏️ Other button.
+            ask_q = _parse_ask_from_pane(current) or _parse_plan_from_pane(current)
             if ask_q is not None:
                 ask_stable += _POLL_INTERVAL
                 ask_sig = "\n".join(o.label for o in ask_q.options)
                 if ask_stable >= _ASK_ALERT_DELAY and ask_sig != last_bridged_ask:
                     last_bridged_ask = ask_sig
                     logger.info(
-                        "AskUserQuestion menu detected, bridging to Discord (thread=%d)",
+                        "Interactive menu detected, bridging to Discord (thread=%d)",
                         self._thread_id,
                     )
                     yield StreamEvent(
@@ -620,6 +764,26 @@ class TmuxClaudeRunner:
             else:
                 ask_stable = 0.0
                 last_bridged_ask = None
+
+            # AskUserQuestion multi-question Submit/Review screen (post-bridge).
+            # Once every question was answered via the Discord buttons, the TUI
+            # shows a "Review your answers" confirmation with the cursor on
+            # "Submit answers".  Auto-confirm with Enter so the answered flow
+            # completes instead of stalling as an "unknown" prompt.  A short
+            # dwell guards against acting on a half-drawn frame, and the
+            # signature dedup prevents re-pressing Enter while it lingers.
+            if _is_ask_submit_screen(current):
+                submit_stable += _POLL_INTERVAL
+                if submit_stable >= _ASK_ALERT_DELAY:
+                    sig = _unknown_prompt_signature(current)
+                    if sig != last_submitted:
+                        last_submitted = sig
+                        await self._submit_ask_screen()
+                    submit_stable = 0.0
+                continue
+            else:
+                submit_stable = 0.0
+                last_submitted = None
 
             # Detect unknown TUI interactive menus (not covered by known markers).
             # Alert Discord so the session doesn't stall silently.
@@ -763,6 +927,39 @@ class TmuxClaudeRunner:
         self._stopped = True
         await asyncio.to_thread(self._tmux.kill_session, self._thread_id)
 
+    async def probe_context_window(self) -> int | None:
+        """Learn the real context-window total by scraping ``/context``.
+
+        ``/context`` renders locally and consumes no model turn (verified: it
+        writes no ``usage``-bearing assistant entry to the transcript), so it is
+        safe to fire between turns.  It must only be called when Claude is idle
+        at the prompt — the caller is responsible for that ordering.
+
+        Returns the window total in absolute tokens (e.g. ``1_000_000`` for a
+        1M tier), or ``None`` if Claude is not running or the pane could not be
+        parsed (the caller then falls back to a per-model default).
+        """
+        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            return None
+
+        # ``send_literal`` (not ``send_input``) so the jsonl-bridge ZWSP marker
+        # is not prepended — a leading invisible char would stop Claude from
+        # recognising ``/context`` as a slash command.
+        if not await asyncio.to_thread(self._tmux.send_literal, self._thread_id, "/context"):
+            return None
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+
+        for _ in range(_CONTEXT_PROBE_ATTEMPTS):
+            await asyncio.sleep(_CONTEXT_PROBE_INTERVAL)
+            pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            total = parse_context_total(_normalize_capture(pane))
+            if total is not None:
+                logger.info("probe_context_window: total=%d (thread=%d)", total, self._thread_id)
+                return total
+
+        logger.info("probe_context_window: could not parse /context (thread=%d)", self._thread_id)
+        return None
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -864,6 +1061,11 @@ class TmuxClaudeRunner:
         # the real UI with a spurious warning.
         if _is_ask_question(zone):
             return False
+        # Exclude the AskUserQuestion multi-question Submit/Review screen: it is a
+        # known, auto-submitted prompt (handled in the poll loop), not an unknown
+        # one — flagging it would surface a spurious warning over an answered flow.
+        if _is_ask_submit_screen(zone):
+            return False
         # Exclude Plan approval (ExitPlanMode) and (legacy) AskUserQuestion menus (#153).
         # These are handled via Discord buttons; surfacing them as "unknown" would
         # confuse users with a duplicate warning alongside the real Discord UI.
@@ -895,6 +1097,19 @@ class TmuxClaudeRunner:
             target = f"{self._tmux.session_name}:{window}"
             key = "y" if self._is_yn_prompt(pane_text) else "Enter"
             _run(["tmux", "send-keys", "-t", target, key])
+
+    async def _submit_ask_screen(self) -> None:
+        """Confirm a multi-question AskUserQuestion Submit/Review screen.
+
+        Every question was already answered via the Discord bridge, so this
+        final screen only needs confirming.  Its cursor starts on "Submit
+        answers", so a bare Enter submits the recorded answers and lets Claude
+        proceed (mirrors the auto-accept used for trust/permission prompts).
+        """
+        logger.info(
+            "AskUserQuestion Submit screen detected, submitting (thread=%d)", self._thread_id
+        )
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
     async def _navigate_menu(self, index: int) -> None:
         """Move the menu cursor down *index* times then confirm with Enter.
@@ -960,7 +1175,7 @@ class TmuxClaudeRunner:
         await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape")
 
     async def peek_pending_ask(self) -> AskQuestion | None:
-        """Re-capture the pane and return an open AskUserQuestion menu, if any (#219).
+        """Re-capture the pane and return an open AskUserQuestion/plan menu (#219).
 
         Post-turn safety net: the ``run`` poll loop only bridges a menu while it
         is active, so a turn that finalizes just before the menu renders (e.g.
@@ -968,9 +1183,13 @@ class TmuxClaudeRunner:
         phase) leaves Claude blocked on a TUI menu that was never bridged.
         ``_run_helper`` calls this after the stream ends to recover such a menu
         and bridge it instead of posting the misleading 'no discord-reply' notice.
+
+        Recovers both AskUserQuestion and plan-approval (#251) menus, which share
+        the pane_ask bridge.
         """
         raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
-        return _parse_ask_from_pane(_normalize_capture(raw))
+        pane = _normalize_capture(raw)
+        return _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:

@@ -15,6 +15,8 @@ from c_lord.database.task_repo import TaskRepository
 def _make_bot() -> MagicMock:
     bot = MagicMock()
     bot.loop = MagicMock()
+    # No settings repo → thread auto-archive resolver uses the 3-day default.
+    bot.settings_repo = None
     return bot
 
 
@@ -146,6 +148,8 @@ class TestSchedulerCogMasterLoop:
         mock_starter_msg.create_thread.assert_called_once()
         thread_name = mock_starter_msg.create_thread.call_args[1]["name"]
         assert "my-task" in thread_name
+        # Defaults to 3 days (4320 min) when no setting is configured.
+        assert mock_starter_msg.create_thread.call_args[1]["auto_archive_duration"] == 4320
 
         # Claude ran inside the thread — call_args[0][0] is the RunConfig
         mock_run.assert_called_once()

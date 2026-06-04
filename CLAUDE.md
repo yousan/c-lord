@@ -4,6 +4,10 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 
 **略称: c-lord** (c-lord)
 
+## 理念 (Philosophy) — 迷ったらここに照らす
+
+C-lord が「何のため・誰のどの痛みを解決するか」を定めた理念は **[docs/PHILOSOPHY.md](docs/PHILOSOPHY.md)** にある。機能や仕様の良し悪しで迷ったとき、コードや好みではなく**まずこの理念に照らして判断する**。理念と現実がぶつかったら「理念を見直す / 例外として記録する / 実装上の制約として切り分ける」のいずれかを明示的に選ぶ。下の各規律（行動規範・DoD 等）はこの理念の手段side。
+
 ## Framework vs Instance
 
 - **c-lord** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
@@ -115,7 +119,7 @@ c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) �
 **前提と制約**:
 - `c_lord/cogs/_run_helper.py` は **bot が spawn する子 Claude の env から `DISCORD_BOT_TOKEN` を strip する** (security audit に記載)。bot 経由で立った Claude は環境変数からは token を読めない
 - 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
-- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多いので、デバッグ時は **Discord REST API を curl で叩く方が確実**
+- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多い。**メッセージの読み取りは MCP に頼らず、`.env` の bot token を読んで Discord REST API を `curl` で叩く**のが確実 — MCP が `Missing Access` を返しても**そこで諦めず curl にフォールバックすること**。MCP は c-lord のスタック外（利用者環境にある保証もない）なので読み取りの基盤にしない。読み取り経路を skill + API として c-lord 内に正式実装する作業は #259、設計方針は #234 を参照
 
 **Token 取得**: 各 clone の作業ディレクトリ直下の `.env` を見るのが基本。本体 (bot を起動している c-lord clone) 以外の並行作業 clone (`c-lord-parallel`, `c-lord-parallel-2`, ...) には **`.env` を本体に symlink する規約** にしている:
 
@@ -328,6 +332,19 @@ CONTRIBUTING.md          # Contribution guidelines
 2. Export from `__init__.py` if it's part of the public API
 3. Test edge cases (empty strings, very long strings, Unicode, code blocks)
 
+## 開発の行動規範 (Working Conduct) — Issue/PR の前提
+
+このリポジトリで AI が作業するときの上位ルール。Issue/PR/証跡の各規律はこの上に乗る。
+背景と経緯は `docs/DESIGN_DECISIONS.md` → "Working agreements" を参照。
+
+- **質問にはまず答える。質問を黙って作業に変換しない。** 「なぜここで〜なの？」「これは仕様？バグ？」は**診断の依頼**であって作業指示ではない。spec か bug かを、**実機の挙動の証跡**（スクショ / メッセージ URL / 観測）と**経緯 (Why)** で答えてから作業に入る。「コードが X だから」は挙動の説明であって仕様判定の答えにはならない（コードは意図を語れない）。
+- **自走の範囲＝合意済みの作業。** 「やる」と決まった作業は **PR → 手動QA → マージ → 本番デプロイ → 本番実測**まで自走してよい（途中で逐一停止しなくてよい）。ただし起点の問いはまだ作業ではない → 診断して合意してから着手する。
+- **柔らかい依頼（「ここ直ってる？」）は「答え→行動」の順で分離する。** 例:「直っていません。これは仕様ではなくバグです。→ 直しました: PR #NNN / Evidence: <URL>」。先頭で事実に答えれば、相手が「答えだけ欲しかった」場合も意図のズレに気づける。安価で可逆なら先回り可。**設計変更・破壊操作・不可逆な判断は推察で走らず一行確認**。
+- **迎合しない・鵜呑みにしない。** 事実ベースで判断し、報告と食い違えば指摘する。ユーザーの仮説も自分のデータで確認し、違えばその判断を優先して伝える。
+- **コードより先に実機の挙動を見る。** 内部実装を熟知した開発者目線ではなく、**利用者目線で「使って不便か」**を確認する。これが無いと、その Issue/PR が何のためにあるか（Why）が掴めない。
+- **報告は簡潔・日本語・URL はクリッカブルに。** 完了は `#NNN done / PR #MMM / Evidence: <URL>` を1行で。実機未確認なら「テスト緑・実機未確認」と正直に書く（過大申告しない）。
+- **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
+
 ## Definition of Done (DoD) — single source of truth
 
 **A change is "done" only when every box below is checked. This list is the one
@@ -352,9 +369,9 @@ A PR may be merged only when:
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
-- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed on staging, with log excerpts pasted under a `## Staging Evidence` heading. **An empty Staging Evidence section = not done.**
-- [ ] **No unrelated changes** in the diff; self-review done.
-- [ ] **Closes gating**: use `Closes #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. Never let a partial PR auto-close an Issue.
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.**
+- [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
+- [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
 
 If you cannot check a box, the change is not done — do not merge. State the
 blocker in the PR instead of silently dropping it.
@@ -364,6 +381,10 @@ blocker in the PR instead of silently dropping it.
 Most "completed but actually missing half" failures start at the Issue, not the
 PR. When you (or Opus) author an Issue:
 
+- **修正の前に必ず Issue 化し、ブランチを紐付ける。** 勝手に直し始めない（診断と合意が先）。
+- **Why を必ず書く（背骨）。** 「この修正/実装は何のためか」を利用者目線で明記する。Issue は**クローズ後も「どういう考えでそうなったか」を辿る記録**なので、症状だけでなく意図を残す。Why が無いと次の判断ができない。
+- **証跡（スクショ）を Issue にも残す。** テキストログだけでは表出しない問題（レイアウト・UI・ランプ状態など）があるため、**スクリーンショット**（理想は tmux の動作 × Discord の動作を合成した画像）で「リアルな問題」を示す。ユーザー提供のスクショは可能な限り Issue に入れる。網羅性を優先し、長いログ/コードは `<details><summary>` で畳んで可読性を保つ。
+- **本文は常に「現在の真実」に保つ。** 相談で方針が変わったら 概要/原因/AC を実態に書き換える。ただし**重要な書き換えは日付つきコメントで「何を・なぜ変えたか」を一次記録として残す**（後続コメントがどの版の本文を前提にしていたか辿れるように）。積み残しは新規 Issue 乱立ではなく**再オープン＋コメント**で残す。
 - **One Issue = one concern.** Do not bundle a bug fix with a design/enhancement task, or two unrelated behaviors, in one Issue. Bundling lets an agent satisfy the easy/testable half, write `Closes`, and auto-close the rest into oblivion. Split into separate Issues.
 - **Acceptance Criteria must be binary and unambiguous** — each AC is a checkbox that is objectively true or false (a command to run, an observable output, a state to assert). No "should probably", no "consider", no open options ("A案 or B案") left in the AC. Decide before filing; move discussion out of the AC list.
 - **Keep scope narrow.** If the Issue's title needs an "and", it is probably two Issues. A wide守備範囲 is where definitions go soft and items leak.
@@ -395,9 +416,7 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 
 **ルール**: バグ修正 / 機能追加の PR は必ず staging 環境で「**修正前 = 再現できる**」「**修正後 = 再現しない (グリーン)**」を webhook 経由で確認する。これを通らないものはマージしない。
 
-**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。詳細は memory `project_staging_env.md` 参照。本番 (`/home/yousan/c-lord`) は kill しない。
-
-⚠️ **staging bot は単一の共有リソース** (`c-lord-parallel-3`, bot user `C-lord-3`)。複数セッション/人間が同時に検証すると、二重起動 (同一トークンが Discord イベントを二重処理) やブランチ切替による他セッションの中断が起きる。staging を借りる前に必ず [Staging bot の占有・解放プロトコル](#staging-bot-の占有解放プロトコル) に従って占有を宣言し、検証後は原状復帰すること。
+**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。詳細は memory `project_staging_env.md` 参照。本番 (`/home/yousan/c-lord`) は kill しない。staging bot は共有リソースで、再起動・ブランチ切替の調整漏れは他セッションの検証を中断させるため、下記レシピ末尾の **原状復帰** を必ず実行する。
 
 **手順** (バグ修正の例):
 ```bash
@@ -410,15 +429,23 @@ curl -X POST -H "Content-Type: application/json" \
 
 # 2. 修正実装 + ユニットテスト
 
-# 3. staging bot を新コードで再起動
+# 3. staging bot を新コードで再起動 (単一インスタンスで起動)
+#    ⚠️ パターン kill は実行中の自分のシェル (eval 中の `c_lord.main` 文字列) にも当たって自滅することがある。
+#       残存 count が 0 にならないときは PID 直指定 (kill <PID>) が安全。
 pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
+echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0 を確認
 nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
+sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1 を確認 (二重起動防止)
 
 # 4. GREEN 確認 — 同じ webhook 入力で問題が再現しないこと
 curl -X POST ... (上と同じ)
 # → ログ + Discord 上の応答が期待通りであることを確認
 
 # 5. PR 本文の "Test plan" にこの再現→修正のログ抜粋を貼る
+
+# 6. 原状復帰 — 検証で切り替えていたなら idle ブランチに戻して上記 (#3) を再実行
+#    idle ブランチは memory project_staging_env.md の "Default branch when idle" 参照
+git checkout fix/wire-max-concurrent-sessions   # 例
 ```
 
 **機能追加の場合**: RED の代わりに「実装前は存在しない挙動」「実装後は期待挙動」を webhook + ログで観測する。例: 構造化ログ追加 PR では `grep "thread=<id>" /tmp/clord-bot-staging.log` で **before = ヒットしない / after = enter/exit ペアが出る** を比較。
@@ -428,74 +455,6 @@ curl -X POST ... (上と同じ)
 - 純粋なリファクタで挙動が変わらないことが自明 (それでも `pytest` は必須)
 
 それ以外で staging 検証を省略するときは PR 本文に省略理由を書く。
-
-### Staging bot の占有・解放プロトコル
-
-staging 検証は **単一の bot** (`/home/yousan/c-lord-parallel-3`, bot user `C-lord-3`) を複数の Claude セッション/人間で共有している。占有の取り決めがないと、(1) 同一トークンの **二重起動** (Discord イベント/スラッシュコマンドを二重処理する有害な状態)、(2) 他セッションが検証中にブランチを切り替えられて **検証が中断** される、といった衝突が起きる (実害: 2026-05-27 の二重起動 + 検証中断)。
-
-仕組みは既にある (AI Lounge `POST /api/lounge` が共有 Discord coordination channel へ転送される)。足りないのは「今どのセッションが staging を握っているか」を宣言・解放する運用ルール。staging を borrow するときは下記 3 ステップを必ず守ること。
-
-#### Step 1 — 占有を宣言する (borrow 開始時)
-
-まず AI Lounge を **読んで** 他セッションが staging を使っていないか確認し、空いていれば占有を宣言する。Lounge は共有 Discord channel に転送されるので、他セッション・人間の双方に見える。
-
-```bash
-# 1a. 直近の Lounge を読む (他セッションが staging を借りていないか確認)
-curl -s "${CLORD_API_URL:-http://127.0.0.1:8080}/api/lounge?limit=20" \
-  | python3 -c "import sys,json;[print(f\"[{m['posted_at']}] {m['label']}: {m['message']}\") for m in json.load(sys.stdin)['messages']]"
-
-# 1b. 空いていれば占有を宣言する (label は自分が分かる名前に)
-curl -s -X POST "${CLORD_API_URL:-http://127.0.0.1:8080}/api/lounge" \
-  -H "Content-Type: application/json" \
-  -d '{"label":"<自分のニックネーム>","message":"staging (c-lord-parallel-3) を borrow します: PR #NNN の検証。完了したら解放通知します。"}'
-```
-
-`CLORD_API_URL` は bot が spawn したセッションには注入済み。手動起動した Claude では prod の `http://127.0.0.1:8080` (staging は `8089`) を直接指定する。誰かが既に borrow 中なら、完了通知を待つか Lounge で調整してから着手する。
-
-#### Step 2 — 単一インスタンスで起動する (kill → 残存確認 → 起動)
-
-起動前に **既存の `c-lord-parallel-3` インスタンスを必ず停止** し、二重起動を防ぐ。素の `pgrep -f c_lord.main` は prod・他 clone・**自分の実行シェルの eval 文字列** にもマッチして自滅・巻き添えの罠がある。staging だけを `c-lord-parallel-3` パスで絞ること。
-
-```bash
-cd /home/yousan/c-lord-parallel-3
-
-# 2a. 既存 staging インスタンスを停止 (parallel-3 パスで限定)
-pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
-
-# 2b. 残存ゼロを確認してから起動する (count が 0 でなければ PID を直指定で kill)
-#     ※ PID 直指定 (kill <PID>) が最も安全。パターン kill が自分のシェルに当たる事故を避けられる
-echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0 であること
-
-# 2c. 単一インスタンスで起動
-nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
-
-# 2d. 起動後、インスタンスが「ちょうど 1 つ」であることを再確認 (二重起動防止)
-sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1 であること
-```
-
-**本番 (`/home/yousan/c-lord`) は絶対に kill しない。** prod の再起動は別パス (`/home/yousan/c-lord/.venv`) で絞る ([Standard Development Flow](#standard-development-flow-mandatory) の Prod redeploy 参照)。
-
-#### Step 3 — 原状復帰して解放を通知する (borrow 終了時)
-
-検証が終わったら staging を **idle ブランチに戻して再起動** し (他セッションが次に借りたとき既知の状態から始められるように)、Lounge へ解放を通知する。idle ブランチは memory `project_staging_env.md` の "Default branch when idle" を参照 (現状 `fix/wire-max-concurrent-sessions`)。
-
-```bash
-cd /home/yousan/c-lord-parallel-3
-
-# 3a. idle ブランチへ戻す (検証で切り替えていた場合)
-git checkout fix/wire-max-concurrent-sessions   # ← project_staging_env.md の idle ブランチ
-
-# 3b. 単一インスタンスで再起動 (Step 2 と同じ kill → 確認 → 起動)
-pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
-echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0
-nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
-sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1
-
-# 3c. Lounge へ解放を通知
-curl -s -X POST "${CLORD_API_URL:-http://127.0.0.1:8080}/api/lounge" \
-  -H "Content-Type: application/json" \
-  -d '{"label":"<自分のニックネーム>","message":"staging を解放しました。idle ブランチに復帰済み。次の人どうぞ。"}'
-```
 
 ## AI Agent Configuration
 

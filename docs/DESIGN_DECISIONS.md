@@ -259,3 +259,103 @@ Three compounding root causes, none of them "the bot is buggy":
 caution, and the operational rules above (kill by explicit PID, count with
 `ps`, launch with `setsid -f`) are the standard procedure. Net: one bot per
 env, no token churn, no cross-clone collateral.
+
+## 14. Working agreements (how Issues / PRs / evidence are run)
+
+**Decision:** The maintainer's working conduct is codified in three layers, kept
+separate so commands stay terse and rationale stays traceable:
+
+1. **CLAUDE.md = commands only** — the "開発の行動規範 (Working Conduct)" section
+   plus the Issue/PR/DoD rules. Imperative, short.
+2. **`.github` templates = enforcement by form** — the Issue and PR templates make
+   each rule a field the author must fill (Why, binary ACs, scope-out, Staging
+   Evidence with screenshots, `<details>` for long logs).
+3. **This file = the why** — rationale and the conversation that produced each rule.
+
+The agreed rules:
+
+- **Answer the question first; don't silently turn a question into work.** An
+  opening question ("why is the menu not showing?", "is this spec or a bug?") is a
+  request for a *diagnosis*, not a work order. Diagnose (spec vs bug) from real
+  behaviour + the Why, then act once it's agreed.
+- **Autonomy applies to agreed work only.** Once "we're fixing X" is settled, the
+  agent may self-run through PR → manual QA → merge → prod redeploy → prod
+  measurement. The opening question is *not yet* agreed work.
+- **Soft requests get "answer → then action", in that order.** Heavy/irreversible
+  calls (design changes, destructive ops) get a one-line confirm instead of a guess.
+- **No pandering, no taking the user's hypothesis as fact** — verify against real
+  data and flag mismatches.
+- **Why is the spine of an Issue.** It's read after close to trace intent.
+- **Evidence is real, not asserted.** Green tests / "I implemented it" is a
+  necessary-but-insufficient condition; "done" requires RED→GREEN reproduced **on
+  staging**. Discord-side proof is normally a **user-provided screenshot** (the
+  server-side agent has no GUI), supplemented by tmux captures + REST-fetched text.
+
+**Why (what motivated this):**
+
+A week-long review of the maintainer's own Discord messages (~1900, excluding
+AI-authored Issue/commit text) surfaced a gap between *what was said* and *what
+got recorded*. The records (Issues/PRs/commits) tended to close on "tests green /
+done"; the maintainer repeatedly pushed the opposite: mocks-green-but-broke-on-real-hardware
+had happened, so "done" must mean reproduced-and-fixed on the real bot, with a
+screenshot of the actual Discord behaviour. A second, subtler gap: when the
+maintainer asked "why is X happening?", the agent would read code and jump
+straight to a fix/PR, skipping the diagnosis the maintainer actually wanted
+("is this the intended spec, or a bug?"). A third: some transcript "user"
+messages were polished instruction text the maintainer had an AI draft and
+pasted — not the maintainer's own intent — so they over-weighted a "stop after
+every PR / merge is the user's gate" reading that the maintainer later corrected
+(self-run through merge/deploy is fine for now).
+
+**Fix:** Codify the conduct in CLAUDE.md, enforce the artifact fields via the
+`.github` templates, and record the rationale here. See CLAUDE.md → "開発の行動規範
+(Working Conduct)" and "Definition of Done (DoD)".
+
+## 15. 経路B移行で撤去するのは reply 経路だけ — API サーバ本体と control plane は残す
+
+**決定:** 「経路A→経路B」への移行（#71）で取り除くのは、Claude が Discord に
+最終回答を出すための **reply 経路だけ** です。具体的には:
+
+- `POST /api/reply` というエンドポイント
+- 各セッションに入れている `discord-reply` skill（`.claude/skills/discord-reply/SKILL.md` の注入）
+
+これだけを撤去します。**API サーバ本体（`c_lord/ext/api_server.py`）と、それ以外の
+control plane エンドポイントは残します。** 残すものの例:
+
+| エンドポイント | 役割 |
+|---|---|
+| `/api/lounge` (GET/POST) | AI Lounge。CLAUDE.md の「Staging bot の占有・解放プロトコル」が依存している |
+| `/api/tasks` (POST/GET/DELETE/PATCH) | SchedulerCog へのタスク登録（設計判断 #8 / #9） |
+| `/api/spawn` | 外部トリガからスレッドを作って Claude を起動する |
+| `/api/mark-resume` | bot 再起動後にセッションを復帰させる |
+| `/api/notify` `/api/schedule` `/api/scheduled` | 即時通知・予約通知 |
+
+**この決定は GO 済み（#71、2026-06-04 に経路A→Bへ進めると決定）です。** ただし
+「GO」が指すのは reply 経路の置き換えだけで、API サーバ撤去は含みません。
+
+**なぜ切り分けるか:**
+
+- 「経路を A→B にすれば API サーバはいらなくなる」という見立ては、**reply の部分に
+  限れば正しい**。でもそこから「API サーバ全体がいらない」へは広げられません。
+- reply 経路（A も B も）が運ぶのは **Claude→Discord の最終回答** だけです。
+  一方 API サーバは、それとは別に **Claude→c-lord の操作面（control plane）**
+  をまるごと持っています（設計判断 #7 / #8 / #9）。スケジュール登録、外部トリガ
+  からのスレッド生成、再起動後の復帰、通知、AI Lounge など、reply とは独立した
+  機能です。
+- 経路B（JSONL transcript の透明ミラー）が置き換えるのは **回答の出し方** であって、
+  操作面の代わりにはなりません。だから reply 経路を消しても control plane は残す
+  必要があります。
+- もし control plane を撤去すると巻き添えになるものが出ます。たとえば `/api/lounge`
+  を消すと、CLAUDE.md に書いてある staging bot の占有・解放プロトコル（複数
+  セッションの協調）が壊れます。
+
+**スコープの固定:**
+
+- #71 の実装で「既存の skill push を撤去する」ステップは、**撤去対象を
+  `/api/reply` 経路（エンドポイント＋skill 注入）だけに限定**します。他の
+  エンドポイントには触りません。
+- 将来どこかの control plane エンドポイントを撤去・移設したくなった場合は、
+  **エンドポイントごとに別の Issue を立てて判断**します。本決定の既定は「残す」です。
+
+参照: #71（経路B 本体）/ #238（このスコープ明確化）/ 設計判断 #7（REST API を
+control plane にする）・#8 / #9（SQLite スケジューラ）。

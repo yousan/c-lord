@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from c_lord.claude.tmux_runner import (
     TmuxClaudeRunner,
     _clean_tui_lines,
+    _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
+    _parse_plan_from_pane,
 )
 from c_lord.claude.types import MessageType
 
@@ -69,6 +71,43 @@ def _make_pane(
             lines.append("─" * 40)
             lines.append("-- INSERT -- ⏵⏵ bypass permissions on")
     return "\n".join(lines)
+
+
+class TestProbeContextWindow:
+    """probe_context_window scrapes /context to learn the real window total."""
+
+    _PANE = (
+        "❯ /context\n"
+        "  ⎿  Context Usage\n"
+        "     claude-opus-4-7[1m]\n"
+        "     11.7k/1m tokens (1%)\n"
+        "──────────────────\n"
+        "❯\n"
+    )
+
+    def test_parses_total_from_context_pane(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_literal.return_value = True
+        tmux_manager.send_keys.return_value = True
+        tmux_manager.capture_pane.return_value = self._PANE
+
+        total = asyncio.run(runner.probe_context_window())
+
+        assert total == 1_000_000
+        # /context must be typed without submitting it as a user turn first.
+        tmux_manager.send_literal.assert_called_once_with(12345, "/context")
+        tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
+
+    def test_returns_none_when_claude_not_running(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = False
+        assert asyncio.run(runner.probe_context_window()) is None
+        tmux_manager.send_literal.assert_not_called()
+
+    def test_returns_none_when_pane_unparseable(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_literal.return_value = True
+        tmux_manager.capture_pane.return_value = "no token info here"
+        assert asyncio.run(runner.probe_context_window()) is None
 
 
 # -- Tests for _extract_response --------------------------------------------
@@ -1857,10 +1896,16 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
     elsewhere (Discord buttons via EventProcessor / TranscriptMirrorCog).
     """
 
-    def test_plan_approval_not_unknown(self) -> None:
-        """ExitPlanMode 'Would you like to proceed?' menu MUST NOT be flagged."""
+    def test_plan_approval_is_parsed_and_bridged(self) -> None:
+        """#251: ExitPlanMode menu is now BRIDGED (parsed into an AskQuestion),
+        not merely suppressed from the unknown alert.
+
+        The run loop routes a parsed plan menu through the same ``pane_ask``
+        bridge as AskUserQuestion (and ``continue``s before reaching the
+        unknown-interactive check), so the menu reaches Discord as buttons.
+        """
         pane = _load_fixture("plan_approval_menu.txt")
-        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+        assert _parse_plan_from_pane(pane) is not None
 
     def test_ask_user_question_not_unknown(self) -> None:
         """AskUserQuestion numbered menu MUST NOT be flagged as unknown."""
@@ -1879,6 +1924,167 @@ class TestKnownInteractiveMenusNotFlaggedAsUnknown:
             "-- INSERT --"
         )
         assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+
+class TestAskUserQuestionSubmitScreen:
+    """Multi-question AskUserQuestion ends on a 'Review your answers' /
+    'Submit answers' / 'Cancel' confirmation screen.  It carries no
+    'Chat about this' marker, so _parse_ask_from_pane misses it and it used to
+    fall through to _has_unknown_interactive — surfacing a spurious 'Unknown TUI
+    prompt' warning instead of completing the answered questions.  c-lord must
+    recognise it and auto-submit (the answers are already locked via the bridge).
+    """
+
+    def test_submit_screen_detected(self) -> None:
+        pane = _normalize_capture(_load_fixture("ask_user_question_submit_screen.txt"))
+        assert _is_ask_submit_screen(pane) is True
+
+    def test_submit_screen_not_flagged_as_unknown(self) -> None:
+        """RED: the Submit/Review screen must NOT trip the unknown-prompt alert."""
+        pane = _normalize_capture(_load_fixture("ask_user_question_submit_screen.txt"))
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_single_question_menu_is_not_submit_screen(self) -> None:
+        """A normal question menu must not be mistaken for the Submit screen."""
+        pane = _normalize_capture(_load_fixture("ask_user_question_menu.txt"))
+        assert _is_ask_submit_screen(pane) is False
+
+    def test_unknown_menu_is_not_submit_screen(self) -> None:
+        """A truly unknown numbered menu must not be mistaken for Submit."""
+        pane = (
+            "Would you like to install the LSP plugin?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "────────────────────────────────────────\n"
+            "-- INSERT --"
+        )
+        assert _is_ask_submit_screen(pane) is False
+
+    @pytest.mark.asyncio
+    async def test_submit_ask_screen_sends_enter(self, runner, tmux_manager) -> None:
+        """Confirming the review screen presses Enter on 'Submit answers'."""
+        await runner._submit_ask_screen()
+        tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
+
+    @pytest.mark.asyncio
+    async def test_run_loop_auto_submits_review_screen(self, runner, tmux_manager) -> None:
+        """End-to-end: when the Submit/Review screen renders, the poll loop
+        auto-presses Enter once (no 'unknown prompt' event is emitted)."""
+        submit_pane = _load_fixture("ask_user_question_submit_screen.txt")
+        done_pane = _make_pane(["● Done."], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Show the review screen long enough to clear the dwell, then a
+            # completed pane so run() can finalise and the loop exits.
+            return submit_pane if call_idx <= 4 else done_pane
+
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.capture_pane.side_effect = capture_fn
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._ASK_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+            async for event in runner.run("follow up"):
+                events.append(event)
+
+        enter_calls = [
+            c for c in tmux_manager.send_keys.call_args_list if c == call(12345, "Enter")
+        ]
+        assert len(enter_calls) >= 1, "review screen should be auto-submitted with Enter"
+        assert not any(e.unknown_tui_prompt for e in events), (
+            "Submit screen must not surface an unknown-prompt warning"
+        )
+
+
+class TestParsePlanFromPane:
+    """#251: Plan approval (ExitPlanMode) menus are parsed from the pane and
+    bridged to Discord buttons via the same path as AskUserQuestion (#166).
+
+    The v2.1.156 fixture is a real captured pane (not hand-written): the menu
+    no longer offers ``No, keep planning`` — it is ``No, refine with Ultraplan
+    …`` / ``Yes, and use auto mode`` — so the old ``_KNOWN_INTERACTIVE_MARKERS``
+    assumptions are stale.
+    """
+
+    def test_parse_new_format_v2156(self) -> None:
+        """Labels are parsed in display order from the real v2.1.156 pane."""
+        pane = _load_fixture("plan_approval_menu_v2156.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == [
+            "Yes, and use auto mode",
+            "Yes, manually approve edits",
+            "No, refine with Ultraplan on Claude Code on the web",
+            "Tell Claude what to change",
+        ]
+        # Plan free-text feedback uses a different keystroke flow than
+        # AskUserQuestion's "Type something." row, so the ✏️ Other affordance
+        # must be suppressed for plan menus.
+        assert q.allow_other is False
+
+    def test_parse_old_format_backward_compatible(self) -> None:
+        """The legacy ``No, keep planning`` format still parses (AC6)."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == [
+            "Yes",
+            "Yes, and auto-accept edits",
+            "No, keep planning",
+        ]
+
+    def test_plan_body_is_folded_into_question(self) -> None:
+        """The plan markdown is shown in the embed so reviewers don't approve
+        blind (#251): the parsed question carries the plan body, with the
+        box-drawing rule lines stripped.
+        """
+        pane = _load_fixture("plan_approval_menu_v2156.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert "Plan: Add greet(name) to greet.py" in q.question
+        assert "def greet(name):" in q.question
+        # The proceed line still terminates the question.
+        assert q.question.rstrip().endswith("Would you like to proceed?")
+        # Box-drawing rule lines must not leak into the embed body.
+        assert "╌" not in q.question
+
+    def test_askuserquestion_is_not_parsed_as_plan(self) -> None:
+        """An AskUserQuestion menu must NOT be misread as a plan menu."""
+        pane = _load_fixture("ask_user_question_menu.txt")
+        assert _parse_plan_from_pane(pane) is None
+
+    def test_non_menu_pane_is_not_parsed_as_plan(self) -> None:
+        """A pane with no plan menu returns None."""
+        pane = _load_fixture("bug_156_yn_in_conversation.txt")
+        assert _parse_plan_from_pane(pane) is None
+
+    def test_plan_menu_falls_back_to_unknown_when_unparsed(self) -> None:
+        """#251 AC: a plan-ish menu whose labels we fail to parse must still
+        surface (no silent stall).  With the plan markers removed from
+        ``_KNOWN_INTERACTIVE_MARKERS``, an unparsed ``Would you like to
+        proceed?`` menu now trips the unknown-interactive fallback.
+        """
+        pane = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────\n"
+            "-- INSERT --"
+        )
+        # This minimal menu IS parseable as a plan menu (2 Yes/No options), so
+        # it is bridged rather than flagged.  The point of the assertion is that
+        # the plan markers no longer unconditionally suppress the fallback.
+        assert _parse_plan_from_pane(pane) is not None
 
 
 class TestGhostTextInputNotFlagged:

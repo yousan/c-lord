@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import os
 import signal
 import sys
 from pathlib import Path
+from typing import IO
 
 from dotenv import load_dotenv
 
@@ -19,9 +21,64 @@ from .utils.logger import setup_logging
 logger = logging.getLogger(__name__)
 
 
-def load_config() -> dict[str, str]:
+def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
+    """Acquire an exclusive non-blocking flock on ``data_dir/.bot.lock``.
+
+    Issue #212: prevents two bot processes with the same data dir from
+    double-connecting to the Discord gateway and double-processing events
+    (the staging incident on 2026-05-27).
+
+    The returned file handle must be retained for the lifetime of the process;
+    closing it releases the lock. flock auto-releases on process exit, so a
+    crash does not leave a stale lock.
+
+    Returns ``None`` when ``CLORD_ALLOW_MULTI_INSTANCE=1`` is set (advanced
+    users who understand the risk). Calls ``sys.exit(1)`` if another instance
+    already holds the lock.
+    """
+    if os.getenv("CLORD_ALLOW_MULTI_INSTANCE") == "1":
+        logger.warning("CLORD_ALLOW_MULTI_INSTANCE=1 set; skipping single-instance guard")
+        return None
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / ".bot.lock"
+    # Intentionally not a context manager: the handle must outlive this function
+    # so flock stays held for the process lifetime (released on process exit).
+    lock_fp = open(lock_path, "wb")  # noqa: SIM115
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as e:
+        lock_fp.close()
+        logger.error(
+            "Another bot instance is already running with the same data dir "
+            "(%s). Refusing to start to avoid Discord double-connect. "
+            "Set CLORD_ALLOW_MULTI_INSTANCE=1 to bypass. (flock error: %s)",
+            data_dir,
+            e,
+        )
+        sys.exit(1)
+    return lock_fp
+
+
+def resolve_data_dir(env_path: Path | None) -> Path:
+    """Resolve the directory that holds sessions.db / notifications.db.
+
+    Issue #202: when launched via ``c-lord start --env <path>``, data files must
+    live next to the given .env — not relative to the CWD — otherwise starting
+    from a different directory silently creates an empty sessions.db and orphans
+    every existing session. Standalone ``python -m c_lord.main`` (env_path=None)
+    keeps the legacy CWD-relative ``data/``.
+    """
+    base = env_path.parent if env_path is not None else Path(".")
+    return base / "data"
+
+
+def load_config(env_path: Path | None = None) -> dict[str, str]:
     """Load and validate configuration from environment."""
-    load_dotenv()
+    if env_path is not None:
+        load_dotenv(env_path)
+    else:
+        load_dotenv()
 
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token:
@@ -47,15 +104,22 @@ def load_config() -> dict[str, str]:
     }
 
 
-async def main() -> None:
+async def main(env_path: Path | None = None) -> None:
     """Start the bot."""
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     setup_logging(log_level)
-    config = load_config()
+    config = load_config(env_path)
 
-    data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
+    data_dir = resolve_data_dir(env_path)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Issue #212: refuse to start if another bot with the same data dir is
+    # already running. The handle must be retained for the process lifetime —
+    # flock auto-releases on close/exit. Assigning to a local that lives until
+    # main() returns is sufficient; we don't need to reference it again.
+    _instance_lock = acquire_single_instance_lock(data_dir)  # noqa: F841
+
     db_path = str(data_dir / "sessions.db")
 
     runner = ClaudeConfig(
@@ -115,6 +179,7 @@ async def main() -> None:
             runner,
             api_server=api_server,
             session_db_path=db_path,
+            task_db_path=str(data_dir / "tasks.db"),
             allowed_user_ids=allowed_user_ids,
             allowed_role_name=allowed_role_name,
             claude_channel_id=int(config["channel_id"]),
