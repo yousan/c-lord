@@ -666,6 +666,69 @@ class TestInterruptOnNewMessage:
         assert kwargs.get("session_id") == "abc-123"
 
     @pytest.mark.asyncio
+    async def test_parked_run_does_not_wedge_thread(self) -> None:
+        """A turn parked forever must not permanently block later messages (#315).
+
+        Production repro of the deadlock: ``_handle_thread_reply`` holds the
+        per-thread lock across the *entire* ``_run_claude``. When that run parks
+        — an AskUserQuestion / Plan-approval menu bridged to Discord buttons and
+        never clicked (``AskView`` is ``timeout=None``, up to 24h) — the lock is
+        held forever, so every later message in the same thread blocks on
+        ``async with lock``: Discord input never reaches tmux, with no error and
+        no log. The new message must instead interrupt the parked run and run.
+        """
+        cog = _make_cog()
+        thread_id = 42
+        parked = asyncio.Event()  # the parked run's only escape (set by interrupt)
+        run_calls: list[str] = []
+
+        async def run_claude_stub(user_message, thread, prompt, **kwargs) -> None:
+            run_calls.append(prompt)
+            if len(run_calls) == 1:
+                # First turn parks forever, exactly like a bridged menu awaiting a
+                # click. Register a runner/task as the real _run_claude does so a
+                # second message can find and interrupt it.
+                runner = MagicMock()
+                runner.interrupt = AsyncMock(side_effect=lambda *a, **k: parked.set())
+                cog._active_runners[thread_id] = runner
+                cog._active_tasks[thread_id] = asyncio.current_task()
+                try:
+                    await parked.wait()
+                finally:
+                    cog._active_runners.pop(thread_id, None)
+                    cog._active_tasks.pop(thread_id, None)
+
+        cog._run_claude = run_claude_stub
+
+        # msg1 acquires the per-thread lock and parks.
+        task1 = asyncio.ensure_future(
+            cog._handle_thread_reply(self._make_thread_message(thread_id))
+        )
+        await asyncio.sleep(0.05)
+        assert run_calls == ["new instruction"], "first turn should start and park"
+        existing_runner = cog._active_runners[thread_id]
+
+        # msg2 must still be serviced, not blocked forever on the held lock.
+        try:
+            await asyncio.wait_for(
+                cog._handle_thread_reply(self._make_thread_message(thread_id)),
+                timeout=1.0,
+            )
+        except TimeoutError:
+            parked.set()
+            task1.cancel()
+            pytest.fail(
+                "DEADLOCK: a parked run holding the per-thread lock blocked a new "
+                "message — Discord input would never reach tmux (#315 repro)."
+            )
+
+        # The parked run was interrupted and the new message's own run started.
+        existing_runner.interrupt.assert_called_once()
+        await asyncio.sleep(0.05)
+        assert len(run_calls) == 2
+        await asyncio.wait_for(task1, timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_active_tasks_dict_initialized(self) -> None:
         """ClaudeChatCog must initialize _active_tasks as an empty dict."""
         cog = _make_cog()
