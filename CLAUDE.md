@@ -338,6 +338,8 @@ CONTRIBUTING.md          # Contribution guidelines
 背景と経緯は `docs/DESIGN_DECISIONS.md` → "Working agreements" を参照。
 
 - **質問にはまず答える。質問を黙って作業に変換しない。** 「なぜここで〜なの？」「これは仕様？バグ？」は**診断の依頼**であって作業指示ではない。spec か bug かを、**実機の挙動の証跡**（スクショ / メッセージ URL / 観測）と**経緯 (Why)** で答えてから作業に入る。「コードが X だから」は挙動の説明であって仕様判定の答えにはならない（コードは意図を語れない）。
+  - **起点の問い・診断質問は、内容の大小に関わらず必ず〈回答＋合意〉を先に通す。例外を作らない。** 「軽微だから」「明らかにバグだから」という理由での勝手な着手も禁止する（その曖昧さこそが再発の元 — "軽微" "明らか" を判定する基準は無く、抜け道になる）。合意が取れたら、あとは下の「自走の範囲」どおり自走してよい。
+  - **止めて答える分、回答自体は手短に速く返す**（長考で待たせない — 回答までの時間も体験に影響する）。
 - **自走の範囲＝合意済みの作業。** 「やる」と決まった作業は **PR → 手動QA → マージ → 本番デプロイ → 本番実測**まで自走してよい（途中で逐一停止しなくてよい）。ただし起点の問いはまだ作業ではない → 診断して合意してから着手する。
 - **柔らかい依頼（「ここ直ってる？」）は「答え→行動」の順で分離する。** 例:「直っていません。これは仕様ではなくバグです。→ 直しました: PR #NNN / Evidence: <URL>」。先頭で事実に答えれば、相手が「答えだけ欲しかった」場合も意図のズレに気づける。安価で可逆なら先回り可。**設計変更・破壊操作・不可逆な判断は推察で走らず一行確認**。
 - **迎合しない・鵜呑みにしない。** 事実ベースで判断し、報告と食い違えば指摘する。ユーザーの仮説も自分のデータで確認し、違えばその判断を優先して伝える。
@@ -347,6 +349,7 @@ CONTRIBUTING.md          # Contribution guidelines
 - **完了報告は「これがこうなる」形で書く（利用者目線を先頭・実装/CI を従）。** Discord への完了報告は、まず**「どこで何を操作すると、Discord 上の見え方がどう変わるか」**を先頭に書く。実装の詳細（関数名・`pytest 37/37`・`dod-gate green`・行番号）はその**後ろ（従）**に置く。コードを読まない利用者でも「自分にとって何が変わったか」が一読で分かるようにするため。利用者の見え方が変わらない変更（内部リファクタ等）は `no-user-visible-change` と明記する。
   - 良い例: 「スレッドに長文を送ると、最後まで複数メッセージで届くようになりました（前は途中で切れていました）。実装: チャンク分割を `_split_reply` に追加 / PR #MMM / pytest green」
   - 悪い例: 「`_split_reply` を追加し pytest 37/37 green、dod-gate green」（利用者から見て何が変わったか分からない）
+- **証跡はスクショを主にする（利用者から見た挙動/UI を変えるとき）。** 「直った / こう変わった」を示す証跡は、テキストログではなく**スクショ（Discord 実画面 and/or tmux ペイン）を主証跡**にする。テキストでは表出しない問題（レイアウト・ボタンの出/不出・ランプ状態・別バブル/同一バブル）があるため。利用者に見えない変更（純リファクタ等）はスクショ不要（`no-user-visible-change`）。**暫定（#243 の Discord 実画面キャプチャが入るまで）は、人間提供の Discord スクショ + tmux ペイン PNG（#286）で代替する。** 注釈／before-after 並置の補助ツールは #310。
 - **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
 
 ## Definition of Done (DoD) — single source of truth
@@ -373,7 +376,7 @@ A PR may be merged only when:
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
-- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.**
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.** 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。Discord 実画面キャプチャ（#243）が入るまでは人間提供スクショ + tmux PNG（#286）で代替（証跡規約 #291）。
 - [ ] **動きを変えたら「あるべき動き」も更新する**: 利用者から見た動きを変える PR は、対応する「あるべき動き」を説明したドキュメント（`docs/specs/` などの仕様・`README.md`・`docs/` の該当箇所）も同じ PR で更新する。動きを変えないなら PR 本文に `no-user-visible-change` と明記する（更新不要であることをはっきり宣言する）。**狙い**: ドキュメントが実際の動きとズレる（drift する）のを防ぎ、「あるべき動き」を信用できる状態に保つ。
 - [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
 - [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
