@@ -81,6 +81,7 @@ typeCheckingMode = "basic"
 ignore = [
     "c_lord/discord_ui/table_renderer.py",
     "c_lord/discord_ui/pane_renderer.py",
+    "c_lord/discord_ui/conversation_renderer.py",
     "c_lord/discord_ui/fonts.py",
     "c_lord/_version.py",
 ]
