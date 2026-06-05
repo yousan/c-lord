@@ -88,6 +88,16 @@ class ConvMessage:
     attachments: tuple[ConvAttachment, ...] = field(default_factory=tuple)
 
 
+def _opt_str(v: object) -> str | None:
+    """Coerce an optional spec value to ``str`` (``None`` stays ``None``).
+
+    Keeps a numeric authoring slip (e.g. ``"timestamp": 1200``) from reaching the
+    renderer as an int, which Pillow would crash on. Mirrors the ``str(...)``
+    coercion applied to the required scalar fields.
+    """
+    return str(v) if v is not None else None
+
+
 def _to_int_color(c: object) -> int | None:
     """Accept an int or ``"#RRGGBB"`` / ``"RRGGBB"`` string → 0xRRGGBB int (0 → None)."""
     if isinstance(c, bool):
@@ -128,8 +138,8 @@ def _embed_from_spec(e: dict) -> ConvEmbed:
         for f in (e.get("fields") or [])
     )
     return ConvEmbed(
-        title=e.get("title"),
-        description=e.get("description"),
+        title=_opt_str(e.get("title")),
+        description=_opt_str(e.get("description")),
         color=_to_int_color(e.get("color")),
         fields=fields,
     )
@@ -153,7 +163,7 @@ def conversation_from_spec(data: object) -> list[ConvMessage]:
                 author=str(m.get("author", "unknown")),
                 content=str(m.get("content", "")),
                 is_bot=bool(m.get("is_bot", False)),
-                timestamp=m.get("timestamp"),
+                timestamp=_opt_str(m.get("timestamp")),
                 color=_to_int_color(m.get("color")),
                 embeds=tuple(_embed_from_spec(e) for e in (m.get("embeds") or [])),
                 reactions=tuple(_reaction_from_spec(r) for r in (m.get("reactions") or [])),

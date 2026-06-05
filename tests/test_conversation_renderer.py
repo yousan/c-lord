@@ -126,6 +126,22 @@ class TestSpecLoader:
         assert conversation_from_spec([]) == []
         assert conversation_from_spec({"messages": []}) == []
 
+    def test_numeric_optional_fields_are_str_coerced(self) -> None:
+        # A bare number where a string is expected (a plausible JSON slip) must
+        # be coerced, not passed through raw (which would crash the renderer).
+        m = conversation_from_spec(
+            [{"author": "a", "timestamp": 1200, "embeds": [{"title": 1, "description": 2}]}]
+        )[0]
+        assert m.timestamp == "1200"
+        assert m.embeds[0].title == "1"
+        assert m.embeds[0].description == "2"
+
+    def test_omitted_optional_fields_stay_none(self) -> None:
+        m = conversation_from_spec([{"author": "a", "embeds": [{"color": "#fff"}]}])[0]
+        assert m.timestamp is None
+        assert m.embeds[0].title is None
+        assert m.embeds[0].description is None
+
     def test_load_spec_file(self, tmp_path) -> None:
         p = tmp_path / "spec.json"
         p.write_text(json.dumps({"messages": [{"author": "a", "content": "hi"}]}), encoding="utf-8")
@@ -158,6 +174,15 @@ class TestRenderPillow:
         monkeypatch.setattr(cr, "load_text_font", lambda size: None)
         monkeypatch.setattr(cr, "load_mono_font", lambda size: None)
         assert render_conversation_png(_sample_messages()) is None
+
+    def test_numeric_spec_fields_render_without_crash(self) -> None:
+        # Regression: numeric timestamp / embed title-desc used to crash Pillow.
+        msgs = conversation_from_spec(
+            [{"author": "a", "timestamp": 1200, "embeds": [{"title": 1, "description": 2}]}]
+        )
+        png = render_conversation_png(msgs)
+        assert png is not None
+        assert png.startswith(PNG_MAGIC)
 
 
 # ── CLI (scripts/discord_mockup.py) ──────────────────────────────────────────
