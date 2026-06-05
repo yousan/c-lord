@@ -31,6 +31,7 @@ from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
+from ..discord_ref import enrich_discord_references
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
@@ -782,6 +783,7 @@ class ClaudeChatCog(commands.Cog):
             name=thread_name, auto_archive_duration=archive_minutes
         )
         prompt, image_paths = await self._build_prompt_and_images(message)
+        prompt = await enrich_discord_references(prompt, message, self.bot)
         await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
 
     async def spawn_session(
@@ -973,6 +975,7 @@ class ClaudeChatCog(commands.Cog):
             record = await self.repo.get(thread.id)
             session_id = (record.session_id or None) if record else None
             prompt, image_paths = await self._build_prompt_and_images(message)
+            prompt = await enrich_discord_references(prompt, message, self.bot)
 
             # Interrupt any active session in this thread before starting a new one.
             existing_runner = self._active_runners.get(thread.id)
