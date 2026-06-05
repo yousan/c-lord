@@ -1,16 +1,13 @@
-"""Tests for the Discord conversation → PNG renderer (#243, route 2).
+"""Tests for the design-comp conversation renderer + spec loader (#316).
 
-These cover the data normalization (live ``discord.Message`` → ``ConvMessage``),
-the ``channel.history`` fetch helper, and both rendering engines (Pillow
-self-render + HTML/headless-Chrome). Rendering tests skip gracefully when the
-optional dependency / browser is unavailable, mirroring ``test_pane_renderer``.
+These cover the hand-authored spec → ``ConvMessage`` loader and the Pillow
+mockup renderer. Rendering tests skip gracefully when the optional ``[table]``
+extra (Pillow) / a usable font is unavailable, mirroring ``test_pane_renderer``.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+import json
 
 import pytest
 
@@ -20,44 +17,38 @@ from c_lord.discord_ui.conversation_renderer import (
     ConvField,
     ConvMessage,
     ConvReaction,
-    browser_available,
-    fetch_conversation,
-    message_to_conv,
-    render_conversation,
-    render_conversation_html_png,
+    conversation_from_spec,
+    load_spec_file,
     render_conversation_png,
 )
 from c_lord.discord_ui.fonts import load_text_font
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-
 _HAS_FONT = load_text_font(20) is not None
 
 
 def _sample_messages() -> list[ConvMessage]:
-    """A small but representative thread: user msg, bot tool-use embed, lamps."""
+    """A small but representative design-comp: user msg, bot tool-use embeds, lamps."""
     return [
         ConvMessage(
             author="yousan",
-            content="この長文をスクショして証跡にして 🙏",
-            is_bot=False,
+            content="この機能のゴールはこう見えてほしい 🙏",
             timestamp="2026-06-04 12:00",
             reactions=(ConvReaction("🧠", 1), ConvReaction("✅", 1)),
         ),
         ConvMessage(
             author="C-lord",
-            content="やってみます。",
             is_bot=True,
             timestamp="2026-06-04 12:00",
+            color=0x5865F2,
+            content="やってみます。",
             embeds=(
                 ConvEmbed(
-                    title="🛠️ Bash(git status)...",
-                    description="⏳ 2s elapsed...",
-                    color=0xFEE75C,
+                    title="🛠️ Bash(git status)...", description="⏳ 2s elapsed...", color=0xFEE75C
                 ),
                 ConvEmbed(
                     title="✅ Done",
-                    description="Duration 3.2s · $0.0041",
+                    description="Duration 3.2s",
                     color=0x57F287,
                     fields=(ConvField("model", "opus", inline=True),),
                 ),
@@ -67,114 +58,81 @@ def _sample_messages() -> list[ConvMessage]:
     ]
 
 
-# ── Data normalization ───────────────────────────────────────────────────────
+# ── Hand-authored spec loader ────────────────────────────────────────────────
 
 
-class TestMessageToConv:
-    def _fake_discord_message(self) -> MagicMock:
-        author = MagicMock()
-        author.display_name = "alice"
-        author.bot = False
-        author.color = SimpleNamespace(value=0xFF0000)
+class TestSpecLoader:
+    def test_minimal(self) -> None:
+        msgs = conversation_from_spec([{"author": "a", "content": "hi"}])
+        assert len(msgs) == 1
+        assert msgs[0].author == "a"
+        assert msgs[0].content == "hi"
 
-        embed = MagicMock()
-        embed.title = "🛠️ Bash(ls)..."
-        embed.description = "running"
-        embed.color = SimpleNamespace(value=0xFEE75C)
-        embed.fields = [SimpleNamespace(name="dir", value="/tmp", inline=True)]
+    def test_messages_key_wrapper(self) -> None:
+        msgs = conversation_from_spec({"messages": [{"author": "a"}, {"author": "b"}]})
+        assert [m.author for m in msgs] == ["a", "b"]
 
-        reaction = MagicMock()
-        reaction.emoji = "✅"
-        reaction.count = 2
+    def test_color_hex_string(self) -> None:
+        assert conversation_from_spec([{"author": "a", "color": "#5865F2"}])[0].color == 0x5865F2
 
-        attachment = MagicMock()
-        attachment.filename = "log.txt"
-        attachment.content_type = "text/plain"
+    def test_color_int(self) -> None:
+        assert conversation_from_spec([{"author": "a", "color": 0xFEE75C}])[0].color == 0xFEE75C
 
-        msg = MagicMock()
-        msg.author = author
-        msg.content = "hello world"
-        msg.created_at = _dt.datetime(2026, 6, 4, 12, 30)
-        msg.embeds = [embed]
-        msg.reactions = [reaction]
-        msg.attachments = [attachment]
-        return msg
+    def test_embeds_and_fields(self) -> None:
+        m = conversation_from_spec(
+            [
+                {
+                    "author": "b",
+                    "is_bot": True,
+                    "embeds": [
+                        {
+                            "title": "🛠️ Bash(ls)",
+                            "description": "run",
+                            "color": "#FEE75C",
+                            "fields": [{"name": "dir", "value": "/tmp", "inline": True}],
+                        }
+                    ],
+                }
+            ]
+        )[0]
+        assert m.is_bot is True
+        assert m.embeds[0].title == "🛠️ Bash(ls)"
+        assert m.embeds[0].color == 0xFEE75C
+        assert m.embeds[0].fields[0].name == "dir"
 
-    def test_basic_fields(self) -> None:
-        conv = message_to_conv(self._fake_discord_message())
-        assert conv.author == "alice"
-        assert conv.content == "hello world"
-        assert conv.is_bot is False
-        assert conv.color == 0xFF0000
-        assert "2026-06-04" in (conv.timestamp or "")
+    def test_reactions_shorthand_and_dict(self) -> None:
+        m = conversation_from_spec(
+            [{"author": "a", "reactions": ["🧠", {"emoji": "✅", "count": 2}]}]
+        )[0]
+        assert m.reactions[0] == ConvReaction("🧠", 1)
+        assert m.reactions[1] == ConvReaction("✅", 2)
 
-    def test_embeds_normalized(self) -> None:
-        conv = message_to_conv(self._fake_discord_message())
-        assert len(conv.embeds) == 1
-        assert conv.embeds[0].title == "🛠️ Bash(ls)..."
-        assert conv.embeds[0].color == 0xFEE75C
-        assert conv.embeds[0].fields[0].name == "dir"
+    def test_attachments_shorthand_and_dict(self) -> None:
+        m = conversation_from_spec(
+            [
+                {
+                    "author": "a",
+                    "attachments": [
+                        "diff.patch",
+                        {"filename": "log.txt", "content_type": "text/plain"},
+                    ],
+                }
+            ]
+        )[0]
+        assert m.attachments[0].filename == "diff.patch"
+        assert m.attachments[1].content_type == "text/plain"
 
-    def test_reactions_and_attachments(self) -> None:
-        conv = message_to_conv(self._fake_discord_message())
-        assert conv.reactions[0].emoji == "✅"
-        assert conv.reactions[0].count == 2
-        assert conv.attachments[0].filename == "log.txt"
+    def test_empty(self) -> None:
+        assert conversation_from_spec([]) == []
+        assert conversation_from_spec({"messages": []}) == []
 
-    def test_zero_color_becomes_none(self) -> None:
-        msg = self._fake_discord_message()
-        msg.author.color = SimpleNamespace(value=0)
-        assert message_to_conv(msg).color is None
-
-    def test_missing_optional_fields_default_safely(self) -> None:
-        msg = MagicMock()
-        msg.author = SimpleNamespace(display_name="bob", bot=True, color=None)
-        msg.content = ""
-        msg.created_at = None
-        msg.embeds = []
-        msg.reactions = []
-        msg.attachments = []
-        conv = message_to_conv(msg)
-        assert conv.author == "bob"
-        assert conv.is_bot is True
-        assert conv.embeds == ()
-
-
-class TestFetchConversation:
-    async def test_iterates_history_oldest_first(self) -> None:
-        def _msg(name: str, content: str) -> MagicMock:
-            m = MagicMock()
-            m.author = SimpleNamespace(display_name=name, bot=False, color=None)
-            m.content = content
-            m.created_at = None
-            m.embeds = []
-            m.reactions = []
-            m.attachments = []
-            return m
-
-        history_msgs = [_msg("a", "first"), _msg("b", "second")]
-
-        class _AsyncIter:
-            def __aiter__(self):
-                async def gen():
-                    for m in history_msgs:
-                        yield m
-
-                return gen()
-
-        channel = MagicMock()
-        channel.history = MagicMock(return_value=_AsyncIter())
-
-        out = await fetch_conversation(channel, limit=5)
-        channel.history.assert_called_once()
-        kwargs = channel.history.call_args.kwargs
-        assert kwargs.get("limit") == 5
-        assert kwargs.get("oldest_first") is True
-        assert [c.author for c in out] == ["a", "b"]
-        assert [c.content for c in out] == ["first", "second"]
+    def test_load_spec_file(self, tmp_path) -> None:
+        p = tmp_path / "spec.json"
+        p.write_text(json.dumps({"messages": [{"author": "a", "content": "hi"}]}), encoding="utf-8")
+        assert load_spec_file(str(p))[0].author == "a"
 
 
-# ── Pillow renderer (variant a) ──────────────────────────────────────────────
+# ── Pillow mockup renderer ───────────────────────────────────────────────────
 
 
 @pytest.mark.skipif(not _HAS_FONT, reason="no usable font (optional [table] extra)")
@@ -184,10 +142,15 @@ class TestRenderPillow:
         assert png is not None
         assert png.startswith(PNG_MAGIC)
 
-    def test_empty_messages_returns_png(self) -> None:
-        # An empty list should still produce a (small) valid PNG, not crash.
+    def test_empty_messages(self) -> None:
         png = render_conversation_png([])
         assert png is None or png.startswith(PNG_MAGIC)
+
+    def test_renders_from_spec(self) -> None:
+        msgs = conversation_from_spec([{"author": "a", "content": "hi 🧠", "reactions": ["✅"]}])
+        png = render_conversation_png(msgs)
+        assert png is not None
+        assert png.startswith(PNG_MAGIC)
 
     def test_no_font_returns_none(self, monkeypatch) -> None:
         import c_lord.discord_ui.conversation_renderer as cr
@@ -197,43 +160,39 @@ class TestRenderPillow:
         assert render_conversation_png(_sample_messages()) is None
 
 
-# ── HTML / headless-Chrome renderer (variant b) ──────────────────────────────
+# ── CLI (scripts/discord_mockup.py) ──────────────────────────────────────────
 
 
-class TestRenderHtml:
-    def test_browser_available_is_bool(self) -> None:
-        assert isinstance(browser_available(), bool)
+def _load_cli():
+    import importlib.util
+    from pathlib import Path
 
-    @pytest.mark.skipif(not browser_available(), reason="no headless browser present")
-    def test_returns_png_bytes_when_browser_present(self) -> None:
-        png = render_conversation_html_png(_sample_messages())
-        assert png is not None
-        assert png.startswith(PNG_MAGIC)
-
-
-# ── Dispatcher ───────────────────────────────────────────────────────────────
+    path = Path(__file__).resolve().parent.parent / "scripts" / "discord_mockup.py"
+    spec = importlib.util.spec_from_file_location("discord_mockup", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-class TestDispatcher:
-    def test_pillow_engine_dispatch(self, monkeypatch) -> None:
-        import c_lord.discord_ui.conversation_renderer as cr
+@pytest.mark.skipif(not _HAS_FONT, reason="no usable font (optional [table] extra)")
+class TestCli:
+    def test_writes_png_from_spec(self, tmp_path) -> None:
+        cli = _load_cli()
+        spec_file = tmp_path / "s.json"
+        spec_file.write_text('[{"author":"a","content":"hi 🧠"}]', encoding="utf-8")
+        out = tmp_path / "o.png"
+        rc = cli.main([str(spec_file), "-o", str(out), "--title", "#x"])
+        assert rc == 0
+        assert out.read_bytes().startswith(PNG_MAGIC)
 
-        monkeypatch.setattr(cr, "render_conversation_png", lambda msgs, **kw: b"PILLOW")
-        monkeypatch.setattr(cr, "render_conversation_html_png", lambda msgs, **kw: b"HTML")
-        assert render_conversation([], engine="pillow") == b"PILLOW"
+    def test_bundled_example_spec_renders(self, tmp_path) -> None:
+        from pathlib import Path
 
-    def test_html_engine_dispatch(self, monkeypatch) -> None:
-        import c_lord.discord_ui.conversation_renderer as cr
-
-        monkeypatch.setattr(cr, "render_conversation_png", lambda msgs, **kw: b"PILLOW")
-        monkeypatch.setattr(cr, "render_conversation_html_png", lambda msgs, **kw: b"HTML")
-        assert render_conversation([], engine="html") == b"HTML"
-
-    def test_auto_prefers_html_when_browser_falls_back_to_pillow(self, monkeypatch) -> None:
-        import c_lord.discord_ui.conversation_renderer as cr
-
-        monkeypatch.setattr(cr, "render_conversation_png", lambda msgs, **kw: b"PILLOW")
-        monkeypatch.setattr(cr, "render_conversation_html_png", lambda msgs, **kw: None)
-        monkeypatch.setattr(cr, "browser_available", lambda: True)
-        # html returns None (e.g. chrome failed) → must fall back to pillow
-        assert render_conversation([], engine="auto") == b"PILLOW"
+        cli = _load_cli()
+        example = (
+            Path(__file__).resolve().parent.parent / "scripts" / "examples" / "mockup_spec.json"
+        )
+        out = tmp_path / "example.png"
+        assert cli.main([str(example), "-o", str(out)]) == 0
+        assert out.read_bytes().startswith(PNG_MAGIC)

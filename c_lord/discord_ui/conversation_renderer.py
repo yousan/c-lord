@@ -1,34 +1,26 @@
-"""Render a Discord thread/conversation to a PNG image (#243, route 2).
+"""Render a *hand-authored* Discord conversation to a PNG mockup (#316).
 
-The c-lord DoD wants *Discord-side* evidence — the result a user actually sees:
-author rows, message text, the ``Bash(...)`` / ``✅ Done`` tool-use embeds, the
-🧠/🛠️/✅ status-lamp reactions, attachments. Automating the real Discord client
-to screenshot it is a self-bot (forbidden by Discord's ToS) and impossible with
-a bot token anyway, so c-lord instead **self-renders** the conversation from
-data it already has in-process via ``channel.history`` — the same approach the
-tmux ``/tmux-screenshot`` (#285) takes for the pane side.
+This is a c-lord **internal dev tool**, not a shipped consumer feature. It draws
+a Discord-looking image from data you author by hand (``ConvMessage`` objects /
+a spec dict), so you can mock up *the intended look* of a feature — author rows,
+message text, the ``Bash(...)`` / ``✅ Done`` tool-use embeds, the 🧠/🛠️/✅
+status-lamp reactions, attachments — and attach it to an Issue as a **design
+comp** ("this is the goal"). Because it renders from arbitrary data it can show
+states that don't exist yet, which a real screenshot cannot.
 
-Two interchangeable engines produce the PNG:
+It is deliberately *not* a capture of the real Discord client (that would need a
+self-bot, forbidden by Discord's ToS — see #243). For evidence of the real
+client's actual rendering, a human screenshot remains authoritative.
 
-* :func:`render_conversation_png` — pure-Python Pillow draw (no new dependency
-  beyond the existing ``c-lord[table]`` extra). Default, zero-config.
-* :func:`render_conversation_html_png` — an HTML/CSS template rendered by a
-  headless system browser (Chrome/Chromium) for higher fidelity. Optional;
-  degrades to ``None`` when no browser is found.
-
-Both return ``bytes | None`` and never raise on a missing optional dependency,
-mirroring :mod:`c_lord.discord_ui.pane_renderer`.
+:func:`render_conversation_png` paints with Pillow and returns ``bytes | None``
+(``None`` when Pillow / a usable font is missing), mirroring
+:mod:`c_lord.discord_ui.pane_renderer`. The CLI lives in
+``scripts/discord_mockup.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import html
-import logging
-import os
-import shutil
-import tempfile
+import json
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -42,8 +34,6 @@ if TYPE_CHECKING:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILImageDraw
     from PIL import ImageFont
-
-logger = logging.getLogger(__name__)
 
 
 # ── Data model (decoupled from live discord.py objects, for testability) ──────
@@ -68,7 +58,7 @@ class ConvField:
 
 @dataclass(frozen=True)
 class ConvEmbed:
-    """A Discord embed — these carry the ``Bash(...)`` / ``✅ Done`` evidence."""
+    """A Discord embed — renders the ``Bash(...)`` / ``✅ Done`` tool-use cards."""
 
     title: str | None = None
     description: str | None = None
@@ -98,86 +88,85 @@ class ConvMessage:
     attachments: tuple[ConvAttachment, ...] = field(default_factory=tuple)
 
 
-def _color_value(obj: object) -> int | None:
-    """Extract an int color from a ``discord.Colour``-like object (0 → None)."""
-    if obj is None:
+def _to_int_color(c: object) -> int | None:
+    """Accept an int or ``"#RRGGBB"`` / ``"RRGGBB"`` string → 0xRRGGBB int (0 → None)."""
+    if isinstance(c, bool):
         return None
-    value = getattr(obj, "value", None)
-    if isinstance(obj, int):
-        value = obj
-    if not value:  # 0 / None → "no color"
-        return None
-    return int(value)
+    if isinstance(c, int):
+        return c or None
+    if isinstance(c, str):
+        try:
+            return int(c.strip().lstrip("#"), 16) or None
+        except ValueError:
+            return None
+    return None
 
 
-def message_to_conv(msg: object) -> ConvMessage:
-    """Normalize a ``discord.Message`` (or a duck-typed stand-in) to a ConvMessage.
+def _reaction_from_spec(r: object) -> ConvReaction:
+    if isinstance(r, dict):
+        return ConvReaction(emoji=str(r.get("emoji", "")), count=int(r.get("count", 1)))
+    if isinstance(r, (list, tuple)):
+        return ConvReaction(emoji=str(r[0]), count=int(r[1]) if len(r) > 1 else 1)
+    return ConvReaction(emoji=str(r), count=1)
 
-    Reads only public attributes, so it works against both real messages and
-    test doubles. Missing optional fields default safely.
+
+def _attachment_from_spec(a: object) -> ConvAttachment:
+    if isinstance(a, dict):
+        return ConvAttachment(
+            filename=str(a.get("filename", "file")), content_type=a.get("content_type")
+        )
+    return ConvAttachment(filename=str(a))
+
+
+def _embed_from_spec(e: dict) -> ConvEmbed:
+    fields = tuple(
+        ConvField(
+            name=str(f.get("name", "")),
+            value=str(f.get("value", "")),
+            inline=bool(f.get("inline", False)),
+        )
+        for f in (e.get("fields") or [])
+    )
+    return ConvEmbed(
+        title=e.get("title"),
+        description=e.get("description"),
+        color=_to_int_color(e.get("color")),
+        fields=fields,
+    )
+
+
+def conversation_from_spec(data: object) -> list[ConvMessage]:
+    """Build ``ConvMessage``\\ s from a hand-authored spec (the design-comp input).
+
+    *data* is a list of message dicts, or ``{"messages": [...]}``. Each message:
+    ``{author, content?, is_bot?, timestamp?, color?, embeds?, reactions?,
+    attachments?}``. ``color`` accepts an int or ``"#RRGGBB"``. ``embeds`` is a
+    list of ``{title?, description?, color?, fields?: [{name, value, inline?}]}``.
+    ``reactions`` accepts ``[{emoji, count?}]`` or ``["🧠", ...]``; ``attachments``
+    accepts ``[{filename, content_type?}]`` or ``["diff.patch", ...]``.
     """
-    author_obj = getattr(msg, "author", None)
-    author = str(getattr(author_obj, "display_name", None) or author_obj or "unknown")
-    is_bot = bool(getattr(author_obj, "bot", False))
-    color = _color_value(getattr(author_obj, "color", None))
-
-    created = getattr(msg, "created_at", None)
-    timestamp = created.strftime("%Y-%m-%d %H:%M") if created is not None else None
-
-    embeds: list[ConvEmbed] = []
-    for e in getattr(msg, "embeds", None) or []:
-        fields = tuple(
-            ConvField(
-                name=str(getattr(f, "name", "") or ""),
-                value=str(getattr(f, "value", "") or ""),
-                inline=bool(getattr(f, "inline", False)),
-            )
-            for f in (getattr(e, "fields", None) or [])
-        )
-        embeds.append(
-            ConvEmbed(
-                title=getattr(e, "title", None),
-                description=getattr(e, "description", None),
-                color=_color_value(getattr(e, "color", None)),
-                fields=fields,
-            )
-        )
-
-    reactions = tuple(
-        ConvReaction(emoji=str(getattr(r, "emoji", "")), count=int(getattr(r, "count", 1) or 1))
-        for r in (getattr(msg, "reactions", None) or [])
-    )
-    attachments = tuple(
-        ConvAttachment(
-            filename=str(getattr(a, "filename", "file")),
-            content_type=getattr(a, "content_type", None),
-        )
-        for a in (getattr(msg, "attachments", None) or [])
-    )
-
-    return ConvMessage(
-        author=author,
-        content=str(getattr(msg, "content", "") or ""),
-        is_bot=is_bot,
-        timestamp=timestamp,
-        color=color,
-        embeds=tuple(embeds),
-        reactions=reactions,
-        attachments=attachments,
-    )
-
-
-async def fetch_conversation(channel: object, *, limit: int = 20) -> list[ConvMessage]:
-    """Fetch the last *limit* messages of *channel* as ConvMessages (oldest first).
-
-    Uses discord.py's ``channel.history`` async iterator — a REST fetch that
-    returns full message payloads (embeds + reactions included) regardless of
-    gateway intents. Purely in-process; no browser, no extra auth.
-    """
+    messages = data.get("messages", []) if isinstance(data, dict) else data
     out: list[ConvMessage] = []
-    async for msg in channel.history(limit=limit, oldest_first=True):  # type: ignore[attr-defined]
-        out.append(message_to_conv(msg))
+    for m in messages or []:
+        out.append(
+            ConvMessage(
+                author=str(m.get("author", "unknown")),
+                content=str(m.get("content", "")),
+                is_bot=bool(m.get("is_bot", False)),
+                timestamp=m.get("timestamp"),
+                color=_to_int_color(m.get("color")),
+                embeds=tuple(_embed_from_spec(e) for e in (m.get("embeds") or [])),
+                reactions=tuple(_reaction_from_spec(r) for r in (m.get("reactions") or [])),
+                attachments=tuple(_attachment_from_spec(a) for a in (m.get("attachments") or [])),
+            )
+        )
     return out
+
+
+def load_spec_file(path: str) -> list[ConvMessage]:
+    """Load a JSON design-comp spec file → ``ConvMessage``\\ s."""
+    with open(path, encoding="utf-8") as fh:
+        return conversation_from_spec(json.load(fh))
 
 
 # ── Palette / layout knobs (Discord dark theme) ──────────────────────────────
@@ -223,7 +212,7 @@ def _rgb(color: int | None) -> tuple[int, int, int] | None:
     return ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
 
 
-# ── Pillow renderer (variant a) ──────────────────────────────────────────────
+# ── Pillow renderer ───────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -604,248 +593,3 @@ def render_conversation_png(
     out = BytesIO()
     img.save(out, format="PNG")
     return out.getvalue()
-
-
-# ── HTML / headless-Chrome renderer (variant b) ──────────────────────────────
-
-_BROWSERS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome")
-
-
-def browser_available() -> bool:
-    """True if a headless-capable system browser binary is on PATH."""
-    return _find_browser() is not None
-
-
-def _find_browser() -> str | None:
-    override = os.getenv("CLORD_HEADLESS_BROWSER")
-    if override and os.path.exists(override):
-        return override
-    return next((p for name in _BROWSERS if (p := shutil.which(name))), None)
-
-
-def _embed_html(e: ConvEmbed) -> str:
-    bar = "#%06x" % (e.color & 0xFFFFFF) if e.color else "#4f545c"
-    parts = [f'<div class="embed" style="border-left:4px solid {bar}">']
-    if e.title:
-        parts.append(f'<div class="etitle">{html.escape(e.title)}</div>')
-    if e.description:
-        parts.append(f'<div class="edesc">{html.escape(e.description)}</div>')
-    for f in e.fields:
-        parts.append(
-            f'<div class="efield"><div class="ename">{html.escape(f.name)}</div>'
-            f'<div class="evalue">{html.escape(f.value)}</div></div>'
-        )
-    parts.append("</div>")
-    return "".join(parts)
-
-
-def _content_html(content: str) -> str:
-    out: list[str] = []
-    for kind, text in _split_code_blocks(content):
-        if not text.strip():
-            continue
-        if kind == "code":
-            out.append(f"<pre><code>{html.escape(text)}</code></pre>")
-        else:
-            out.append(f'<div class="body">{html.escape(text).replace(chr(10), "<br>")}</div>')
-    return "".join(out)
-
-
-def _message_html(m: ConvMessage) -> str:
-    initial = html.escape((m.author.strip()[:1] or "?").upper())
-    hue = sum(ord(c) for c in m.author) * 47 % 360
-    name_color = "#%06x" % (m.color & 0xFFFFFF) if m.color else "#f2f3f5"
-    badge = '<span class="badge">BOT</span>' if m.is_bot else ""
-    ts = f'<span class="ts">{html.escape(m.timestamp)}</span>' if m.timestamp else ""
-    chips = "".join(
-        f'<span class="chip">📎 {html.escape(a.filename)}</span>' for a in m.attachments
-    ) + "".join(f'<span class="chip">{html.escape(r.emoji)} {r.count}</span>' for r in m.reactions)
-    chips_html = f'<div class="chips">{chips}</div>' if chips else ""
-    embeds = "".join(_embed_html(e) for e in m.embeds)
-    name_html = f'<span class="name" style="color:{name_color}">{html.escape(m.author)}</span>'
-    head = f'<div class="head">{name_html}{badge}{ts}</div>'
-    return (
-        f'<div class="msg">'
-        f'<div class="avatar" style="background:hsl({hue},45%,45%)">{initial}</div>'
-        f'<div class="col">{head}'
-        f"{_content_html(m.content)}{embeds}{chips_html}"
-        f"</div></div>"
-    )
-
-
-def _build_html(messages: list[ConvMessage], title: str | None) -> str:
-    body = "".join(_message_html(m) for m in messages)
-    header = f'<div class="title">{html.escape(title)}</div>' if title else ""
-    return f"""<!doctype html><html><head><meta charset="utf-8"><style>
-* {{ box-sizing: border-box; }}
-body {{ margin:0; width:860px; background:#313338;
-  font-family:'Noto Sans CJK JP','Noto Sans JP','Noto Color Emoji',sans-serif;
-  color:#dbdee1; font-size:16px; line-height:1.35; }}
-.title {{ padding:12px 16px; color:#949ba4; font-size:14px; border-bottom:1px solid #2b2d31; }}
-.msg {{ display:flex; padding:6px 16px; gap:14px; }}
-.avatar {{ width:40px; height:40px; border-radius:50%; flex:0 0 40px;
-  display:flex; align-items:center; justify-content:center; color:#fff; font-weight:600; }}
-.col {{ min-width:0; flex:1; }}
-.head {{ display:flex; align-items:center; gap:8px; }}
-.name {{ font-weight:600; }}
-.badge {{ background:#5865f2; color:#fff; font-size:11px; font-weight:700;
-  border-radius:4px; padding:1px 5px; }}
-.ts {{ color:#949ba4; font-size:12px; }}
-.body {{ margin-top:2px; white-space:pre-wrap; word-break:break-word; }}
-pre {{ background:#1e1f22; border-radius:5px; padding:8px 12px; margin:4px 0;
-  overflow:hidden; }}
-code {{ font-family:'DejaVu Sans Mono',monospace; font-size:14px; white-space:pre-wrap;
-  word-break:break-word; }}
-.embed {{ background:#2b2d31; border-radius:6px; padding:8px 12px; margin:4px 0; max-width:520px; }}
-.etitle {{ font-weight:600; color:#f2f3f5; }}
-.edesc {{ color:#c5c9cf; margin-top:2px; }}
-.efield {{ margin-top:4px; }}
-.ename {{ font-weight:600; font-size:14px; }}
-.evalue {{ color:#c5c9cf; font-size:14px; }}
-.chips {{ margin-top:4px; }}
-.chip {{ display:inline-block; background:#3c3f45; border-radius:8px;
-  padding:2px 8px; margin:2px 4px 2px 0; font-size:14px; }}
-</style></head><body>{header}{body}</body></html>"""
-
-
-def _autocrop_bottom(png: bytes) -> bytes:
-    """Trim uniform bottom padding left by a fixed-height headless screenshot."""
-    try:
-        from PIL import Image
-    except ImportError:
-        return png
-    try:
-        im = Image.open(BytesIO(png)).convert("RGB")
-    except Exception:
-        return png
-    w, h = im.size
-    bg = im.getpixel((w // 2, h - 1))
-    px = im.load()
-    bottom = h
-    for yy in range(h - 1, -1, -1):
-        if any(px[xx, yy] != bg for xx in range(0, w, max(1, w // 60))):
-            bottom = min(h, yy + 16)
-            break
-    if bottom < h:
-        im = im.crop((0, 0, w, bottom))
-    out = BytesIO()
-    im.save(out, format="PNG")
-    return out.getvalue()
-
-
-def render_conversation_html_png(
-    messages: list[ConvMessage], *, title: str | None = None
-) -> bytes | None:
-    """Render *messages* to PNG via an HTML template + headless system browser.
-
-    Returns ``None`` when no browser binary is found or the browser fails, so
-    callers can fall back to :func:`render_conversation_png`.
-    """
-    browser = _find_browser()
-    if browser is None:
-        return None
-
-    # Headless screenshot clips to the window height, so bias the estimate HIGH
-    # (code blocks, wrapped lines, and field-heavy embeds all add rows) and let
-    # _autocrop_bottom trim the surplus. Underestimating would clip content.
-    def _msg_h(m: ConvMessage) -> int:
-        lines = m.content.count("\n") + 1 + len(m.content) // 60
-        embed_rows = sum(2 + len(e.fields) + (len(e.description or "") // 60) for e in m.embeds)
-        return 120 + 30 * lines + 90 * len(m.embeds) + 30 * embed_rows
-
-    est_h = 160 + sum(_msg_h(m) for m in messages)
-    est_h = max(400, min(est_h, 24000))
-    html_doc = _build_html(messages, title)
-
-    tmpdir = tempfile.mkdtemp(prefix="clord-shot-")
-    html_path = os.path.join(tmpdir, "c.html")
-    out_path = os.path.join(tmpdir, "c.png")
-    with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(html_doc)
-
-    args = [
-        browser,
-        "--headless",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--hide-scrollbars",
-        "--force-device-scale-factor=2",
-        "--default-background-color=313338ff",
-        f"--window-size={WIDTH},{est_h}",
-        f"--screenshot={out_path}",
-        f"file://{html_path}",
-    ]
-    try:
-        png = asyncio.run(_run_browser(args, out_path))
-    except RuntimeError:
-        # Already inside a running loop — run in a fresh thread's loop.
-        png = _run_browser_sync(args, out_path)
-    except Exception as exc:  # noqa: BLE001 — degrade gracefully like other renderers
-        logger.warning("html screenshot failed: %s", exc)
-        png = None
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-    if png is None:
-        return None
-    return _autocrop_bottom(png)
-
-
-async def _run_browser(args: list[str], out_path: str) -> bytes | None:
-    proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-    )
-    try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except TimeoutError:
-        proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()  # reap so we don't leave a zombie
-        logger.warning("html screenshot timed out")
-        return None
-    if not os.path.exists(out_path):
-        logger.warning(
-            "html screenshot produced no file: %s", stderr.decode("utf-8", "replace")[:300]
-        )
-        return None
-    with open(out_path, "rb") as fh:
-        return fh.read()
-
-
-def _run_browser_sync(args: list[str], out_path: str) -> bytes | None:
-    import subprocess
-
-    try:
-        subprocess.run(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning("html screenshot subprocess failed: %s", exc)
-        return None
-    if not os.path.exists(out_path):
-        return None
-    with open(out_path, "rb") as fh:
-        return fh.read()
-
-
-# ── Dispatcher ───────────────────────────────────────────────────────────────
-
-
-def render_conversation(
-    messages: list[ConvMessage], *, engine: str = "pillow", title: str | None = None
-) -> bytes | None:
-    """Render *messages* with the requested *engine*.
-
-    * ``"pillow"`` (default) — pure-Python self-render, zero-config.
-    * ``"html"`` — HTML template + headless browser (higher fidelity).
-    * ``"auto"`` — prefer HTML when a browser exists, fall back to Pillow.
-    """
-    if engine == "html":
-        return render_conversation_html_png(messages, title=title)
-    if engine == "auto":
-        if browser_available():
-            png = render_conversation_html_png(messages, title=title)
-            if png is not None:
-                return png
-        return render_conversation_png(messages, title=title)
-    return render_conversation_png(messages, title=title)

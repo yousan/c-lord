@@ -20,7 +20,6 @@ The bridge's security goal is:
 | Secrets leaking to Claude subprocess | `_STRIPPED_ENV_KEYS` removes `DISCORD_BOT_TOKEN`, `CLAUDECODE`, etc. from subprocess env |
 | Claude reading Discord secrets via Bash tool | Environment stripping prevents `echo $DISCORD_BOT_TOKEN` in Claude's Bash |
 | Nesting detection bypass | `CLAUDECODE` env var stripped — subprocess won't think it's already inside Claude Code |
-| Browser-based code execution (evidence screenshots, #243) | The `html` engine runs a headless browser only on a **local, c-lord-generated** `file://` page (no remote URLs); all message text is `html.escape`'d into that file — never into CLI args. `--no-sandbox` is used because the input is our own trusted markup. The default `pillow` engine spawns no subprocess at all. |
 
 ### What We Do NOT Protect Against
 

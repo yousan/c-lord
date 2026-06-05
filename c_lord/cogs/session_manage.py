@@ -19,7 +19,6 @@ from discord.ext import commands
 
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
-from ..discord_ui.conversation_renderer import fetch_conversation, render_conversation
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..session_dir import SessionDirManager
@@ -911,82 +910,6 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /tmux-screenshot — webhook-invokable for E2E (#285)."""
         respond, ack = self._ctx_io(ctx)
         await self._screenshot_impl(channel=ctx.channel, respond=respond, ack=ack)
-
-    async def _discord_screenshot_impl(
-        self,
-        *,
-        channel: object,
-        respond: _Responder,
-        ack: _Acknowledger,
-        engine: str = "pillow",
-    ) -> None:
-        """Shared core for /discord-screenshot and !discord-screenshot (#243).
-
-        Renders the thread's recent Discord messages (text, tool-use embeds,
-        status-lamp reactions, attachments) to a PNG so the *Discord-side*
-        result can be attached as PR evidence. This is the manual twin of the
-        auto-capture that fires on completion. PNG rendering needs the optional
-        ``c-lord[table]`` extra (Pillow) — or a headless browser for
-        ``engine=html``; without either we reply with an actionable hint.
-        """
-        if not isinstance(channel, discord.Thread):
-            await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
-
-        await ack()  # fetch + render can exceed Discord's 3s ack window
-
-        import asyncio
-
-        messages = await fetch_conversation(channel, limit=25)
-        if not messages:
-            await respond("ℹ️ No messages to screenshot in this thread.", ephemeral=True)
-            return
-
-        title = f"#{getattr(channel, 'name', None) or channel.id}"
-        png = await asyncio.to_thread(render_conversation, messages, engine=engine, title=title)
-        if png is None:
-            await respond(
-                "⚠️ スクリーンショットのレンダリングに必要な依存が見つかりません。"
-                " `pip install c-lord[table]` (Pillow) を導入するか、"
-                " `engine:html` 用にヘッドレスブラウザを用意してください。",
-                ephemeral=True,
-            )
-            return
-
-        file = discord.File(BytesIO(png), filename=f"discord-{channel.id}.png")
-        await respond(file=file)
-
-    @app_commands.command(
-        name="discord-screenshot",
-        description="Post a PNG screenshot of this thread's Discord conversation (evidence)",
-    )
-    @app_commands.describe(engine="Rendering engine — pillow (default), html, or auto")
-    @app_commands.choices(
-        engine=[
-            app_commands.Choice(name="Pillow (default, no extra deps)", value="pillow"),
-            app_commands.Choice(name="HTML + headless browser (high fidelity)", value="html"),
-            app_commands.Choice(name="Auto (HTML if a browser exists, else Pillow)", value="auto"),
-        ]
-    )
-    async def discord_screenshot(
-        self, interaction: discord.Interaction, engine: str = "pillow"
-    ) -> None:
-        """Screenshot the current Discord thread and post it as a PNG (#243)."""
-        respond, ack = self._slash_io(interaction)
-        await self._discord_screenshot_impl(
-            channel=interaction.channel, respond=respond, ack=ack, engine=engine
-        )
-
-    @commands.command(name="discord-screenshot")
-    async def discord_screenshot_text(self, ctx: commands.Context, engine: str = "pillow") -> None:
-        """Text/mention twin of /discord-screenshot — webhook-invokable for E2E (#243)."""
-        respond, ack = self._ctx_io(ctx)
-        await self._discord_screenshot_impl(
-            channel=ctx.channel, respond=respond, ack=ack, engine=engine
-        )
 
     async def _workspace_delete_impl(
         self, *, channel: object, respond: _Responder, ack: _Acknowledger

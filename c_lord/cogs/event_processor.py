@@ -305,31 +305,6 @@ class EventProcessor:
                 )
             self._state.session_id = event.session_id
 
-        # Auto-capture a Discord-side evidence screenshot for the PR/Issue (#243).
-        await self._maybe_auto_evidence()
-
-    async def _maybe_auto_evidence(self) -> None:
-        """Render this thread to a PNG evidence screenshot on completion (#243).
-
-        Env-gated (``CLORD_AUTO_SCREENSHOT``) and debounced per thread. Fully
-        best-effort: a screenshot problem must never break the Claude run, so
-        any error here is suppressed (capture_evidence is itself defensive).
-        """
-        from ..discord_ui.evidence import (
-            auto_screenshot_enabled,
-            capture_evidence,
-            should_capture,
-        )
-
-        if not auto_screenshot_enabled():
-            return
-        thread = self._config.thread
-        if not should_capture(thread.id):
-            return
-        title = f"#{getattr(thread, 'name', None) or thread.id}"
-        with contextlib.suppress(Exception):
-            await capture_evidence(thread, self._config.working_dir, title=title)
-
     # ------------------------------------------------------------------
     # Text streaming helpers
     # ------------------------------------------------------------------
