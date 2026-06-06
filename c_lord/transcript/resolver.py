@@ -8,6 +8,7 @@ with every ``/`` replaced by ``-`` (the leading slash too — so
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -16,9 +17,21 @@ def derive_project_dir(cwd: str, *, projects_root: Path | None = None) -> Path:
 
     The directory may not exist yet — Claude Code creates it lazily on first
     write — so callers should not assume ``.is_dir()`` is true here.
+
+    The slug must match Claude Code's own algorithm, which (#320):
+
+    * is computed from the **absolute** cwd — Claude Code always records its
+      working directory as an absolute path. ``working_dir`` may be stored
+      relative (the default session base is ``data/sessions``), so a relative
+      input is resolved against the current process CWD first.
+    * replaces **both** ``/`` and ``.`` with ``-`` — e.g. ``/home/u/.config``
+      becomes ``-home-u--config`` (the leading ``/`` plus the converted dot
+      yields a double dash).
     """
+    if not os.path.isabs(cwd):
+        cwd = os.path.realpath(cwd)
     root = projects_root if projects_root is not None else Path.home() / ".claude" / "projects"
-    return root / cwd.replace("/", "-")
+    return root / cwd.replace("/", "-").replace(".", "-")
 
 
 def latest_session_jsonl(project_dir: Path) -> Path | None:
