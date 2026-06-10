@@ -121,21 +121,15 @@ c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) �
 - 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
 - Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多い。**メッセージの読み取りは MCP に頼らず、`.env` の bot token を読んで Discord REST API を `curl` で叩く**のが確実 — MCP が `Missing Access` を返しても**そこで諦めず curl にフォールバックすること**。MCP は c-lord のスタック外（利用者環境にある保証もない）なので読み取りの基盤にしない。読み取り経路を skill + API として c-lord 内に正式実装する作業は #259、設計方針は #234 を参照
 
-**Token 取得**: 各 clone の作業ディレクトリ直下の `.env` を見るのが基本。本体 (bot を起動している c-lord clone) 以外の並行作業 clone (`c-lord-parallel`, `c-lord-parallel-2`, ...) には **`.env` を本体に symlink する規約** にしている:
+**Token 取得**: **本番 `.env` を絶対パスで直接読む** (`/home/yousan/c-lord/.env`。パスは運用に合わせて)。
 
-```bash
-# 並行 clone を新規作成したら一度だけ
-ln -s /home/yousan/c-lord/.env /path/to/your-clone/.env
-# (パスは運用に合わせて。canonical な bot の .env を指す symlink)
-```
-
-これで以降 `.env` (相対パス) を読めば全 clone から同じ token に届く。bot 本体 clone は実ファイル、並行 clone は symlink。
+⚠️ **旧規約(並行 clone の `.env` を本体に symlink)は廃止された** (#326)。symlink された `.env` は「その clone で bot を起動すると本番トークンで第2の本番 bot が立つ」地雷だったため (#322 根因)、各並行 clone (`c-lord-parallel`, `c-lord-parallel-2`, `c-lord-issue63`) の `.env` は現在**無効なセンチネル値を持つ実ファイル**になっており、bot を起動しても Discord ログインに失敗して即終了する。**新しい並行 clone を作るときも symlink を張らないこと**(token はどこからでも上の絶対パスで読める)。
 
 **読み取り (任意の thread / channel のメッセージ取得)**:
 
 ```bash
-# clone のルートで実行 (実ファイル / symlink どちらでも OK)
-TOKEN=$(grep '^DISCORD_BOT_TOKEN=' .env | cut -d= -f2-)
+# どの clone / session_dir からでも、本番 .env を絶対パスで読む (#326 以降 symlink は無い)
+TOKEN=$(grep '^DISCORD_BOT_TOKEN=' /home/yousan/c-lord/.env | cut -d= -f2-)
 
 # 直近 N 件のメッセージ
 curl -s -H "Authorization: Bot $TOKEN" \
@@ -158,7 +152,7 @@ curl -s -X POST -H "Authorization: Bot $TOKEN" \
   "https://discord.com/api/v10/channels/<THREAD_ID>/messages"
 ```
 
-**bot 内 spawn 子 Claude (`c-lord-sessions/<ch>/<thr>/` cwd) の場合**: env は strip されているが、ファイル読みは strip 対象外なので絶対パス (`cat /path/to/c-lord/.env`) で token を取得可能。並行 clone と違い session_dir には symlink を入れていないため絶対パス必須。
+**bot 内 spawn 子 Claude (`c-lord-sessions/<ch>/<thr>/` cwd) の場合**: env は strip されているが、ファイル読みは strip 対象外なので、上と同じく絶対パス (`cat /home/yousan/c-lord/.env`) で token を取得可能。
 
 **代替: c-lord REST API (`ext/api_server.py`)**:
 api_server をオプトインで有効化してある環境では `POST /api/threads/{thread_id}/messages` で同等の操作が可能 (詳細は `docs/COMMANDS.md`)。bot を再起動せずに有効化する手段はないため、デバッグ目的では上の curl が手軽。
