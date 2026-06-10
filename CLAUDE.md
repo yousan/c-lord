@@ -34,7 +34,7 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
 
 1. **Claude pushes its own answer via Skill, not scraped from TUI** (#53): Each session dir gets a `.claude/skills/discord-reply/SKILL.md` (with `thread_id`, `api_url`, optional `Authorization: Bearer` baked in) that tells Claude to `curl POST /api/reply` at the end of every turn. c-lord no longer extracts Claude's response from `tmux capture-pane`. The tmux pane is kept solely for human visibility (`tmux attach -t <session>:<work>`) and for `send-keys` input. **This is what structurally prevents the TUI-chrome-leak class of bugs** (#23, #27, #28, #29, #30, #32, #34, #35, #39, #41, #43, #45, #49, #50): there is no text-from-TUI codepath that reaches Discord anymore, so a new chrome element can no longer leak. The legacy `USE_SKILL_REPLY` env remains as an opt-out switch (`USE_SKILL_REPLY=0`) but disabling it does **not** restore the old scrape path — it simply stops the skill from being injected, leaving Claude with no path to Discord. See `c_lord/skills/`.
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
-3. **Emoji reactions for status**: Non-intrusive progress indication on the user's message. Debounced to avoid Discord rate limits.
+3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. See `docs/specs/thread-lamp.md`.
 4. **Tool-use embeds are still driven by the tmux event stream**: `tmux_runner.py` still polls `capture-pane` and emits SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events. Only the ASSISTANT text events were removed (#53). So Discord still gets live "Bash(...)" / "Read(...)" embeds, status emoji, plan-approval buttons, etc. — none of that goes through the (removed) text-post path.
 5. **Installable package**: `c_lord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
 6. **Shared run helper**: `cogs/_run_helper.py` centralizes Claude CLI execution logic used by both ClaudeChatCog and SkillCommandCog.
@@ -361,8 +361,10 @@ incident that motivated this.
 
 **Label-based exemptions** (enforced by `dod-gate` CI — see `.github/workflows/dod-gate.yml`):
 
-- `no-runtime-change` or `documentation` label: **exempts TDD evidence and Staging verification** (items 2 and 4 below). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
-- **Closes discipline (item 6) is always enforced**, regardless of labels.
+- `no-runtime-change` or `documentation` label: **waives the DoD-completion checklist below** (notably the **TDD evidence** and **Staging verification** requirements). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
+- **`Closes` discipline is always enforced**, regardless of labels: if a PR uses `Closes`/`Resolves #N`, that Issue's Acceptance Criteria must be 100% met (else use `Refs #N`).
+
+<!-- 参照はルール名で固定（番号で指さない）。項目を挿入すると番号がずれ免除対象がずれるため。dod-gate.yml の実挙動: ラベルあり → DoD 完了要件 (Rule 1) を免除 / `Closes` 規律 (Rule 2) は常時適用。 -->
 
 A PR may be merged only when:
 
@@ -386,6 +388,7 @@ PR. When you (or Opus) author an Issue:
 - **修正の前に必ず Issue 化し、ブランチを紐付ける。** 勝手に直し始めない（診断と合意が先）。
 - **Why を必ず書く（背骨）。** 「この修正/実装は何のためか」を利用者目線で明記する。Issue は**クローズ後も「どういう考えでそうなったか」を辿る記録**なので、症状だけでなく意図を残す。Why が無いと次の判断ができない。
 - **証跡（スクショ）を Issue にも残す。** テキストログだけでは表出しない問題（レイアウト・UI・ランプ状態など）があるため、**スクリーンショット**（理想は tmux の動作 × Discord の動作を合成した画像）で「リアルな問題」を示す。ユーザー提供のスクショは可能な限り Issue に入れる。網羅性を優先し、長いログ/コードは `<details><summary>` で畳んで可読性を保つ。
+- **「あるべき見た目」はデザインカンプで絵にして合意する（#316）。** Discord 上の見た目・挙動を**提案**する Issue/設計では、`scripts/discord_mockup.py` で手組み spec から Discord 風モック PNG を描き、Issue に添付して「**ゴールはこれ**」を絵で合意する（散文 spec では yousan が裁定できない — #287 P1）。スクショ（上項）が「実際こうだった」の証跡なのに対し、こちらは「**こうあるべき**」のモック。使い方は `docs/design-comp-mockup.md`。
 - **本文は常に「現在の真実」に保つ。** 相談で方針が変わったら 概要/原因/AC を実態に書き換える。ただし**重要な書き換えは日付つきコメントで「何を・なぜ変えたか」を一次記録として残す**（後続コメントがどの版の本文を前提にしていたか辿れるように）。積み残しは新規 Issue 乱立ではなく**再オープン＋コメント**で残す。
 - **One Issue = one concern.** Do not bundle a bug fix with a design/enhancement task, or two unrelated behaviors, in one Issue. Bundling lets an agent satisfy the easy/testable half, write `Closes`, and auto-close the rest into oblivion. Split into separate Issues.
 - **Acceptance Criteria must be binary and unambiguous** — each AC is a checkbox that is objectively true or false (a command to run, an observable output, a state to assert). No "should probably", no "consider", no open options ("A案 or B案") left in the AC. Decide before filing; move discussion out of the AC list.

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from c_lord.thread_name import STATUS_EMOJI, build_name, parse_topic_from_name
+from c_lord.thread_name import (
+    STATUS_EMOJI,
+    build_name,
+    parse_topic_from_name,
+    thread_lamp_enabled,
+)
 
 
 def test_build_name_alive_with_index():
@@ -111,3 +116,72 @@ def test_build_name_dead_no_work_prefix():
     out = build_name("topic", "dead", 3)
     assert "W3" not in out
     assert "│" not in out
+
+
+# --- #329: lamp can be disabled (default) — name keeps the topic, drops the
+#     leading status emoji so the thread is never renamed on a state change. ---
+
+
+def test_build_name_lamp_false_omits_emoji_with_index():
+    # lamp disabled → no leading status emoji, topic + work prefix kept
+    assert build_name("topic", "running", 3, lamp=False) == "W3 │ topic"
+
+
+def test_build_name_lamp_false_omits_emoji_no_index():
+    assert build_name("topic", "running", None, lamp=False) == "topic"
+
+
+def test_build_name_lamp_false_no_status_emoji_for_any_state():
+    for state in ("running", "waiting", "error", "dead", "alive", "pending"):
+        out = build_name("topic", state, 2, lamp=False)
+        for emoji in STATUS_EMOJI.values():
+            assert emoji not in out, f"{state!r} leaked {emoji!r}"
+
+
+def test_build_name_lamp_false_truncates_long_topic():
+    out = build_name("あ" * 100, "running", 12, lamp=False)
+    assert len(out) <= 30
+    assert out.startswith("W12 │ ")
+
+
+def test_build_name_lamp_true_is_default_and_backward_compat():
+    # Default is lamp=True — unchanged behaviour.
+    assert build_name("topic", "running", 3) == build_name("topic", "running", 3, lamp=True)
+    assert build_name("topic", "running", 3).startswith(STATUS_EMOJI["running"])
+
+
+def test_parse_roundtrip_lamp_false():
+    name = build_name("やること整理", "running", 3, lamp=False)
+    assert parse_topic_from_name(name) == "やること整理"
+
+
+# --- #329: thread_lamp_enabled() — off by default, opt in via CLORD_THREAD_LAMP ---
+
+
+def test_thread_lamp_enabled_default_off(monkeypatch):
+    monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)
+    assert thread_lamp_enabled() is False
+
+
+def test_thread_lamp_enabled_opt_in(monkeypatch):
+    monkeypatch.setenv("CLORD_THREAD_LAMP", "1")
+    assert thread_lamp_enabled() is True
+
+
+def test_thread_lamp_enabled_explicit_overrides_env(monkeypatch):
+    monkeypatch.setenv("CLORD_THREAD_LAMP", "1")
+    assert thread_lamp_enabled(False) is False
+    monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)
+    assert thread_lamp_enabled(True) is True
+
+
+def test_thread_lamp_enabled_truthy_values(monkeypatch):
+    for v in ("1", "true", "yes", "on", "True", "YES"):
+        monkeypatch.setenv("CLORD_THREAD_LAMP", v)
+        assert thread_lamp_enabled() is True, f"{v!r} should enable"
+
+
+def test_thread_lamp_enabled_falsy_values(monkeypatch):
+    for v in ("0", "false", "no", "off", "", "  "):
+        monkeypatch.setenv("CLORD_THREAD_LAMP", v)
+        assert thread_lamp_enabled() is False, f"{v!r} should disable"

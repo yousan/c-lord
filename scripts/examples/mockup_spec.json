@@ -1,0 +1,33 @@
+{
+  "messages": [
+    {
+      "author": "yousan",
+      "timestamp": "2026-06-04 12:00",
+      "content": "新機能のゴール: スレッドに送った長文が、途中で切れずに最後まで届いてほしい 🙏",
+      "reactions": ["🧠", "✅"]
+    },
+    {
+      "author": "C-lord",
+      "is_bot": true,
+      "color": "#5865F2",
+      "timestamp": "2026-06-04 12:00",
+      "content": "了解です。実装イメージはこんな見え方です:\n```python\ndef _split_reply(text):\n    # send in <=2000-char chunks, in order\n    ...\n```",
+      "embeds": [
+        { "title": "🛠️ Bash(git status)...", "description": "⏳ 2s elapsed...", "color": "#FEE75C" },
+        {
+          "title": "✅ Done",
+          "description": "Duration 3.2s · $0.0041",
+          "color": "#57F287",
+          "fields": [{ "name": "model", "value": "opus 4.8", "inline": true }]
+        }
+      ],
+      "attachments": ["diff.patch"],
+      "reactions": [{ "emoji": "✅", "count": 1 }]
+    },
+    {
+      "author": "yousan",
+      "timestamp": "2026-06-04 12:01",
+      "content": "いいね、これがゴール。"
+    }
+  ]
+}

@@ -31,10 +31,12 @@ from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
+from ..discord_ref import enrich_discord_references
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
+from ..thread_name import thread_lamp_enabled
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -86,11 +88,17 @@ class ClaudeChatCog(commands.Cog):
         resume_repo: PendingResumeRepository | None = None,
         settings_repo: SettingsRepository | None = None,
         allowed_role_name: str | None = None,
+        thread_lamp: bool | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.runner = runner
         self._max_concurrent = max_concurrent
+        # Thread-name status lamp (🟢🟡🔴⚪). Off by default (#329) because
+        # repainting the name on every state change saturates Discord's
+        # thread-rename rate-limit. Opt in via thread_lamp=True or
+        # CLORD_THREAD_LAMP=1. Resolved once here so the env is read at startup.
+        self._thread_lamp = thread_lamp_enabled(thread_lamp)
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
@@ -311,48 +319,10 @@ class ClaudeChatCog(commands.Cog):
             # just deleted concurrently).
             topic = parse_topic_from_name(thread.name) or "新しいスレッド"
 
-        new_name = build_name(topic, state, window_number)
-        if (thread.name or "") == new_name:
-            return
-        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
-            await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
-            logger.info(
-                "%s lamp → %s (event-driven) %r",
-                log_ctx(thread_id=thread.id),
-                state,
-                new_name,
-            )
-
-    async def _set_lamp_state(
-        self,
-        thread: discord.Thread,
-        state: str,
-        tmux_manager,  # TmuxManager | None
-    ) -> None:
-        """Persist ``state`` and repaint the thread-name lamp immediately (#236).
-
-        Lightweight counterpart to :meth:`_apply_thread_naming` — reuses the
-        already-stored topic (no LLM retitle) and the stable ``work{N}`` window
-        number, so the leading 🟢/🟡 flips the instant a turn starts/ends instead
-        of waiting for the ≤60s state-sync poll. No-op when no topic exists yet
-        (the next user-driven naming pass will catch up).
-        """
-        from ..thread_name import build_name
-
-        await self.repo.set_state(thread.id, state)
-
-        record = await self.repo.get(thread.id)
-        topic = record.topic if record else None
-        if not topic:
-            return
-
-        window_number: int | None = None
-        if tmux_manager is not None:
-            info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
-            if info is not None:
-                window_number = info[1]
-
-        new_name = build_name(topic, state, window_number)
+        # lamp=False (default, #329) keeps the topic but drops the leading
+        # status emoji, so the name no longer changes on state transitions and
+        # the only rename is the one-off topic naming.
+        new_name = build_name(topic, state, window_number, lamp=self._thread_lamp)
         if (thread.name or "") == new_name:
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
@@ -782,6 +752,7 @@ class ClaudeChatCog(commands.Cog):
             name=thread_name, auto_archive_duration=archive_minutes
         )
         prompt, image_paths = await self._build_prompt_and_images(message)
+        prompt = await enrich_discord_references(prompt, message, self.bot)
         await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
 
     async def spawn_session(
@@ -973,6 +944,7 @@ class ClaudeChatCog(commands.Cog):
             record = await self.repo.get(thread.id)
             session_id = (record.session_id or None) if record else None
             prompt, image_paths = await self._build_prompt_and_images(message)
+            prompt = await enrich_discord_references(prompt, message, self.bot)
 
             # Interrupt any active session in this thread before starting a new one.
             existing_runner = self._active_runners.get(thread.id)
@@ -1120,11 +1092,14 @@ class ClaudeChatCog(commands.Cog):
             if current_task is not None:
                 self._active_tasks[thread.id] = current_task
 
-            # Lamp → 🟢 running immediately, event-driven (#236). Persist the
-            # state now so the rename in _apply_thread_naming below paints the
-            # thread green without waiting for the ≤60s state-sync poll.
-            with contextlib.suppress(Exception):
-                await self.repo.set_state(thread.id, "running")
+            # #246: the per-turn 🟢/🟡 lamp now lives on the trigger-message
+            # reaction (StatusManager below), NOT on the thread name. We no
+            # longer set_state("running") + immediately rename here — that
+            # per-turn PATCH (added in #236) saturated Discord's ~2-renames-per-
+            # 10-min thread bucket and made the lamp stick (#241). The thread
+            # name lamp is now the low-frequency, eventually-consistent sidebar
+            # view owned by the state-sync poll (its is_processing guard still
+            # promotes waiting→running within ≤60s).
 
             # Mark thread as PROCESSING when Claude starts
             if dashboard is not None:
@@ -1142,7 +1117,7 @@ class ClaudeChatCog(commands.Cog):
                 )
 
             status = StatusManager(user_message, on_hard_stall=_notify_stall)
-            await status.set_thinking()
+            await status.set_running()
 
             model_override = await self._get_current_model()
 
@@ -1261,11 +1236,10 @@ class ClaudeChatCog(commands.Cog):
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
 
-                # Lamp → 🟡 waiting the instant the turn finishes (#236). Runs
-                # after _active_tasks.pop above, so is_processing() is already
-                # False and the next state-sync poll stays consistent.
-                with contextlib.suppress(Exception):
-                    await self._set_lamp_state(thread, "waiting", tmux_manager)
+                # #246: no per-turn thread rename here. The turn-end 🟡 lamp is
+                # the StatusManager reaction (set via set_done() on the RESULT
+                # event); the thread-name lamp flips to 🟡 on the next state-sync
+                # poll (is_processing() is already False after the pop above).
 
                 if dashboard is not None:
                     with contextlib.suppress(Exception):
