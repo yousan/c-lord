@@ -38,3 +38,4 @@ tmux.sh
 
 # Version file generated at build time by hatch-vcs (source of truth = git tags)
 c_lord/_version.py
+.staging-lease
