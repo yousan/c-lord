@@ -1989,7 +1989,6 @@ class TestApplyThreadNamingRetitle:
 
     def _make_cog_with_repo(self, record):
         """Return (cog, thread, tmux_manager) with a pre-configured repo record."""
-        from unittest.mock import patch as _patch
 
         cog = _make_cog()
         cog.repo.get = AsyncMock(return_value=record)
@@ -2067,6 +2066,47 @@ class TestApplyThreadNamingRetitle:
         cog.repo.set_topic.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_no_per_turn_rename_when_name_unchanged(self, monkeypatch):
+        """#246: a continuing turn where the topic already matches the current
+        thread name issues NO rename. The per-turn 🟢/🟡 lamp is now the
+        StatusManager reaction; the thread name is only repainted by the
+        state-sync poll, so claude_chat must not PATCH the thread every turn
+        (that #236 churn saturated Discord's rename rate-limit, #241).
+
+        #329: with the thread-name lamp off by default, the unchanged name has
+        no leading status emoji (just ``W<N> │ <topic>``)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)  # default: lamp off
+
+        # Thread name already reflects the topic for the current state (lamp off
+        # → no leading emoji).
+        record = self._make_record(topic="認証リファクタ", state="running")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "W1 │ 認証リファクタ"
+
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="続きをお願いします"
+            )
+
+        thread.edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_set_lamp_state_removed(self):
+        """#246: the per-turn lamp-rename helper is gone (replaced by reactions).
+
+        Guards against re-introducing a turn-boundary ``thread.edit`` that would
+        bring the 429 storm back.
+        """
+        cog = _make_cog()
+        assert not hasattr(cog, "_set_lamp_state")
+
+    @pytest.mark.asyncio
     async def test_retitle_skips_when_locked(self):
         """When auto_topic_locked=1, maybe_retitle must not be called."""
         from unittest.mock import patch
@@ -2113,9 +2153,10 @@ class TestApplyThreadNamingRetitle:
 class TestThreadLampDisabled:
     """#329: thread-name status lamp (🟢🟡) is off by default.
 
-    Repainting the thread name on every state change saturates Discord's
-    thread-rename rate-limit, so ``_set_lamp_state`` must persist the DB state
-    but skip the rename unless ``CLORD_THREAD_LAMP`` opts in.
+    Renaming the thread to repaint the leading emoji saturates Discord's
+    thread-rename rate-limit, so by default ``_apply_thread_naming`` keeps the
+    topic but emits no status emoji (and the state-sync poll is skipped — see
+    setup.py). Opt back in with ``CLORD_THREAD_LAMP=1``.
     """
 
     def _make_cog_and_thread(self, *, topic: str | None = "認証リファクタ"):
@@ -2135,29 +2176,6 @@ class TestThreadLampDisabled:
         tmux = MagicMock()
         tmux.get_window_info = MagicMock(return_value=("@1", 1))
         return cog, thread, tmux
-
-    @pytest.mark.asyncio
-    async def test_set_lamp_state_persists_db_but_skips_rename_by_default(self, monkeypatch):
-        monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)
-        cog, thread, tmux = self._make_cog_and_thread()
-
-        await cog._set_lamp_state(thread, "waiting", tmux)
-
-        cog.repo.set_state.assert_awaited_once_with(55555, "waiting")
-        thread.edit.assert_not_awaited()  # no rename → never hits rename rate-limit
-
-    @pytest.mark.asyncio
-    async def test_set_lamp_state_renames_when_opted_in(self, monkeypatch):
-        monkeypatch.setenv("CLORD_THREAD_LAMP", "1")
-        cog, thread, tmux = self._make_cog_and_thread()
-
-        await cog._set_lamp_state(thread, "waiting", tmux)
-
-        thread.edit.assert_awaited_once()
-        call_name = thread.edit.await_args.kwargs.get(
-            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
-        )
-        assert call_name.startswith("🟡")  # waiting lamp painted
 
     @pytest.mark.asyncio
     async def test_apply_thread_naming_omits_lamp_emoji_by_default(self, monkeypatch):
@@ -2188,3 +2206,120 @@ class TestThreadLampDisabled:
         assert "初回トピック" in call_name  # topic still applied
         for emoji in STATUS_EMOJI.values():
             assert emoji not in call_name  # no lamp emoji
+
+    @pytest.mark.asyncio
+    async def test_apply_thread_naming_paints_lamp_when_opted_in(self, monkeypatch):
+        """CLORD_THREAD_LAMP=1 restores the leading status emoji (backward compat)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        monkeypatch.setenv("CLORD_THREAD_LAMP", "1")
+        cog, thread, tmux = self._make_cog_and_thread(topic=None)
+        cog.repo.set_topic = AsyncMock()
+        thread.name = "old"
+
+        with patch.object(
+            cc_module.topic_module,
+            "generate_topic",
+            new=AsyncMock(return_value=("初回トピック", "llm")),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="初回メッセージです"
+            )
+
+        thread.edit.assert_awaited_once()
+        call_name = thread.edit.await_args.kwargs.get(
+            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
+        )
+        assert "初回トピック" in call_name
+        assert call_name.startswith("🟢")  # running lamp painted
+
+
+class TestDiscordLinkEnrichmentWireIn:
+    """#318: pasted Discord links are resolved into the prompt that reaches Claude."""
+
+    @staticmethod
+    def _channel_with_message(content: str, *, name: str = "support") -> MagicMock:
+        referenced = MagicMock()
+        referenced.content = content
+        referenced.author = MagicMock(display_name="bob", name="bob")
+        referenced.created_at = "2026-06-05T00:00:00"
+        channel = MagicMock()
+        channel.name = name
+        channel.fetch_message = AsyncMock(return_value=referenced)
+        return channel
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_inlines_referenced_message(self) -> None:
+        cog = _make_cog()
+        cog.bot.get_channel = MagicMock(
+            return_value=self._channel_with_message("the linked content")
+        )
+        cog._run_claude = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        thread.parent_id = 999
+        thread.send = AsyncMock()
+        msg = MagicMock(spec=discord.Message)
+        msg.id = 1
+        msg.channel = thread
+        msg.reference = None
+        msg.content = "look 👉 https://discord.com/channels/111/222/333"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+
+        await cog._handle_thread_reply(msg)
+
+        cog._run_claude.assert_awaited_once()
+        prompt_arg = cog._run_claude.await_args.args[2]
+        assert "the linked content" in prompt_arg  # enriched
+        assert "look 👉" in prompt_arg  # original preserved
+
+    @pytest.mark.asyncio
+    async def test_new_conversation_inlines_referenced_message(self) -> None:
+        cog = _make_cog()
+        cog.bot.get_channel = MagicMock(
+            return_value=self._channel_with_message("fresh-thread linked content")
+        )
+        cog._run_claude = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 7
+        msg = MagicMock(spec=discord.Message)
+        msg.id = 2
+        msg.reference = None
+        msg.content = "kick off https://discord.com/channels/111/222/333"
+        msg.attachments = []
+        msg.create_thread = AsyncMock(return_value=thread)
+
+        await cog._handle_new_conversation(msg)
+
+        cog._run_claude.assert_awaited_once()
+        prompt_arg = cog._run_claude.await_args.args[2]
+        assert "fresh-thread linked content" in prompt_arg
+
+    @pytest.mark.asyncio
+    async def test_spawn_session_seed_is_not_enriched(self) -> None:
+        """Programmatic spawn (seed message) must NOT be enriched — only human turns are."""
+        cog = _make_cog()
+        # A channel that WOULD enrich if enrichment were (wrongly) called on the seed.
+        cog.bot.get_channel = MagicMock(return_value=self._channel_with_message("LEAKED"))
+        cog._run_claude = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 5
+        thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.create_thread = AsyncMock(return_value=thread)
+
+        prompt = "do it https://discord.com/channels/111/222/333"
+        await cog.spawn_session(channel, prompt)
+        await asyncio.sleep(0)  # let the create_task(_run_claude) run
+
+        cog._run_claude.assert_awaited_once()
+        prompt_arg = cog._run_claude.await_args.args[2]
+        assert prompt_arg == prompt  # passed through unchanged
+        assert "LEAKED" not in prompt_arg

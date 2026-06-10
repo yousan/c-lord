@@ -115,16 +115,20 @@ Type normally in the thread. Each message is sent to Claude as a new prompt. If 
 
 ### Status Indicators (Emoji Reactions)
 
-The bot adds emoji reactions to your message to show what Claude is doing:
+The bot adds a single emoji reaction to your message to show the turn status:
 
 | Emoji | Meaning |
 |-------|---------|
-| 🧠 | Thinking / reasoning |
-| 🛠️ | Reading files |
-| 💻 | Editing code |
-| 🌐 | Web search |
+| 🟢 | Running — Claude is working (thinking or running tools) |
+| 🟡 | Waiting — the turn finished; it's your turn |
+| ❌ | The turn ended in an error |
+| ⚠️ | No activity for a while — possible stall (extended thinking or compaction) |
+| 🗜️ | Compacting context |
 
-Reactions are removed when the step completes.
+The reaction flips 🟢 → 🟡 each turn. Because reactions and thread renames use
+different Discord rate limits, this lamp stays responsive even under heavy use;
+the 🟢/🟡 in the **thread name** is a slower, eventually-consistent sidebar view
+(#246).
 
 ---
 

@@ -75,8 +75,8 @@ Discord screenshot (user-provided): <attach / link>
 
 See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked.
 
-> **Label exemptions** (`no-runtime-change` or `documentation` label): items 1–2 and 5 below are waived.
-> `Closes` discipline (item 7) is **always enforced**, regardless of label.
+> **Label exemptions** (`no-runtime-change` or `documentation` label): the DoD-completion checklist below is waived (notably **TDD evidence** and **Staging Evidence**).
+> **`Closes` discipline is always enforced**, regardless of label: if you use `Closes`/`Resolves #N`, the Acceptance Criteria above must still be fully checked (else use `Refs #N`).
 
 - [ ] Every Acceptance Criterion above is checked
 - [ ] TDD: test failed before (RED) and passes after (GREEN) — RED line pasted
