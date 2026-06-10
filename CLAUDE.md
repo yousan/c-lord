@@ -91,12 +91,9 @@ uv run python -m c_lord.main
 Bot 再起動は積極的に行ってよい。新しいコードで Bot を再起動し、Discord 上で動作確認する。
 
 ```bash
-# 1. Bot 再起動
-# 注意: 同一ホストで staging clone (c-lord-parallel-3 等) も動かしている場合、
-# 素の pgrep だと staging も巻き添えで kill される。本番だけ狙うなら venv パスで絞る:
-#   pgrep -f "/home/yousan/c-lord/.venv/bin/python3 -m c_lord.main" | xargs -r kill
-pgrep -f "c_lord.main" | xargs kill 2>/dev/null; sleep 2
-nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &
+# 1. Bot 再起動 — 必ず scripts/staging.sh を使う (#327)。
+#    pgrep パターン kill / nohup uv run は事故パターンとして禁止 (docs/STAGING.md 参照)
+bash scripts/staging.sh restart
 
 # 2. E2E テスト実行（要 .env: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID / E2E_TEST_WEBHOOK_URL）
 uv run pytest -m e2e tests/e2e/ -v
@@ -159,7 +156,7 @@ api_server をオプトインで有効化してある環境では `POST /api/thr
 
 ## Debugging & Troubleshooting
 
-Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ** と **Discord 上のメッセージ** の 2 つ。前者は `nohup` 経由で `/tmp/clord-bot.log` に出ているのが運用上の標準 (上の "Running (standalone)" 参照)。後者は `.env` を読んで Discord REST API を curl で叩く ("Debugging Discord from a Claude session" 参照 — Claude Code から実行可)。
+Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ** と **Discord 上のメッセージ** の 2 つ。前者のパスは `bash scripts/staging.sh status` が表示する (per-run ログ + 最新への symlink `/tmp/clord-bot-<clone名>.log`。旧運用の固定パス `/tmp/clord-bot.log` / `/tmp/clord-bot-staging.log` は名残り)。後者は `.env` を読んで Discord REST API を curl で叩く ("Debugging Discord from a Claude session" 参照 — Claude Code から実行可)。
 
 ### ログの読み方
 
@@ -414,44 +411,27 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 4. **動作確認 (E2E on staging)** ← **必須** — 下記のスキーム
 5. **セルフレビュー** — diff を読み返す / 不要な変更がないか / セキュリティ監査 (`security-audit` skill)
 6. **Merge** (squash + delete branch) — **only after every [Definition of Done](#definition-of-done-dod--single-source-of-truth) box is checked.** A green CI is necessary but not sufficient.
-7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && pgrep -f "/home/yousan/c-lord/.venv/bin/python3 -m c_lord.main" | xargs -r kill && sleep 3 && nohup uv run python -m c_lord.main > /tmp/clord-bot.log 2>&1 &`
-   - ⚠️ **本番 venv のパスで絞ること。** 素の `pgrep -f c_lord.main` は staging clone (`c-lord-parallel-3` 等) のプロセスにもマッチするため、本番再起動のつもりで staging を巻き添えで kill してしまう。`/home/yousan/c-lord/.venv` を含むパスで絞れば本番プロセスだけに当たる (staging は `c-lord-parallel-3/.venv` なので除外される)。staging 側の再起動コマンド (下記 [動作確認スキーム](#動作確認スキーム-必須)) が `pgrep -f "c-lord-parallel-3.*c_lord.main"` で絞っているのと同じ要領。
+7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && bash scripts/staging.sh restart`
+   - スクリプトは実行ディレクトリの bot **だけ**を `/proc/<pid>/cwd` で同定して PID 直 kill する(staging を巻き添えにしない)。pgrep パターン kill は禁止 — 事故パターン一覧は `docs/STAGING.md` 参照。
+   - ⚠️ 本番が supervisor (systemd --user / start-clord.sh --guard) 配下で動いている場合は supervisor 経由で再起動すること(手動 kill+起動は #195 の二重 bot 事故の元)。
 
 ### 動作確認スキーム (必須)
 
 **ルール**: バグ修正 / 機能追加の PR は必ず staging 環境で「**修正前 = 再現できる**」「**修正後 = 再現しない (グリーン)**」を webhook 経由で確認する。これを通らないものはマージしない。
 
-**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。詳細は memory `project_staging_env.md` 参照。本番 (`/home/yousan/c-lord`) は kill しない。staging bot は共有リソースで、再起動・ブランチ切替の調整漏れは他セッションの検証を中断させるため、下記レシピ末尾の **原状復帰** を必ず実行する。
+**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。本番 (`/home/yousan/c-lord`) は kill しない。staging bot は共有リソース — 借用前の占有確認と検証後の**原状復帰**を必ず行う。
 
-**手順** (バグ修正の例):
+**手順の詳細は [docs/STAGING.md](docs/STAGING.md) が唯一の正**(レイアウト・占有プロトコル・禁止事項・増設手順を含む)。骨子:
+
 ```bash
-# 1. RED 再現 — staging 上で問題が発生することを webhook 経由で確認
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"content":"<bug を再現する入力>"}' \
-  "$E2E_TEST_WEBHOOK_URL?wait=true&thread_id=$E2E_TEST_THREAD_ID"
-# → /tmp/clord-bot-staging.log で問題発生をログ確認
-# → Discord 上で症状を確認 (REST API で fetch_messages)
-
-# 2. 修正実装 + ユニットテスト
-
-# 3. staging bot を新コードで再起動 (単一インスタンスで起動)
-#    ⚠️ パターン kill は実行中の自分のシェル (eval 中の `c_lord.main` 文字列) にも当たって自滅することがある。
-#       残存 count が 0 にならないときは PID 直指定 (kill <PID>) が安全。
-pgrep -f "c-lord-parallel-3.*c_lord.main" | xargs -r kill; sleep 3
-echo "remaining: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"   # ← 0 を確認
-nohup uv run python -m c_lord.main > /tmp/clord-bot-staging.log 2>&1 &
-sleep 2; echo "running: $(pgrep -f 'c-lord-parallel-3.*c_lord.main' | wc -l)"  # ← 1 を確認 (二重起動防止)
-
-# 4. GREEN 確認 — 同じ webhook 入力で問題が再現しないこと
-curl -X POST ... (上と同じ)
-# → ログ + Discord 上の応答が期待通りであることを確認
-
-# 5. PR 本文の "Test plan" にこの再現→修正のログ抜粋を貼る
-
-# 6. 原状復帰 — 検証で切り替えていたなら idle ブランチに戻して上記 (#3) を再実行
-#    idle ブランチは memory project_staging_env.md の "Default branch when idle" 参照
-git checkout fix/wire-max-concurrent-sessions   # 例
+cd /home/yousan/c-lord-parallel-3
+bash scripts/staging.sh status        # 占有・状態確認 (.staging-lease も見る)
+bash scripts/staging.sh restart main  # 1. RED — 修正前コードで再現 (webhook 経由)
+bash scripts/staging.sh restart <fix-branch>  # 3. GREEN — 修正後コードで再現しない
+bash scripts/staging.sh restart main  # 6. 原状復帰 (idle ブランチ = main)
 ```
+
+webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッドに sessions レコードが必要、等) は STAGING.md の「検証レシピ」を参照。PR 本文の "Staging Evidence" に RED→GREEN のログ抜粋を貼る。
 
 **機能追加の場合**: RED の代わりに「実装前は存在しない挙動」「実装後は期待挙動」を webhook + ログで観測する。例: 構造化ログ追加 PR では `grep "thread=<id>" /tmp/clord-bot-staging.log` で **before = ヒットしない / after = enter/exit ペアが出る** を比較。
 
