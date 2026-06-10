@@ -1053,6 +1053,55 @@ class TestTmuxClaudeRunnerRun:
         tmux_manager.start_claude.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_dismisses_open_ask_menu_before_send_input(self, runner, tmux_manager) -> None:
+        """A follow-up message must NOT have its Enter eaten by an open menu (#358).
+
+        Repro from the real incident (thread 1513372727447126056): Claude was
+        blocked on an AskUserQuestion menu when the user sent an unrelated
+        message.  Before the fix, ``run()`` delivered it via ``send_input``
+        (text + trailing Enter) straight into the open menu, so the Enter
+        selected the highlighted *first* option ("commit だけ") and the typed
+        text was discarded.  After the fix, the open menu is dismissed with Esc
+        BEFORE the message is delivered, so no option is selected by accident.
+        """
+        tmux_manager.is_claude_running.return_value = True
+        # A real captured AskUserQuestion menu (open, awaiting a choice).
+        ask_pane = _load_fixture("ask_user_question_3options.txt")
+        done_pane = _make_pane(["● done"], with_input_prompt=True)
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            # The first capture (pre-send peek) still sees the open menu;
+            # afterwards it is gone so the poll loop can finalize the turn.
+            return ask_pane if calls["n"] == 1 else done_pane
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.05),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+        ):
+            async for _event in runner.run("そのファイルを Discord に添付してください"):
+                pass
+
+        # Ordered view of the two pane interactions we care about.
+        order = [
+            (c[0], c[1]) for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_input")
+        ]
+        esc_idx = next(
+            (i for i, (m, a) in enumerate(order) if m == "send_keys" and "Escape" in a),
+            None,
+        )
+        send_idx = next((i for i, (m, _a) in enumerate(order) if m == "send_input"), None)
+        assert esc_idx is not None, "expected Esc (cancel_menu) to dismiss the open menu"
+        assert send_idx is not None, "expected the message to be delivered via send_input"
+        assert esc_idx < send_idx, "Esc must be sent BEFORE send_input (menu closed first)"
+
+    @pytest.mark.asyncio
     async def test_start_claude_failure_yields_error(self, runner, tmux_manager) -> None:
         tmux_manager.is_claude_running.return_value = False
         tmux_manager.start_claude.return_value = False
