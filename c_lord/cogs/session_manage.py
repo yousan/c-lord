@@ -1003,7 +1003,7 @@ class SessionManageCog(commands.Cog):
 
         results: list[str] = []
 
-        # Kill the tmux window to free the work<N> slot.
+        # Kill the tmux window to free the w<N> slot.
         tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
         if tmux_mgr is not None:
             killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)

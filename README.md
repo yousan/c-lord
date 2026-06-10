@@ -623,7 +623,7 @@ The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Kn
 | Thread  | tmux window  | 1:1     |
 
 - **1 Discord channel = 1 tmux session.** All threads in a channel share that one session. The session name is derived from the channel's bound repo (via `/clord-init`); unbound channels fall back to the default `clord` session.
-- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`work1`, `work2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
+- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`w1`, `w2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
 
 For the "why" behind this design, see [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 

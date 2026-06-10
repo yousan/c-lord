@@ -1,8 +1,10 @@
 """Tmux session management for Claude Code sessions.
 
-Uses a single tmux session ``clord`` with per-thread windows (``work1``,
-``work2``, ...).  The mapping between thread IDs and window names is
+Uses a single tmux session ``clord`` with per-thread windows (``w1``,
+``w2``, ...).  The mapping between thread IDs and window names is
 stored in tmux window options (``@thread_id``) so it survives bot restarts.
+(Windows created before the prefix was shortened are named ``work{N}`` and
+are still recognized — see :func:`parse_work_number`.)
 
 All operations use ``asyncio.to_thread`` for non-blocking execution.
 When tmux is not installed, operations degrade gracefully (log warning, skip).
@@ -24,7 +26,14 @@ _THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
 logger = logging.getLogger(__name__)
 
 SESSION_NAME = "clord"
-WINDOW_PREFIX = "work"
+# Short window prefix (#356): windows are named ``w1``, ``w2``, … so the tmux
+# window list / status bar stays compact (``w73`` instead of ``work73``).
+WINDOW_PREFIX = "w"
+# Windows created before the prefix was shortened are named ``work{N}``.  We
+# keep recognizing that form so already-running windows survive the transition
+# (their W<N> Discord label and thread mapping keep working until they are
+# naturally recreated). New windows always use ``WINDOW_PREFIX``.
+_LEGACY_WINDOW_PREFIX = "work"
 
 # #147: Claude Code runs with ``editorMode: vim``.  Its input box therefore has
 # a vim NORMAL mode in which literal characters (``send-keys -l``) are
@@ -45,21 +54,29 @@ _INSERT_SETTLE = 0.15
 
 
 def parse_work_number(window_name: str) -> int | None:
-    """Extract the ``N`` from a ``work{N}`` window name.
+    """Extract the ``N`` from a ``w{N}`` (or legacy ``work{N}``) window name.
 
-    Returns ``None`` for windows that don't follow the ``work{N}`` convention
-    (e.g. the session's initial shell window, or a window adopted by dir-match).
+    Returns ``None`` for windows that don't follow the convention (e.g. the
+    session's initial shell window, or a window adopted by dir-match).
 
     This number is the *stable* window identifier shown as the ``W<N>`` thread
     name prefix. It deliberately is NOT tmux's ``#{window_index}``, which is
     volatile — the index shifts when other windows are killed/renumbered and is
     offset by ``base-index``, so using it would make the Discord ``W<N>`` label
-    disagree with the window's own ``work{N}`` name.
+    disagree with the window's own ``w{N}`` name.
+
+    Both the current short prefix (``w{N}``) and the legacy long prefix
+    (``work{N}``) are accepted so windows created before the rename keep their
+    label across the transition. ``WINDOW_PREFIX`` is checked first; because it
+    is a prefix of ``_LEGACY_WINDOW_PREFIX`` (``"w"`` ⊂ ``"work"``), a name like
+    ``work73`` falls through to the legacy branch (its ``"ork73"`` suffix isn't
+    numeric) and is parsed correctly.
     """
-    if window_name.startswith(WINDOW_PREFIX):
-        suffix = window_name[len(WINDOW_PREFIX) :]
-        if suffix.isdigit():
-            return int(suffix)
+    for prefix in (WINDOW_PREFIX, _LEGACY_WINDOW_PREFIX):
+        if window_name.startswith(prefix):
+            suffix = window_name[len(prefix) :]
+            if suffix.isdigit():
+                return int(suffix)
     return None
 
 
@@ -104,7 +121,7 @@ class TmuxSessionManager:
     """Manages tmux windows for Claude Code Discord threads.
 
     One global tmux session ``clord`` holds all threads.  Each thread gets
-    a window named ``work{N}`` with the thread ID stored in the ``@thread_id``
+    a window named ``w{N}`` with the thread ID stored in the ``@thread_id``
     window option.
     """
 
@@ -193,7 +210,7 @@ class TmuxSessionManager:
         return self._thread_to_window.get(thread_id)
 
     def _next_window_name(self) -> str:
-        """Generate the next ``work{N}`` name and increment the counter."""
+        """Generate the next ``w{N}`` name and increment the counter."""
         name = f"{WINDOW_PREFIX}{self._next_work_id}"
         self._next_work_id += 1
         return name
@@ -285,10 +302,11 @@ class TmuxSessionManager:
             if thread_id is not None:
                 self._thread_to_window[thread_id] = window_name
 
-            if window_name.startswith(WINDOW_PREFIX):
-                suffix = window_name[len(WINDOW_PREFIX) :]
-                if suffix.isdigit():
-                    max_id = max(max_id, int(suffix))
+            # Count both ``w{N}`` and legacy ``work{N}`` windows toward the high
+            # watermark so numbering stays monotonic across the prefix rename.
+            n = parse_work_number(window_name)
+            if n is not None:
+                max_id = max(max_id, n)
 
         self._next_work_id = max_id + 1
 
@@ -565,9 +583,9 @@ class TmuxSessionManager:
         """Return ``(window_id, work_number)`` for the thread, or None.
 
         ``window_id`` is tmux's internal immutable id (e.g. ``@7``).
-        ``work_number`` is the ``N`` in the window's ``work{N}`` name — the
-        stable identifier shown as the ``W<N>`` thread-name prefix. It is
-        ``None`` for windows that don't follow the ``work{N}`` convention.
+        ``work_number`` is the ``N`` in the window's ``w{N}`` name (or legacy
+        ``work{N}``) — the stable identifier shown as the ``W<N>`` thread-name
+        prefix. It is ``None`` for windows that don't follow the convention.
 
         Note: this is intentionally NOT tmux's volatile ``#{window_index}``.
         See :func:`parse_work_number` for why the stable name is used instead.
