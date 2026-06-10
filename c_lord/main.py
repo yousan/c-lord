@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import IO
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
@@ -74,11 +74,27 @@ def resolve_data_dir(env_path: Path | None) -> Path:
 
 
 def load_config(env_path: Path | None = None) -> dict[str, str]:
-    """Load and validate configuration from environment."""
+    """Load and validate configuration from environment.
+
+    Issue #324: ``override=True`` — keys defined in the .env file always beat
+    inherited process env. Claude sessions spawned by a bot inherit that bot's
+    DISCORD_* vars; with the python-dotenv default (override=False) those
+    silently won over the local .env and a "staging" launch booted as the
+    production identity (#322). Directory == identity: the .env file is the
+    single source of truth for every key it defines. Keys absent from the
+    file still fall back to the process env (env-var-only setups keep working).
+    """
     if env_path is not None:
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=True)
     else:
-        load_dotenv()
+        # find_dotenv(usecwd=True): search from the CURRENT DIRECTORY upward,
+        # not from this package's location. README documents the bare launch as
+        # "reads .env in current dir" — the package-location walk only matched
+        # that contract by accident (repo-clone deployments) and diverges for
+        # any CWD outside the package tree.
+        found = find_dotenv(usecwd=True)
+        if found:
+            load_dotenv(found, override=True)
 
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token:

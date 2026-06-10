@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from c_lord.main import load_config, resolve_data_dir
 
 
@@ -71,3 +73,56 @@ class TestExpectedBotUserId:
         with patch.object(sys, "exit") as mock_exit:
             load_config()
         mock_exit.assert_called_with(1)
+
+
+class TestDotenvOverride:
+    """Issue #324: keys present in the .env file must beat inherited process env.
+
+    A Claude session spawned by the prod bot inherits prod's DISCORD_* vars;
+    with the python-dotenv default (override=False) those silently win over
+    the staging .env and the "staging" bot boots as production (#322 根因A).
+    Directory == identity: what the .env file says is what the bot is.
+    """
+
+    def test_env_file_beats_inherited_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "inherited-prod-tok")
+        monkeypatch.setenv("DISCORD_CHANNEL_ID", "111")
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "DISCORD_BOT_TOKEN=file-tok\nDISCORD_CHANNEL_ID=222\n", encoding="utf-8"
+        )
+        config = load_config(env_path)
+        assert config["token"] == "file-tok"
+        assert config["channel_id"] == "222"
+
+    def test_keys_absent_from_file_fall_back_to_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Env-var-only setups (no key in .env) keep working — override only
+        applies to keys the file actually defines."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "x")
+        monkeypatch.setenv("DISCORD_CHANNEL_ID", "1")
+        monkeypatch.setenv("CLAUDE_MODEL", "model-from-env")
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "DISCORD_BOT_TOKEN=file-tok\nDISCORD_CHANNEL_ID=222\n", encoding="utf-8"
+        )
+        config = load_config(env_path)
+        assert config["claude_model"] == "model-from-env"
+
+    def test_override_applies_to_cwd_dotenv_without_explicit_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bare `python -m c_lord.main` launch (env_path=None) is the exact
+        path the staging incidents used — it must also prefer the CWD .env."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "inherited-prod-tok")
+        monkeypatch.setenv("DISCORD_CHANNEL_ID", "111")
+        (tmp_path / ".env").write_text(
+            "DISCORD_BOT_TOKEN=cwd-file-tok\nDISCORD_CHANNEL_ID=333\n", encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+        config = load_config()
+        assert config["token"] == "cwd-file-tok"
+        assert config["channel_id"] == "333"
