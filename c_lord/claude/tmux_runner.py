@@ -557,6 +557,21 @@ class TmuxClaudeRunner:
         claude_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)
 
         if claude_running:
+            # If Claude is blocked on an open AskUserQuestion/plan menu, a bare
+            # send_input would type the message + Enter straight into the menu —
+            # the trailing Enter selects the highlighted *first* option and the
+            # typed text is discarded (#358).  The user sending a normal message
+            # instead of clicking a button means "I'm not answering that menu, do
+            # this instead", so dismiss the menu (Esc) first and let the TUI
+            # settle back to the input prompt before delivering the message.
+            if await self.peek_pending_ask() is not None:
+                logger.info(
+                    "Open menu detected before delivering new input; dismissing it "
+                    "(Esc) so the message is not consumed as a menu selection (thread=%d)",
+                    self._thread_id,
+                )
+                await self.cancel_menu()
+                await asyncio.sleep(_MENU_NAV_DELAY)
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
                 yield StreamEvent(
