@@ -101,7 +101,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 
 | Module | Class/Function | Role |
 |--------|---------------|------|
-| `status.py` | `StatusManager` | Emoji reaction manager. Shows one status emoji at a time on the user's original message. Debounced at 700ms to avoid rate limits. Includes stall detection: soft warning (hourglass) at 10s, hard warning at 30s. Maps `ToolCategory` to emoji. Cleans up reactions when done. |
+| `status.py` | `StatusManager` | Emoji reaction lamp on the user's trigger message: 🟢 running (turn start, kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce) — the lamp changes only a couple of times per turn, and reactions use a different rate-limit bucket than thread renames. This replaced the per-turn thread-name lamp that saturated Discord's ~2/10min rename limit (#246); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. Includes stall detection: soft (⏳) at 10s, hard (⚠️) at 30s. |
 | `chunker.py` | `chunk_message()` | Fence-aware message splitter. Splits at paragraph boundaries (preferred), then line boundaries, then hard-splits. Tracks open code fences and properly closes/reopens them across chunk boundaries. Limits chunks to 1950 chars (2000 minus overhead). |
 | `embeds.py` | `tool_use_embed()`, `session_start_embed()`, etc. | Discord embed builders. Color-coded: blurple for info, green for success, red for error, yellow for tool use. Consistent visual language across all bot output. |
 

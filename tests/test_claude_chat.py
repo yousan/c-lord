@@ -2066,6 +2066,41 @@ class TestApplyThreadNamingRetitle:
         cog.repo.set_topic.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_no_per_turn_rename_when_name_unchanged(self):
+        """#246: a continuing turn where the topic and lamp already match the
+        current thread name issues NO rename. The per-turn 🟢/🟡 lamp is now the
+        StatusManager reaction; the thread name is only repainted by the
+        state-sync poll, so claude_chat must not PATCH the thread every turn
+        (that #236 churn saturated Discord's rename rate-limit, #241)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        # Thread name already reflects topic + lamp for the current state.
+        record = self._make_record(topic="認証リファクタ", state="running")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "🟢 W1 │ 認証リファクタ"
+
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="続きをお願いします"
+            )
+
+        thread.edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_set_lamp_state_removed(self):
+        """#246: the per-turn lamp-rename helper is gone (replaced by reactions).
+
+        Guards against re-introducing a turn-boundary ``thread.edit`` that would
+        bring the 429 storm back.
+        """
+        cog = _make_cog()
+        assert not hasattr(cog, "_set_lamp_state")
+
+    @pytest.mark.asyncio
     async def test_retitle_skips_when_locked(self):
         """When auto_topic_locked=1, maybe_retitle must not be called."""
         from unittest.mock import patch
