@@ -392,6 +392,7 @@ PR. When you (or Opus) author an Issue:
 - **修正の前に必ず Issue 化し、ブランチを紐付ける。** 勝手に直し始めない（診断と合意が先）。
 - **Why を必ず書く（背骨）。** 「この修正/実装は何のためか」を利用者目線で明記する。Issue は**クローズ後も「どういう考えでそうなったか」を辿る記録**なので、症状だけでなく意図を残す。Why が無いと次の判断ができない。
 - **証跡（スクショ）を Issue にも残す。** テキストログだけでは表出しない問題（レイアウト・UI・ランプ状態など）があるため、**スクリーンショット**（理想は tmux の動作 × Discord の動作を合成した画像）で「リアルな問題」を示す。ユーザー提供のスクショは可能な限り Issue に入れる。網羅性を優先し、長いログ/コードは `<details><summary>` で畳んで可読性を保つ。
+- **「あるべき見た目」はデザインカンプで絵にして合意する（#316）。** Discord 上の見た目・挙動を**提案**する Issue/設計では、`scripts/discord_mockup.py` で手組み spec から Discord 風モック PNG を描き、Issue に添付して「**ゴールはこれ**」を絵で合意する（散文 spec では yousan が裁定できない — #287 P1）。スクショ（上項）が「実際こうだった」の証跡なのに対し、こちらは「**こうあるべき**」のモック。使い方は `docs/design-comp-mockup.md`。
 - **本文は常に「現在の真実」に保つ。** 相談で方針が変わったら 概要/原因/AC を実態に書き換える。ただし**重要な書き換えは日付つきコメントで「何を・なぜ変えたか」を一次記録として残す**（後続コメントがどの版の本文を前提にしていたか辿れるように）。積み残しは新規 Issue 乱立ではなく**再オープン＋コメント**で残す。
 - **One Issue = one concern.** Do not bundle a bug fix with a design/enhancement task, or two unrelated behaviors, in one Issue. Bundling lets an agent satisfy the easy/testable half, write `Closes`, and auto-close the rest into oblivion. Split into separate Issues.
 - **Acceptance Criteria must be binary and unambiguous** — each AC is a checkbox that is objectively true or false (a command to run, an observable output, a state to assert). No "should probably", no "consider", no open options ("A案 or B案") left in the AC. Decide before filing; move discussion out of the AC list.
