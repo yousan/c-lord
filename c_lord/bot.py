@@ -39,6 +39,7 @@ class ClaudeDiscordBot(commands.Bot):
         lounge_channel_id: int | None = None,
         session_dir_manager: SessionDirManager | None = None,
         tmux_manager: TmuxSessionManager | None = None,
+        expected_bot_user_id: int | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -67,6 +68,10 @@ class ClaudeDiscordBot(commands.Bot):
         self.session_dir_manager: SessionDirManager | None = session_dir_manager
         # Tmux session lifecycle manager (optional)
         self.tmux_manager: TmuxSessionManager | None = tmux_manager
+        # Issue #323: when set, on_ready verifies the logged-in identity and
+        # kills the process on mismatch (guards against booting with an
+        # inherited production token — the #322 env-contamination class).
+        self.expected_bot_user_id: int | None = expected_bot_user_id
 
     async def process_commands(self, message: discord.Message, /) -> None:
         """Override to allow webhook messages to trigger text commands.
@@ -110,9 +115,33 @@ class ClaudeDiscordBot(commands.Bot):
         """Log slash command errors that would otherwise be silently swallowed."""
         logger.error("Slash command error: %s", error, exc_info=error)
 
+    def _assert_expected_identity(self) -> None:
+        """Fail fast when the logged-in identity is not the expected one.
+
+        Issue #323: with ``load_dotenv(override=False)`` semantics and shell
+        env inheritance, a staging launch can silently boot with the
+        production token (#322). When ``expected_bot_user_id`` is configured,
+        a mismatch means the process is running as the WRONG bot — refuse to
+        run rather than whisper one log line and continue.
+        """
+        if self.expected_bot_user_id is None:
+            return
+        actual = self.user.id if self.user else None
+        if actual != self.expected_bot_user_id:
+            logger.critical(
+                "IDENTITY MISMATCH: logged in as bot user id %s but "
+                "EXPECTED_BOT_USER_ID=%s — refusing to run (wrong token in "
+                "env? see #322/#323). Exiting.",
+                actual,
+                self.expected_bot_user_id,
+            )
+            sys.exit(1)
+
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
         logger.info("Watching channel ID: %d", self.channel_id)
+        # Issue #323: verify identity BEFORE doing anything else.
+        self._assert_expected_identity()
 
         # Re-register persistent AskViews for any questions that were pending
         # when the bot last shut down.  This prevents "Interaction Failed" on
