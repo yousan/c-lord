@@ -52,19 +52,28 @@ per-run ログ → `Logged in as` を待って identity を検証(mismatch な�
 - `nohup uv run ...` での起動(Bash ツール teardown で exit 144 死する)
 - 本番 (`/home/yousan/c-lord`) への手動 kill+nohup(supervised — #195 の二重 bot 事故になる)
 
-## 占有(借用)プロトコル — 暫定版
+## 占有(借用)プロトコル (#328)
 
 staging は**共有リソース**。複数セッションが同時に使うと kill / checkout の踏み合いになる(2026-05-29 実害)。
-CLI 化(borrow/release/TTL)は #328 で実装予定。それまでの暫定規約:
+占有はリースファイル(clone 直下の `.staging-lease`、環境ごとに1枚・中央台帳なし)で機械的に管理する:
 
-1. **借りる前に確認**: `bash scripts/staging.sh status` + `.staging-lease` ファイルの有無。
-   lease があり、自分のものでなく、`acquired_at + ttl` が未失効なら**触らない**。
-2. **借りる**: clone 直下に `.staging-lease` を書く:
-   ```json
-   {"owner": "<セッション識別子>", "purpose": "PR #NNN 検証", "branch_before": "main",
-    "acquired_at": "<ISO8601>", "ttl_hours": 2}
-   ```
-3. **返す(原状復帰)**: `bash scripts/staging.sh restart main` → `status` で単一インスタンス確認 → `.staging-lease` を削除。
+```bash
+cd /home/yousan/c-lord-parallel-3
+export CLORD_LEASE_OWNER="<自分のセッション識別子>"   # 例: claude-session-<thread_id>
+
+bash scripts/staging.sh borrow --purpose "PR #NNN 検証" [--ttl-hours 2]
+#   → 他セッションの有効リース中なら拒否され、誰が・何のために・いつまでが表示される
+#   → 失効リースは奪取できる(旧リース内容がログに残る)
+
+bash scripts/staging.sh restart <branch>   # ← 有効な自リースが無いと拒否される
+bash scripts/staging.sh stop               # ← 他人の有効リース中は拒否される
+
+bash scripts/staging.sh release            # 検証後の原状復帰とセットで必ず実行
+```
+
+**ルール**: `restart` は常に自リース必須(borrow → restart → … → restart main → release)。
+`stop` はリースが無ければ可(掃除目的)、他人の有効リース中は不可(検証中の bot を殺さない)。
+リースの確認だけなら `status`(lease 行に owner / purpose / TTL が出る)。
 
 > 旧ドキュメントの「Lounge API (`/api/lounge`) で占有を宣言」は**使えない**:
 > `CLORD_BRIDGE_MODE=jsonl` の本デプロイでは ApiServer 自体が起動しない(#322 根因B)。

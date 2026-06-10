@@ -37,7 +37,7 @@ Refs #
 
 ## Staging Evidence (証跡)
 
-> 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。Discord 実画面キャプチャ（#243）が入るまでは、人間提供の Discord スクショ + tmux ペイン PNG（#286）で代替する。
+> 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。Discord 実画面は AI が `scripts/discord_evidence_shot.sh`（#243）で撮り、PNG は `docs/evidence/<issue番号>/` に commit して参照する（Discord CDN の添付 URL は期限付きなので直貼り禁止）。原因側の tmux ペイン PNG（#286）とペアで貼る。
 
 <!-- REQUIRED for behavior changes (bug fixes / features).
      Skip ONLY for pure-docs or provably no-behavior-change refactors —
@@ -48,10 +48,12 @@ Refs #
        GREEN = problem gone after the fix
      Include timestamp / thread / branch hash, and clickable URLs.
 
-     Discord-side proof: a Discord screenshot is the主役 and is normally
-     USER-PROVIDED (the server-side agent has no GUI and cannot screenshot the
-     Discord client). The agent supplements with tmux pane captures and
-     REST-fetched message text. Fold long excerpts into <details>. -->
+     Discord-side proof: the agent captures the real Discord client itself via
+     scripts/discord_evidence_shot.sh (#243, runs on the bot host). Commit
+     evidence PNGs to docs/evidence/<issue>/ and reference them (Discord CDN
+     attachment URLs expire — never hot-link them). Supplement with tmux pane
+     captures (#286) and REST-fetched message text; human-provided screenshots
+     cover what the test account cannot see. Fold long excerpts into <details>. -->
 
 <details>
 <summary>RED (before) — reproduced on staging</summary>
