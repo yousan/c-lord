@@ -359,3 +359,43 @@ control plane エンドポイントは残します。** 残すものの例:
 
 参照: #71（経路B 本体）/ #238（このスコープ明確化）/ 設計判断 #7（REST API を
 control plane にする）・#8 / #9（SQLite スケジューラ）。
+
+## 16. 読み取りは「push（入力エンリッチ）」で行う — tool 注入はしない
+
+**決定 (2026-06-05, yousan):** 人間が Discord のメッセージリンクを貼った（または
+Discord の返信機能で別メッセージに返信した）とき、c-lord は **そのリンク先の本文を
+サーバ側（bot token）で取得し、Claude に渡す prompt に verbatim で inline する**
+（"push"）。読み取り用の skill / tool / MCP を Claude Code に **注入しない**（"pull"）。
+実装は `c_lord/discord_ref.py::enrich_discord_references`、配線は
+`claude_chat._handle_new_conversation` / `_handle_thread_reply`。`CLORD_RESOLVE_DISCORD_LINKS`
+（既定 on）でゲート。
+
+**背景（解決する問題）:** Claude が別チャンネルを読むとき、c-lord 外の MCP
+(`plugin:discord:discord`) を選んで `Missing Access` で諦める事例があった。読み取りを
+2つに分けると:
+- **reactive**（人間がリンクを貼る）= 本決定の push で解く。
+- **proactive**（Claude が自発的に読む）= 別途（読み取り API + CLAUDE.md 誘導）。本決定の対象外。
+
+**なぜ push（tool でなく）か — #71 原則との関係:**
+- **tool（注入）= 原則②「c-lord は Claude Code に何も注入しない」へのハード違反**。
+  skill/MCP を Claude Code の "中" に置くことになり、利用者の他 skill/plugin と衝突する
+  （#259 を止めた理由）。
+- **push（入力エンリッチ）= 原則①「透明な I/O ミラー（解釈・編集しない）」へのソフト抵触**。
+  人間が打っていない中身を足すため。ただし:
+  1. 既存の **ファイル添付inline**（`claude_chat._build_prompt_and_images`）が全く同じ
+     「人間のターンを広げる」操作を既に行い、許容されている **前例** がある。
+  2. inline した内容は **ペインにも verbatim で出る** ので、原則③「ターミナル=Discord
+     等価性」は保たれる。
+  3. c-lord は Claude Code の **外側のまま**（入力テキストを太らせるだけ）なので原則②は
+     クリア。
+  4. reactive を **決定論的** に解決でき、「Claude が経路を選び損ねて諦める」再発余地が
+     消える（tool では選択ミスが残る）。
+
+**判定:** 原則①への抵触は **添付inline と同列の許容範囲** と判断し、push を採用する。
+ただし境界を守る:
+- **verbatim のみ**（要約・解釈をしない）、件数・文字数の **ハード上限**、重複は dedupe。
+- inline するのは **人間が参照したもの**だけ。取得失敗は `[c-lord could not fetch …]` の
+  明示ノートにする（黙って欠落させない）。
+- token は prompt にもファイルにも一切出さない（discord.py が内部で auth を運ぶ）。
+
+参照: #318（実装）/ #259（読み取り経路の設計）/ #71（経路B の3原則）/ #234（アクセス方針）。

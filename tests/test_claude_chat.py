@@ -1989,7 +1989,6 @@ class TestApplyThreadNamingRetitle:
 
     def _make_cog_with_repo(self, record):
         """Return (cog, thread, tmux_manager) with a pre-configured repo record."""
-        from unittest.mock import patch as _patch
 
         cog = _make_cog()
         cog.repo.get = AsyncMock(return_value=record)
@@ -2143,3 +2142,92 @@ class TestApplyThreadNamingRetitle:
             )
 
         mock_retitle.assert_not_awaited()
+
+
+class TestDiscordLinkEnrichmentWireIn:
+    """#318: pasted Discord links are resolved into the prompt that reaches Claude."""
+
+    @staticmethod
+    def _channel_with_message(content: str, *, name: str = "support") -> MagicMock:
+        referenced = MagicMock()
+        referenced.content = content
+        referenced.author = MagicMock(display_name="bob", name="bob")
+        referenced.created_at = "2026-06-05T00:00:00"
+        channel = MagicMock()
+        channel.name = name
+        channel.fetch_message = AsyncMock(return_value=referenced)
+        return channel
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_inlines_referenced_message(self) -> None:
+        cog = _make_cog()
+        cog.bot.get_channel = MagicMock(
+            return_value=self._channel_with_message("the linked content")
+        )
+        cog._run_claude = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        thread.parent_id = 999
+        thread.send = AsyncMock()
+        msg = MagicMock(spec=discord.Message)
+        msg.id = 1
+        msg.channel = thread
+        msg.reference = None
+        msg.content = "look 👉 https://discord.com/channels/111/222/333"
+        msg.attachments = []
+        msg.author = MagicMock()
+        msg.author.bot = False
+
+        await cog._handle_thread_reply(msg)
+
+        cog._run_claude.assert_awaited_once()
+        prompt_arg = cog._run_claude.await_args.args[2]
+        assert "the linked content" in prompt_arg  # enriched
+        assert "look 👉" in prompt_arg  # original preserved
+
+    @pytest.mark.asyncio
+    async def test_new_conversation_inlines_referenced_message(self) -> None:
+        cog = _make_cog()
+        cog.bot.get_channel = MagicMock(
+            return_value=self._channel_with_message("fresh-thread linked content")
+        )
+        cog._run_claude = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 7
+        msg = MagicMock(spec=discord.Message)
+        msg.id = 2
+        msg.reference = None
+        msg.content = "kick off https://discord.com/channels/111/222/333"
+        msg.attachments = []
+        msg.create_thread = AsyncMock(return_value=thread)
+
+        await cog._handle_new_conversation(msg)
+
+        cog._run_claude.assert_awaited_once()
+        prompt_arg = cog._run_claude.await_args.args[2]
+        assert "fresh-thread linked content" in prompt_arg
+
+    @pytest.mark.asyncio
+    async def test_spawn_session_seed_is_not_enriched(self) -> None:
+        """Programmatic spawn (seed message) must NOT be enriched — only human turns are."""
+        cog = _make_cog()
+        # A channel that WOULD enrich if enrichment were (wrongly) called on the seed.
+        cog.bot.get_channel = MagicMock(return_value=self._channel_with_message("LEAKED"))
+        cog._run_claude = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 5
+        thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.create_thread = AsyncMock(return_value=thread)
+
+        prompt = "do it https://discord.com/channels/111/222/333"
+        await cog.spawn_session(channel, prompt)
+        await asyncio.sleep(0)  # let the create_task(_run_claude) run
+
+        cog._run_claude.assert_awaited_once()
+        prompt_arg = cog._run_claude.await_args.args[2]
+        assert prompt_arg == prompt  # passed through unchanged
+        assert "LEAKED" not in prompt_arg
