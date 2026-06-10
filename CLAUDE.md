@@ -340,7 +340,7 @@ CONTRIBUTING.md          # Contribution guidelines
 - **完了報告は「これがこうなる」形で書く（利用者目線を先頭・実装/CI を従）。** Discord への完了報告は、まず**「どこで何を操作すると、Discord 上の見え方がどう変わるか」**を先頭に書く。実装の詳細（関数名・`pytest 37/37`・`dod-gate green`・行番号）はその**後ろ（従）**に置く。コードを読まない利用者でも「自分にとって何が変わったか」が一読で分かるようにするため。利用者の見え方が変わらない変更（内部リファクタ等）は `no-user-visible-change` と明記する。
   - 良い例: 「スレッドに長文を送ると、最後まで複数メッセージで届くようになりました（前は途中で切れていました）。実装: チャンク分割を `_split_reply` に追加 / PR #MMM / pytest green」
   - 悪い例: 「`_split_reply` を追加し pytest 37/37 green、dod-gate green」（利用者から見て何が変わったか分からない）
-- **証跡はスクショを主にする（利用者から見た挙動/UI を変えるとき）。** 「直った / こう変わった」を示す証跡は、テキストログではなく**スクショ（Discord 実画面 and/or tmux ペイン）を主証跡**にする。テキストでは表出しない問題（レイアウト・ボタンの出/不出・ランプ状態・別バブル/同一バブル）があるため。利用者に見えない変更（純リファクタ等）はスクショ不要（`no-user-visible-change`）。**暫定（#243 の Discord 実画面キャプチャが入るまで）は、人間提供の Discord スクショ + tmux ペイン PNG（#286）で代替する。** 注釈／before-after 並置の補助ツールは #310。
+- **証跡はスクショを主にする（利用者から見た挙動/UI を変えるとき）。** 「直った / こう変わった」を示す証跡は、テキストログではなく**スクショ（Discord 実画面 and/or tmux ペイン）を主証跡**にする。テキストでは表出しない問題（レイアウト・ボタンの出/不出・ランプ状態・別バブル/同一バブル）があるため。利用者に見えない変更（純リファクタ等）はスクショ不要（`no-user-visible-change`）。**Discord 実画面は AI 自身が撮る（#243）**: `scripts/discord_evidence_shot.sh` にメッセージリンク/チャンネル URL を渡す（bot ホスト上でのみ動く。セットアップ・制約は `docs/discord-evidence-capture.md`）。人間提供のスクショは AI のキャプチャが届かない場面（テストアカウント未参加のサーバ・ログイン失効時など）の補助。原因側の tmux ペイン PNG（#286）とペアで A=結果 / C=原因 を揃える（#287）。注釈／before-after 並置の補助ツールは #310。
 - **Issue/PR はテンプレートに従う** (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`)。テンプレが各規律を書式で強制する。
 
 ## Definition of Done (DoD) — single source of truth
@@ -369,7 +369,7 @@ A PR may be merged only when:
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
-- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡はユーザー提供のスクリーンショットが主**（サーバ上の AI は GUI を持たず Discord クライアントの画面を撮れない）。AI は **tmux ペインキャプチャ + REST 取得メッセージ本文**で補強する。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.** 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。Discord 実画面キャプチャ（#243）が入るまでは人間提供スクショ + tmux PNG（#286）で代替（証跡規約 #291）。
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡は AI が `scripts/discord_evidence_shot.sh` で撮った実画面スクショが主**（#243。bot ホスト上で実行）。tmux ペインキャプチャ（#286）+ REST 取得メッセージ本文で補強し、人間提供スクショは AI のキャプチャが届かない場面の補助とする。**証跡 PNG は PR ブランチに commit する（`docs/evidence/<issue番号>/`）— Discord CDN の添付 URL は期限付きなので PR/Issue 本文に直貼りしない**（詳細は `docs/discord-evidence-capture.md`）。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.** 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助。証跡規約 #291 → #350 で更新）。
 - [ ] **動きを変えたら「あるべき動き」も更新する**: 利用者から見た動きを変える PR は、対応する「あるべき動き」を説明したドキュメント（`docs/specs/` などの仕様・`README.md`・`docs/` の該当箇所）も同じ PR で更新する。動きを変えないなら PR 本文に `no-user-visible-change` と明記する（更新不要であることをはっきり宣言する）。**狙い**: ドキュメントが実際の動きとズレる（drift する）のを防ぎ、「あるべき動き」を信用できる状態に保つ。
 - [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
 - [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
@@ -384,7 +384,7 @@ PR. When you (or Opus) author an Issue:
 
 - **修正の前に必ず Issue 化し、ブランチを紐付ける。** 勝手に直し始めない（診断と合意が先）。
 - **Why を必ず書く（背骨）。** 「この修正/実装は何のためか」を利用者目線で明記する。Issue は**クローズ後も「どういう考えでそうなったか」を辿る記録**なので、症状だけでなく意図を残す。Why が無いと次の判断ができない。
-- **証跡（スクショ）を Issue にも残す。** テキストログだけでは表出しない問題（レイアウト・UI・ランプ状態など）があるため、**スクリーンショット**（理想は tmux の動作 × Discord の動作を合成した画像）で「リアルな問題」を示す。ユーザー提供のスクショは可能な限り Issue に入れる。網羅性を優先し、長いログ/コードは `<details><summary>` で畳んで可読性を保つ。
+- **証跡（スクショ）を Issue にも残す。** テキストログだけでは表出しない問題（レイアウト・UI・ランプ状態など）があるため、**スクリーンショット**（理想は tmux の動作 × Discord の動作を合成した画像）で「リアルな問題」を示す。**問題発生中（RED）の実画面は AI 自身が `scripts/discord_evidence_shot.sh` で撮って Issue に添付する**（yousan からメッセージリンクをもらう、または REST で該当箇所を特定する）。ユーザー提供のスクショもあれば併せて入れる。網羅性を優先し、長いログ/コードは `<details><summary>` で畳んで可読性を保つ。
 - **「あるべき見た目」はデザインカンプで絵にして合意する（#316）。** Discord 上の見た目・挙動を**提案**する Issue/設計では、`scripts/discord_mockup.py` で手組み spec から Discord 風モック PNG を描き、Issue に添付して「**ゴールはこれ**」を絵で合意する（散文 spec では yousan が裁定できない — #287 P1）。スクショ（上項）が「実際こうだった」の証跡なのに対し、こちらは「**こうあるべき**」のモック。使い方は `docs/design-comp-mockup.md`。
 - **本文は常に「現在の真実」に保つ。** 相談で方針が変わったら 概要/原因/AC を実態に書き換える。ただし**重要な書き換えは日付つきコメントで「何を・なぜ変えたか」を一次記録として残す**（後続コメントがどの版の本文を前提にしていたか辿れるように）。積み残しは新規 Issue 乱立ではなく**再オープン＋コメント**で残す。
 - **One Issue = one concern.** Do not bundle a bug fix with a design/enhancement task, or two unrelated behaviors, in one Issue. Bundling lets an agent satisfy the easy/testable half, write `Closes`, and auto-close the rest into oblivion. Split into separate Issues.
@@ -434,7 +434,7 @@ bash scripts/staging.sh restart main                    # 4. 原状復帰 (idle 
 bash scripts/staging.sh release                         # 5. 返却
 ```
 
-webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッドに sessions レコードが必要、等) は STAGING.md の「検証レシピ」を参照。PR 本文の "Staging Evidence" に RED→GREEN のログ抜粋を貼る。
+webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッドに sessions レコードが必要、等) は STAGING.md の「検証レシピ」を参照。PR 本文の "Staging Evidence" には RED→GREEN のログ抜粋に加え、**RED / GREEN それぞれの Discord 実画面スクショ**を主証跡として貼る — `scripts/discord_evidence_shot.sh "<検証スレッドの URL>" -o red.png` のように撮り、PNG は `docs/evidence/<issue番号>/` に commit して参照する (#243)。
 
 **機能追加の場合**: RED の代わりに「実装前は存在しない挙動」「実装後は期待挙動」を webhook + ログで観測する。例: 構造化ログ追加 PR では `grep "thread=<id>" /tmp/clord-bot-staging.log` で **before = ヒットしない / after = enter/exit ペアが出る** を比較。
 

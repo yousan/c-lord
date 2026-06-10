@@ -145,6 +145,29 @@ class ClaudeChatCog(commands.Cog):
             return False  # DM — no role info
         return self._allowed_user_ids is None
 
+    def _is_message_authorized(self, message: discord.Message) -> bool:
+        """Whether *message* is allowed to drive Claude.
+
+        Infrastructure bypasses the human allowlist so that configuring an
+        owner does not break it:
+
+        - **Webhook** messages (``webhook_id`` set): possession of the webhook
+          URL is itself authorization (CI/CD triggers, E2E).
+        - **Trusted bots** (``CLORD_TRUSTED_BOT_IDS``): companion bots treated
+          like humans; pre-authorized.
+
+        Any other bot is rejected. Human users must satisfy :meth:`_is_allowed`
+        (owner / role), so a configured ``DISCORD_OWNER_ID`` restricts access to
+        the owner **without** locking out webhooks or trusted bots.
+        """
+        if message.webhook_id:
+            return True
+        if message.author.bot:
+            trusted_raw = os.getenv("CLORD_TRUSTED_BOT_IDS", "")
+            trusted_ids = {int(x.strip()) for x in trusted_raw.split(",") if x.strip().isdigit()}
+            return message.author.id in trusted_ids
+        return self._is_allowed(message.author)
+
     def is_processing(self, thread_id: int) -> bool:
         """True while a Claude turn is actively running for ``thread_id``.
 
@@ -337,17 +360,11 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
-        # Ignore bot messages (but allow webhook messages and trusted bots through).
-        # CLORD_TRUSTED_BOT_IDS env: comma-separated bot user IDs to treat like humans.
-        if message.author.bot and not message.webhook_id:
-            trusted_raw = os.getenv("CLORD_TRUSTED_BOT_IDS", "")
-            trusted_ids = {int(x.strip()) for x in trusted_raw.split(",") if x.strip().isdigit()}
-            if message.author.id not in trusted_ids:
-                return
-
-        # Authorization check — user must match allowed_user_ids or have
-        # the allowed role.  When neither is configured, everyone is allowed.
-        if not self._is_allowed(message.author):
+        # Authorization: webhooks + trusted bots bypass the human allowlist;
+        # any other bot is ignored; humans must match owner / role. See
+        # _is_message_authorized. When no allowlist is configured, humans are
+        # still allowed (zero-config default unchanged).
+        if not self._is_message_authorized(message):
             return
 
         # Channel direct messages are ignored — thread creation is limited to
