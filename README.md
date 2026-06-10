@@ -142,7 +142,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Session interrupt** — Sending a new message to an active thread sends SIGINT to the running session and starts fresh with the new instruction; no manual `/stop` needed
 
 #### 📡 Real-time Feedback
-- **Real-time status** — Emoji reactions: 🧠 thinking, 🛠️ reading files, 💻 editing, 🌐 web search
+- **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⚠️ if it stalls). Reactions stay responsive under heavy use; the thread-name lamp is the slower, eventually-consistent sidebar view (#246)
 - **Streaming text** — Intermediate assistant text appears as Claude works
 - **Tool result embeds** — Live tool call results with elapsed time ticking up every 10s
 - **Extended thinking** — Reasoning shown as spoiler-tagged embeds (click to reveal)

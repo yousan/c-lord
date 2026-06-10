@@ -323,47 +323,6 @@ class ClaudeChatCog(commands.Cog):
                 new_name,
             )
 
-    async def _set_lamp_state(
-        self,
-        thread: discord.Thread,
-        state: str,
-        tmux_manager,  # TmuxManager | None
-    ) -> None:
-        """Persist ``state`` and repaint the thread-name lamp immediately (#236).
-
-        Lightweight counterpart to :meth:`_apply_thread_naming` — reuses the
-        already-stored topic (no LLM retitle) and the stable ``work{N}`` window
-        number, so the leading 🟢/🟡 flips the instant a turn starts/ends instead
-        of waiting for the ≤60s state-sync poll. No-op when no topic exists yet
-        (the next user-driven naming pass will catch up).
-        """
-        from ..thread_name import build_name
-
-        await self.repo.set_state(thread.id, state)
-
-        record = await self.repo.get(thread.id)
-        topic = record.topic if record else None
-        if not topic:
-            return
-
-        window_number: int | None = None
-        if tmux_manager is not None:
-            info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
-            if info is not None:
-                window_number = info[1]
-
-        new_name = build_name(topic, state, window_number)
-        if (thread.name or "") == new_name:
-            return
-        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
-            await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
-            logger.info(
-                "%s lamp → %s (event-driven) %r",
-                log_ctx(thread_id=thread.id),
-                state,
-                new_name,
-            )
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
@@ -1120,11 +1079,14 @@ class ClaudeChatCog(commands.Cog):
             if current_task is not None:
                 self._active_tasks[thread.id] = current_task
 
-            # Lamp → 🟢 running immediately, event-driven (#236). Persist the
-            # state now so the rename in _apply_thread_naming below paints the
-            # thread green without waiting for the ≤60s state-sync poll.
-            with contextlib.suppress(Exception):
-                await self.repo.set_state(thread.id, "running")
+            # #246: the per-turn 🟢/🟡 lamp now lives on the trigger-message
+            # reaction (StatusManager below), NOT on the thread name. We no
+            # longer set_state("running") + immediately rename here — that
+            # per-turn PATCH (added in #236) saturated Discord's ~2-renames-per-
+            # 10-min thread bucket and made the lamp stick (#241). The thread
+            # name lamp is now the low-frequency, eventually-consistent sidebar
+            # view owned by the state-sync poll (its is_processing guard still
+            # promotes waiting→running within ≤60s).
 
             # Mark thread as PROCESSING when Claude starts
             if dashboard is not None:
@@ -1142,7 +1104,7 @@ class ClaudeChatCog(commands.Cog):
                 )
 
             status = StatusManager(user_message, on_hard_stall=_notify_stall)
-            await status.set_thinking()
+            await status.set_running()
 
             model_override = await self._get_current_model()
 
@@ -1261,11 +1223,10 @@ class ClaudeChatCog(commands.Cog):
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
 
-                # Lamp → 🟡 waiting the instant the turn finishes (#236). Runs
-                # after _active_tasks.pop above, so is_processing() is already
-                # False and the next state-sync poll stays consistent.
-                with contextlib.suppress(Exception):
-                    await self._set_lamp_state(thread, "waiting", tmux_manager)
+                # #246: no per-turn thread rename here. The turn-end 🟡 lamp is
+                # the StatusManager reaction (set via set_done() on the RESULT
+                # event); the thread-name lamp flips to 🟡 on the next state-sync
+                # poll (is_processing() is already False after the pop above).
 
                 if dashboard is not None:
                     with contextlib.suppress(Exception):

@@ -114,7 +114,7 @@ Se o bot reiniciar no meio de uma sessão, as sessões do Claude interrompidas s
 
 ### Chat Interativo
 - **Thread = Session** — Mapeamento 1:1 entre thread do Discord e sessão do Claude Code
-- **Status em tempo real** — Reações emoji: 🧠 pensando, 🛠️ lendo arquivos, 💻 editando, 🌐 pesquisa web
+- **Status em tempo real** — Reação emoji na sua mensagem: 🟢 em execução enquanto Claude trabalha, 🟡 aguardando quando é a sua vez (❌ em erro, ⚠️ se travar). As reações continuam ágeis sob uso intenso; a lâmpada no nome da thread é a visão lateral mais lenta e eventualmente consistente (#246)
 - **Texto em streaming** — Texto intermediário do assistente aparece enquanto o Claude trabalha
 - **Embeds de resultados de ferramentas** — Resultados ao vivo com tempo decorrido aumentando a cada 10s
 - **Pensamento estendido** — Raciocínio exibido como embeds com spoiler (clique para revelar)
