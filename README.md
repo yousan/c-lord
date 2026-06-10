@@ -273,6 +273,11 @@ c-lord start    # start the bot (reads .env in current dir)
 c-lord start --env /path/to/.env   # custom .env location
 ```
 
+> **Config precedence (#324):** keys defined in the `.env` file always win over
+> inherited process environment variables — the directory you start from
+> determines the bot's identity. Keys *absent* from the file still fall back to
+> the process env, so env-var-only setups keep working.
+
 Send a message in the configured channel — Claude will reply in a new thread.
 
 ---
