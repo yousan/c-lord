@@ -425,10 +425,13 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 
 ```bash
 cd /home/yousan/c-lord-parallel-3
-bash scripts/staging.sh status        # 占有・状態確認 (.staging-lease も見る)
-bash scripts/staging.sh restart main  # 1. RED — 修正前コードで再現 (webhook 経由)
-bash scripts/staging.sh restart <fix-branch>  # 3. GREEN — 修正後コードで再現しない
-bash scripts/staging.sh restart main  # 6. 原状復帰 (idle ブランチ = main)
+export CLORD_LEASE_OWNER="<セッション識別子>"
+bash scripts/staging.sh status                          # 0. 占有・状態確認
+bash scripts/staging.sh borrow --purpose "PR #NNN 検証"  # 1. 借用 (他人の有効リース中は拒否される)
+bash scripts/staging.sh restart main                    # 2. RED — 修正前コードで再現 (webhook 経由)
+bash scripts/staging.sh restart <fix-branch>            # 3. GREEN — 修正後コードで再現しない
+bash scripts/staging.sh restart main                    # 4. 原状復帰 (idle ブランチ = main)
+bash scripts/staging.sh release                         # 5. 返却
 ```
 
 webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッドに sessions レコードが必要、等) は STAGING.md の「検証レシピ」を参照。PR 本文の "Staging Evidence" には RED→GREEN のログ抜粋に加え、**RED / GREEN それぞれの Discord 実画面スクショ**を主証跡として貼る — `scripts/discord_evidence_shot.sh "<検証スレッドの URL>" -o red.png` のように撮り、PNG は `docs/evidence/<issue番号>/` に commit して参照する (#243)。
