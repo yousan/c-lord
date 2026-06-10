@@ -35,6 +35,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
+from ..thread_name import thread_lamp_enabled
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -86,11 +87,17 @@ class ClaudeChatCog(commands.Cog):
         resume_repo: PendingResumeRepository | None = None,
         settings_repo: SettingsRepository | None = None,
         allowed_role_name: str | None = None,
+        thread_lamp: bool | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.runner = runner
         self._max_concurrent = max_concurrent
+        # Thread-name status lamp (🟢🟡🔴⚪). Off by default (#329) because
+        # repainting the name on every state change saturates Discord's
+        # thread-rename rate-limit. Opt in via thread_lamp=True or
+        # CLORD_THREAD_LAMP=1. Resolved once here so the env is read at startup.
+        self._thread_lamp = thread_lamp_enabled(thread_lamp)
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
@@ -311,7 +318,10 @@ class ClaudeChatCog(commands.Cog):
             # just deleted concurrently).
             topic = parse_topic_from_name(thread.name) or "新しいスレッド"
 
-        new_name = build_name(topic, state, window_number)
+        # lamp=False (default, #329) keeps the topic but drops the leading
+        # status emoji, so the name no longer changes on state transitions and
+        # the only rename is the one-off topic naming.
+        new_name = build_name(topic, state, window_number, lamp=self._thread_lamp)
         if (thread.name or "") == new_name:
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
@@ -341,6 +351,13 @@ class ClaudeChatCog(commands.Cog):
 
         await self.repo.set_state(thread.id, state)
 
+        # Lamp off (default, #329): the DB state is still persisted above (so
+        # dashboards / state-sync stay correct), but we never repaint the thread
+        # name — renaming on every turn boundary saturates Discord's
+        # thread-rename rate-limit (~2 per 10 min per thread).
+        if not self._thread_lamp:
+            return
+
         record = await self.repo.get(thread.id)
         topic = record.topic if record else None
         if not topic:
@@ -352,7 +369,7 @@ class ClaudeChatCog(commands.Cog):
             if info is not None:
                 window_number = info[1]
 
-        new_name = build_name(topic, state, window_number)
+        new_name = build_name(topic, state, window_number, lamp=self._thread_lamp)
         if (thread.name or "") == new_name:
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):

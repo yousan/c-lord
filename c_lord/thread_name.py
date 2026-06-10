@@ -31,6 +31,7 @@ Rules:
 
 from __future__ import annotations
 
+import os
 import re
 
 STATUS_EMOJI: dict[str, str] = {
@@ -62,6 +63,8 @@ def build_name(
     topic: str,
     state: str,
     window_number: int | None,
+    *,
+    lamp: bool = True,
 ) -> str:
     """Build a thread name from its parts, capped at 30 characters.
 
@@ -72,24 +75,51 @@ def build_name(
     Drops the work prefix for dead state or when the window number is unknown.
     Unknown ``state`` falls back to the ``alive``/🟢 emoji.
     When the combination is too long, only the topic is truncated.
+
+    ``lamp=False`` (the thread-lamp opt-out, #329) drops the leading status
+    emoji entirely — the name keeps only ``W<N> │ <topic>`` (or just ``<topic>``).
+    The point is that the name then no longer depends on ``state``, so a state
+    change never produces a different name and never triggers a Discord rename
+    (which is rate-limited to ~2 per 10 min per thread).
     """
     emoji = STATUS_EMOJI.get(state, STATUS_EMOJI["alive"])
+    prefix_emoji = f"{emoji} " if lamp else ""
 
     if state not in _NO_PREFIX_STATES and window_number is not None:
-        fixed = f"{emoji} W{window_number} │ "
+        fixed = f"{prefix_emoji}W{window_number} │ "
     else:
-        fixed = f"{emoji} "
+        fixed = prefix_emoji
 
     topic_clean = (topic or "").strip()
     budget = _MAX_NAME_LEN - len(fixed)
     if budget < 1:
         # Pathological case (very long prefix); drop work prefix.
-        fixed = f"{emoji} "
+        fixed = prefix_emoji
         budget = _MAX_NAME_LEN - len(fixed)
     if len(topic_clean) > budget:
         topic_clean = topic_clean[: max(budget, 0)]
 
     return f"{fixed}{topic_clean}"[:_MAX_NAME_LEN]
+
+
+_LAMP_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def thread_lamp_enabled(explicit: bool | None = None) -> bool:
+    """Whether the thread-name status lamp (🟢🟡🔴⚪) is active.
+
+    **Off by default (#329).** Repainting the Discord thread name on every state
+    change calls the thread-rename API, which Discord rate-limits to ~2 changes
+    per 10 minutes per thread; in a busy server the lamp saturates that limit
+    (429s). Opt back in with ``CLORD_THREAD_LAMP=1`` (or ``true``/``yes``/``on``)
+    or the ``thread_lamp`` constructor argument of :class:`ClaudeChatCog`.
+
+    ``explicit`` (a constructor override) wins over the environment when not
+    ``None``; otherwise the ``CLORD_THREAD_LAMP`` env var decides.
+    """
+    if explicit is not None:
+        return explicit
+    return os.getenv("CLORD_THREAD_LAMP", "").strip().lower() in _LAMP_TRUTHY
 
 
 def parse_topic_from_name(name: str) -> str:
