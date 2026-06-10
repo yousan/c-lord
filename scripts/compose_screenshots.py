@@ -26,7 +26,7 @@ _BG = (255, 255, 255)  # canvas background
 _FG = (0, 0, 0)  # label text color
 
 
-def _load_font() -> ImageFont.ImageFont:
+def _load_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Return a usable font, falling back to Pillow's bundled default."""
     try:
         return ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
