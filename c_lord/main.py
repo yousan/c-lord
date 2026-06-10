@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import logging
 import os
 import signal
@@ -57,6 +58,57 @@ def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
             e,
         )
         sys.exit(1)
+    return lock_fp
+
+
+def acquire_token_lock(token: str, lock_dir: Path | None = None) -> IO[str] | None:
+    """Acquire a host-global exclusive flock keyed on the bot TOKEN (#325).
+
+    The #212 data-dir lock keys on a filesystem path, but the real hazard is
+    two processes sharing one Discord token: a clone with a different data dir
+    (e.g. an ``.env`` pointing at production) passes the data-dir lock and
+    double-connects to the gateway anyway. This lock enforces the actual
+    invariant — one process per token — before Discord is ever touched.
+
+    The lock file is named by a SHA-256 prefix of the token (no plaintext
+    token on disk) and records the holder's pid/cwd so a refused second
+    process can say WHO is already running. flock auto-releases on exit.
+
+    Returns ``None`` when ``CLORD_ALLOW_MULTI_INSTANCE=1`` (same escape hatch
+    as the data-dir lock). Calls ``sys.exit(1)`` on conflict.
+    """
+    if os.getenv("CLORD_ALLOW_MULTI_INSTANCE") == "1":
+        logger.warning("CLORD_ALLOW_MULTI_INSTANCE=1 set; skipping token-lock guard")
+        return None
+
+    if lock_dir is None:
+        lock_dir = Path.home() / ".cache" / "c-lord" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(token.encode()).hexdigest()[:16]
+    lock_path = lock_dir / f"token-{digest}.lock"
+    # Not a context manager: the handle must outlive this function so the
+    # flock stays held for the process lifetime (released on process exit).
+    lock_fp = open(lock_path, "a+")  # noqa: SIM115
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_fp.seek(0)
+        holder = lock_fp.read().strip() or "(unknown)"
+        lock_fp.close()
+        logger.error(
+            "Another bot process is already running with the SAME Discord "
+            "token — refusing to start to avoid a gateway double-connect "
+            "(#325). Holder: %s. If this is intentional, set "
+            "CLORD_ALLOW_MULTI_INSTANCE=1.",
+            holder,
+        )
+        sys.exit(1)
+        return None  # only reached in tests where sys.exit is mocked
+    # Record holder info for the error message of a refused second process.
+    lock_fp.seek(0)
+    lock_fp.truncate()
+    lock_fp.write(f"pid={os.getpid()} cwd={Path.cwd()}\n")
+    lock_fp.flush()
     return lock_fp
 
 
@@ -146,6 +198,11 @@ async def main(env_path: Path | None = None) -> None:
     # flock auto-releases on close/exit. Assigning to a local that lives until
     # main() returns is sufficient; we don't need to reference it again.
     _instance_lock = acquire_single_instance_lock(data_dir)  # noqa: F841
+
+    # Issue #325: additionally refuse if another process already holds THIS
+    # TOKEN (host-global). The data-dir lock alone cannot stop a same-token
+    # double-connect launched from a different clone/directory.
+    _token_lock = acquire_token_lock(config["token"])  # noqa: F841
 
     db_path = str(data_dir / "sessions.db")
 
