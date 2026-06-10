@@ -39,3 +39,35 @@ class TestLoadConfigEnvPath:
         finally:
             os.environ.pop("DISCORD_BOT_TOKEN", None)
             os.environ.pop("DISCORD_CHANNEL_ID", None)
+
+
+class TestExpectedBotUserId:
+    """Issue #323: EXPECTED_BOT_USER_ID config key for the identity fail-fast guard."""
+
+    def _base_env(self, monkeypatch: object) -> None:
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")  # type: ignore[attr-defined]
+        monkeypatch.setenv("DISCORD_CHANNEL_ID", "999")  # type: ignore[attr-defined]
+
+    def test_parsed_when_set(self, monkeypatch: object) -> None:
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("EXPECTED_BOT_USER_ID", "1503195981142032405")  # type: ignore[attr-defined]
+        config = load_config()
+        assert config["expected_bot_user_id"] == "1503195981142032405"
+
+    def test_empty_when_unset(self, monkeypatch: object) -> None:
+        self._base_env(monkeypatch)
+        monkeypatch.delenv("EXPECTED_BOT_USER_ID", raising=False)  # type: ignore[attr-defined]
+        config = load_config()
+        assert config["expected_bot_user_id"] == ""
+
+    def test_non_numeric_value_exits(self, monkeypatch: object) -> None:
+        """A garbage value must fail loudly — a guard that silently disables
+        itself is worse than no guard."""
+        import sys
+        from unittest.mock import patch
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("EXPECTED_BOT_USER_ID", "not-a-number")  # type: ignore[attr-defined]
+        with patch.object(sys, "exit") as mock_exit:
+            load_config()
+        mock_exit.assert_called_with(1)

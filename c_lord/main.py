@@ -90,9 +90,20 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         logger.error("DISCORD_CHANNEL_ID is required")
         sys.exit(1)
 
+    # Issue #323: optional identity guard. A garbage value must fail loudly —
+    # a guard that silently disables itself is worse than no guard.
+    expected_bot_user_id = os.getenv("EXPECTED_BOT_USER_ID", "")
+    if expected_bot_user_id and not expected_bot_user_id.isdigit():
+        logger.error(
+            "EXPECTED_BOT_USER_ID must be a numeric Discord user id, got: %r",
+            expected_bot_user_id,
+        )
+        sys.exit(1)
+
     return {
         "token": token,
         "channel_id": channel_id,
+        "expected_bot_user_id": expected_bot_user_id,
         "claude_command": os.getenv("CLAUDE_COMMAND", "claude"),
         "claude_model": os.getenv("CLAUDE_MODEL", "sonnet"),
         "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
@@ -141,6 +152,9 @@ async def main(env_path: Path | None = None) -> None:
         channel_id=int(config["channel_id"]),
         owner_id=owner_id,
         coordination_channel_id=coordination_channel_id,
+        expected_bot_user_id=(
+            int(config["expected_bot_user_id"]) if config["expected_bot_user_id"] else None
+        ),
     )
 
     # Issue #53: REST API is the only path Claude has for reaching Discord
