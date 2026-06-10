@@ -2066,20 +2066,26 @@ class TestApplyThreadNamingRetitle:
         cog.repo.set_topic.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_no_per_turn_rename_when_name_unchanged(self):
-        """#246: a continuing turn where the topic and lamp already match the
-        current thread name issues NO rename. The per-turn 🟢/🟡 lamp is now the
+    async def test_no_per_turn_rename_when_name_unchanged(self, monkeypatch):
+        """#246: a continuing turn where the topic already matches the current
+        thread name issues NO rename. The per-turn 🟢/🟡 lamp is now the
         StatusManager reaction; the thread name is only repainted by the
         state-sync poll, so claude_chat must not PATCH the thread every turn
-        (that #236 churn saturated Discord's rename rate-limit, #241)."""
+        (that #236 churn saturated Discord's rename rate-limit, #241).
+
+        #329: with the thread-name lamp off by default, the unchanged name has
+        no leading status emoji (just ``W<N> │ <topic>``)."""
         from unittest.mock import patch
 
         from c_lord.cogs import claude_chat as cc_module
 
-        # Thread name already reflects topic + lamp for the current state.
+        monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)  # default: lamp off
+
+        # Thread name already reflects the topic for the current state (lamp off
+        # → no leading emoji).
         record = self._make_record(topic="認証リファクタ", state="running")
         cog, thread, tmux = self._make_cog_with_repo(record)
-        thread.name = "🟢 W1 │ 認証リファクタ"
+        thread.name = "W1 │ 認証リファクタ"
 
         with patch.object(
             cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value=None)
@@ -2142,6 +2148,92 @@ class TestApplyThreadNamingRetitle:
             )
 
         mock_retitle.assert_not_awaited()
+
+
+class TestThreadLampDisabled:
+    """#329: thread-name status lamp (🟢🟡) is off by default.
+
+    Renaming the thread to repaint the leading emoji saturates Discord's
+    thread-rename rate-limit, so by default ``_apply_thread_naming`` keeps the
+    topic but emits no status emoji (and the state-sync poll is skipped — see
+    setup.py). Opt back in with ``CLORD_THREAD_LAMP=1``.
+    """
+
+    def _make_cog_and_thread(self, *, topic: str | None = "認証リファクタ"):
+        cog = _make_cog()
+        record = MagicMock()
+        record.topic = topic
+        record.state = "running"
+        record.auto_topic_locked = 0
+        record.tmux_window_id = "@1"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog.repo.set_state = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 55555
+        thread.name = "認証リファクタ"  # no lamp emoji
+
+        tmux = MagicMock()
+        tmux.get_window_info = MagicMock(return_value=("@1", 1))
+        return cog, thread, tmux
+
+    @pytest.mark.asyncio
+    async def test_apply_thread_naming_omits_lamp_emoji_by_default(self, monkeypatch):
+        """Default: topic naming still happens, but the name carries no status lamp."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+        from c_lord.thread_name import STATUS_EMOJI
+
+        monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)
+        cog, thread, tmux = self._make_cog_and_thread(topic=None)
+        cog.repo.set_topic = AsyncMock()
+        thread.name = "old"
+
+        with patch.object(
+            cc_module.topic_module,
+            "generate_topic",
+            new=AsyncMock(return_value=("初回トピック", "llm")),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="初回メッセージです"
+            )
+
+        thread.edit.assert_awaited_once()
+        call_name = thread.edit.await_args.kwargs.get(
+            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
+        )
+        assert "初回トピック" in call_name  # topic still applied
+        for emoji in STATUS_EMOJI.values():
+            assert emoji not in call_name  # no lamp emoji
+
+    @pytest.mark.asyncio
+    async def test_apply_thread_naming_paints_lamp_when_opted_in(self, monkeypatch):
+        """CLORD_THREAD_LAMP=1 restores the leading status emoji (backward compat)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        monkeypatch.setenv("CLORD_THREAD_LAMP", "1")
+        cog, thread, tmux = self._make_cog_and_thread(topic=None)
+        cog.repo.set_topic = AsyncMock()
+        thread.name = "old"
+
+        with patch.object(
+            cc_module.topic_module,
+            "generate_topic",
+            new=AsyncMock(return_value=("初回トピック", "llm")),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread, tmux_manager=tmux, first_message="初回メッセージです"
+            )
+
+        thread.edit.assert_awaited_once()
+        call_name = thread.edit.await_args.kwargs.get(
+            "name", thread.edit.await_args.args[0] if thread.edit.await_args.args else ""
+        )
+        assert "初回トピック" in call_name
+        assert call_name.startswith("🟢")  # running lamp painted
 
 
 class TestDiscordLinkEnrichmentWireIn:

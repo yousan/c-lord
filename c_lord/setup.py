@@ -261,7 +261,17 @@ async def setup_bridge(
     # --- Thread state sync loop (Issue #95) ---
     # Refreshes the leading status emoji + trailing #window-index hint on each
     # Discord thread once per minute.  Topic body is never touched.
-    if os.getenv("CLORD_THREAD_STATE_SYNC", "1") not in ("0", "false", "no"):
+    #
+    # The thread-name lamp (🟢🟡) is off by default (#329) — repainting the name
+    # on every state change saturates Discord's thread-rename rate-limit. When
+    # the lamp is off there is nothing for this poll to paint, so skip the loop
+    # entirely. Opt in with CLORD_THREAD_LAMP=1 (CLORD_THREAD_STATE_SYNC=0 then
+    # keeps the event-driven lamp but drops the ≤60s poll).
+    from .thread_name import thread_lamp_enabled
+
+    _lamp_on = thread_lamp_enabled()
+    _sync_on = os.getenv("CLORD_THREAD_STATE_SYNC", "1") not in ("0", "false", "no")
+    if _lamp_on and _sync_on:
         from .thread_state_sync import ThreadStateSyncLoop
 
         interval_env = os.getenv("CLORD_THREAD_STATE_SYNC_INTERVAL", "60")
@@ -280,6 +290,11 @@ async def setup_bridge(
         sync_loop.start()
         bot.thread_state_sync = sync_loop  # type: ignore[attr-defined]
         logger.info("Started ThreadStateSyncLoop (interval=%.0fs)", interval)
+    elif not _lamp_on:
+        logger.info(
+            "ThreadStateSyncLoop disabled: thread lamp is off "
+            "(set CLORD_THREAD_LAMP=1 to enable 🟢🟡 thread-name lamps)"
+        )
 
     components = BridgeComponents(
         session_repo=session_repo,
