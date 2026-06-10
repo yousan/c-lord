@@ -11,7 +11,71 @@ from pathlib import Path
 
 import pytest
 
-from c_lord.main import load_config, resolve_data_dir
+from c_lord.main import acquire_token_lock, load_config, resolve_data_dir
+
+
+class TestTokenLock:
+    """Issue #325: host-global flock keyed on the bot TOKEN, not the data dir.
+
+    The #212 data-dir flock cannot stop a same-token double-connect from a
+    different clone (different data dir -> different lock file). The real
+    invariant is "one process per token"; this lock enforces it before the
+    Discord gateway is ever touched.
+    """
+
+    def test_same_token_second_acquire_exits(self, tmp_path: Path) -> None:
+        import sys
+        from unittest.mock import patch
+
+        first = acquire_token_lock("tok-A", lock_dir=tmp_path)
+        assert first is not None
+        with patch.object(sys, "exit") as mock_exit:
+            acquire_token_lock("tok-A", lock_dir=tmp_path)
+        mock_exit.assert_called_with(1)
+        first.close()
+
+    def test_different_tokens_both_acquire(self, tmp_path: Path) -> None:
+        a = acquire_token_lock("tok-A", lock_dir=tmp_path)
+        b = acquire_token_lock("tok-B", lock_dir=tmp_path)
+        assert a is not None and b is not None
+        a.close()
+        b.close()
+
+    def test_no_plaintext_token_on_disk(self, tmp_path: Path) -> None:
+        token = "super-secret-token-value"
+        handle = acquire_token_lock(token, lock_dir=tmp_path)
+        assert handle is not None
+        try:
+            for f in tmp_path.iterdir():
+                assert token not in f.name
+                assert token not in f.read_text(errors="replace")
+        finally:
+            handle.close()
+
+    def test_refusal_reports_holder_pid_and_cwd(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+        import sys
+        from unittest.mock import patch
+
+        first = acquire_token_lock("tok-A", lock_dir=tmp_path)
+        assert first is not None
+        with (
+            caplog.at_level(logging.ERROR, logger="c_lord.main"),
+            patch.object(sys, "exit"),
+        ):
+            acquire_token_lock("tok-A", lock_dir=tmp_path)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert str(os.getpid()) in joined  # holder pid
+        assert str(Path.cwd()) in joined  # holder cwd
+        first.close()
+
+    def test_multi_instance_escape_hatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLORD_ALLOW_MULTI_INSTANCE", "1")
+        assert acquire_token_lock("tok-A", lock_dir=tmp_path) is None
 
 
 class TestResolveDataDir:

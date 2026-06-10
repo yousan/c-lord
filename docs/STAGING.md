@@ -30,7 +30,7 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 1. **directory == identity** (#324): `.env` に書かれたキーは継承 env に常に勝つ。正しいディレクトリで起動すれば正しい bot になる。
 2. **identity fail-fast** (#323): `.env` の `EXPECTED_BOT_USER_ID` と実ログイン identity が違えば bot は即 exit(1)。**新しい環境の .env には必ず設定すること。**
 3. **センチネル .env** (#326): `c-lord-parallel` / `-2` / `c-lord-issue63` の `.env` は無効値。そこから bot は起動できない(本番 token の読み取りは `/home/yousan/c-lord/.env` を絶対パスで)。
-4. **単一インスタンス flock** (#212): 同一 data dir の二重起動は拒否される。トークン基準のロックは #325 で予定。
+4. **単一インスタンス flock**: 同一 data dir の二重起動 (#212) に加え、**同一トークンの二重起動**もホスト全域ロックで拒否される (#325, `~/.cache/c-lord/locks/token-<hash>.lock`)。別ディレクトリからでも同じ bot は2つ立てられない。緊急回避は `CLORD_ALLOW_MULTI_INSTANCE=1`(両ロックを無効化 — 理解した上でのみ)。
 
 ## 操作 — `scripts/staging.sh`(clone のルートで実行)
 
@@ -52,19 +52,28 @@ per-run ログ → `Logged in as` を待って identity を検証(mismatch な�
 - `nohup uv run ...` での起動(Bash ツール teardown で exit 144 死する)
 - 本番 (`/home/yousan/c-lord`) への手動 kill+nohup(supervised — #195 の二重 bot 事故になる)
 
-## 占有(借用)プロトコル — 暫定版
+## 占有(借用)プロトコル (#328)
 
 staging は**共有リソース**。複数セッションが同時に使うと kill / checkout の踏み合いになる(2026-05-29 実害)。
-CLI 化(borrow/release/TTL)は #328 で実装予定。それまでの暫定規約:
+占有はリースファイル(clone 直下の `.staging-lease`、環境ごとに1枚・中央台帳なし)で機械的に管理する:
 
-1. **借りる前に確認**: `bash scripts/staging.sh status` + `.staging-lease` ファイルの有無。
-   lease があり、自分のものでなく、`acquired_at + ttl` が未失効なら**触らない**。
-2. **借りる**: clone 直下に `.staging-lease` を書く:
-   ```json
-   {"owner": "<セッション識別子>", "purpose": "PR #NNN 検証", "branch_before": "main",
-    "acquired_at": "<ISO8601>", "ttl_hours": 2}
-   ```
-3. **返す(原状復帰)**: `bash scripts/staging.sh restart main` → `status` で単一インスタンス確認 → `.staging-lease` を削除。
+```bash
+cd /home/yousan/c-lord-parallel-3
+export CLORD_LEASE_OWNER="<自分のセッション識別子>"   # 例: claude-session-<thread_id>
+
+bash scripts/staging.sh borrow --purpose "PR #NNN 検証" [--ttl-hours 2]
+#   → 他セッションの有効リース中なら拒否され、誰が・何のために・いつまでが表示される
+#   → 失効リースは奪取できる(旧リース内容がログに残る)
+
+bash scripts/staging.sh restart <branch>   # ← 有効な自リースが無いと拒否される
+bash scripts/staging.sh stop               # ← 他人の有効リース中は拒否される
+
+bash scripts/staging.sh release            # 検証後の原状復帰とセットで必ず実行
+```
+
+**ルール**: `restart` は常に自リース必須(borrow → restart → … → restart main → release)。
+`stop` はリースが無ければ可(掃除目的)、他人の有効リース中は不可(検証中の bot を殺さない)。
+リースの確認だけなら `status`(lease 行に owner / purpose / TTL が出る)。
 
 > 旧ドキュメントの「Lounge API (`/api/lounge`) で占有を宣言」は**使えない**:
 > `CLORD_BRIDGE_MODE=jsonl` の本デプロイでは ApiServer 自体が起動しない(#322 根因B)。
