@@ -197,6 +197,7 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
         api_url=cfg.api_url,
         api_secret=cfg.api_secret,
         webhook_url=cfg.webhook_url,
+        skip_health=args.skip_health,
     )
     bot_id = _bot_user_id(client)
 
@@ -204,7 +205,11 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
         if args.restart_if_down and cfg.staging_dir:
             restart_bot(cfg)
         if not client.health():
-            log("WARNING: bot /api/health is down — injections will likely fail")
+            log(
+                f"WARNING: bot /api/health is unreachable at {cfg.api_url} — spawn injections "
+                "will fail. Set FUZZ_API_URL to the bot's actual API port, or use "
+                "`--inject webhook --skip-health`."
+            )
 
     deadline = _monotonic() + args.budget
     observations = []
@@ -370,6 +375,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-report", action="store_true", help="do not post a Discord summary")
     p.add_argument(
         "--restart-if-down", action="store_true", help="restart staging if /api/health is down"
+    )
+    p.add_argument(
+        "--skip-health",
+        action="store_true",
+        help="skip the /api/health probe (webhook-only injection, or unreachable API)",
     )
     return p.parse_args(argv)
 

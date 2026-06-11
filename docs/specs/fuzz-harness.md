@@ -97,7 +97,11 @@ harness は「チャンネルが用意され `/clord-init` 済み」を前提に
    - `FUZZ_CHANNEL_ID` = `#fuzz-staging` の channel id
    - `FUZZ_REPORT_CHANNEL_ID` = `#fuzz-report` の channel id
    - `FUZZ_GUILD_ID` = サーバ id（レポートの thread URL をクリッカブルにする）
-   - 必要なら `FUZZ_API_URL`（staging bot の API、既定は `CLORD_API_URL`）
+   - **`FUZZ_API_URL` = staging bot の API の実ポート**（既定 `CLORD_API_URL`）。
+     ⚠️ **これがズレていると spawn 注入が毎回 `SPAWN_FAILED`/`HEALTH_DOWN` になる**（#377 の検証中、
+     `.env` の `CLORD_API_URL=:8089` が実際の bind とドリフトしていて実害が出た）。設定後に
+     `curl -m3 $FUZZ_API_URL/api/health` が 200 を返すことを必ず確認する。API がこのホストから
+     到達不能なら `--inject webhook --skip-health`（`FUZZ_WEBHOOK_URL`＋`FUZZ_TEST_THREAD_ID` を設定）で運用する。
 4. cron を入れる（毎時 0 分）:
 
    ```cron

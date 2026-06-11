@@ -13,9 +13,16 @@
 # unset, the harness runs against the clone it lives in (run-in-place model).
 #
 # The hourly run borrows the staging lease; if another session holds it, the run
-# skips cleanly (exit 0). It restarts the staging bot only if /api/health is down
-# (--restart-if-down). Per-run logs land in $FUZZ_LOG_DIR (default /tmp) with a
+# skips cleanly (exit 0). Per-run logs land in $FUZZ_LOG_DIR (default /tmp) with a
 # symlink to the latest. Tunables: FUZZ_COUNT, FUZZ_MODEL, FUZZ_EXTRA_ARGS.
+#
+# IMPORTANT: for the default `spawn` injection, FUZZ_API_URL (or CLORD_API_URL in
+# the staging .env) MUST point at the bot's ACTUAL API port — a drifted URL makes
+# every scenario report SPAWN_FAILED/HEALTH_DOWN. `--restart-if-down` is therefore
+# NOT passed by default (a wrong URL would needlessly restart staging every hour);
+# opt in via FUZZ_EXTRA_ARGS="--restart-if-down" only when the URL is verified. For
+# an API that is unreachable from this host, use FUZZ_EXTRA_ARGS="--inject webhook
+# --skip-health" with FUZZ_WEBHOOK_URL + FUZZ_TEST_THREAD_ID set.
 # =============================================================================
 set -u
 
@@ -39,7 +46,8 @@ if [ ! -x "$VENV_PY" ]; then
 fi
 
 # Build args. --staging-dir defaults to the staging clone (lease lives there).
-ARGS=(--restart-if-down)
+# --restart-if-down is intentionally NOT here (see header) — opt in via FUZZ_EXTRA_ARGS.
+ARGS=()
 if [ -n "${FUZZ_STAGING_CLONE_DIR:-}" ]; then
   ARGS+=(--staging-dir "$FUZZ_STAGING_CLONE_DIR")
 fi

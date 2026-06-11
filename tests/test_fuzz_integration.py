@@ -104,3 +104,22 @@ def test_full_loop_spawn_failure_is_flagged() -> None:
     obs = _observe(client, "anything")
     assert not obs.injected
     assert [a.kind for a in detect_anomalies(obs)] == ["SPAWN_FAILED"]
+
+
+def test_full_loop_webhook_mode_observes_reply() -> None:
+    # Webhook mode injects into a pre-attached thread and observes the bot reply
+    # (no /api/spawn). The faked webhook_post returns trigger id "999".
+    messages = [_bot_msg("2", "Hi there, all good.")]
+    obs = inject_and_observe(
+        FakeClient(messages),
+        Scenario("s01", "cat", "hello", "intent"),
+        mode="webhook",
+        channel_id="c",
+        bot_id=BOT,
+        webhook_thread_id="thr",
+        timeout=0.3,
+        poll=0.05,
+    )
+    assert obs.injected and obs.replied
+    assert obs.reply_text == "Hi there, all good."
+    assert detect_anomalies(obs) == []

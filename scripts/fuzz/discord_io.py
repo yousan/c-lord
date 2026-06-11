@@ -47,11 +47,16 @@ class FuzzClient:
         api_url: str,
         api_secret: str | None = None,
         webhook_url: str | None = None,
+        skip_health: bool = False,
     ) -> None:
         self._token = bot_token
         self._api_url = api_url.rstrip("/")
         self._api_secret = api_secret or None
         self._webhook = webhook_url or None
+        # When the bot's REST API is not reachable from the harness host (e.g.
+        # webhook-only injection, or a drifted CLORD_API_URL), skip the health
+        # probe so it does not flag a spurious HEALTH_DOWN on every scenario.
+        self._skip_health = skip_health
 
     # -- low-level ----------------------------------------------------------
     def _discord_get(self, path: str) -> Any:
@@ -82,6 +87,8 @@ class FuzzClient:
 
     # -- health -------------------------------------------------------------
     def health(self) -> bool:
+        if self._skip_health:
+            return True
         req = urllib.request.Request(f"{self._api_url}/api/health")
         req.add_header("User-Agent", UA)
         try:

@@ -7,9 +7,16 @@ the part most likely to silently mis-classify and corrupt the oracle's input.
 
 from __future__ import annotations
 
-from scripts.fuzz.discord_io import _collect_answer, _find_seed, _reaction_names
+from scripts.fuzz.discord_io import FuzzClient, _collect_answer, _find_seed, _reaction_names
 
 BOT = "999"
+
+
+def test_skip_health_short_circuits_without_network() -> None:
+    # An unreachable api_url would normally make health() False; skip_health makes
+    # it return True without any request (webhook-only / drifted-URL environments).
+    c = FuzzClient(bot_token="x", api_url="http://127.0.0.1:1", skip_health=True)
+    assert c.health() is True
 
 
 def _msg(mid: str, *, author: str = BOT, content: str = "", webhook: bool = False, reactions=None):
