@@ -19,6 +19,8 @@ class TestTmuxSessionManager:
         """First call creates global session + new window with @thread_id."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
+        # Isolate from the post-create window sort (#374) — tested separately.
+        mgr._sort_windows_unlocked = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -47,6 +49,9 @@ class TestTmuxSessionManager:
         assert SESSION_NAME in args
         assert "w1" in args
         assert "/work/dir" in args
+        # #374: created detached so a new thread doesn't steal the attached
+        # user's tmux focus.
+        assert "-d" in args
 
         # Verify set-option was called to store thread_id
         set_opt_call = mock_run.call_args_list[5]
@@ -85,6 +90,8 @@ class TestTmuxSessionManager:
         """Each new window gets an incrementing work number."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
+        # Isolate from the post-create window sort (#374) — tested separately.
+        mgr._sort_windows_unlocked = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             # First thread
@@ -505,6 +512,63 @@ class TestTmuxSessionManager:
         args = cmd_call[0][0]
         cmd_str = " ".join(args[3:])
         assert "--continue" not in cmd_str
+
+    def test_start_claude_includes_effort_flag(self) -> None:
+        """start_claude passes a valid effort level as --effort <level>."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            mgr.start_claude(12345, "hello", effort="max")
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--effort max" in cmd_str
+
+    def test_start_claude_no_effort_flag_when_none(self) -> None:
+        """effort=None (default) omits the --effort flag entirely."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            mgr.start_claude(12345, "hello")
+
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--effort" not in cmd_str
+
+    def test_start_claude_invalid_effort_is_skipped(self) -> None:
+        """An effort the --effort flag rejects (e.g. ultracode) is dropped, not
+        passed — passing it would hard-error the claude process and leave the
+        thread with no response. The command is still built without it."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0),  # send-keys
+            ]
+            result = mgr.start_claude(12345, "hello", effort="ultracode")
+
+        assert result is True
+        cmd_call = mock_run.call_args_list[1]
+        args = cmd_call[0][0]
+        cmd_str = " ".join(args[3:])
+        assert "--effort" not in cmd_str
 
     def test_send_input_sends_text_and_enter(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -1347,6 +1411,146 @@ class TestWindowNameGeneration:
         assert mgr._thread_to_window == {333: "work3"}
         assert mgr._next_work_id == 4
         assert mgr._next_window_name() == "w4"
+
+
+class TestSortWindows:
+    """Windows are kept in ascending ``w{N}`` order on add (#374)."""
+
+    @staticmethod
+    def _avail_mgr() -> TmuxSessionManager:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        return mgr
+
+    @staticmethod
+    def _move_sources(mock_run: MagicMock) -> list[str]:
+        """Return the ``-s`` source of each ``move-window`` call, in order."""
+        sources: list[str] = []
+        for c in mock_run.call_args_list:
+            argv = c[0][0]
+            if "move-window" in argv and "-s" in argv:
+                sources.append(argv[argv.index("-s") + 1])
+        return sources
+
+    def test_orders_numbered_windows_ascending(self) -> None:
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # list-windows: window_id \t name (unordered: w30, w5, w12)
+                MagicMock(returncode=0, stdout="@5\tw30\n@6\tw5\n@7\tw12\n"),
+                MagicMock(returncode=0),  # move w5
+                MagicMock(returncode=0),  # move w12
+                MagicMock(returncode=0),  # move w30
+                MagicMock(returncode=0),  # move-window -r
+            ]
+            mgr._sort_windows_unlocked()
+        # sources must be ascending by number: w5(@6), w12(@7), w30(@5)
+        assert self._move_sources(mock_run) == ["@6", "@7", "@5"]
+        assert any(
+            "move-window" in c[0][0] and "-r" in c[0][0] for c in mock_run.call_args_list
+        )
+
+    def test_non_numbered_windows_go_to_end(self) -> None:
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="@1\tzsh\n@2\tw9\n@3\tw3\n"),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+            ]
+            mgr._sort_windows_unlocked()
+        # numbered ascending (w3@3, w9@2) then non-numbered zsh(@1) last
+        assert self._move_sources(mock_run) == ["@3", "@2", "@1"]
+
+    def test_noop_when_already_sorted(self) -> None:
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="@1\tw3\n@2\tw9\n@3\tw30\n"),
+            ]
+            mgr._sort_windows_unlocked()
+        assert not any("move-window" in c[0][0] for c in mock_run.call_args_list)
+
+    def test_noop_single_window(self) -> None:
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [MagicMock(returncode=0, stdout="@1\tw1\n")]
+            mgr._sort_windows_unlocked()
+        assert not any("move-window" in c[0][0] for c in mock_run.call_args_list)
+
+    def test_noop_when_tmux_unavailable(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = False
+        with patch("c_lord.tmux._run") as mock_run:
+            mgr._sort_windows_unlocked()
+        mock_run.assert_not_called()
+
+    def test_only_moves_never_renames_or_kills(self) -> None:
+        """Sorting must change indices/focus only — never rename, kill, or
+        re-option windows (so names / @thread_id / panes are preserved)."""
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="@1\tw9\n@2\tw3\n"),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+            ]
+            mgr._sort_windows_unlocked()
+        verbs = {c[0][0][1] for c in mock_run.call_args_list if len(c[0][0]) > 1}
+        assert verbs <= {"list-windows", "move-window", "select-window"}
+
+    def test_restores_active_window_after_sort(self) -> None:
+        """Parking/renumbering resets the session's current window; the sort
+        must re-select whatever was active so an attached user's view is not
+        yanked away (#374)."""
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # window_id \t name \t active — @6 (w3) is the active window
+                MagicMock(returncode=0, stdout="@5\tw9\t0\n@6\tw3\t1\n"),
+                MagicMock(returncode=0),  # move w3
+                MagicMock(returncode=0),  # move w9
+                MagicMock(returncode=0),  # move-window -r
+                MagicMock(returncode=0),  # select-window restore
+            ]
+            mgr._sort_windows_unlocked()
+        select_calls = [c[0][0] for c in mock_run.call_args_list if "select-window" in c[0][0]]
+        assert len(select_calls) == 1
+        assert select_calls[0][-1] == "@6"  # the previously-active window
+
+    def test_no_select_window_when_none_active(self) -> None:
+        """If no window is reported active, the sort doesn't emit select-window."""
+        mgr = self._avail_mgr()
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="@5\tw9\t0\n@6\tw3\t0\n"),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
+            ]
+            mgr._sort_windows_unlocked()
+        assert not any("select-window" in c[0][0] for c in mock_run.call_args_list)
+
+    def test_create_session_sorts_after_new_window(self) -> None:
+        """The new-window path triggers a sort; the existing-window path does not."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        called = {"n": 0}
+        mgr._sort_windows_unlocked = lambda: called.__setitem__("n", called["n"] + 1)  # type: ignore[method-assign]
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stdout=""),  # rebuild list-windows (no session)
+                MagicMock(returncode=1),  # has-session (no)
+                MagicMock(returncode=0),  # new-session
+                MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
+                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=0),  # set-option
+            ]
+            mgr.create_session(12345, "/work/dir")
+        assert called["n"] == 1
 
 
 class TestGetWindowInfo:

@@ -351,6 +351,11 @@ uv lock --upgrade-package c-lord && uv sync
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
 | `CLORD_BRIDGE_MODE` | Set to `jsonl` to enable TranscriptMirror (tails Claude Code JSONL transcripts and forwards events to Discord threads) | (optional) |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
+| `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
+
+### URL Link Previews (CLORD_SHOW_URL_EMBEDS)
+
+When Claude's reply contains a URL (e.g. a GitHub Issues link), Discord would normally expand it into a tall OGP preview card (title, description, image), pushing the actual answer down and cluttering the thread. By default c-lord **suppresses** these previews (the `SUPPRESS_EMBEDS` flag is set on each reply), so the link stays inline and the answer reads cleanly. Set `CLORD_SHOW_URL_EMBEDS=true` to restore Discord's default link-preview expansion.
 
 ### Table Image Rendering (CLORD_RENDER_TABLE_IMAGES)
 

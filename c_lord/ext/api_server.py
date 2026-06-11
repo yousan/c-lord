@@ -64,10 +64,15 @@ class ApiServer:
         lounge_channel_id: int | None = None,
         resume_repo: PendingResumeRepository | None = None,
         session_repo: SessionRepository | None = None,
+        show_url_embeds: bool = False,
     ) -> None:
         self.repo = repo
         self.bot = bot
         self.default_channel_id = default_channel_id
+        # #372: when False (default) Discord URL/OGP link previews are
+        # suppressed on /api/reply so a link in Claude's answer doesn't expand
+        # into a tall preview card. Opt back in with CLORD_SHOW_URL_EMBEDS=true.
+        self.show_url_embeds = show_url_embeds
         self.host = host
         self.port = port
         self.api_secret = api_secret
@@ -752,7 +757,10 @@ class ApiServer:
         last_idx = len(chunks) - 1
         last_sent: discord.Message | None = None
         for idx, chunk in enumerate(chunks):
-            send_kwargs: dict = {"content": chunk}
+            # #372: suppress URL OGP/link-preview cards by default. Setting the
+            # SUPPRESS_EMBEDS flag is non-destructive (it never mutates the body)
+            # and is a no-op when the chunk has no URL.
+            send_kwargs: dict = {"content": chunk, "suppress_embeds": not self.show_url_embeds}
             if idx == 0 and reference is not None:
                 send_kwargs["reference"] = reference
                 send_kwargs["mention_author"] = False

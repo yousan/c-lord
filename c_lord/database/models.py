@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tmux_window_id TEXT,
     auto_topic_locked INTEGER NOT NULL DEFAULT 0,
     topic_source TEXT,
+    rename_backoff_until TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -141,6 +142,10 @@ _MIGRATIONS = [
     # restart can detect & re-deliver a final answer dropped while the bot
     # was down (mirror not tailing).
     "ALTER TABLE sessions ADD COLUMN mirror_replied_uuid TEXT",
+    # Issue #281: persist the state-sync rename rate-limit deadline (wall-clock)
+    # so a bot restart honours Discord's ~10-min per-channel rename window
+    # instead of forgetting it (in-memory backoff resets on restart → 429).
+    "ALTER TABLE sessions ADD COLUMN rename_backoff_until TEXT",
 ]
 
 
