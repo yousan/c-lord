@@ -296,6 +296,19 @@ async def setup_bridge(
             "(set CLORD_THREAD_LAMP=1 to enable 🟢🟡 thread-name lamps)"
         )
 
+    # --- Menu watchdog (#359) ---
+    # Always-on (zero-config): bridges TUI AskUserQuestion/plan menus that no
+    # turn is watching (turn finalized early; mirror cannot read the tool_use
+    # until resolution). Independent of the thread-name lamp above — the user's
+    # ability to answer menus must not depend on an opt-in cosmetic. Opt out
+    # with CLORD_MENU_WATCHDOG=0.
+    if os.getenv("CLORD_MENU_WATCHDOG", "1") not in ("0", "false", "no"):
+        from .thread_state_sync import MenuWatchdogLoop
+
+        menu_watchdog = MenuWatchdogLoop(bot, is_processing=chat_cog.is_processing)
+        menu_watchdog.start()
+        bot.menu_watchdog = menu_watchdog  # type: ignore[attr-defined]
+
     components = BridgeComponents(
         session_repo=session_repo,
         task_repo=task_repo,

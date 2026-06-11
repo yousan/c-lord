@@ -867,9 +867,8 @@ def _make_loop(is_processing=lambda _tid: False):
     bot.ask_repo = None
     thread = MagicMock(spec=thread_state_sync.discord.Thread)
     bot.get_channel.return_value = thread
-    repo = MagicMock()
-    loop = thread_state_sync.ThreadStateSyncLoop(
-        bot, repo, interval_seconds=60, is_processing=is_processing
+    loop = thread_state_sync.MenuWatchdogLoop(
+        bot, interval_seconds=60, is_processing=is_processing
     )
     return loop, bot, thread
 
