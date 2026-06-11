@@ -46,11 +46,15 @@ class TestScriptGuards:
         assert "instances: 0" in result.stdout
 
     def test_restart_refuses_without_venv(self, tmp_path: Path) -> None:
-        """restart must not attempt a launch when the clone has no .venv."""
+        """restart must not attempt a launch when the clone has no .venv.
+
+        (#328 以降 restart はリース必須なので、borrow してから venv 層に到達する)
+        """
         (tmp_path / ".env").write_text(
             "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\n", encoding="utf-8"
         )
-        result = run_script(["restart"], cwd=tmp_path)
+        run_script(["borrow", "--owner", "sess-T", "--purpose", "test"], cwd=tmp_path)
+        result = run_script(["restart", "--owner", "sess-T"], cwd=tmp_path)
         assert result.returncode != 0
         assert ".venv" in result.stdout + result.stderr
 
@@ -111,3 +115,116 @@ class TestScriptSideIdentityCheck:
         result = run_script(["check-log", str(log)], cwd=tmp_path)
         assert result.returncode == 0
         assert "WARNING" in result.stdout
+
+
+class TestLease:
+    """borrow/release/TTL — staging 占有リース (#328).
+
+    1 つの staging working tree を複数セッションが取り合う問題の機械的防止。
+    リースは clone 直下の .staging-lease(環境ごとに 1 枚、中央台帳なし)。
+    """
+
+    def _clone(self, tmp_path: Path) -> Path:
+        (tmp_path / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\n", encoding="utf-8"
+        )
+        return tmp_path
+
+    def test_borrow_creates_lease(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        result = run_script(["borrow", "--owner", "sess-A", "--purpose", "PR #999 検証"], cwd=clone)
+        assert result.returncode == 0
+        assert (clone / ".staging-lease").is_file()
+        assert "sess-A" in (clone / ".staging-lease").read_text()
+
+    def test_second_borrower_is_refused_with_owner_info(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "PR #999 検証"], cwd=clone)
+        result = run_script(["borrow", "--owner", "sess-B", "--purpose", "別件"], cwd=clone)
+        assert result.returncode != 0
+        out = result.stdout + result.stderr
+        assert "sess-A" in out  # 誰が
+        assert "PR #999" in out  # 何のために
+
+    def test_same_owner_can_reborrow(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "x"], cwd=clone)
+        result = run_script(["borrow", "--owner", "sess-A", "--purpose", "x続き"], cwd=clone)
+        assert result.returncode == 0
+
+    def test_expired_lease_can_be_taken_over(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        run_script(
+            ["borrow", "--owner", "sess-A", "--purpose", "放置", "--ttl-hours", "0"],
+            cwd=clone,
+        )
+        result = run_script(["borrow", "--owner", "sess-B", "--purpose", "奪取"], cwd=clone)
+        assert result.returncode == 0
+        out = result.stdout + result.stderr
+        assert "sess-A" in out  # 奪取時は旧リース内容をログに残す
+        assert "sess-B" in (clone / ".staging-lease").read_text()
+
+    def test_release_by_owner(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "x"], cwd=clone)
+        result = run_script(["release", "--owner", "sess-A"], cwd=clone)
+        assert result.returncode == 0
+        assert not (clone / ".staging-lease").exists()
+
+    def test_release_by_non_owner_is_refused(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "x"], cwd=clone)
+        result = run_script(["release", "--owner", "sess-B"], cwd=clone)
+        assert result.returncode != 0
+        assert (clone / ".staging-lease").exists()
+
+    def test_after_release_other_owner_can_borrow_immediately(self, tmp_path: Path) -> None:
+        """AC: release 後は別 owner が即 borrow できる。"""
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "x"], cwd=clone)
+        run_script(["release", "--owner", "sess-A"], cwd=clone)
+        result = run_script(["borrow", "--owner", "sess-B", "--purpose", "y"], cwd=clone)
+        assert result.returncode == 0
+        assert "sess-B" in (clone / ".staging-lease").read_text()
+
+    def test_refusal_shows_remaining_time(self, tmp_path: Path) -> None:
+        """AC: 拒否時に所有者・目的・残り時間が表示される。"""
+        clone = self._clone(tmp_path)
+        run_script(
+            ["borrow", "--owner", "sess-A", "--purpose", "PR #999", "--ttl-hours", "2"],
+            cwd=clone,
+        )
+        result = run_script(["borrow", "--owner", "sess-B", "--purpose", "z"], cwd=clone)
+        assert result.returncode != 0
+        assert "remaining=" in result.stdout + result.stderr
+
+    def test_restart_refused_while_leased_to_other(self, tmp_path: Path) -> None:
+        """他人の有効リース中の restart は venv チェックより前に拒否される。"""
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "PR #999 検証"], cwd=clone)
+        result = run_script(["restart", "--owner", "sess-B"], cwd=clone)
+        assert result.returncode != 0
+        assert "sess-A" in result.stdout + result.stderr
+
+    def test_restart_allowed_for_lease_owner(self, tmp_path: Path) -> None:
+        """自リースなら restart はリース層を通過する(.venv が無いので後段で落ちる)。"""
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "x"], cwd=clone)
+        result = run_script(["restart", "--owner", "sess-A"], cwd=clone)
+        assert result.returncode != 0
+        assert ".venv" in result.stdout + result.stderr  # リースでなく venv で落ちた
+
+    def test_restart_without_lease_is_refused(self, tmp_path: Path) -> None:
+        """AC: 有効な自リースなしの restart は拒否(必ず borrow が先)。"""
+        clone = self._clone(tmp_path)
+        result = run_script(["restart", "--owner", "sess-A"], cwd=clone)
+        assert result.returncode != 0
+        assert "borrow" in (result.stdout + result.stderr).lower()
+
+    def test_stop_is_also_lease_guarded(self, tmp_path: Path) -> None:
+        """stop も他人の有効リース中は拒否(他人の検証中 bot を殺す事故の防止)。"""
+        clone = self._clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-A", "--purpose", "PR #999 検証"], cwd=clone)
+        result = run_script(["stop", "--owner", "sess-B"], cwd=clone)
+        assert result.returncode != 0
+        assert "sess-A" in result.stdout + result.stderr
