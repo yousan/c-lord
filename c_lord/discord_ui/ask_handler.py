@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 # step away for the day and come back without "Interaction Failed" errors.
 ASK_ANSWER_TIMEOUT = 86_400  # 24 h
 
+# #359: while waiting for a Discord click, also watch the tmux pane.  The human
+# can answer/cancel the menu directly in the pane (tmux attach); without this
+# watch the bridge would wait for a click for ``ASK_ANSWER_TIMEOUT`` while the
+# suspended ``run_claude`` holds the thread lock — freezing the whole thread.
+# Poll ``peek_pending_ask`` every ``_PANE_RESOLVE_POLL`` seconds and treat the
+# menu as resolved-elsewhere after ``_PANE_RESOLVE_MISSES`` consecutive misses
+# (a small dwell guards against a transient half-drawn capture).
+_PANE_RESOLVE_POLL = 2.0
+_PANE_RESOLVE_MISSES = 2
+
 
 async def bridge_pane_ask(
     thread: discord.Thread,
@@ -62,9 +72,41 @@ async def bridge_pane_ask(
         view=view,
     )
 
+    resolved_note = "-# ✅ 端末で回答済み（このボタンは無効です）"
+
+    async def _wait_tui_resolved() -> None:
+        """Return once the menu is no longer open in the pane (#359).
+
+        The human can answer/cancel the menu directly in the tmux pane.  Without
+        this the bridge would wait for a Discord click for ``ASK_ANSWER_TIMEOUT``
+        while the suspended ``run_claude`` holds the thread lock, freezing it.
+        """
+        if not hasattr(runner, "peek_pending_ask"):
+            await asyncio.sleep(ASK_ANSWER_TIMEOUT)  # non-tmux runner: click-only
+            return
+        misses = 0
+        while misses < _PANE_RESOLVE_MISSES:
+            await asyncio.sleep(_PANE_RESOLVE_POLL)
+            if await runner.peek_pending_ask() is None:
+                misses += 1
+            else:
+                misses = 0
+
+    click_task: asyncio.Future = asyncio.ensure_future(answer_queue.get())
+    tui_task: asyncio.Future = asyncio.ensure_future(_wait_tui_resolved())
     try:
-        selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)
-    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+        done, _ = await asyncio.wait(
+            {click_task, tui_task},
+            timeout=ASK_ANSWER_TIMEOUT,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in (click_task, tui_task):
+            t.cancel()
+        _ask_bus.unregister(thread.id)
+
+    if not done:
+        # 24h timeout with the menu still open → dismiss it.
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(
                 content="-# ⏰ Question timed out — send a new message to continue.",
@@ -73,8 +115,20 @@ async def bridge_pane_ask(
             )
         await runner.cancel_menu()
         return
-    finally:
-        _ask_bus.unregister(thread.id)
+
+    if click_task not in done:
+        # Menu was answered/cancelled directly in the pane — buttons are stale.
+        with contextlib.suppress(discord.HTTPException):
+            await msg.edit(content=resolved_note, embed=None, view=None)
+        return
+
+    selected = click_task.result()
+    # The menu may have been resolved in the TUI in the same instant the click
+    # arrived; sending keystrokes then would leak into the idle prompt (#359).
+    if hasattr(runner, "peek_pending_ask") and await runner.peek_pending_ask() is None:
+        with contextlib.suppress(discord.HTTPException):
+            await msg.edit(content=resolved_note, embed=None, view=None)
+        return
 
     if not selected:
         await runner.cancel_menu()
