@@ -1234,6 +1234,7 @@ class ClaudeChatCog(commands.Cog):
                         registry=self._registry,
                         ask_repo=self._ask_repo,
                         lounge_repo=self._lounge_repo,
+                        settings_repo=self._settings_repo,
                         stop_view=stop_view,
                         session_dir_manager=session_dir_manager,
                         tmux_manager=tmux_manager,
