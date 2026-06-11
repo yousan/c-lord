@@ -1,0 +1,4 @@
+# Fuzz run artifacts (<timestamp>.json / .md) are written here by
+# scripts/fuzz. The artifacts themselves are gitignored; this file keeps the
+# directory present in the repo. Commit a specific run only as PR evidence
+# under docs/evidence/<issue>/ instead.
