@@ -115,6 +115,17 @@ def reply_to_trigger_enabled() -> bool:
     return os.getenv("CLORD_REPLY_TO_TRIGGER", "1").strip().lower() not in ("0", "false", "no")
 
 
+def show_url_embeds_enabled() -> bool:
+    """Return True only when ``CLORD_SHOW_URL_EMBEDS`` is explicitly truthy.
+
+    Defaults to False (#372): URL OGP/link-preview cards in Claude's replies
+    are suppressed (``suppress_embeds=True`` on each send) so a link doesn't
+    expand into a tall preview card. Set ``CLORD_SHOW_URL_EMBEDS=1/true/yes/on``
+    to restore Discord's default link-preview expansion.
+    """
+    return os.getenv("CLORD_SHOW_URL_EMBEDS", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
 def idle_flush_seconds() -> float:
     """Return the idle-flush window from ``CLORD_MIRROR_IDLE_FLUSH_SECONDS``.
 
