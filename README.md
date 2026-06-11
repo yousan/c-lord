@@ -351,6 +351,11 @@ uv lock --upgrade-package c-lord && uv sync
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
 | `CLORD_BRIDGE_MODE` | Set to `jsonl` to enable TranscriptMirror (tails Claude Code JSONL transcripts and forwards events to Discord threads) | (optional) |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
+| `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
+
+### URL Link Previews (CLORD_SHOW_URL_EMBEDS)
+
+When Claude's reply contains a URL (e.g. a GitHub Issues link), Discord would normally expand it into a tall OGP preview card (title, description, image), pushing the actual answer down and cluttering the thread. By default c-lord **suppresses** these previews (the `SUPPRESS_EMBEDS` flag is set on each reply), so the link stays inline and the answer reads cleanly. Set `CLORD_SHOW_URL_EMBEDS=true` to restore Discord's default link-preview expansion.
 
 ### Table Image Rendering (CLORD_RENDER_TABLE_IMAGES)
 
@@ -623,7 +628,7 @@ The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Kn
 | Thread  | tmux window  | 1:1     |
 
 - **1 Discord channel = 1 tmux session.** All threads in a channel share that one session. The session name is derived from the channel's bound repo (via `/clord-init`); unbound channels fall back to the default `clord` session.
-- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`work1`, `work2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
+- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`w1`, `w2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
 
 For the "why" behind this design, see [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 

@@ -22,8 +22,8 @@ Bot (c-lord process)                                     ← one instance
 │   │   └── Linked via /clord-init (stored in DB)
 │   │
 │   ├── tmux session: "project-a"
-│   │   ├── work1 ── Claude Code CLI for Thread 101
-│   │   └── work2 ── Claude Code CLI for Thread 102
+│   │   ├── w1 ── Claude Code CLI for Thread 101
+│   │   └── w2 ── Claude Code CLI for Thread 102
 │   │
 │   └── session_dir: ~/c-lord-sessions/project-a/
 │       ├── 101/ ── git clone of project-a (for Thread 101)
@@ -34,7 +34,7 @@ Bot (c-lord process)                                     ← one instance
 │   ├── Repository: github.com/user/project-b.git
 │   │
 │   ├── tmux session: "project-b"
-│   │   └── work1 ── Claude Code CLI for Thread 201
+│   │   └── w1 ── Claude Code CLI for Thread 201
 │   │
 │   └── session_dir: ~/c-lord-sessions/project-b/
 │       └── 201/ ── git clone of project-b (for Thread 201)
@@ -65,7 +65,7 @@ User: /clord Fix the auth bug
 Bot automatically:
   1. Creates Thread (Discord)
   2. git clone (session_dir)
-  3. Creates tmux window (work1, work2, ...)
+  3. Creates tmux window (w1, w2, ...)
   4. Launches Claude Code CLI
 ```
 
@@ -90,8 +90,8 @@ The bot creates a new thread and Claude begins working. All subsequent messages 
 Attach an existing tmux window to the current thread. Use this inside a thread that was created manually (e.g. for an already-running Claude Code CLI session).
 
 ```
-/clord-attach work1
-!attach work1
+/clord-attach w1
+!attach w1
 ```
 
 After attaching, the bot will respond to messages in that thread.
@@ -218,7 +218,7 @@ Bot restart → Session auto-resumes
 1. DB session record created (thread_id → session_id)
 2. session_dir created: ~/c-lord-sessions/project-a/{thread_id}/
    └── git clone https://github.com/user/project-a.git
-3. tmux window created: project-a:work1
+3. tmux window created: project-a:w1
    └── @thread_id = {thread_id}
 4. Claude Code CLI launched (runs inside tmux window)
     ↓
@@ -267,7 +267,7 @@ tmux ls
 # Attach to a project's sessions
 tmux attach -t project-a
 
-# Switch between windows (work1, work2, ...)
+# Switch between windows (w1, w2, ...)
 # Ctrl-b + n (next), Ctrl-b + p (prev), Ctrl-b + 1 (by number)
 ```
 

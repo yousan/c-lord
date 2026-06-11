@@ -190,6 +190,70 @@ class TestPostContextUsage:
         assert "1.0M" in new_content
         cfg.thread.send.assert_not_called()
 
+    def test_context_edit_preserves_embed_suppression_by_default(self, monkeypatch) -> None:
+        """#372: the context-line edit() must keep URL OGP cards suppressed.
+
+        discord.py's ``Message.edit`` defaults ``suppress=False`` (not MISSING),
+        so an edit that omits ``suppress`` explicitly *un*-suppresses embeds —
+        re-enabling the OGP card that reply_sink had suppressed at send-time.
+        ``_post_context_usage`` must pass ``suppress=True`` by default.
+        """
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+
+        last_msg = MagicMock()
+        last_msg.content = "see https://github.com/yousan/c-lord/issues"
+        last_msg.edit = AsyncMock()
+        reply_tracker.record_reply_message(12345, last_msg)
+
+        monkeypatch.setattr(
+            _run_helper, "read_latest_usage", lambda _p: ContextUsage(input_tokens=60_000)
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-suppress"))
+
+        last_msg.edit.assert_awaited_once()
+        assert last_msg.edit.await_args.kwargs.get("suppress") is True
+
+    def test_context_edit_respects_show_url_embeds_optin(self, monkeypatch) -> None:
+        """#372: CLORD_SHOW_URL_EMBEDS=true keeps embeds enabled on the edit too."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        monkeypatch.setenv("CLORD_SHOW_URL_EMBEDS", "true")
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+
+        last_msg = MagicMock()
+        last_msg.content = "see https://github.com/yousan/c-lord/issues"
+        last_msg.edit = AsyncMock()
+        reply_tracker.record_reply_message(12345, last_msg)
+
+        monkeypatch.setattr(
+            _run_helper, "read_latest_usage", lambda _p: ContextUsage(input_tokens=60_000)
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-optin"))
+
+        last_msg.edit.assert_awaited_once()
+        assert last_msg.edit.await_args.kwargs.get("suppress") is False
+
     def test_waits_briefly_for_reply_sink_then_edits(self, monkeypatch) -> None:
         """In jsonl bridge mode the reply_sink races with the run-loop end.
 

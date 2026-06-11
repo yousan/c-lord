@@ -68,7 +68,7 @@ def build_name(
 ) -> str:
     """Build a thread name from its parts, capped at 30 characters.
 
-    ``window_number`` is the ``N`` from the tmux ``work{N}`` window name (a
+    ``window_number`` is the ``N`` from the tmux ``w{N}`` window name (a
     stable identifier), not tmux's volatile ``#{window_index}``.
 
     Format: ``<emoji> W<N> │ <topic>`` when running/waiting/error with a window number.

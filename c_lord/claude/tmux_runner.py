@@ -6,7 +6,7 @@ this runner starts Claude in TUI mode inside a tmux pane and polls
 
 The trade-off is that structured stream events (tool use, thinking, etc.)
 are not available — only plain text deltas.  However, users can
-``tmux attach -t clord:workN`` to see the full Claude TUI in real time.
+``tmux attach -t clord:wN`` to see the full Claude TUI in real time.
 """
 
 from __future__ import annotations
@@ -545,6 +545,7 @@ class TmuxClaudeRunner:
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
+        effort: str | None = None,
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
@@ -553,6 +554,7 @@ class TmuxClaudeRunner:
         self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
+        self._effort = effort
         # True only for the restart-resume path (on_ready → pending_resumes).
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
@@ -592,6 +594,21 @@ class TmuxClaudeRunner:
         claude_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)
 
         if claude_running:
+            # If Claude is blocked on an open AskUserQuestion/plan menu, a bare
+            # send_input would type the message + Enter straight into the menu —
+            # the trailing Enter selects the highlighted *first* option and the
+            # typed text is discarded (#358).  The user sending a normal message
+            # instead of clicking a button means "I'm not answering that menu, do
+            # this instead", so dismiss the menu (Esc) first and let the TUI
+            # settle back to the input prompt before delivering the message.
+            if await self.peek_pending_ask() is not None:
+                logger.info(
+                    "Open menu detected before delivering new input; dismissing it "
+                    "(Esc) so the message is not consumed as a menu selection (thread=%d)",
+                    self._thread_id,
+                )
+                await self.cancel_menu()
+                await asyncio.sleep(_MENU_NAV_DELAY)
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
                 yield StreamEvent(
@@ -614,6 +631,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=True,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -643,6 +661,7 @@ class TmuxClaudeRunner:
                         permission_mode=self._permission_mode,
                         dangerously_skip_permissions=self._dangerously_skip_permissions,
                         try_continue=False,
+                        effort=self._effort,
                     )
                     if not ok:
                         yield StreamEvent(
@@ -663,6 +682,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=False,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
