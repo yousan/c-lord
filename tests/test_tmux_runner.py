@@ -1030,6 +1030,7 @@ class TestTmuxClaudeRunnerRun:
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=False,
+            effort=None,
         )
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
@@ -1664,6 +1665,7 @@ class TestContinueFallback:
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=True,
+            effort=None,
         )
 
     @pytest.mark.asyncio
@@ -1750,6 +1752,7 @@ class TestContinueFallback:
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=False,
+            effort=None,
         )
         # Only one is_claude_running call (no post-continue check)
         assert tmux_manager.is_claude_running.call_count == 1

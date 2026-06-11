@@ -398,6 +398,90 @@ class TestCloseWorkspace:
         thread.edit.assert_called_once()
         assert thread.edit.call_args.kwargs.get("archived") is True
 
+    async def test_close_stops_mirror_before_archiving(self):
+        """#379: close-workspace MUST stop the TranscriptMirror before archiving.
+
+        Otherwise the mirror keeps tailing the JSONL and posts a ``👤``
+        echo (e.g. the ``<task-notification>`` emitted when close-workspace's
+        own ``kill_session`` stops a background task) *after* the archive,
+        which makes Discord auto-unarchive the thread — so it never closes.
+        """
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+
+        # TranscriptMirrorCog stub with an async stop_for.
+        mirror_cog = MagicMock()
+        mirror_cog.stop_for = AsyncMock()
+        cog.bot.get_cog = MagicMock(return_value=mirror_cog)
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.edit = AsyncMock()
+
+        # Record global call order across stop_for and the archive edit.
+        order: list[str] = []
+        mirror_cog.stop_for.side_effect = lambda *a, **k: order.append("stop_for")
+        thread.edit.side_effect = lambda *a, **k: order.append("edit")
+
+        ctx = _make_ctx(channel=thread)
+        await cog.close_workspace_text.callback(cog, ctx)
+
+        # Looked up by the canonical cog name.
+        cog.bot.get_cog.assert_any_call("TranscriptMirrorCog")
+        # Stopped for this exact thread.
+        mirror_cog.stop_for.assert_awaited_once_with(555)
+        # And stopped BEFORE the archive, so no echo can land post-archive.
+        assert order == ["stop_for", "edit"]
+
+    async def test_close_works_when_mirror_cog_absent(self):
+        """#379 zero-config: no TranscriptMirrorCog (bridge OFF) → no crash, still archives."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog.bot.get_cog = MagicMock(return_value=None)  # cog not registered
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.edit = AsyncMock()
+        ctx = _make_ctx(channel=thread)
+
+        await cog.close_workspace_text.callback(cog, ctx)
+
+        thread.edit.assert_called_once()
+        assert thread.edit.call_args.kwargs.get("archived") is True
+
+    async def test_workspace_delete_stops_mirror(self):
+        """#379: workspace-delete also tears the mirror down so it doesn't tail a removed JSONL."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(return_value=True)
+        sdm = MagicMock()
+        sdm.cleanup_for_thread = MagicMock(
+            return_value=MagicMock(removed=True, path="/tmp/x", reason="")
+        )
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
+
+        mirror_cog = MagicMock()
+        mirror_cog.stop_for = AsyncMock()
+        cog.bot.get_cog = MagicMock(return_value=mirror_cog)
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        ctx = _make_ctx(channel=thread)
+
+        await cog.workspace_delete_text.callback(cog, ctx)
+
+        mirror_cog.stop_for.assert_awaited_once_with(555)
+
 
 class TestThreadArchiveCommand:
     """/thread-archive show + set and their !text twins."""

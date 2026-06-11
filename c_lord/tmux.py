@@ -41,6 +41,12 @@ _LEGACY_WINDOW_PREFIX = "work"
 # compacts them back from ``base-index``. Far above any realistic window count.
 _SORT_TMP_BASE = 9000
 
+# Effort levels the ``claude --effort`` flag accepts (commander-validated; it
+# hard-errors on anything else).  ``ultracode``/``auto`` are real effort levels
+# but only settable via ``CLAUDE_CODE_EFFORT_LEVEL`` or the ``/effort`` command,
+# not this flag — so they are intentionally excluded here.
+_VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
 # #147: Claude Code runs with ``editorMode: vim``.  Its input box therefore has
 # a vim NORMAL mode in which literal characters (``send-keys -l``) are
 # interpreted as editor commands, corrupting the message.  The TUI status bar
@@ -876,6 +882,7 @@ class TmuxSessionManager:
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
+        effort: str | None = None,
     ) -> bool:
         """Start Claude Code inside the tmux window for *thread_id*.
 
@@ -910,6 +917,20 @@ class TmuxSessionManager:
             cmd_parts.append("--dangerously-skip-permissions")
         else:
             cmd_parts.extend(["--permission-mode", permission_mode])
+        if effort is not None:
+            if effort in _VALID_EFFORT_LEVELS:
+                cmd_parts.extend(["--effort", effort])
+            else:
+                # The --effort flag hard-errors on unknown values, which would
+                # abort claude startup and leave the thread with no reply.  Drop
+                # the flag and fall back to the CLI default instead of crashing.
+                # (ultracode/auto are valid effort levels but only via
+                # CLAUDE_CODE_EFFORT_LEVEL / the /effort command, not this flag.)
+                logger.warning(
+                    "start_claude: ignoring unsupported effort %r (valid: %s)",
+                    effort,
+                    ", ".join(sorted(_VALID_EFFORT_LEVELS)),
+                )
 
         # Escape single quotes in the prompt for shell safety.
         safe_prompt = prompt.replace("'", "'\\''")
