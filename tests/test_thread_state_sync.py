@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -845,3 +846,112 @@ async def test_loop_start_is_idempotent():
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__])
+
+
+# -- #359 menu watchdog -------------------------------------------------------
+# The 60s pane sweep must bridge an unresolved AskUserQuestion/plan menu that
+# no run_claude turn is watching (turn finalized early / mirror blind), so the
+# user gets Discord buttons within one tick instead of never.
+
+
+def _fixture(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).parent / "fixtures" / "panes" / name).read_text()
+
+
+def _make_loop(is_processing=lambda _tid: False):
+    bot = MagicMock()
+    bot.get_cog.return_value = None
+    bot.tmux_manager = MagicMock()
+    bot.ask_repo = None
+    thread = MagicMock(spec=thread_state_sync.discord.Thread)
+    bot.get_channel.return_value = thread
+    repo = MagicMock()
+    loop = thread_state_sync.ThreadStateSyncLoop(
+        bot, repo, interval_seconds=60, is_processing=is_processing
+    )
+    return loop, bot, thread
+
+
+@pytest.mark.asyncio
+async def test_watchdog_bridges_unwatched_menu():
+    """An open menu in the pane with no active turn gets bridged (RED for #359)."""
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(111, "sess", "w1", pane)
+        # the bridge runs as a background task — let it start
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(111)
+        assert task is not None
+        await task
+    bridge.assert_awaited_once()
+    q = bridge.await_args.args[1]
+    assert [o.label for o in q.options] == [
+        "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_while_turn_active():
+    """While a run_claude turn is processing, its poll loop owns menus."""
+    loop, bot, thread = _make_loop(is_processing=lambda _tid: True)
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(112, "sess", "w1", pane)
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()
+    assert 112 not in loop._ask_bridges
+
+
+@pytest.mark.asyncio
+async def test_watchdog_dedups_active_bridge_and_busy_bus():
+    """No double-bridge: pending watchdog task or an ask_bus waiter blocks re-entry."""
+    from c_lord.discord_ui.ask_bus import ask_bus
+
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    never = asyncio.get_event_loop().create_future()
+
+    async def _hang(*a, **k):
+        await never
+
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock(side_effect=_hang)) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(113, "sess", "w1", pane)
+        await asyncio.sleep(0)
+        await loop._maybe_bridge_open_menu(113, "sess", "w1", pane)  # pending task → skip
+        assert bridge.await_count <= 1
+        # separate thread: a foreign ask_bus waiter (e.g. live poll bridge) blocks too
+        ask_bus.register(114)
+        try:
+            await loop._maybe_bridge_open_menu(114, "sess", "w1", pane)
+            await asyncio.sleep(0)
+            assert 114 not in loop._ask_bridges
+        finally:
+            ask_bus.unregister(114)
+        never.set_result(None)
+        t = loop._ask_bridges.get(113)
+        if t is not None:
+            await t
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_pane_without_menu():
+    loop, bot, thread = _make_loop()
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯ \n-- INSERT --"),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(115, "sess", "w1", "❯ \n-- INSERT --")
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()

@@ -237,6 +237,9 @@ class ThreadStateSyncLoop:
         # the loop self-contained for consumers that don't wire it up.
         self._is_processing: Callable[[int], bool] = is_processing or (lambda _tid: False)
         self._task: asyncio.Task[None] | None = None
+        # #359 menu watchdog: per-thread background bridge task for a TUI menu
+        # found open with no turn watching it. One at a time per thread.
+        self._ask_bridges: dict[int, asyncio.Task[None]] = {}
         # Per-thread rate-limit backoff: thread_id → monotonic time until next rename is allowed.
         self._rename_backoff: dict[int, float] = {}
         # #277: the first tick after startup must only sync DB state — never
@@ -254,6 +257,9 @@ class ThreadStateSyncLoop:
 
     async def stop(self) -> None:
         """Cancel the loop. Safe to call multiple times."""
+        for t in self._ask_bridges.values():
+            t.cancel()
+        self._ask_bridges.clear()
         if self._task is None:
             return
         self._task.cancel()
@@ -291,6 +297,85 @@ class ThreadStateSyncLoop:
             )
             self._initial_pass = False
 
+    async def _maybe_bridge_open_menu(
+        self, thread_id: int, session_name: str, window_name: str, pane_text: str
+    ) -> None:
+        """#359 menu watchdog: bridge an unresolved TUI menu no turn is watching.
+
+        A menu that renders after ``run_claude`` finalized (quiet tool run /
+        long thinking trips the stable fallback) has no live bridge: the
+        post-turn peek is one-shot and the transcript mirror cannot read the
+        ``tool_use`` line until the menu resolves. This sweep-time check is the
+        retrying backstop: every tick, an open AskUserQuestion/plan menu with no
+        active waiter gets bridged to Discord buttons. ``bridge_pane_ask``'s
+        pane watch (#369) ends the bridge when the menu resolves elsewhere, so
+        a TUI answer cannot strand the watchdog task.
+        """
+        # Cheap signature test on the small lamp capture before paying for a
+        # full capture + parse.
+        from .claude.tmux_runner import _ASK_SIGNATURE, _PLAN_SIGNATURE
+
+        if _ASK_SIGNATURE not in pane_text and _PLAN_SIGNATURE not in pane_text:
+            return
+        # A live turn's poll loop owns menus while it is processing (#166).
+        if self._is_processing(thread_id):
+            return
+        existing = self._ask_bridges.get(thread_id)
+        if existing is not None and not existing.done():
+            return
+        from .discord_ui.ask_bus import ask_bus
+
+        if ask_bus.is_active(thread_id):
+            return
+
+        from .claude.tmux_runner import (
+            TmuxClaudeRunner,
+            _normalize_capture,
+            _parse_ask_from_pane,
+            _parse_plan_from_pane,
+        )
+
+        full = await asyncio.to_thread(_capture_pane_text, session_name, window_name, 120)
+        norm = _normalize_capture(full)
+        question = _parse_ask_from_pane(norm) or _parse_plan_from_pane(norm)
+        if question is None:
+            return
+
+        channel = self._bot.get_channel(thread_id)
+        if channel is None:
+            with contextlib.suppress(Exception):
+                channel = await self._bot.fetch_channel(thread_id)
+        if not isinstance(channel, discord.Thread):
+            return
+
+        from .cogs.channel_repo import ChannelRepoCog
+
+        parent_id = getattr(channel, "parent_id", None) or thread_id
+        tmux_manager = None
+        channel_cog = self._bot.get_cog("ChannelRepoCog")
+        if isinstance(channel_cog, ChannelRepoCog):
+            tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
+        if tmux_manager is None:
+            tmux_manager = getattr(self._bot, "tmux_manager", None)
+        if tmux_manager is None:
+            logger.warning("menu watchdog: no tmux manager for thread=%d", thread_id)
+            return
+        runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
+
+        from .discord_ui.ask_handler import bridge_pane_ask
+
+        logger.info(
+            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r)",
+            thread_id,
+            question.header,
+        )
+        self._ask_bridges[thread_id] = asyncio.create_task(
+            bridge_pane_ask(
+                channel, question, runner, ask_repo=getattr(self._bot, "ask_repo", None)
+            ),
+            name=f"menu-watchdog-{thread_id}",
+        )
+
     async def _sync_one(
         self,
         record,  # SessionRecord
@@ -317,6 +402,12 @@ class ThreadStateSyncLoop:
             window_number: int | None = parse_work_number(window_name)
             pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
             new_state = _pane_lamp_state(pane_text)
+            # #359 menu watchdog: bridge an open, unwatched TUI menu on every
+            # sweep (errors must never break lamp syncing).
+            try:
+                await self._maybe_bridge_open_menu(thread_id, session_name, window_name, pane_text)
+            except Exception:
+                logger.exception("menu watchdog failed for thread=%d", thread_id)
             # Don't roll an actively-processing thread back to 🟡 just because the
             # poll landed in a brief no-spinner window (startup / tool gap). Only
             # promote waiting→running; error stays error (#236).
