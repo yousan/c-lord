@@ -258,6 +258,9 @@ async def main(env_path: Path | None = None) -> None:
                 host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
                 port=api_port,
                 api_secret=os.getenv("CLORD_API_SECRET") or None,
+                # #372: OGP/URL link previews are OFF by default; opt back in.
+                show_url_embeds=os.getenv("CLORD_SHOW_URL_EMBEDS", "false").strip().lower()
+                in ("1", "true", "yes", "on"),
             )
 
     async with bot:

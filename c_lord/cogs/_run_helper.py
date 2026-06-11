@@ -253,15 +253,22 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         if last_reply is not None:
             break
         await asyncio.sleep(_REPLY_WAIT_INTERVAL)
+    # #372: discord.py's Message.edit defaults suppress=False (NOT MISSING), so
+    # an edit that omits suppress explicitly *un*-suppresses embeds — which would
+    # re-enable the URL OGP card that reply_sink suppressed at send-time. Pass
+    # suppress explicitly so appending the context line preserves the setting.
+    from ..transcript.mirror import show_url_embeds_enabled
+
+    suppress_embeds = not show_url_embeds_enabled()
     if last_reply is not None:
         existing = last_reply.content or ""
         combined = f"{existing}\n{line}" if existing else line
         if len(combined) <= 2000:
             with contextlib.suppress(discord.HTTPException):
-                await last_reply.edit(content=combined)
+                await last_reply.edit(content=combined, suppress=suppress_embeds)
             return
     with contextlib.suppress(discord.HTTPException):
-        await config.thread.send(line)
+        await config.thread.send(line, suppress_embeds=suppress_embeds)
 
 
 async def run_claude_with_config(config: RunConfig) -> str | None:

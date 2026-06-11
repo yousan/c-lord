@@ -130,6 +130,44 @@ async def test_reply_sink_chunks_long_messages(
         assert not body.endswith("…")
 
 
+async def test_reply_sink_suppresses_url_embeds_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#372: in jsonl bridge mode the final answer goes through reply_sink.
+    By default (CLORD_SHOW_URL_EMBEDS unset) it must set suppress_embeds=True
+    so a URL in Claude's reply doesn't expand into an OGP card."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    reply_sink = cog._make_reply_sink(7)
+    await reply_sink("see https://github.com/yousan/c-lord/issues for details")
+    channel.send.assert_called_once()
+    assert channel.send.call_args.kwargs.get("suppress_embeds") is True
+
+
+async def test_reply_sink_shows_url_embeds_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#372: CLORD_SHOW_URL_EMBEDS=true restores OGP previews on reply_sink."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    monkeypatch.setenv("CLORD_SHOW_URL_EMBEDS", "true")
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    reply_sink = cog._make_reply_sink(7)
+    await reply_sink("see https://github.com/yousan/c-lord/issues for details")
+    channel.send.assert_called_once()
+    assert channel.send.call_args.kwargs.get("suppress_embeds") is False
+
+
 async def test_file_sink_chunks_and_attaches_to_last_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
