@@ -5,13 +5,13 @@ from __future__ import annotations
 from c_lord.claude.config import ClaudeConfig
 
 
-def test_effort_defaults_to_max() -> None:
-    """c-lord raises the effort default: a fresh ClaudeConfig uses 'max'.
+def test_effort_defaults_to_none() -> None:
+    """A fresh ClaudeConfig passes no --effort flag (CLI default applies).
 
-    The Claude CLI otherwise runs at its own (lower) default; c-lord opts every
-    session into the deepest reasoning level available via the --effort flag.
+    c-lord does not override the CLI's own reasoning-effort default; the
+    effort level is opt-in via ``CLAUDE_EFFORT`` / per-instance config.
     """
-    assert ClaudeConfig().effort == "max"
+    assert ClaudeConfig().effort is None
 
 
 def test_effort_is_configurable() -> None:
