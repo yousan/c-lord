@@ -931,6 +931,9 @@ class SessionManageCog(commands.Cog):
         if stop_for is None:
             return
         try:
+            logger.info(
+                "%s stopping transcript mirror (workspace teardown)", log_ctx(thread_id=thread_id)
+            )
             await stop_for(thread_id)
         except Exception:  # pragma: no cover - defensive; never block teardown
             logger.warning(
