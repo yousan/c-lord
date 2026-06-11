@@ -2865,3 +2865,48 @@ class TestRunStartupErrorSurfacing:
         result_events = [e for e in events if e.is_complete]
         assert len(result_events) == 1
         assert result_events[0].error is None
+
+
+class TestParseAskNewLayouts:
+    """#388: CLI v2.1.173 renders two newer AskUserQuestion layouts that the
+    parser must read correctly (real captured fixtures):
+
+    - multiSelect: checkbox rows ``❯ 1. [ ] ログ強化`` under a tab row
+      ``←  ☐ 機能  ✔ Submit  →``; meta rows ``Type something``(no period) and
+      ``Submit`` must not leak into options.
+    - preview: a right-hand preview pane drawn NEXT TO the option list; its
+      box-drawing/content must not pollute labels or descriptions.
+    """
+
+    def test_multiselect_labels_and_flag(self) -> None:
+        pane = _load_fixture("ask_multiselect_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == ["ログ強化", "メトリクス", "トレース"]
+        assert q.multi_select is True
+        assert q.header == "機能"
+        descs = [o.description for o in q.options]
+        assert descs == ["構造化ログを有効にする", "Prometheus への送信", "OpenTelemetry トレース"]
+
+    def test_preview_pane_not_in_labels(self) -> None:
+        pane = _load_fixture("ask_preview_pane_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == ["案A 縦並び", "案B 2カラム", "案C グリッド"]
+        for o in q.options:
+            assert "│" not in o.label and "┌" not in o.label
+            assert "│" not in o.description and "Notes:" not in o.description
+        assert q.header == "設計案"
+        assert q.question == "どのレイアウト案にしますか?"
+
+    def test_rich_descriptions_regression(self) -> None:
+        """The dominant single-select layout must keep parsing perfectly."""
+        pane = _load_fixture("ask_rich_descriptions.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.header == "リリース方式"
+        assert [o.label for o in q.options] == [
+            "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+        ]
+        assert all(len(o.description) > 20 for o in q.options)
+        assert q.multi_select is False
