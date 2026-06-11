@@ -46,13 +46,31 @@ GREEN では `👤 ... GREEN probe` は thread に **出ない**（mirror が cl
 - before（main）: `/close-workspace` 後、transcript が動くと 👤 echo でスレッドが即開き直る（閉じない）
 - after（fix）: `/close-workspace` 後、スレッドはアーカイブされたまま畳まれる（次のメッセージで resume は従来どおり）
 
+## 本番 before/after（実画面ペア）
+
+fix を本番デプロイ後、本番 guild (`1285582352596209694`) の E2E スレッド `1499664870948339834` で
+staging と同条件（close → 合成 transcript event 追記）を実演し、GREEN 実画面を取得した（本番 guild は
+撮影可能）。
+
+| | before = RED（修正前 / 本番で実際に発生） | after = GREEN（本番デプロイ後） |
+|---|---|---|
+| 画像 | `red-prod-real-screen.png` | `green-prod-real-screen.png` |
+| `🧹 Workspace Closed` の後 | `👤 <task-notification … status killed …>` が着弾 | **👤 echo 無し** |
+| thread | un-archive されて再オープン | `archived=True` のまま（閉じたまま） |
+| stop ログ | なし | `stopping transcript mirror` / `TranscriptMirror stopped: thread=1499664870948339834`（21:39:38）|
+
+> GREEN 画像で上段に並ぶ `C-lord-staging-1〜4` は同チャンネル在席の staging フリート bot の重複応答
+> （リポジトリ未 bind で「/clord-init してください」を返すだけのノイズ）。本命は最下段の prod **C-lord** の
+> `🧹 Workspace Closed`（その後に 👤 echo が続かない＝閉じたまま）。
+
 ## 実画面スクショについて
 
 - **RED の実 Discord 画面**は本番で実際に発生したもの（利用者 yousan 提供）を `red-prod-real-screen.png` に同梱。
   `🧹 Workspace Closed` の直後に `👤 <task-notification ... status killed ...>` が並んでおり、これが本バグの実体。
+- **GREEN の実 Discord 画面**は本番デプロイ後に AI が `scripts/discord_evidence_shot.sh` で取得（`green-prod-real-screen.png`）。
 - staging guild (`1503196656265597082`) は証跡用テストアカウントが**未参加**のため、`scripts/discord_evidence_shot.sh`
   での AI 自動キャプチャは「テキストチャンネルがありません」となり描画不可（`docs/discord-evidence-capture.md` の既知制約）。
-  そのため staging 側の RED→GREEN は上記 REST 観測（archived 状態遷移）＋ bot ログを主証跡とした。
+  そのため staging 側の RED→GREEN は REST 観測（archived 状態遷移）＋ bot ログを主証跡とし、実画面の after は本番で取得した。
 
 ## 注記（環境ノイズ）
 
