@@ -217,6 +217,24 @@ _ASK_META_LABELS = ("Type something.", "Chat about this")
 _ASK_HEADER_RE = re.compile(r"^\s*☐\s+(.+?)\s*$")
 # A numbered option line, with or without the leading ❯ cursor.
 _ASK_OPTION_RE = re.compile(r"^\s*❯?\s*\d+\.\s+(.+?)\s*$", re.MULTILINE)
+# #388: multiSelect menus render checkbox options ("❯ 1. [ ] ログ強化") under a
+# tab row ("←  ☐ 機能  ✔ Submit  →").  The checkbox prefix is stripped from
+# labels and its presence marks the question multi-select.
+_ASK_CHECKBOX_RE = re.compile(r"^\[[ xX✓]\]\s*")
+_ASK_TAB_HEADER_RE = re.compile(r"☐\s+(.+?)\s{2,}")
+# #388: preview-equipped menus draw a preview pane to the RIGHT of the option
+# list; any of these box-drawing characters on an option line marks where the
+# pane starts, and everything from that column on must be ignored.
+_ASK_PREVIEW_BOX_CHARS = ("┌", "│", "└", "╭", "╰", "┐", "┘")
+
+
+def _is_ask_meta_label(label: str) -> bool:
+    """True for TUI affordance rows that must not become Discord buttons.
+
+    "Type something." lost its trailing period in the multiSelect layout, and
+    that layout adds a "Submit" row (#388), so exact matching is not enough.
+    """
+    return label in ("Chat about this", "Submit") or label.startswith("Type something")
 
 
 def _is_ask_question(text: str) -> bool:
@@ -279,20 +297,50 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
             header = m.group(1).strip()
             header_idx = i
             break
+        # multiSelect tab row ("←  ☐ 機能  ✔ Submit  →") — the header sits
+        # inside the row instead of owning the whole line (#388).
+        if "☐" in lines[i]:
+            m2 = _ASK_TAB_HEADER_RE.search(lines[i])
+            if m2:
+                header = m2.group(1).strip()
+                header_idx = i
+                break
 
     # Bound the scan: from the header (or, if it scrolled off, a small window
     # above the menu end) down to the menu end — never the whole buffer.
     scan_from = header_idx + 1 if header_idx >= 0 else max(0, end_idx - 20)
 
+    # #388: preview-equipped menus draw a box to the RIGHT of the options.  The
+    # pane start column is the leftmost box-drawing character on any numbered
+    # option line; everything from that column on (on every menu line) is the
+    # preview pane, not menu content.
+    pane_col: int | None = None
+    for i in range(scan_from, end_idx + 1):
+        if _ASK_OPTION_RE.match(lines[i]):
+            cols = [lines[i].find(ch) for ch in _ASK_PREVIEW_BOX_CHARS if ch in lines[i]]
+            if cols:
+                c = min(cols)
+                pane_col = c if pane_col is None else min(pane_col, c)
+
+    def _menu_text(line: str) -> str:
+        return line[:pane_col] if pane_col is not None else line
+
     # Indices of every numbered line (including meta-options) within the menu —
     # used to bound the region from which each real option's description is read.
-    all_opt_indices = [i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(lines[i])]
+    all_opt_indices = [
+        i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(_menu_text(lines[i]))
+    ]
 
     options: list[AskOption] = []
     first_opt_idx: int | None = None
+    multi_select = False
     for pos, i in enumerate(all_opt_indices):
-        label = _ASK_OPTION_RE.match(lines[i]).group(1).strip()  # type: ignore[union-attr]
-        if label in _ASK_META_LABELS:
+        label = _ASK_OPTION_RE.match(_menu_text(lines[i])).group(1).strip()  # type: ignore[union-attr]
+        # multiSelect checkbox prefix ("[ ] ログ強化") → strip + flag (#388).
+        if _ASK_CHECKBOX_RE.match(label):
+            label = _ASK_CHECKBOX_RE.sub("", label, count=1).strip()
+            multi_select = True
+        if _is_ask_meta_label(label):
             continue
         if first_opt_idx is None:
             first_opt_idx = i
@@ -302,8 +350,8 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx + 1
         description = ""
         for j in range(i + 1, next_i):
-            s = lines[j].strip()
-            if not s or _SEPARATOR_RE.match(lines[j]):
+            s = _menu_text(lines[j]).strip()
+            if not s or _SEPARATOR_RE.match(_menu_text(lines[j])):
                 continue
             description = s
             break
@@ -317,12 +365,12 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     question = ""
     end = first_opt_idx if first_opt_idx is not None else end_idx
     for line in lines[scan_from:end]:
-        s = line.strip()
-        if not s or _SEPARATOR_RE.match(line):
+        s = _menu_text(line).strip()
+        if not s or _SEPARATOR_RE.match(_menu_text(line)):
             continue
         question = s
 
-    return AskQuestion(question=question, header=header, options=options)
+    return AskQuestion(question=question, header=header, options=options, multi_select=multi_select)
 
 
 # -- Plan approval (ExitPlanMode) TUI menu parsing (#251) ---------------------
