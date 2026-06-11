@@ -13,7 +13,7 @@ Every ``poll_interval`` seconds:
    * ``dead``     → no tmux window exists
    * ``pending`` is reserved for explicit external setters and is
      never produced by this loop.
-3. If the state changed (or the work{N} window number changed, or the
+3. If the state changed (or the w{N} window number changed, or the
    topic is set), build the new thread name with
    :func:`thread_name.build_name` and rename the Discord thread
    when it differs from the current name. Minimises API calls.
@@ -302,7 +302,7 @@ class ThreadStateSyncLoop:
             # Detect fine-grained lamp state from pane content (#120).
             session_name = window_info.get("session_name", "")
             window_name = window_info.get("window_name", "")
-            # W<N> follows the stable work{N} name, not the volatile window_index.
+            # W<N> follows the stable w{N} name, not the volatile window_index.
             window_number: int | None = parse_work_number(window_name)
             pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
             new_state = _pane_lamp_state(pane_text)

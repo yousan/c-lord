@@ -6,7 +6,7 @@ this runner starts Claude in TUI mode inside a tmux pane and polls
 
 The trade-off is that structured stream events (tool use, thinking, etc.)
 are not available — only plain text deltas.  However, users can
-``tmux attach -t clord:workN`` to see the full Claude TUI in real time.
+``tmux attach -t clord:wN`` to see the full Claude TUI in real time.
 """
 
 from __future__ import annotations

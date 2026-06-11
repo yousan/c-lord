@@ -37,15 +37,15 @@ class TestTmuxSessionManager:
             ]
             name = mgr.create_session(12345, "/work/dir")
 
-        assert name == "work1"
-        assert mgr._thread_to_window[12345] == "work1"
+        assert name == "w1"
+        assert mgr._thread_to_window[12345] == "w1"
 
         # Verify new-window was called correctly
         new_window_call = mock_run.call_args_list[4]
         args = new_window_call[0][0]
         assert "new-window" in args
         assert SESSION_NAME in args
-        assert "work1" in args
+        assert "w1" in args
         assert "/work/dir" in args
 
         # Verify set-option was called to store thread_id
@@ -78,7 +78,7 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run") as mock_run:
             name = mgr.create_session(12345, "/work/dir")
 
-        assert name == "work0"
+        assert name == "w0"
         mock_run.assert_not_called()
 
     def test_create_session_increments_counter(self) -> None:
@@ -100,17 +100,17 @@ class TestTmuxSessionManager:
             # Second thread
             mock_run.side_effect = [
                 # _find_window_for_thread cache miss → _rebuild_mapping
-                MagicMock(returncode=0, stdout="work1\n"),  # list-windows
-                MagicMock(returncode=0, stdout="111\n"),  # show-option work1
+                MagicMock(returncode=0, stdout="w1\n"),  # list-windows
+                MagicMock(returncode=0, stdout="111\n"),  # show-option w1
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout="work1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
             ]
             name2 = mgr.create_session(222, "/b")
 
-        assert name1 == "work1"
-        assert name2 == "work2"
+        assert name1 == "w1"
+        assert name2 == "w2"
 
     def test_session_exists_true(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -1105,10 +1105,12 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run", side_effect=fake_run):
             name = mgr.create_session(THREAD_ID, WORKING_DIR)
 
-        # Must create a new window, not adopt the unrelated one
+        # Must create a new window, not adopt the unrelated one.
+        # The pre-existing legacy ``work1`` window counts toward the sequence,
+        # so the new short-prefixed window is ``w2``.
         new_window_calls = [c for c in recorded_calls if "new-window" in c]
         assert new_window_calls != [], "new-window should have been called for unrelated dir"
-        assert name == "work2"
+        assert name == "w2"
 
     # ── Issue #113: Fix B — persistent window mapping file ───────────
 
@@ -1292,7 +1294,16 @@ class TestPaneInsertModeDetection:
 class TestParseWorkNumber:
     """The W<N> thread-name label must track the stable work{N} window name."""
 
-    def test_parses_work_number(self) -> None:
+    def test_parses_short_window_number(self) -> None:
+        # New short prefix (#356): windows are named w1, w2, ... not work1.
+        assert parse_work_number("w1") == 1
+        assert parse_work_number("w5") == 5
+        assert parse_work_number("w73") == 73
+
+    def test_parses_legacy_work_number(self) -> None:
+        # Windows created before the prefix was shortened are named work{N}.
+        # parse_work_number must keep recognizing them so already-running
+        # windows keep their W<N> Discord label across the transition.
         assert parse_work_number("work1") == 1
         assert parse_work_number("work5") == 5
         assert parse_work_number("work42") == 42
@@ -1303,8 +1314,39 @@ class TestParseWorkNumber:
         assert parse_work_number("") is None
 
     def test_returns_none_for_non_numeric_suffix(self) -> None:
+        assert parse_work_number("w") is None
         assert parse_work_number("work") is None
         assert parse_work_number("workbench") is None
+        assert parse_work_number("wibble") is None
+
+
+class TestWindowNameGeneration:
+    """New windows use the short ``w{N}`` prefix (#356)."""
+
+    def test_next_window_name_uses_short_prefix(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        assert mgr._next_window_name() == "w1"
+        assert mgr._next_window_name() == "w2"
+
+    def test_rebuild_continues_sequence_after_legacy_work_window(self) -> None:
+        """A legacy ``work{N}`` window left over from before the rename still
+        counts toward ``_next_work_id`` so the next new window is ``w{N+1}`` —
+        the numbering stays monotonic across the transition (no w1 colliding
+        with an existing work3)."""
+        mgr = TmuxSessionManager(mapping_path="")
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                # list-windows: one legacy work3 window survives
+                MagicMock(returncode=0, stdout="work3\n"),
+                # show-option @thread_id for work3
+                MagicMock(returncode=0, stdout="333\n"),
+            ]
+            mgr._rebuild_mapping()
+
+        assert mgr._thread_to_window == {333: "work3"}
+        assert mgr._next_work_id == 4
+        assert mgr._next_window_name() == "w4"
 
 
 class TestGetWindowInfo:
