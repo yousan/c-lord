@@ -78,17 +78,44 @@ scripts/discord_evidence_shot.sh \
 URL は Discord 上でチャンネル/メッセージを右クリック → 「リンクをコピー」、
 または bot の REST API で ID を特定して組み立てる。
 
-## 証跡の置き場の規約
+## 証跡の置き場の規約 (#390)
 
-- **PR の証跡**: PNG を PR ブランチに commit する
-  (`docs/evidence/<issue番号>/<説明>.png`) か、Discord に投稿してその
-  **メッセージリンク**を貼る。
-  **Discord CDN の添付 URL (`cdn.discordapp.com/attachments/...`) を
-  PR/Issue 本文に直貼りしない** — 2024 年以降は期限付き署名 URL のため
-  数日で 404 になる。メッセージリンク (`discord.com/channels/...`) は
-  期限切れしないのでこちらを使う
-- **Issue の証跡**: 同上。yousan 提供のスクショはそのまま添付で良い
-  (GitHub にアップロードされた画像は期限なし)
+**原則: 証跡 PNG は git ツリーに commit しない。GitHub Release アセットに
+アップロードして URL を参照する。** バイナリを source repo に貯めると履歴が
+不可逆に膨らむため。業界一般でも「使い捨てスクショは off-repo に置き PR には
+リンクを載せる」が定石 (visual regression の Percy / Chromatic / Argos も
+画像は自前ストレージ + PR にリンク)。GitHub にアップロードされた画像は
+期限切れしない。
+
+- **アップロード**: `scripts/evidence_upload.py` を使う。
+
+  ```bash
+  # 撮る → 上げる
+  scripts/discord_evidence_shot.sh "<thread URL>" -o red.png
+  scripts/discord_evidence_shot.sh "<thread URL>" -o green.png
+  scripts/evidence_upload.py red.png green.png --issue 390
+  # → 各 browser_download_url と貼り付け用 markdown が stdout に出るので
+  #    その URL / ![...](url) を PR・Issue 本文に貼る
+  ```
+
+  画像は専用の **prerelease タグ `evidence`** にアセットとして載る
+  (`https://github.com/<owner>/<repo>/releases/download/evidence/<name>`)。
+  prerelease なので `releases/latest` には出ず、auto-upgrade を妨げない。
+
+- **証跡は催促される前に貼る (必須)**。「言われたら付ける」ではなく、挙動/UI を
+  変える PR・Issue には最初から RED / GREEN (前/後) の両方を貼る。
+- **やってはいけない**:
+  - PNG を `docs/evidence/<issue番号>/` 等に commit する (旧規約。既存の
+    commit 済み PNG は過去 PR のリンク保全のため残すが、新規は作らない)。
+  - **Discord CDN の添付 URL (`cdn.discordapp.com/attachments/...`) を
+    本文に直貼りする** — 2024 年以降は期限付き署名 URL で数日で 404 になる。
+    Discord 由来の画像は一度ローカルに落として上の script で上げ直すこと。
+- **bot から user-attachments CDN は使えない**: ドラッグ&ドロップで付く
+  `github.com/user-attachments/...` への自動アップロードは公式 API が無く
+  (Web UI はブラウザ Cookie 必須)、headless な bot からは扱えない。だから
+  Release アセットを使う。
+- **yousan 提供のスクショ**は Issue にそのまま添付で良い (GitHub に上がった
+  画像は期限なし)。
 
 ## 制約
 
