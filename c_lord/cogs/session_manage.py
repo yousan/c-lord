@@ -1022,6 +1022,13 @@ class SessionManageCog(commands.Cog):
         the conversation via ``--continue`` (#270) — that is the whole point of
         "close" vs "delete".  Note this never resolves the session-dir manager,
         so the directory-removal path is structurally unreachable here.
+
+        The thread is expected to **stay archived** after this runs.  To guarantee
+        that, the TranscriptMirror is stopped *before* the kill/archive
+        (:meth:`_stop_transcript_mirror`): otherwise the kill's own
+        ``<task-notification>`` would be echoed (👤) into the thread *after* we
+        archive it, and Discord auto-unarchives a thread on any new message — so
+        it would never close (#379).
         """
         if not isinstance(channel, discord.Thread):
             await respond(
