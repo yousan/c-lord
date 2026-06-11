@@ -198,6 +198,7 @@ class SkillCommandCog(commands.Cog):
             working_dir=self.runner.working_dir,
             timeout_seconds=self.runner.timeout_seconds,
             dangerously_skip_permissions=True,
+            effort=self.runner.effort,
         )
 
     def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:

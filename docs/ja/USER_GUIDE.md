@@ -22,8 +22,8 @@ Bot (c-lord プロセス)                                    ← 1つ
 │   │   └── /clord-init で紐づけ (DB に保存)
 │   │
 │   ├── tmux session: "project-a"
-│   │   ├── work1 ── Thread 101 の Claude Code CLI
-│   │   └── work2 ── Thread 102 の Claude Code CLI
+│   │   ├── w1 ── Thread 101 の Claude Code CLI
+│   │   └── w2 ── Thread 102 の Claude Code CLI
 │   │
 │   └── session_dir: ~/c-lord-sessions/project-a/
 │       ├── 101/ ── git clone of project-a (Thread 101 用)
@@ -34,7 +34,7 @@ Bot (c-lord プロセス)                                    ← 1つ
 │   ├── リポジトリ: github.com/user/project-b.git
 │   │
 │   ├── tmux session: "project-b"
-│   │   └── work1 ── Thread 201 の Claude Code CLI
+│   │   └── w1 ── Thread 201 の Claude Code CLI
 │   │
 │   └── session_dir: ~/c-lord-sessions/project-b/
 │       └── 201/ ── git clone of project-b (Thread 201 用)
@@ -65,7 +65,7 @@ DB に保存: channel_id → repo URL, tmux session 名, session_dir パス
 Bot が自動で:
   1. Thread 作成 (Discord)
   2. git clone (session_dir)
-  3. tmux window 作成 (work1, work2, ...)
+  3. tmux window 作成 (w1, w2, ...)
   4. Claude Code CLI 起動
 ```
 
@@ -90,8 +90,8 @@ Claude Code セッションを開始する基本コマンド。リポジトリ�
 既存の tmux ウィンドウを現在のスレッドに紐づけます。手動で作ったスレッド（例: 既に動いている Claude Code CLI セッション用）で使用します。
 
 ```
-/clord-attach work1
-!attach work1
+/clord-attach w1
+!attach w1
 ```
 
 紐づけ後、ボットはそのスレッドのメッセージに応答するようになります。
@@ -215,7 +215,7 @@ Bot と対話できるユーザーは Discord のロールで制御します。
 1. DB に session レコード作成 (thread_id → session_id)
 2. session_dir 作成: ~/c-lord-sessions/project-a/{thread_id}/
    └── git clone https://github.com/user/project-a.git
-3. tmux window 作成: project-a:work1
+3. tmux window 作成: project-a:w1
    └── @thread_id = {thread_id}
 4. Claude Code CLI 起動 (tmux window 内で実行)
     ↓
@@ -264,7 +264,7 @@ tmux ls
 # project-a のセッションにアタッチ
 tmux attach -t project-a
 
-# 特定ウィンドウに切り替え (work1, work2, ...)
+# 特定ウィンドウに切り替え (w1, w2, ...)
 # Ctrl-b + n (次), Ctrl-b + p (前), Ctrl-b + 1 (番号指定)
 ```
 

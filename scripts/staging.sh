@@ -37,8 +37,127 @@ die() {
 }
 
 usage() {
-  echo "usage: bash scripts/staging.sh {status|stop|restart [<branch>]}" >&2
+  cat >&2 <<'USAGE'
+usage: bash scripts/staging.sh <command> [options]
+
+  status                                     状態表示 (リース・identity・pid)
+  borrow  --purpose "<目的>" [--ttl-hours N] リースを取得 (既定 TTL 2h)
+  release                                    自分のリースを解放
+  restart [<branch>]                         (branch 切替+) 安全再起動 — 要・自リース
+  stop                                       安全停止 — 要・自リース (リース無しなら可)
+
+  --owner <id> または環境変数 CLORD_LEASE_OWNER で身元を示す。
+  restart/stop は他セッションの有効リース中は拒否される (#328)。
+USAGE
   exit 1
+}
+
+# ---- lease (#328) -----------------------------------------------------------
+# 占有リース: clone 直下の .staging-lease (環境ごとに 1 枚、中央台帳なし)。
+# 1 つの staging working tree を複数セッションが取り合い、他人の検証中 bot を
+# kill / checkout で踏む事故 (2026-05-29 実害) を機械的に防ぐ。
+LEASE_FILE="$CLONE_DIR/.staging-lease"
+
+lease_field() {
+  # lease_field <key> — リースファイルから値を 1 つ読む (無ければ空)
+  [ -f "$LEASE_FILE" ] || return 0
+  python3 -c "
+import json, sys
+try:
+    d = json.load(open('$LEASE_FILE'))
+    print(d.get('$1', ''))
+except Exception:
+    pass"
+}
+
+lease_is_valid() {
+  # 有効 (未失効) なリースが存在するか
+  [ -f "$LEASE_FILE" ] || return 1
+  local acquired ttl now
+  acquired="$(lease_field acquired_epoch)"
+  ttl="$(lease_field ttl_hours)"
+  [ -n "$acquired" ] && [ -n "$ttl" ] || return 1
+  now="$(date +%s)"
+  python3 -c "import sys; sys.exit(0 if $now < $acquired + float($ttl)*3600 else 1)"
+}
+
+lease_remaining_min() {
+  # 残り時間 (分)。失効していれば 0。
+  local acquired ttl now
+  acquired="$(lease_field acquired_epoch)"
+  ttl="$(lease_field ttl_hours)"
+  [ -n "$acquired" ] && [ -n "$ttl" ] || {
+    echo 0
+    return
+  }
+  now="$(date +%s)"
+  python3 -c "print(max(0, int(($acquired + float($ttl)*3600 - $now) // 60)))"
+}
+
+lease_describe() {
+  echo "owner=$(lease_field owner) purpose=\"$(lease_field purpose)\" acquired=$(lease_field acquired_at) ttl=$(lease_field ttl_hours)h remaining=$(lease_remaining_min)min"
+}
+
+lease_guard() {
+  # restart / stop の前提: 有効な「自分の」リースがあること。
+  # 他人の有効リース → 拒否 / リース無し or 失効 → borrow を促して拒否。
+  local owner="$1" holder
+  if lease_is_valid; then
+    holder="$(lease_field owner)"
+    if [ -z "$owner" ] || [ "$holder" != "$owner" ]; then
+      echo "occupied: $(lease_describe)" >&2
+      die "他セッションの有効リース中 (holder=$holder)。release を待つか TTL 失効後に borrow してください。"
+    fi
+    return 0
+  fi
+  die "有効な自リースが無い。先に borrow してください: bash scripts/staging.sh borrow --owner <id> --purpose \"...\""
+}
+
+cmd_borrow() {
+  local owner="$1" purpose="$2" ttl="$3" holder branch
+  [ -n "$owner" ] || die "--owner <id> (または CLORD_LEASE_OWNER) が必要"
+  [ -n "$purpose" ] || die "--purpose \"<目的>\" が必要 (誰が見ても分かる形で)"
+  if lease_is_valid; then
+    holder="$(lease_field owner)"
+    if [ "$holder" != "$owner" ]; then
+      echo "occupied: $(lease_describe)" >&2
+      die "borrow 拒否 — 他セッションの有効リース中"
+    fi
+    echo "re-borrow (同一 owner): 既存リースを更新"
+  elif [ -f "$LEASE_FILE" ]; then
+    # 失効リースの奪取: 旧内容をログに残す (奪取の監査痕跡)
+    echo "takeover: 失効リースを奪取 — old: $(lease_describe)"
+  fi
+  branch="$(git -C "$CLONE_DIR" branch --show-current 2>/dev/null || echo '')"
+  LEASE_PATH="$LEASE_FILE" LEASE_OWNER="$owner" LEASE_PURPOSE="$purpose" LEASE_TTL="$ttl" LEASE_BRANCH="$branch" python3 - <<'PYEOF'
+import json, os, time
+data = {
+    "owner": os.environ["LEASE_OWNER"],
+    "purpose": os.environ["LEASE_PURPOSE"],
+    "branch_before": os.environ["LEASE_BRANCH"],
+    "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "acquired_epoch": int(time.time()),
+    "ttl_hours": float(os.environ["LEASE_TTL"]),
+}
+with open(os.environ.get("LEASE_PATH", ".staging-lease"), "w") as f:
+    json.dump(data, f, ensure_ascii=False, indent=1)
+PYEOF
+  echo "leased: $(lease_describe)"
+}
+
+cmd_release() {
+  local owner="$1" holder
+  [ -f "$LEASE_FILE" ] || {
+    echo "no lease to release"
+    return 0
+  }
+  holder="$(lease_field owner)"
+  if [ -z "$owner" ] || [ "$holder" != "$owner" ]; then
+    echo "lease: $(lease_describe)" >&2
+    die "release 拒否 — リースの owner ($holder) ではない"
+  fi
+  rm -f "$LEASE_FILE"
+  echo "released."
 }
 
 env_get() {
@@ -49,15 +168,24 @@ env_get() {
 
 find_pids() {
   # この clone を cwd とする c_lord.main プロセスだけを列挙する。
-  # cmdline パターンマッチ (pgrep -f) は使わない: 自分のシェルへの自己
-  # マッチ・相対パス起動の取り逃し・他環境への誤爆があるため。
+  #
+  # 手順: pgrep -f で「c_lord.main を含むプロセス」を候補に絞り (高速)、
+  # 各候補の /proc/<pid>/cwd が $CLONE_DIR と一致するものだけ採用する。
+  # pgrep を「候補抽出」だけに使い、最終判定は必ず cwd 照合で行うので、
+  # かつて pgrep 直 kill を避けた理由 (自己マッチ・他 clone への誤爆) は
+  # cwd 照合がそのまま吸収する。staging.sh は常に `python -m c_lord.main`
+  # で起動するため -f で確実に拾える (相対パス起動の取り逃しも無い)。
+  #
+  # timeout ガード (#383): WSL2 等で応答しないマウント上に cwd を持つ
+  # プロセスがあると readlink /proc/<pid>/cwd が uninterruptible に
+  # ブロックし、これを毎反復呼ぶ restart の待機ループごとハングする
+  # (2026-06-11 に約11分のハングを観測)。readlink を 2 秒で打ち切り、
+  # 1つの stuck pid が関数全体を巻き込まないようにする。pgrep 前段で
+  # 候補が数個に絞られるので fork 回数も少ない。
   local pid cwd
-  for pid in $(ps -eo pid --no-headers); do
-    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
-    [ "$cwd" = "$CLONE_DIR" ] || continue
-    if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | /usr/bin/grep -q "c_lord\.main"; then
-      echo "$pid"
-    fi
+  for pid in $(pgrep -f "c_lord\.main" 2>/dev/null); do
+    cwd="$(timeout 2 readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
+    [ "$cwd" = "$CLONE_DIR" ] && echo "$pid"
   done
 }
 
@@ -215,17 +343,70 @@ cmd_restart() {
 # ---- entry -----------------------------------------------------------------
 [ -f "$ENV_FILE" ] || die "no .env in $CLONE_DIR — clone のルートで実行してください"
 
-case "${1:-}" in
-status) cmd_status ;;
-stop) cmd_stop ;;
+COMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+# 共通フラグ解析: --owner / --purpose / --ttl-hours、残り 1 つは branch
+OWNER="${CLORD_LEASE_OWNER:-}"
+PURPOSE=""
+TTL_HOURS="2"
+BRANCH=""
+POSITIONAL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --owner)
+    OWNER="${2:?--owner needs a value}"
+    shift 2
+    ;;
+  --purpose)
+    PURPOSE="${2:?--purpose needs a value}"
+    shift 2
+    ;;
+  --ttl-hours)
+    TTL_HOURS="${2:?--ttl-hours needs a value}"
+    shift 2
+    ;;
+  *)
+    POSITIONAL="$1"
+    shift
+    ;;
+  esac
+done
+BRANCH="$POSITIONAL"
+
+case "$COMMAND" in
+status)
+  cmd_status
+  if [ -f "$LEASE_FILE" ]; then
+    if lease_is_valid; then
+      echo "lease:     $(lease_describe)"
+    else
+      echo "lease:     EXPIRED — $(lease_describe)"
+    fi
+  else
+    echo "lease:     (none)"
+  fi
+  ;;
+borrow) cmd_borrow "$OWNER" "$PURPOSE" "$TTL_HOURS" ;;
+release) cmd_release "$OWNER" ;;
+stop)
+  # リース無しの stop は許可 (掃除目的)。他人の有効リース中のみ拒否。
+  if lease_is_valid; then
+    holder="$(lease_field owner)"
+    if [ -z "$OWNER" ] || [ "$holder" != "$OWNER" ]; then
+      echo "occupied: $(lease_describe)" >&2
+      die "stop 拒否 — 他セッション ($holder) の有効リース中 (検証中の bot を殺さない)"
+    fi
+  fi
+  cmd_stop
+  ;;
 restart)
-  shift
-  cmd_restart "${1:-}"
+  lease_guard "$OWNER" # 有効な自リース必須 (#328)
+  cmd_restart "$BRANCH"
   ;;
 check-log)
   # テスト用の隠しサブコマンド: ログファイルの identity を .env と照合
-  shift
-  check_log_identity "${1:?usage: check-log <logfile>}"
+  check_log_identity "${BRANCH:?usage: check-log <logfile>}"
   ;;
 *) usage ;;
 esac

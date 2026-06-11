@@ -1,0 +1,38 @@
+S2 triggered; log=/tmp/clord-bot-c-lord-parallel-3-20260611-151128.log offset=9018
+[    5s] menu=False buttons=False log={'run_exit': False, 'poll_bridge': False, 'mirror_bridge': False}
+[   10s] menu=False buttons=False log={'run_exit': False, 'poll_bridge': False, 'mirror_bridge': False}
+[   16s] menu=False buttons=False log={'run_exit': False, 'poll_bridge': False, 'mirror_bridge': False}
+[   21s] menu=False buttons=False log={'run_exit': False, 'poll_bridge': False, 'mirror_bridge': False}
+[   27s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   32s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   38s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   43s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   49s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   54s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   60s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   65s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   70s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   76s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   81s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   87s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   92s] menu=False buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[   98s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  103s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  108s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  114s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  119s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  125s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  130s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  136s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  141s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  146s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  152s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  159s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  165s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  170s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+[  176s] menu=True buttons=False log={'run_exit': True, 'poll_bridge': False, 'mirror_bridge': False}
+
+>>> menu opened at 97.65556981391273s; buttons: Nones -> NOT BRIDGED while open
+answered in TUI (D2B); watching Discord for the after-text...
+[  182s] AFTER-TEXT appeared in Discord (user's exact symptom)
+S2 done

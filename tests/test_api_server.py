@@ -614,6 +614,49 @@ class TestReplyEndpoint:
         assert not sent.startswith("-# ")
 
     @pytest.mark.asyncio
+    async def test_suppresses_url_embeds_by_default(
+        self, reply_client: TestClient, thread_mock: MagicMock
+    ) -> None:
+        """#372: by default (CLORD_SHOW_URL_EMBEDS unset) Discord OGP/link
+        previews are suppressed — send() is called with suppress_embeds=True."""
+        resp = await reply_client.post(
+            "/api/reply",
+            json={"thread_id": 555666777, "content": "see https://example.com for details"},
+        )
+        assert resp.status == 200
+        thread_mock.send.assert_called_once()
+        assert thread_mock.send.call_args.kwargs.get("suppress_embeds") is True
+
+    @pytest.mark.asyncio
+    async def test_shows_url_embeds_when_enabled(
+        self,
+        repo: NotificationRepository,
+        bot_with_thread: MagicMock,
+        thread_mock: MagicMock,
+    ) -> None:
+        """#372: opt-in via show_url_embeds=True restores OGP previews —
+        send() is called with suppress_embeds=False."""
+        api = ApiServer(
+            repo=repo,
+            bot=bot_with_thread,
+            default_channel_id=12345,
+            show_url_embeds=True,
+        )
+        server = TestServer(api.app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 555666777, "content": "see https://example.com for details"},
+            )
+            assert resp.status == 200
+            thread_mock.send.assert_called_once()
+            assert thread_mock.send.call_args.kwargs.get("suppress_embeds") is False
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
     async def test_missing_content_returns_400(self, reply_client: TestClient) -> None:
         resp = await reply_client.post("/api/reply", json={"thread_id": 555666777})
         assert resp.status == 400

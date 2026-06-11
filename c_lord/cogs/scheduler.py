@@ -148,6 +148,7 @@ class SchedulerCog(commands.Cog):
                 working_dir=working_dir,
                 timeout_seconds=self.runner.timeout_seconds,
                 dangerously_skip_permissions=True,
+                effort=self.runner.effort,
             )
 
             registry = getattr(self.bot, "session_registry", None)

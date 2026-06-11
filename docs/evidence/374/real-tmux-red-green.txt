@@ -1,0 +1,13 @@
+### RED — raw `tmux new-window` (no -d, no sort)
+  windows : ['1:base', '2:w1', '3:w5', '4:w3', '5:w4']
+  active  : w5  (raw new-window stole focus → expected w5)
+  numbered: [1, 5, 3, 4]  (w5 landed in the gap, NOT ascending)
+
+### GREEN — real TmuxSessionManager (#374: -d + sort-on-add)
+  after 4 adds      : ['1:w1', '2:w2', '3:w3', '4:w4', '5:zsh']
+  after killing w2  : ['1:w1', '3:w3', '4:w4', '5:zsh']
+  after new thread  : ['1:w1', '2:w3', '3:w4', '4:w5', '5:zsh']
+  numbered order    : [1, 3, 4, 5]  (expect ascending [1,3,4,5])
+  new window name   : w5
+  active before/after new thread: 'w1' -> 'w1' (focus NOT stolen by -d)
+  RESULT: PASS — sorted ascending after add, and focus kept.
