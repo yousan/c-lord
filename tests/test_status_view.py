@@ -45,8 +45,7 @@ NOW = datetime(2026, 6, 11, 12, 0, 0)
 )
 def test_classify_status(has_window, db_state, dir_exists, expected):
     assert (
-        classify_status(has_window=has_window, db_state=db_state, dir_exists=dir_exists)
-        == expected
+        classify_status(has_window=has_window, db_state=db_state, dir_exists=dir_exists) == expected
     )
 
 
@@ -177,6 +176,33 @@ def test_deleted_never_becomes_a_row():
     assert "deleted: 99" in out
     # only 3 data rows (2 live + 1 closed); deleted contributes none
     assert len(_table_rows(out)) == 3
+
+
+def test_topic_with_backticks_and_newline_cannot_break_the_table():
+    rows = [
+        StatusRow(
+            window_number=1,
+            status="run",
+            topic="evil```\ntopic\nwith breaks",
+            size_bytes=10_000_000,
+            last_used="2026-06-11 11:00:00",
+            session_id="dead-beef",
+        )
+    ]
+    out = render_status(
+        rows=rows,
+        show_all=False,
+        channel_name="dev",
+        repo="yousan/c-lord",
+        session_name="c-lord",
+        deleted_count=0,
+        now=NOW,
+    )
+    # exactly one fenced block opens and closes (a stray ``` in the topic would
+    # add more fence delimiters)
+    assert out.count("```") == 2
+    # the single data row stayed a single line
+    assert len(_table_rows(out)) == 1
 
 
 def test_row_cap_is_announced_not_silent():

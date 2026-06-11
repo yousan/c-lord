@@ -164,12 +164,10 @@ Claude が `TodoWrite` でタスクを管理すると、1 つの embed が投稿
 | `/stop` | 現在のセッションを停止（リジューム可能な状態で保持） | 利用可能 |
 | `/clear` | スレッドの Claude Code セッションをリセット | 利用可能 |
 | `/skill <名前> [引数]` | Claude Code スキルを実行（オートコンプリート付き） | 利用可能 |
-| `/sessions` | セッション一覧（origin、時間帯でフィルタ可能） | 利用可能 |
+| `/clord-status [show_all]` | このチャンネルのセッション一覧（容量・attach・resume。`/sessions`・`/session-dirs`・`/resume-info` を統合） | 利用可能 |
 | `/sync-sessions` | CLI セッションを Discord スレッドにインポート | 利用可能 |
-| `/resume-info` | このセッションをターミナルで継続するための CLI コマンドを表示 | 利用可能 |
 | `/model show` | 現在のモデル表示（グローバル + スレッド別） | 利用可能 |
 | `/model set <モデル>` | 新規セッションのモデルを変更（再起動不要） | 利用可能 |
-| `/session-dirs` | アクティブなセッションディレクトリ一覧 | 利用可能 |
 | `/session-cleanup` | クリーンな孤立セッションディレクトリを削除 | 利用可能 |
 | `/tmux-list` | アクティブな tmux ウィンドウ一覧 | 利用可能 |
 | `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | 利用可能 |

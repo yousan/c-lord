@@ -66,16 +66,15 @@ Bot → Channel (= 1 リポジトリ + 1 tmux session) → Thread (= 1 tmux wind
 
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
-| `/resume-info` | このスレッドのセッションを CLI で再開するコマンドを表示 | スレッドのみ |
-| `/sessions` | 全セッション一覧 | どこでも |
+| `/clord-status` | **このチャンネル**の稼働中セッション一覧（容量・attach・resume） | どこでも |
+| `/clord-status show_all:true` | closed なセッションも含める（`docker ps -a` 相当） | どこでも |
 
-**`/resume-info`** は `claude --resume <session_id>` コマンドを表示します。ターミナルから会話を続けたいときに使います。
+**`/clord-status`** はチャンネル単位のセッション状態を 1 コマンドにまとめたものです。各セッションの window 番号・状態（`run`/`wait`/`err`/`closed`）・ディレクトリ容量・最終利用時刻・`tmux attach -t <session>:work<#>`・`claude --resume <id>` を表示します。既定は **live** のみ（`docker ps` 相当）、`show_all` で **closed**（`/close-workspace` 済み — tmux は閉じたが dir は残り容量を食う）も表示。`/workspace-delete` 済み（作業 dir 削除）のものは footer に件数のみ。**削除された `/sessions`・`/session-dirs`・`/resume-info` を統合**したものです（#363）。
 
 ### ワークスペース管理
 
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
-| `/session-dirs` | アクティブなセッションディレクトリを一覧表示 | どこでも |
 | `/session-cleanup [dry_run]` | 孤立したセッションディレクトリを削除 | どこでも |
 | `/tmux-list` | アクティブな tmux ウィンドウを一覧表示 | どこでも |
 | `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | スレッドのみ |

@@ -109,6 +109,18 @@ def _short_id(session_id: str) -> str:
     return session_id.split("-", 1)[0][:8] if session_id else "-"
 
 
+def _cell(value: str, *, cap: int = 40) -> str:
+    """Make ``value`` safe + bounded for a fenced monospace table cell.
+
+    A topic carrying a newline or a ``` run would otherwise wreck the row
+    alignment or break out of the code fence, so collapse whitespace, neutralise
+    backticks, and cap the width.
+    """
+    s = value.replace("\r", " ").replace("\n", " ").replace("\t", " ").replace("`", "'")
+    s = " ".join(s.split())
+    return s if len(s) <= cap else s[: cap - 1] + "…"
+
+
 def _build_table(rows: list[StatusRow], *, now: datetime, max_rows: int) -> str:
     header = ["#", "status", "topic", "size", "used", "resume"]
     body: list[list[str]] = []
@@ -117,7 +129,7 @@ def _build_table(rows: list[StatusRow], *, now: datetime, max_rows: int) -> str:
             [
                 str(r.window_number) if r.window_number is not None else "-",
                 r.status,
-                r.topic,
+                _cell(r.topic, cap=28),
                 format_size(r.size_bytes),
                 format_relative(r.last_used, now=now),
                 _short_id(r.session_id),
@@ -176,9 +188,7 @@ def render_status(
             f"{len(live)} active · {format_size(total_live)}"
         )
 
-    attach_line = (
-        f"attach: tmux attach -t {session_name}:work<#>      resume: claude --resume <id>"
-    )
+    attach_line = f"attach: tmux attach -t {session_name}:work<#>      resume: claude --resume <id>"
     legend = _LEGEND_ALL if show_all else _LEGEND_DEFAULT
 
     table_rows = (live + closed) if show_all else live

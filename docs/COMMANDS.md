@@ -69,16 +69,15 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/resume-info` | Show the CLI command to resume this thread's session | Thread only |
-| `/sessions` | List all known sessions | Anywhere |
+| `/clord-status` | List **this channel's** live sessions — size, attach, resume | Anywhere |
+| `/clord-status show_all:true` | Also include closed sessions (like `docker ps -a`) | Anywhere |
 
-**`/resume-info`** displays `claude --resume <session_id>` so you can continue the conversation from your terminal.
+**`/clord-status`** is the single per-channel status view. For each session it shows the window number, status (`run`/`wait`/`err`/`closed`), directory size, last-used time, the `tmux attach -t <session>:work<#>` target, and the `claude --resume <id>` command. By default it lists only **live** sessions (like `docker ps`); `show_all` adds **closed** ones (`/close-workspace`'d — tmux window gone, session dir kept, still using disk). Sessions whose working dir was deleted (`/workspace-delete`) are a footer count only. It **supersedes the removed `/sessions`, `/session-dirs`, and `/resume-info`** (#363).
 
 ### Workspace Management
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/session-dirs` | List all active session directories | Anywhere |
 | `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
@@ -105,9 +104,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!clear` | Reset the session — next message starts fresh | `!clear` | `/clear` |
 | `!compact [instructions]` | Compact (summarize) the session context | `!compact keep open tasks` | `/compact` |
 | `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
-| `!resume-info` | Show the CLI command to resume this thread | `!resume-info` | `/resume-info` |
-| `!sessions` | List all known sessions | `!sessions` | `/sessions` |
-| `!session-dirs` | List active session directories | `!session-dirs` | `/session-dirs` |
+| `!clord-status [all]` | List this channel's sessions (`all` = include closed) | `!clord-status all` | `/clord-status` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
 | `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
