@@ -33,12 +33,12 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 
 | # | clone | bot (user id) | channel (id) | E2E スレッド id | port |
 |---|---|---|---|---|---|
-| 1 | `/home/yousan/c-lord-parallel-3`† | `C-lord-3` (`1503195981142032405`) | `#c-lord-3` (`1503196656265597082`) | `1514085380666691664` | 8089 |
+| 1 | `/home/yousan/c-lord-parallel-3`† | `C-lord-staging-1` (`1503195981142032405`) | `#c-lord-staging-1` (`1503196656265597082`) | `1514085380666691664` | 8089 |
 | 2 | `/home/yousan/c-lord-staging-2` | `C-lord-staging-2` (`1514518564403413014`) | `#c-lord-staging-2` (`1514535894575743056`) | `1514545583459926117` | 8091 |
 | 3 | `/home/yousan/c-lord-staging-3` | `C-lord-staging-3` (`1503234123932635206`) | `#c-lord-staging-3` (`1503245597841559623`) | `1514546023282769920` | 8093 |
 | 4 | `/home/yousan/c-lord-staging-4` | `C-lord-staging-4` (`1514523658780016771`) | `#c-lord-staging-4` (`1514535896328700015`) | `1514546025631580260` | 8095 |
 
-† #1 は既存 staging。`c-lord-parallel-3` → `c-lord-staging-1` への改称・bot/channel 名揃えは予定(本 PR 時点では未実施)。
+† #1 は既存 staging。bot/channel 名は `C-lord-staging-1` / `#c-lord-staging-1` に改称済み。ディレクトリ `c-lord-parallel-3` → `c-lord-staging-1` の mv はライブ稼働中につき lease 解放後に実施予定(その時 clone パス記載も更新する)。統合ロール名 `C-lord-3` は managed のため Portal の Application 名変更で揃う。
 
 - **port = 8087 + 2×N**(prod=N0=8087)。`CLORD_BRIDGE_MODE=jsonl` では ApiServer 非バインドなので名目値。
 - channel アクセスは共有ロール **`c-lord-staging`**(`1514537446132682853`)一本で制御(staging bot 全台に付与)。
