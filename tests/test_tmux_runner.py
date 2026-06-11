@@ -1151,6 +1151,76 @@ class TestTmuxClaudeRunnerRun:
         assert len(result_events) == 1
 
 
+class TestPrematureCompletionOnStaleResponse:
+    """#365: continuing a thread must not report completion off the PREVIOUS
+    turn's still-visible response before the NEW turn starts generating.
+
+    Repro from the real incident (thread 1514163047453687828): the user sent a
+    follow-up message; the pane still showed the previous turn's (stable, non-
+    empty) answer with the input prompt visible, and Claude had not yet shown a
+    generation spinner (``--resume`` / context-load latency).  The completion
+    detector saw "response stable for _RESPONSE_STABLE_TIMEOUT + no spinner +
+    prompt visible" and finalized the turn after ~8s — firing the
+    "Claude has finished — your reply is needed" owner mention BEFORE the real
+    answer was produced (it arrived afterwards via the transcript / skill path).
+
+    The fix gates completion on the new turn actually having started: a
+    generation spinner observed at least once, OR the extracted response having
+    changed from the post-input baseline.
+    """
+
+    @pytest.mark.asyncio
+    async def test_does_not_finalize_on_stale_previous_response(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+
+        # Phase 1: the PREVIOUS turn's answer is still on screen — stable, non-
+        # empty, input prompt visible, NO spinner.  Claude has not picked up the
+        # new prompt yet.  Phase 2: the new turn starts generating (spinner with
+        # an elapsed timer).  Phase 3: the new answer, stable, prompt visible.
+        stale = _make_pane(["● Previous turn answer."], with_input_prompt=True)
+        generating = "\n✻ Working… (2s · ↑ 1.2k tokens)\n────────\n❯\n────────\n-- INSERT --"
+        done = _make_pane(["● Brand new answer for this turn."], with_input_prompt=True)
+
+        # Long enough that the buggy 3-poll-stable quick-exit would have fired
+        # well inside the stale phase.
+        stale_polls = 12
+        gen_polls = 4
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            if calls["n"] <= stale_polls:
+                return stale
+            if calls["n"] <= stale_polls + gen_polls:
+                return generating
+            return done
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.03),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("follow up"):
+                events.append(event)
+
+        # The loop must persist past the stale phase — i.e. it must not finalize
+        # while only the previous turn's residual response is visible.  Before
+        # the fix it broke at ~poll 5 (well under stale_polls), prematurely
+        # firing the completion that drives the owner mention.
+        assert calls["n"] > stale_polls, (
+            f"run() finalized during the stale previous-response phase "
+            f"(only {calls['n']} polls) — premature completion before the new "
+            f"turn started generating"
+        )
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None
+
+
 class TestInactivityTimeout:
     """#94: the hard ``timeout_seconds`` backstop must be inactivity-based.
 

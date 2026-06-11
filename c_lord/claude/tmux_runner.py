@@ -697,6 +697,23 @@ class TmuxClaudeRunner:
         last_raw = ""
         raw_static_seconds = 0.0
 
+        # #365: Gate completion on the NEW turn actually having started. When a
+        # follow-up message is delivered to an already-running Claude
+        # (``claude_running`` above), the pane still shows the PREVIOUS turn's
+        # (stable, non-empty) response with the input prompt visible until Claude
+        # picks up the prompt and starts generating — a gap of several seconds on
+        # a --resume / large-context turn. Without this gate the completion
+        # detector below reads that residual response as "done" and finalizes the
+        # turn early, firing the "Claude has finished — your reply is needed"
+        # owner mention BEFORE the real answer is produced (it arrives later via
+        # the transcript / discord-reply path). We only accept completion once
+        # either: a generation spinner was observed at least once this turn, OR
+        # the extracted response changed from the baseline captured at the start
+        # of polling. The baseline is empty on a fresh start, so the first real
+        # response trivially differs and cold starts are unaffected.
+        saw_generation = False
+        baseline_response: str | None = None
+
         # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
         # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
         # — easily runs past 300s while the pane keeps changing every poll
@@ -829,6 +846,11 @@ class TmuxClaudeRunner:
             response = self._extract_response(current)
             has_prompt = self._has_input_prompt(current)
 
+            # #365: snapshot the residual (previous-turn) response on the first
+            # poll so we can tell when the NEW turn produces output of its own.
+            if baseline_response is None:
+                baseline_response = response
+
             if elapsed % 10 < _POLL_INTERVAL:  # Log every ~10 seconds
                 logger.debug(
                     "poll: elapsed=%.0fs stable=%.1fs resp_len=%d has_prompt=%s (thread=%d)",
@@ -870,10 +892,22 @@ class TmuxClaudeRunner:
             # (#179).  While the generation indicator is visible the turn stays
             # open; the inactivity ``timeout_seconds`` backstop still applies.
             is_gen = self._is_generating(current)
+            if is_gen:
+                saw_generation = True
+
+            # #365: only finalize once the new turn demonstrably started —
+            # either we saw it generate, or its output differs from the residual
+            # previous-turn response captured as the baseline. Otherwise a
+            # follow-up delivered to a still-loading Claude would finalize off
+            # the old answer and mention the owner prematurely.
+            new_turn_started = saw_generation or (
+                bool(last_response) and last_response != baseline_response
+            )
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
                 and not is_gen
+                and new_turn_started
                 and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
             ):
                 break
