@@ -50,6 +50,6 @@ def test_build_config_defaults_when_absent() -> None:
 def test_parse_args_defaults() -> None:
     args = parse_args([])
     assert args.count == 8
-    assert args.inject == "spawn"
+    assert args.inject is None  # auto-resolved per clone (#395): jsonl→webhook, else spawn
     assert args.dry_run is False
     assert args.budget == 1200.0

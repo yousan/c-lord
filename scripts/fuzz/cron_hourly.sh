@@ -7,22 +7,24 @@
 #   0 * * * * /ABS/PATH/c-lord/scripts/fuzz/cron_hourly.sh
 #
 # This wrapper runs the harness from the clone it lives in (which must have
-# scripts/fuzz + a .venv), and points it at the STAGING clone for lease + inject
-# via FUZZ_STAGING_CLONE_DIR. Config (bot token, FUZZ_* channels, API url) is
-# read from the staging clone's .env by the harness. If FUZZ_STAGING_CLONE_DIR is
-# unset, the harness runs against the clone it lives in (run-in-place model).
+# scripts/fuzz + a .venv). Point it at the staging FLEET with FUZZ_STAGING_CLONES
+# (comma-separated clone dirs) — the harness runs on the first one it can lease,
+# so a busy clone no longer wastes the whole hour. FUZZ_STAGING_CLONE_DIR (single)
+# still works; with neither set, it runs in-place.
 #
-# The hourly run borrows the staging lease; if another session holds it, the run
-# skips cleanly (exit 0). Per-run logs land in $FUZZ_LOG_DIR (default /tmp) with a
-# symlink to the latest. Tunables: FUZZ_COUNT, FUZZ_MODEL, FUZZ_EXTRA_ARGS.
+#   export FUZZ_STAGING_CLONES=/home/you/c-lord-staging-1,/home/you/c-lord-staging-2,\
+#     /home/you/c-lord-staging-3,/home/you/c-lord-staging-4
 #
-# IMPORTANT: for the default `spawn` injection, FUZZ_API_URL (or CLORD_API_URL in
-# the staging .env) MUST point at the bot's ACTUAL API port — a drifted URL makes
-# every scenario report SPAWN_FAILED/HEALTH_DOWN. `--restart-if-down` is therefore
-# NOT passed by default (a wrong URL would needlessly restart staging every hour);
-# opt in via FUZZ_EXTRA_ARGS="--restart-if-down" only when the URL is verified. For
-# an API that is unreachable from this host, use FUZZ_EXTRA_ARGS="--inject webhook
-# --skip-health" with FUZZ_WEBHOOK_URL + FUZZ_TEST_THREAD_ID set.
+# Per-clone config (bot token, channels, webhook) is read from each clone's own
+# .env. Injection mode is auto-resolved per clone: a CLORD_BRIDGE_MODE=jsonl clone
+# does not bind its REST API, so the harness uses webhook+skip-health there
+# automatically (no FUZZ_EXTRA_ARGS needed); otherwise spawn. Override with
+# FUZZ_EXTRA_ARGS="--inject spawn" / "--restart-if-down" only when you've verified
+# FUZZ_API_URL points at a reachable API.
+#
+# The run borrows a lease; if all clones are busy/absent it skips cleanly (exit 0).
+# Per-run logs land in $FUZZ_LOG_DIR (default /tmp). Tunables: FUZZ_COUNT,
+# FUZZ_MODEL, FUZZ_EXTRA_ARGS.
 # =============================================================================
 set -u
 
@@ -45,10 +47,13 @@ if [ ! -x "$VENV_PY" ]; then
   exit 1
 fi
 
-# Build args. --staging-dir defaults to the staging clone (lease lives there).
-# --restart-if-down is intentionally NOT here (see header) — opt in via FUZZ_EXTRA_ARGS.
+# Build args. Fleet (FUZZ_STAGING_CLONES) wins; else single FUZZ_STAGING_CLONE_DIR.
+# --restart-if-down / --inject are intentionally NOT here (auto-resolved per clone;
+# see header) — opt in via FUZZ_EXTRA_ARGS.
 ARGS=()
-if [ -n "${FUZZ_STAGING_CLONE_DIR:-}" ]; then
+if [ -n "${FUZZ_STAGING_CLONES:-}" ]; then
+  ARGS+=(--staging-clones "$FUZZ_STAGING_CLONES")
+elif [ -n "${FUZZ_STAGING_CLONE_DIR:-}" ]; then
   ARGS+=(--staging-dir "$FUZZ_STAGING_CLONE_DIR")
 fi
 [ -n "${FUZZ_COUNT:-}" ] && ARGS+=(-n "$FUZZ_COUNT")
