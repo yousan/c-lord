@@ -8,13 +8,13 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 
 | | 本番 (prod) | staging |
 |---|---|---|
-| clone | `/home/yousan/c-lord` | `/home/yousan/c-lord-parallel-3` |
+| clone | `/home/yousan/c-lord` | `/home/yousan/c-lord-staging-1` |
 | bot | `C-lord#8255` (`1475105094071750818`) | `C-lord-3#1206` (`1503195981142032405`) |
 | channel | `.env` の `DISCORD_CHANNEL_ID` | `#c-lord-3` (`1503196656265597082`) |
 | API port | 8087 | 8089 |
-| tmux session | `c-lord` | `c-lord-parallel-3` |
+| tmux session | `c-lord` | `c-lord-staging-1` |
 | session dir | `c-lord-sessions/` | `c-lord-sessions-staging/` |
-| ログ (最新) | `/tmp/clord-bot-c-lord.log`* | `/tmp/clord-bot-c-lord-parallel-3.log`* |
+| ログ (最新) | `/tmp/clord-bot-c-lord.log`* | `/tmp/clord-bot-c-lord-staging-1.log`* |
 | ライフサイクル | **supervised**(手動 kill+nohup 禁止 — #195) | `scripts/staging.sh` で手動管理 |
 | idle ブランチ | `main` | **`main`** |
 
@@ -33,12 +33,12 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 
 | # | clone | bot (user id) | channel (id) | E2E スレッド id | port |
 |---|---|---|---|---|---|
-| 1 | `/home/yousan/c-lord-parallel-3`† | `C-lord-staging-1` (`1503195981142032405`) | `#c-lord-staging-1` (`1503196656265597082`) | `1514085380666691664` | 8089 |
+| 1 | `/home/yousan/c-lord-staging-1`† | `C-lord-staging-1` (`1503195981142032405`) | `#c-lord-staging-1` (`1503196656265597082`) | `1514085380666691664` | 8089 |
 | 2 | `/home/yousan/c-lord-staging-2` | `C-lord-staging-2` (`1514518564403413014`) | `#c-lord-staging-2` (`1514535894575743056`) | `1514545583459926117` | 8091 |
 | 3 | `/home/yousan/c-lord-staging-3` | `C-lord-staging-3` (`1503234123932635206`) | `#c-lord-staging-3` (`1503245597841559623`) | `1514546023282769920` | 8093 |
 | 4 | `/home/yousan/c-lord-staging-4` | `C-lord-staging-4` (`1514523658780016771`) | `#c-lord-staging-4` (`1514535896328700015`) | `1514546025631580260` | 8095 |
 
-† #1 は既存 staging。bot/channel 名は `C-lord-staging-1` / `#c-lord-staging-1` に改称済み。ディレクトリ `c-lord-parallel-3` → `c-lord-staging-1` の mv はライブ稼働中につき lease 解放後に実施予定(その時 clone パス記載も更新する)。統合ロール名 `C-lord-3` は managed のため Portal の Application 名変更で揃う。
+† #1 は既存 staging。2026-06-11 に bot/channel/ディレクトリを全て `staging-1` 系へ改称完了(旧名 `c-lord-parallel-3` / `C-lord-3` / `#c-lord-3`)。統合ロール名のみ `C-lord-3` のまま残る(managed ロールは API 改名不可。Portal の Application 名変更で揃う。機能には無影響)。
 
 - **port = 8087 + 2×N**(prod=N0=8087)。`CLORD_BRIDGE_MODE=jsonl` では ApiServer 非バインドなので名目値。
 - channel アクセスは共有ロール **`c-lord-staging`**(`1514537446132682853`)一本で制御(staging bot 全台に付与)。
@@ -77,7 +77,7 @@ webhook (`E2E_TEST_WEBHOOK_URL`) でもトリガーできる。
 ## 操作 — `scripts/staging.sh`(clone のルートで実行)
 
 ```bash
-cd /home/yousan/c-lord-parallel-3
+cd /home/yousan/c-lord-staging-1
 
 bash scripts/staging.sh status             # identity / branch / pid / instances / log
 bash scripts/staging.sh stop               # この clone の bot を安全停止
@@ -100,7 +100,7 @@ staging は**共有リソース**。複数セッションが同時に使うと k
 占有はリースファイル(clone 直下の `.staging-lease`、環境ごとに1枚・中央台帳なし)で機械的に管理する:
 
 ```bash
-cd /home/yousan/c-lord-parallel-3
+cd /home/yousan/c-lord-staging-1
 export CLORD_LEASE_OWNER="<自分のセッション識別子>"   # 例: claude-session-<thread_id>
 
 bash scripts/staging.sh borrow --purpose "PR #NNN 検証" [--ttl-hours 2]
@@ -129,7 +129,7 @@ bash scripts/staging.sh release            # 検証後の原状復帰とセッ�
 - 確認/再導出: `python3 -c "import sqlite3; print(sqlite3.connect('data/sessions.db').execute('select thread_id from sessions order by last_used_at desc limit 3').fetchall())"`
 
 ```bash
-cd /home/yousan/c-lord-parallel-3
+cd /home/yousan/c-lord-staging-1
 set -a; . ./.env; set +a   # E2E_* を読み込む
 
 # 1. RED — 修正前のコード (通常 main) で問題を再現
