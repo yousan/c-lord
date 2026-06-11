@@ -1187,6 +1187,7 @@ class ClaudeChatCog(commands.Cog):
                 timeout_seconds=self.runner.timeout_seconds,
                 dangerously_skip_permissions=True,
                 try_continue=try_continue,
+                effort=self.runner.effort,
             )
 
             self._active_runners[thread.id] = runner

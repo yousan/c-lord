@@ -115,6 +115,41 @@ _PERMISSION_PROMPT_MARKERS = (
     "Continue anyway?",
 )
 
+# Fatal Claude-CLI startup errors that appear in the tmux pane when the
+# ``claude`` process dies immediately instead of starting a session — e.g. a
+# broken install whose platform-native binary was never downloaded
+# (``Error: claude native binary not installed.``), or ``claude`` missing from
+# PATH (``command not found``).  When the pane shows one of these and no
+# response was ever produced, the runner surfaces it to Discord as an error
+# instead of silently reporting a normal completion (#366).  Matched
+# case-insensitively as substrings of a single pane line.
+_STARTUP_ERROR_MARKERS = (
+    "native binary not installed",
+    "command not found: claude",
+    "claude: command not found",
+)
+
+
+def _extract_startup_error(pane: str) -> str | None:
+    """Return a fatal Claude-CLI startup-error line found in *pane*, else None.
+
+    Used when the runner reaches completion without ever extracting a response:
+    the pane then typically shows the CLI's own error output (e.g.
+    ``Error: claude native binary not installed.``) above the shell prompt.
+    Returns the first line containing a known fatal signature (trimmed and
+    length-capped for a Discord embed), or None when no such signature is
+    present.  Gating callers on "no response yet" keeps this from matching a
+    marker phrase that merely appears inside Claude's own answer (#366).
+    """
+    if not pane:
+        return None
+    for line in pane.splitlines():
+        stripped = line.strip()
+        if any(marker in stripped.lower() for marker in _STARTUP_ERROR_MARKERS):
+            return stripped[:300]
+    return None
+
+
 # Regex matching [y/N] or [Y/n] inline yes/no prompts (Claude Code v2.1+).
 # These need "y" + Enter instead of just Enter (Enter selects the default, N).
 _YN_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]", re.IGNORECASE)
@@ -510,6 +545,7 @@ class TmuxClaudeRunner:
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
+        effort: str | None = None,
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
@@ -518,6 +554,7 @@ class TmuxClaudeRunner:
         self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
+        self._effort = effort
         # True only for the restart-resume path (on_ready → pending_resumes).
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
@@ -594,6 +631,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=True,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -623,6 +661,7 @@ class TmuxClaudeRunner:
                         permission_mode=self._permission_mode,
                         dangerously_skip_permissions=self._dangerously_skip_permissions,
                         try_continue=False,
+                        effort=self._effort,
                     )
                     if not ok:
                         yield StreamEvent(
@@ -643,6 +682,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=False,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -696,6 +736,14 @@ class TmuxClaudeRunner:
         # polling before the menu appears.
         last_raw = ""
         raw_static_seconds = 0.0
+        # Last normalised pane capture — initialised so the final-event error
+        # logic can scan it even if the poll loop body never ran (#366).
+        current = ""
+        # Fatal Claude-CLI startup error scraped from the pane (#366).  Set when
+        # the ``claude`` process dies immediately (e.g. native binary missing);
+        # surfaced as the RESULT error so Discord shows the cause instead of a
+        # silent "done".
+        startup_error: str | None = None
 
         # #365: Gate completion on the NEW turn actually having started. When a
         # follow-up message is delivered to an already-running Claude
@@ -740,6 +788,24 @@ class TmuxClaudeRunner:
             # "1." — leaving the escapes in place makes the menu regexes (and the
             # AskUserQuestion parser) silently miss real menus (#166).
             current = _normalize_capture(raw_current)
+
+            # Fast-fail on a fatal Claude-CLI startup error (#366).  When the
+            # ``claude`` process dies immediately (e.g. native binary missing,
+            # command not found) the pane shows the CLI's error instead of a
+            # session and will never produce a response — don't wait out the idle
+            # timeout, break now so the final event surfaces the cause.  Gated on
+            # ``not last_response`` so it can only fire before any answer text
+            # exists, never mid-conversation (a marker phrase inside Claude's own
+            # answer must not abort a live turn).
+            if not last_response:
+                startup_error = _extract_startup_error(current)
+                if startup_error is not None:
+                    logger.warning(
+                        "Claude startup error detected, aborting poll (thread=%d): %s",
+                        self._thread_id,
+                        startup_error,
+                    )
+                    break
 
             # Auto-accept the folder-trust dialog ("Quick safety check…").  Every
             # thread runs in a freshly-cloned session dir with no trusted ancestor,
@@ -933,30 +999,45 @@ class TmuxClaudeRunner:
                 )
                 break
 
-        # Yield final complete event.
+        # Yield final complete event.  ``error`` is computed first so the single
+        # yield below carries the right outcome (#366: a failed/empty run must
+        # surface an error, not a silent "done").
         if self._stopped:
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                error=None if self._silent_stop else "Stopped by user",
-            )
+            error = None if self._silent_stop else "Stopped by user"
         elif raw_static_seconds >= self.timeout_seconds:
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                error=f"Timed out after {self.timeout_seconds} seconds",
-            )
+            error = f"Timed out after {self.timeout_seconds} seconds"
+        elif not last_response:
+            # Reached completion (idle timeout or startup fast-fail) without ever
+            # extracting a response.  This is NOT a normal completion — decide
+            # whether to surface it (#366):
+            #   1. A fatal startup error is on the pane → report it verbatim.
+            #   2. No marker, but ``claude`` is no longer running → it exited
+            #      without answering (crash / unrecognised fatal error).
+            #   3. ``claude`` is still alive at its prompt → most likely it
+            #      answered via the discord-reply skill and we simply didn't
+            #      scrape the text; stay silent to avoid a false error embed.
+            pane_error = startup_error or _extract_startup_error(current)
+            if pane_error is not None:
+                error = f"Claude failed to start: {pane_error}"
+            elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+                error = (
+                    "Claude exited without producing a response "
+                    "(possible startup failure or crash) — check the tmux pane."
+                )
+            else:
+                error = None
         else:
             # Normal completion — emit RESULT only. The text is intentionally
             # dropped (#53): Claude posts its own final answer via the
             # discord-reply skill, not through the runner stream.
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.RESULT,
-                is_complete=True,
-            )
+            error = None
+
+        yield StreamEvent(
+            raw={},
+            message_type=MessageType.RESULT,
+            is_complete=True,
+            error=error,
+        )
 
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).

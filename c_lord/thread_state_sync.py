@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import re
 import subprocess
@@ -44,6 +45,16 @@ if TYPE_CHECKING:
     from .database.repository import SessionRepository
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock format used to persist the rename backoff deadline (#281). Matches
+# the DB's datetime('now','localtime') text so values are directly comparable.
+_BACKOFF_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _now() -> datetime.datetime:
+    """Current local wall-clock time. Indirected for deterministic testing."""
+    return datetime.datetime.now()
+
 
 # Format: <session_name>|<window_id>|<window_index>|<@thread_id>|<window_name>
 _LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_id}|#{window_name}"
@@ -351,6 +362,23 @@ class ThreadStateSyncLoop:
         if (channel.name or "") == new_name:
             return
 
+        # Persisted (cross-restart) rate-limit backoff (#281): the in-memory
+        # _rename_backoff resets on restart, so honour the DB-persisted deadline
+        # too. A fresh process forgets it just renamed this channel and would
+        # re-PATCH within Discord's ~10-min window (429); the persisted wall-clock
+        # deadline survives the restart.
+        persisted = getattr(record, "rename_backoff_until", None)
+        if persisted:
+            with contextlib.suppress(ValueError, TypeError):
+                deadline = datetime.datetime.strptime(persisted, _BACKOFF_TS_FORMAT)
+                if _now() < deadline:
+                    logger.debug(
+                        "state-sync: rename skipped thread %d (persisted backoff until %s)",
+                        thread_id,
+                        persisted,
+                    )
+                    return
+
         # Per-thread rate-limit backoff: skip rename if still within back-off window.
         now = asyncio.get_event_loop().time()
         backoff_until = self._rename_backoff.get(thread_id, 0.0)
@@ -371,6 +399,7 @@ class ThreadStateSyncLoop:
                 new_state,
             )
             self._rename_backoff.pop(thread_id, None)
+            await self._persist_backoff(thread_id, None)  # clear stale deadline (#281)
         except discord.HTTPException as exc:
             if exc.status == 429:
                 retry_after = float(
@@ -378,6 +407,7 @@ class ThreadStateSyncLoop:
                     or _DEFAULT_RENAME_BACKOFF_SECONDS
                 )
                 self._rename_backoff[thread_id] = asyncio.get_event_loop().time() + retry_after
+                await self._persist_backoff(thread_id, retry_after)  # survive restart (#281)
                 logger.warning(
                     "state-sync: rename rate-limited thread %d, backing off %.0fs",
                     thread_id,
@@ -391,9 +421,28 @@ class ThreadStateSyncLoop:
             self._rename_backoff[thread_id] = (
                 asyncio.get_event_loop().time() + _DEFAULT_RENAME_BACKOFF_SECONDS
             )
+            await self._persist_backoff(thread_id, _DEFAULT_RENAME_BACKOFF_SECONDS)  # (#281)
             logger.warning(
                 "state-sync: rename timed out for thread %d"
                 " (suspected rate-limit), backing off %.0fs",
                 thread_id,
                 _DEFAULT_RENAME_BACKOFF_SECONDS,
             )
+
+    async def _persist_backoff(self, thread_id: int, retry_after_seconds: float | None) -> None:
+        """Persist (or clear) the rename backoff deadline to the DB (#281).
+
+        ``retry_after_seconds`` None clears the deadline; otherwise the deadline
+        is ``_now() + retry_after_seconds`` as a wall-clock string. Best-effort:
+        a repo without ``set_rename_backoff_until`` (older consumers) is skipped.
+        """
+        setter = getattr(self._repo, "set_rename_backoff_until", None)
+        if setter is None:
+            return
+        deadline: str | None = None
+        if retry_after_seconds is not None:
+            deadline = (_now() + datetime.timedelta(seconds=retry_after_seconds)).strftime(
+                _BACKOFF_TS_FORMAT
+            )
+        with contextlib.suppress(Exception):
+            await setter(thread_id, deadline)

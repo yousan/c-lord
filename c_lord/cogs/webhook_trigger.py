@@ -170,6 +170,7 @@ class WebhookTriggerCog(commands.Cog):
             working_dir=trigger.working_dir or self.runner.working_dir,
             timeout_seconds=trigger.timeout,
             dangerously_skip_permissions=trigger.dangerously_skip_permissions,
+            effort=self.runner.effort,
         )
 
         self._active_count += 1

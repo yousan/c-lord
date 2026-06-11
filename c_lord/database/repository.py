@@ -32,6 +32,9 @@ class SessionRecord:
     trigger_message_id: int | None = None
     # Issue #215: uuid of the last final answer the mirror delivered
     mirror_replied_uuid: str | None = None
+    # Issue #281: persisted state-sync rename rate-limit deadline (wall-clock
+    # "YYYY-MM-DD HH:MM:SS"); survives restarts so the rename window is honoured.
+    rename_backoff_until: str | None = None
 
 
 class SessionRepository:
@@ -190,6 +193,21 @@ class SessionRepository:
             await db.execute(
                 "UPDATE sessions SET mirror_replied_uuid = ? WHERE thread_id = ?",
                 (uuid, thread_id),
+            )
+            await db.commit()
+
+    async def set_rename_backoff_until(self, thread_id: int, deadline: str | None) -> None:
+        """Persist the state-sync rename rate-limit deadline (Issue #281).
+
+        ``deadline`` is a wall-clock "YYYY-MM-DD HH:MM:SS" string (or None to
+        clear). Persisting it lets a bot restart honour Discord's per-channel
+        rename window instead of forgetting the in-memory backoff and re-PATCHing
+        within the window (429).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET rename_backoff_until = ? WHERE thread_id = ?",
+                (deadline, thread_id),
             )
             await db.commit()
 

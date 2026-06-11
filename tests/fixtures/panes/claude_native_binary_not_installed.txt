@@ -1,0 +1,12 @@
+yousan@tachikoma1 ~/c-lord-sessions/123/456 (main) $ unalias claude 2>/dev/null; env -u CLAUDECODE claude --model opus --permission-mode acceptEdits 'fix the bug'
+Error: claude native binary not installed.
+
+Either postinstall did not run (--ignore-scripts, some pnpm configs)
+or the platform-native optional dependency was not downloaded
+(--omit=optional).
+
+Run the postinstall manually (adjust path for local vs global install):
+  node node_modules/@anthropic-ai/claude-code/install.cjs
+
+Or reinstall without --ignore-scripts / --omit=optional.
+yousan@tachikoma1 ~/c-lord-sessions/123/456 (main) $

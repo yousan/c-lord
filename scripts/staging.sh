@@ -168,15 +168,24 @@ env_get() {
 
 find_pids() {
   # この clone を cwd とする c_lord.main プロセスだけを列挙する。
-  # cmdline パターンマッチ (pgrep -f) は使わない: 自分のシェルへの自己
-  # マッチ・相対パス起動の取り逃し・他環境への誤爆があるため。
+  #
+  # 手順: pgrep -f で「c_lord.main を含むプロセス」を候補に絞り (高速)、
+  # 各候補の /proc/<pid>/cwd が $CLONE_DIR と一致するものだけ採用する。
+  # pgrep を「候補抽出」だけに使い、最終判定は必ず cwd 照合で行うので、
+  # かつて pgrep 直 kill を避けた理由 (自己マッチ・他 clone への誤爆) は
+  # cwd 照合がそのまま吸収する。staging.sh は常に `python -m c_lord.main`
+  # で起動するため -f で確実に拾える (相対パス起動の取り逃しも無い)。
+  #
+  # timeout ガード (#383): WSL2 等で応答しないマウント上に cwd を持つ
+  # プロセスがあると readlink /proc/<pid>/cwd が uninterruptible に
+  # ブロックし、これを毎反復呼ぶ restart の待機ループごとハングする
+  # (2026-06-11 に約11分のハングを観測)。readlink を 2 秒で打ち切り、
+  # 1つの stuck pid が関数全体を巻き込まないようにする。pgrep 前段で
+  # 候補が数個に絞られるので fork 回数も少ない。
   local pid cwd
-  for pid in $(ps -eo pid --no-headers); do
-    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
-    [ "$cwd" = "$CLONE_DIR" ] || continue
-    if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | /usr/bin/grep -q "c_lord\.main"; then
-      echo "$pid"
-    fi
+  for pid in $(pgrep -f "c_lord\.main" 2>/dev/null); do
+    cwd="$(timeout 2 readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
+    [ "$cwd" = "$CLONE_DIR" ] && echo "$pid"
   done
 }
 

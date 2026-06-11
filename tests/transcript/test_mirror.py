@@ -905,6 +905,62 @@ async def test_mirror_bridges_ask_to_cb(tmp_path: Path) -> None:
     assert [o.label for o in captured["q"].options] == ["A案", "B案"]
 
 
+async def test_mirror_skips_already_answered_ask(tmp_path: Path) -> None:
+    """#262: a menu whose tool_result is already in the transcript (answered)
+    must NOT be re-bridged.
+
+    The mirror can process the AskUserQuestion ``tool_use`` line late (queue lag
+    or restart replay), by which point the answer (``tool_result``) is already in
+    the transcript. Bridging then posts a dead, duplicate menu to Discord *after*
+    the user already answered (the live bridge having released ``ask_bus``).
+    """
+    import os
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    os.utime(jsonl, (1, 1))
+
+    tid = 2320003
+    spawned = False
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def ask_cb(question) -> None:
+        nonlocal spawned
+        spawned = True
+
+    ask_with_id = _assistant_ask("発生箇所")
+    ask_with_id["message"]["content"][0]["id"] = "toolu_answered1"
+    answer = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_answered1", "content": "answered"}
+            ],
+        },
+    }
+
+    mirror = TranscriptMirror(
+        thread_id=tid, project_dir=project, sink=sink, poll_interval=0.05, ask_bridge_cb=ask_cb
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # Both the menu and its answer are already in the transcript by the time
+        # the mirror tails them (the lag / restart-replay case from #262).
+        _write_event(jsonl, ask_with_id)
+        _write_event(jsonl, answer)
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+
+    assert spawned is False
+
+
 async def test_mirror_skips_ask_when_bus_active(tmp_path: Path) -> None:
     """#232 dedup: when a bridge is already active (run_claude owns the menu via
     ask_bus), the mirror must NOT spawn a second bridge."""
