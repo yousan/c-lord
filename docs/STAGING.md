@@ -25,6 +25,48 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 > このブランチは staging DB のスキーマ前進 (`mirror_replied_uuid`, #232/#242) と不整合で**起動クラッシュする**。
 > idle = `main` が現在の正(2026-06-10 改訂)。
 
+## staging フリート(並行検証用に増設, 2026-06-11)
+
+単一 staging では複数セッションが lease を取り合う(2026-05-29 実害)ため、staging bot を **4台**に
+増設した。各台は独立した clone / bot identity / channel / E2E スレッドを持ち、**別ブランチを同時に検証**
+できる。1 つ借りられていても他の空き番号を borrow すればよい。
+
+| # | clone | bot (user id) | channel (id) | E2E スレッド id | port |
+|---|---|---|---|---|---|
+| 1 | `/home/yousan/c-lord-parallel-3`† | `C-lord-3` (`1503195981142032405`) | `#c-lord-3` (`1503196656265597082`) | `1514085380666691664` | 8089 |
+| 2 | `/home/yousan/c-lord-staging-2` | `C-lord-staging-2` (`1514518564403413014`) | `#c-lord-staging-2` (`1514535894575743056`) | `1514545583459926117` | 8091 |
+| 3 | `/home/yousan/c-lord-staging-3` | `C-lord-staging-3` (`1503234123932635206`) | `#c-lord-staging-3` (`1503245597841559623`) | `1514546023282769920` | 8093 |
+| 4 | `/home/yousan/c-lord-staging-4` | `C-lord-staging-4` (`1514523658780016771`) | `#c-lord-staging-4` (`1514535896328700015`) | `1514546025631580260` | 8095 |
+
+† #1 は既存 staging。`c-lord-parallel-3` → `c-lord-staging-1` への改称・bot/channel 名揃えは予定(本 PR 時点では未実施)。
+
+- **port = 8087 + 2×N**(prod=N0=8087)。`CLORD_BRIDGE_MODE=jsonl` では ApiServer 非バインドなので名目値。
+- channel アクセスは共有ロール **`c-lord-staging`**(`1514537446132682853`)一本で制御(staging bot 全台に付与)。
+  bot を増やしたらこのロールを付けるだけ(個別の permission overwrite は不要)。
+- 各 clone の `.env` に `DISCORD_CHANNEL_ID` / `EXPECTED_BOT_USER_ID` / `E2E_TEST_THREAD_ID` 設定済み。
+  各 staging channel は自分の clone に `channel_repo_bindings` で bind 済み(`/clord-init` 相当)。
+
+### 他エージェントからのトリガー(信頼bot方式, webhook 不要)
+
+新 staging (#2–#4) は `.env` に `CLORD_TRUSTED_BOT_IDS=1475105094071750818`(prod bot) を設定済み。
+prod の bot token で各台の **E2E スレッド**に投稿すれば、その staging bot が信頼 bot として受理し
+(`claude_chat._is_message_authorized`)、Claude を起動して応答をスレッドにミラーする(jsonl の
+`TranscriptMirrorCog` 経由)。Discord webhook も Manage Webhooks も要らない。
+
+```bash
+PTOK=$(grep '^DISCORD_BOT_TOKEN=' /home/yousan/c-lord/.env | cut -d= -f2-)
+THREAD=1514545583459926117   # 上表の E2E スレッド id (例: staging-2)
+curl -s -X POST -H "Authorization: Bot $PTOK" -H "User-Agent: DiscordBot/1.0" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"<検証入力>"}' \
+  "https://discord.com/api/v10/channels/$THREAD/messages"
+# → 応答は同じ E2E スレッドに返る(別 bot 投稿なので staging bot だけが反応)
+```
+
+borrow → ブランチ切替(`staging.sh restart <branch>`) → トリガー → 原状復帰 → release の流れは
+下の「占有プロトコル」「検証レシピ」と同じ(対象 clone を上表で読み替えるだけ)。既存 #1 は従来どおり
+webhook (`E2E_TEST_WEBHOOK_URL`) でもトリガーできる。
+
 ## 安全原理(コードで強制されているもの)
 
 1. **directory == identity** (#324): `.env` に書かれたキーは継承 env に常に勝つ。正しいディレクトリで起動すれば正しい bot になる。
@@ -117,10 +159,15 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 4. `.env` を**実ファイル**で作成(symlink 禁止 — #326)。必須: `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` /
    **`EXPECTED_BOT_USER_ID`(新 bot の user id)** / `CLORD_API_PORT`(未使用ポート、#258 で自動化予定) /
    `SESSION_DIR_BASE`(専用ディレクトリ) / `E2E_TEST_WEBHOOK_URL`
-5. `bash scripts/staging.sh restart` → `status` で identity を確認
-6. チャンネルで `/clord-init` を実行して repo を bind
-7. E2E 用スレッドを 1 つ作って `E2E_TEST_THREAD_ID` を `.env` に追記
-8. この表(環境レイアウト)に行を追加する
+   - `E2E_TEST_WEBHOOK_URL` は任意。webhook を作らない場合は次の信頼bot方式で代替できる。
+   - 信頼bot方式を使うなら `CLORD_TRUSTED_BOT_IDS=<prod bot user id>` も入れる(prod token 投稿でトリガー可能になる)。
+5. **channel アクセス**: 新 bot に共有ロール **`c-lord-staging`** を付与(`PUT /guilds/{g}/members/{bot}/roles/{role}`)。
+   非公開カテゴリでもこのロール 1 つで閲覧可になる(個別 overwrite は不要。「staging フリート」節参照)。
+6. `bash scripts/staging.sh restart` → `status` で identity を確認
+7. repo を bind: `/clord-init`(slash)、または `channel_repo_bindings(channel_id, source_repo=clone)` を直接 INSERT
+8. E2E スレッドを 1 つ作って `sessions` 行を seed → その id を `.env` の `E2E_TEST_THREAD_ID` に追記
+9. **「staging フリート」節の表に行を追加**(port = 8087 + 2×N)
+10. 信頼bot方式なら prod token で E2E スレッドに投稿して RED→GREEN を確認(「他エージェントからのトリガー」節)
 
 ## トラブルシュート
 
