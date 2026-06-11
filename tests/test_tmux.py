@@ -30,6 +30,9 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
+                # _strip_sensitive_env → set-environment -r ×2 (#353)
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
                 # _find_window_by_working_dir → list-windows (no windows yet)
                 MagicMock(returncode=1, stdout=""),
                 # new-window
@@ -43,7 +46,7 @@ class TestTmuxSessionManager:
         assert mgr._thread_to_window[12345] == "w1"
 
         # Verify new-window was called correctly
-        new_window_call = mock_run.call_args_list[4]
+        new_window_call = mock_run.call_args_list[6]
         args = new_window_call[0][0]
         assert "new-window" in args
         assert SESSION_NAME in args
@@ -54,7 +57,7 @@ class TestTmuxSessionManager:
         assert "-d" in args
 
         # Verify set-option was called to store thread_id
-        set_opt_call = mock_run.call_args_list[5]
+        set_opt_call = mock_run.call_args_list[7]
         args = set_opt_call[0][0]
         assert "set-option" in args
         assert "@thread_id" in args
@@ -98,6 +101,8 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
+                MagicMock(returncode=0),  # set-environment -r ×2 (#353)
+                MagicMock(returncode=0),
                 MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -362,8 +367,9 @@ class TestTmuxSessionManager:
             mock_run.return_value = MagicMock(returncode=0)
             assert mgr._ensure_session() is True
 
-        # Only has-session called, no new-session
-        assert mock_run.call_count == 1
+        # has-session + set-environment -r ×2 (#353); no new-session
+        assert mock_run.call_count == 3
+        assert not any("new-session" in c.args[0] for c in mock_run.call_args_list)
 
     def test_ensure_session_creates_new(self) -> None:
         """_ensure_session creates session when it doesn't exist."""
@@ -373,6 +379,8 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
                 MagicMock(returncode=0),  # new-session → success
+                MagicMock(returncode=0),  # set-environment -r ×2 (#353)
+                MagicMock(returncode=0),
             ]
             assert mgr._ensure_session() is True
 
@@ -977,6 +985,8 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
                 MagicMock(returncode=0),  # new-session → success
+                MagicMock(returncode=0),  # set-environment -r ×2 (#353)
+                MagicMock(returncode=0),
             ]
             assert mgr._ensure_session() is True
 
@@ -987,6 +997,11 @@ class TestTmuxSessionManager:
         # Verify new-session used custom name
         new_call = mock_run.call_args_list[1]
         assert "custom" in new_call[0][0]
+
+        # Verify the strip targets the custom session too (#353)
+        strip_call = mock_run.call_args_list[2]
+        assert "set-environment" in strip_call[0][0]
+        assert "custom" in strip_call[0][0]
 
     def test_none_session_name_uses_default(self) -> None:
         """Passing None as session_name uses the default."""
@@ -1545,6 +1560,8 @@ class TestSortWindows:
                 MagicMock(returncode=1, stdout=""),  # rebuild list-windows (no session)
                 MagicMock(returncode=1),  # has-session (no)
                 MagicMock(returncode=0),  # new-session
+                MagicMock(returncode=0),  # set-environment -r ×2 (#353)
+                MagicMock(returncode=0),
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -1585,3 +1602,59 @@ class TestGetWindowInfo:
             info = mgr.get_window_info(12345)
 
         assert info == ("@2", None)
+
+
+class TestSensitiveEnvStrip:
+    """Issue #353: bot-managed tmux sessions must not expose secrets to panes.
+
+    The tmux server inherits the bot's environment (it may even be started by
+    the bot), so every pane in every window could read DISCORD_BOT_TOKEN via
+    plain ``printenv`` — despite CLAUDE.md documenting an env strip. Verified
+    live 2026-06-11: 6/6 staging panes carried the production token.
+    The fix: mark secrets for removal in the session environment
+    (``set-environment -r``) so every newly created pane drops them.
+    """
+
+    def _strip_calls(self, mock_run: MagicMock) -> list[list[str]]:
+        return [
+            c.args[0]
+            for c in mock_run.call_args_list
+            if len(c.args) > 0 and "set-environment" in c.args[0]
+        ]
+
+    def test_strip_applied_when_session_created(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            # has-session fails → new-session path
+            mock_run.side_effect = None
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._ensure_session()
+        calls = self._strip_calls(mock_run)
+        for key in ("DISCORD_BOT_TOKEN", "CLORD_API_SECRET"):
+            assert any(
+                "-r" in c and key in c and mgr.session_name in c for c in calls
+            ), f"set-environment -r {key} not issued: {calls}"
+
+    def test_strip_applied_to_existing_session_too(self) -> None:
+        """Legacy sessions (created before the fix) get the removal mark on
+        the next bot start — new windows in old sessions become clean."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")  # has-session OK
+            mgr._ensure_session()
+        calls = self._strip_calls(mock_run)
+        assert len(calls) >= 2, f"strip must run even for pre-existing sessions: {calls}"
+
+    def test_strip_runs_once_per_manager(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._ensure_session()
+            mgr._ensure_session()
+        calls = self._strip_calls(mock_run)
+        keys = [c for c in calls if "DISCORD_BOT_TOKEN" in c]
+        assert len(keys) == 1, f"strip should be idempotent-once per manager: {calls}"

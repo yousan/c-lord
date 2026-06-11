@@ -27,6 +27,12 @@ _THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
 logger = logging.getLogger(__name__)
 
 SESSION_NAME = "clord"
+
+# Issue #353: secrets that must never be readable from inside a tmux pane.
+# The tmux server inherits the environment of whichever process first starts
+# it — often the bot itself — so without an explicit removal mark EVERY pane
+# in EVERY window can read the bot token with a plain `printenv`.
+SENSITIVE_ENV_KEYS = ("DISCORD_BOT_TOKEN", "CLORD_API_SECRET")
 # Short window prefix (#356): windows are named ``w1``, ``w2``, … so the tmux
 # window list / status bar stays compact (``w73`` instead of ``work73``).
 WINDOW_PREFIX = "w"
@@ -146,6 +152,8 @@ class TmuxSessionManager:
         # create_session() calls (one per Discord thread, run in the asyncio
         # thread pool) don't interleave their move-window operations.
         self._lock = threading.Lock()
+        # Issue #353: apply the sensitive-env removal mark once per manager.
+        self._env_stripped: bool = False
         # Persistent thread→window mapping file. Survives tmux restarts; used
         # as fallback in _rebuild_mapping when pane has cd'd away (issue #113).
         if mapping_path is not None:
@@ -165,6 +173,29 @@ class TmuxSessionManager:
 
     # ── Helpers ────────────────────────────────────────────────────────
 
+    def _strip_sensitive_env(self) -> None:
+        """Mark secrets for removal from the session environment (#353).
+
+        ``set-environment -r`` removes the variable from the environment of
+        every process subsequently spawned in this session — regardless of
+        what the tmux SERVER inherited from whoever started it (often the bot
+        itself, complete with DISCORD_BOT_TOKEN). Applied to pre-existing
+        sessions too, so legacy sessions become clean for new windows after a
+        bot restart. Idempotent; run once per manager lifetime. Panes that
+        are ALREADY running keep their environment (cannot be fixed
+        retroactively) — they age out as windows are recreated.
+        """
+        if self._env_stripped:
+            return
+        for key in SENSITIVE_ENV_KEYS:
+            _run(["tmux", "set-environment", "-t", self.session_name, "-r", key])
+        self._env_stripped = True
+        logger.info(
+            "Marked %d sensitive env var(s) for removal in tmux session %s (#353)",
+            len(SENSITIVE_ENV_KEYS),
+            self.session_name,
+        )
+
     def _ensure_session(self) -> bool:
         """Ensure the global ``clord`` tmux session exists.
 
@@ -173,6 +204,7 @@ class TmuxSessionManager:
         """
         result = _run(["tmux", "has-session", "-t", self.session_name])
         if result.returncode == 0:
+            self._strip_sensitive_env()
             return True
 
         # Create with a temporary first window that will be replaced
@@ -194,6 +226,7 @@ class TmuxSessionManager:
             return False
 
         logger.info("Created global tmux session: %s", self.session_name)
+        self._strip_sensitive_env()
         return True
 
     def _find_window_for_thread(self, thread_id: int) -> str | None:

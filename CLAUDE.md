@@ -114,8 +114,8 @@ E2E テストは `tests/e2e/` 配下に pytest として実装され、`@pytest.
 c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) で動かしている Claude から Discord をデバッグ目的で参照・操作したいときの手順。bot 本体や bot が spawn した子プロセスではなく、**手動で起動した Claude / 別マシンの Claude** が対象。
 
 **前提と制約**:
-- `c_lord/cogs/_run_helper.py` は **bot が spawn する子 Claude の env から `DISCORD_BOT_TOKEN` を strip する** (security audit に記載)。bot 経由で立った Claude は環境変数からは token を読めない
-- 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
+- **secrets の strip は tmux セッション環境レベルで行われる** (#353): `c_lord/tmux.py` の `TmuxSessionManager` が bot 管理セッションに `set-environment -r DISCORD_BOT_TOKEN` 等の除去マークを張るため、**fix 後に作られた window 内の Claude は環境変数から token を読めない**(fix 前から生きている pane には残存し得る — window 再作成で解消)。旧記述「`_run_helper.py` が subprocess env を strip する」は #53 の tmux 化で実体を失っていた(2026-06-11 実測で確認、#353)
+- token が必要なときは **bot の `.env` ファイル**を直接読む(下記)
 - Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多い。**メッセージの読み取りは MCP に頼らず、`.env` の bot token を読んで Discord REST API を `curl` で叩く**のが確実 — MCP が `Missing Access` を返しても**そこで諦めず curl にフォールバックすること**。MCP は c-lord のスタック外（利用者環境にある保証もない）なので読み取りの基盤にしない。読み取り経路を skill + API として c-lord 内に正式実装する作業は #259、設計方針は #234 を参照
 
 **Token 取得**: **本番 `.env` を絶対パスで直接読む** (`/home/yousan/c-lord/.env`。パスは運用に合わせて)。
@@ -149,7 +149,7 @@ curl -s -X POST -H "Authorization: Bot $TOKEN" \
   "https://discord.com/api/v10/channels/<THREAD_ID>/messages"
 ```
 
-**bot 内 spawn 子 Claude (`c-lord-sessions/<ch>/<thr>/` cwd) の場合**: env は strip されているが、ファイル読みは strip 対象外なので、上と同じく絶対パス (`cat /home/yousan/c-lord/.env`) で token を取得可能。
+**bot 内 spawn 子 Claude (`c-lord-sessions/<ch>/<thr>/` cwd) の場合**: env からは token を読めない (#353 の tmux セッション env strip)が、ファイル読みは対象外なので、上と同じく絶対パス (`cat /home/yousan/c-lord/.env`) で token を取得可能。
 
 **代替: c-lord REST API (`ext/api_server.py`)**:
 api_server をオプトインで有効化してある環境では `POST /api/threads/{thread_id}/messages` で同等の操作が可能 (詳細は `docs/COMMANDS.md`)。bot を再起動せずに有効化する手段はないため、デバッグ目的では上の curl が手軽。
@@ -230,7 +230,7 @@ This project runs arbitrary Claude Code sessions. Security is non-negotiable.
 - **`--` separator**: Always use `--` before the prompt argument to prevent flag injection
 - **Session ID validation**: Strict regex `^[a-f0-9\-]+$` before passing to `--resume`
 - **Skill name validation**: Strict regex `^[\w-]+$` before passing to Claude
-- **Environment stripping**: `DISCORD_BOT_TOKEN` and other secrets are removed from the subprocess env so Claude's Bash tool can't read them
+- **Environment stripping (#353)**: `DISCORD_BOT_TOKEN` / `CLORD_API_SECRET` are marked for removal in the bot-managed tmux **session environment** (`set-environment -r`, see `SENSITIVE_ENV_KEYS` in `c_lord/tmux.py`), so Claude's Bash tool can't read them in any newly created window
 - **No `dangerously_skip_permissions` by default**: This flag exists for advanced users who understand the risk
 
 If you modify `tmux_runner.py`, `_run_helper.py`, or any Cog, the security audit is **mandatory** before committing.
