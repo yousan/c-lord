@@ -28,6 +28,7 @@ from ..transcript.mirror import (
     TranscriptMirror,
     bridge_mode_jsonl,
     reply_to_trigger_enabled,
+    show_url_embeds_enabled,
     silent_posts_enabled,
     verbosity_mode,
 )
@@ -398,10 +399,14 @@ class TranscriptMirrorCog(commands.Cog):
         from ..discord_ui.reply_chunker import chunk_discord_content
 
         chunks = chunk_discord_content(text)
+        # #372: suppress URL OGP/link-preview cards on Claude's posts by default.
+        # This is the production (jsonl-bridge) reply path, so the flag must be
+        # honored here — not just in ext/api_server.py's skill-reply path.
+        suppress_embeds = not show_url_embeds_enabled()
         last = len(chunks) - 1
         last_sent: discord.Message | None = None
         for idx, chunk in enumerate(chunks):
-            kwargs: dict = {"content": chunk}
+            kwargs: dict = {"content": chunk, "suppress_embeds": suppress_embeds}
             if silent:
                 kwargs["silent"] = True
             if idx == 0 and reference is not None:

@@ -1,8 +1,10 @@
 """Tmux session management for Claude Code sessions.
 
-Uses a single tmux session ``clord`` with per-thread windows (``work1``,
-``work2``, ...).  The mapping between thread IDs and window names is
+Uses a single tmux session ``clord`` with per-thread windows (``w1``,
+``w2``, ...).  The mapping between thread IDs and window names is
 stored in tmux window options (``@thread_id``) so it survives bot restarts.
+(Windows created before the prefix was shortened are named ``work{N}`` and
+are still recognized — see :func:`parse_work_number`.)
 
 All operations use ``asyncio.to_thread`` for non-blocking execution.
 When tmux is not installed, operations degrade gracefully (log warning, skip).
@@ -15,6 +17,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 
 # Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
@@ -24,7 +27,25 @@ _THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
 logger = logging.getLogger(__name__)
 
 SESSION_NAME = "clord"
-WINDOW_PREFIX = "work"
+# Short window prefix (#356): windows are named ``w1``, ``w2``, … so the tmux
+# window list / status bar stays compact (``w73`` instead of ``work73``).
+WINDOW_PREFIX = "w"
+# Windows created before the prefix was shortened are named ``work{N}``.  We
+# keep recognizing that form so already-running windows survive the transition
+# (their W<N> Discord label and thread mapping keep working until they are
+# naturally recreated). New windows always use ``WINDOW_PREFIX``.
+_LEGACY_WINDOW_PREFIX = "work"
+
+# #374: temporary index base used while re-sorting windows. Windows are first
+# moved into this (free) high range in the desired order, then ``move-window -r``
+# compacts them back from ``base-index``. Far above any realistic window count.
+_SORT_TMP_BASE = 9000
+
+# Effort levels the ``claude --effort`` flag accepts (commander-validated; it
+# hard-errors on anything else).  ``ultracode``/``auto`` are real effort levels
+# but only settable via ``CLAUDE_CODE_EFFORT_LEVEL`` or the ``/effort`` command,
+# not this flag — so they are intentionally excluded here.
+_VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 # #147: Claude Code runs with ``editorMode: vim``.  Its input box therefore has
 # a vim NORMAL mode in which literal characters (``send-keys -l``) are
@@ -45,21 +66,29 @@ _INSERT_SETTLE = 0.15
 
 
 def parse_work_number(window_name: str) -> int | None:
-    """Extract the ``N`` from a ``work{N}`` window name.
+    """Extract the ``N`` from a ``w{N}`` (or legacy ``work{N}``) window name.
 
-    Returns ``None`` for windows that don't follow the ``work{N}`` convention
-    (e.g. the session's initial shell window, or a window adopted by dir-match).
+    Returns ``None`` for windows that don't follow the convention (e.g. the
+    session's initial shell window, or a window adopted by dir-match).
 
     This number is the *stable* window identifier shown as the ``W<N>`` thread
     name prefix. It deliberately is NOT tmux's ``#{window_index}``, which is
     volatile — the index shifts when other windows are killed/renumbered and is
     offset by ``base-index``, so using it would make the Discord ``W<N>`` label
-    disagree with the window's own ``work{N}`` name.
+    disagree with the window's own ``w{N}`` name.
+
+    Both the current short prefix (``w{N}``) and the legacy long prefix
+    (``work{N}``) are accepted so windows created before the rename keep their
+    label across the transition. ``WINDOW_PREFIX`` is checked first; because it
+    is a prefix of ``_LEGACY_WINDOW_PREFIX`` (``"w"`` ⊂ ``"work"``), a name like
+    ``work73`` falls through to the legacy branch (its ``"ork73"`` suffix isn't
+    numeric) and is parsed correctly.
     """
-    if window_name.startswith(WINDOW_PREFIX):
-        suffix = window_name[len(WINDOW_PREFIX) :]
-        if suffix.isdigit():
-            return int(suffix)
+    for prefix in (WINDOW_PREFIX, _LEGACY_WINDOW_PREFIX):
+        if window_name.startswith(prefix):
+            suffix = window_name[len(prefix) :]
+            if suffix.isdigit():
+                return int(suffix)
     return None
 
 
@@ -104,7 +133,7 @@ class TmuxSessionManager:
     """Manages tmux windows for Claude Code Discord threads.
 
     One global tmux session ``clord`` holds all threads.  Each thread gets
-    a window named ``work{N}`` with the thread ID stored in the ``@thread_id``
+    a window named ``w{N}`` with the thread ID stored in the ``@thread_id``
     window option.
     """
 
@@ -113,6 +142,10 @@ class TmuxSessionManager:
         self._available: bool | None = None
         self._next_work_id: int = 1
         self._thread_to_window: dict[int, str] = {}
+        # Serializes window creation + the post-create sort (#374) so concurrent
+        # create_session() calls (one per Discord thread, run in the asyncio
+        # thread pool) don't interleave their move-window operations.
+        self._lock = threading.Lock()
         # Persistent thread→window mapping file. Survives tmux restarts; used
         # as fallback in _rebuild_mapping when pane has cd'd away (issue #113).
         if mapping_path is not None:
@@ -193,7 +226,7 @@ class TmuxSessionManager:
         return self._thread_to_window.get(thread_id)
 
     def _next_window_name(self) -> str:
-        """Generate the next ``work{N}`` name and increment the counter."""
+        """Generate the next ``w{N}`` name and increment the counter."""
         name = f"{WINDOW_PREFIX}{self._next_work_id}"
         self._next_work_id += 1
         return name
@@ -285,10 +318,11 @@ class TmuxSessionManager:
             if thread_id is not None:
                 self._thread_to_window[thread_id] = window_name
 
-            if window_name.startswith(WINDOW_PREFIX):
-                suffix = window_name[len(WINDOW_PREFIX) :]
-                if suffix.isdigit():
-                    max_id = max(max_id, int(suffix))
+            # Count both ``w{N}`` and legacy ``work{N}`` windows toward the high
+            # watermark so numbering stays monotonic across the prefix rename.
+            n = parse_work_number(window_name)
+            if n is not None:
+                max_id = max(max_id, n)
 
         self._next_work_id = max_id + 1
 
@@ -430,80 +464,195 @@ class TmuxSessionManager:
             logger.debug("tmux window already exists for thread %d: %s", thread_id, existing)
             return existing
 
-        if not self._ensure_session():
-            return f"{WINDOW_PREFIX}0"
+        # Serialize the create-and-sort critical section (#374) so concurrent
+        # create_session() calls don't interleave their move-window ops.
+        with self._lock:
+            if not self._ensure_session():
+                return f"{WINDOW_PREFIX}0"
 
-        # Guard: if any window is already sitting in working_dir, adopt it
-        # instead of creating a duplicate. This covers the post-tmux-restart
-        # case where @thread_id options were cleared but the pane hasn't moved.
-        # (Issue #111.)
-        adopted = self._find_window_by_working_dir(working_dir)
-        if adopted is not None:
+            # Guard: if any window is already sitting in working_dir, adopt it
+            # instead of creating a duplicate. This covers the post-tmux-restart
+            # case where @thread_id options were cleared but the pane hasn't moved.
+            # (Issue #111.)  Adoption reuses an existing window, so no new window
+            # is added and no re-sort is needed.
+            adopted = self._find_window_by_working_dir(working_dir)
+            if adopted is not None:
+                _run(
+                    [
+                        "tmux",
+                        "set-option",
+                        "-w",
+                        "-t",
+                        f"{self.session_name}:{adopted}",
+                        "@thread_id",
+                        str(thread_id),
+                    ]
+                )
+                self._thread_to_window[thread_id] = adopted
+                logger.info(
+                    "Adopted window %s for thread %d by dir match: %s",
+                    adopted,
+                    thread_id,
+                    working_dir,
+                )
+                self._save_mapping()
+                return adopted
+
+            window_name = self._next_window_name()
+
+            result = _run(
+                [
+                    "tmux",
+                    "new-window",
+                    # -d: create detached so a new thread doesn't steal the
+                    # attached user's tmux focus (#374).
+                    "-d",
+                    "-t",
+                    self.session_name,
+                    "-n",
+                    window_name,
+                    "-c",
+                    working_dir,
+                ]
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "Failed to create tmux window %s: %s",
+                    window_name,
+                    result.stderr.strip(),
+                )
+                return window_name
+
+            # Store thread_id as a window option
             _run(
                 [
                     "tmux",
                     "set-option",
                     "-w",
                     "-t",
-                    f"{self.session_name}:{adopted}",
+                    f"{self.session_name}:{window_name}",
                     "@thread_id",
                     str(thread_id),
                 ]
             )
-            self._thread_to_window[thread_id] = adopted
+
+            self._thread_to_window[thread_id] = window_name
+            self._save_mapping()
+            # Keep the session ordered by window number (#374). The new window
+            # was inserted at the lowest free index (tmux default), so it may be
+            # out of order; re-sort restores ascending w{N} order.
+            self._sort_windows_unlocked()
             logger.info(
-                "Adopted window %s for thread %d by dir match: %s",
-                adopted,
+                "Created tmux window: %s (thread=%d, dir=%s)",
+                window_name,
                 thread_id,
                 working_dir,
             )
-            self._save_mapping()
-            return adopted
+            return window_name
 
-        window_name = self._next_window_name()
+    def _sort_windows(self) -> None:
+        """Re-sort the session's windows by number (thread-safe wrapper).
+
+        Acquires the manager lock; safe to call from outside the create path
+        (e.g. a future manual ``/sort`` command).
+        """
+        with self._lock:
+            self._sort_windows_unlocked()
+
+    def _sort_windows_unlocked(self) -> None:
+        """Reorder the session's windows into ascending ``w{N}`` order.
+
+        Numbered windows (``w{N}`` / legacy ``work{N}``) come first in ascending
+        numeric order; windows without a parseable number (the initial shell,
+        manually-created or adopted windows) are pushed to the end, preserving
+        their relative order.
+
+        Only tmux window *indices* change — window names, the ``@thread_id``
+        option and the panes are untouched (the bot identifies windows by
+        ``@thread_id`` / name, not index, so this is invisible to it). This is a
+        purely cosmetic ordering for the human watching ``tmux attach`` (#374).
+
+        No-op when tmux is unavailable, when there are ≤1 windows, or when the
+        windows are already sorted (so no needless ``move-window`` churn).
+
+        The caller must hold ``self._lock``; concurrent re-sorts would interleave
+        their ``move-window`` operations and corrupt the layout. The sort key is
+        deliberately factored out (``_window_sort_key``) so other orderings
+        (by activity, by log length, a manual ``/sort <key>``) can be added later
+        — see ``docs/specs/tmux-window-ordering.md``.
+        """
+        if not self._check_available():
+            return
 
         result = _run(
             [
                 "tmux",
-                "new-window",
+                "list-windows",
                 "-t",
                 self.session_name,
-                "-n",
-                window_name,
-                "-c",
-                working_dir,
+                "-F",
+                "#{window_id}\t#{window_name}\t#{window_active}",
             ]
         )
         if result.returncode != 0:
-            logger.warning(
-                "Failed to create tmux window %s: %s",
-                window_name,
-                result.stderr.strip(),
+            return
+
+        entries: list[tuple[str, str]] = []
+        active_id: str | None = None
+        for line in result.stdout.strip().splitlines():
+            if not line:
+                continue
+            parts = line.split("\t", 2)
+            window_id = parts[0]
+            window_name = parts[1] if len(parts) > 1 else ""
+            if not window_id:
+                continue
+            entries.append((window_id, window_name))
+            if len(parts) > 2 and parts[2] == "1":
+                active_id = window_id
+
+        if len(entries) <= 1:
+            return
+
+        ordered = [entry for _, entry in sorted(enumerate(entries), key=self._window_sort_key)]
+        if ordered == entries:
+            return  # already sorted — avoid move-window churn
+
+        # Park every window in a free high-index range in the desired order,
+        # then renumber the session to compact them back from base-index.
+        for offset, (window_id, _name) in enumerate(ordered):
+            _run(
+                [
+                    "tmux",
+                    "move-window",
+                    "-s",
+                    window_id,
+                    "-t",
+                    f"{self.session_name}:{_SORT_TMP_BASE + offset}",
+                ]
             )
-            return window_name
+        _run(["tmux", "move-window", "-r", "-t", self.session_name])
 
-        # Store thread_id as a window option
-        _run(
-            [
-                "tmux",
-                "set-option",
-                "-w",
-                "-t",
-                f"{self.session_name}:{window_name}",
-                "@thread_id",
-                str(thread_id),
-            ]
-        )
+        # Restore the active window: parking/renumbering resets the session's
+        # current window to the base index, which would yank an attached user's
+        # view away from what they were watching — defeating the ``-d`` focus
+        # guarantee (#374). Re-select the window that was active before the sort.
+        if active_id is not None:
+            _run(["tmux", "select-window", "-t", active_id])
 
-        self._thread_to_window[thread_id] = window_name
-        self._save_mapping()
-        logger.info(
-            "Created tmux window: %s (thread=%d, dir=%s)",
-            window_name,
-            thread_id,
-            working_dir,
-        )
-        return window_name
+    @staticmethod
+    def _window_sort_key(item: tuple[int, tuple[str, str]]) -> tuple[int, int]:
+        """Sort key for :meth:`_sort_windows_unlocked`.
+
+        ``item`` is ``(original_index, (window_id, window_name))``. Numbered
+        windows sort first (group 0) by their number; unnumbered windows sort
+        last (group 1) keeping their original relative order.
+        """
+        orig_index, (_window_id, window_name) = item
+        number = parse_work_number(window_name)
+        if number is not None:
+            return (0, number)
+        return (1, orig_index)
 
     def remap_window(self, thread_id: int, window_name: str) -> bool:
         """Remap an existing tmux window to a new thread ID.
@@ -565,9 +714,9 @@ class TmuxSessionManager:
         """Return ``(window_id, work_number)`` for the thread, or None.
 
         ``window_id`` is tmux's internal immutable id (e.g. ``@7``).
-        ``work_number`` is the ``N`` in the window's ``work{N}`` name — the
-        stable identifier shown as the ``W<N>`` thread-name prefix. It is
-        ``None`` for windows that don't follow the ``work{N}`` convention.
+        ``work_number`` is the ``N`` in the window's ``w{N}`` name (or legacy
+        ``work{N}``) — the stable identifier shown as the ``W<N>`` thread-name
+        prefix. It is ``None`` for windows that don't follow the convention.
 
         Note: this is intentionally NOT tmux's volatile ``#{window_index}``.
         See :func:`parse_work_number` for why the stable name is used instead.
@@ -733,6 +882,7 @@ class TmuxSessionManager:
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
+        effort: str | None = None,
     ) -> bool:
         """Start Claude Code inside the tmux window for *thread_id*.
 
@@ -767,6 +917,20 @@ class TmuxSessionManager:
             cmd_parts.append("--dangerously-skip-permissions")
         else:
             cmd_parts.extend(["--permission-mode", permission_mode])
+        if effort is not None:
+            if effort in _VALID_EFFORT_LEVELS:
+                cmd_parts.extend(["--effort", effort])
+            else:
+                # The --effort flag hard-errors on unknown values, which would
+                # abort claude startup and leave the thread with no reply.  Drop
+                # the flag and fall back to the CLI default instead of crashing.
+                # (ultracode/auto are valid effort levels but only via
+                # CLAUDE_CODE_EFFORT_LEVEL / the /effort command, not this flag.)
+                logger.warning(
+                    "start_claude: ignoring unsupported effort %r (valid: %s)",
+                    effort,
+                    ", ".join(sorted(_VALID_EFFORT_LEVELS)),
+                )
 
         # Escape single quotes in the prompt for shell safety.
         safe_prompt = prompt.replace("'", "'\\''")

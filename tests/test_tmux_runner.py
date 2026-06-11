@@ -11,6 +11,7 @@ import pytest
 from c_lord.claude.tmux_runner import (
     TmuxClaudeRunner,
     _clean_tui_lines,
+    _extract_startup_error,
     _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
@@ -1030,6 +1031,7 @@ class TestTmuxClaudeRunnerRun:
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=False,
+            effort=None,
         )
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
@@ -1664,6 +1666,7 @@ class TestContinueFallback:
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=True,
+            effort=None,
         )
 
     @pytest.mark.asyncio
@@ -1750,6 +1753,7 @@ class TestContinueFallback:
             permission_mode="acceptEdits",
             dangerously_skip_permissions=False,
             try_continue=False,
+            effort=None,
         )
         # Only one is_claude_running call (no post-continue check)
         assert tmux_manager.is_claude_running.call_count == 1
@@ -2684,3 +2688,110 @@ class TestPeekPendingAsk:
     async def test_peek_returns_none_when_no_menu(self, runner, tmux_manager) -> None:
         tmux_manager.capture_pane.return_value = "● Done.\n\n❯\n──────\n-- INSERT --"
         assert await runner.peek_pending_ask() is None
+
+
+# -- Regression tests for #366 (claude startup-error silent swallow) ----------
+
+
+class TestExtractStartupError:
+    """#366: detect a fatal Claude-CLI startup error left in the tmux pane.
+
+    When ``claude`` dies immediately (e.g. a broken install whose native
+    binary was never downloaded), the pane shows the CLI's own error instead
+    of a session.  ``_extract_startup_error`` finds it so the runner can
+    surface it to Discord instead of reporting a silent normal completion.
+    """
+
+    def test_detects_native_binary_not_installed(self) -> None:
+        pane = _load_fixture("claude_native_binary_not_installed.txt")
+        result = _extract_startup_error(pane)
+        assert result is not None
+        assert "native binary not installed" in result.lower()
+
+    def test_detects_command_not_found(self) -> None:
+        pane = (
+            "yousan@host ~ $ env -u CLAUDECODE claude --model opus 'hi'\n"
+            "zsh: command not found: claude\n"
+            "yousan@host ~ $\n"
+        )
+        result = _extract_startup_error(pane)
+        assert result is not None
+        assert "command not found" in result.lower()
+
+    def test_healthy_response_pane_returns_none(self) -> None:
+        pane = _make_pane(["● Sure, here is the fix."], with_input_prompt=True)
+        assert _extract_startup_error(pane) is None
+
+    def test_empty_pane_returns_none(self) -> None:
+        assert _extract_startup_error("") is None
+
+
+class TestRunStartupErrorSurfacing:
+    """#366: a failed/empty Claude run must yield an error, not a silent done."""
+
+    @pytest.mark.asyncio
+    async def test_startup_error_pane_yields_error_event(self, runner, tmux_manager) -> None:
+        """Pane shows 'native binary not installed' → final RESULT carries the error."""
+        pane = _load_fixture("claude_native_binary_not_installed.txt")
+        tmux_manager.capture_pane.return_value = pane
+        # Claude crashed → the foreground process is the shell again.
+        tmux_manager.is_claude_running.return_value = False
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("fix the bug"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "native binary not installed" in result_events[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_response_claude_exited_yields_error(self, runner, tmux_manager) -> None:
+        """No response + claude no longer running → surfaced as an error, not silent."""
+        tmux_manager.capture_pane.return_value = "static text"
+        tmux_manager.is_claude_running.return_value = False
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+
+    @pytest.mark.asyncio
+    async def test_no_response_claude_alive_stays_silent(self, runner, tmux_manager) -> None:
+        """No extractable response but claude is still alive at its prompt →
+        treat as a benign completion (likely a skill-only post we didn't scrape),
+        NOT an error.  Guards against false-positive error embeds."""
+        tmux_manager.capture_pane.return_value = "static text"
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None

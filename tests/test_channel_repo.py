@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from c_lord.cogs.channel_repo import ChannelRepoCog
-from c_lord.database.channel_repo import ChannelRepository, derive_session_name
+from c_lord.database.channel_repo import (
+    ChannelRepository,
+    derive_session_name,
+    normalize_repo_url,
+)
 from c_lord.database.thread_repo import ThreadRepository
 
 # ---------------------------------------------------------------------------
@@ -153,6 +157,128 @@ class TestDeriveSessionName:
 
     def test_dot_git_only_returns_fallback(self) -> None:
         assert derive_session_name(".git") == "clord"
+
+
+# ===========================================================================
+# normalize_repo_url tests (#88)
+# ===========================================================================
+
+
+class TestNormalizeRepoUrl:
+    """A derived GitHub URL (pull/issues/blob/tree/...) is shrunk to owner/repo.git."""
+
+    def test_pull_request_url(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo/pull/2")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_issues_url(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo/issues/5")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_blob_url(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo/blob/main/foo.py")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_tree_url(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo/tree/main/src")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_bare_repo_url_gets_dot_git(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_already_dot_git_unchanged(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo.git")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_trailing_slash(self) -> None:
+        assert (
+            normalize_repo_url("https://github.com/owner/repo/")
+            == "https://github.com/owner/repo.git"
+        )
+
+    def test_ssh_with_dot_git_unchanged(self) -> None:
+        assert (
+            normalize_repo_url("git@github.com:owner/repo.git") == "git@github.com:owner/repo.git"
+        )
+
+    def test_ssh_without_dot_git_gets_dot_git(self) -> None:
+        assert normalize_repo_url("git@github.com:owner/repo") == "git@github.com:owner/repo.git"
+
+    def test_gitlab_derived_url(self) -> None:
+        assert (
+            normalize_repo_url("https://gitlab.com/owner/repo/-/merge_requests/3")
+            == "https://gitlab.com/owner/repo.git"
+        )
+
+    def test_bitbucket_derived_url(self) -> None:
+        assert (
+            normalize_repo_url("https://bitbucket.org/owner/repo/pull-requests/7")
+            == "https://bitbucket.org/owner/repo.git"
+        )
+
+    def test_local_path_unchanged(self) -> None:
+        assert normalize_repo_url("/home/user/repos/my-project") == "/home/user/repos/my-project"
+
+    def test_empty_string_unchanged(self) -> None:
+        assert normalize_repo_url("") == ""
+
+    def test_whitespace_stripped(self) -> None:
+        assert (
+            normalize_repo_url("  https://github.com/owner/repo/pull/2  ")
+            == "https://github.com/owner/repo.git"
+        )
+
+
+# ===========================================================================
+# Bind handlers normalize the URL before persisting (#88)
+# ===========================================================================
+
+
+class TestBindNormalizesUrl:
+    async def test_clord_init_persists_normalized_repo(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        await cog._clord_init_impl(
+            channel_id=100,
+            user=MagicMock(),
+            repo="https://github.com/owner/repo/pull/2",
+            remove=False,
+            respond=AsyncMock(),
+        )
+        binding = await repo.get(100)
+        assert binding is not None
+        assert binding["source_repo"] == "https://github.com/owner/repo.git"
+
+    async def test_clord_thread_init_persists_normalized_repo(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        channel = MagicMock()
+        # Not a discord.Thread → channel_id falls back to thread_id; skips parent access check.
+        await cog._clord_thread_init_impl(
+            thread_id=200,
+            channel=channel,
+            client=MagicMock(),
+            user=MagicMock(),
+            repo="https://github.com/owner/repo/issues/5",
+            remove=False,
+            respond=AsyncMock(),
+        )
+        binding = await thread_repo.get(200)
+        assert binding is not None
+        assert binding["source_repo"] == "https://github.com/owner/repo.git"
 
 
 # ===========================================================================

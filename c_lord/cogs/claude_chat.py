@@ -297,7 +297,7 @@ class ClaudeChatCog(commands.Cog):
             if pending_win and record.tmux_window_id != pending_win:
                 await self.repo.set_tmux_window_id(thread.id, pending_win)
 
-        # Resolve tmux window-id / work-number (the stable work{N} number).
+        # Resolve tmux window-id / work-number (the stable w{N} number).
         info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
         if info is not None:
             window_id, window_number = info
@@ -568,7 +568,7 @@ class ClaudeChatCog(commands.Cog):
         name="clord-attach",
         description="Attach this thread to an existing tmux window",
     )
-    @app_commands.describe(window="tmux window name (e.g. work1)")
+    @app_commands.describe(window="tmux window name (e.g. w1)")
     async def attach_window(self, interaction: discord.Interaction, window: str) -> None:
         """Remap an existing tmux window to the current thread."""
         if not isinstance(interaction.channel, discord.Thread):
@@ -607,7 +607,7 @@ class ClaudeChatCog(commands.Cog):
         """Text command: attach this thread to a tmux window.
 
         E2E-testable alternative to the /clord-attach slash command.
-        Usage: !attach work13
+        Usage: !attach w13
         """
         if not isinstance(ctx.channel, discord.Thread):
             await ctx.send("This command can only be used in a thread.")
@@ -1187,6 +1187,7 @@ class ClaudeChatCog(commands.Cog):
                 timeout_seconds=self.runner.timeout_seconds,
                 dangerously_skip_permissions=True,
                 try_continue=try_continue,
+                effort=self.runner.effort,
             )
 
             self._active_runners[thread.id] = runner

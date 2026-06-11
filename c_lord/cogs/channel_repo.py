@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from ..database.channel_repo import ChannelRepository
     from ..database.thread_repo import ThreadRepository
 
-from ..database.channel_repo import derive_session_name
+from ..database.channel_repo import derive_session_name, normalize_repo_url
 from ..session_dir import SessionDirManager
 from ..tmux import TmuxSessionManager
 
@@ -229,6 +229,7 @@ class ChannelRepoCog(commands.Cog):
             return
 
         # --- Bind channel to repo ---
+        repo = normalize_repo_url(repo)  # shrink derived URLs (PR/issue/blob/...) to repo (#88)
         await self._repo.save(channel_id=channel_id, source_repo=repo)
         self.evict_cache(channel_id)
 
@@ -342,6 +343,7 @@ class ChannelRepoCog(commands.Cog):
                 pass  # 他のエラーは無視してbindを続行
 
         # --- Bind thread to repo ---
+        repo = normalize_repo_url(repo)  # shrink derived URLs (PR/issue/blob/...) to repo (#88)
         await self._thread_repo.save(thread_id=thread_id, source_repo=repo, channel_id=channel_id)
         self.evict_thread_cache(thread_id)
         await respond(f"Bound thread <#{thread_id}> → `{repo}`", ephemeral=True)
