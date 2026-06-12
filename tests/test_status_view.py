@@ -7,6 +7,7 @@ tmux, or the filesystem.
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime
 
 import pytest
@@ -217,6 +218,30 @@ def test_topic_with_backticks_and_newline_cannot_break_the_table():
     assert out.count("```") == 4
     # the single data row stayed a single line
     assert len(_table_rows(out)) == 1
+
+
+def _dw(s: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def test_display_width_counts_fullwidth_as_two():
+    from c_lord.status_view import _display_width
+
+    assert _display_width("ab") == 2
+    assert _display_width("作業") == 4
+    assert _display_width("a作") == 3
+
+
+def test_cjk_and_ascii_topics_align_by_display_width():
+    # Two topics of equal *display* width but different char count must produce
+    # rows of equal display width (columns aligned by display width, not len()).
+    rows = [
+        StatusRow(1, "run", "あ", 4_000_000, "2026-06-11 11:00:00", "x1"),
+        StatusRow(2, "run", "ab", 4_000_000, "2026-06-11 11:00:00", "x2"),
+    ]
+    out = _render(show_all=False, rows=rows)
+    l0, l1 = _table_rows(out)
+    assert _dw(l0) == _dw(l1)
 
 
 def test_row_cap_is_announced_not_silent():
