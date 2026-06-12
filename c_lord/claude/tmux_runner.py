@@ -1340,6 +1340,48 @@ class TmuxClaudeRunner:
         )
         await self._navigate_menu(index)
 
+    async def answer_menu_multi(self, indices: list[int], option_count: int) -> None:
+        """Answer a multiSelect AskUserQuestion: toggle each option then Submit (#418).
+
+        ``answer_menu`` (Down×index + Enter) is single-select only, so the bridge
+        used to drop every checkbox but the first.  The multiSelect TUI, verified
+        on a live Claude Code TUI, works differently:
+
+        - the cursor starts on option 0;
+        - **Space** toggles the checkbox under the cursor (``[ ]`` ⇄ ``[✔]``);
+        - a **"Submit"** row sits just past the real options and the
+          "Type something" affordance, i.e. at index ``option_count + 1``
+          (mirroring the ``option_count`` index :meth:`answer_menu_text` uses for
+          the "Type something" row); ``Down`` to it and ``Enter`` opens the
+          "Submit answers" review screen whose cursor defaults to submit, so a
+          final ``Enter`` records every toggled value.
+
+        Keys are sent one-per-call with ``_MENU_NAV_DELAY`` spacing — batching is
+        dropped by the TUI (#171).
+        """
+        logger.info(
+            "Answering multiSelect AskUserQuestion menu: indices=%s (thread=%d)",
+            indices,
+            self._thread_id,
+        )
+        cursor = 0
+        for idx in sorted({i for i in indices if i >= 0}):
+            for _ in range(idx - cursor):
+                await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+                await asyncio.sleep(_MENU_NAV_DELAY)
+            cursor = idx
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Space")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        # Navigate to the "Submit" row (one past "Type something") and open the
+        # "Submit answers" review screen.
+        for _ in range(max(0, (option_count + 1) - cursor)):
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        await asyncio.sleep(_MENU_NAV_DELAY)
+        # Confirm the review screen (cursor defaults to "Submit answers").
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+
     async def answer_menu_text(self, text_option_index: int, text: str) -> None:
         """Answer via the free-text ("Type something.") affordance (#172).
 

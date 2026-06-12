@@ -27,6 +27,15 @@ def _question() -> AskQuestion:
     )
 
 
+def _multi_question() -> AskQuestion:
+    return AskQuestion(
+        question="which envs?",
+        header="env",
+        options=[AskOption("A1", "one"), AskOption("A2", "two"), AskOption("A3", "three")],
+        multi_select=True,
+    )
+
+
 def _thread(thread_id: int) -> tuple[MagicMock, MagicMock]:
     thread = MagicMock()
     thread.id = thread_id
@@ -93,3 +102,60 @@ async def test_discord_click_still_answers_menu(monkeypatch):
     # Option index 1 (A2) selected via keystrokes.
     runner.answer_menu.assert_awaited_once_with(1)
     runner.cancel_menu.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_multi_select_click_toggles_all_options(monkeypatch):
+    """#418: a multiSelect click delivers ALL selected labels to the TUI via
+    answer_menu_multi — not just selected[0] (which dropped every choice but
+    the first).
+    """
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(418_0001)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_multi_question())
+    runner.answer_menu = AsyncMock()
+    runner.answer_menu_multi = AsyncMock()
+    runner.answer_menu_text = AsyncMock()
+    runner.cancel_menu = AsyncMock()
+
+    async def _click_soon():
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["A1", "A3"])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _multi_question(), runner), timeout=3.0),
+        _click_soon(),
+    )
+    # All selected options (indices 0 and 2) toggled, with the option count (3)
+    # so the runner can locate the Submit row.
+    runner.answer_menu_multi.assert_awaited_once_with([0, 2], 3)
+    runner.answer_menu.assert_not_called()
+    runner.cancel_menu.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_multi_select_other_freetext_uses_text_path(monkeypatch):
+    """#418: free text from ✏️ Other in a multiSelect question still goes through
+    the single free-text path (Other yields one typed string, not options)."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(418_0002)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_multi_question())
+    runner.answer_menu = AsyncMock()
+    runner.answer_menu_multi = AsyncMock()
+    runner.answer_menu_text = AsyncMock()
+    runner.cancel_menu = AsyncMock()
+
+    async def _click_soon():
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["something custom"])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _multi_question(), runner), timeout=3.0),
+        _click_soon(),
+    )
+    runner.answer_menu_text.assert_awaited_once_with(3, "something custom")
+    runner.answer_menu_multi.assert_not_called()

@@ -134,14 +134,18 @@ async def bridge_pane_ask(
         await runner.cancel_menu()
         return
 
-    label = selected[0]
     labels = [opt.label for opt in question.options]
-    if label in labels:
-        await runner.answer_menu(labels.index(label))
+    indices = [labels.index(s) for s in selected if s in labels]
+    if question.multi_select and indices:
+        # multiSelect: toggle every chosen option and Submit (#418).  Using
+        # answer_menu (single-select) here dropped all but selected[0].
+        await runner.answer_menu_multi(indices, len(question.options))
+    elif selected[0] in labels:
+        await runner.answer_menu(labels.index(selected[0]))
     else:
         # Free text from the "Other" modal → use the "Type something." option,
         # which the TUI numbers immediately after the real options.
-        await runner.answer_menu_text(len(question.options), label)
+        await runner.answer_menu_text(len(question.options), selected[0])
 
 
 async def collect_ask_answers(
