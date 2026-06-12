@@ -485,6 +485,18 @@ _GENERATION_STATUS_RE = re.compile(r"^(?!❯)[\u2700-\u27BF*·] .+$")
 # Additional explicit markers.
 _GENERATION_STATUS_MARKERS = ("Tip:", "·")
 
+# #365 (follow-up): the live working spinner shows a "(<elapsed> · …)" timer that
+# only exists while Claude is actively generating/executing, e.g.
+#   ✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)
+# While a tool runs, its result preview + the input box + footer push that timer
+# line 10-20 lines off the bottom, so a bottom-6-only scan misses it and the turn
+# is finalized early (premature mention before the real answer). We scan the
+# timer across a WIDE bottom window — the same heuristic the #190 lamp detector
+# (`thread_state_sync._pane_lamp_state`) already uses. Matching the timer (not the
+# bare glyph) avoids false-positives on stale completed spinners in scrollback.
+_RUNNING_PROBE_LINES = 30
+_RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
+
 # Markers that indicate Claude has actually started producing output:
 #   ● — assistant response paragraph
 #   ⎿ — tool result
@@ -1514,6 +1526,17 @@ class TmuxClaudeRunner:
         the ellipsis off the end and the turn was wrongly finalized early (#179).
         """
         lines = text.rstrip().splitlines()
+        # #365 follow-up: scan the live-spinner "(Ns ·" timer across a WIDE bottom
+        # window. While a tool runs, its result preview + input box + footer push
+        # the timer line 10-20 lines off the bottom; a bottom-6-only scan misses
+        # it and the turn is finalized early. The timer only exists while actively
+        # working, so a wide scan does not false-positive on idle panes.
+        for line in lines[-_RUNNING_PROBE_LINES:]:
+            if _RUNNING_SPINNER_RE.search(line):
+                return True
+        # Fallback: an ellipsis-bearing status glyph in the bottom few lines —
+        # catches a spinner that has no timer line yet (just "✻ Running…"). Kept
+        # narrow so a stale in-progress spinner up in scrollback is not matched.
         for line in lines[-6:]:
             stripped = line.strip()
             if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:
