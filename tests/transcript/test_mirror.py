@@ -1118,3 +1118,53 @@ async def test_mirror_commits_uuid_of_suppressed_text_when_turn_ends(tmp_path: P
 
     assert replied == []  # nothing re-posted
     assert "uuid-399-suppressed" in cursor
+
+
+async def test_mirror_commits_suppressed_uuid_without_turn_end_marker(tmp_path: Path) -> None:
+    """#399 hardening: when the suppressed text is the last event and NO
+    turn-end marker ever arrives (current CLI builds often emit none), the
+    uuid must still be committed — otherwise a bot restart re-posts the
+    already-delivered context via #215 recovery."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    cursor: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def cursor_sink(uuid: str) -> None:
+        cursor.append(uuid)
+
+    bridged_context.clear()
+    bridged_context.register(99401, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99401,
+        project_dir=project,
+        sink=sink,
+        reply_cursor_sink=cursor_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.2,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        event = _assistant_text(flushed_md)
+        event["uuid"] = "uuid-399-idle-suppressed"
+        _write_event(jsonl, event)
+        # NO turn_end marker — only the idle window passes. The uuid must be
+        # committed while the mirror is still RUNNING (a hard-killed bot never
+        # reaches the graceful-stop commit).
+        await asyncio.sleep(0.6)
+        assert "uuid-399-idle-suppressed" in cursor
+    finally:
+        await mirror.stop()
+        bridged_context.clear()

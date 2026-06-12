@@ -43,6 +43,12 @@ _TTL_SECONDS = 86_400.0
 _MAX_PER_THREAD = 8
 # SequenceMatcher acceptance threshold for the fuzzy fallback.
 _MATCH_RATIO = 0.9
+# Containment counts only between comparably-sized texts. Without this cap, a
+# long final reply that merely QUOTES the registered context would be
+# suppressed wholesale — the worst possible failure (a real message silently
+# lost). 1.5x still covers the intended case: a watchdog-truncated pane
+# registration matching its slightly longer flushed twin.
+_CONTAINMENT_MAX_RATIO = 1.5
 
 
 def _normalize(text: str) -> str:
@@ -52,7 +58,8 @@ def _normalize(text: str) -> str:
 def _matches(a: str, b: str) -> bool:
     if a == b:
         return True
-    if a in b or b in a:
+    shorter, longer = sorted((a, b), key=len)
+    if shorter in longer and len(longer) <= len(shorter) * _CONTAINMENT_MAX_RATIO:
         return True
     return difflib.SequenceMatcher(None, a, b).ratio() >= _MATCH_RATIO
 

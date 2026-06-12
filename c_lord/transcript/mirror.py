@@ -462,6 +462,10 @@ class TranscriptMirror:
                                 "TranscriptMirror: suppressed pane-bridged ask context thread=%d",
                                 self.thread_id,
                             )
+                            # Commit immediately: the text IS delivered, and a
+                            # turn-end marker may never arrive — without this a
+                            # hard-killed bot would re-post it on restart (#215).
+                            await _commit_cursor()
                             continue
                         # Another text while one is pending → previous was intermediate.
                         if _pending_text is not None:

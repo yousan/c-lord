@@ -77,3 +77,33 @@ def test_expired_entry_does_not_match(monkeypatch) -> None:
     reg.register(399, _pane_context())
     now[0] += mod._TTL_SECONDS + 1
     assert reg.consume_match(399, _flushed_markdown()) is False
+
+
+def test_long_reply_quoting_context_is_not_suppressed() -> None:
+    """A FINAL reply that merely QUOTES the registered context must not be
+    suppressed — containment only counts when the two texts are comparable in
+    size (the flushed twin), never when the context is a snippet of a much
+    longer, genuinely new message."""
+    reg = BridgedContextRegistry()
+    ctx = "私の推しは (A) です。理由は通常時のオーバーヘッドがほぼゼロだからです。"
+    reg.register(399, ctx)
+    long_reply = (
+        "実装が完了しました。設計の経緯を振り返ると、"
+        + ctx
+        + " その方針に沿って楽観ロックを repository 層に実装し、テストも追加しました。"
+        + "詳細は PR を参照してください。" * 10
+    )
+    assert reg.consume_match(399, long_reply) is False
+    # The comparable-size flushed twin still matches afterwards.
+    assert reg.consume_match(399, ctx) is True
+
+
+def test_truncated_registration_still_matches_comparable_flush() -> None:
+    """Watchdog captures are capped (120 lines): the registered pane text can
+    be a large suffix of the flushed text. Containment at comparable size
+    (<=1.5x) must still match."""
+    reg = BridgedContextRegistry()
+    full = "判断ポイントは三つあります。" * 12
+    suffix = full[len(full) // 4 :]  # registered = trailing 3/4 of the flush
+    reg.register(399, suffix)
+    assert reg.consume_match(399, full) is True
