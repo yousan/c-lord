@@ -462,7 +462,7 @@ c_lord/
   cogs/
     claude_chat.py         # Chat interativo (criação de threads, manipulação de mensagens)
     skill_command.py       # Comando slash /skill com autocomplete
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /clord-status, /sync-sessions
     scheduler.py           # Executor de tarefas periódicas do Claude Code
     webhook_trigger.py     # Webhook → tarefa do Claude Code (CI/CD)
     auto_upgrade.py        # Webhook → atualização de pacote + reinício com drenagem

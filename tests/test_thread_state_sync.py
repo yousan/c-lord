@@ -996,3 +996,75 @@ async def test_watchdog_ignores_pane_without_menu():
         await loop._maybe_bridge_open_menu(115, "sess", "w1", "❯ \n-- INSERT --")
         await asyncio.sleep(0)
     bridge.assert_not_awaited()
+
+
+# -- #420: stranded menu when no manager resolves -----------------------------
+# A channel without a /clord-init binding resolves no TmuxSessionManager
+# (resolve_tmux_manager → None) and bot.tmux_manager is unwired (main.py never
+# passes one), so the watchdog used to log "no tmux manager" and give up every
+# tick — the open menu never reached Discord and the tmux→Discord mirror "cut
+# off". But the sweep ALREADY knows the session_name the window lives in (it
+# captured the pane from it), so the bridge must still happen.
+
+
+@pytest.mark.asyncio
+async def test_watchdog_bridges_using_swept_session_when_no_manager_resolves():
+    """#420: resolve_tmux_manager=None AND bot.tmux_manager=None must NOT strand
+    the menu — the watchdog builds a manager from the swept session_name and
+    bridges. RED before the fix: it logged 'no tmux manager' and never bridged."""
+    from c_lord.cogs.channel_repo import ChannelRepoCog
+    from c_lord.tmux import TmuxSessionManager
+
+    bot = MagicMock()
+    bot.tmux_manager = None  # global default not wired (main.py:226)
+    bot.ask_repo = None
+    # Parent channel has no /clord-init binding → resolve returns None.
+    cog = MagicMock(spec=ChannelRepoCog)
+    cog.resolve_tmux_manager = AsyncMock(return_value=None)
+    bot.get_cog.return_value = cog
+    thread = MagicMock(spec=thread_state_sync.discord.Thread)
+    thread.parent_id = 999
+    bot.get_channel.return_value = thread
+
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60)
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(222, "clord", "w94", pane)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(222)
+        assert task is not None, "menu was stranded — watchdog gave up instead of bridging"
+        await task
+
+    bridge.assert_awaited_once()
+    # The runner must target the session the sweep located, not a re-resolved one.
+    assert bridge.await_args is not None
+    runner = bridge.await_args.args[2]
+    assert isinstance(runner._tmux, TmuxSessionManager)
+    assert runner._tmux.session_name == "clord"
+
+
+@pytest.mark.asyncio
+async def test_watchdog_still_gives_up_when_session_name_empty():
+    """The empty-session_name guard stays: with nothing to target, the watchdog
+    must not fabricate a default session — it logs and returns (safety preserved)."""
+    bot = MagicMock()
+    bot.tmux_manager = None
+    bot.ask_repo = None
+    bot.get_cog.return_value = None
+    thread = MagicMock(spec=thread_state_sync.discord.Thread)
+    thread.parent_id = 999
+    bot.get_channel.return_value = thread
+
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60)
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(223, "", "w94", pane)
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()
+    assert 223 not in loop._ask_bridges

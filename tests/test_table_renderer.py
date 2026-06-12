@@ -11,6 +11,7 @@ from c_lord.discord_ui.table_renderer import (
     _display_width,
     _first_existing,
     _segment_runs,
+    _strip_inline_markdown,
     _wrap_cell,
     detect_tables,
     has_tables,
@@ -226,6 +227,74 @@ class TestSegmentRuns:
     def test_reassembles_to_original(self) -> None:
         text = "状態 🟢 OK / 🔴 NG ✅"
         assert "".join(s for s, _ in _segment_runs(text)) == text
+
+
+# ===========================================================================
+# _strip_inline_markdown
+# ===========================================================================
+
+
+class TestStripInlineMarkdown:
+    """Inline markdown is rendered into a PNG, so it cannot be made interactive.
+
+    The renderer must collapse it to the plain text a reader cares about instead
+    of leaking the raw syntax into the image (#415).
+    """
+
+    def test_empty_unchanged(self) -> None:
+        assert _strip_inline_markdown("") == ""
+
+    def test_plain_text_unchanged(self) -> None:
+        assert _strip_inline_markdown("plain text 123") == "plain text 123"
+
+    def test_strips_bold(self) -> None:
+        assert _strip_inline_markdown("**クローズ 6件**") == "クローズ 6件"
+
+    def test_strips_italic(self) -> None:
+        assert _strip_inline_markdown("*italic*") == "italic"
+
+    def test_strips_bold_italic(self) -> None:
+        assert _strip_inline_markdown("***both***") == "both"
+
+    def test_strips_strikethrough(self) -> None:
+        assert _strip_inline_markdown("~~old~~") == "old"
+
+    def test_strips_inline_code(self) -> None:
+        assert _strip_inline_markdown("`/clear`") == "/clear"
+
+    def test_link_collapses_to_label(self) -> None:
+        # The URL is unclickable inside an image, so only the label is kept.
+        url = "https://github.com/yousan/c-lord/issues/61"
+        assert _strip_inline_markdown(f"[#61]({url})") == "#61"
+
+    def test_image_collapses_to_alt(self) -> None:
+        assert _strip_inline_markdown("![alt](https://x/y.png)") == "alt"
+
+    def test_link_with_trailing_text(self) -> None:
+        url = "https://github.com/yousan/c-lord/issues/61"
+        assert _strip_inline_markdown(f"[#61]({url})(not planned)") == "#61(not planned)"
+
+    def test_code_preserves_underscores(self) -> None:
+        # Identifiers inside code spans must survive intact.
+        assert _strip_inline_markdown("`_is_allowed`") == "_is_allowed"
+
+    def test_underscore_emphasis_left_untouched(self) -> None:
+        # Intra-word underscores are identifiers, not emphasis (GFM agrees).
+        assert _strip_inline_markdown("foo_bar_baz") == "foo_bar_baz"
+        assert _strip_inline_markdown("__init__") == "__init__"
+
+    def test_multiple_constructs_in_one_cell(self) -> None:
+        url = "https://github.com/yousan/c-lord/issues/405"
+        text = f"[#405]({url}) — `/clear`・`!clear` の `_is_allowed` 欠如 (#56由来)"
+        expected = "#405 — /clear・!clear の _is_allowed 欠如 (#56由来)"
+        assert _strip_inline_markdown(text) == expected
+
+    def test_mixed_bold_link_code(self) -> None:
+        assert _strip_inline_markdown("**a** and [b](http://u) and `c`") == "a and b and c"
+
+    def test_hash_reference_unchanged(self) -> None:
+        # `#61` is an issue ref, not a heading — must not be touched.
+        assert _strip_inline_markdown("#61(not planned)") == "#61(not planned)"
 
 
 # ===========================================================================

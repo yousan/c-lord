@@ -41,6 +41,16 @@ _LEGACY_WINDOW_PREFIX = "work"
 # compacts them back from ``base-index``. Far above any realistic window count.
 _SORT_TMP_BASE = 9000
 
+# #403: bot sessions are pinned to ``window-size manual`` so the human's SSH
+# terminal changing size does not — via the tmux default ``window-size latest``
+# — resize every window and SIGWINCH-storm each idle Claude TUI into redrawing
+# its bottom status line. That redraw is frequently incomplete for an inactive
+# pane, leaving the status block ghosted/duplicated until a full redraw (a
+# manual resize / Ctrl-L). New windows are fitted to the attached client (or
+# this default when none is attached) at creation, so they still look right and
+# then stay fixed. Chosen large enough for a usable Claude TUI.
+DEFAULT_MANAGED_WINDOW_SIZE = (160, 40)
+
 # Effort levels the ``claude --effort`` flag accepts (commander-validated; it
 # hard-errors on anything else).  ``ultracode``/``auto`` are real effort levels
 # but only settable via ``CLAUDE_CODE_EFFORT_LEVEL`` or the ``/effort`` command,
@@ -165,6 +175,68 @@ class TmuxSessionManager:
 
     # ── Helpers ────────────────────────────────────────────────────────
 
+    def _ensure_window_size_manual(self) -> None:
+        """Pin the session to ``window-size manual`` (#403).
+
+        Under the tmux default ``latest``, the human's terminal changing size
+        resizes every window and ghosts each idle Claude TUI's status line.
+        ``manual`` makes the windows immune to client-size changes. Idempotent.
+        """
+        if not self._check_available():
+            return
+        _run(["tmux", "set-option", "-t", self.session_name, "window-size", "manual"])
+
+    def _current_client_size(self) -> tuple[int, int] | None:
+        """Return ``(width, height)`` of an attached client, or ``None``.
+
+        ``None`` when no client is attached or tmux is unavailable.
+        """
+        if not self._check_available():
+            return None
+        result = _run(
+            [
+                "tmux",
+                "list-clients",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{client_width} #{client_height}",
+            ]
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    return int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+        return None
+
+    def _fit_window_to_client(self, window_name: str) -> None:
+        """Size a (manual) window to the attached client, or a default (#403).
+
+        Called right after a window is created — while it is empty, so the
+        resize cannot ghost a running TUI — so the window looks right when first
+        viewed and then stays fixed (immune to later terminal-size changes).
+        """
+        if not self._check_available():
+            return
+        width, height = self._current_client_size() or DEFAULT_MANAGED_WINDOW_SIZE
+        _run(
+            [
+                "tmux",
+                "resize-window",
+                "-t",
+                f"{self.session_name}:{window_name}",
+                "-x",
+                str(width),
+                "-y",
+                str(height),
+            ]
+        )
+
     def _ensure_session(self) -> bool:
         """Ensure the global ``clord`` tmux session exists.
 
@@ -173,6 +245,7 @@ class TmuxSessionManager:
         """
         result = _run(["tmux", "has-session", "-t", self.session_name])
         if result.returncode == 0:
+            self._ensure_window_size_manual()  # #403
             return True
 
         # Create with a temporary first window that will be replaced
@@ -194,6 +267,7 @@ class TmuxSessionManager:
             return False
 
         logger.info("Created global tmux session: %s", self.session_name)
+        self._ensure_window_size_manual()  # #403
         return True
 
     def _find_window_for_thread(self, thread_id: int) -> str | None:
@@ -218,8 +292,10 @@ class TmuxSessionManager:
             )
             if result.returncode == 0 and result.stdout.strip() == str(thread_id):
                 return cached
-            # Stale cache entry
-            del self._thread_to_window[thread_id]
+            # Stale cache entry. Use pop(): capture_pane runs in a thread executor
+            # and is called many times per turn, so a concurrent call may have
+            # already evicted this key — a bare ``del`` raised KeyError (#410).
+            self._thread_to_window.pop(thread_id, None)
 
         # Fallback: scan all windows
         self._rebuild_mapping()
@@ -536,6 +612,10 @@ class TmuxSessionManager:
                 ]
             )
 
+            # Fit the new (manual-sized) window to the attached client while it
+            # is still empty, so it looks right and then stays fixed (#403).
+            self._fit_window_to_client(window_name)
+
             self._thread_to_window[thread_id] = window_name
             self._save_mapping()
             # Keep the session ordered by window number (#374). The new window
@@ -701,10 +781,12 @@ class TmuxSessionManager:
             ]
         )
 
-        # Update cache: remove any old thread→window mapping for this window
+        # Update cache: remove any old thread→window mapping for this window.
+        # pop() (not del) for the same reason as #410 — a concurrent capture_pane
+        # call may have evicted one of these keys between the comprehension and here.
         old_threads = [tid for tid, wname in self._thread_to_window.items() if wname == window_name]
         for tid in old_threads:
-            del self._thread_to_window[tid]
+            self._thread_to_window.pop(tid, None)
         self._thread_to_window[thread_id] = window_name
 
         logger.info("Remapped window %s → thread %d", window_name, thread_id)

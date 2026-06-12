@@ -78,8 +78,15 @@ C案 — いったん保留
   legend in the embed body (Discord buttons cannot show descriptions) (#169).
 - **≥ 5 options, or multi-select** → a Discord **select menu**, which shows
   each option's description in its dropdown; no body legend is added.
+- **multi-select** additionally gets an explicit **`✅ 確定` (confirm) button**
+  (#418): the select only *records* the choice, the button *submits* it. Without
+  it the only way to submit was Discord's dismiss-the-dropdown gesture, which is
+  undiscoverable — users reported "no way to confirm after picking". Single-select
+  keeps immediate delivery (one pick = done, no confirm button).
 
 ## How a click is answered
+
+(Single-select. For multi-select see the next section.)
 
 The menu is still open in the pane and the cursor starts on the first option.
 On a button click c-lord computes the chosen option's 0-based index and calls
@@ -97,6 +104,27 @@ verified with the bot's actual `answer_menu` selecting the intended option.
 
 While the bridge waits for the click, the runner is suspended at its `yield`,
 so the pane is not re-polled and the menu is not re-detected (natural dedup).
+
+## How a multi-select is answered (#418)
+
+`answer_menu(index)` is single-select only — it sends `Down×index + Enter`, so a
+multi-select click used to deliver only `selected[0]` and drop every other pick.
+A multi-select question is now answered with `TmuxClaudeRunner.answer_menu_multi`,
+which mirrors the native TUI's keyboard model (verified on a live Claude Code TUI):
+
+```
+for each chosen option (ascending):
+    Down (×offset)   then   Space      # Space toggles the checkbox  [ ] ⇄ [✔]
+Down (× to reach the "Submit" row at option_count + 1)   then   Enter   # → review screen
+Enter                                  # confirm "Submit answers" (cursor defaults to it)
+```
+
+The `Submit` row sits one past the `Type something` meta-row (`option_count + 1`).
+Reaching it + `Enter` opens the "Submit answers" review screen, whose cursor
+defaults to submit, so a final `Enter` records **every** toggled value. Keys are
+spaced by `_MENU_NAV_DELAY` (#171). Free text from `✏️ Other` in a multi-select
+question still goes through the single free-text path below (Other yields one
+typed string, not toggled options).
 
 ## How free text (`✏️ Other`) is answered (#172)
 
@@ -149,5 +177,6 @@ needed.
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
 | Show buttons / route answer | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
-| Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_text` |
+| Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
+| Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |

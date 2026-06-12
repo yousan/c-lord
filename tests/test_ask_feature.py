@@ -8,6 +8,8 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from c_lord.claude.types import AskOption, AskQuestion, ToolCategory, _parse_ask_questions
@@ -276,3 +278,97 @@ class TestAskViewOtherGating:
             allow_other=False,
         )
         assert self._other_button_ids(q) == []
+
+
+class TestAskViewMultiSelectConfirm:
+    """#418: a multiSelect question needs an explicit ✅ confirm button — the
+    Select records the choice, the button submits it (single-select stays
+    immediate, with no confirm button)."""
+
+    @staticmethod
+    def _confirm_button_ids(q: AskQuestion) -> list[str]:
+        from c_lord.discord_ui.ask_view import AskView
+
+        view = AskView(q, thread_id=123, q_idx=0)
+        return [
+            cid
+            for c in view.children
+            if (cid := getattr(c, "custom_id", "")) and cid.endswith("_confirm")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_confirm_button_present_for_multi_select(self) -> None:
+        q = AskQuestion(
+            question="pick many",
+            options=[AskOption(label="A"), AskOption(label="B"), AskOption(label="C")],
+            multi_select=True,
+        )
+        assert self._confirm_button_ids(q), "multiSelect must expose a ✅ confirm button"
+
+    @pytest.mark.asyncio
+    async def test_no_confirm_button_for_single_select(self) -> None:
+        q = AskQuestion(
+            question="pick one",
+            options=[AskOption(label="A"), AskOption(label="B")],
+        )
+        assert q.multi_select is False
+        assert self._confirm_button_ids(q) == []
+
+    @pytest.mark.asyncio
+    async def test_select_records_only_confirm_delivers_all(self) -> None:
+        """Selecting in the dropdown records (does NOT deliver); pressing ✅
+        confirm delivers every recorded value to the bus."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from c_lord.discord_ui.ask_bus import ask_bus
+        from c_lord.discord_ui.ask_view import AskView
+
+        tid = 418_0010
+        q = AskQuestion(
+            question="pick",
+            options=[AskOption(label="A"), AskOption(label="B"), AskOption(label="C")],
+            multi_select=True,
+        )
+        view = AskView(q, thread_id=tid, q_idx=0)
+        queue = ask_bus.register(tid)
+        try:
+            # 1) Select fires — must record only, not deliver.
+            sel = MagicMock()
+            sel.data = {"values": ["A", "C"]}
+            sel.response.edit_message = AsyncMock()
+            await view._multi_select_record(sel)
+            assert queue.empty(), "selection must not deliver before confirm"
+
+            # 2) Confirm button delivers all recorded values.
+            conf = MagicMock()
+            conf.response.edit_message = AsyncMock()
+            await view._confirm_callback(conf)
+            delivered = await asyncio.wait_for(queue.get(), timeout=1.0)
+            assert delivered == ["A", "C"]
+        finally:
+            ask_bus.unregister(tid)
+
+    @pytest.mark.asyncio
+    async def test_confirm_without_selection_errors_and_does_not_deliver(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from c_lord.discord_ui.ask_bus import ask_bus
+        from c_lord.discord_ui.ask_view import AskView
+
+        tid = 418_0011
+        q = AskQuestion(
+            question="pick",
+            options=[AskOption(label="A"), AskOption(label="B")],
+            multi_select=True,
+        )
+        view = AskView(q, thread_id=tid, q_idx=0)
+        queue = ask_bus.register(tid)
+        try:
+            conf = MagicMock()
+            conf.response.send_message = AsyncMock()
+            conf.response.edit_message = AsyncMock()
+            await view._confirm_callback(conf)
+            conf.response.send_message.assert_awaited()  # ephemeral "select first"
+            assert queue.empty()
+        finally:
+            ask_bus.unregister(tid)
