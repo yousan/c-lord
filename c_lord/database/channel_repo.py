@@ -22,6 +22,53 @@ CREATE TABLE IF NOT EXISTS channel_repo_bindings (
 """
 
 
+def normalize_repo_url(url: str) -> str:
+    """Normalize a (possibly derived) repository URL to a clonable ``owner/repo.git``.
+
+    Users frequently paste GitHub/GitLab/Bitbucket *derived* URLs (a PR, issue,
+    file blob, tree, etc.) instead of the repository URL itself. ``git clone``
+    cannot consume those. This shrinks any such URL back to the repository root
+    and appends ``.git`` so the result is directly clonable (#88).
+
+    Examples::
+
+        'https://github.com/owner/repo/pull/2'        → 'https://github.com/owner/repo.git'
+        'https://github.com/owner/repo/issues/5'      → 'https://github.com/owner/repo.git'
+        'https://github.com/owner/repo/blob/main/x.py' → 'https://github.com/owner/repo.git'
+        'https://github.com/owner/repo'               → 'https://github.com/owner/repo.git'
+        'https://github.com/owner/repo.git'           → 'https://github.com/owner/repo.git'
+        'git@github.com:owner/repo'                   → 'git@github.com:owner/repo.git'
+        'git@github.com:owner/repo.git'               → 'git@github.com:owner/repo.git'
+        'https://gitlab.com/owner/repo/-/merge_requests/3' → 'https://gitlab.com/owner/repo.git'
+
+    Non-HTTP(S) inputs that are not ``git@host:`` SSH URLs (e.g. local paths) are
+    returned unchanged apart from whitespace stripping, since their structure is
+    unknown. Empty input is returned unchanged.
+    """
+    url = url.strip()
+    if not url:
+        return url
+
+    # SSH shorthand: git@host:owner/repo[.git] — only ensure a .git suffix.
+    if url.startswith("git@") and ":" in url:
+        return url if url.endswith(".git") else f"{url}.git"
+
+    if url.startswith(("http://", "https://")):
+        scheme, rest = url.split("://", 1)
+        rest = rest.strip("/")
+        parts = rest.split("/")
+        # Need at least host/owner/repo to identify the repository root.
+        if len(parts) < 3:
+            return url
+        host, owner, repo = parts[0], parts[1], parts[2]
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return f"{scheme}://{host}/{owner}/{repo}.git"
+
+    # Unknown form (local path, etc.) — leave as-is.
+    return url
+
+
 def derive_session_name(source_repo: str) -> str:
     """Derive a tmux session name from a repository URL or path.
 

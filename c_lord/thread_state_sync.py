@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import re
 import subprocess
@@ -44,6 +45,16 @@ if TYPE_CHECKING:
     from .database.repository import SessionRepository
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock format used to persist the rename backoff deadline (#281). Matches
+# the DB's datetime('now','localtime') text so values are directly comparable.
+_BACKOFF_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _now() -> datetime.datetime:
+    """Current local wall-clock time. Indirected for deterministic testing."""
+    return datetime.datetime.now()
+
 
 # Format: <session_name>|<window_id>|<window_index>|<@thread_id>|<window_name>
 _LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_id}|#{window_name}"
@@ -351,6 +362,23 @@ class ThreadStateSyncLoop:
         if (channel.name or "") == new_name:
             return
 
+        # Persisted (cross-restart) rate-limit backoff (#281): the in-memory
+        # _rename_backoff resets on restart, so honour the DB-persisted deadline
+        # too. A fresh process forgets it just renamed this channel and would
+        # re-PATCH within Discord's ~10-min window (429); the persisted wall-clock
+        # deadline survives the restart.
+        persisted = getattr(record, "rename_backoff_until", None)
+        if persisted:
+            with contextlib.suppress(ValueError, TypeError):
+                deadline = datetime.datetime.strptime(persisted, _BACKOFF_TS_FORMAT)
+                if _now() < deadline:
+                    logger.debug(
+                        "state-sync: rename skipped thread %d (persisted backoff until %s)",
+                        thread_id,
+                        persisted,
+                    )
+                    return
+
         # Per-thread rate-limit backoff: skip rename if still within back-off window.
         now = asyncio.get_event_loop().time()
         backoff_until = self._rename_backoff.get(thread_id, 0.0)
@@ -371,6 +399,7 @@ class ThreadStateSyncLoop:
                 new_state,
             )
             self._rename_backoff.pop(thread_id, None)
+            await self._persist_backoff(thread_id, None)  # clear stale deadline (#281)
         except discord.HTTPException as exc:
             if exc.status == 429:
                 retry_after = float(
@@ -378,6 +407,7 @@ class ThreadStateSyncLoop:
                     or _DEFAULT_RENAME_BACKOFF_SECONDS
                 )
                 self._rename_backoff[thread_id] = asyncio.get_event_loop().time() + retry_after
+                await self._persist_backoff(thread_id, retry_after)  # survive restart (#281)
                 logger.warning(
                     "state-sync: rename rate-limited thread %d, backing off %.0fs",
                     thread_id,
@@ -391,9 +421,176 @@ class ThreadStateSyncLoop:
             self._rename_backoff[thread_id] = (
                 asyncio.get_event_loop().time() + _DEFAULT_RENAME_BACKOFF_SECONDS
             )
+            await self._persist_backoff(thread_id, _DEFAULT_RENAME_BACKOFF_SECONDS)  # (#281)
             logger.warning(
                 "state-sync: rename timed out for thread %d"
                 " (suspected rate-limit), backing off %.0fs",
                 thread_id,
                 _DEFAULT_RENAME_BACKOFF_SECONDS,
             )
+
+    async def _persist_backoff(self, thread_id: int, retry_after_seconds: float | None) -> None:
+        """Persist (or clear) the rename backoff deadline to the DB (#281).
+
+        ``retry_after_seconds`` None clears the deadline; otherwise the deadline
+        is ``_now() + retry_after_seconds`` as a wall-clock string. Best-effort:
+        a repo without ``set_rename_backoff_until`` (older consumers) is skipped.
+        """
+        setter = getattr(self._repo, "set_rename_backoff_until", None)
+        if setter is None:
+            return
+        deadline: str | None = None
+        if retry_after_seconds is not None:
+            deadline = (_now() + datetime.timedelta(seconds=retry_after_seconds)).strftime(
+                _BACKOFF_TS_FORMAT
+            )
+        with contextlib.suppress(Exception):
+            await setter(thread_id, deadline)
+
+
+class MenuWatchdogLoop:
+    """Always-on 60s sweep that bridges unresolved TUI menus to Discord (#359).
+
+    Independent of the thread-name lamp (which is off by default, #329): the
+    user's ability to see and answer AskUserQuestion/plan menus must not depend
+    on an opt-in cosmetic feature.  Iterates every tmux window that carries an
+    ``@thread_id`` — no DB dependency — so it also recovers menus opened before
+    the bot (re)started.
+    """
+
+    def __init__(
+        self,
+        bot: Bot,
+        *,
+        interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
+        is_processing: Callable[[int], bool] | None = None,
+    ) -> None:
+        self._bot = bot
+        self._interval = interval_seconds
+        self._is_processing: Callable[[int], bool] = is_processing or (lambda _tid: False)
+        self._task: asyncio.Task[None] | None = None
+        # Per-thread background bridge task — one at a time per thread.
+        self._ask_bridges: dict[int, asyncio.Task[None]] = {}
+
+    def start(self) -> None:
+        """Spawn the loop task. Idempotent."""
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._run(), name="menu_watchdog")
+        logger.info("Started menu watchdog loop (interval=%.0fs)", self._interval)
+
+    async def stop(self) -> None:
+        for t in self._ask_bridges.values():
+            t.cancel()
+        self._ask_bridges.clear()
+        if self._task is None:
+            return
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
+        self._task = None
+
+    async def _run(self) -> None:
+        await asyncio.sleep(min(5.0, self._interval))
+        while True:
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("menu watchdog tick raised")
+            await asyncio.sleep(self._interval)
+
+    async def tick(self) -> None:
+        """One sweep over every tmux window bound to a thread. Public for tests."""
+        windows = await asyncio.to_thread(_list_all_windows)
+        for w in windows:
+            tid = w.get("thread_id") or ""
+            if not tid.isdigit():
+                continue
+            session_name = w.get("session_name", "")
+            window_name = w.get("window_name", "")
+            pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
+            try:
+                await self._maybe_bridge_open_menu(int(tid), session_name, window_name, pane_text)
+            except Exception:
+                logger.exception("menu watchdog failed for thread=%s", tid)
+
+    async def _maybe_bridge_open_menu(
+        self, thread_id: int, session_name: str, window_name: str, pane_text: str
+    ) -> None:
+        """#359 menu watchdog: bridge an unresolved TUI menu no turn is watching.
+
+        A menu that renders after ``run_claude`` finalized (quiet tool run /
+        long thinking trips the stable fallback) has no live bridge: the
+        post-turn peek is one-shot and the transcript mirror cannot read the
+        ``tool_use`` line until the menu resolves. This sweep-time check is the
+        retrying backstop: every tick, an open AskUserQuestion/plan menu with no
+        active waiter gets bridged to Discord buttons. ``bridge_pane_ask``'s
+        pane watch (#369) ends the bridge when the menu resolves elsewhere, so
+        a TUI answer cannot strand the watchdog task.
+        """
+        # Cheap signature test on the small lamp capture before paying for a
+        # full capture + parse.
+        from .claude.tmux_runner import _ASK_SIGNATURE, _PLAN_SIGNATURE
+
+        if _ASK_SIGNATURE not in pane_text and _PLAN_SIGNATURE not in pane_text:
+            return
+        # A live turn's poll loop owns menus while it is processing (#166).
+        if self._is_processing(thread_id):
+            return
+        existing = self._ask_bridges.get(thread_id)
+        if existing is not None and not existing.done():
+            return
+        from .discord_ui.ask_bus import ask_bus
+
+        if ask_bus.is_active(thread_id):
+            return
+
+        from .claude.tmux_runner import (
+            TmuxClaudeRunner,
+            _normalize_capture,
+            _parse_ask_from_pane,
+            _parse_plan_from_pane,
+        )
+
+        full = await asyncio.to_thread(_capture_pane_text, session_name, window_name, 120)
+        norm = _normalize_capture(full)
+        question = _parse_ask_from_pane(norm) or _parse_plan_from_pane(norm)
+        if question is None:
+            return
+
+        channel = self._bot.get_channel(thread_id)
+        if channel is None:
+            with contextlib.suppress(Exception):
+                channel = await self._bot.fetch_channel(thread_id)
+        if not isinstance(channel, discord.Thread):
+            return
+
+        from .cogs.channel_repo import ChannelRepoCog
+
+        parent_id = getattr(channel, "parent_id", None) or thread_id
+        tmux_manager = None
+        channel_cog = self._bot.get_cog("ChannelRepoCog")
+        if isinstance(channel_cog, ChannelRepoCog):
+            tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
+        if tmux_manager is None:
+            tmux_manager = getattr(self._bot, "tmux_manager", None)
+        if tmux_manager is None:
+            logger.warning("menu watchdog: no tmux manager for thread=%d", thread_id)
+            return
+        runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
+
+        from .discord_ui.ask_handler import bridge_pane_ask
+
+        logger.info(
+            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r)",
+            thread_id,
+            question.header,
+        )
+        self._ask_bridges[thread_id] = asyncio.create_task(
+            bridge_pane_ask(
+                channel, question, runner, ask_repo=getattr(self._bot, "ask_repo", None)
+            ),
+            name=f"menu-watchdog-{thread_id}",
+        )

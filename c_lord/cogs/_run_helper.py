@@ -300,15 +300,22 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         if last_reply is not None:
             break
         await asyncio.sleep(_REPLY_WAIT_INTERVAL)
+    # #372: discord.py's Message.edit defaults suppress=False (NOT MISSING), so
+    # an edit that omits suppress explicitly *un*-suppresses embeds — which would
+    # re-enable the URL OGP card that reply_sink suppressed at send-time. Pass
+    # suppress explicitly so appending the context line preserves the setting.
+    from ..transcript.mirror import show_url_embeds_enabled
+
+    suppress_embeds = not show_url_embeds_enabled()
     if last_reply is not None:
         existing = last_reply.content or ""
         combined = f"{existing}\n{line}" if existing else line
         if len(combined) <= 2000:
             with contextlib.suppress(discord.HTTPException):
-                await last_reply.edit(content=combined)
+                await last_reply.edit(content=combined, suppress=suppress_embeds)
             return
     with contextlib.suppress(discord.HTTPException):
-        await config.thread.send(line)
+        await config.thread.send(line, suppress_embeds=suppress_embeds)
 
 
 async def run_claude_with_config(config: RunConfig) -> str | None:
@@ -371,7 +378,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # guards that gate the #67 notice below. (Gating it there left prod's jsonl
     # mode never recovering a post-turn menu, so the user saw no choices — #222.)
     pending_pane_ask = None
-    if not run_errored and not processor.pending_ask and isinstance(runner, TmuxClaudeRunner):
+    if (
+        not run_errored
+        and not processor.pending_ask
+        and isinstance(runner, TmuxClaudeRunner)
+        and not runner.stopped
+    ):
+        # ``runner.stopped`` guard (#315): a turn pre-empted by a follow-up message
+        # was deliberately torn down; re-bridging its leftover menu here would
+        # re-park the run on a fresh ``timeout=None`` await and the new turn could
+        # never start (observed on staging — the ⚡ fired but no new run began).
         pending_pane_ask = await runner.peek_pending_ask()
 
     if pending_pane_ask is not None:

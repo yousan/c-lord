@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -33,6 +34,8 @@ class _Rec:
     created_at: str = ""
     last_used_at: str = ""
     topic_source: str | None = None
+    # #281: persisted rename rate-limit deadline (wall-clock "YYYY-MM-DD HH:MM:SS")
+    rename_backoff_until: str | None = None
 
 
 def test_index_by_thread_id_keeps_only_digit_tids():
@@ -704,6 +707,132 @@ async def test_second_tick_renames_normally(monkeypatch):
         fake_thread.edit.assert_awaited_once()
 
 
+# ── #281: rename backoff persists across restarts ─────────────────────────────
+
+
+_FIXED_NOW = "2026-06-02 12:00:00"
+
+
+def _ts(offset_seconds: int) -> str:
+    """Return a wall-clock timestamp `offset_seconds` from _FIXED_NOW."""
+    import datetime as _dt
+
+    base = _dt.datetime.strptime(_FIXED_NOW, "%Y-%m-%d %H:%M:%S")
+    return (base + _dt.timedelta(seconds=offset_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def test_persisted_backoff_in_future_skips_rename(monkeypatch):
+    """#281: a FRESH loop (simulating a restart — _rename_backoff empty) must
+    still honour a backoff deadline persisted in the DB. Without persistence the
+    restart would forget the rate-limit window and re-PATCH within it (429)."""
+    import datetime as _dt
+
+    monkeypatch.setattr(
+        thread_state_sync,
+        "_now",
+        lambda: _dt.datetime.strptime(_FIXED_NOW, "%Y-%m-%d %H:%M:%S"),
+    )
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+    repo.set_rename_backoff_until = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    # In-memory backoff is empty (fresh process), but DB says "still backed off".
+    rec = _Rec(thread_id=1201, state="waiting", topic="persisted backoff", tmux_window_id="@1")
+    rec.rename_backoff_until = _ts(300)  # 5 min in the future
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    fake_thread.edit.assert_not_called()
+
+
+async def test_persisted_backoff_in_past_allows_rename(monkeypatch):
+    """#281: once the persisted deadline has passed, rename proceeds normally."""
+    import datetime as _dt
+
+    monkeypatch.setattr(
+        thread_state_sync,
+        "_now",
+        lambda: _dt.datetime.strptime(_FIXED_NOW, "%Y-%m-%d %H:%M:%S"),
+    )
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+    repo.set_rename_backoff_until = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(thread_id=1202, state="waiting", topic="expired backoff", tmux_window_id="@1")
+    rec.rename_backoff_until = _ts(-1)  # already expired
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    fake_thread.edit.assert_awaited_once()
+
+
+async def test_429_persists_backoff_to_db(monkeypatch):
+    """#281: a 429 must persist the backoff deadline to the DB (not just memory)
+    so a restart before the window elapses still honours it."""
+    import datetime as _dt
+
+    monkeypatch.setattr(
+        thread_state_sync,
+        "_now",
+        lambda: _dt.datetime.strptime(_FIXED_NOW, "%Y-%m-%d %H:%M:%S"),
+    )
+
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+    repo.set_rename_backoff_until = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock(side_effect=_FakeHTTPException(429, retry_after=300.0))
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(thread_id=1203, state="waiting", topic="429 persist")
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯\n"),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = _FakeHTTPException
+        await loop._sync_one(rec, by_tid={})
+
+    # Deadline persisted = now + retry_after (300s).
+    repo.set_rename_backoff_until.assert_awaited_once_with(1203, _ts(300))
+
+
 async def test_loop_start_is_idempotent():
     repo = MagicMock()
     bot = MagicMock()
@@ -717,3 +846,111 @@ async def test_loop_start_is_idempotent():
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__])
+
+
+# -- #359 menu watchdog -------------------------------------------------------
+# The 60s pane sweep must bridge an unresolved AskUserQuestion/plan menu that
+# no run_claude turn is watching (turn finalized early / mirror blind), so the
+# user gets Discord buttons within one tick instead of never.
+
+
+def _fixture(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).parent / "fixtures" / "panes" / name).read_text()
+
+
+def _make_loop(is_processing=lambda _tid: False):
+    bot = MagicMock()
+    bot.get_cog.return_value = None
+    bot.tmux_manager = MagicMock()
+    bot.ask_repo = None
+    thread = MagicMock(spec=thread_state_sync.discord.Thread)
+    bot.get_channel.return_value = thread
+    loop = thread_state_sync.MenuWatchdogLoop(
+        bot, interval_seconds=60, is_processing=is_processing
+    )
+    return loop, bot, thread
+
+
+@pytest.mark.asyncio
+async def test_watchdog_bridges_unwatched_menu():
+    """An open menu in the pane with no active turn gets bridged (RED for #359)."""
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(111, "sess", "w1", pane)
+        # the bridge runs as a background task — let it start
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(111)
+        assert task is not None
+        await task
+    bridge.assert_awaited_once()
+    q = bridge.await_args.args[1]
+    assert [o.label for o in q.options] == [
+        "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_while_turn_active():
+    """While a run_claude turn is processing, its poll loop owns menus."""
+    loop, bot, thread = _make_loop(is_processing=lambda _tid: True)
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(112, "sess", "w1", pane)
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()
+    assert 112 not in loop._ask_bridges
+
+
+@pytest.mark.asyncio
+async def test_watchdog_dedups_active_bridge_and_busy_bus():
+    """No double-bridge: pending watchdog task or an ask_bus waiter blocks re-entry."""
+    from c_lord.discord_ui.ask_bus import ask_bus
+
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    never = asyncio.get_event_loop().create_future()
+
+    async def _hang(*a, **k):
+        await never
+
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock(side_effect=_hang)) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(113, "sess", "w1", pane)
+        await asyncio.sleep(0)
+        await loop._maybe_bridge_open_menu(113, "sess", "w1", pane)  # pending task → skip
+        assert bridge.await_count <= 1
+        # separate thread: a foreign ask_bus waiter (e.g. live poll bridge) blocks too
+        ask_bus.register(114)
+        try:
+            await loop._maybe_bridge_open_menu(114, "sess", "w1", pane)
+            await asyncio.sleep(0)
+            assert 114 not in loop._ask_bridges
+        finally:
+            ask_bus.unregister(114)
+        never.set_result(None)
+        t = loop._ask_bridges.get(113)
+        if t is not None:
+            await t
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_pane_without_menu():
+    loop, bot, thread = _make_loop()
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯ \n-- INSERT --"),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(115, "sess", "w1", "❯ \n-- INSERT --")
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()

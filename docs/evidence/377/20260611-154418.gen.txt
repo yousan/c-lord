@@ -1,0 +1,24 @@
+===FUZZ===
+category: rtl-multilang-code-blocks
+intent: Test rendering of right-to-left and CJK text mixed with unterminated code blocks and emoji; bot should parse intent correctly and handle display without corruption or truncation
+---TEXT---
+مرحبا، هذا مثال على الكود:
+
+```python
+# 你好世界 - hello world
+def process_arabic(text: str) -> str:
+    """معالجة النصوص العربية"""
+    return text.strip()
+
+# Code block doesn't close properly
+
+Here's a follow-up in Japanese: 次のコードも見てください
+More with emoji: 🌍🌎🌏🔤📝✅
+
+Final note: これはテストです
+
+===FUZZ===
+category: combining-marks-long-line
+intent: Test handling of messages with extensive combining diacritical marks and extreme character encoding; bot should cleanly process and respond without rendering anomalies or output inflation
+---TEXT---
+T̶h̸i̵s̴ ̸i̴s̵ ̶a̴ ̸t̸e̴s̵t̴ ̶m̸e̴s̵s̶a̴g̸e̵ ̶w̴i̸t̵h̴ ̶l̸o̴t̵s̶ ̴o̸f̴ ̵c̶o̴m̸b̵i̶n̸i̴n̵g̴ ̶d̸i̴a̵c̶r̸i̴t̵i̶c̴s̵ ̶a̸d̴d̵e̶d̸ ̴t̶o̸ ̵e̶v̸e̴r̵y̶ ̸l̴e̵t̶t̴e̵r̶ ̸t̵o̴ ̶m̸a̵k̶e̸ ̸t̸h̴e̵ ̶t̸e̴x̵t̶ ̸l̴o̵o̶k̸ ̵c̶o̴r̵r̶u̸p̴t̵ ̶i̸n̴ ̵s̶o̸m̴e̵ ̶r̸e̴n̸d̴e̵r̶s̸.̴ ̸C̴a̵n̶ ̸y̴o̵u̶ ̸p̴r̵o̶c̸e̴s̵s̶ ̸t̶h̴i̵s̴ ̶c̸l̴e̵a̶n̸l̴y̵?̶

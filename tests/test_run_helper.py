@@ -269,6 +269,70 @@ class TestPostContextUsage:
         assert "1.0M" in new_content
         cfg.thread.send.assert_not_called()
 
+    def test_context_edit_preserves_embed_suppression_by_default(self, monkeypatch) -> None:
+        """#372: the context-line edit() must keep URL OGP cards suppressed.
+
+        discord.py's ``Message.edit`` defaults ``suppress=False`` (not MISSING),
+        so an edit that omits ``suppress`` explicitly *un*-suppresses embeds —
+        re-enabling the OGP card that reply_sink had suppressed at send-time.
+        ``_post_context_usage`` must pass ``suppress=True`` by default.
+        """
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+
+        last_msg = MagicMock()
+        last_msg.content = "see https://github.com/yousan/c-lord/issues"
+        last_msg.edit = AsyncMock()
+        reply_tracker.record_reply_message(12345, last_msg)
+
+        monkeypatch.setattr(
+            _run_helper, "read_latest_usage", lambda _p: ContextUsage(input_tokens=60_000)
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-suppress"))
+
+        last_msg.edit.assert_awaited_once()
+        assert last_msg.edit.await_args.kwargs.get("suppress") is True
+
+    def test_context_edit_respects_show_url_embeds_optin(self, monkeypatch) -> None:
+        """#372: CLORD_SHOW_URL_EMBEDS=true keeps embeds enabled on the edit too."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.skills import reply_tracker
+
+        monkeypatch.setenv("CLORD_SHOW_URL_EMBEDS", "true")
+        _run_helper._context_window_cache.clear()
+        reply_tracker.reset_tracker()
+
+        last_msg = MagicMock()
+        last_msg.content = "see https://github.com/yousan/c-lord/issues"
+        last_msg.edit = AsyncMock()
+        reply_tracker.record_reply_message(12345, last_msg)
+
+        monkeypatch.setattr(
+            _run_helper, "read_latest_usage", lambda _p: ContextUsage(input_tokens=60_000)
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
+
+        cfg = self._config(probe_total=1_000_000)
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-optin"))
+
+        last_msg.edit.assert_awaited_once()
+        assert last_msg.edit.await_args.kwargs.get("suppress") is False
+
     def test_waits_briefly_for_reply_sink_then_edits(self, monkeypatch) -> None:
         """In jsonl bridge mode the reply_sink races with the run-loop end.
 
@@ -860,6 +924,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -907,6 +972,7 @@ class TestRecoverMissedPaneAsk:
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -940,6 +1006,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
 
         async def gen_with_reply(*args, **kwargs):
             yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
@@ -960,6 +1027,47 @@ class TestRecoverMissedPaneAsk:
             await run_claude_in_thread(thread, runner, repo, "hello", None)
 
         bridge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stopped_run_does_not_rebridge_post_turn(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """A pre-empted (stopped) run must NOT re-bridge its leftover menu (#315).
+
+        When a follow-up message interrupts a turn parked on a menu, the run is
+        torn down (``runner.stopped`` is True).  Re-bridging here would re-park it
+        on a fresh ``timeout=None`` await, so the new turn could never start — the
+        exact failure observed on staging (the ⚡ fired but no new run began).
+        """
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = True  # deliberately pre-empted by a follow-up message
+        runner.run = self._make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
+            ]
+        )
+        runner.peek_pending_ask = AsyncMock(
+            return_value=AskQuestion(
+                question="Which environment?",
+                header="Deploy",
+                options=[AskOption(label="Production", description="本番")],
+            )
+        )
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_not_awaited()
+        runner.peek_pending_ask.assert_not_called()
 
 
 class TestMakeErrorEmbed:

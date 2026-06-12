@@ -115,6 +115,41 @@ _PERMISSION_PROMPT_MARKERS = (
     "Continue anyway?",
 )
 
+# Fatal Claude-CLI startup errors that appear in the tmux pane when the
+# ``claude`` process dies immediately instead of starting a session — e.g. a
+# broken install whose platform-native binary was never downloaded
+# (``Error: claude native binary not installed.``), or ``claude`` missing from
+# PATH (``command not found``).  When the pane shows one of these and no
+# response was ever produced, the runner surfaces it to Discord as an error
+# instead of silently reporting a normal completion (#366).  Matched
+# case-insensitively as substrings of a single pane line.
+_STARTUP_ERROR_MARKERS = (
+    "native binary not installed",
+    "command not found: claude",
+    "claude: command not found",
+)
+
+
+def _extract_startup_error(pane: str) -> str | None:
+    """Return a fatal Claude-CLI startup-error line found in *pane*, else None.
+
+    Used when the runner reaches completion without ever extracting a response:
+    the pane then typically shows the CLI's own error output (e.g.
+    ``Error: claude native binary not installed.``) above the shell prompt.
+    Returns the first line containing a known fatal signature (trimmed and
+    length-capped for a Discord embed), or None when no such signature is
+    present.  Gating callers on "no response yet" keeps this from matching a
+    marker phrase that merely appears inside Claude's own answer (#366).
+    """
+    if not pane:
+        return None
+    for line in pane.splitlines():
+        stripped = line.strip()
+        if any(marker in stripped.lower() for marker in _STARTUP_ERROR_MARKERS):
+            return stripped[:300]
+    return None
+
+
 # Regex matching [y/N] or [Y/n] inline yes/no prompts (Claude Code v2.1+).
 # These need "y" + Enter instead of just Enter (Enter selects the default, N).
 _YN_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]", re.IGNORECASE)
@@ -182,6 +217,24 @@ _ASK_META_LABELS = ("Type something.", "Chat about this")
 _ASK_HEADER_RE = re.compile(r"^\s*☐\s+(.+?)\s*$")
 # A numbered option line, with or without the leading ❯ cursor.
 _ASK_OPTION_RE = re.compile(r"^\s*❯?\s*\d+\.\s+(.+?)\s*$", re.MULTILINE)
+# #388: multiSelect menus render checkbox options ("❯ 1. [ ] ログ強化") under a
+# tab row ("←  ☐ 機能  ✔ Submit  →").  The checkbox prefix is stripped from
+# labels and its presence marks the question multi-select.
+_ASK_CHECKBOX_RE = re.compile(r"^\[[ xX✓]\]\s*")
+_ASK_TAB_HEADER_RE = re.compile(r"☐\s+(.+?)\s{2,}")
+# #388: preview-equipped menus draw a preview pane to the RIGHT of the option
+# list; any of these box-drawing characters on an option line marks where the
+# pane starts, and everything from that column on must be ignored.
+_ASK_PREVIEW_BOX_CHARS = ("┌", "│", "└", "╭", "╰", "┐", "┘")
+
+
+def _is_ask_meta_label(label: str) -> bool:
+    """True for TUI affordance rows that must not become Discord buttons.
+
+    "Type something." lost its trailing period in the multiSelect layout, and
+    that layout adds a "Submit" row (#388), so exact matching is not enough.
+    """
+    return label in ("Chat about this", "Submit") or label.startswith("Type something")
 
 
 def _is_ask_question(text: str) -> bool:
@@ -244,20 +297,50 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
             header = m.group(1).strip()
             header_idx = i
             break
+        # multiSelect tab row ("←  ☐ 機能  ✔ Submit  →") — the header sits
+        # inside the row instead of owning the whole line (#388).
+        if "☐" in lines[i]:
+            m2 = _ASK_TAB_HEADER_RE.search(lines[i])
+            if m2:
+                header = m2.group(1).strip()
+                header_idx = i
+                break
 
     # Bound the scan: from the header (or, if it scrolled off, a small window
     # above the menu end) down to the menu end — never the whole buffer.
     scan_from = header_idx + 1 if header_idx >= 0 else max(0, end_idx - 20)
 
+    # #388: preview-equipped menus draw a box to the RIGHT of the options.  The
+    # pane start column is the leftmost box-drawing character on any numbered
+    # option line; everything from that column on (on every menu line) is the
+    # preview pane, not menu content.
+    pane_col: int | None = None
+    for i in range(scan_from, end_idx + 1):
+        if _ASK_OPTION_RE.match(lines[i]):
+            cols = [lines[i].find(ch) for ch in _ASK_PREVIEW_BOX_CHARS if ch in lines[i]]
+            if cols:
+                c = min(cols)
+                pane_col = c if pane_col is None else min(pane_col, c)
+
+    def _menu_text(line: str) -> str:
+        return line[:pane_col] if pane_col is not None else line
+
     # Indices of every numbered line (including meta-options) within the menu —
     # used to bound the region from which each real option's description is read.
-    all_opt_indices = [i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(lines[i])]
+    all_opt_indices = [
+        i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(_menu_text(lines[i]))
+    ]
 
     options: list[AskOption] = []
     first_opt_idx: int | None = None
+    multi_select = False
     for pos, i in enumerate(all_opt_indices):
-        label = _ASK_OPTION_RE.match(lines[i]).group(1).strip()  # type: ignore[union-attr]
-        if label in _ASK_META_LABELS:
+        label = _ASK_OPTION_RE.match(_menu_text(lines[i])).group(1).strip()  # type: ignore[union-attr]
+        # multiSelect checkbox prefix ("[ ] ログ強化") → strip + flag (#388).
+        if _ASK_CHECKBOX_RE.match(label):
+            label = _ASK_CHECKBOX_RE.sub("", label, count=1).strip()
+            multi_select = True
+        if _is_ask_meta_label(label):
             continue
         if first_opt_idx is None:
             first_opt_idx = i
@@ -267,8 +350,8 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx + 1
         description = ""
         for j in range(i + 1, next_i):
-            s = lines[j].strip()
-            if not s or _SEPARATOR_RE.match(lines[j]):
+            s = _menu_text(lines[j]).strip()
+            if not s or _SEPARATOR_RE.match(_menu_text(lines[j])):
                 continue
             description = s
             break
@@ -282,12 +365,12 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     question = ""
     end = first_opt_idx if first_opt_idx is not None else end_idx
     for line in lines[scan_from:end]:
-        s = line.strip()
-        if not s or _SEPARATOR_RE.match(line):
+        s = _menu_text(line).strip()
+        if not s or _SEPARATOR_RE.match(_menu_text(line)):
             continue
         question = s
 
-    return AskQuestion(question=question, header=header, options=options)
+    return AskQuestion(question=question, header=header, options=options, multi_select=multi_select)
 
 
 # -- Plan approval (ExitPlanMode) TUI menu parsing (#251) ---------------------
@@ -402,6 +485,18 @@ _GENERATION_STATUS_RE = re.compile(r"^(?!❯)[\u2700-\u27BF*·] .+$")
 # Additional explicit markers.
 _GENERATION_STATUS_MARKERS = ("Tip:", "·")
 
+# #365 (follow-up): the live working spinner shows a "(<elapsed> · …)" timer that
+# only exists while Claude is actively generating/executing, e.g.
+#   ✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)
+# While a tool runs, its result preview + the input box + footer push that timer
+# line 10-20 lines off the bottom, so a bottom-6-only scan misses it and the turn
+# is finalized early (premature mention before the real answer). We scan the
+# timer across a WIDE bottom window — the same heuristic the #190 lamp detector
+# (`thread_state_sync._pane_lamp_state`) already uses. Matching the timer (not the
+# bare glyph) avoids false-positives on stale completed spinners in scrollback.
+_RUNNING_PROBE_LINES = 30
+_RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
+
 # Markers that indicate Claude has actually started producing output:
 #   ● — assistant response paragraph
 #   ⎿ — tool result
@@ -510,6 +605,7 @@ class TmuxClaudeRunner:
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
+        effort: str | None = None,
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
@@ -518,6 +614,7 @@ class TmuxClaudeRunner:
         self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
+        self._effort = effort
         # True only for the restart-resume path (on_ready → pending_resumes).
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
@@ -594,6 +691,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=True,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -623,6 +721,7 @@ class TmuxClaudeRunner:
                         permission_mode=self._permission_mode,
                         dangerously_skip_permissions=self._dangerously_skip_permissions,
                         try_continue=False,
+                        effort=self._effort,
                     )
                     if not ok:
                         yield StreamEvent(
@@ -643,6 +742,7 @@ class TmuxClaudeRunner:
                     permission_mode=self._permission_mode,
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=False,
+                    effort=self._effort,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -696,6 +796,31 @@ class TmuxClaudeRunner:
         # polling before the menu appears.
         last_raw = ""
         raw_static_seconds = 0.0
+        # Last normalised pane capture — initialised so the final-event error
+        # logic can scan it even if the poll loop body never ran (#366).
+        current = ""
+        # Fatal Claude-CLI startup error scraped from the pane (#366).  Set when
+        # the ``claude`` process dies immediately (e.g. native binary missing);
+        # surfaced as the RESULT error so Discord shows the cause instead of a
+        # silent "done".
+        startup_error: str | None = None
+
+        # #365: Gate completion on the NEW turn actually having started. When a
+        # follow-up message is delivered to an already-running Claude
+        # (``claude_running`` above), the pane still shows the PREVIOUS turn's
+        # (stable, non-empty) response with the input prompt visible until Claude
+        # picks up the prompt and starts generating — a gap of several seconds on
+        # a --resume / large-context turn. Without this gate the completion
+        # detector below reads that residual response as "done" and finalizes the
+        # turn early, firing the "Claude has finished — your reply is needed"
+        # owner mention BEFORE the real answer is produced (it arrives later via
+        # the transcript / discord-reply path). We only accept completion once
+        # either: a generation spinner was observed at least once this turn, OR
+        # the extracted response changed from the baseline captured at the start
+        # of polling. The baseline is empty on a fresh start, so the first real
+        # response trivially differs and cold starts are unaffected.
+        saw_generation = False
+        baseline_response: str | None = None
 
         # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
         # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
@@ -723,6 +848,24 @@ class TmuxClaudeRunner:
             # "1." — leaving the escapes in place makes the menu regexes (and the
             # AskUserQuestion parser) silently miss real menus (#166).
             current = _normalize_capture(raw_current)
+
+            # Fast-fail on a fatal Claude-CLI startup error (#366).  When the
+            # ``claude`` process dies immediately (e.g. native binary missing,
+            # command not found) the pane shows the CLI's error instead of a
+            # session and will never produce a response — don't wait out the idle
+            # timeout, break now so the final event surfaces the cause.  Gated on
+            # ``not last_response`` so it can only fire before any answer text
+            # exists, never mid-conversation (a marker phrase inside Claude's own
+            # answer must not abort a live turn).
+            if not last_response:
+                startup_error = _extract_startup_error(current)
+                if startup_error is not None:
+                    logger.warning(
+                        "Claude startup error detected, aborting poll (thread=%d): %s",
+                        self._thread_id,
+                        startup_error,
+                    )
+                    break
 
             # Auto-accept the folder-trust dialog ("Quick safety check…").  Every
             # thread runs in a freshly-cloned session dir with no trusted ancestor,
@@ -829,6 +972,11 @@ class TmuxClaudeRunner:
             response = self._extract_response(current)
             has_prompt = self._has_input_prompt(current)
 
+            # #365: snapshot the residual (previous-turn) response on the first
+            # poll so we can tell when the NEW turn produces output of its own.
+            if baseline_response is None:
+                baseline_response = response
+
             if elapsed % 10 < _POLL_INTERVAL:  # Log every ~10 seconds
                 logger.debug(
                     "poll: elapsed=%.0fs stable=%.1fs resp_len=%d has_prompt=%s (thread=%d)",
@@ -870,10 +1018,22 @@ class TmuxClaudeRunner:
             # (#179).  While the generation indicator is visible the turn stays
             # open; the inactivity ``timeout_seconds`` backstop still applies.
             is_gen = self._is_generating(current)
+            if is_gen:
+                saw_generation = True
+
+            # #365: only finalize once the new turn demonstrably started —
+            # either we saw it generate, or its output differs from the residual
+            # previous-turn response captured as the baseline. Otherwise a
+            # follow-up delivered to a still-loading Claude would finalize off
+            # the old answer and mention the owner prematurely.
+            new_turn_started = saw_generation or (
+                bool(last_response) and last_response != baseline_response
+            )
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
                 and not is_gen
+                and new_turn_started
                 and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
             ):
                 break
@@ -899,30 +1059,56 @@ class TmuxClaudeRunner:
                 )
                 break
 
-        # Yield final complete event.
+        # Yield final complete event.  ``error`` is computed first so the single
+        # yield below carries the right outcome (#366: a failed/empty run must
+        # surface an error, not a silent "done").
         if self._stopped:
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                error=None if self._silent_stop else "Stopped by user",
-            )
+            error = None if self._silent_stop else "Stopped by user"
         elif raw_static_seconds >= self.timeout_seconds:
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                error=f"Timed out after {self.timeout_seconds} seconds",
-            )
+            error = f"Timed out after {self.timeout_seconds} seconds"
+        elif not last_response:
+            # Reached completion (idle timeout or startup fast-fail) without ever
+            # extracting a response.  This is NOT a normal completion — decide
+            # whether to surface it (#366):
+            #   1. A fatal startup error is on the pane → report it verbatim.
+            #   2. No marker, but ``claude`` is no longer running → it exited
+            #      without answering (crash / unrecognised fatal error).
+            #   3. ``claude`` is still alive at its prompt → most likely it
+            #      answered via the discord-reply skill and we simply didn't
+            #      scrape the text; stay silent to avoid a false error embed.
+            pane_error = startup_error or _extract_startup_error(current)
+            if pane_error is not None:
+                error = f"Claude failed to start: {pane_error}"
+            elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+                error = (
+                    "Claude exited without producing a response "
+                    "(possible startup failure or crash) — check the tmux pane."
+                )
+            else:
+                error = None
         else:
             # Normal completion — emit RESULT only. The text is intentionally
             # dropped (#53): Claude posts its own final answer via the
             # discord-reply skill, not through the runner stream.
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.RESULT,
-                is_complete=True,
-            )
+            error = None
+
+        yield StreamEvent(
+            raw={},
+            message_type=MessageType.RESULT,
+            is_complete=True,
+            error=error,
+        )
+
+    @property
+    def stopped(self) -> bool:
+        """True once :meth:`interrupt` or :meth:`kill` has been called.
+
+        Lets callers (e.g. ``_run_helper``'s post-turn menu recovery) tell a turn
+        that was deliberately pre-empted from one that ended on its own, so a
+        pre-empted turn is not re-bridged into a fresh menu it would re-park on
+        (#315).
+        """
+        return self._stopped
 
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).
@@ -1351,6 +1537,17 @@ class TmuxClaudeRunner:
         the ellipsis off the end and the turn was wrongly finalized early (#179).
         """
         lines = text.rstrip().splitlines()
+        # #365 follow-up: scan the live-spinner "(Ns ·" timer across a WIDE bottom
+        # window. While a tool runs, its result preview + input box + footer push
+        # the timer line 10-20 lines off the bottom; a bottom-6-only scan misses
+        # it and the turn is finalized early. The timer only exists while actively
+        # working, so a wide scan does not false-positive on idle panes.
+        for line in lines[-_RUNNING_PROBE_LINES:]:
+            if _RUNNING_SPINNER_RE.search(line):
+                return True
+        # Fallback: an ellipsis-bearing status glyph in the bottom few lines —
+        # catches a spinner that has no timer line yet (just "✻ Running…"). Kept
+        # narrow so a stale in-progress spinner up in scrollback is not matched.
         for line in lines[-6:]:
             stripped = line.strip()
             if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:

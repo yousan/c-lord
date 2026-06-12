@@ -27,6 +27,7 @@ from ..thread_settings import (
     VALID_DURATIONS,
     resolve_auto_archive_duration,
 )
+from ..utils.logger import log_ctx
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
@@ -911,6 +912,36 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._screenshot_impl(channel=ctx.channel, respond=respond, ack=ack)
 
+    async def _stop_transcript_mirror(self, thread_id: int) -> None:
+        """Stop the TranscriptMirror tailing this thread, if any (#379).
+
+        Workspace teardown (close/delete) kills the tmux window; that can make
+        the Claude harness write a final ``<task-notification>`` user-row into
+        the JSONL transcript. If the mirror is still tailing, it posts that as a
+        ``👤`` echo *after* we archive the thread — and Discord auto-unarchives a
+        thread the moment any message lands in it, so the thread never closes
+        (#379). Stopping the mirror **before** the kill/archive breaks that loop.
+
+        No-op when ``CLORD_BRIDGE_MODE`` is not ``jsonl`` (the cog stays idle and
+        keeps no per-thread mirror) or when the cog is not registered at all, so
+        this is safe to call unconditionally (zero-config).
+        """
+        mirror_cog = self.bot.get_cog("TranscriptMirrorCog")
+        stop_for = getattr(mirror_cog, "stop_for", None)
+        if stop_for is None:
+            return
+        try:
+            logger.info(
+                "%s stopping transcript mirror (workspace teardown)", log_ctx(thread_id=thread_id)
+            )
+            await stop_for(thread_id)
+        except Exception:  # pragma: no cover - defensive; never block teardown
+            logger.warning(
+                "%s failed to stop transcript mirror during teardown",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
+
     async def _workspace_delete_impl(
         self, *, channel: object, respond: _Responder, ack: _Acknowledger
     ) -> None:
@@ -927,6 +958,10 @@ class SessionManageCog(commands.Cog):
         await ack()
 
         import asyncio
+
+        # Stop the mirror before tearing down so it doesn't keep tailing a JSONL
+        # whose session dir we're about to remove (and can't echo post-teardown) (#379).
+        await self._stop_transcript_mirror(thread_id)
 
         results: list[str] = []
 
@@ -987,6 +1022,13 @@ class SessionManageCog(commands.Cog):
         the conversation via ``--continue`` (#270) — that is the whole point of
         "close" vs "delete".  Note this never resolves the session-dir manager,
         so the directory-removal path is structurally unreachable here.
+
+        The thread is expected to **stay archived** after this runs.  To guarantee
+        that, the TranscriptMirror is stopped *before* the kill/archive
+        (:meth:`_stop_transcript_mirror`): otherwise the kill's own
+        ``<task-notification>`` would be echoed (👤) into the thread *after* we
+        archive it, and Discord auto-unarchives a thread on any new message — so
+        it would never close (#379).
         """
         if not isinstance(channel, discord.Thread):
             await respond(
@@ -1000,6 +1042,10 @@ class SessionManageCog(commands.Cog):
         await ack()
 
         import asyncio
+
+        # Stop the mirror BEFORE kill/archive so the kill's task-notification can't
+        # be echoed (👤) into the thread after we archive it and un-archive it (#379).
+        await self._stop_transcript_mirror(thread_id)
 
         results: list[str] = []
 
