@@ -484,7 +484,7 @@ c_lord/
   cogs/
     claude_chat.py         # 交互式聊天（线程创建，消息处理）
     skill_command.py       # /skill 斜杠命令，含自动补全
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /clord-status, /sync-sessions
     scheduler.py           # 定期 Claude Code 任务执行器
     webhook_trigger.py     # Webhook → Claude Code 任务（CI/CD）
     auto_upgrade.py        # Webhook → 包升级 + 感知排空重启

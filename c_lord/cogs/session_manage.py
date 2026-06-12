@@ -1,8 +1,9 @@
 """Session management Cog.
 
 Provides slash commands for viewing and managing Claude Code sessions:
-- /resume-info: Show CLI resume command for the current thread's session
-- /sessions: List all known sessions
+- /clord-status: Per-channel session status (size, attach, resume) — supersedes
+  the removed /sessions, /session-dirs, /resume-info (#363)
+- /session-cleanup, /tmux-list, /tmux-screenshot, /workspace-delete, ...
 """
 
 from __future__ import annotations
@@ -22,11 +23,14 @@ from ..database.settings_repo import SettingsRepository
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..session_dir import SessionDirManager
+from ..status_view import StatusRow, classify_status, render_status
 from ..thread_settings import (
     SETTING_THREAD_AUTO_ARCHIVE,
     VALID_DURATIONS,
     resolve_auto_archive_duration,
 )
+from ..tmux import parse_work_number
+from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -39,27 +43,6 @@ logger = logging.getLogger(__name__)
 # without duplicating the body (#209 follow-up).
 _Responder = Callable[..., Awaitable[None]]
 _Acknowledger = Callable[..., Awaitable[None]]
-
-_ORIGIN_ICON = {
-    "discord": "\U0001f4ac",  # 💬
-    "cli": "\U0001f5a5\ufe0f",  # 🖥️
-}
-
-
-def _is_tmux_session(session_id: str) -> bool:
-    """Check if a session ID represents a tmux-managed session."""
-    return session_id.startswith("tmux-")
-
-
-def _format_session_short(session_id: str, *, window_name: str | None = None) -> str:
-    """Format a session ID for display.
-
-    For tmux sessions: show window_name if available, otherwise 'tmux'.
-    For CLI sessions: show first 8 chars of the session ID.
-    """
-    if _is_tmux_session(session_id):
-        return window_name or "tmux"
-    return session_id[:8]
 
 
 # Model management
@@ -89,6 +72,48 @@ def _format_duration(minutes: int) -> str:
         4320: "3 days",
         10080: "7 days",
     }.get(minutes, f"{minutes} min")
+
+
+def _dir_size_bytes(path: str) -> int:
+    """Disk usage of ``path`` in bytes via ``du -sb`` (never shell=True).
+
+    Falls back to an ``os.walk`` sum if ``du`` is unavailable or errors. Runs in
+    a worker thread (see callers) so the event loop never blocks on the syscall.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["du", "-sb", "--", path],  # -- guards a path that could start with '-'
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return int(result.stdout.split("\t", 1)[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+    total = 0
+    import os
+
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(root, name)).st_size
+    return total
+
+
+def _short_repo(source_repo: str | None) -> str:
+    """``https://github.com/yousan/c-lord.git`` → ``yousan/c-lord``."""
+    if not source_repo:
+        return "-"
+    s = source_repo.rstrip("/")
+    if s.endswith(".git"):
+        s = s[:-4]
+    parts = [p for p in s.replace(":", "/").split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else s
 
 
 class SessionManageCog(commands.Cog):
@@ -383,146 +408,6 @@ class SessionManageCog(commands.Cog):
             return
         await self._archive_set_impl(duration=minutes, respond=respond)
 
-    async def _resume_info_impl(self, *, channel: object, respond: _Responder) -> None:
-        """Shared core for /resume-info and !resume-info (#209 follow-up)."""
-        if not isinstance(channel, discord.Thread):
-            await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
-
-        record = await self.repo.get(channel.id)
-        if not record:
-            await respond(
-                "No session found for this thread.",
-                ephemeral=True,
-            )
-            return
-
-        if _is_tmux_session(record.session_id):
-            # tmux session — show tmux attach instructions
-            thread_id = channel.id
-            tmux_mgr = await self._resolve_tmux_manager(channel.parent_id or thread_id)
-            window_name: str | None = None
-            session_name: str | None = None
-            if tmux_mgr is not None:
-                import asyncio
-
-                window_name = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
-                session_name = tmux_mgr.session_name
-
-            if window_name and session_name:
-                cmd = f"tmux attach -t {session_name}:{window_name}"
-            elif session_name:
-                cmd = f"tmux attach -t {session_name}"
-            else:
-                cmd = "tmux attach"
-
-            embed = discord.Embed(
-                title="\U0001f517 Resume via tmux",
-                description=(
-                    f"This session is managed by tmux.\n\n"
-                    f"```\n{cmd}\n```\n"
-                    f"Run this command to attach to the session."
-                ),
-                color=COLOR_INFO,
-            )
-        else:
-            embed = discord.Embed(
-                title="\U0001f517 Resume from CLI",
-                description=(
-                    f"```\nclaude --resume {record.session_id}\n```\n"
-                    f"Run this command in your terminal to continue this session."
-                ),
-                color=COLOR_INFO,
-            )
-        if record.working_dir:
-            embed.add_field(name="Working Directory", value=f"`{record.working_dir}`", inline=True)
-        if record.model:
-            embed.add_field(name="Model", value=record.model, inline=True)
-
-        await respond(embed=embed)
-
-    @app_commands.command(
-        name="resume-info",
-        description="Show the CLI command to resume this thread's session",
-    )
-    async def resume_info(self, interaction: discord.Interaction) -> None:
-        """Show the claude --resume command for the current thread."""
-        respond, _ = self._slash_io(interaction)
-        await self._resume_info_impl(channel=interaction.channel, respond=respond)
-
-    @commands.command(name="resume-info")
-    async def resume_info_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /resume-info — webhook-invokable for E2E (#209)."""
-        respond, _ = self._ctx_io(ctx)
-        await self._resume_info_impl(channel=ctx.channel, respond=respond)
-
-    async def _sessions_list_impl(self, *, respond: _Responder) -> None:
-        """Shared core for /sessions and !sessions (#209 follow-up)."""
-        records = await self.repo.list_all(limit=25)
-
-        if not records:
-            embed = discord.Embed(
-                title="\U0001f4cb Sessions",
-                description="No sessions found.",
-                color=COLOR_INFO,
-            )
-            await respond(embed=embed)
-            return
-
-        embed = discord.Embed(
-            title=f"\U0001f4cb Sessions ({len(records)})",
-            color=COLOR_INFO,
-        )
-
-        # Build thread→window mapping from all tmux managers for display
-        has_tmux = any(_is_tmux_session(r.session_id) for r in records)
-        thread_to_window: dict[int, str] = {}
-        if has_tmux:
-            import asyncio
-
-            managers = await self._resolve_all_tmux_managers()
-            for mgr in managers:
-                await asyncio.to_thread(mgr._rebuild_mapping)
-                thread_to_window.update(mgr._thread_to_window)
-
-        for record in records:
-            icon = _ORIGIN_ICON.get(record.origin, "\u2753")
-            summary = record.summary or "(no summary)"
-            window_name = thread_to_window.get(record.thread_id)
-            session_short = _format_session_short(record.session_id, window_name=window_name)
-
-            name = f"{icon} {summary[:50]}"
-            if _is_tmux_session(record.session_id):
-                value = f"`{session_short}` | {record.last_used_at}"
-            else:
-                value = f"`{session_short}...` | {record.last_used_at}"
-            if record.working_dir:
-                # Show just the last directory component
-                dir_short = record.working_dir.rsplit("/", 1)[-1]
-                value += f" | `{dir_short}`"
-
-            embed.add_field(name=name, value=value, inline=False)
-
-        await respond(embed=embed)
-
-    @app_commands.command(
-        name="sessions",
-        description="List all known Claude Code sessions",
-    )
-    async def sessions_list(self, interaction: discord.Interaction) -> None:
-        """List all sessions with origin, summary, and last activity."""
-        respond, _ = self._slash_io(interaction)
-        await self._sessions_list_impl(respond=respond)
-
-    @commands.command(name="sessions")
-    async def sessions_list_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /sessions — webhook-invokable for E2E (#209)."""
-        respond, _ = self._ctx_io(ctx)
-        await self._sessions_list_impl(respond=respond)
-
     # ------------------------------------------------------------------
     # Session directory commands
     # ------------------------------------------------------------------
@@ -573,63 +458,136 @@ class SessionManageCog(commands.Cog):
             return await channel_cog._repo.list_all()
         return []
 
-    async def _session_dirs_list_impl(self, *, respond: _Responder, ack: _Acknowledger) -> None:
-        """Shared core for /session-dirs and !session-dirs (#209 follow-up)."""
-        bindings = await self._get_all_bindings()
-        if not bindings:
+    # ── /clord-status (#363) ────────────────────────────────────────────────
+    # One per-channel view that supersedes /sessions, /session-dirs, /resume-info.
+    # docker ps model: default = live only, `all` = live + closed; deleted (no
+    # working dir) is a footer count, never a row. See c_lord/status_view.py.
+
+    @staticmethod
+    def _resume_uuid_for(working_dir: str | None) -> str:
+        """Real ``claude --resume`` id for a session = its transcript jsonl stem.
+
+        The DB ``session_id`` is ``tmux-…`` for tmux-managed sessions (not a
+        resumable id), so the actual Claude session uuid is recovered from
+        ``~/.claude/projects/<slug>/<uuid>.jsonl`` (#363).
+        """
+        if not working_dir:
+            return ""
+        jsonl = latest_session_jsonl(derive_project_dir(working_dir))
+        return jsonl.stem if jsonl is not None else ""
+
+    async def _clord_status_impl(
+        self, *, channel: object, show_all: bool, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /clord-status and !clord-status (#363).
+
+        Lists only the sessions of the *invoking channel* (per-channel — this is
+        what structurally avoids the all-channels 25-field crash that froze the
+        old /session-dirs). Live + closed get table rows; deleted is a count.
+        """
+        import asyncio
+        from datetime import datetime
+
+        channel_id = getattr(channel, "id", None)
+        parent_id = getattr(channel, "parent_id", None) or channel_id
+        if parent_id is None:
+            await respond("This command must be used in a server channel.", ephemeral=True)
+            return
+
+        sdm = await self._resolve_session_dir_manager(parent_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_id)
+        if sdm is None or tmux_mgr is None:
             await respond(
-                "❌ No channel-repo bindings configured. Use `/clord-init` first.",
+                "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
+                " `/clord-init` で設定してください。",
                 ephemeral=True,
             )
             return
 
-        await ack(ephemeral=True)
+        await ack()
 
-        import asyncio
+        dirs = await asyncio.to_thread(sdm.find_session_dirs)
+        windows = await asyncio.to_thread(tmux_mgr.list_sessions)
+        window_by_thread: dict[int, str] = {}
+        for w in windows:
+            tid = w.get("thread_id")
+            if tid:
+                with contextlib.suppress(ValueError, TypeError):
+                    window_by_thread[int(tid)] = w["window_name"]
 
-        all_dirs = []
-        for binding in bindings:
-            sdm = await self._resolve_session_dir_manager(binding["channel_id"])
-            if sdm is not None:
-                dirs = await asyncio.to_thread(sdm.find_session_dirs)
-                all_dirs.extend(dirs)
-
-        if not all_dirs:
-            await respond(
-                embed=discord.Embed(
-                    title="📁 Session Directories",
-                    description="No session directories found.",
-                    color=COLOR_INFO,
+        rows: list[StatusRow] = []
+        for d in dirs:
+            rec = await self.repo.get(d.thread_id)
+            window_name = window_by_thread.get(d.thread_id)
+            has_window = window_name is not None
+            status = classify_status(
+                has_window=has_window,
+                db_state=rec.state if rec else None,
+                dir_exists=True,
+            )
+            if status is None:  # dir exists -> never None, but stay defensive
+                continue
+            size = await asyncio.to_thread(_dir_size_bytes, d.path)
+            topic = (rec.topic or rec.summary if rec else None) or "(no topic)"
+            rows.append(
+                StatusRow(
+                    window_number=parse_work_number(window_name) if window_name else None,
+                    status=status,
+                    topic=topic,
+                    size_bytes=size,
+                    last_used=rec.last_used_at if rec else "",
+                    session_id=self._resume_uuid_for((rec.working_dir if rec else None) or d.path),
                 )
             )
-            return
 
-        embed = discord.Embed(
-            title=f"📁 Session Directories ({len(all_dirs)})",
-            color=COLOR_INFO,
+        # deleted = this channel's DB sessions whose working dir is gone and which
+        # have no live window (workspace-delete removed the clone). Count only.
+        present = {d.thread_id for d in dirs}
+        all_records = await self.repo.list_all(limit=1000)
+        deleted_count = sum(
+            1
+            for r in all_records
+            if r.working_dir
+            and f"/{parent_id}/" in r.working_dir
+            and r.thread_id not in present
+            and r.thread_id not in window_by_thread
         )
-        for d in all_dirs:
-            status = "✅ clean" if d.is_clean else "⚠️ dirty"
-            name = f"`{d.thread_id}`"
-            value = f"Path: `{d.path}`\nCommit: `{d.commit or 'unknown'}`\nStatus: {status}"
-            embed.add_field(name=name, value=value, inline=False)
 
-        await respond(embed=embed)
+        repo_label = _short_repo(dirs[0].source_repo if dirs else None)
+        channel_name = getattr(getattr(channel, "parent", None), "name", None) or getattr(
+            channel, "name", str(parent_id)
+        )
+        content = render_status(
+            rows=rows,
+            show_all=show_all,
+            channel_name=channel_name,
+            repo=repo_label,
+            session_name=tmux_mgr.session_name,
+            deleted_count=deleted_count,
+            now=datetime.now(),
+        )
+        await respond(content)
 
     @app_commands.command(
-        name="session-dirs",
-        description="List all active Claude Code session directories",
+        name="clord-status",
+        description="List this channel's Claude sessions (size, attach, resume)",
     )
-    async def session_dirs_list(self, interaction: discord.Interaction) -> None:
-        """Show all session directories and their status (across all bindings)."""
+    @app_commands.describe(show_all="Include closed sessions too (like `docker ps -a`)")
+    async def clord_status(self, interaction: discord.Interaction, show_all: bool = False) -> None:
+        """Per-channel session status. ``show_all`` adds closed sessions (#363)."""
         respond, ack = self._slash_io(interaction)
-        await self._session_dirs_list_impl(respond=respond, ack=ack)
+        await self._clord_status_impl(
+            channel=interaction.channel, show_all=show_all, respond=respond, ack=ack
+        )
 
-    @commands.command(name="session-dirs")
-    async def session_dirs_list_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /session-dirs — webhook-invokable for E2E (#209)."""
+    @commands.command(name="clord-status")
+    async def clord_status_text(self, ctx: commands.Context, arg: str | None = None) -> None:
+        """Text/mention twin of /clord-status. ``!clord-status all`` shows closed."""
+        show_all = (arg or "").lower() in {"all", "-a", "a"}
         respond, ack = self._ctx_io(ctx)
-        await self._session_dirs_list_impl(respond=respond, ack=ack)
+        await self._clord_status_impl(
+            channel=ctx.channel, show_all=show_all, respond=respond, ack=ack
+        )
 
     async def _session_cleanup_impl(
         self, *, dry_run: bool, respond: _Responder, ack: _Acknowledger

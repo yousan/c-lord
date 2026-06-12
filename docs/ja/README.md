@@ -189,8 +189,7 @@ Bot の再起動中にセッションが中断された場合、Bot が再起動
 
 ### セッション管理
 - **セッション同期** — CLI セッションを Discord スレッドにインポート（`/sync-sessions`）
-- **セッション一覧** — 起動元（Discord / CLI / 全て）と時間範囲でフィルタリング（`/sessions`）
-- **リジューム情報** — 現在のセッションをターミナルで継続する CLI コマンドを表示（`/resume-info`）
+- **チャンネル状態** — `/clord-status` がこのチャンネルのセッションをディレクトリ容量・`tmux attach` 先・`claude --resume` コマンド付きで一覧表示。`show_all` で closed も含む（`docker ps -a` 相当）。旧 `/sessions`・`/session-dirs`・`/resume-info` を統合。
 - **スタートアップリジューム** — 任意のBot 再起動後に中断セッションを自動再開。`AutoUpgradeCog`（アップグレード再起動）および `ClaudeChatCog.cog_unload()`（その他すべてのシャットダウン）が自動登録、または `POST /api/mark-resume` で手動登録
 - **プログラム的スポーン** — `POST /api/spawn` でスクリプトや Claude サブプロセスから新しい Discord スレッド + Claude セッションを作成。スレッド作成後すぐに非ブロッキング 201 を返す
 - **スレッド ID 注入** — すべての Claude サブプロセスに `DISCORD_THREAD_ID` 環境変数を渡し、セッションから `$CLORD_API_URL/api/spawn` で子セッションを起動可能
@@ -501,7 +500,7 @@ c_lord/
   cogs/
     claude_chat.py         # インタラクティブチャット（スレッド作成、メッセージ処理）
     skill_command.py       # /skill スラッシュコマンド（オートコンプリート付き）
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /clord-status, /sync-sessions
     scheduler.py           # 定期 Claude Code タスク実行エンジン
     webhook_trigger.py     # Webhook → Claude Code タスク実行（CI/CD）
     auto_upgrade.py        # Webhook → パッケージアップグレード + DrainAware 再起動
