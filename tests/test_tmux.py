@@ -21,6 +21,9 @@ class TestTmuxSessionManager:
         mgr._available = True
         # Isolate from the post-create window sort (#374) — tested separately.
         mgr._sort_windows_unlocked = lambda: None  # type: ignore[method-assign]
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
+        mgr._fit_window_to_client = lambda *_: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -92,6 +95,9 @@ class TestTmuxSessionManager:
         mgr._available = True
         # Isolate from the post-create window sort (#374) — tested separately.
         mgr._sort_windows_unlocked = lambda: None  # type: ignore[method-assign]
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
+        mgr._fit_window_to_client = lambda *_: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             # First thread
@@ -357,6 +363,8 @@ class TestTmuxSessionManager:
     def test_ensure_session_already_exists(self) -> None:
         """_ensure_session returns True when session already exists."""
         mgr = TmuxSessionManager(mapping_path="")
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
@@ -368,6 +376,8 @@ class TestTmuxSessionManager:
     def test_ensure_session_creates_new(self) -> None:
         """_ensure_session creates session when it doesn't exist."""
         mgr = TmuxSessionManager(mapping_path="")
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -972,6 +982,8 @@ class TestTmuxSessionManager:
     def test_custom_session_name_in_ensure_session(self) -> None:
         """Custom session name is used when creating the tmux session."""
         mgr = TmuxSessionManager(session_name="custom", mapping_path="")
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -1313,6 +1325,85 @@ class TestTmuxSessionManager:
         )
 
 
+class TestWindowSizePolicy:
+    """#403: pin bot session to a fixed (manual) window size so a client (the
+    human's SSH terminal) resizing does not SIGWINCH-storm every idle Claude TUI
+    into ghosting its status line."""
+
+    def test_ensure_window_size_manual_sets_option(self) -> None:
+        """window-size is pinned to ``manual`` on the bot session."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._ensure_window_size_manual()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert any(
+            "set-option" in a and "window-size" in a and "manual" in a for a in calls
+        ), calls
+
+    def test_ensure_window_size_manual_noop_when_unavailable(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = False
+        with patch("c_lord.tmux._run") as mock_run:
+            mgr._ensure_window_size_manual()
+        mock_run.assert_not_called()
+
+    def test_current_client_size_parses_list_clients(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="146 38\n")
+            assert mgr._current_client_size() == (146, 38)
+
+    def test_current_client_size_none_when_no_client(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            assert mgr._current_client_size() is None
+
+    def test_fit_window_to_client_uses_client_size(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="146 38\n"),  # list-clients
+                MagicMock(returncode=0),  # resize-window
+            ]
+            mgr._fit_window_to_client("w1")
+        resize = mock_run.call_args_list[-1].args[0]
+        assert "resize-window" in resize
+        assert "146" in resize and "38" in resize
+
+    def test_fit_window_to_client_falls_back_to_default(self) -> None:
+        from c_lord.tmux import DEFAULT_MANAGED_WINDOW_SIZE
+
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=""),  # list-clients: none attached
+                MagicMock(returncode=0),  # resize-window
+            ]
+            mgr._fit_window_to_client("w1")
+        resize = mock_run.call_args_list[-1].args[0]
+        assert str(DEFAULT_MANAGED_WINDOW_SIZE[0]) in resize
+        assert str(DEFAULT_MANAGED_WINDOW_SIZE[1]) in resize
+
+    def test_ensure_session_pins_window_size_manual(self) -> None:
+        """_ensure_session wires in the manual window-size policy (#403)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._ensure_session()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert any(
+            "set-option" in a and "window-size" in a and "manual" in a for a in calls
+        ), calls
+
+
 class TestPaneInsertModeDetection:
     """#147: detect vim INSERT vs NORMAL from the pane status bar.
 
@@ -1538,6 +1629,9 @@ class TestSortWindows:
         """The new-window path triggers a sort; the existing-window path does not."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
+        mgr._fit_window_to_client = lambda *_: None  # type: ignore[method-assign]
         called = {"n": 0}
         mgr._sort_windows_unlocked = lambda: called.__setitem__("n", called["n"] + 1)  # type: ignore[method-assign]
         with patch("c_lord.tmux._run") as mock_run:
