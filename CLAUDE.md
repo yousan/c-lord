@@ -358,10 +358,11 @@ incident that motivated this.
 
 **Label-based exemptions** (enforced by `dod-gate` CI — see `.github/workflows/dod-gate.yml`):
 
-- `no-runtime-change` or `documentation` label: **waives the DoD-completion checklist below** (notably the **TDD evidence** and **Staging verification** requirements). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
+- `no-runtime-change` or `documentation` label: **waives the DoD-completion checklist below** (notably the **TDD evidence**, **Staging verification**, and the **evidence-link requirement**). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
 - **`Closes` discipline is always enforced**, regardless of labels: if a PR uses `Closes`/`Resolves #N`, that Issue's Acceptance Criteria must be 100% met (else use `Refs #N`).
+- **Evidence-link required** (#391): a PR **without** an exempt label must contain a 証跡 image (`![...](URL)`) or a Release-asset URL in its body, or `dod-gate` fails. Text logs alone do not pass — paste an actual screenshot/URL (`scripts/evidence_upload.py`), or apply `no-runtime-change`/`documentation` if evidence is genuinely N/A.
 
-<!-- 参照はルール名で固定（番号で指さない）。項目を挿入すると番号がずれ免除対象がずれるため。dod-gate.yml の実挙動: ラベルあり → DoD 完了要件 (Rule 1) を免除 / `Closes` 規律 (Rule 2) は常時適用。 -->
+<!-- 参照はルール名で固定（番号で指さない）。項目を挿入すると番号がずれ免除対象がずれるため。dod-gate.yml の実挙動: ラベルあり → DoD 完了要件 (Rule 1) + 証跡リンク必須 (Rule 3) を免除 / `Closes` 規律 (Rule 2) は常時適用。 -->
 
 A PR may be merged only when:
 

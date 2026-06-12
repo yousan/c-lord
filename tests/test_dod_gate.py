@@ -28,6 +28,9 @@ _DOD_OK = (
     "- [x] Closes discipline\n"
 )
 
+# 証跡画像断片 (#391: 免除ラベルの無い挙動変更 PR は証跡必須)。
+_IMG = "\n![red](https://example.com/shot.png)\n"
+
 
 def _run_gate(body: str, labels: list[str], tmp_path: Path) -> subprocess.CompletedProcess[str]:
     event = {"pull_request": {"body": body, "labels": [{"name": n} for n in labels]}}
@@ -42,7 +45,8 @@ def _run_gate(body: str, labels: list[str], tmp_path: Path) -> subprocess.Comple
 
 
 def test_proper_ac_heading_all_checked_with_closes_passes(tmp_path: Path) -> None:
-    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + "\nCloses #1\n"
+    # 非免除 PR は証跡画像 (_IMG) が必須 (#391)。AC 全チェック + Closes + 証跡で通過。
+    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + _IMG + "\nCloses #1\n"
     result = _run_gate(body, [], tmp_path)
     assert result.returncode == 0, result.stderr
 
@@ -79,3 +83,43 @@ def test_missing_dod_section_fails(tmp_path: Path) -> None:
     body = "## Acceptance Criteria\n\n- [x] AC1\n\nbody without a DoD section\n"
     result = _run_gate(body, [], tmp_path)
     assert result.returncode == 1, result.stdout
+
+
+# --- Rule 3 (#391): 挙動変更 PR は証跡画像 / Release アセット URL が必須 ---
+
+
+def test_behavior_change_without_evidence_fails(tmp_path: Path) -> None:
+    # 免除ラベル無し・証跡画像無し → 落ちる。
+    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + "\nCloses #1\n"
+    result = _run_gate(body, [], tmp_path)
+    assert result.returncode == 1, result.stdout
+    assert "証跡" in result.stderr
+
+
+def test_markdown_image_satisfies_evidence(tmp_path: Path) -> None:
+    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + _IMG + "\nCloses #1\n"
+    result = _run_gate(body, [], tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def test_release_asset_url_satisfies_evidence(tmp_path: Path) -> None:
+    # 拡張子の無い裸の Release ダウンロード URL でも証跡として認める。
+    url = "https://github.com/yousan/c-lord/releases/download/evidence/i1-red"
+    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + f"\n証跡: {url}\n\nCloses #1\n"
+    result = _run_gate(body, [], tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def test_bare_user_attachments_url_satisfies_evidence(tmp_path: Path) -> None:
+    # ドラッグ&ドロップ画像は ![](...) になるが、裸の user-attachments URL でも認める。
+    url = "https://github.com/user-attachments/assets/0a1b2c3d-evidence"
+    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + f"\n{url}\n\nCloses #1\n"
+    result = _run_gate(body, [], tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def test_no_runtime_change_label_exempts_evidence(tmp_path: Path) -> None:
+    # 免除ラベルがあれば証跡画像が無くても通る。
+    body = "## Acceptance Criteria\n\n- [x] AC1\n\n" + _DOD_OK + "\nCloses #1\n"
+    result = _run_gate(body, ["no-runtime-change"], tmp_path)
+    assert result.returncode == 0, result.stderr
