@@ -25,16 +25,95 @@ from c_lord.cogs._run_helper import (
 from c_lord.concurrency import SessionRegistry
 
 
+class TestPersistedContextWindow:
+    """#370: the window total is persisted per-model in the settings KV store.
+
+    tier is stable per (host, account, model), so a value learned once survives
+    bot restarts and other sessions on the same model — the /context probe
+    (which renders into the human-visible tmux pane) then fires at most once per
+    model per host, instead of once per session / bot-restart.
+    """
+
+    def _config(self, *, probe_total: int | None, settings_repo: object | None):
+        cfg = MagicMock()
+        cfg.runner.model = "opus"
+        cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        cfg.settings_repo = settings_repo
+        return cfg
+
+    def test_disk_hit_skips_probe(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value="1000000")
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=1_000_000, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-disk", "claude-opus-4-8", 50_000)
+        )
+
+        assert total == 1_000_000
+        settings.get.assert_awaited_once_with("context_window:claude-opus-4-8")
+        cfg.runner.probe_context_window.assert_not_awaited()
+
+    def test_disk_miss_probes_then_persists(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value=None)
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=1_000_000, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-miss", "claude-opus-4-8", 50_000)
+        )
+
+        assert total == 1_000_000
+        cfg.runner.probe_context_window.assert_awaited_once()
+        settings.set.assert_awaited_once_with("context_window:claude-opus-4-8", "1000000")
+
+    def test_probe_failure_is_not_persisted(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value=None)
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=None, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-failpersist", "claude-opus-4-8", 20_000)
+        )
+
+        # Probe failed → fallback used, and nothing is written to disk (a
+        # transient failure must not lock a wrong window in for every future
+        # session — mirrors the in-memory "do not cache on failure" rule).
+        assert total == 200_000
+        settings.set.assert_not_awaited()
+
+
 class TestPostContextUsage:
     """_post_context_usage posts the context line and caches the denominator."""
 
-    def _config(self, *, working_dir: str | None = "/tmp/x", probe_total: int | None = 1_000_000):
+    def _config(
+        self,
+        *,
+        working_dir: str | None = "/tmp/x",
+        probe_total: int | None = 1_000_000,
+        settings_repo: object | None = None,
+    ):
         cfg = MagicMock()
         cfg.thread.id = 12345
         cfg.thread.send = AsyncMock()
         cfg.runner.working_dir = working_dir
         cfg.runner.model = "opus"
         cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        # Default to None so existing tests exercise the no-persistence path; a
+        # bare MagicMock would make ``await settings_repo.get(...)`` blow up.
+        cfg.settings_repo = settings_repo
         return cfg
 
     def _patch_usage(self, monkeypatch, used: int | None):
