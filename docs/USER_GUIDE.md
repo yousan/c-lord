@@ -165,12 +165,10 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 | `/stop` | Stop the current session (preserves it for resume) | Available |
 | `/clear` | Reset the Claude Code session for this thread | Available |
 | `/skill <name> [args]` | Run a Claude Code skill (with autocomplete) | Available |
-| `/sessions` | List sessions (filter by origin, time window) | Available |
+| `/clord-status [show_all]` | List this channel's sessions — size, attach, resume (supersedes `/sessions`, `/session-dirs`, `/resume-info`) | Available |
 | `/sync-sessions` | Import CLI sessions as Discord threads | Available |
-| `/resume-info` | Show the CLI command to continue this session in a terminal | Available |
 | `/model show` | Show current model (global + per-thread) | Available |
 | `/model set <model>` | Change model for all new sessions | Available |
-| `/session-dirs` | List all active session directories | Available |
 | `/session-cleanup` | Remove clean orphaned session directories | Available |
 | `/tmux-list` | List all active tmux windows | Available |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Available |
@@ -207,7 +205,9 @@ Send follow-up messages → Claude continues in same session
     ↓
 /stop → Session paused (send a new message to resume)
     ↓
-Bot restart → Session auto-resumes
+Bot restart → tmux session keeps running; observers re-attach and a quiet
+              "C-lord を再起動しました" notice is posted. Claude is NOT
+              re-prompted (#406) — send a new message to continue.
 ```
 
 ### What Happens Under the Hood
