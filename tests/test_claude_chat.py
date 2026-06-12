@@ -1017,8 +1017,13 @@ class TestOnReady:
         bot.get_channel.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_on_ready_deletes_before_spawning(self) -> None:
-        """Row must be deleted BEFORE _run_claude is called (single-fire guarantee)."""
+    async def test_on_ready_deletes_before_acting(self) -> None:
+        """Row must be deleted BEFORE acting on it (single-fire guarantee).
+
+        #406: the "action" is now posting a quiet restart notice (no re-prompt),
+        but the delete-first ordering that prevents a double-fire across a racy
+        reconnect must be preserved.
+        """
         from unittest.mock import AsyncMock, MagicMock, patch
 
         import discord
@@ -1029,7 +1034,7 @@ class TestOnReady:
             id=7,
             thread_id=555,
             session_id="sess-abc",
-            reason="self_restart",
+            reason="bot_shutdown",
             resume_prompt="Continue please.",
             created_at="2026-02-21 20:00:00",
         )
@@ -1039,7 +1044,6 @@ class TestOnReady:
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 555
-        thread.send = AsyncMock(return_value=MagicMock())
         parent = MagicMock(spec=discord.TextChannel)
         thread.parent = parent
 
@@ -1050,18 +1054,17 @@ class TestOnReady:
 
         call_order: list[str] = []
         resume_repo.delete.side_effect = lambda _: call_order.append("delete")
+        thread.send = AsyncMock(side_effect=lambda *a, **k: call_order.append("notice"))
 
-        async def fake_run_claude(*args, **kwargs):
-            call_order.append("run_claude")
-
-        with patch.object(cog, "_run_claude", side_effect=fake_run_claude):
+        with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
             await cog.on_ready()
-            # create_task schedules the coroutine; yield to the event loop so it runs.
             await asyncio.sleep(0)
 
-        assert call_order == ["delete", "run_claude"], (
-            "delete() must be called before _run_claude to prevent double-resume"
+        assert call_order == ["delete", "notice"], (
+            "delete() must be called before the restart notice to prevent double-fire"
         )
+        # #406: no re-prompt — Claude is never re-run on restart.
+        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_on_ready_skips_non_thread_channels(self) -> None:
@@ -1093,6 +1096,66 @@ class TestOnReady:
         await cog.on_ready()
         # delete was still called (single-fire)
         resume_repo.delete.assert_called_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_on_ready_posts_quiet_notice_and_does_not_reprompt(self) -> None:
+        """#406: restart must NOT re-prompt Claude — only post a quiet notice.
+
+        The ``claude`` process in tmux survives a bot restart, and the observers
+        (TranscriptMirror + menu watchdog) self-restore on startup.  Re-running
+        Claude with a "continue your work" prompt therefore only causes unwanted
+        autonomous progress (意図しない前進) and makes the conversation appear to
+        "jump".  on_ready must instead post a subtle ``-#`` subtext notice and
+        leave the live session alone.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import discord
+
+        from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
+
+        entry = PendingResume(
+            id=9,
+            thread_id=555,
+            session_id="sess-abc",
+            reason="bot_shutdown",
+            resume_prompt=(
+                "ボットが再起動しました。前の作業の続きを確認し、必要な残作業があれば完了してください。"
+            ),
+            created_at="2026-06-12 05:00:00",
+        )
+        resume_repo = MagicMock(spec=PendingResumeRepository)
+        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.delete = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.send = AsyncMock(return_value=MagicMock())
+        thread.parent = MagicMock(spec=discord.TextChannel)
+
+        bot = MagicMock()
+        bot.get_channel.return_value = thread
+
+        cog = ClaudeChatCog(
+            bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo
+        )
+
+        with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
+            await cog.on_ready()
+            # create_task (if any) is scheduled; yield so it would run.
+            await asyncio.sleep(0)
+
+        # No re-prompt: Claude must not be re-run on restart.
+        mock_run.assert_not_called()
+        # Single-fire still guaranteed (row deleted before acting).
+        resume_repo.delete.assert_called_once_with(9)
+        # A quiet (-# subtext) notice was posted — and it is NOT the old loud
+        # "complete your remaining work" instruction injected into the session.
+        thread.send.assert_called_once()
+        sent = thread.send.call_args.args[0]
+        assert sent.startswith("-#"), f"notice must be quiet -# subtext, got: {sent!r}"
+        assert "完了してください" not in sent
+        assert "残作業" not in sent
 
 
 class TestCogUnloadMarkForResume:
