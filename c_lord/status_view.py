@@ -24,6 +24,7 @@ The docker mental model: default ``/clord-status`` ≈ ``docker ps`` (live only)
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -101,6 +102,21 @@ def _short_id(session_id: str) -> str:
     return session_id.split("-", 1)[0][:8] if session_id else "-"
 
 
+def _display_width(s: str) -> int:
+    """Monospace display columns for ``s`` — East-Asian wide/fullwidth count as 2.
+
+    Discord (and terminals) render the table in a monospace font where CJK
+    glyphs are double-width, so padding by ``len()`` misaligns rows with CJK
+    topics. Width is computed from ``unicodedata.east_asian_width`` (#408).
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def _pad(s: str, width: int) -> str:
+    """Left-justify ``s`` to ``width`` *display* columns (not char count)."""
+    return s + " " * max(0, width - _display_width(s))
+
+
 def _cell(value: str, *, cap: int = 40) -> str:
     """Make ``value`` safe + bounded for a fenced monospace table cell.
 
@@ -134,15 +150,15 @@ def _build_table(
             cells.append(_short_id(r.session_id))
         body.append(cells)
 
-    widths = [len(h) for h in header]
+    widths = [_display_width(h) for h in header]
     for cells in body:
         for i, c in enumerate(cells):
-            widths[i] = max(widths[i], len(c))
+            widths[i] = max(widths[i], _display_width(c))
 
     def fmt(cells: list[str]) -> str:
-        # last column not padded (ragged right is fine)
+        # pad by display width so CJK-topic rows still line up; last col ragged
         return "  ".join(
-            c.ljust(widths[i]) if i < len(cells) - 1 else c for i, c in enumerate(cells)
+            _pad(c, widths[i]) if i < len(cells) - 1 else c for i, c in enumerate(cells)
         ).rstrip()
 
     lines = [fmt(header), *(fmt(c) for c in body)]
