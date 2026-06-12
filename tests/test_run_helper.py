@@ -845,6 +845,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -892,6 +893,7 @@ class TestRecoverMissedPaneAsk:
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -925,6 +927,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
 
         async def gen_with_reply(*args, **kwargs):
             yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
@@ -945,6 +948,47 @@ class TestRecoverMissedPaneAsk:
             await run_claude_in_thread(thread, runner, repo, "hello", None)
 
         bridge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stopped_run_does_not_rebridge_post_turn(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """A pre-empted (stopped) run must NOT re-bridge its leftover menu (#315).
+
+        When a follow-up message interrupts a turn parked on a menu, the run is
+        torn down (``runner.stopped`` is True).  Re-bridging here would re-park it
+        on a fresh ``timeout=None`` await, so the new turn could never start — the
+        exact failure observed on staging (the ⚡ fired but no new run began).
+        """
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = True  # deliberately pre-empted by a follow-up message
+        runner.run = self._make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
+            ]
+        )
+        runner.peek_pending_ask = AsyncMock(
+            return_value=AskQuestion(
+                question="Which environment?",
+                header="Deploy",
+                options=[AskOption(label="Production", description="本番")],
+            )
+        )
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_not_awaited()
+        runner.peek_pending_ask.assert_not_called()
 
 
 class TestMakeErrorEmbed:

@@ -331,7 +331,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # guards that gate the #67 notice below. (Gating it there left prod's jsonl
     # mode never recovering a post-turn menu, so the user saw no choices — #222.)
     pending_pane_ask = None
-    if not run_errored and not processor.pending_ask and isinstance(runner, TmuxClaudeRunner):
+    if (
+        not run_errored
+        and not processor.pending_ask
+        and isinstance(runner, TmuxClaudeRunner)
+        and not runner.stopped
+    ):
+        # ``runner.stopped`` guard (#315): a turn pre-empted by a follow-up message
+        # was deliberately torn down; re-bridging its leftover menu here would
+        # re-park the run on a fresh ``timeout=None`` await and the new turn could
+        # never start (observed on staging — the ⚡ fired but no new run began).
         pending_pane_ask = await runner.peek_pending_ask()
 
     if pending_pane_ask is not None:

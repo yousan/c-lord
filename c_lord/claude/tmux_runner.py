@@ -1099,6 +1099,17 @@ class TmuxClaudeRunner:
             error=error,
         )
 
+    @property
+    def stopped(self) -> bool:
+        """True once :meth:`interrupt` or :meth:`kill` has been called.
+
+        Lets callers (e.g. ``_run_helper``'s post-turn menu recovery) tell a turn
+        that was deliberately pre-empted from one that ended on its own, so a
+        pre-empted turn is not re-bridged into a fresh menu it would re-park on
+        (#315).
+        """
+        return self._stopped
+
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).
 
