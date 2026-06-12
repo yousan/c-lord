@@ -207,7 +207,9 @@ Send follow-up messages → Claude continues in same session
     ↓
 /stop → Session paused (send a new message to resume)
     ↓
-Bot restart → Session auto-resumes
+Bot restart → tmux session keeps running; observers re-attach and a quiet
+              "C-lord を再起動しました" notice is posted. Claude is NOT
+              re-prompted (#406) — send a new message to continue.
 ```
 
 ### What Happens Under the Hood
