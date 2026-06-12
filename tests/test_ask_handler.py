@@ -93,3 +93,133 @@ async def test_discord_click_still_answers_menu(monkeypatch):
     # Option index 1 (A2) selected via keystrokes.
     runner.answer_menu.assert_awaited_once_with(1)
     runner.cancel_menu.assert_not_called()
+
+
+# -- #399: prose context above the menu -------------------------------------
+
+
+_CONTEXT = (
+    "案Aと案Bを比較すると、案Aは実装が単純でデッドロックの心配がない一方、"
+    "案Bは競合が頻繁な処理で安定します。私の推しは (A) です。理由は通常時の"
+    "オーバーヘッドがほぼゼロだからです。"
+)
+
+
+def _resolved_runner() -> MagicMock:
+    """Runner whose menu resolves in the TUI right away (fast test exit)."""
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=None)
+    runner.answer_menu = AsyncMock()
+    runner.answer_menu_text = AsyncMock()
+    runner.cancel_menu = AsyncMock()
+    return runner
+
+
+@pytest.fixture(autouse=True)
+def _clear_bridged_context():
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    bridged_context.clear()
+    yield
+    bridged_context.clear()
+
+
+@pytest.mark.asyncio
+async def test_context_posted_as_silent_message_before_embed(monkeypatch):
+    """#399: the prose spoken above the menu must reach Discord as its own
+    silent message, posted BEFORE the menu embed, and survive menu resolution
+    (the embed message is edited to nothing when the menu resolves)."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(399_0001)
+    q = _question()
+    q.context = _CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert thread.send.await_count == 2
+    first, second = thread.send.await_args_list
+    # 1st send: the context, plain content, silent, no buttons.
+    assert _CONTEXT in first.kwargs.get("content", "")
+    assert first.kwargs.get("silent") is True
+    assert "view" not in first.kwargs
+    # 2nd send: the menu embed.
+    assert "embed" in second.kwargs
+
+
+@pytest.mark.asyncio
+async def test_context_registered_for_mirror_dedup(monkeypatch):
+    """#399 AC3: once posted, the context is registered so the transcript
+    mirror can suppress the CLI's post-resolution flush of the same text."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(399_0002)
+    q = _question()
+    q.context = _CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert bridged_context.consume_match(thread.id, _CONTEXT) is True
+
+
+@pytest.mark.asyncio
+async def test_no_context_message_when_context_empty(monkeypatch):
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(399_0003)
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), _resolved_runner()), timeout=3.0)
+
+    # Only the embed message — no extra context post.
+    assert thread.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_long_context_truncated_keeping_tail(monkeypatch):
+    """Context longer than a Discord message keeps its TAIL — the
+    recommendation (推し) is conventionally the last thing said."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(399_0004)
+    q = _question()
+    q.context = ("長い経緯です。" * 400) + "私の推しは (A) です。"
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    first = thread.send.await_args_list[0]
+    content = first.kwargs.get("content", "")
+    assert len(content) <= 2000
+    assert content.endswith("私の推しは (A) です。")
+
+
+@pytest.mark.asyncio
+async def test_context_send_failure_does_not_break_bridge(monkeypatch):
+    """An HTTP failure posting the context must not kill the menu bridge, and
+    the undelivered text must NOT be registered (suppressing it later would
+    swallow it entirely)."""
+    import discord
+
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, msg = _thread(399_0005)
+    q = _question()
+    q.context = _CONTEXT
+
+    calls = {"n": 0}
+
+    async def _send(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise discord.HTTPException(MagicMock(status=500), "boom")
+        return msg
+
+    thread.send = AsyncMock(side_effect=_send)
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert calls["n"] == 2  # embed still sent
+    assert bridged_context.consume_match(thread.id, _CONTEXT) is False

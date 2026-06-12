@@ -25,6 +25,7 @@ from ..claude.types import AskQuestion
 from ..database.ask_repo import PendingAskRepository
 from .ask_bus import ask_bus as _ask_bus
 from .ask_view import AskView
+from .bridged_context import bridged_context as _bridged_context
 from .embeds import ask_embed
 
 if TYPE_CHECKING:
@@ -46,6 +47,17 @@ ASK_ANSWER_TIMEOUT = 86_400  # 24 h
 _PANE_RESOLVE_POLL = 2.0
 _PANE_RESOLVE_MISSES = 2
 
+# #399: the prose context above the menu is posted as its own message; keep the
+# TAIL when it exceeds a Discord message — the recommendation (推し) is
+# conventionally the last thing said before the menu opens.
+_CONTEXT_MSG_LIMIT = 1900
+
+
+def _clip_context(text: str) -> str:
+    if len(text) <= _CONTEXT_MSG_LIMIT:
+        return text
+    return "…" + text[-_CONTEXT_MSG_LIMIT:]
+
 
 async def bridge_pane_ask(
     thread: discord.Thread,
@@ -64,6 +76,26 @@ async def bridge_pane_ask(
     - timeout / no answer → ``runner.cancel_menu()`` (Esc)
     """
     answer_queue = _ask_bus.register(thread.id)
+
+    # #399: deliver the prose Claude spoke right above the menu (経緯・推し) as
+    # its own silent message BEFORE the menu embed. The CLI buffers the jsonl
+    # chunk containing the menu until resolution, so the transcript mirror
+    # cannot deliver this text while the menu is open — and the embed message
+    # is wiped (``embed=None``) once the menu resolves, so the context must
+    # live in a message of its own to stay readable afterwards. Register the
+    # delivered text so the mirror suppresses the CLI's post-resolution flush
+    # of the same text (AC3); on send failure nothing is registered — the
+    # late flush then delivers it instead.
+    if question.context:
+        try:
+            await thread.send(content=_clip_context(question.context), silent=True)
+        except discord.HTTPException:
+            logger.warning(
+                "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
+            )
+        else:
+            _bridged_context.register(thread.id, question.context)
+
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
     msg = await thread.send(
         embed=ask_embed(

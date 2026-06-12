@@ -30,6 +30,7 @@ from pathlib import Path
 
 from ..claude.types import AskQuestion, _parse_ask_questions
 from ..discord_ui.ask_bus import ask_bus
+from ..discord_ui.bridged_context import bridged_context
 from .formatter import RenderedEvent, render_event
 from .tail import tail_events
 
@@ -447,10 +448,25 @@ class TranscriptMirror:
                         await _flush_pending_silently()
                         progress_buf.append(_format_body(rendered))
                     elif rendered.kind == "assistant_text":
+                        body = _format_body(rendered)
+                        # #399 AC3: the CLI flushes the prose preceding an
+                        # AskUserQuestion/plan menu only after the menu
+                        # resolves; if the pane-ask bridge already delivered
+                        # it as the menu's context message, re-posting it here
+                        # would duplicate it. Still record its uuid (#215) so
+                        # a restart does not re-post it as a missed final.
+                        if bridged_context.consume_match(self.thread_id, body):
+                            await _flush_pending_silently()
+                            _last_text_uuid = event.get("uuid") or _last_text_uuid
+                            logger.info(
+                                "TranscriptMirror: suppressed pane-bridged ask context thread=%d",
+                                self.thread_id,
+                            )
+                            continue
                         # Another text while one is pending → previous was intermediate.
                         if _pending_text is not None:
                             await _flush_pending_silently()
-                        _pending_text = _format_body(rendered)
+                        _pending_text = body
                         _pending_progress = list(progress_buf)
                         _last_text_uuid = event.get("uuid") or _last_text_uuid
                         progress_buf.clear()

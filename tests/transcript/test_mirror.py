@@ -996,3 +996,125 @@ async def test_mirror_skips_ask_when_bus_active(tmp_path: Path) -> None:
         ask_bus.unregister(tid)
 
     assert spawned is False
+
+
+# -- #399 AC3: suppress the post-resolution flush of pane-bridged context ----
+
+
+def _pane_bridged_pair() -> tuple[str, str]:
+    """(pane-rendered context, raw markdown the CLI flushed) — real captures."""
+    from c_lord.claude.tmux_runner import _parse_ask_from_pane
+
+    fixtures = Path(__file__).parent.parent / "fixtures"
+    pane = (fixtures / "panes" / "ask_context_prose_above_menu.txt").read_text()
+    q = _parse_ask_from_pane(pane)
+    assert q is not None and q.context
+    md = (fixtures / "transcripts" / "i399_prose_flushed_markdown.txt").read_text()
+    return q.context, md
+
+
+async def test_mirror_suppresses_pane_bridged_context(tmp_path: Path) -> None:
+    """#399 AC3: when the pane-ask bridge already posted the pre-menu prose,
+    the CLI's post-resolution flush of the same text (raw markdown) must not be
+    re-posted — but later, different text still flows normally."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    bridged_context.clear()
+    bridged_context.register(99399, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99399,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # The flush-at-resolution: prose (markdown), then continuation, turn end.
+        _write_event(jsonl, _assistant_text(flushed_md))
+        _write_event(jsonl, _assistant_text("選択を受けて続行します。"))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    everything = posted + replied
+    assert not any("楽観ロック" in p for p in everything), (
+        "pane-bridged context was re-posted by the mirror"
+    )
+    # The rest of the turn still flows.
+    assert any("選択を受けて続行します。" in p for p in everything)
+
+
+async def test_mirror_commits_uuid_of_suppressed_text_when_turn_ends(tmp_path: Path) -> None:
+    """If the suppressed text is the turn's last text, its uuid must still be
+    committed (#215) so a restart does not re-post it as a missed final answer."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    cursor: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    async def cursor_sink(uuid: str) -> None:
+        cursor.append(uuid)
+
+    bridged_context.clear()
+    bridged_context.register(99400, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99400,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        reply_cursor_sink=cursor_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        event = _assistant_text(flushed_md)
+        event["uuid"] = "uuid-399-suppressed"
+        _write_event(jsonl, event)
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    assert replied == []  # nothing re-posted
+    assert "uuid-399-suppressed" in cursor

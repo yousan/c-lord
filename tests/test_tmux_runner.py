@@ -2906,7 +2906,127 @@ class TestParseAskNewLayouts:
         assert q is not None
         assert q.header == "リリース方式"
         assert [o.label for o in q.options] == [
-            "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+            "カナリアリリース",
+            "ブルーグリーン",
+            "ローリング更新",
+            "一斉切り替え",
         ]
         assert all(len(o.description) > 20 for o in q.options)
         assert q.multi_select is False
+
+
+class TestAskContextExtraction:
+    """#399: the assistant prose immediately above an AskUserQuestion menu
+    (経緯・推し) must ride along on the parsed AskQuestion as ``context`` so the
+    bridge can show it on Discord — the CLI buffers the jsonl chunk containing
+    the menu until resolution, so the pane is the only live source.
+
+    The extraction is deliberately narrow (#53 guard): only the LAST ``●``
+    response block directly above the menu frame, never tool blocks
+    (``● Bash(...)`` / ``⎿`` output), never the echoed user prompt, never TUI
+    chrome. All positive/negative fixtures are real captured panes
+    (CLI v2.1.173, 2026-06-12).
+    """
+
+    def test_prose_above_menu_is_captured_as_context(self) -> None:
+        pane = _load_fixture("ask_context_prose_above_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        # The recommendation sentence — the whole point of #399 — is carried.
+        assert "私の推しは (A) です" in q.context
+        assert "楽観ロック" in q.context
+        # Menu fields keep parsing exactly as before.
+        assert q.header == "ロック方式"
+        assert [o.label for o in q.options] == ["案A: 楽観ロック (Recommended)", "案B: 悲観ロック"]
+
+    def test_context_has_no_tui_chrome(self) -> None:
+        pane = _load_fixture("ask_context_prose_above_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        for chrome in ("❯", "☐", "Chat about this", "INSERT", "✻", "─────"):
+            assert chrome not in q.context, f"chrome leaked into context: {chrome!r}"
+        # The ● response marker itself is stripped, not carried.
+        assert "●" not in q.context
+
+    def test_echoed_user_prompt_not_in_context(self) -> None:
+        """The user's own prompt (echoed above the response) must not be
+        re-posted to Discord as Claude's context."""
+        pane = _load_fixture("ask_context_prose_above_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert "設計判断の相談です" not in q.context
+
+    def test_tool_block_above_menu_yields_empty_context(self) -> None:
+        """Negative: when the block directly above the menu is a tool
+        invocation (``● Bash(date)`` + ``⎿`` output), there is no prose to
+        carry — context must be empty, and the menu itself must still parse."""
+        pane = _load_fixture("ask_menu_tool_block_above.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.context == ""
+        assert q.header == "時刻確認"
+        assert [o.label for o in q.options] == ["はい", "いいえ"]
+
+    def test_no_context_when_header_scrolled_off(self) -> None:
+        """When the ☐ header scrolled out of the capture the menu region is
+        bounded by a small fallback window — prose extraction must not guess."""
+        pane = (
+            "● 長い散文がここにあったはず\n"
+            "Which one?\n"
+            "❯ 1. Alpha\n"
+            "  2. Beta\n"
+            "  3. Type something.\n"
+            "  4. Chat about this\n"
+        )
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.context == ""
+
+    def test_legacy_layout_unaffected(self) -> None:
+        """The pre-☐ legacy menu fixture has no header anchor → no context."""
+        pane = _load_fixture("ask_user_question_3options.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert isinstance(q.context, str)
+
+    def test_multiselect_tab_header_still_parses(self) -> None:
+        pane = _load_fixture("ask_multiselect_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.multi_select is True
+
+
+class TestPlanContextExtraction:
+    """#399 AC4: plan-approval menus share the buffering gap. Prose directly
+    above the plan box is carried as ``context``; the ``● Updated plan`` /
+    ``⎿ /plan to preview`` tool chrome that usually sits there is not."""
+
+    def test_tool_chrome_above_plan_box_yields_empty_context(self) -> None:
+        pane = _load_fixture("plan_menu_tool_chrome_above.txt")
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert q.context == ""
+        # Plan body still folds into the question (#251 behavior unchanged).
+        assert "Would you like to proceed?" in q.question
+
+    def test_prose_above_plan_box_is_captured(self) -> None:
+        pane = (
+            "❯ 計画を立てて\n"
+            "● 保存形式の判断ポイント: 標準ライブラリだけで済む形式が望ましいです。\n"
+            "  私の推しは JSON 保存です。理由は可搬性です。\n"
+            "──────────────────────────────\n"
+            " Ready to code?\n"
+            " Here is Claude's plan:\n"
+            "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n"
+            " TODO CLI を作る\n"
+            "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n"
+            " Would you like to proceed?\n"
+            " ❯ 1. Yes, and bypass permissions\n"
+            "   2. Yes, manually approve edits\n"
+            "   3. Tell Claude what to change\n"
+        )
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert "私の推しは JSON 保存です" in q.context
+        assert "Ready to code?" not in q.context
+        assert "❯" not in q.context
