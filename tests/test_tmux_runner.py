@@ -11,6 +11,7 @@ import pytest
 from c_lord.claude.tmux_runner import (
     TmuxClaudeRunner,
     _clean_tui_lines,
+    _extract_startup_error,
     _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
@@ -1152,6 +1153,76 @@ class TestTmuxClaudeRunnerRun:
         assert len(result_events) == 1
 
 
+class TestPrematureCompletionOnStaleResponse:
+    """#365: continuing a thread must not report completion off the PREVIOUS
+    turn's still-visible response before the NEW turn starts generating.
+
+    Repro from the real incident (thread 1514163047453687828): the user sent a
+    follow-up message; the pane still showed the previous turn's (stable, non-
+    empty) answer with the input prompt visible, and Claude had not yet shown a
+    generation spinner (``--resume`` / context-load latency).  The completion
+    detector saw "response stable for _RESPONSE_STABLE_TIMEOUT + no spinner +
+    prompt visible" and finalized the turn after ~8s — firing the
+    "Claude has finished — your reply is needed" owner mention BEFORE the real
+    answer was produced (it arrived afterwards via the transcript / skill path).
+
+    The fix gates completion on the new turn actually having started: a
+    generation spinner observed at least once, OR the extracted response having
+    changed from the post-input baseline.
+    """
+
+    @pytest.mark.asyncio
+    async def test_does_not_finalize_on_stale_previous_response(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+
+        # Phase 1: the PREVIOUS turn's answer is still on screen — stable, non-
+        # empty, input prompt visible, NO spinner.  Claude has not picked up the
+        # new prompt yet.  Phase 2: the new turn starts generating (spinner with
+        # an elapsed timer).  Phase 3: the new answer, stable, prompt visible.
+        stale = _make_pane(["● Previous turn answer."], with_input_prompt=True)
+        generating = "\n✻ Working… (2s · ↑ 1.2k tokens)\n────────\n❯\n────────\n-- INSERT --"
+        done = _make_pane(["● Brand new answer for this turn."], with_input_prompt=True)
+
+        # Long enough that the buggy 3-poll-stable quick-exit would have fired
+        # well inside the stale phase.
+        stale_polls = 12
+        gen_polls = 4
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            if calls["n"] <= stale_polls:
+                return stale
+            if calls["n"] <= stale_polls + gen_polls:
+                return generating
+            return done
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.03),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("follow up"):
+                events.append(event)
+
+        # The loop must persist past the stale phase — i.e. it must not finalize
+        # while only the previous turn's residual response is visible.  Before
+        # the fix it broke at ~poll 5 (well under stale_polls), prematurely
+        # firing the completion that drives the owner mention.
+        assert calls["n"] > stale_polls, (
+            f"run() finalized during the stale previous-response phase "
+            f"(only {calls['n']} polls) — premature completion before the new "
+            f"turn started generating"
+        )
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None
+
+
 class TestInactivityTimeout:
     """#94: the hard ``timeout_seconds`` backstop must be inactivity-based.
 
@@ -1398,6 +1469,39 @@ class TestIsGenerating:
     def test_is_generating_empty_text(self) -> None:
         """Empty pane text → False."""
         assert TmuxClaudeRunner._is_generating("") is False
+
+    def test_is_generating_spinner_pushed_off_bottom_six(self) -> None:
+        """#365 follow-up: the live spinner is pushed >6 lines off the bottom.
+
+        Real incident (prod thread 1514448641635385447, 08:51 JST): a continuing
+        turn finalized after 14s and fired the owner mention before the real
+        answer. Root cause — while Claude runs a tool, the tool-result preview +
+        input box + footer push the spinner's timer line 10-20 lines off the
+        bottom (the same layout #190 documented for the lamp). ``_is_generating``
+        only scanned the bottom 6 lines, missed the spinner, reported "not
+        generating", and the completion detector finalized the turn early.
+
+        Detection must scan the live-spinner timer ``(Ns ·`` over a wide bottom
+        window (as the #190 lamp detector already does), not just the bottom 6.
+        """
+        text = "\n".join(
+            [
+                "❯ 前のターンの質問",
+                "",
+                "● 調査しています。まず関連ファイルを読みます。",
+                "✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)",
+                "  ⎿ Bash(uv run pytest tests/test_tmux_runner.py -q)",
+                "     ........................................ [ 41%]",
+                "     ........................................ [ 83%]",
+                "     .............................            [100%]",
+                "     173 passed in 120s",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is True
 
 
 class TestToolExecutionCompletion:
@@ -2687,3 +2791,158 @@ class TestPeekPendingAsk:
     async def test_peek_returns_none_when_no_menu(self, runner, tmux_manager) -> None:
         tmux_manager.capture_pane.return_value = "● Done.\n\n❯\n──────\n-- INSERT --"
         assert await runner.peek_pending_ask() is None
+
+
+# -- Regression tests for #366 (claude startup-error silent swallow) ----------
+
+
+class TestExtractStartupError:
+    """#366: detect a fatal Claude-CLI startup error left in the tmux pane.
+
+    When ``claude`` dies immediately (e.g. a broken install whose native
+    binary was never downloaded), the pane shows the CLI's own error instead
+    of a session.  ``_extract_startup_error`` finds it so the runner can
+    surface it to Discord instead of reporting a silent normal completion.
+    """
+
+    def test_detects_native_binary_not_installed(self) -> None:
+        pane = _load_fixture("claude_native_binary_not_installed.txt")
+        result = _extract_startup_error(pane)
+        assert result is not None
+        assert "native binary not installed" in result.lower()
+
+    def test_detects_command_not_found(self) -> None:
+        pane = (
+            "yousan@host ~ $ env -u CLAUDECODE claude --model opus 'hi'\n"
+            "zsh: command not found: claude\n"
+            "yousan@host ~ $\n"
+        )
+        result = _extract_startup_error(pane)
+        assert result is not None
+        assert "command not found" in result.lower()
+
+    def test_healthy_response_pane_returns_none(self) -> None:
+        pane = _make_pane(["● Sure, here is the fix."], with_input_prompt=True)
+        assert _extract_startup_error(pane) is None
+
+    def test_empty_pane_returns_none(self) -> None:
+        assert _extract_startup_error("") is None
+
+
+class TestRunStartupErrorSurfacing:
+    """#366: a failed/empty Claude run must yield an error, not a silent done."""
+
+    @pytest.mark.asyncio
+    async def test_startup_error_pane_yields_error_event(self, runner, tmux_manager) -> None:
+        """Pane shows 'native binary not installed' → final RESULT carries the error."""
+        pane = _load_fixture("claude_native_binary_not_installed.txt")
+        tmux_manager.capture_pane.return_value = pane
+        # Claude crashed → the foreground process is the shell again.
+        tmux_manager.is_claude_running.return_value = False
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("fix the bug"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "native binary not installed" in result_events[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_response_claude_exited_yields_error(self, runner, tmux_manager) -> None:
+        """No response + claude no longer running → surfaced as an error, not silent."""
+        tmux_manager.capture_pane.return_value = "static text"
+        tmux_manager.is_claude_running.return_value = False
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+
+    @pytest.mark.asyncio
+    async def test_no_response_claude_alive_stays_silent(self, runner, tmux_manager) -> None:
+        """No extractable response but claude is still alive at its prompt →
+        treat as a benign completion (likely a skill-only post we didn't scrape),
+        NOT an error.  Guards against false-positive error embeds."""
+        tmux_manager.capture_pane.return_value = "static text"
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None
+
+
+class TestParseAskNewLayouts:
+    """#388: CLI v2.1.173 renders two newer AskUserQuestion layouts that the
+    parser must read correctly (real captured fixtures):
+
+    - multiSelect: checkbox rows ``❯ 1. [ ] ログ強化`` under a tab row
+      ``←  ☐ 機能  ✔ Submit  →``; meta rows ``Type something``(no period) and
+      ``Submit`` must not leak into options.
+    - preview: a right-hand preview pane drawn NEXT TO the option list; its
+      box-drawing/content must not pollute labels or descriptions.
+    """
+
+    def test_multiselect_labels_and_flag(self) -> None:
+        pane = _load_fixture("ask_multiselect_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == ["ログ強化", "メトリクス", "トレース"]
+        assert q.multi_select is True
+        assert q.header == "機能"
+        descs = [o.description for o in q.options]
+        assert descs == ["構造化ログを有効にする", "Prometheus への送信", "OpenTelemetry トレース"]
+
+    def test_preview_pane_not_in_labels(self) -> None:
+        pane = _load_fixture("ask_preview_pane_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == ["案A 縦並び", "案B 2カラム", "案C グリッド"]
+        for o in q.options:
+            assert "│" not in o.label and "┌" not in o.label
+            assert "│" not in o.description and "Notes:" not in o.description
+        assert q.header == "設計案"
+        assert q.question == "どのレイアウト案にしますか?"
+
+    def test_rich_descriptions_regression(self) -> None:
+        """The dominant single-select layout must keep parsing perfectly."""
+        pane = _load_fixture("ask_rich_descriptions.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.header == "リリース方式"
+        assert [o.label for o in q.options] == [
+            "カナリアリリース",
+            "ブルーグリーン",
+            "ローリング更新",
+            "一斉切り替え",
+        ]
+        assert all(len(o.description) > 20 for o in q.options)
+        assert q.multi_select is False

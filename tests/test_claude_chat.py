@@ -549,26 +549,45 @@ class TestInterruptOnNewMessage:
         thread.parent_id = 999
         thread.send = AsyncMock()
         msg = MagicMock(spec=discord.Message)
+        msg.id = 1
         msg.channel = thread
         msg.content = "new instruction"
         msg.attachments = []
+        msg.reference = None  # no Discord-reply → enrich_discord_references is a no-op
         msg.author = MagicMock()
         msg.author.bot = False
         return msg
 
+    def _plant_active_turn(self, cog: ClaudeChatCog, thread_id: int) -> MagicMock:
+        """Make ``thread_id`` look like it has an in-flight turn.
+
+        Plants an active task plus a runner whose ``interrupt`` lets the task
+        finish (mirroring a SIGINT breaking the runner's poll loop).  Returns the
+        runner so the caller can assert it was interrupted (#315).
+        """
+        runner = MagicMock()
+        done = asyncio.Event()
+        runner.interrupt = AsyncMock(side_effect=lambda *a, **k: done.set())
+        cog._active_runners[thread_id] = runner
+
+        async def active_turn() -> None:
+            try:
+                await done.wait()
+            finally:
+                cog._active_runners.pop(thread_id, None)
+                cog._active_tasks.pop(thread_id, None)
+
+        cog._active_tasks[thread_id] = asyncio.ensure_future(active_turn())
+        return runner
+
     @pytest.mark.asyncio
-    async def test_interrupt_called_when_runner_active(self) -> None:
-        """When a runner is active for a thread, _handle_thread_reply must interrupt it."""
+    async def test_interrupt_called_when_prior_turn_active(self) -> None:
+        """A new message interrupts the in-flight turn (USER_GUIDE behaviour, #315)."""
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
 
-        # Plant an active runner in the cog
-        existing_runner = MagicMock()
-        existing_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = existing_runner
-
-        # Stub _run_claude so we don't actually spawn Claude
+        existing_runner = self._plant_active_turn(cog, thread_id)
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
@@ -576,16 +595,14 @@ class TestInterruptOnNewMessage:
         existing_runner.interrupt.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_interrupt_message_sent_to_thread(self) -> None:
-        """The thread should receive a notification when the session is interrupted."""
+    async def test_interrupt_message_sent_when_preempting(self) -> None:
+        """The thread is notified when an in-flight turn is interrupted (#315)."""
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
         thread = message.channel
 
-        existing_runner = MagicMock()
-        existing_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = existing_runner
+        self._plant_active_turn(cog, thread_id)
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
@@ -640,6 +657,11 @@ class TestInterruptOnNewMessage:
 
         await cog._handle_thread_reply(message)
 
+        # The new turn now runs as its own task off the lock (#315) — let it run.
+        spawned = cog._active_tasks.get(thread_id)
+        assert spawned is not None
+        await asyncio.wait_for(spawned, timeout=1.0)
+
         assert call_order == ["task_done", "new_session_started"]
 
     @pytest.mark.asyncio
@@ -664,6 +686,74 @@ class TestInterruptOnNewMessage:
         cog._run_claude.assert_called_once()
         _, kwargs = cog._run_claude.call_args
         assert kwargs.get("session_id") == "abc-123"
+
+    @pytest.mark.asyncio
+    async def test_parked_menu_run_does_not_wedge_thread(self) -> None:
+        """A turn parked on a bridged menu must not wedge the thread (#315).
+
+        Production repro of the deadlock: the per-thread lock used to be held
+        across the *entire* ``_run_claude``, so a turn parked on an
+        AskUserQuestion / Plan-approval menu bridged to Discord buttons and never
+        clicked (``AskView`` is ``timeout=None``, up to 24h) held the lock
+        forever — every later message blocked on ``async with lock`` and never
+        reached tmux, with no error and no log. The fix dispatches the run off the
+        lock and pre-empts a menu-parked turn (detected via the ask-bus) so the
+        new message runs.
+        """
+        from c_lord.discord_ui.ask_bus import ask_bus
+
+        cog = _make_cog()
+        thread_id = 42
+        run_calls: list[str] = []
+
+        async def run_claude_stub(user_message, thread, prompt, **kwargs) -> None:
+            run_calls.append(prompt)
+            if len(run_calls) == 1:
+                # Model a turn parked on a bridged menu: register an ask-bus
+                # waiter (as bridge_pane_ask does) and block on the Discord button.
+                runner = MagicMock()
+                runner.interrupt = AsyncMock()
+                cog._active_runners[thread_id] = runner
+                cog._active_tasks[thread_id] = asyncio.current_task()
+                answer_q = ask_bus.register(thread_id)
+                try:
+                    await answer_q.get()  # timeout=None — the #315 park point
+                finally:
+                    ask_bus.unregister(thread_id)
+                    cog._active_runners.pop(thread_id, None)
+                    cog._active_tasks.pop(thread_id, None)
+
+        cog._run_claude = run_claude_stub
+
+        # First message starts the turn, which parks on the bridged menu.
+        task1 = asyncio.ensure_future(
+            cog._handle_thread_reply(self._make_thread_message(thread_id))
+        )
+        await asyncio.sleep(0.05)
+        assert run_calls == ["new instruction"], "first turn should start and park"
+        assert ask_bus.is_active(thread_id), "first turn should be parked on the menu"
+        existing_runner = cog._active_runners[thread_id]
+
+        # Second message must pre-empt the menu-parked turn and run — not hang on
+        # the (previously held-across-run) per-thread lock.
+        try:
+            await asyncio.wait_for(
+                cog._handle_thread_reply(self._make_thread_message(thread_id)),
+                timeout=2.0,
+            )
+        except TimeoutError:
+            ask_bus.unregister(thread_id)
+            task1.cancel()
+            pytest.fail(
+                "DEADLOCK: a menu-parked turn blocked a new message — Discord "
+                "input would never reach tmux (#315 repro)."
+            )
+
+        existing_runner.interrupt.assert_called_once()
+        await asyncio.sleep(0.05)
+        assert len(run_calls) == 2, "the new message's own turn should have run"
+        assert not ask_bus.is_active(thread_id), "the bridged menu should be dismissed"
+        await asyncio.wait_for(task1, timeout=1.0)
 
     @pytest.mark.asyncio
     async def test_active_tasks_dict_initialized(self) -> None:
@@ -1788,8 +1878,15 @@ class TestThreadLockSerialization:
         t2 = asyncio.create_task(cog._handle_thread_reply(msg2))
         await asyncio.gather(t1, t2)
 
-        # With serialization, call_log should be [start, end, start, end]
-        # Without it, it would be [start, start, end, end]
+        # Runs are dispatched as their own tasks off the lock now (#315); the
+        # second message pre-empts the first, which is drained before the second
+        # run starts — so the two never overlap.  Wait for the last spawned run.
+        spawned = cog._active_tasks.get(42)
+        if spawned is not None:
+            await asyncio.wait_for(spawned, timeout=2.0)
+
+        # No overlap: the runs execute one after the other, never concurrently.
+        # With overlap it would be [start, start, end, end].
         assert call_log == ["start", "end", "start", "end"]
 
 
@@ -2272,6 +2369,11 @@ class TestDiscordLinkEnrichmentWireIn:
         msg.author.bot = False
 
         await cog._handle_thread_reply(msg)
+        # The run is now dispatched as its own task off the lock (#315) — await it
+        # so the enriched prompt actually reaches _run_claude.
+        spawned = cog._active_tasks.get(42)
+        assert spawned is not None
+        await asyncio.wait_for(spawned, timeout=1.0)
 
         cog._run_claude.assert_awaited_once()
         prompt_arg = cog._run_claude.await_args.args[2]

@@ -358,10 +358,11 @@ incident that motivated this.
 
 **Label-based exemptions** (enforced by `dod-gate` CI — see `.github/workflows/dod-gate.yml`):
 
-- `no-runtime-change` or `documentation` label: **waives the DoD-completion checklist below** (notably the **TDD evidence** and **Staging verification** requirements). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
+- `no-runtime-change` or `documentation` label: **waives the DoD-completion checklist below** (notably the **TDD evidence**, **Staging verification**, and the **evidence-link requirement**). Use for pure-docs, CI/tooling, or provably no-behavior-change commits.
 - **`Closes` discipline is always enforced**, regardless of labels: if a PR uses `Closes`/`Resolves #N`, that Issue's Acceptance Criteria must be 100% met (else use `Refs #N`).
+- **Evidence-link required** (#391): a PR **without** an exempt label must contain a 証跡 image (`![...](URL)`) or a Release-asset URL in its body, or `dod-gate` fails. Text logs alone do not pass — paste an actual screenshot/URL (`scripts/evidence_upload.py`), or apply `no-runtime-change`/`documentation` if evidence is genuinely N/A.
 
-<!-- 参照はルール名で固定（番号で指さない）。項目を挿入すると番号がずれ免除対象がずれるため。dod-gate.yml の実挙動: ラベルあり → DoD 完了要件 (Rule 1) を免除 / `Closes` 規律 (Rule 2) は常時適用。 -->
+<!-- 参照はルール名で固定（番号で指さない）。項目を挿入すると番号がずれ免除対象がずれるため。dod-gate.yml の実挙動: ラベルあり → DoD 完了要件 (Rule 1) + 証跡リンク必須 (Rule 3) を免除 / `Closes` 規律 (Rule 2) は常時適用。 -->
 
 A PR may be merged only when:
 
@@ -369,7 +370,7 @@ A PR may be merged only when:
 - [ ] **TDD evidence**: the new test failed before the change (RED) and passes after (GREEN). Paste the RED failure line.
 - [ ] **Detection bug fixture rule**: if the fix targets a TUI prompt detection function (`_has_permission_prompt`, `_is_yn_prompt`, `_has_unknown_interactive`), add a real captured pane snapshot to `tests/fixtures/panes/` **before** writing the fix. The fixture must reproduce the bug (i.e. the broken detection returns a wrong value on that snapshot).
 - [ ] **`pytest` + `ruff check` + `ruff format --check` + `pyright` all green** (CI covers this).
-- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡は AI が `scripts/discord_evidence_shot.sh` で撮った実画面スクショが主**（#243。bot ホスト上で実行）。tmux ペインキャプチャ（#286）+ REST 取得メッセージ本文で補強し、人間提供スクショは AI のキャプチャが届かない場面の補助とする。**証跡 PNG は PR ブランチに commit する（`docs/evidence/<issue番号>/`）— Discord CDN の添付 URL は期限付きなので PR/Issue 本文に直貼りしない**（詳細は `docs/discord-evidence-capture.md`）。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.** 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助。証跡規約 #291 → #350 で更新）。
+- [ ] **Staging behavior verified** (unless the [skip exceptions](#動作確認スキーム-必須) apply): RED reproduced + GREEN confirmed **on staging** (not just mocks), with log excerpts pasted under a `## Staging Evidence` heading (timestamp / thread / branch hash, clickable URLs). **Discord 側の証跡は AI が `scripts/discord_evidence_shot.sh` で撮った実画面スクショが主**（#243。bot ホスト上で実行）。tmux ペインキャプチャ（#286）+ REST 取得メッセージ本文で補強し、人間提供スクショは AI のキャプチャが届かない場面の補助とする。**証跡 PNG は `scripts/evidence_upload.py` で GitHub Release アセット（prerelease タグ `evidence`）にアップロードし、その URL を PR/Issue 本文に貼る（git ツリーには commit しない — バイナリで履歴が膨らむ＆業界的にも off-repo + リンクが定石）。証跡は催促される前に貼る（必須）。Discord CDN の添付 URL は期限付きなので直貼りしない**（詳細は `docs/discord-evidence-capture.md`、#390）。長いログは `<details>` で畳む。**An empty Staging Evidence section = not done.** 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助。証跡規約 #291 → #350 で更新）。
 - [ ] **動きを変えたら「あるべき動き」も更新する**: 利用者から見た動きを変える PR は、対応する「あるべき動き」を説明したドキュメント（`docs/specs/` などの仕様・`README.md`・`docs/` の該当箇所）も同じ PR で更新する。動きを変えないなら PR 本文に `no-user-visible-change` と明記する（更新不要であることをはっきり宣言する）。**狙い**: ドキュメントが実際の動きとズレる（drift する）のを防ぎ、「あるべき動き」を信用できる状態に保つ。
 - [ ] **No unrelated changes** in the diff; self-review done (`git diff main` が当該変更だけかを確認)。
 - [ ] **Closes gating**: use `Closes #N` / `Resolves #N` **only if this PR satisfies 100% of that Issue's ACs**. If any AC is deferred, use `Refs #N` instead and leave the Issue open with a comment naming what remains. **キーワードは箇条書き (`- `) の中に入れず独立行に正確に書く**（リスト内だと GitHub が拾わない）。Never let a partial PR auto-close an Issue.
@@ -434,7 +435,7 @@ bash scripts/staging.sh restart main                    # 4. 原状復帰 (idle 
 bash scripts/staging.sh release                         # 5. 返却
 ```
 
-webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッドに sessions レコードが必要、等) は STAGING.md の「検証レシピ」を参照。PR 本文の "Staging Evidence" には RED→GREEN のログ抜粋に加え、**RED / GREEN それぞれの Discord 実画面スクショ**を主証跡として貼る — `scripts/discord_evidence_shot.sh "<検証スレッドの URL>" -o red.png` のように撮り、PNG は `docs/evidence/<issue番号>/` に commit して参照する (#243)。
+webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッドに sessions レコードが必要、等) は STAGING.md の「検証レシピ」を参照。PR 本文の "Staging Evidence" には RED→GREEN のログ抜粋に加え、**RED / GREEN それぞれの Discord 実画面スクショ**を主証跡として貼る — `scripts/discord_evidence_shot.sh "<検証スレッドの URL>" -o red.png` のように撮り、`scripts/evidence_upload.py red.png green.png --issue <N>` で `evidence` リリースにアップロードして出力された URL を参照する (#390。git には commit しない)。
 
 **機能追加の場合**: RED の代わりに「実装前は存在しない挙動」「実装後は期待挙動」を webhook + ログで観測する。例: 構造化ログ追加 PR では `grep "thread=<id>" /tmp/clord-bot-staging.log` で **before = ヒットしない / after = enter/exit ペアが出る** を比較。
 

@@ -57,6 +57,16 @@ _REPLY_WAIT_INTERVAL = 0.2  # 8 × 200ms = up to 1.6 s
 # mismatch forces a re-probe.  The numerator is re-read every turn regardless.
 _context_window_cache: dict[str, tuple[str | None, int]] = {}
 
+# #370: settings-table key prefix for the per-model context-window total.  The
+# in-memory cache above is cleared on every bot restart, so the /context probe
+# (which renders into the human-visible tmux pane) re-fires once per session
+# after each restart.  Persisting the learned total per model — the tier is
+# stable per (host, account, model) — lets the probe fire at most once per model
+# per host instead.  One scalar key per model (not a JSON blob) so concurrent
+# probes of different models are independent ON CONFLICT upserts, no read-
+# modify-write race.  Stored in the existing ``settings`` KV (no new table).
+_CONTEXT_WINDOW_KEY_PREFIX = "context_window:"
+
 # Max characters for tool result display (re-exported for backward compat).
 TOOL_RESULT_MAX_CHARS = 3000
 
@@ -185,21 +195,56 @@ async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:
             logger.debug("Deleted image tempfile: %s", path)
 
 
+async def _load_persisted_window(settings_repo: object, model: str) -> int | None:
+    """Return the disk-persisted context-window total for ``model``, or None.
+
+    Best-effort: a missing key, a malformed value, or any storage error yields
+    None so the caller falls back to a live probe.
+    """
+    with contextlib.suppress(Exception):
+        raw = await settings_repo.get(f"{_CONTEXT_WINDOW_KEY_PREFIX}{model}")  # type: ignore[attr-defined]
+        if raw is not None:
+            value = int(raw)
+            if value > 0:
+                return value
+    return None
+
+
+async def _store_persisted_window(settings_repo: object, model: str, total: int) -> None:
+    """Persist ``total`` as the context-window for ``model`` (best-effort)."""
+    with contextlib.suppress(Exception):
+        await settings_repo.set(f"{_CONTEXT_WINDOW_KEY_PREFIX}{model}", str(total))  # type: ignore[attr-defined]
+
+
 async def _resolve_context_window(
     config: RunConfig, session_id: str, model: str | None, used: int = 0
 ) -> int:
     """Return the context-window total for ``session_id`` running ``model``.
 
-    Learned by scraping ``/context`` (Claude is idle at the prompt after a turn
-    completes), then cached.  A re-probe is forced when ``model`` differs from
-    the value cached for this session, since the window size can change with the
-    model.  Falls back to a per-model default when the runner cannot probe or
-    the pane cannot be parsed — ``used`` is passed so the fallback can never
-    report a window smaller than the tokens already in it (#292).
+    Resolution order: in-memory cache → disk (``settings`` KV, keyed by model,
+    #370) → live ``/context`` probe → per-model fallback.  The probe scrapes
+    ``/context`` (Claude is idle at the prompt after a turn completes) and
+    renders into the human-visible tmux pane, so it is avoided whenever the
+    total is already known on disk.  A re-probe is forced when ``model`` differs
+    from the value cached for this session, since the window size can change
+    with the model.  Falls back to a per-model default when the runner cannot
+    probe or the pane cannot be parsed — ``used`` is passed so the fallback can
+    never report a window smaller than the tokens already in it (#292).
     """
     cached = _context_window_cache.get(session_id)
     if cached is not None and cached[0] == model:
         return cached[1]
+
+    settings_repo = getattr(config, "settings_repo", None)
+
+    # Disk layer (#370): the total is stable per (host, account, model), so a
+    # value learned once survives bot restarts and other sessions — no probe,
+    # no tmux-pane pollution.  Keyed by model; skipped when model is unknown.
+    if settings_repo is not None and model:
+        persisted = await _load_persisted_window(settings_repo, model)
+        if persisted is not None:
+            _context_window_cache[session_id] = (model, persisted)
+            return persisted
 
     total: int | None = None
     probe = getattr(config.runner, "probe_context_window", None)
@@ -211,6 +256,8 @@ async def _resolve_context_window(
         # Cache only successful probes — a transient pane-parse failure must
         # not lock the per-model fallback in for the rest of the session.
         _context_window_cache[session_id] = (model, total)
+        if settings_repo is not None and model:
+            await _store_persisted_window(settings_repo, model, total)
         return total
     return fallback_window(model or getattr(config.runner, "model", None), used)
 
@@ -331,7 +378,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # guards that gate the #67 notice below. (Gating it there left prod's jsonl
     # mode never recovering a post-turn menu, so the user saw no choices — #222.)
     pending_pane_ask = None
-    if not run_errored and not processor.pending_ask and isinstance(runner, TmuxClaudeRunner):
+    if (
+        not run_errored
+        and not processor.pending_ask
+        and isinstance(runner, TmuxClaudeRunner)
+        and not runner.stopped
+    ):
+        # ``runner.stopped`` guard (#315): a turn pre-empted by a follow-up message
+        # was deliberately torn down; re-bridging its leftover menu here would
+        # re-park the run on a fresh ``timeout=None`` await and the new turn could
+        # never start (observed on staging — the ⚡ fired but no new run began).
         pending_pane_ask = await runner.peek_pending_ask()
 
     if pending_pane_ask is not None:

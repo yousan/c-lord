@@ -18,6 +18,7 @@ from ..concurrency import SessionRegistry
 from ..database.ask_repo import PendingAskRepository
 from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRepository
+from ..database.settings_repo import SettingsRepository
 from ..discord_ui.status import StatusManager
 
 if TYPE_CHECKING:
@@ -45,6 +46,9 @@ class RunConfig:
                   notice is prepended to the prompt.
         ask_repo: Repository for persisting AskUserQuestion state across restarts.
         lounge_repo: Repository for AI Lounge context injection.
+        settings_repo: KV store for the persisted per-model context-window total
+                       (#370). When provided, a learned window survives restarts
+                       and the /context probe stops re-running every session.
         stop_view: StopView instance to bump after each major message, keeping
                    the Stop button at the bottom of the thread.
         session_dir_manager: SessionDirManager for automatic session dir cleanup.
@@ -64,6 +68,10 @@ class RunConfig:
     registry: SessionRegistry | None = None
     ask_repo: PendingAskRepository | None = None
     lounge_repo: LoungeRepository | None = None
+    # #370: persists the per-model context-window total so the /context probe
+    # (which renders into the human-visible tmux pane) fires at most once per
+    # model per host instead of once per session / bot-restart.
+    settings_repo: SettingsRepository | None = None
     stop_view: StopView | None = None
     session_dir_manager: SessionDirManager | None = None
     tmux_manager: TmuxSessionManager | None = None

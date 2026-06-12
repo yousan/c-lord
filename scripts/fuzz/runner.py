@@ -71,12 +71,23 @@ class FuzzConfig:
     out_dir: str
     claude_cmd: str
     model: str
+    inject_mode: str
+    skip_health: bool
 
 
-def build_config(env: dict[str, str], args: argparse.Namespace) -> FuzzConfig:
-    """Merge ``.env`` values, process env, and CLI args into a FuzzConfig.
+def build_config(
+    env: dict[str, str], args: argparse.Namespace, *, staging_dir: str | None = None
+) -> FuzzConfig:
+    """Merge ``.env`` values and CLI args into a FuzzConfig for one staging clone.
 
     Precedence: explicit CLI arg > FUZZ_* key > generic fallback key > default.
+
+    ``staging_dir`` (when given) is the specific clone this config targets — each
+    fleet clone has its own ``.env``, so ``env`` should be that clone's. The
+    injection mode is resolved here: a clone running ``CLORD_BRIDGE_MODE=jsonl``
+    does not bind its REST API, so ``spawn`` + ``/api/health`` are unreachable —
+    we default such a clone to ``webhook`` + ``skip_health`` unless the operator
+    passed an explicit ``--inject``.
     """
 
     def pick(*keys: str, default: str | None = None) -> str | None:
@@ -85,6 +96,18 @@ def build_config(env: dict[str, str], args: argparse.Namespace) -> FuzzConfig:
             if v:
                 return v
         return default
+
+    bridge_jsonl = (env.get("CLORD_BRIDGE_MODE") or "").strip().lower() == "jsonl"
+    explicit_inject = getattr(args, "inject", None)
+    inject_mode = explicit_inject or ("webhook" if bridge_jsonl else "spawn")
+    skip_health = bool(getattr(args, "skip_health", False)) or (
+        bridge_jsonl and inject_mode == "webhook"
+    )
+    resolved_staging = (
+        staging_dir
+        if staging_dir is not None
+        else (args.staging_dir or env.get("FUZZ_STAGING_CLONE_DIR"))
+    )
 
     return FuzzConfig(
         api_url=pick("FUZZ_API_URL", "CLORD_API_URL", default=DEFAULT_API_URL) or DEFAULT_API_URL,
@@ -97,11 +120,28 @@ def build_config(env: dict[str, str], args: argparse.Namespace) -> FuzzConfig:
         webhook_thread_id=pick("FUZZ_TEST_THREAD_ID", "E2E_TEST_THREAD_ID"),
         guild_id=pick("FUZZ_GUILD_ID", "DISCORD_GUILD_ID"),
         lease_owner=pick("CLORD_LEASE_OWNER", default="fuzz-hourly") or "fuzz-hourly",
-        staging_dir=args.staging_dir or env.get("FUZZ_STAGING_CLONE_DIR"),
+        staging_dir=resolved_staging,
         out_dir=args.out_dir,
         claude_cmd=pick("CLAUDE_COMMAND", default="claude") or "claude",
         model=args.model,
+        inject_mode=inject_mode,
+        skip_health=skip_health,
     )
+
+
+def candidate_clones(args: argparse.Namespace, env: dict[str, str]) -> list[str]:
+    """Ordered list of staging clone dirs to try (fleet rotation).
+
+    ``--staging-clones`` / ``FUZZ_STAGING_CLONES`` (comma-separated) wins; else a
+    single ``--staging-dir`` / ``FUZZ_STAGING_CLONE_DIR``; else the cwd (``.``).
+    """
+    raw = getattr(args, "staging_clones", None) or env.get("FUZZ_STAGING_CLONES")
+    if raw:
+        clones = [c.strip() for c in raw.split(",") if c.strip()]
+        if clones:
+            return clones
+    single = args.staging_dir or env.get("FUZZ_STAGING_CLONE_DIR")
+    return [single] if single else ["."]
 
 
 # --------------------------------------------------------------------------
@@ -109,13 +149,24 @@ def build_config(env: dict[str, str], args: argparse.Namespace) -> FuzzConfig:
 # --------------------------------------------------------------------------
 def _staging(cfg: FuzzConfig, *staging_args: str) -> subprocess.CompletedProcess:
     cwd = cfg.staging_dir or "."
-    return subprocess.run(
-        ["bash", "scripts/staging.sh", *staging_args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # A clone dir can vanish under us (the fleet rename did exactly this) — treat
+    # a missing cwd as a non-zero result, not a FileNotFoundError traceback.
+    if not Path(cwd).is_dir():
+        return subprocess.CompletedProcess(
+            args=list(staging_args), returncode=127, stdout="", stderr=f"no such clone dir: {cwd}"
+        )
+    try:
+        return subprocess.run(
+            ["bash", "scripts/staging.sh", *staging_args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        return subprocess.CompletedProcess(
+            args=list(staging_args), returncode=127, stdout="", stderr=str(exc)
+        )
 
 
 def borrow_lease(cfg: FuzzConfig, purpose: str) -> bool:
@@ -170,7 +221,7 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
             started_at=started_at,
             finished_at=datetime.now().isoformat(timespec="seconds"),
             branch=_git_branch(cfg.staging_dir),
-            inject_mode=args.inject if not args.dry_run else "dry-run",
+            inject_mode=cfg.inject_mode if not args.dry_run else "dry-run",
             scenarios=[],
             observations=[],
             anomalies=[],
@@ -197,7 +248,7 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
         api_url=cfg.api_url,
         api_secret=cfg.api_secret,
         webhook_url=cfg.webhook_url,
-        skip_health=args.skip_health,
+        skip_health=cfg.skip_health,
     )
     bot_id = _bot_user_id(client)
 
@@ -217,12 +268,12 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
         if _monotonic() > deadline:
             log(f"budget {args.budget}s exhausted — skipping remaining scenarios")
             break
-        log(f"injecting [{s.id}] ({s.category}) via {args.inject}")
+        log(f"injecting [{s.id}] ({s.category}) via {cfg.inject_mode}")
         try:
             obs = inject_and_observe(
                 client,
                 s,
-                mode=args.inject,
+                mode=cfg.inject_mode,
                 channel_id=cfg.inject_channel_id or "",
                 bot_id=bot_id,
                 webhook_thread_id=cfg.webhook_thread_id,
@@ -252,7 +303,7 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
         started_at=started_at,
         finished_at=datetime.now().isoformat(timespec="seconds"),
         branch=_git_branch(cfg.staging_dir),
-        inject_mode=args.inject,
+        inject_mode=cfg.inject_mode,
         scenarios=scenarios,
         observations=observations,
         anomalies=anomalies,
@@ -276,16 +327,30 @@ def _run_once(cfg: FuzzConfig, args: argparse.Namespace) -> dict:
     return report
 
 
-def run(cfg: FuzzConfig, args: argparse.Namespace) -> int:
+def _config_for(clone: str, args: argparse.Namespace, root_env: dict[str, str]) -> FuzzConfig:
+    """Build the config for one fleet clone, reading that clone's own ``.env``."""
+    env = load_env_file(Path(clone) / ".env") if clone not in (".", None) else root_env
+    return build_config(env, args, staging_dir=clone)
+
+
+def run_fleet(clones: list[str], args: argparse.Namespace, root_env: dict[str, str]) -> int:
+    """Try each staging clone in order; run on the first one we can lease.
+
+    ``dry-run`` / ``no-lease`` use the first clone's config and skip the lease
+    dance. When every clone is busy or absent, skip cleanly (exit 0).
+    """
     if args.dry_run or args.no_lease:
-        _run_once(cfg, args)
+        _run_once(_config_for(clones[0], args, root_env), args)
         return 0
-    if not borrow_lease(cfg, purpose=args.purpose):
-        return 0  # occupied by another owner — skip this hour cleanly
-    try:
-        _run_once(cfg, args)
-    finally:
-        release_lease(cfg)
+    for clone in clones:
+        cfg = _config_for(clone, args, root_env)
+        if borrow_lease(cfg, purpose=args.purpose):
+            try:
+                _run_once(cfg, args)
+            finally:
+                release_lease(cfg)
+            return 0
+    log(f"all {len(clones)} staging target(s) busy/absent → skip this round")
     return 0
 
 
@@ -345,8 +410,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--inject",
         choices=("spawn", "webhook"),
-        default="spawn",
-        help="spawn = fresh thread per scenario (default); webhook = multi-turn into one thread",
+        default=None,
+        help="spawn = fresh thread/scenario; webhook = multi-turn into one thread. "
+        "Default: auto — webhook on CLORD_BRIDGE_MODE=jsonl clones (API unbound), else spawn.",
     )
     p.add_argument("--focus", default=None, help="bias the generated batch toward a theme")
     p.add_argument("--model", default="haiku", help="claude model for generation (default haiku)")
@@ -360,7 +426,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--channel", default=None, help="override inject channel id")
     p.add_argument("--report-channel", default=None, help="override report channel id")
-    p.add_argument("--staging-dir", default=None, help="staging clone dir for lease management")
+    p.add_argument("--staging-dir", default=None, help="single staging clone dir for lease mgmt")
+    p.add_argument(
+        "--staging-clones",
+        default=None,
+        help="comma-separated staging clone dirs (fleet); runs on the first one it can lease",
+    )
     p.add_argument(
         "--env-file",
         default=None,
@@ -386,15 +457,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    env_path = (
+    # Root env supplies the fleet list (FUZZ_STAGING_CLONES) and single-clone
+    # fallbacks; per-clone tokens/channels are read from each clone's own .env.
+    root_env_path = (
         Path(args.env_file)
         if args.env_file
         else (Path(args.staging_dir) / ".env" if args.staging_dir else Path(".env"))
     )
-    env = load_env_file(env_path)
-    cfg = build_config(env, args)
+    root_env = load_env_file(root_env_path)
+    clones = candidate_clones(args, root_env)
     try:
-        return run(cfg, args)
+        return run_fleet(clones, args, root_env)
     except GenerationError as exc:
         log(f"generation failed: {exc}")
         return 1

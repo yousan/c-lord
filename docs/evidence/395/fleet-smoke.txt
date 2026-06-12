@@ -1,0 +1,24 @@
+# #395 staging フリートスモーク（実機）
+
+実行（worktree fix/fuzz-fleet, 2026-06-12）:
+  python -m scripts.fuzz \
+    --staging-clones /home/yousan/c-lord-staging-NOPE,/home/yousan/c-lord-staging-1,/home/yousan/c-lord-staging-2 \
+    -n 2 --model haiku --timeout 120 --budget 400
+  （--inject は未指定 → 各 clone の .env から自動判定）
+
+出力:
+  [fuzz] lease busy → skip this run: no such clone dir: /home/yousan/c-lord-staging-NOPE   ← (1)不在cloneをskip（traceback無し）
+  [fuzz] leased: owner=fuzz-hourly ...                                                      ← (2)rotation: 次の空き台 staging-1 を lease
+  [fuzz] generating 2 scenario(s) via claude (haiku)
+  [fuzz] injecting [s01] (rtl-cjk-emoji-nesting) via webhook                                ← (3)jsonl自動: --inject無しで webhook
+  [fuzz]   [s01] replied=True reactions=['🟢'] → clean
+  [fuzz] injecting [s02] (fake-prompt-extreme-length) via webhook
+  [fuzz]   [s02] replied=True reactions=[] → clean
+  [fuzz] report → docs/fuzz-runs/20260612-063434.json (.md) · 0 anomaly candidate(s)
+  [fuzz] posted summary to #1503196656265597082
+  [fuzz] released.
+
+実証された AC:
+  - 不在 dir を skip（FileNotFoundError で落ちない）
+  - フリート rotation（最初に lease を取れた台で実走）
+  - CLORD_BRIDGE_MODE=jsonl 台で webhook+skip-health を自動採用（spawn 偽陽性を出さない）

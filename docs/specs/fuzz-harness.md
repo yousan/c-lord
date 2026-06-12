@@ -102,16 +102,29 @@ harness は「チャンネルが用意され `/clord-init` 済み」を前提に
      `.env` の `CLORD_API_URL=:8089` が実際の bind とドリフトしていて実害が出た）。設定後に
      `curl -m3 $FUZZ_API_URL/api/health` が 200 を返すことを必ず確認する。API がこのホストから
      到達不能なら `--inject webhook --skip-health`（`FUZZ_WEBHOOK_URL`＋`FUZZ_TEST_THREAD_ID` を設定）で運用する。
-4. cron を入れる（毎時 0 分）:
+4. cron を入れる（毎時 0 分）。**フリート（#395）**は `FUZZ_STAGING_CLONES` に複数 clone を渡す:
 
    ```cron
-   0 * * * * FUZZ_STAGING_CLONE_DIR=/home/you/c-lord-parallel-3 \
+   0 * * * * FUZZ_STAGING_CLONES=/home/you/c-lord-staging-1,/home/you/c-lord-staging-2,/home/you/c-lord-staging-3,/home/you/c-lord-staging-4 \
      /home/you/c-lord/scripts/fuzz/cron_hourly.sh
    ```
 
    `cron_hourly.sh` は自分の置かれた clone（harness コードと `.venv` を持つ安定 clone）から実行し、
-   `--staging-dir` で staging clone を指す。config は staging clone の `.env` から読む。
-   ログは `$FUZZ_LOG_DIR`（既定 `/tmp`）に per-run + 最新 symlink で残る。
+   `--staging-clones` でフリートを指す。config は **各 staging clone 自身の `.env`** から読む。
+   ログは `$FUZZ_LOG_DIR`（既定 `/tmp`）に per-run + 最新 symlink で残る。単一台なら
+   `FUZZ_STAGING_CLONES` の代わりに `FUZZ_STAGING_CLONE_DIR` でも可。
+
+### フリート rotation と注入モード自動判定（#395）
+
+- **rotation**: `--staging-clones`（または `FUZZ_STAGING_CLONES`）に複数 clone を渡すと、harness は
+  **lease を borrow できた最初の台で実走**する。全台が占有中/不在なら静かに skip（exit 0）。1台が
+  検証で塞がっていても、別の空き台で撃てる（staging フリート #381 の活用）。
+- **jsonl-bridge 自動判定**: 対象 clone の `.env` が `CLORD_BRIDGE_MODE=jsonl` の場合、その bot は
+  **REST API（ApiServer）を bind しない**（`docs/STAGING.md`「staging フリート」節）。harness は
+  `--inject` 未指定ならこの台を自動的に **webhook + skip-health** で撃つ（spawn の偽陽性 SPAWN_FAILED/
+  HEALTH_DOWN を出さない）。明示 `--inject spawn` は尊重する。
+- **堅牢化**: `--staging-dir`/clone が**存在しない**場合は「その台を skip」として扱い、`FileNotFoundError`
+  で落ちない（フリート改称で対象 dir が消えた事故を踏まえた #395）。
 
 ## 手で動かす
 

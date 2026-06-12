@@ -69,6 +69,15 @@ _ATTACHMENT_URL_NOTE = (
     "(This is a signed CDN URL valid for ~24 hours. Use the WebFetch tool or curl to retrieve it.)"
 )
 
+# Issue #75: shown when the bot lacks send permission (discord.Forbidden / 50001
+# Missing Access) on a channel or thread.  Names the exact permissions to grant
+# so the user can self-diagnose instead of staring at a silent failure.
+_SEND_PERMISSION_HELP = (
+    "❌ このチャンネル/スレッドに書き込み権限がありません。\n"
+    "Bot に「メッセージの送信」「公開スレッドでのメッセージ送信」"
+    "「プライベートスレッドでのメッセージ送信」を付与してください。"
+)
+
 
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
@@ -443,7 +452,18 @@ class ClaudeChatCog(commands.Cog):
             # Continue in existing thread
             record = await self.repo.get(channel.id)
             session_id = (record.session_id or None) if record else None
-            seed_message = await channel.send(prompt)
+            try:
+                seed_message = await channel.send(prompt)
+            except discord.Forbidden:
+                # #75: bot lacks "Send Messages in Threads" → tell the user the
+                # exact missing permission instead of a silent 50001 traceback.
+                logger.warning(
+                    "%s seed send forbidden (missing send permission)",
+                    log_ctx(thread_id=channel.id),
+                    exc_info=True,
+                )
+                await respond(_SEND_PERMISSION_HELP, ephemeral=True)
+                return
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
             await respond("Session completed.", silent=True)
         else:
@@ -808,7 +828,22 @@ class ClaudeChatCog(commands.Cog):
             auto_archive_duration=archive_minutes,
         )
         # Post the prompt so StatusManager has a Message to add reactions to.
-        seed_message = await thread.send(prompt)
+        try:
+            seed_message = await thread.send(prompt)
+        except discord.Forbidden:
+            # #75: bot can create the thread but lacks "Send Messages in
+            # Threads".  The thread itself is unreachable, so surface the
+            # permission guidance in the parent channel where the user can see
+            # it, then re-raise so the caller (/clord, /api/spawn) knows the
+            # spawn failed instead of returning a dead thread.
+            logger.warning(
+                "%s spawn seed send forbidden (missing send permission)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(_SEND_PERMISSION_HELP)
+            raise
         # Run Claude in the background so /api/spawn returns immediately.
         # The caller gets the thread reference without waiting for Claude to finish.
         asyncio.create_task(self._run_claude(seed_message, thread, prompt, session_id=session_id))
@@ -944,14 +979,19 @@ class ClaudeChatCog(commands.Cog):
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
 
-        If Claude is already running in this thread, sends SIGINT to the active
-        session (graceful interrupt, like pressing Escape) and waits for it to
-        finish cleaning up before starting the new session.  This prevents two
-        Claude processes from running in parallel in the same thread.
+        A new message while a turn is already in flight **interrupts** that turn
+        and starts fresh with the new instruction — the documented behaviour (see
+        USER_GUIDE → "Interrupting").  :meth:`_preempt_prior_turn` does the
+        teardown, which also covers a turn parked on a bridged
+        AskUserQuestion/plan menu whose ``timeout=None`` await previously wedged
+        the thread forever (#315).
 
-        A per-thread asyncio.Lock serializes concurrent calls so that a second
-        message arriving before the first registers in ``_active_runners``
-        cannot spawn a duplicate ``_run_claude``.
+        A per-thread asyncio.Lock serializes the *setup* of concurrent calls so a
+        second message arriving before the first registers cannot spawn a
+        duplicate ``_run_claude``.  The lock is **not** held across the turn
+        itself (the run is dispatched as its own task), so a turn that blocks on a
+        bridged menu can never hold the lock — that held-across-run lock was the
+        #315 deadlock.
         """
         thread = message.channel
         assert isinstance(thread, discord.Thread)
@@ -963,23 +1003,23 @@ class ClaudeChatCog(commands.Cog):
             prompt, image_paths = await self._build_prompt_and_images(message)
             prompt = await enrich_discord_references(prompt, message, self.bot)
 
-            # Interrupt any active session in this thread before starting a new one.
-            existing_runner = self._active_runners.get(thread.id)
-            existing_task = self._active_tasks.get(thread.id)
-            if existing_runner is not None:
-                await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
-                await existing_runner.interrupt(silent=True)
-                # Wait for the interrupted _run_claude to finish its finally block
-                # (which releases the semaphore and removes entries from dicts).
-                if existing_task is not None and not existing_task.done():
-                    with contextlib.suppress(Exception):
-                        await existing_task
+            # Interrupt any in-flight turn for this thread before starting the new
+            # one.  We key on ``_active_tasks`` (set synchronously below, under
+            # this same lock) rather than ``_active_runners`` (registered later,
+            # inside ``_run_claude``): this removes the registration race the lock
+            # was added for, without holding the lock across the run — so a turn
+            # parked on a bridged menu can no longer wedge the thread (#315).
+            prev_task = self._active_tasks.get(thread.id)
+            prev_runner = self._active_runners.get(thread.id)
+            had_active = prev_task is not None and not prev_task.done()
+            if prev_task is not None and had_active:
+                await self._preempt_prior_turn(thread, prev_task, prev_runner)
 
             # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
             # death) but a prior session's transcript is still on disk, resume it via
             # --continue instead of starting fresh and discarding the history.
             # Conditions:
-            #   - existing_runner is None: an interrupted-but-live session stays alive
+            #   - no in-flight turn: an interrupted-but-live session stays alive
             #     in tmux and should just receive send_input, not --continue.
             #   - session_id is not None: a /clear'd thread has its session_id reset,
             #     so it stays fresh — preserving the #123 Part 1 invariant.
@@ -987,21 +1027,78 @@ class ClaudeChatCog(commands.Cog):
             # This extends the --continue fallback (previously only on the
             # restart-resume path, #123 Part 2) to the ordinary reply path.
             try_continue = False
-            if session_id is not None and existing_runner is None:
+            if session_id is not None and not had_active:
                 parent_channel_id = getattr(thread, "parent_id", None) or thread.id
                 tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
                 if tmux_manager is not None:
                     pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
                     try_continue = not pane_alive
 
-            await self._run_claude(
-                message,
-                thread,
-                prompt,
-                session_id=session_id,
-                image_paths=image_paths,
-                try_continue=try_continue,
+            # Run as its own task so the per-thread lock is NOT held for the
+            # (possibly long, possibly menu-parked) duration of the turn — that
+            # held-across-run lock was the #315 deadlock.  Registering the task
+            # here, under the lock, preserves the no-duplicate-run invariant: a
+            # second reply that gets the lock sees this task and pre-empts it.
+            task = asyncio.create_task(
+                self._run_claude(
+                    message,
+                    thread,
+                    prompt,
+                    session_id=session_id,
+                    image_paths=image_paths,
+                    try_continue=try_continue,
+                )
             )
+            self._active_tasks[thread.id] = task
+
+    async def _preempt_prior_turn(
+        self,
+        thread: discord.Thread,
+        prev_task: asyncio.Task,
+        prev_runner: TmuxClaudeRunner | None,
+    ) -> None:
+        """Interrupt the in-flight turn so the new message starts fresh (#315).
+
+        This is the documented behaviour (USER_GUIDE → "Interrupting"): a new
+        message while Claude is working interrupts the current turn and resumes
+        with the new instruction.  A graceful SIGINT breaks the runner's poll
+        loop, so a normally-progressing turn winds down on its own.  A turn parked
+        on a bridged menu, however, ignores the SIGINT — its ``await`` is on the
+        Discord button (``AskView`` is ``timeout=None``), not the poll loop — so
+        an empty ask-bus answer dismisses the menu (``bridge_pane_ask`` sends Esc
+        and returns) and a task cancel is the final backstop.  Together these
+        guarantee a parked menu can never wedge the thread (the #315 deadlock).
+        """
+        from ..discord_ui.ask_bus import ask_bus
+
+        await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
+        if prev_runner is not None:
+            with contextlib.suppress(Exception):
+                await prev_runner.interrupt(silent=True)
+        # No-op unless the turn is parked on a bridged menu; then it unblocks
+        # bridge_pane_ask so the run can wind down instead of waiting on a click.
+        ask_bus.post_answer(thread.id, [])
+        await self._drain_thread_task(prev_task)
+
+    async def _drain_thread_task(self, task: asyncio.Task, *, grace: float = 5.0) -> None:
+        """Tear down a prior turn so a new one can start cleanly (#315).
+
+        Waits up to ``grace`` seconds for ``task`` to finish on its own (the
+        graceful interrupt may already be winding it down); if it is still alive
+        — e.g. parked on a bridged menu whose ``await`` ignores the interrupt —
+        it is cancelled.  The cancellation propagates through ``bridge_pane_ask``
+        (which unregisters from the ask-bus in its ``finally``) and unwinds
+        ``_run_claude``'s ``finally`` (releasing the semaphore slot and clearing
+        ``_active_runners``), so a parked turn can never hold the thread hostage.
+        """
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+            task.cancel()
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            await task
 
     async def _build_prompt(self, message: discord.Message) -> str:
         """Build the prompt string (text only). Use _build_prompt_and_images for full processing."""
@@ -1235,6 +1332,7 @@ class ClaudeChatCog(commands.Cog):
                         registry=self._registry,
                         ask_repo=self._ask_repo,
                         lounge_repo=self._lounge_repo,
+                        settings_repo=self._settings_repo,
                         stop_view=stop_view,
                         session_dir_manager=session_dir_manager,
                         tmux_manager=tmux_manager,
@@ -1248,8 +1346,14 @@ class ClaudeChatCog(commands.Cog):
                 # a zombie.  The individual helpers already log errors internally.
                 with contextlib.suppress(Exception):
                     await stop_view.disable()
-                self._active_runners.pop(thread.id, None)
-                self._active_tasks.pop(thread.id, None)
+                # Conditional pop: runs are no longer serialised by a lock held
+                # across the whole turn (#315), so a newer reply may have already
+                # replaced these entries with its own runner/task — only clear our
+                # own, never a successor's.
+                if self._active_runners.get(thread.id) is runner:
+                    self._active_runners.pop(thread.id, None)
+                if self._active_tasks.get(thread.id) is current_task:
+                    self._active_tasks.pop(thread.id, None)
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
