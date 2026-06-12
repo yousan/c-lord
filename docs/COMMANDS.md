@@ -72,7 +72,16 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `/clord-status` | List **this channel's** live sessions — size, attach, resume | Anywhere |
 | `/clord-status show_all:true` | Also include closed sessions (like `docker ps -a`) | Anywhere |
 
-**`/clord-status`** is the single per-channel status view. For each session it shows the window number, status (`run`/`wait`/`err`/`closed`), directory size, last-used time, the `tmux attach -t <session>:work<#>` target, and the `claude --resume <id>` command. By default it lists only **live** sessions (like `docker ps`); `show_all` adds **closed** ones (`/close-workspace`'d — tmux window gone, session dir kept, still using disk). Sessions whose working dir was deleted (`/workspace-delete`) are a footer count only. It **supersedes the removed `/sessions`, `/session-dirs`, and `/resume-info`** (#363).
+**`/clord-status`** is the single per-channel status view. Each row shows the window number `#` (sorted ascending), the `status`, the thread `topic`, the directory `size`, and `used` (time since last activity). Above the table is a copyable `tmux attach -t <session>:work<#>` command (substitute the `#`). The Claude-Code session id (`cc-session`, for `claude --resume <id>` from a terminal) is shown only in the `all` view, at the right edge. By default it lists only **live** sessions (like `docker ps`); `show_all` adds **closed** ones (`/close-workspace`'d — tmux window gone, session dir kept, still using disk). Sessions whose working dir was deleted (`/workspace-delete`) are a footer count only. It **supersedes the removed `/sessions`, `/session-dirs`, and `/resume-info`** (#363).
+
+**Status values** (observed live at call time, not the polled DB state):
+
+| status | meaning |
+|--------|---------|
+| `run` | tmux window exists and Claude is executing (🟢) |
+| `wait` | tmux window exists, turn done, waiting for your input (🟡) |
+| `err` | tmux window exists, an error is visible in the pane (🔴) |
+| `closed` | no tmux window but the session dir still exists (`/close-workspace`'d — still uses disk; resume by sending a message) (⚪) |
 
 ### Workspace Management
 

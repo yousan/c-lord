@@ -115,11 +115,13 @@ def _rows():
 
 
 def _table_rows(out: str) -> list[str]:
-    """Extract the data rows from the single fenced table block (drop the
-    column header and any truncation note)."""
-    block = out.split("```")[1]
-    lines = [ln for ln in block.splitlines() if ln.strip()]
-    # lines[0] is the column header ("#  status  topic ...")
+    """Extract the data rows from the fenced *table* block (there is also a
+    separate attach-command block now), dropping the column header and any
+    truncation note."""
+    blocks = out.split("```")
+    # code blocks are odd indices; the table is the one carrying the header cols
+    table = next(b for i, b in enumerate(blocks) if i % 2 == 1 and "status" in b and "topic" in b)
+    lines = [ln for ln in table.splitlines() if ln.strip()]
     return [ln for ln in lines[1:] if not ln.lstrip().startswith("…")]
 
 
@@ -142,28 +144,40 @@ def test_default_view_shows_only_live_rows():
     # header reflects active count + session
     assert "c-lord status" in out
     assert "dev-claude" in out
-    assert "session c-lord" in out or "c-lord" in out
     assert "2 active" in out
     # live topics present, closed topic absent from the table
     assert "auth-bug-fix" in out
     assert "readme-update" in out
     assert "old-refactor" not in out
-    # legend is co-located with output (anti-drift)
-    assert "legend:" in out
-    # attach pattern shown once, derived from #
+    # legend was removed from the output (now lives in docs, #363 feedback)
+    assert "legend" not in out
+    # attach pattern is attach-only (no resume hint) in a code block
     assert "tmux attach -t c-lord:work<#>" in out
+    assert "claude --resume" not in out
+    # cc-session column is NOT shown in the default view
+    assert "cc-session" not in out
+    assert "a1b2c3d4" not in out  # the resume/session id is hidden by default
     # footer points to `all` with the closed + deleted summary
     assert "1 closed" in out
     assert "deleted 2" in out
     assert "/clord-status all" in out
 
 
-def test_all_view_shows_closed_rows():
+def test_default_view_sorted_by_window_number_ascending():
+    out = _render(show_all=False)
+    nums = [ln.split()[0] for ln in _table_rows(out)]
+    assert nums == ["1", "2"]  # #363 feedback: ascending by #
+
+
+def test_all_view_shows_closed_rows_and_cc_session():
     out = _render(show_all=True)
     assert "(all)" in out
     assert "old-refactor" in out  # closed row now present
     assert "closed" in out
     assert "deleted: 2" in out
+    # cc-session column appears only in the all view, at the right edge
+    assert "cc-session" in out
+    assert "c1d2e3f4" in out  # the closed session's id
     # closed rows have no window number -> rendered as "-"
     closed_line = next(ln for ln in _table_rows(out) if "old-refactor" in ln)
     assert closed_line.lstrip().startswith("-")
@@ -198,9 +212,9 @@ def test_topic_with_backticks_and_newline_cannot_break_the_table():
         deleted_count=0,
         now=NOW,
     )
-    # exactly one fenced block opens and closes (a stray ``` in the topic would
-    # add more fence delimiters)
-    assert out.count("```") == 2
+    # two fenced blocks (attach + table); a stray ``` in the topic would add
+    # more fence delimiters than these 4 if not neutralised
+    assert out.count("```") == 4
     # the single data row stayed a single line
     assert len(_table_rows(out)) == 1
 

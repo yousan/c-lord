@@ -37,14 +37,6 @@ _LIVE_STATE_WORD = {
     "pending": "run",  # external setter; treat as live
 }
 
-# Co-located legends so the definition travels with the output (anti-drift).
-_LEGEND_DEFAULT = "legend: run=実行中  wait=入力待ち  err=エラー"
-_LEGEND_ALL = (
-    "legend: run/wait/err=live  "
-    "closed=/close-workspace済(window無し/dir残・容量を食う)  "
-    "deleted=dir削除済(行なし)"
-)
-
 
 def classify_status(*, has_window: bool, db_state: str | None, dir_exists: bool) -> str | None:
     """Return the table word for a session, or ``None`` when it has no row.
@@ -121,20 +113,26 @@ def _cell(value: str, *, cap: int = 40) -> str:
     return s if len(s) <= cap else s[: cap - 1] + "…"
 
 
-def _build_table(rows: list[StatusRow], *, now: datetime, max_rows: int) -> str:
-    header = ["#", "status", "topic", "size", "used", "resume"]
+def _build_table(
+    rows: list[StatusRow], *, now: datetime, max_rows: int, include_session: bool
+) -> str:
+    # The CC-session id is niche (few people resume from a cold terminal), so it
+    # only rides along in the ``all`` view, at the right edge (#363 feedback).
+    header = ["#", "status", "topic", "size", "used"]
+    if include_session:
+        header.append("cc-session")
     body: list[list[str]] = []
     for r in rows[:max_rows]:
-        body.append(
-            [
-                str(r.window_number) if r.window_number is not None else "-",
-                r.status,
-                _cell(r.topic, cap=28),
-                format_size(r.size_bytes),
-                format_relative(r.last_used, now=now),
-                _short_id(r.session_id),
-            ]
-        )
+        cells = [
+            str(r.window_number) if r.window_number is not None else "-",
+            r.status,
+            _cell(r.topic, cap=28),
+            format_size(r.size_bytes),
+            format_relative(r.last_used, now=now),
+        ]
+        if include_session:
+            cells.append(_short_id(r.session_id))
+        body.append(cells)
 
     widths = [len(h) for h in header]
     for cells in body:
@@ -172,6 +170,9 @@ def render_status(
     """
     live = [r for r in rows if r.status != "closed"]
     closed = [r for r in rows if r.status == "closed"]
+    # Sort live rows by window number ascending (#363 feedback); closed have no
+    # window number so they trail, in given order.
+    live.sort(key=lambda r: r.window_number if r.window_number is not None else 10**9)
     total_live = sum(r.size_bytes for r in live)
     total_all = total_live + sum(r.size_bytes for r in closed)
     closed_bytes = sum(r.size_bytes for r in closed)
@@ -188,13 +189,13 @@ def render_status(
             f"{len(live)} active · {format_size(total_live)}"
         )
 
-    attach_line = f"attach: tmux attach -t {session_name}:work<#>      resume: claude --resume <id>"
-    legend = _LEGEND_ALL if show_all else _LEGEND_DEFAULT
+    # attach pattern in its own copyable code block (#363 feedback: attach-only, pre).
+    attach_block = f"```\ntmux attach -t {session_name}:work<#>\n```"
 
     table_rows = (live + closed) if show_all else live
-    table = _build_table(table_rows, now=now, max_rows=max_rows)
+    table = _build_table(table_rows, now=now, max_rows=max_rows, include_session=show_all)
 
-    parts = [head, attach_line, legend, f"```\n{table}\n```"]
+    parts = [head, attach_block, f"```\n{table}\n```"]
 
     if show_all:
         parts.append(
