@@ -104,6 +104,8 @@ URL は Discord 上でチャンネル/メッセージを右クリック → 「�
 
 - **証跡は催促される前に貼る (必須)**。「言われたら付ける」ではなく、挙動/UI を
   変える PR・Issue には最初から RED / GREEN (前/後) の両方を貼る。
+  **`dod-gate` CI は、免除ラベル (`no-runtime-change` / `documentation`) の無い PR の
+  本文に証跡画像 (`![...](URL)`) も Release アセット URL も無ければ落とす (#391)。**
 - **やってはいけない**:
   - PNG を `docs/evidence/<issue番号>/` 等に commit する (旧規約。既存の
     commit 済み PNG は過去 PR のリンク保全のため残すが、新規は作らない)。

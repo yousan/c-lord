@@ -24,6 +24,11 @@ function evaluateDod({ body = '', labels = [] } = {}) {
   };
   const countUnchecked = (text) => (text.match(/- \[ \]/g) || []).length;
 
+  // 証跡シグナル (#391): markdown 画像 / <img> / Release アセット URL /
+  // GitHub user-attachments URL / 画像拡張子つき URL。
+  const EVIDENCE_RE =
+    /!\[[^\]]*\]\([^)]+\)|<img\s|https?:\/\/\S+\/releases\/download\/\S+|https?:\/\/\S*user-attachments\/\S+|https?:\/\/\S+\.(?:png|jpe?g|gif|svg|webp)(?:[?#]\S*)?/i;
+
   const dodSection = section('Definition of Done checklist');
   const acSection = section('Acceptance Criteria');
 
@@ -61,6 +66,17 @@ function evaluateDod({ body = '', labels = [] } = {}) {
         );
       }
     }
+  }
+
+  // Rule 3 (#391): 挙動/UI を変える PR は証跡（画像 or Release アセット URL）が本文に必須。
+  // 免除ラベル（documentation / no-runtime-change）があればスキップ。証跡を「言われる前に
+  // 貼る」を機械的に強制する層。テキストログだけ（画像/URL 無し）は素通りさせない。
+  if (!ruleOneExempt && !EVIDENCE_RE.test(body)) {
+    errors.push(
+      '証跡が見つからない。挙動/UI を変える PR は本文に証跡画像（`![...](URL)`）か ' +
+        'Release アセット URL（`scripts/evidence_upload.py` で生成）を貼ること。' +
+        '純リファクタ/CI/docs で証跡が不要なら `no-runtime-change` か `documentation` ラベルを付ける。'
+    );
   }
 
   return { errors };
