@@ -1,0 +1,3 @@
+# Monitor run artifacts (<timestamp>.json/.md) + state.json are written here by
+# scripts/monitor. The artifacts are gitignored; this file keeps the dir present.
+# Commit a specific scan only as PR evidence under docs/evidence/<issue>/ instead.
