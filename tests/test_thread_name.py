@@ -7,6 +7,7 @@ from c_lord.thread_name import (
     build_name,
     parse_topic_from_name,
     thread_lamp_enabled,
+    thread_retitle_enabled,
 )
 
 
@@ -185,3 +186,70 @@ def test_thread_lamp_enabled_falsy_values(monkeypatch):
     for v in ("0", "false", "no", "off", "", "  "):
         monkeypatch.setenv("CLORD_THREAD_LAMP", v)
         assert thread_lamp_enabled() is False, f"{v!r} should disable"
+
+
+# --- #414: Issue/PR number token in the thread name ---
+
+
+def test_build_name_with_issue_ref_lamp_on():
+    out = build_name("認証", "running", 2, issue_ref="404")
+    assert out == "🟢 W2 │ #404 認証"
+
+
+def test_build_name_with_issue_ref_lamp_off():
+    # Default deployment (lamp off): no status emoji, number kept.
+    assert build_name("認証", "running", 2, lamp=False, issue_ref="404") == "W2 │ #404 認証"
+
+
+def test_build_name_issue_ref_none_is_backward_compat():
+    assert build_name("topic", "running", 3, issue_ref=None) == build_name("topic", "running", 3)
+
+
+def test_build_name_issue_ref_normalizes_leading_hash():
+    # Caller may pass "#404" or "404" — both render a single #.
+    assert build_name("x", "running", 1, issue_ref="#404") == build_name(
+        "x", "running", 1, issue_ref="404"
+    )
+
+
+def test_build_name_issue_ref_no_window():
+    out = build_name("topic", "running", None, issue_ref="55")
+    assert out == "🟢 #55 topic"
+
+
+def test_build_name_issue_ref_truncates_topic_to_fit():
+    out = build_name("あ" * 100, "running", 12, issue_ref="404")
+    assert len(out) <= 30
+    assert out.startswith("🟢 W12 │ #404 ")
+
+
+def test_parse_strips_leading_issue_ref():
+    # New format: number sits between the work prefix and the topic.
+    assert parse_topic_from_name("🟢 W2 │ #404 認証") == "認証"
+    assert parse_topic_from_name("W2 │ #404 認証") == "認証"
+    assert parse_topic_from_name("🟢 #55 topic") == "topic"
+
+
+def test_build_then_parse_roundtrip_with_issue_ref():
+    name = build_name("やること整理", "running", 3, issue_ref="404")
+    assert parse_topic_from_name(name) == "やること整理"
+
+
+# --- #414: maybe_retitle is opt-in (default off) via CLORD_THREAD_RETITLE ---
+
+
+def test_thread_retitle_enabled_default_off(monkeypatch):
+    monkeypatch.delenv("CLORD_THREAD_RETITLE", raising=False)
+    assert thread_retitle_enabled() is False
+
+
+def test_thread_retitle_enabled_opt_in(monkeypatch):
+    monkeypatch.setenv("CLORD_THREAD_RETITLE", "1")
+    assert thread_retitle_enabled() is True
+
+
+def test_thread_retitle_enabled_explicit_overrides_env(monkeypatch):
+    monkeypatch.setenv("CLORD_THREAD_RETITLE", "1")
+    assert thread_retitle_enabled(False) is False
+    monkeypatch.delenv("CLORD_THREAD_RETITLE", raising=False)
+    assert thread_retitle_enabled(True) is True

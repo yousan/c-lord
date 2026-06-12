@@ -345,7 +345,9 @@ class ThreadStateSyncLoop:
         if not record.topic:
             return
 
-        new_name = build_name(record.topic, new_state, window_number)
+        # #414: keep the Issue/PR number in the lamp-sync rename too, otherwise
+        # the slow sidebar repaint would drop it from the name.
+        new_name = build_name(record.topic, new_state, window_number, issue_ref=record.issue_ref)
 
         # Fetch the Discord thread and rename if different.
         try:

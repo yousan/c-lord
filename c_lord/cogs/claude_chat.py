@@ -21,6 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
@@ -36,7 +37,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
-from ..thread_name import thread_lamp_enabled
+from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -98,6 +99,7 @@ class ClaudeChatCog(commands.Cog):
         settings_repo: SettingsRepository | None = None,
         allowed_role_name: str | None = None,
         thread_lamp: bool | None = None,
+        thread_retitle: bool | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -108,6 +110,10 @@ class ClaudeChatCog(commands.Cog):
         # thread-rename rate-limit. Opt in via thread_lamp=True or
         # CLORD_THREAD_LAMP=1. Resolved once here so the env is read at startup.
         self._thread_lamp = thread_lamp_enabled(thread_lamp)
+        # Automatic mid-conversation topic re-titling (#121). Off by default
+        # (#414) — it fired too eagerly and renamed threads users didn't want
+        # renamed. Opt in via thread_retitle=True or CLORD_THREAD_RETITLE=1.
+        self._thread_retitle = thread_retitle_enabled(thread_retitle)
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
@@ -138,6 +144,9 @@ class ClaudeChatCog(commands.Cog):
         # its first session_id).  Drained by _apply_thread_naming on the
         # next call once the row exists.
         self._pending_topic: dict[int, tuple[str, str]] = {}
+        # Issue #414: issue/PR number resolved before the session row exists;
+        # drained by _apply_thread_naming on the next call once the row is saved.
+        self._pending_issue_ref: dict[int, str] = {}
         self._pending_tmux_window_id: dict[int, str] = {}
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
@@ -275,15 +284,21 @@ class ClaudeChatCog(commands.Cog):
         thread: discord.Thread,
         tmux_manager: TmuxSessionManager,
         first_message: str,
+        working_dir: str | None = None,
     ) -> None:
-        """Apply the Issue #95 naming scheme to ``thread``.
+        """Apply the Issue #95 / #414 naming scheme to ``thread``.
 
         - Generates and persists ``topic`` on first use (unless the
           thread is ``auto_topic_locked`` from a previous manual rename).
+        - Resolves and persists the Issue/PR number (#414) from the session's
+          git branch (``working_dir``) or, as a fallback, the first message.
         - Persists the tmux ``window_id`` (immutable) on the row.
         - Renames the Discord thread to
-          ``<status_emoji> W<work_number> │ <topic>`` capped at 30 chars,
-          but only if the current name differs (minimises API calls).
+          ``<status_emoji> W<work_number> │ #<issue> <topic>`` capped at 30
+          chars, but only if the current name differs (minimises API calls).
+
+        Mid-conversation topic re-titling (#121) is gated on ``self._thread_retitle``
+        (off by default, #414).
 
         All errors are swallowed by the caller; this helper raises only
         on truly unexpected programmer mistakes.
@@ -294,14 +309,19 @@ class ClaudeChatCog(commands.Cog):
         topic = record.topic if record else None
         locked = bool(record.auto_topic_locked) if record else False
         state = (record.state if record else None) or "alive"
+        issue_ref = record.issue_ref if record else None
 
-        # Drain any topic / window-id pending from a previous call where
-        # the session row did not yet exist.
+        # Drain any topic / issue-ref / window-id pending from a previous call
+        # where the session row did not yet exist.
         if record is not None:
             pending = self._pending_topic.pop(thread.id, None)
             if pending and not record.topic and not locked:
                 await self.repo.set_topic(thread.id, pending[0], source=pending[1])
                 topic = pending[0]
+            pending_ref = self._pending_issue_ref.pop(thread.id, None)
+            if pending_ref and not record.issue_ref:
+                await self.repo.set_issue_ref(thread.id, pending_ref)
+                issue_ref = pending_ref
             pending_win = self._pending_tmux_window_id.pop(thread.id, None)
             if pending_win and record.tmux_window_id != pending_win:
                 await self.repo.set_tmux_window_id(thread.id, pending_win)
@@ -317,11 +337,12 @@ class ClaudeChatCog(commands.Cog):
         else:
             window_number = None
 
-        # Re-summarize title on subsequent messages (#121).
-        # Only runs when a topic already exists and the thread is not manually
-        # renamed (locked).  Returns None when the LLM deems the current topic
-        # still valid (verbatim match) — so no rename API call is triggered.
-        if topic and not locked:
+        # Re-summarize title on subsequent messages (#121) — opt-in only (#414).
+        # Off by default because it renamed threads too eagerly; enable via
+        # CLORD_THREAD_RETITLE=1. Only runs when a topic already exists and the
+        # thread is not manually renamed (locked). Returns None when the LLM
+        # deems the current topic still valid — so no rename API call is fired.
+        if topic and not locked and self._thread_retitle:
             with contextlib.suppress(Exception):
                 new_topic = await topic_module.maybe_retitle(first_message or "", topic)
                 if new_topic is not None:
@@ -351,10 +372,26 @@ class ClaudeChatCog(commands.Cog):
             # just deleted concurrently).
             topic = parse_topic_from_name(thread.name) or "新しいスレッド"
 
+        # Resolve the Issue/PR number (#414). The git branch is authoritative
+        # and re-read every call (so a branch switch is followed); the first
+        # message's #NNN / issue URL is only a fallback used until a number is
+        # known. Never auto-cleared — a known number persists until a *different*
+        # branch number appears.
+        detected_ref = await self._detect_issue_ref(working_dir, first_message, current=issue_ref)
+        if detected_ref and detected_ref != issue_ref:
+            issue_ref = detected_ref
+            if record is not None:
+                await self.repo.set_issue_ref(thread.id, detected_ref)
+            else:
+                self._pending_issue_ref[thread.id] = detected_ref
+
         # lamp=False (default, #329) keeps the topic but drops the leading
         # status emoji, so the name no longer changes on state transitions and
-        # the only rename is the one-off topic naming.
-        new_name = build_name(topic, state, window_number, lamp=self._thread_lamp)
+        # the only rename is the one-off topic naming. The #<issue> number (#414)
+        # is shown when known.
+        new_name = build_name(
+            topic, state, window_number, lamp=self._thread_lamp, issue_ref=issue_ref
+        )
         if (thread.name or "") == new_name:
             return
         with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
@@ -365,6 +402,56 @@ class ClaudeChatCog(commands.Cog):
                 state,
                 new_name,
             )
+
+    async def _detect_issue_ref(
+        self,
+        working_dir: str | None,
+        first_message: str,
+        *,
+        current: str | None,
+    ) -> str | None:
+        """Resolve the thread's Issue/PR number (#414), or ``None``.
+
+        Priority: the session's git branch (authoritative, re-read each call) →
+        the first message's ``#NNN`` / issue URL (fallback, only while no number
+        is known yet) → the current value (no change).
+        """
+        branch_ref = await self._read_branch_issue_ref(working_dir)
+        if branch_ref:
+            return branch_ref
+        if not current:
+            return issue_ref_module.extract_from_text(first_message or "")
+        return current
+
+    async def _read_branch_issue_ref(self, working_dir: str | None) -> str | None:
+        """Read the git branch of ``working_dir`` and extract its issue number."""
+        if not working_dir:
+            return None
+        branch = await asyncio.to_thread(self._git_current_branch, working_dir)
+        return issue_ref_module.extract_from_branch(branch)
+
+    @staticmethod
+    def _git_current_branch(working_dir: str) -> str | None:
+        """Return the current git branch name of ``working_dir`` (best-effort).
+
+        Never raises — returns ``None`` on any error or detached HEAD. Uses a
+        list-arg subprocess (no shell) per the security policy.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", working_dir, "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1267,6 +1354,7 @@ class ClaudeChatCog(commands.Cog):
                         thread=thread,
                         tmux_manager=tmux_manager,
                         first_message=prompt,
+                        working_dir=working_dir,
                     )
 
             # Create a TmuxClaudeRunner for this thread.

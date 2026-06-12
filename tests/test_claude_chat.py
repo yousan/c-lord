@@ -2091,6 +2091,7 @@ class TestApplyThreadNamingRetitle:
         cog.repo.get = AsyncMock(return_value=record)
         cog.repo.set_topic = AsyncMock()
         cog.repo.set_tmux_window_id = AsyncMock()
+        cog.repo.set_issue_ref = AsyncMock()
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 55555
@@ -2101,12 +2102,13 @@ class TestApplyThreadNamingRetitle:
 
         return cog, thread, tmux_manager
 
-    def _make_record(self, *, topic, locked=0, state="running"):
+    def _make_record(self, *, topic, locked=0, state="running", issue_ref=None):
         record = MagicMock()
         record.topic = topic
         record.auto_topic_locked = locked
         record.state = state
         record.tmux_window_id = "@1"
+        record.issue_ref = issue_ref
         return record
 
     @pytest.mark.asyncio
@@ -2118,6 +2120,7 @@ class TestApplyThreadNamingRetitle:
 
         record = self._make_record(topic="認証リファクタ")
         cog, thread, tmux = self._make_cog_with_repo(record)
+        cog._thread_retitle = True  # #414: retitle is opt-in; enable for this path
         thread.name = "🟢 W1 │ 認証リファクタ"
 
         instruction = "次はDockerfileを最適化してCI/CDを改善してください"
@@ -2245,6 +2248,118 @@ class TestApplyThreadNamingRetitle:
             )
 
         mock_retitle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retitle_disabled_by_default(self):
+        """#414: maybe_retitle is NOT called when thread_retitle is off (default)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        record = self._make_record(topic="認証リファクタ")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        assert cog._thread_retitle is False  # default off (#414)
+
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="別タイトル")
+        ) as mock_retitle:
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="次はDockerを最適化してCIを改善してください",
+            )
+
+        mock_retitle.assert_not_awaited()
+
+
+class TestApplyThreadNamingIssueRef:
+    """#414: the Issue/PR number is auto-detected from the branch / first message."""
+
+    def _make_cog_with_repo(self, record):
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=record)
+        cog.repo.set_topic = AsyncMock()
+        cog.repo.set_tmux_window_id = AsyncMock()
+        cog.repo.set_issue_ref = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 55555
+        thread.name = "W1 │ 認証リファクタ"
+
+        tmux_manager = MagicMock()
+        tmux_manager.get_window_info = MagicMock(return_value=("@1", 1))
+        return cog, thread, tmux_manager
+
+    def _make_record(self, *, topic="認証リファクタ", issue_ref=None):
+        record = MagicMock()
+        record.topic = topic
+        record.auto_topic_locked = 0
+        record.state = "running"
+        record.tmux_window_id = "@1"
+        record.issue_ref = issue_ref
+        return record
+
+    @pytest.mark.asyncio
+    async def test_branch_number_persisted_and_shown_in_name(self):
+        """A branch like fix/404-x yields #404 — persisted and rendered."""
+        from unittest.mock import patch
+
+        record = self._make_record(issue_ref=None)
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="fix/404-add-thing"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="続きをお願いします",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_awaited_once_with(55555, "404")
+        thread.edit.assert_awaited_once()
+        name = thread.edit.await_args.kwargs.get("name", "")
+        assert "#404" in name
+
+    @pytest.mark.asyncio
+    async def test_first_message_number_used_when_branch_has_none(self):
+        """No branch number → fall back to the first message's #NNN."""
+        from unittest.mock import patch
+
+        record = self._make_record(issue_ref=None)
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="main"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="#512 を直してください",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_awaited_once_with(55555, "512")
+
+    @pytest.mark.asyncio
+    async def test_known_number_not_overwritten_by_casual_mention(self):
+        """An already-known number is kept; a later #NNN in text does not replace it."""
+        from unittest.mock import patch
+
+        record = self._make_record(issue_ref="404")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="main"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="ついでに #999 も見て",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_not_awaited()  # #404 stays
+
+    def test_git_current_branch_missing_repo_returns_none(self):
+        """_git_current_branch never raises on a non-repo path."""
+        cog = _make_cog()
+        assert cog._git_current_branch("/nonexistent/path/xyz") is None
 
 
 class TestThreadLampDisabled:

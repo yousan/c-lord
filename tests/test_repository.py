@@ -28,6 +28,18 @@ class TestSessionRepository:
         result = await repo.get(99999)
         assert result is None
 
+    async def test_issue_ref_defaults_none_and_roundtrips(self, repo):
+        # #414: new column defaults to NULL and is read/written via set_issue_ref.
+        await repo.save(thread_id=42, session_id="s")
+        assert (await repo.get(42)).issue_ref is None
+
+        await repo.set_issue_ref(42, "404")
+        assert (await repo.get(42)).issue_ref == "404"
+
+        # Clearing back to None is supported.
+        await repo.set_issue_ref(42, None)
+        assert (await repo.get(42)).issue_ref is None
+
     async def test_save_updates_existing(self, repo):
         await repo.save(thread_id=100, session_id="first")
         await repo.save(thread_id=100, session_id="second")
