@@ -1,0 +1,26 @@
+[
+  {
+    "author": "yousan",
+    "timestamp": "2026-06-11 10:00",
+    "content": "/clord-status"
+  },
+  {
+    "author": "C-lord",
+    "is_bot": true,
+    "timestamp": "2026-06-11 10:00",
+    "color": "#5865F2",
+    "content": "c-lord status · #dev-claude · yousan/c-lord · session c-lord · 2 active · 600 MB\nattach: tmux attach -t c-lord:work<#>      resume: claude --resume <id>\nlegend: run=実行中  wait=入力待ち  err=エラー\n```\n#  status  topic          size    used   resume\n1  run     auth-bug-fix   412 MB  2h     a1b2c3d4\n2  wait    readme-update  188 MB  5m     e5f6a7b8\n```\n+ 3 idle (288 MB) · deleted 2   →   /clord-status all"
+  },
+  {
+    "author": "yousan",
+    "timestamp": "2026-06-11 10:01",
+    "content": "/clord-status all"
+  },
+  {
+    "author": "C-lord",
+    "is_bot": true,
+    "timestamp": "2026-06-11 10:01",
+    "color": "#5865F2",
+    "content": "c-lord status (all) · #dev-claude · session c-lord · 2 active · 3 idle · 888 MB\nlegend: idle=closed(window無し/dir残/容量を食う)   deleted=dir削除済(行なし)\n```\n#  status  topic          size    used   resume\n1  run     auth-bug-fix   412 MB  2h     a1b2c3d4\n2  wait    readme-update  188 MB  5m     e5f6a7b8\n-  idle    old-refactor    96 MB  3d     c1d2e3f4\n-  idle    spike-test     110 MB  8d     d4e5f6a7\n-  idle    docs-pass       82 MB  12d    e7f8a9b0\n```\ndeleted: 2 (dir removed) — resume は claude 本体に履歴が残れば可"
+  }
+]
