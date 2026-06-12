@@ -1470,6 +1470,39 @@ class TestIsGenerating:
         """Empty pane text → False."""
         assert TmuxClaudeRunner._is_generating("") is False
 
+    def test_is_generating_spinner_pushed_off_bottom_six(self) -> None:
+        """#365 follow-up: the live spinner is pushed >6 lines off the bottom.
+
+        Real incident (prod thread 1514448641635385447, 08:51 JST): a continuing
+        turn finalized after 14s and fired the owner mention before the real
+        answer. Root cause — while Claude runs a tool, the tool-result preview +
+        input box + footer push the spinner's timer line 10-20 lines off the
+        bottom (the same layout #190 documented for the lamp). ``_is_generating``
+        only scanned the bottom 6 lines, missed the spinner, reported "not
+        generating", and the completion detector finalized the turn early.
+
+        Detection must scan the live-spinner timer ``(Ns ·`` over a wide bottom
+        window (as the #190 lamp detector already does), not just the bottom 6.
+        """
+        text = "\n".join(
+            [
+                "❯ 前のターンの質問",
+                "",
+                "● 調査しています。まず関連ファイルを読みます。",
+                "✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)",
+                "  ⎿ Bash(uv run pytest tests/test_tmux_runner.py -q)",
+                "     ........................................ [ 41%]",
+                "     ........................................ [ 83%]",
+                "     .............................            [100%]",
+                "     173 passed in 120s",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is True
+
 
 class TestToolExecutionCompletion:
     """Tests that tool execution does not trigger false early completion."""
@@ -2906,7 +2939,10 @@ class TestParseAskNewLayouts:
         assert q is not None
         assert q.header == "リリース方式"
         assert [o.label for o in q.options] == [
-            "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+            "カナリアリリース",
+            "ブルーグリーン",
+            "ローリング更新",
+            "一斉切り替え",
         ]
         assert all(len(o.description) > 20 for o in q.options)
         assert q.multi_select is False
