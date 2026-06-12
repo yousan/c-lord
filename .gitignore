@@ -44,3 +44,7 @@ c_lord/_version.py
 # Commit a specific run only as PR evidence under docs/evidence/<issue>/.
 docs/fuzz-runs/*
 !docs/fuzz-runs/.gitkeep
+
+# Monitor run artifacts (#404) — keep the dir (.gitkeep), ignore the runs.
+docs/monitor-runs/*
+!docs/monitor-runs/.gitkeep
