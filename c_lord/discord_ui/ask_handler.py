@@ -47,16 +47,27 @@ ASK_ANSWER_TIMEOUT = 86_400  # 24 h
 _PANE_RESOLVE_POLL = 2.0
 _PANE_RESOLVE_MISSES = 2
 
-# #399: the prose context above the menu is posted as its own message; keep the
-# TAIL when it exceeds a Discord message — the recommendation (推し) is
-# conventionally the last thing said before the menu opens.
+# #399: the prose context above the menu is posted as its own message(s).
+# Up to _CONTEXT_MAX_MSGS sequential chunks deliver the text IN FULL — clipping
+# while registering the full text would suppress the flush and lose the
+# clipped part forever (review blocker 1). Beyond the budget the TAIL is kept
+# (the recommendation 推し is conventionally last) and the text is NOT
+# registered, so the later jsonl flush delivers the full text as a late
+# duplicate — degraded mode is duplication, never loss.
 _CONTEXT_MSG_LIMIT = 1900
+_CONTEXT_MAX_MSGS = 3
 
 
-def _clip_context(text: str) -> str:
-    if len(text) <= _CONTEXT_MSG_LIMIT:
-        return text
-    return "…" + text[-_CONTEXT_MSG_LIMIT:]
+def _context_chunks(text: str) -> tuple[list[str], bool]:
+    """Split *text* into ≤``_CONTEXT_MSG_LIMIT`` chunks. Returns (chunks, truncated)."""
+    budget = _CONTEXT_MSG_LIMIT * _CONTEXT_MAX_MSGS
+    truncated = len(text) > budget
+    if truncated:
+        text = text[-budget:]
+    chunks = [text[i : i + _CONTEXT_MSG_LIMIT] for i in range(0, len(text), _CONTEXT_MSG_LIMIT)]
+    if truncated and chunks:
+        chunks[0] = "…" + chunks[0]
+    return chunks, truncated
 
 
 async def bridge_pane_ask(
@@ -87,14 +98,19 @@ async def bridge_pane_ask(
     # of the same text (AC3); on send failure nothing is registered — the
     # late flush then delivers it instead.
     if question.context:
+        chunks, truncated = _context_chunks(question.context)
         try:
-            await thread.send(content=_clip_context(question.context), silent=True)
+            for chunk in chunks:
+                await thread.send(content=chunk, silent=True)
         except discord.HTTPException:
             logger.warning(
                 "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
             )
         else:
-            _bridged_context.register(thread.id, question.context)
+            # Register only when the FULL text was delivered: suppressing the
+            # flush twin of a partially-posted text would lose the rest.
+            if not truncated:
+                _bridged_context.register(thread.id, question.context)
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
     msg = await thread.send(

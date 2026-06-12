@@ -436,6 +436,10 @@ class TranscriptMirror:
                     # Turn boundary: flush pending as the final reply.
                     await _flush_pending_as_reply()
                     await _commit_cursor()
+                    # #399: disarm unconsumed pane-bridge entries — the
+                    # legitimate flush always precedes its turn end, so a
+                    # surviving entry could only swallow a future real message.
+                    bridged_context.clear_thread(self.thread_id)
                     continue
 
                 rendered = render_event(event)
@@ -478,6 +482,7 @@ class TranscriptMirror:
                         # Human turn: previous assistant turn is over → flush as reply.
                         await _flush_pending_as_reply()
                         await _commit_cursor()
+                        bridged_context.clear_thread(self.thread_id)  # #399 (see turn_end)
                         await self._post(rendered)
                     else:
                         await _flush_pending_silently()

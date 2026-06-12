@@ -22,16 +22,19 @@ design is deliberately conservative):
 - entries expire after ``_TTL_SECONDS`` (the ask-menu answer timeout);
 - at most ``_MAX_PER_THREAD`` entries are kept per thread.
 
-The registry is in-memory: a bot restart while a menu is open loses the
-entry, degrading to the pre-#399 behavior (the flush is posted late) — a
-duplicate-free failure mode.
+The registry is in-memory: a bot restart between the context post and the
+flush loses the entry, so the flush is posted late as a DUPLICATE of the
+already-delivered context — the degraded mode is duplication, never loss.
 """
 
 from __future__ import annotations
 
 import difflib
+import logging
 import re
 import time
+
+logger = logging.getLogger(__name__)
 
 # Whitespace + markdown + box-drawing punctuation differ between the TUI
 # rendering and the raw markdown; none of it is content.
@@ -46,22 +49,26 @@ _MATCH_RATIO = 0.9
 # Containment counts only between comparably-sized texts. Without this cap, a
 # long final reply that merely QUOTES the registered context would be
 # suppressed wholesale — the worst possible failure (a real message silently
-# lost). 1.5x still covers the intended case: a watchdog-truncated pane
-# registration matching its slightly longer flushed twin.
-_CONTAINMENT_MAX_RATIO = 1.5
+# lost). 1.25x still covers the intended case: a watchdog-truncated pane
+# registration matching its slightly longer flushed twin; deeper truncation
+# degrades to a late duplicate, never to loss.
+_CONTAINMENT_MAX_RATIO = 1.25
 
 
 def _normalize(text: str) -> str:
     return _NORM_RE.sub("", text)
 
 
-def _matches(a: str, b: str) -> bool:
+def _match_kind(a: str, b: str) -> str | None:
+    """Return how *a* and *b* match ("exact"/"containment"/"ratio") or None."""
     if a == b:
-        return True
+        return "exact"
     shorter, longer = sorted((a, b), key=len)
     if shorter in longer and len(longer) <= len(shorter) * _CONTAINMENT_MAX_RATIO:
-        return True
-    return difflib.SequenceMatcher(None, a, b).ratio() >= _MATCH_RATIO
+        return "containment"
+    if difflib.SequenceMatcher(None, a, b).ratio() >= _MATCH_RATIO:
+        return "ratio"
+    return None
 
 
 class BridgedContextRegistry:
@@ -76,8 +83,16 @@ class BridgedContextRegistry:
         norm = _normalize(text)
         if len(norm) < _MIN_NORM_LEN:
             return
+        now = time.monotonic()
+        # Purge expired entries everywhere — in skill mode no consumer ever
+        # calls consume_match, so without this the registry grows forever.
+        for tid in list(self._entries):
+            bucket = self._entries[tid]
+            bucket[:] = [(t, n) for t, n in bucket if now - t < _TTL_SECONDS]
+            if not bucket:
+                del self._entries[tid]
         bucket = self._entries.setdefault(thread_id, [])
-        bucket.append((time.monotonic(), norm))
+        bucket.append((now, norm))
         del bucket[:-_MAX_PER_THREAD]
 
     def consume_match(self, thread_id: int, text: str) -> bool:
@@ -90,14 +105,33 @@ class BridgedContextRegistry:
         norm = _normalize(text)
         if len(norm) >= _MIN_NORM_LEN:
             for i, (_, cand) in enumerate(bucket):
-                if _matches(cand, norm):
+                kind = _match_kind(cand, norm)
+                if kind is not None:
                     del bucket[i]
                     if not bucket:
                         self._entries.pop(thread_id, None)
+                    if kind != "exact":
+                        # Non-exact suppression is the risky path — keep it
+                        # loud so a false positive is diagnosable from logs.
+                        logger.warning(
+                            "bridged_context: non-exact suppression (%s) thread=%d len=%d",
+                            kind,
+                            thread_id,
+                            len(norm),
+                        )
                     return True
         if not bucket:
             self._entries.pop(thread_id, None)
         return False
+
+    def clear_thread(self, thread_id: int) -> None:
+        """Disarm all entries for *thread_id* (called at turn boundaries).
+
+        The legitimate flush always arrives before its turn ends, so an entry
+        surviving a turn boundary can only ever cause a false positive — a
+        later, genuinely new message being swallowed.
+        """
+        self._entries.pop(thread_id, None)
 
     def clear(self) -> None:
         """Drop all entries (test isolation)."""

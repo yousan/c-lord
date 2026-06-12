@@ -3030,3 +3030,59 @@ class TestPlanContextExtraction:
         assert "私の推しは JSON 保存です" in q.context
         assert "Ready to code?" not in q.context
         assert "❯" not in q.context
+
+
+class TestAskContextInteriorFailClosed:
+    """#399 review blocker 2: the block interior must be validated line by
+    line — unclassified chrome between the ● head and the menu (mid-redraw
+    ghost frames, #32 class) must kill the whole extraction, never leak."""
+
+    @staticmethod
+    def _inject_into_block(extra_line: str) -> str:
+        pane = _load_fixture("ask_context_prose_above_menu.txt")
+        lines = pane.splitlines()
+        idx = next(i for i, line in enumerate(lines) if line.startswith("● 案A"))
+        lines.insert(idx + 2, extra_line)
+        return "\n".join(lines)
+
+    def test_column0_status_line_inside_block_fails_closed(self) -> None:
+        pane = self._inject_into_block("Context left until auto-compact: 8%")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.context == ""
+
+    def test_esc_hint_inside_block_fails_closed_even_indented(self) -> None:
+        pane = self._inject_into_block("  (esc to interrupt · ctrl+t to show todos)")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.context == ""
+
+    def test_braille_spinner_inside_block_fails_closed(self) -> None:
+        pane = self._inject_into_block("  ⠧ Worked for 5m 3s")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.context == ""
+
+    def test_clean_positive_fixture_still_extracts(self) -> None:
+        pane = _load_fixture("ask_context_prose_above_menu.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert "私の推しは (A) です" in q.context
+
+
+class TestPlanContextGate:
+    """#399 review: plan context requires the plan-body header anchor, exactly
+    like ask context requires the ☐ header — no anchor, no guessing."""
+
+    def test_no_context_without_plan_body_header(self) -> None:
+        pane = (
+            "● 直前の散文がここにある\n"
+            "  続きの行\n"
+            " Would you like to proceed?\n"
+            " ❯ 1. Yes, and bypass permissions\n"
+            "   2. Yes, manually approve edits\n"
+            "   3. Tell Claude what to change\n"
+        )
+        q = _parse_plan_from_pane(pane)
+        assert q is not None
+        assert q.context == ""

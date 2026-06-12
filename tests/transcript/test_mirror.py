@@ -1168,3 +1168,57 @@ async def test_mirror_commits_suppressed_uuid_without_turn_end_marker(tmp_path: 
     finally:
         await mirror.stop()
         bridged_context.clear()
+
+
+async def test_stale_registry_entry_cleared_at_turn_boundary(tmp_path: Path) -> None:
+    """#399 review blocker 3: an entry whose flush never arrived (CLI killed /
+    menu Esc'd) must be disarmed at the next turn boundary — otherwise a later
+    similar-but-different REAL message gets swallowed (reproduced at
+    SequenceMatcher ratio 0.97 with one decision-flipping sentence changed)."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    bridged_context.clear()
+    bridged_context.register(99402, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99402,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # Turn ends WITHOUT the flush ever arriving (menu was Esc'd).
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.2)
+        # Next turn: Claude restates the (similar) prose as a REAL message.
+        _write_event(jsonl, _assistant_text(flushed_md))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    assert any("楽観ロック" in p for p in posted + replied), (
+        "stale registry entry swallowed a real message after a turn boundary"
+    )

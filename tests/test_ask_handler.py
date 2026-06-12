@@ -177,21 +177,53 @@ async def test_no_context_message_when_context_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_long_context_truncated_keeping_tail(monkeypatch):
-    """Context longer than a Discord message keeps its TAIL — the
-    recommendation (推し) is conventionally the last thing said."""
+async def test_long_context_fully_delivered_in_chunks(monkeypatch):
+    """#399 review blocker 1: a context longer than one Discord message must be
+    delivered IN FULL (sequential silent chunks) — clipping the head while
+    registering the full text suppressed the flush and lost the head forever."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
     thread, _msg = _thread(399_0004)
     q = _question()
-    q.context = ("長い経緯です。" * 400) + "私の推しは (A) です。"
+    q.context = ("経緯です。" * 500) + "私の推しは (A) です。"  # ~2510 chars
 
     await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
 
-    first = thread.send.await_args_list[0]
-    content = first.kwargs.get("content", "")
-    assert len(content) <= 2000
-    assert content.endswith("私の推しは (A) です。")
+    sends = thread.send.await_args_list
+    context_sends = [s for s in sends if "content" in s.kwargs and "embed" not in s.kwargs]
+    assert len(context_sends) == 2
+    joined = "".join(s.kwargs["content"] for s in context_sends)
+    assert joined == q.context  # nothing lost, nothing added
+    assert all(len(s.kwargs["content"]) <= 2000 for s in context_sends)
+    assert all(s.kwargs.get("silent") is True for s in context_sends)
+    # Full text registered → the flush twin is suppressed.
+    assert bridged_context.consume_match(thread.id, q.context) is True
+
+
+@pytest.mark.asyncio
+async def test_oversized_context_keeps_tail_and_skips_registration(monkeypatch):
+    """Beyond the chunk budget the tail is posted with a 前略 marker and the
+    text is NOT registered: the later jsonl flush then delivers the full text
+    (a late duplicate) — degraded mode is duplication, never loss."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(399_0006)
+    q = _question()
+    q.context = "あ" * 6500  # > 3 * 1900
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    sends = thread.send.await_args_list
+    context_sends = [s for s in sends if "content" in s.kwargs and "embed" not in s.kwargs]
+    assert 1 <= len(context_sends) <= 3
+    assert context_sends[0].kwargs["content"].startswith("…")
+    assert all(len(s.kwargs["content"]) <= 2000 for s in context_sends)
+    # NOT registered — the flush must not be suppressed (it carries the head).
+    assert bridged_context.consume_match(thread.id, q.context) is False
 
 
 @pytest.mark.asyncio

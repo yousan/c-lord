@@ -452,7 +452,7 @@ def _parse_plan_from_pane(text: str) -> AskQuestion | None:
     # #399 (AC4): prose spoken before ExitPlanMode sits above the plan box —
     # same buffering gap as AskUserQuestion, same narrow extraction.
     body_starts = [i for i, line in enumerate(lines[:sig_idx]) if _PLAN_BODY_START in line]
-    context = _extract_pane_context(lines, max(body_starts) if body_starts else sig_idx)
+    context = _extract_pane_context(lines, max(body_starts)) if body_starts else ""
     return AskQuestion(
         question=question,
         header="📋 Plan ready — approve?",
@@ -510,6 +510,13 @@ _CONTEXT_CHROME_BLOCKS = ("Updated plan", "User answered Claude's questions")
 # Upper bound on the upward scan for the block start — a prose block before a
 # menu is short; anything larger is a runaway and must not be carried.
 _CONTEXT_SCAN_LIMIT = 120
+# Chrome that can be painted INSIDE the walked-up region during a mid-redraw
+# ghost frame (#32 class). Any hit kills the whole extraction — fail closed.
+_CONTEXT_INTERIOR_BAIL = (
+    re.compile(r"\(esc to interrupt.*"),
+    re.compile(r"Context left until auto-compact.*"),
+    re.compile(r"[\u2800-\u28FF] .+"),  # braille spinner frames ("⠧ Worked for 5m 3s")
+)
 
 
 def _extract_pane_context(lines: list[str], boundary_idx: int) -> str:
@@ -559,7 +566,22 @@ def _extract_pane_context(lines: list[str], boundary_idx: int) -> str:
         return ""
     if head[2:].lstrip().startswith(_CONTEXT_CHROME_BLOCKS):
         return ""
-    return _clean_tui_lines(lines[start : i + 1])
+
+    # Validate the block INTERIOR (review blocker 2): a mid-redraw ghost frame
+    # can paint chrome between the ● head and the menu. Only space-indented
+    # continuations and blanks are prose; any other column-0 line or known
+    # status/hint line means the region is not a clean prose block → carry
+    # nothing (fail closed), never "most of it".
+    block = lines[start : i + 1]
+    for line in block[1:]:
+        s = line.strip()
+        if not s:
+            continue
+        if any(p.fullmatch(s) for p in _CONTEXT_INTERIOR_BAIL):
+            return ""
+        if not line.startswith(" "):
+            return ""
+    return _clean_tui_lines(block)
 
 
 # TUI status bar patterns at the very bottom.
@@ -990,8 +1012,10 @@ class TmuxClaudeRunner:
                 if ask_stable >= _ASK_ALERT_DELAY and ask_sig != last_bridged_ask:
                     last_bridged_ask = ask_sig
                     logger.info(
-                        "Interactive menu detected, bridging to Discord (thread=%d)",
+                        "Interactive menu detected, bridging to Discord "
+                        "(thread=%d, context_chars=%d)",
                         self._thread_id,
+                        len(ask_q.context),
                     )
                     yield StreamEvent(
                         raw={},

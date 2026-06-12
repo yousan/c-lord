@@ -103,7 +103,26 @@ def test_truncated_registration_still_matches_comparable_flush() -> None:
     be a large suffix of the flushed text. Containment at comparable size
     (<=1.5x) must still match."""
     reg = BridgedContextRegistry()
-    full = "判断ポイントは三つあります。" * 12
-    suffix = full[len(full) // 4 :]  # registered = trailing 3/4 of the flush
+    full = "判断ポイントは三つあります。" * 20
+    suffix = full[len(full) * 15 // 100 :]  # registered = trailing 85% of the flush
     reg.register(399, suffix)
     assert reg.consume_match(399, full) is True
+
+
+def test_clear_thread_removes_only_that_thread() -> None:
+    reg = BridgedContextRegistry()
+    reg.register(399, _pane_context())
+    reg.register(400, _pane_context())
+    reg.clear_thread(399)
+    assert reg.consume_match(399, _flushed_markdown()) is False
+    assert reg.consume_match(400, _flushed_markdown()) is True
+
+
+def test_decision_flipped_restatement_not_suppressed_after_boundary_clear() -> None:
+    """#399 review blocker 3 (registry half): clear_thread is the API the
+    mirror calls at turn boundaries so a never-consumed entry cannot linger
+    and swallow a similar-but-different REAL message later."""
+    reg = BridgedContextRegistry()
+    reg.register(399, _pane_context())
+    reg.clear_thread(399)
+    assert reg.consume_match(399, _flushed_markdown()) is False
