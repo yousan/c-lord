@@ -218,8 +218,10 @@ class TmuxSessionManager:
             )
             if result.returncode == 0 and result.stdout.strip() == str(thread_id):
                 return cached
-            # Stale cache entry
-            del self._thread_to_window[thread_id]
+            # Stale cache entry. Use pop(): capture_pane runs in a thread executor
+            # and is called many times per turn, so a concurrent call may have
+            # already evicted this key — a bare ``del`` raised KeyError (#410).
+            self._thread_to_window.pop(thread_id, None)
 
         # Fallback: scan all windows
         self._rebuild_mapping()
@@ -701,10 +703,12 @@ class TmuxSessionManager:
             ]
         )
 
-        # Update cache: remove any old thread→window mapping for this window
+        # Update cache: remove any old thread→window mapping for this window.
+        # pop() (not del) for the same reason as #410 — a concurrent capture_pane
+        # call may have evicted one of these keys between the comprehension and here.
         old_threads = [tid for tid, wname in self._thread_to_window.items() if wname == window_name]
         for tid in old_threads:
-            del self._thread_to_window[tid]
+            self._thread_to_window.pop(tid, None)
         self._thread_to_window[thread_id] = window_name
 
         logger.info("Remapped window %s → thread %d", window_name, thread_id)
