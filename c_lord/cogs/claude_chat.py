@@ -394,13 +394,32 @@ class ClaudeChatCog(commands.Cog):
         )
         if (thread.name or "") == new_name:
             return
-        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
+        try:
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
             logger.info(
                 "%s lamp → %s (event-driven) %r",
                 log_ctx(thread_id=thread.id),
                 state,
                 new_name,
+            )
+        except (  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
+            discord.HTTPException,
+            TimeoutError,
+            asyncio.TimeoutError,
+        ) as exc:
+            # #423: previously suppressed silently — a failed rename left a stuck
+            # title (e.g. the monitoring thread) with no trace of *why*. Log the
+            # reason (HTTP status/code if any) but keep swallowing: a cosmetic
+            # rename must never break the response path.
+            logger.warning(
+                "%s thread rename failed: %r → %r: %s status=%s code=%s: %s",
+                log_ctx(thread_id=thread.id),
+                thread.name,
+                new_name,
+                type(exc).__name__,
+                getattr(exc, "status", None),
+                getattr(exc, "code", None),
+                exc,
             )
 
     async def _detect_issue_ref(
@@ -1347,12 +1366,19 @@ class ClaudeChatCog(commands.Cog):
                 #   (auto_topic_locked=1).
                 # - The tmux window-index is a *hint* shown at the end of the
                 #   name; the immutable tmux window-id is stored in the DB.
-                with contextlib.suppress(Exception):
+                try:
                     await self._apply_thread_naming(
                         thread=thread,
                         tmux_manager=tmux_manager,
                         first_message=prompt,
                         working_dir=working_dir,
+                    )
+                except Exception:
+                    # #423: naming is best-effort and must not break the run, but a
+                    # failure before the rename (e.g. window lookup) was invisible.
+                    # Log it (with stacktrace) instead of swallowing silently.
+                    logger.warning(
+                        "%s thread naming failed", log_ctx(thread_id=thread.id), exc_info=True
                     )
 
             # Create a TmuxClaudeRunner for this thread.
