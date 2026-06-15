@@ -2334,6 +2334,30 @@ class TestApplyThreadNamingRetitle:
 
         mock_retitle.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_rename_failure_is_logged_not_silent(self, caplog):
+        """#423: a swallowed thread.edit failure must surface in the log (not silent).
+
+        Previously the rename was wrapped in ``contextlib.suppress`` so a stuck
+        title (e.g. the monitoring thread) left no trace of *why* it failed.
+        """
+        import logging
+
+        record = self._make_record(topic="挨拶")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "monitoring"  # differs from computed 'W1 │ 挨拶' → edit fires
+
+        resp = MagicMock()
+        resp.status = 403
+        resp.reason = "Forbidden"
+        thread.edit = AsyncMock(side_effect=discord.HTTPException(resp, "Missing Permissions"))
+
+        with caplog.at_level(logging.WARNING):
+            # Must NOT propagate — the response path keeps working.
+            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
+
+        assert any("rename failed" in r.getMessage() for r in caplog.records), caplog.text
+
 
 class TestApplyThreadNamingIssueRef:
     """#414: the Issue/PR number is auto-detected from the branch / first message."""
