@@ -431,10 +431,11 @@ class ClaudeChatCog(commands.Cog):
             if isinstance(exc, discord.Forbidden) and thread.id not in self._rename_hint_sent:
                 self._rename_hint_sent.add(thread.id)
                 with contextlib.suppress(discord.HTTPException):
+                    # `-# ` renders as Discord subtext (small, muted) so the hint is
+                    # unobtrusive — one quiet line, not a full warning message (#429).
                     await thread.send(
-                        "⚠️ このスレッドの名前を自動更新できませんでした（Discord の権限不足）。"
-                        "作業状況をスレッド名に反映するには、このサーバーで bot に "
-                        "**スレッドの管理 (Manage Threads)** 権限を付与してください。"
+                        "-# スレッド名を自動更新できませんでした"
+                        "（bot に「スレッドの管理 / Manage Threads」権限が必要）"
                     )
 
     async def _detect_issue_ref(
