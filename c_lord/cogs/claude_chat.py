@@ -313,6 +313,11 @@ class ClaudeChatCog(commands.Cog):
         locked = bool(record.auto_topic_locked) if record else False
         state = (record.state if record else None) or "alive"
         issue_ref = record.issue_ref if record else None
+        # #428: text-based issue-ref detection runs ONLY on the thread's first
+        # message (the branch is still read every turn). Captured before topic
+        # generation: no topic persisted yet and none pending = first naming.
+        # Otherwise a casual mid-thread '#1' would be captured and stick forever.
+        is_first_message = not topic and thread.id not in self._pending_topic
 
         # Drain any topic / issue-ref / window-id pending from a previous call
         # where the session row did not yet exist.
@@ -380,7 +385,9 @@ class ClaudeChatCog(commands.Cog):
         # message's #NNN / issue URL is only a fallback used until a number is
         # known. Never auto-cleared — a known number persists until a *different*
         # branch number appears.
-        detected_ref = await self._detect_issue_ref(working_dir, first_message, current=issue_ref)
+        detected_ref = await self._detect_issue_ref(
+            working_dir, first_message, current=issue_ref, allow_text=is_first_message
+        )
         if detected_ref and detected_ref != issue_ref:
             issue_ref = detected_ref
             if record is not None:
@@ -444,17 +451,20 @@ class ClaudeChatCog(commands.Cog):
         first_message: str,
         *,
         current: str | None,
+        allow_text: bool,
     ) -> str | None:
         """Resolve the thread's Issue/PR number (#414), or ``None``.
 
         Priority: the session's git branch (authoritative, re-read each call) →
-        the first message's ``#NNN`` / issue URL (fallback, only while no number
-        is known yet) → the current value (no change).
+        the first message's ``#NNN`` / issue URL (only when ``allow_text`` — i.e.
+        the thread's first message, #428 — and no number is known yet) → the
+        current value (no change). Reading text on later messages would let a
+        casual mid-thread ``#1`` be captured and stick forever.
         """
         branch_ref = await self._read_branch_issue_ref(working_dir)
         if branch_ref:
             return branch_ref
-        if not current:
+        if allow_text and not current:
             return issue_ref_module.extract_from_text(first_message or "")
         return current
 
