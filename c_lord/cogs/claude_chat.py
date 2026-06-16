@@ -147,6 +147,9 @@ class ClaudeChatCog(commands.Cog):
         # Issue #414: issue/PR number resolved before the session row exists;
         # drained by _apply_thread_naming on the next call once the row is saved.
         self._pending_issue_ref: dict[int, str] = {}
+        # Issue #429: thread ids already shown the "rename needs Manage Threads"
+        # hint, so it is posted at most once per process per thread (not per turn).
+        self._rename_hint_sent: set[int] = set()
         self._pending_tmux_window_id: dict[int, str] = {}
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
@@ -421,6 +424,19 @@ class ClaudeChatCog(commands.Cog):
                 getattr(exc, "code", None),
                 exc,
             )
+            # #429: a 403 means the bot lacks "Manage Threads" in this server, so it
+            # can post but never rename. Surface that to the user once per process
+            # (re-hint after a restart so it stays visible until the perm is added).
+            # Only for 403 — timeouts / other errors aren't user-actionable.
+            if isinstance(exc, discord.Forbidden) and thread.id not in self._rename_hint_sent:
+                self._rename_hint_sent.add(thread.id)
+                with contextlib.suppress(discord.HTTPException):
+                    # `-# ` renders as Discord subtext (small, muted) so the hint is
+                    # unobtrusive — one quiet line, not a full warning message (#429).
+                    await thread.send(
+                        "-# スレッド名を自動更新できませんでした"
+                        "（bot に「スレッドの管理 / Manage Threads」権限が必要）"
+                    )
 
     async def _detect_issue_ref(
         self,
