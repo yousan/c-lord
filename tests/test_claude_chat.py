@@ -2358,6 +2358,39 @@ class TestApplyThreadNamingRetitle:
 
         assert any("rename failed" in r.getMessage() for r in caplog.records), caplog.text
 
+    @pytest.mark.asyncio
+    async def test_rename_403_posts_hint_once(self):
+        """#429: a 403 (Missing Access) posts a one-time Manage-Threads hint."""
+        record = self._make_record(topic="挨拶")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "monitoring"  # differs → edit fires
+        thread.send = AsyncMock()
+        resp = MagicMock()
+        resp.status = 403
+        resp.reason = "Forbidden"
+        thread.edit = AsyncMock(side_effect=discord.Forbidden(resp, "Missing Access"))
+
+        await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
+        assert thread.send.await_count == 1
+        sent = thread.send.await_args.args[0] if thread.send.await_args.args else ""
+        assert "Manage Threads" in sent or "スレッドの管理" in sent
+
+        # Second 403 on the same thread must NOT re-post (one hint per process).
+        await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi again")
+        assert thread.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rename_timeout_does_not_post_hint(self):
+        """#429: only 403 (permission) gets a hint — timeouts are not user-actionable."""
+        record = self._make_record(topic="挨拶")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "monitoring"
+        thread.send = AsyncMock()
+        thread.edit = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
+        thread.send.assert_not_awaited()
+
 
 class TestApplyThreadNamingIssueRef:
     """#414: the Issue/PR number is auto-detected from the branch / first message."""
