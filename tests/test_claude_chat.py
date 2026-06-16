@@ -2442,13 +2442,23 @@ class TestApplyThreadNamingIssueRef:
 
     @pytest.mark.asyncio
     async def test_first_message_number_used_when_branch_has_none(self):
-        """No branch number → fall back to the first message's #NNN."""
+        """No branch number → the FIRST message's #NNN is used (#414/#428)."""
         from unittest.mock import patch
 
-        record = self._make_record(issue_ref=None)
+        from c_lord.cogs import claude_chat as cc_module
+
+        # First message = no topic yet (topic gets generated this turn).
+        record = self._make_record(topic=None, issue_ref=None)
         cog, thread, tmux = self._make_cog_with_repo(record)
 
-        with patch.object(cog, "_git_current_branch", return_value="main"):
+        with (
+            patch.object(cog, "_git_current_branch", return_value="main"),
+            patch.object(
+                cc_module.topic_module,
+                "generate_topic",
+                new=AsyncMock(return_value=("トピック", "llm")),
+            ),
+        ):
             await cog._apply_thread_naming(
                 thread=thread,
                 tmux_manager=tmux,
@@ -2457,6 +2467,28 @@ class TestApplyThreadNamingIssueRef:
             )
 
         cog.repo.set_issue_ref.assert_awaited_once_with(55555, "512")
+
+    @pytest.mark.asyncio
+    async def test_later_message_hashref_not_captured(self):
+        """#428: a #NNN in a LATER message (topic already set) must NOT be captured.
+
+        Text detection is first-message-only; otherwise a casual '#1' mid-thread
+        sticks forever (the monitoring-thread false positive).
+        """
+        from unittest.mock import patch
+
+        record = self._make_record(topic="既存トピック", issue_ref=None)
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="main"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="ついでに #999 も見ておいて",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_not_awaited()  # #999 ignored (not first message)
 
     @pytest.mark.asyncio
     async def test_known_number_not_overwritten_by_casual_mention(self):
