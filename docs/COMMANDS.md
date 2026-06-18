@@ -98,10 +98,21 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 |---------|-------------|-------|
 | `/resync` | Reconnect this thread's Discord mirror to its tmux pane | Thread only |
 | `/resync-channel` | Reconnect the mirror for every thread in this channel | Channel or thread |
+| `/restart-claude` | Restart the Claude process for this thread (keeps the conversation) | Thread only |
 
 **`/resync`** is a safety valve for when the tmux→Discord *mirror* feels out of sync — a selection menu's buttons never appeared, or a tool embed looks stale. It re-projects the **current** tmux state onto Discord: (1) re-bridges any stranded TUI menu so its buttons (re)appear, and (2) posts a fresh PNG snapshot of the pane so you can see the live state. It does this immediately, without waiting for the 60s menu-watchdog sweep or a bot restart.
 
-It does **not** touch the Claude process or the conversation — the session is untouched. To restart the Claude process while keeping the conversation, use `/restart-claude`. To wipe the context and start fresh, use `/clear`. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
+It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
+
+**`/restart-claude`** restarts the Claude *process* for this thread **while keeping the conversation**. Use it when the process is wedged (e.g. a stuck turn silently blocks further input). It kills the active runner and the tmux window so the old/stuck process is gone, but — unlike `/clear` — it does **not** reset the session. Your next message then resumes the same conversation via `--continue`, so the context survives. (The fresh process spawns on that next message through the normal reply path, which is what keeps session setup correct.)
+
+**The three recovery commands, by what they touch:**
+
+| Command | Discord mirror | Claude process | Conversation/context |
+|---------|----------------|----------------|----------------------|
+| `/resync` | reconnect | untouched | kept |
+| `/restart-claude` | — | restarted | **kept** (via `--continue`) |
+| `/clear` | — | killed | **wiped** (fresh session) |
 
 ### Upgrade
 
@@ -129,6 +140,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
 | `!resync` | Reconnect this thread's Discord mirror to tmux | `!resync` | `/resync` |
 | `!resync-channel` | Reconnect the mirror for every thread in the channel | `!resync-channel` | `/resync-channel` |
+| `!restart-claude` | Restart the Claude process (keeps the conversation) | `!restart-claude` | `/restart-claude` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |

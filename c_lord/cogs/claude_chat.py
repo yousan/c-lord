@@ -34,6 +34,7 @@ from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
 from ..discord_ui.embeds import stopped_embed
+from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
@@ -603,7 +604,21 @@ class ClaudeChatCog(commands.Cog):
             if not isinstance(channel, discord.TextChannel):
                 await respond("This command must be used in a text channel.", ephemeral=True)
                 return
-            thread = await self.spawn_session(channel, prompt)
+            try:
+                thread = await self.spawn_session(channel, prompt)
+            except ThreadCreateForbiddenError:
+                # #443: bot lacks View Channel / Create Public Threads here.
+                # Reply via the interaction (ephemeral) — the channel itself is
+                # unreachable, so this is the only path that reaches the user.
+                await respond(create_thread_permission_help(), ephemeral=True)
+                return
+            except discord.Forbidden:
+                # #75: seed send into the new thread failed; spawn_session has
+                # already notified the parent channel.  Acknowledge via the
+                # interaction too so the slash command does not surface a raw
+                # traceback (defer with no followup = hung "thinking" spinner).
+                await respond(_SEND_PERMISSION_HELP, ephemeral=True)
+                return
             await respond(f"Session started → {thread.mention}")
 
     @app_commands.command(name="clord", description="Start a new Claude Code session")
@@ -843,6 +858,86 @@ class ClaudeChatCog(commands.Cog):
 
         await self._clear_impl(ctx.channel, respond)
 
+    async def _restart_impl(self, channel: object, respond: _Responder) -> None:
+        """Shared core for /restart-claude and !restart-claude (#440).
+
+        Restarts the Claude **process** for this thread while PRESERVING the
+        conversation. It kills the active runner and the tmux window — so a
+        stuck / wedged claude process is gone — but, unlike :meth:`_clear_impl`,
+        it does **not** reset the session row. With the window dead and a live
+        ``session_id`` still on disk, the next message hits the #270 dead-pane
+        path and resumes via ``--continue``, so the context survives.
+
+        This sits between ``/resync`` (reconnect the Discord mirror only — the
+        process is untouched) and ``/clear`` (wipe the session, start fresh).
+        Observationally for the Discord user: after this, your next message is
+        handled by a fresh claude process that still remembers the conversation.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        thread_id = channel.id
+
+        # A session must exist to restart-and-resume; without one there is
+        # nothing to ``--continue`` and this would be a no-op.
+        record = await self.repo.get(thread_id)
+        if record is None:
+            await respond("No active session found for this thread to restart.", ephemeral=True)
+            return
+
+        # Kill the active runner (graceful kill of the in-flight, possibly
+        # wedged, turn) if one is registered.
+        runner = self._active_runners.get(thread_id)
+        if runner:
+            await runner.kill()
+            del self._active_runners[thread_id]
+
+        # Kill the tmux window so the old/stuck claude process is gone and
+        # ``is_claude_running`` returns False. We deliberately do NOT reset the
+        # session row — that is what distinguishes restart from /clear and lets
+        # the next message resume the conversation via --continue (#270, #123).
+        parent_id = getattr(channel, "parent_id", None) or thread_id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        if tmux_manager is not None:
+            await asyncio.to_thread(tmux_manager.kill_session, thread_id)
+
+        await respond(
+            "\U0001f504 Claude を再起動しました。会話は保持されています — "
+            "次のメッセージで `--continue` により文脈を引き継いで再開します。"
+        )
+
+    @app_commands.command(
+        name="restart-claude",
+        description="Restart the Claude process for this thread (keeps the conversation)",
+    )
+    async def restart_claude(self, interaction: discord.Interaction) -> None:
+        """Restart Claude for this thread, preserving context (#440)."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._restart_impl(interaction.channel, respond)
+
+    @commands.command(name="restart-claude")
+    async def restart_claude_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /restart-claude — invokable from webhooks (#440)."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            await ctx.send(content or "")
+
+        await self._restart_impl(ctx.channel, respond)
+
     async def _compact_impl(
         self, channel: object, respond: _Responder, *, instructions: str = ""
     ) -> None:
@@ -917,9 +1012,22 @@ class ClaudeChatCog(commands.Cog):
         """Create a new thread and start a Claude Code session."""
         thread_name = message.content[:100] if message.content else "Claude Chat"
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
-        thread = await message.create_thread(
-            name=thread_name, auto_archive_duration=archive_minutes
-        )
+        try:
+            thread = await message.create_thread(
+                name=thread_name, auto_archive_duration=archive_minutes
+            )
+        except discord.Forbidden:
+            # #443: the bot can see this channel (it received the message) but
+            # lacks "Create Public Threads".  Tell the user in-channel; if
+            # "Send Messages" is also missing, suppress (nothing else we can do).
+            logger.warning(
+                "%s create_thread forbidden on message trigger (missing Create Public Threads)",
+                log_ctx(thread_id=message.id),
+                exc_info=True,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await message.reply(create_thread_permission_help())
+            return
         prompt, image_paths = await self._build_prompt_and_images(message)
         prompt = await enrich_discord_references(prompt, message, self.bot)
         await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
@@ -954,11 +1062,23 @@ class ClaudeChatCog(commands.Cog):
         """
         name = (thread_name or prompt)[:100]
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
-        thread = await channel.create_thread(
-            name=name,
-            type=discord.ChannelType.public_thread,
-            auto_archive_duration=archive_minutes,
-        )
+        try:
+            thread = await channel.create_thread(
+                name=name,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=archive_minutes,
+            )
+        except discord.Forbidden as exc:
+            # #443: bot was denied "View Channel" and/or "Create Public Threads"
+            # on this channel.  The channel itself is unreachable (a notice
+            # posted there would fail with another Forbidden), so signal the
+            # caller to surface the permission help via the interaction instead.
+            logger.warning(
+                "%s create_thread forbidden (missing View Channel / Create Public Threads)",
+                log_ctx(channel_id=channel.id),
+                exc_info=True,
+            )
+            raise ThreadCreateForbiddenError() from exc
         # Post the prompt so StatusManager has a Message to add reactions to.
         try:
             seed_message = await thread.send(prompt)
