@@ -28,6 +28,21 @@ async def _drain(agen, n: int, timeout: float = 2.0) -> list:
     return collected
 
 
+async def _collect_for(agen, duration: float) -> list:
+    """Collect every event yielded within *duration* seconds (then stop)."""
+    collected: list = []
+
+    async def pull() -> None:
+        async for ev in agen:
+            collected.append(ev)
+
+    task = asyncio.create_task(pull())
+    await asyncio.sleep(duration)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    return collected
+
+
 async def test_tail_yields_lines_appended_after_start(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
@@ -168,3 +183,84 @@ async def test_tail_handles_truncation_or_rewrite(tmp_path: Path) -> None:
         await asyncio.gather(prod, return_exceptions=True)
 
     assert events[0]["n"] == 99
+
+
+async def test_tail_does_not_replay_history_on_resume_rewrite(tmp_path: Path) -> None:
+    # Issue #433: the real production trigger. A ``--resume`` (after a host crash
+    # killed the tmux Claude) makes Claude Code rewrite the active jsonl IN PLACE,
+    # PRESERVING the whole history and appending the new turn. The rewrite is
+    # smaller than the padded original, so ``size < offset`` fires and tail resets
+    # offset to 0 — re-reading the entire history. Tail must NOT re-yield events
+    # (by uuid) that already existed when it started: only the genuinely new
+    # ``u3`` may be emitted. Without the dedup this yields u1, u2, u3 (the burst).
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    # Existing history (delivered by a previous tail lifetime) with padding so the
+    # later rewrite shrinks the file and trips the truncation-reset path.
+    _write_event(jsonl, {"type": "assistant", "uuid": "u1", "pad": "x" * 400})
+    _write_event(jsonl, {"type": "assistant", "uuid": "u2", "pad": "x" * 400})
+    os.utime(jsonl, (1, 1))
+
+    agen = tail_events(project, poll_interval=0.05).__aiter__()
+
+    async def producer() -> None:
+        await asyncio.sleep(0.15)
+        # Resume rewrite: history preserved verbatim + new u3, no padding (smaller).
+        jsonl.write_text(
+            json.dumps({"type": "assistant", "uuid": "u1"})
+            + "\n"
+            + json.dumps({"type": "assistant", "uuid": "u2"})
+            + "\n"
+            + json.dumps({"type": "assistant", "uuid": "u3"})
+            + "\n"
+        )
+        os.utime(jsonl, (50, 50))
+
+    prod = asyncio.create_task(producer())
+    try:
+        events = await _collect_for(agen, 0.5)
+    finally:
+        prod.cancel()
+        await asyncio.gather(prod, return_exceptions=True)
+
+    assert [e["uuid"] for e in events] == ["u3"]
+
+
+async def test_tail_does_not_re_yield_already_followed_event_on_rewrite(tmp_path: Path) -> None:
+    # A uuid appended *after* tail started (already delivered live) must also not
+    # be re-emitted when a subsequent rewrite resets the offset to 0.
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    _write_event(jsonl, {"type": "assistant", "uuid": "base", "pad": "x" * 400})
+    os.utime(jsonl, (1, 1))
+
+    agen = tail_events(project, poll_interval=0.05).__aiter__()
+
+    async def producer() -> None:
+        await asyncio.sleep(0.15)
+        # Live append — delivered now.
+        _write_event(jsonl, {"type": "assistant", "uuid": "live"})
+        os.utime(jsonl, (40, 40))
+        await asyncio.sleep(0.2)
+        # Rewrite preserving everything (shrinks → reset to 0).
+        jsonl.write_text(
+            json.dumps({"type": "assistant", "uuid": "base"})
+            + "\n"
+            + json.dumps({"type": "assistant", "uuid": "live"})
+            + "\n"
+            + json.dumps({"type": "assistant", "uuid": "fresh"})
+            + "\n"
+        )
+        os.utime(jsonl, (80, 80))
+
+    prod = asyncio.create_task(producer())
+    try:
+        events = await _collect_for(agen, 0.7)
+    finally:
+        prod.cancel()
+        await asyncio.gather(prod, return_exceptions=True)
+
+    # "live" is yielded once (when appended), "fresh" once; "base" never; no dup.
+    assert [e["uuid"] for e in events] == ["live", "fresh"]

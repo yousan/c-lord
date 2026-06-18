@@ -5,6 +5,14 @@ is re-selected on every poll as the mtime-latest ``*.jsonl`` under the project
 directory, so ``/clear`` (which causes Claude Code to start a new
 ``<session-id>.jsonl``) is followed without restarting the tail.  Truncation
 or rewrite of the current file is handled by resetting the read offset to 0.
+
+Re-reading from byte 0 (truncation / in-place rewrite / new active file) must
+never re-emit an event that was already yielded — otherwise a ``--resume`` that
+rewrites the active jsonl in place (preserving history) would flood the consumer
+with the whole transcript again (Issue #433).  Each event is therefore yielded
+at most once per follow session, deduplicated by its stable ``uuid``.  At start
+(``from_start=False``) the uuids already present in the file are seeded so the
+pre-existing history is treated as already-delivered and never replayed.
 """
 
 from __future__ import annotations
@@ -16,6 +24,32 @@ from pathlib import Path
 from typing import Any
 
 from .resolver import latest_session_jsonl
+
+
+def _seed_seen_uuids(path: Path, upto_offset: int, seen: set[str]) -> None:
+    """Record the uuids of events in ``path[:upto_offset]`` into ``seen``.
+
+    Reads exactly ``upto_offset`` bytes (the same baseline the follow loop skips
+    past) so events that existed when the tail started are marked already-seen
+    and are never re-emitted on a later offset-0 reset.  A partial trailing line
+    (offset cutting mid-line) fails to parse and is ignored — it is read afresh
+    by the follow loop from ``upto_offset``.
+    """
+    try:
+        with path.open("rb") as f:
+            data = f.read(upto_offset)
+    except OSError:
+        return
+    for line in data.decode("utf-8", errors="replace").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        uid = event.get("uuid")
+        if isinstance(uid, str) and uid:
+            seen.add(uid)
 
 
 async def tail_events(
@@ -46,6 +80,17 @@ async def tail_events(
     initial_offset = (
         initial_path.stat().st_size if initial_path is not None and not from_start else 0
     )
+
+    # Issue #433: events already yielded (or present at start) must not be
+    # re-emitted when the read offset is reset to 0 (truncation / in-place
+    # rewrite / new active file).  Dedup by stable ``uuid``; events without a
+    # uuid are non-rendered metadata (mode/permission-mode/file-history-snapshot/
+    # …) that the consumer drops, so re-emitting them on a reset is harmless and
+    # they are intentionally not deduplicated (avoids collapsing two distinct
+    # uuid-less records that happen to serialise identically).
+    seen_uuids: set[str] = set()
+    if initial_path is not None and not from_start:
+        _seed_seen_uuids(initial_path, initial_offset, seen_uuids)
 
     current_path: Path | None = None
     offset = 0
@@ -97,8 +142,14 @@ async def tail_events(
                 if not line.strip():
                     continue
                 try:
-                    yield json.loads(line)
+                    event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                uid = event.get("uuid")
+                if isinstance(uid, str) and uid:
+                    if uid in seen_uuids:
+                        continue  # already emitted — do not replay on offset reset
+                    seen_uuids.add(uid)
+                yield event
 
         await asyncio.sleep(poll_interval)
