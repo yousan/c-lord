@@ -279,6 +279,43 @@ c-lord start --env /path/to/.env   # custom .env location
 
 Send a message in the configured channel — Claude will reply in a new thread.
 
+### Run as a Service (systemd --user — survives reboot)
+
+To keep c-lord running in the background and **start it automatically when the
+host reboots**, install it as a `systemd --user` service. From your clone:
+
+```bash
+bash scripts/install-systemd.sh
+```
+
+This generates `~/.config/systemd/user/c-lord.service` (pointing at this clone
+and your `uv`), enables it, and turns on **linger** so the service starts on
+boot even when no one is logged in. Then manage it with standard systemd:
+
+```bash
+systemctl --user restart c-lord.service     # after a `git pull`
+systemctl --user stop    c-lord.service
+systemctl --user status  c-lord.service
+journalctl --user -u c-lord.service -f      # live logs
+```
+
+Why `--user` instead of a system service: c-lord drives the user's `tmux`,
+`~/.claude` session files, `uv`, and the `claude` CLI, so it runs cleanest as
+**you**, with your environment — a root/system service would have to re-create
+all of that via `User=`/`Environment=`. `loginctl enable-linger "$USER"` is what
+makes a user service survive logout and start at boot; the installer runs it for
+you.
+
+> **Manual install:** copy [`deploy/c-lord.service`](deploy/c-lord.service), fix
+> the two `CHANGE-ME` paths (clone dir + `uv`), then
+> `systemctl --user daemon-reload && systemctl --user enable --now c-lord.service && loginctl enable-linger "$USER"`.
+
+> **WSL note:** if `systemctl --user` reports `Failed to connect to bus`, the
+> user D-Bus session isn't up. Ensure `systemd=true` under `[boot]` in
+> `/etc/wsl.conf` and reboot WSL (`wsl --shutdown`), or restart the bot by
+> killing it and letting `Restart=always` respawn it (`pkill -f c_lord.main` is
+> unsafe with multiple clones — kill by PID).
+
 ---
 
 ### Minimal Bot (Install as a Package)
