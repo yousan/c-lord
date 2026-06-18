@@ -870,6 +870,185 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._screenshot_impl(channel=ctx.channel, respond=respond, ack=ack)
 
+    # ── /resync (#439) — reconnect the Discord mirror to tmux ───────────────
+    # A user-facing safety valve for when the tmux→Discord mirror feels out of
+    # sync (a menu's buttons never showed, an embed looks stale). It does NOT
+    # touch the claude process or the session — only re-projects the *current*
+    # tmux state onto Discord: (1) re-bridge any stranded TUI menu via the menu
+    # watchdog (#359/#420), and (2) post a fresh pane snapshot. Restarting the
+    # claude process is /restart-claude (#440); wiping context is /clear (#56).
+
+    async def _find_thread_window(self, thread_id: int) -> tuple[str | None, str | None]:
+        """Locate the tmux session+window backing *thread_id* via the @thread_id sweep.
+
+        Reuses ``_list_all_windows`` (no DB dependency), so it works even for
+        channels with no ``/clord-init`` binding — same construction the #420
+        menu-watchdog fix relies on.
+        """
+        import asyncio
+
+        from ..thread_state_sync import _list_all_windows
+
+        windows = await asyncio.to_thread(_list_all_windows)
+        for w in windows:
+            if (w.get("thread_id") or "") == str(thread_id):
+                return w.get("session_name") or None, w.get("window_name") or None
+        return None, None
+
+    async def _rebridge_menu(self, thread_id: int, session_name: str, window_name: str) -> None:
+        """Re-bridge a stranded TUI menu for one thread via the menu watchdog.
+
+        Delegates to the always-on ``MenuWatchdogLoop`` (wired as
+        ``bot.menu_watchdog`` in setup.py) so /resync and the 60s sweep share
+        one code path — including the #420 manager fallback and the ask_bus /
+        is_processing guards that prevent duplicate bridges. No-op (safe) if the
+        watchdog is not wired.
+        """
+        import asyncio
+
+        from ..thread_state_sync import _capture_pane_text
+
+        watchdog = getattr(self.bot, "menu_watchdog", None)
+        maybe_bridge = getattr(watchdog, "_maybe_bridge_open_menu", None)
+        if maybe_bridge is None:
+            return
+        pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
+        await maybe_bridge(thread_id, session_name, window_name, pane_text)
+
+    async def _snapshot_pane(
+        self, session_name: str, window_name: str, thread_id: int
+    ) -> bytes | None:
+        """Render the thread's current tmux pane to a PNG (colors + status bar).
+
+        Builds a ``TmuxSessionManager`` straight from the swept session name so
+        it works without a channel binding (#420 fallback). Returns None when
+        the pane is empty or the optional Pillow extra is missing.
+        """
+        import asyncio
+
+        from ..tmux import TmuxSessionManager
+
+        tmux_mgr = TmuxSessionManager(session_name=session_name)
+        ansi = await asyncio.to_thread(tmux_mgr.capture_screen, thread_id)
+        if not ansi.strip():
+            return None
+        tabs = await asyncio.to_thread(tmux_mgr.list_window_tabs)
+        status_bar = (tmux_mgr.session_name, tabs, window_name) if tabs else None
+        return await asyncio.to_thread(render_pane_png, ansi, status_bar)
+
+    async def _resolve_channel_session(self, channel: object, parent_id: int | None) -> str | None:
+        """Return the tmux session name backing *channel*'s threads.
+
+        Per the per-channel session model (#10), all threads in a channel share
+        one tmux session. Prefer the channel's bound manager; fall back to the
+        session the invoking thread's window actually lives in (covers unbound
+        channels, mirroring the #420 watchdog fallback).
+        """
+        if parent_id is not None:
+            tmux_mgr = await self._resolve_tmux_manager(parent_id)
+            if tmux_mgr is not None:
+                return tmux_mgr.session_name
+        if isinstance(channel, discord.Thread):
+            session_name, _ = await self._find_thread_window(channel.id)
+            return session_name
+        return None
+
+    async def _resync_impl(
+        self, *, channel: object, scope: str, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /resync (thread) and /resync-channel (#439)."""
+        import asyncio
+
+        if scope == "thread":
+            if not isinstance(channel, discord.Thread):
+                await respond(
+                    "This command can only be used in a Claude chat thread.",
+                    ephemeral=True,
+                )
+                return
+            thread_id = channel.id
+            await ack()
+            session_name, window_name = await self._find_thread_window(thread_id)
+            if not session_name or not window_name:
+                await respond("ℹ️ No tmux window found for this thread.", ephemeral=True)
+                return
+            # 1. Re-bridge any stranded TUI menu so its buttons (re)appear.
+            await self._rebridge_menu(thread_id, session_name, window_name)
+            # 2. Post the current pane snapshot so the user sees the live state.
+            png = await self._snapshot_pane(session_name, window_name, thread_id)
+            if png is not None:
+                file = discord.File(
+                    BytesIO(png), filename=f"resync-{session_name}-{window_name}.png"
+                )
+                await respond("🔄 ミラーを今の tmux 状態に繋ぎ直しました。", file=file)
+            else:
+                await respond(
+                    "🔄 ミラーを繋ぎ直しました（pane は空、または PNG 依存 "
+                    "`c-lord[table]` が未導入）。"
+                )
+            return
+
+        # channel scope — resync every thread window in this channel's session.
+        channel_id = getattr(channel, "id", None)
+        parent_id = getattr(channel, "parent_id", None) or channel_id
+        await ack()
+        session_name = await self._resolve_channel_session(channel, parent_id)
+        if not session_name:
+            await respond(
+                "ℹ️ このチャンネルの tmux セッションが見つかりません。"
+                " `/clord-init` でリポジトリを紐づけてください。",
+                ephemeral=True,
+            )
+            return
+
+        from ..thread_state_sync import _list_all_windows
+
+        windows = await asyncio.to_thread(_list_all_windows)
+        count = 0
+        for w in windows:
+            if w.get("session_name") != session_name:
+                continue
+            tid = w.get("thread_id") or ""
+            if not tid.isdigit():
+                continue
+            await self._rebridge_menu(int(tid), session_name, w.get("window_name") or "")
+            count += 1
+        await respond(f"🔄 {count} スレッドのミラーを繋ぎ直しました（session={session_name}）。")
+
+    @app_commands.command(
+        name="resync",
+        description="Reconnect this thread's Discord mirror to its tmux pane",
+    )
+    async def resync(self, interaction: discord.Interaction) -> None:
+        """Re-bridge a stranded menu and post a fresh pane snapshot (#439)."""
+        respond, ack = self._slash_io(interaction)
+        await self._resync_impl(
+            channel=interaction.channel, scope="thread", respond=respond, ack=ack
+        )
+
+    @commands.command(name="resync")
+    async def resync_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /resync — webhook-invokable for E2E (#439)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._resync_impl(channel=ctx.channel, scope="thread", respond=respond, ack=ack)
+
+    @app_commands.command(
+        name="resync-channel",
+        description="Reconnect the Discord mirror for every thread in this channel",
+    )
+    async def resync_channel(self, interaction: discord.Interaction) -> None:
+        """Channel-wide /resync — re-bridge every thread in this channel (#439)."""
+        respond, ack = self._slash_io(interaction)
+        await self._resync_impl(
+            channel=interaction.channel, scope="channel", respond=respond, ack=ack
+        )
+
+    @commands.command(name="resync-channel")
+    async def resync_channel_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /resync-channel (#439)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._resync_impl(channel=ctx.channel, scope="channel", respond=respond, ack=ack)
+
     async def _stop_transcript_mirror(self, thread_id: int) -> None:
         """Stop the TranscriptMirror tailing this thread, if any (#379).
 
