@@ -15,6 +15,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -129,6 +130,22 @@ class ChannelRepoCog(commands.Cog):
         manager = TmuxSessionManager(session_name=session_name)
         self._tmux_cache[channel_id] = manager
         return manager
+
+    async def managed_session_names(self) -> set[str]:
+        """tmux session names this bot manages (#438).
+
+        Used by the menu watchdog to ignore other bots' sessions on a shared
+        tmux server. Derived from this bot's channel bindings, plus the global
+        default session (``clord``) so that windows for an unbound channel
+        (#420) are still recognised as ours.
+        """
+        from ..tmux import SESSION_NAME
+
+        names: set[str] = {SESSION_NAME}
+        for binding in await self._repo.list_all():
+            with contextlib.suppress(Exception):
+                names.add(derive_session_name(binding["source_repo"]))
+        return names
 
     def evict_cache(self, channel_id: int) -> None:
         """Remove a cached channel manager (called on bind/unbind)."""

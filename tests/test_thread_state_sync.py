@@ -1068,3 +1068,111 @@ async def test_watchdog_still_gives_up_when_session_name_empty():
         await asyncio.sleep(0)
     bridge.assert_not_awaited()
     assert 223 not in loop._ask_bridges
+
+
+# ── #438: menu watchdog must only act on windows THIS bot owns ────────────────
+# `tmux list-windows -a` returns every session on a shared tmux server, including
+# other bots'. The watchdog must ignore foreign windows (else bot B bridges bot
+# A's menu). Ownership = thread_id ∈ my sessions.db (AC2) AND session ∈ my
+# managed tmux sessions (AC1).
+
+
+def _make_owned_watchdog(known_thread_ids, managed_sessions):
+    """Build a watchdog whose repo knows `known_thread_ids` and whose
+    ChannelRepoCog manages `managed_sessions`."""
+    from c_lord.cogs.channel_repo import ChannelRepoCog
+
+    bot = MagicMock()
+    cog = MagicMock(spec=ChannelRepoCog)
+    cog.managed_session_names = AsyncMock(return_value=set(managed_sessions))
+    bot.get_cog.return_value = cog
+
+    repo = MagicMock()
+    known = set(known_thread_ids)
+    repo.get = AsyncMock(side_effect=lambda tid: object() if tid in known else None)
+
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60, repo=repo)
+    return loop, bot, repo
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_window_for_thread_not_in_db():
+    """AC2: a window whose @thread_id is not in this bot's sessions.db (another
+    bot's session on the shared tmux server) is never bridged."""
+    loop, _bot, repo = _make_owned_watchdog(known_thread_ids={100}, managed_sessions={"clord"})
+    windows = [{"thread_id": "999", "session_name": "other-bot", "window_name": "w1"}]
+    with (
+        patch.object(thread_state_sync, "_list_all_windows", return_value=windows),
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="menu") as cap,
+        patch.object(loop, "_maybe_bridge_open_menu", new=AsyncMock()) as bridge,
+    ):
+        await loop.tick()
+    bridge.assert_not_awaited()
+    cap.assert_not_called()  # foreign window: don't even capture its pane
+    repo.get.assert_awaited_with(999)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_processes_window_for_own_thread():
+    """An owned thread (in my DB) in a managed session is processed normally."""
+    loop, _bot, _repo = _make_owned_watchdog(
+        known_thread_ids={100}, managed_sessions={"clord", "myrepo"}
+    )
+    windows = [{"thread_id": "100", "session_name": "myrepo", "window_name": "w1"}]
+    with (
+        patch.object(thread_state_sync, "_list_all_windows", return_value=windows),
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="menu"),
+        patch.object(loop, "_maybe_bridge_open_menu", new=AsyncMock()) as bridge,
+    ):
+        await loop.tick()
+    bridge.assert_awaited_once()
+    assert bridge.await_args is not None
+    assert bridge.await_args.args[0] == 100
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_foreign_session_even_if_thread_id_collides():
+    """AC1: a window in a tmux session this bot does NOT manage is skipped, even
+    if its @thread_id happens to match one of ours (二重ガード)."""
+    loop, _bot, _repo = _make_owned_watchdog(known_thread_ids={100}, managed_sessions={"clord"})
+    windows = [{"thread_id": "100", "session_name": "someone-elses-session", "window_name": "w1"}]
+    with (
+        patch.object(thread_state_sync, "_list_all_windows", return_value=windows),
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="menu"),
+        patch.object(loop, "_maybe_bridge_open_menu", new=AsyncMock()) as bridge,
+    ):
+        await loop.tick()
+    bridge.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_processes_owned_thread_in_default_clord_session():
+    """#420 regression: an owned thread whose window is in the default `clord`
+    session (unbound channel) is still bridged — the managed set includes the
+    default session, so the ownership filter does not strand it."""
+    loop, _bot, _repo = _make_owned_watchdog(known_thread_ids={100}, managed_sessions={"clord"})
+    windows = [{"thread_id": "100", "session_name": "clord", "window_name": "w94"}]
+    with (
+        patch.object(thread_state_sync, "_list_all_windows", return_value=windows),
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="menu"),
+        patch.object(loop, "_maybe_bridge_open_menu", new=AsyncMock()) as bridge,
+    ):
+        await loop.tick()
+    bridge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_without_repo_is_backward_compatible():
+    """Zero-config / legacy: a loop built without a repo (and no ChannelRepoCog)
+    keeps the old behaviour — it does not filter and still processes windows."""
+    bot = MagicMock()
+    bot.get_cog.return_value = None
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60)  # no repo
+    windows = [{"thread_id": "100", "session_name": "clord", "window_name": "w1"}]
+    with (
+        patch.object(thread_state_sync, "_list_all_windows", return_value=windows),
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="menu"),
+        patch.object(loop, "_maybe_bridge_open_menu", new=AsyncMock()) as bridge,
+    ):
+        await loop.tick()
+    bridge.assert_awaited_once()
