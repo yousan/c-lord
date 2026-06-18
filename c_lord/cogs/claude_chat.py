@@ -858,6 +858,86 @@ class ClaudeChatCog(commands.Cog):
 
         await self._clear_impl(ctx.channel, respond)
 
+    async def _restart_impl(self, channel: object, respond: _Responder) -> None:
+        """Shared core for /restart-claude and !restart-claude (#440).
+
+        Restarts the Claude **process** for this thread while PRESERVING the
+        conversation. It kills the active runner and the tmux window — so a
+        stuck / wedged claude process is gone — but, unlike :meth:`_clear_impl`,
+        it does **not** reset the session row. With the window dead and a live
+        ``session_id`` still on disk, the next message hits the #270 dead-pane
+        path and resumes via ``--continue``, so the context survives.
+
+        This sits between ``/resync`` (reconnect the Discord mirror only — the
+        process is untouched) and ``/clear`` (wipe the session, start fresh).
+        Observationally for the Discord user: after this, your next message is
+        handled by a fresh claude process that still remembers the conversation.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        thread_id = channel.id
+
+        # A session must exist to restart-and-resume; without one there is
+        # nothing to ``--continue`` and this would be a no-op.
+        record = await self.repo.get(thread_id)
+        if record is None:
+            await respond("No active session found for this thread to restart.", ephemeral=True)
+            return
+
+        # Kill the active runner (graceful kill of the in-flight, possibly
+        # wedged, turn) if one is registered.
+        runner = self._active_runners.get(thread_id)
+        if runner:
+            await runner.kill()
+            del self._active_runners[thread_id]
+
+        # Kill the tmux window so the old/stuck claude process is gone and
+        # ``is_claude_running`` returns False. We deliberately do NOT reset the
+        # session row — that is what distinguishes restart from /clear and lets
+        # the next message resume the conversation via --continue (#270, #123).
+        parent_id = getattr(channel, "parent_id", None) or thread_id
+        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        if tmux_manager is not None:
+            await asyncio.to_thread(tmux_manager.kill_session, thread_id)
+
+        await respond(
+            "\U0001f504 Claude を再起動しました。会話は保持されています — "
+            "次のメッセージで `--continue` により文脈を引き継いで再開します。"
+        )
+
+    @app_commands.command(
+        name="restart-claude",
+        description="Restart the Claude process for this thread (keeps the conversation)",
+    )
+    async def restart_claude(self, interaction: discord.Interaction) -> None:
+        """Restart Claude for this thread, preserving context (#440)."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        await self._restart_impl(interaction.channel, respond)
+
+    @commands.command(name="restart-claude")
+    async def restart_claude_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /restart-claude — invokable from webhooks (#440)."""
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            await ctx.send(content or "")
+
+        await self._restart_impl(ctx.channel, respond)
+
     async def _compact_impl(
         self, channel: object, respond: _Responder, *, instructions: str = ""
     ) -> None:

@@ -264,6 +264,99 @@ class TestClearTextCommand:
         assert 12345 not in cog._active_runners
 
 
+class TestRestartClaudeCommand:
+    """/restart-claude restarts the Claude process while KEEPING the conversation.
+
+    The defining property vs /clear: it must NOT reset the session row. Killing
+    the tmux window leaves a live session_id on disk, so the next message
+    resumes via ``--continue`` (the #270 dead-pane path) and context survives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_outside_thread_sends_ephemeral(self) -> None:
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        await cog.restart_claude.callback(cog, interaction)
+        kwargs = interaction.response.send_message.call_args.kwargs
+        assert kwargs.get("ephemeral") is True
+
+    @pytest.mark.asyncio
+    async def test_kills_window_but_keeps_session(self) -> None:
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=MagicMock())  # a session exists
+        cog.repo.reset = AsyncMock()
+        tmux = MagicMock()
+        tmux.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
+        interaction = _make_thread_interaction(12345)
+
+        await cog.restart_claude.callback(cog, interaction)
+
+        tmux.kill_session.assert_called_once_with(12345)
+        # KEY: the session row must survive so --continue can resume it.
+        cog.repo.reset.assert_not_called()
+        interaction.response.send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kills_active_runner(self) -> None:
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=MagicMock())
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        mock_runner = MagicMock()
+        mock_runner.kill = AsyncMock()
+        cog._active_runners[12345] = mock_runner
+        interaction = _make_thread_interaction(12345)
+
+        await cog.restart_claude.callback(cog, interaction)
+
+        mock_runner.kill.assert_called_once()
+        assert 12345 not in cog._active_runners
+
+    @pytest.mark.asyncio
+    async def test_no_session_reports_nothing_to_restart(self) -> None:
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=None)  # no session
+        cog.repo.reset = AsyncMock()
+        tmux = MagicMock()
+        tmux.kill_session = MagicMock()
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
+        interaction = _make_thread_interaction(12345)
+
+        await cog.restart_claude.callback(cog, interaction)
+
+        kwargs = interaction.response.send_message.call_args.kwargs
+        assert kwargs.get("ephemeral") is True
+        cog.repo.reset.assert_not_called()
+        tmux.kill_session.assert_not_called()
+
+
+class TestRestartClaudeTextCommand:
+    """!restart-claude mirrors /restart-claude but is invokable from webhooks."""
+
+    @pytest.mark.asyncio
+    async def test_outside_thread(self) -> None:
+        cog = _make_cog()
+        ctx = _make_channel_ctx()
+        await cog.restart_claude_text.callback(cog, ctx)
+        ctx.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restarts_keeping_session(self) -> None:
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=MagicMock())
+        cog.repo.reset = AsyncMock()
+        tmux = MagicMock()
+        tmux.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
+        ctx = _make_thread_ctx(thread_id=12345)
+
+        await cog.restart_claude_text.callback(cog, ctx)
+
+        tmux.kill_session.assert_called_once_with(12345)
+        cog.repo.reset.assert_not_called()
+        ctx.send.assert_called_once()
+
+
 class TestActiveCountAlias:
     """Tests for ClaudeChatCog.active_count (DrainAware alias)."""
 
@@ -1136,9 +1229,7 @@ class TestOnReady:
         bot = MagicMock()
         bot.get_channel.return_value = thread
 
-        cog = ClaudeChatCog(
-            bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo
-        )
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
 
         with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
             await cog.on_ready()
@@ -2386,7 +2477,7 @@ class TestApplyThreadNamingRetitle:
         cog, thread, tmux = self._make_cog_with_repo(record)
         thread.name = "monitoring"
         thread.send = AsyncMock()
-        thread.edit = AsyncMock(side_effect=asyncio.TimeoutError())
+        thread.edit = AsyncMock(side_effect=TimeoutError())
 
         await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
         thread.send.assert_not_awaited()
