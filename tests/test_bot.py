@@ -72,9 +72,17 @@ class TestOnAppCommandError:
 
     @pytest.mark.asyncio
     async def test_handler_logs_error(self, caplog: pytest.LogCaptureFixture) -> None:
-        """on_app_command_error should log the error at ERROR level."""
+        """on_app_command_error should log the error at ERROR level.
+
+        #444 also makes it reply to the user, so the interaction's response
+        methods must be awaitable mocks (see test_error_safety_net.py for the
+        reply-behavior assertions).
+        """
         bot = ClaudeDiscordBot(channel_id=123)
         interaction = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+        interaction.followup.send = AsyncMock()
         error = app_commands.AppCommandError("test failure")
 
         with caplog.at_level(logging.ERROR, logger="c_lord.bot"):

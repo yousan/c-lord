@@ -9,6 +9,7 @@ from typing import Protocol, runtime_checkable
 import discord
 
 from .embeds import stopped_embed
+from .error_reporting import ErrorReportingViewMixin
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ class Interruptable(Protocol):
     async def interrupt(self) -> None: ...
 
 
-class StopView(discord.ui.View):
+class StopView(ErrorReportingViewMixin, discord.ui.View):
     """A ⏹ Stop button attached to the session status message.
 
     Clicking it sends SIGINT to the active Claude runner (graceful interrupt,

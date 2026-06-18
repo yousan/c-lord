@@ -29,6 +29,7 @@ import discord
 
 from .ask_bus import AskAnswerBus
 from .ask_bus import ask_bus as _default_ask_bus
+from .error_reporting import ErrorReportingViewMixin
 
 if TYPE_CHECKING:
     from ..claude.types import AskQuestion
@@ -42,7 +43,7 @@ _RESTART_MSG = (
 )
 
 
-class AskView(discord.ui.View):
+class AskView(ErrorReportingViewMixin, discord.ui.View):
     """Renders buttons or a select menu for a single AskUserQuestion prompt.
 
     This is a **persistent** view — ``timeout=None``.  Register it with the

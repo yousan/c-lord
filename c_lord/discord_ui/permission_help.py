@@ -9,6 +9,8 @@ hitting a silent failure or a generic "interaction failed".
 
 from __future__ import annotations
 
+import discord
+
 
 class ThreadCreateForbiddenError(Exception):
     """Signals that ``channel.create_thread()`` failed with ``discord.Forbidden``.
@@ -39,3 +41,35 @@ def create_thread_permission_help() -> str:
     Create Public Threads on the channel).
     """
     return _CREATE_THREAD_PERMISSION_HELP
+
+
+# --- Generic last-resort messages (#444 safety net) ----------------------------
+# Shown when an *unhandled* exception reaches a global error handler (slash/text
+# command, or a View button/modal callback). They must be actionable but must
+# NOT leak the raw exception text or a traceback to the user.
+
+PERMISSION_DENIED_HELP = (
+    "❌ Bot に必要な権限が無い可能性があります。対象チャンネルで Bot（またはそのロール）に "
+    "「チャンネルを見る」「メッセージの送信」「公開スレッドの作成」"
+    "「スレッドでメッセージを送信」などが付与されているか確認してください。"
+)
+
+UNEXPECTED_ERROR_HELP = (
+    "⚠️ 処理中に予期せぬエラーが発生しました。少し待ってもう一度試してください。"
+    "繰り返す場合は bot のログを確認してください。"
+)
+
+
+def command_error_help(error: BaseException) -> str:
+    """Map a command/interaction exception to a sanitized, user-facing message.
+
+    discord.py wraps callback exceptions in ``CommandInvokeError`` (both the
+    app-command and text-command variants expose the cause as ``.original``), so
+    we unwrap one level before classifying.  A ``discord.Forbidden`` becomes a
+    permission hint; anything else becomes a generic "unexpected error" message
+    so the user never sees a raw traceback.
+    """
+    original = getattr(error, "original", error)
+    if isinstance(original, discord.Forbidden):
+        return PERMISSION_DENIED_HELP
+    return UNEXPECTED_ERROR_HELP

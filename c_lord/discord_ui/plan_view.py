@@ -11,13 +11,15 @@ import logging
 
 import discord
 
+from .error_reporting import ErrorReportingViewMixin
+
 logger = logging.getLogger(__name__)
 
 # Timeout for plan approval — if no response in 5 minutes, cancel.
 PLAN_APPROVAL_TIMEOUT = 300
 
 
-class PlanApprovalView(discord.ui.View):
+class PlanApprovalView(ErrorReportingViewMixin, discord.ui.View):
     """Two-button view: ✅ Approve | ❌ Cancel for plan mode."""
 
     def __init__(self, runner, request_id: str) -> None:
