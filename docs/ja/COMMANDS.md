@@ -66,16 +66,24 @@ Bot → Channel (= 1 リポジトリ + 1 tmux session) → Thread (= 1 tmux wind
 
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
-| `/resume-info` | このスレッドのセッションを CLI で再開するコマンドを表示 | スレッドのみ |
-| `/sessions` | 全セッション一覧 | どこでも |
+| `/clord-status` | **このチャンネル**の稼働中セッション一覧（容量・attach・resume） | どこでも |
+| `/clord-status show_all:true` | closed なセッションも含める（`docker ps -a` 相当） | どこでも |
 
-**`/resume-info`** は `claude --resume <session_id>` コマンドを表示します。ターミナルから会話を続けたいときに使います。
+**`/clord-status`** はチャンネル単位のセッション状態を 1 コマンドにまとめたものです。各行に window 番号 `#`（昇順）・`status`・スレッドの `topic`・`size`・`used`（最終活動からの経過）を表示。表の上にコピペ可能な `tmux attach -t <session>:work<#>` を出します（`#` を置換）。Claude Code セッション ID（`cc-session`、ターミナルで `claude --resume <id>` する用）は **`all` の時だけ右端**に出ます。既定は **live** のみ（`docker ps` 相当）、`show_all` で **closed**（`/close-workspace` 済み — tmux は閉じたが dir は残り容量を食う）も表示。`/workspace-delete` 済み（作業 dir 削除）のものは footer に件数のみ。**削除された `/sessions`・`/session-dirs`・`/resume-info` を統合**したものです（#363）。
+
+**status の値**（DB ではなく呼び出し時のライブ判定）：
+
+| status | 意味 |
+|--------|------|
+| `run` | tmux window あり・Claude 実行中（🟢） |
+| `wait` | tmux window あり・ターン完了で入力待ち（🟡） |
+| `err` | tmux window あり・ペインにエラー（🔴） |
+| `closed` | tmux window 無しだが session dir は残存（`/close-workspace` 済み — 容量を食う／メッセージ送信で再開）（⚪） |
 
 ### ワークスペース管理
 
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
-| `/session-dirs` | アクティブなセッションディレクトリを一覧表示 | どこでも |
 | `/session-cleanup [dry_run]` | 孤立したセッションディレクトリを削除 | どこでも |
 | `/tmux-list` | アクティブな tmux ウィンドウを一覧表示 | どこでも |
 | `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | スレッドのみ |

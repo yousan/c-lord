@@ -36,6 +36,8 @@ class _Rec:
     topic_source: str | None = None
     # #281: persisted rename rate-limit deadline (wall-clock "YYYY-MM-DD HH:MM:SS")
     rename_backoff_until: str | None = None
+    # #414: Issue/PR number shown in the thread name
+    issue_ref: str | None = None
 
 
 def test_index_by_thread_id_keeps_only_digit_tids():
@@ -251,6 +253,46 @@ async def test_sync_one_running_when_tool_executing_in_pane():
     # W1 from window_name "work1", NOT W4 from the volatile window_index.
     assert "W1" in kwargs["name"]
     assert "W4" not in kwargs["name"]
+
+
+async def test_sync_one_keeps_issue_ref_in_name():
+    """#414: the lamp-sync rename must keep the #<issue> number in the name."""
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(thread_id=222, state="running", topic="やること", tmux_window_id="@9", issue_ref="404")
+    by_tid = {
+        222: {
+            "window_id": "@9",
+            "window_index": "1",
+            "thread_id": "222",
+            "session_name": "clord",
+            "window_name": "work1",
+        }
+    }
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(
+            thread_state_sync,
+            "_capture_pane_text",
+            return_value="✻ Running bash...\n● response text\n",
+        ),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = Exception
+        await loop._sync_one(rec, by_tid)
+
+    fake_thread.edit.assert_awaited_once()
+    assert "#404" in fake_thread.edit.await_args.kwargs["name"]
 
 
 async def test_sync_one_waiting_when_prompt_visible():
@@ -954,3 +996,75 @@ async def test_watchdog_ignores_pane_without_menu():
         await loop._maybe_bridge_open_menu(115, "sess", "w1", "❯ \n-- INSERT --")
         await asyncio.sleep(0)
     bridge.assert_not_awaited()
+
+
+# -- #420: stranded menu when no manager resolves -----------------------------
+# A channel without a /clord-init binding resolves no TmuxSessionManager
+# (resolve_tmux_manager → None) and bot.tmux_manager is unwired (main.py never
+# passes one), so the watchdog used to log "no tmux manager" and give up every
+# tick — the open menu never reached Discord and the tmux→Discord mirror "cut
+# off". But the sweep ALREADY knows the session_name the window lives in (it
+# captured the pane from it), so the bridge must still happen.
+
+
+@pytest.mark.asyncio
+async def test_watchdog_bridges_using_swept_session_when_no_manager_resolves():
+    """#420: resolve_tmux_manager=None AND bot.tmux_manager=None must NOT strand
+    the menu — the watchdog builds a manager from the swept session_name and
+    bridges. RED before the fix: it logged 'no tmux manager' and never bridged."""
+    from c_lord.cogs.channel_repo import ChannelRepoCog
+    from c_lord.tmux import TmuxSessionManager
+
+    bot = MagicMock()
+    bot.tmux_manager = None  # global default not wired (main.py:226)
+    bot.ask_repo = None
+    # Parent channel has no /clord-init binding → resolve returns None.
+    cog = MagicMock(spec=ChannelRepoCog)
+    cog.resolve_tmux_manager = AsyncMock(return_value=None)
+    bot.get_cog.return_value = cog
+    thread = MagicMock(spec=thread_state_sync.discord.Thread)
+    thread.parent_id = 999
+    bot.get_channel.return_value = thread
+
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60)
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(222, "clord", "w94", pane)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(222)
+        assert task is not None, "menu was stranded — watchdog gave up instead of bridging"
+        await task
+
+    bridge.assert_awaited_once()
+    # The runner must target the session the sweep located, not a re-resolved one.
+    assert bridge.await_args is not None
+    runner = bridge.await_args.args[2]
+    assert isinstance(runner._tmux, TmuxSessionManager)
+    assert runner._tmux.session_name == "clord"
+
+
+@pytest.mark.asyncio
+async def test_watchdog_still_gives_up_when_session_name_empty():
+    """The empty-session_name guard stays: with nothing to target, the watchdog
+    must not fabricate a default session — it logs and returns (safety preserved)."""
+    bot = MagicMock()
+    bot.tmux_manager = None
+    bot.ask_repo = None
+    bot.get_cog.return_value = None
+    thread = MagicMock(spec=thread_state_sync.discord.Thread)
+    thread.parent_id = 999
+    bot.get_channel.return_value = thread
+
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60)
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(223, "", "w94", pane)
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()
+    assert 223 not in loop._ask_bridges

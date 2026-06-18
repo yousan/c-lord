@@ -998,6 +998,78 @@ async def test_mirror_skips_ask_when_bus_active(tmp_path: Path) -> None:
     assert spawned is False
 
 
+# ---------------------------------------------------------------------------
+# Issue #433: resume (after host crash) rewrites the active jsonl in place,
+# preserving history. The mirror must NOT re-post that history to Discord.
+# ---------------------------------------------------------------------------
+
+
+def _assistant_text_uuid(text: str, uuid: str, pad: int = 0) -> dict:
+    d = _assistant_text(text)
+    d["uuid"] = uuid
+    if pad:
+        d["pad"] = "x" * pad
+    return d
+
+
+def _turn_end(uuid: str) -> dict:
+    return {"type": "system", "subtype": "turn_duration", "uuid": uuid}
+
+
+async def test_mirror_does_not_repost_history_on_resume_rewrite(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    # Two completed turns of HISTORY, delivered by a previous mirror lifetime.
+    # Padded so the later resume-rewrite shrinks the file (trips offset reset).
+    _write_event(jsonl, _assistant_text_uuid("old answer 1", "u1", pad=400))
+    _write_event(jsonl, _turn_end("t1"))
+    _write_event(jsonl, _assistant_text_uuid("old answer 2", "u2", pad=400))
+    _write_event(jsonl, _turn_end("t2"))
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    reply_sink_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        reply_sink_calls.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()  # tails from EOF — history must stay un-posted
+    try:
+        await asyncio.sleep(0.2)
+        # Resume rewrite: history preserved verbatim + a NEW turn, no padding.
+        lines = [
+            _assistant_text_uuid("old answer 1", "u1"),
+            _turn_end("t1"),
+            _assistant_text_uuid("old answer 2", "u2"),
+            _turn_end("t2"),
+            _assistant_text_uuid("brand new answer", "u3"),
+            _turn_end("t3"),
+        ]
+        jsonl.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        os.utime(jsonl, (50, 50))
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+
+    # Only the genuinely new turn reaches Discord; no history re-post (the burst).
+    assert any("brand new answer" in s for s in reply_sink_calls), reply_sink_calls
+    assert not any("old answer 1" in s for s in reply_sink_calls), reply_sink_calls
+    assert not any("old answer 2" in s for s in reply_sink_calls), reply_sink_calls
+
+
 # -- #399 AC3: suppress the post-resolution flush of pane-bridged context ----
 
 
@@ -1243,12 +1315,13 @@ async def test_mirror_registers_flushed_intermediate_text_as_mirror_source(tmp_p
     async def sink(text: str) -> None:
         posted.append(text)
 
-    prose = "保存先の判断ポイント。メモは bot スコープかローカルかで決まります。私の推しはホーム直下です。" * 2
+    prose = (
+        "保存先の判断ポイント。メモは bot スコープかローカルかで決まります。私の推しはホーム直下です。"
+        * 2
+    )
 
     bridged_context.clear()
-    mirror = TranscriptMirror(
-        thread_id=99500, project_dir=project, sink=sink, poll_interval=0.05
-    )
+    mirror = TranscriptMirror(thread_id=99500, project_dir=project, sink=sink, poll_interval=0.05)
     mirror.start()
     try:
         await asyncio.sleep(0.15)

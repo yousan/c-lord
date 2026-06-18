@@ -21,6 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
@@ -36,7 +37,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
-from ..thread_name import thread_lamp_enabled
+from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -69,6 +70,15 @@ _ATTACHMENT_URL_NOTE = (
     "(This is a signed CDN URL valid for ~24 hours. Use the WebFetch tool or curl to retrieve it.)"
 )
 
+# Issue #75: shown when the bot lacks send permission (discord.Forbidden / 50001
+# Missing Access) on a channel or thread.  Names the exact permissions to grant
+# so the user can self-diagnose instead of staring at a silent failure.
+_SEND_PERMISSION_HELP = (
+    "❌ このチャンネル/スレッドに書き込み権限がありません。\n"
+    "Bot に「メッセージの送信」「公開スレッドでのメッセージ送信」"
+    "「プライベートスレッドでのメッセージ送信」を付与してください。"
+)
+
 
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
@@ -89,6 +99,7 @@ class ClaudeChatCog(commands.Cog):
         settings_repo: SettingsRepository | None = None,
         allowed_role_name: str | None = None,
         thread_lamp: bool | None = None,
+        thread_retitle: bool | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -99,6 +110,10 @@ class ClaudeChatCog(commands.Cog):
         # thread-rename rate-limit. Opt in via thread_lamp=True or
         # CLORD_THREAD_LAMP=1. Resolved once here so the env is read at startup.
         self._thread_lamp = thread_lamp_enabled(thread_lamp)
+        # Automatic mid-conversation topic re-titling (#121). Off by default
+        # (#414) — it fired too eagerly and renamed threads users didn't want
+        # renamed. Opt in via thread_retitle=True or CLORD_THREAD_RETITLE=1.
+        self._thread_retitle = thread_retitle_enabled(thread_retitle)
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         self._registry = registry or getattr(bot, "session_registry", None)
@@ -129,6 +144,12 @@ class ClaudeChatCog(commands.Cog):
         # its first session_id).  Drained by _apply_thread_naming on the
         # next call once the row exists.
         self._pending_topic: dict[int, tuple[str, str]] = {}
+        # Issue #414: issue/PR number resolved before the session row exists;
+        # drained by _apply_thread_naming on the next call once the row is saved.
+        self._pending_issue_ref: dict[int, str] = {}
+        # Issue #429: thread ids already shown the "rename needs Manage Threads"
+        # hint, so it is posted at most once per process per thread (not per turn).
+        self._rename_hint_sent: set[int] = set()
         self._pending_tmux_window_id: dict[int, str] = {}
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
@@ -266,15 +287,21 @@ class ClaudeChatCog(commands.Cog):
         thread: discord.Thread,
         tmux_manager: TmuxSessionManager,
         first_message: str,
+        working_dir: str | None = None,
     ) -> None:
-        """Apply the Issue #95 naming scheme to ``thread``.
+        """Apply the Issue #95 / #414 naming scheme to ``thread``.
 
         - Generates and persists ``topic`` on first use (unless the
           thread is ``auto_topic_locked`` from a previous manual rename).
+        - Resolves and persists the Issue/PR number (#414) from the session's
+          git branch (``working_dir``) or, as a fallback, the first message.
         - Persists the tmux ``window_id`` (immutable) on the row.
         - Renames the Discord thread to
-          ``<status_emoji> W<work_number> │ <topic>`` capped at 30 chars,
-          but only if the current name differs (minimises API calls).
+          ``<status_emoji> W<work_number> │ #<issue> <topic>`` capped at 30
+          chars, but only if the current name differs (minimises API calls).
+
+        Mid-conversation topic re-titling (#121) is gated on ``self._thread_retitle``
+        (off by default, #414).
 
         All errors are swallowed by the caller; this helper raises only
         on truly unexpected programmer mistakes.
@@ -285,14 +312,24 @@ class ClaudeChatCog(commands.Cog):
         topic = record.topic if record else None
         locked = bool(record.auto_topic_locked) if record else False
         state = (record.state if record else None) or "alive"
+        issue_ref = record.issue_ref if record else None
+        # #428: text-based issue-ref detection runs ONLY on the thread's first
+        # message (the branch is still read every turn). Captured before topic
+        # generation: no topic persisted yet and none pending = first naming.
+        # Otherwise a casual mid-thread '#1' would be captured and stick forever.
+        is_first_message = not topic and thread.id not in self._pending_topic
 
-        # Drain any topic / window-id pending from a previous call where
-        # the session row did not yet exist.
+        # Drain any topic / issue-ref / window-id pending from a previous call
+        # where the session row did not yet exist.
         if record is not None:
             pending = self._pending_topic.pop(thread.id, None)
             if pending and not record.topic and not locked:
                 await self.repo.set_topic(thread.id, pending[0], source=pending[1])
                 topic = pending[0]
+            pending_ref = self._pending_issue_ref.pop(thread.id, None)
+            if pending_ref and not record.issue_ref:
+                await self.repo.set_issue_ref(thread.id, pending_ref)
+                issue_ref = pending_ref
             pending_win = self._pending_tmux_window_id.pop(thread.id, None)
             if pending_win and record.tmux_window_id != pending_win:
                 await self.repo.set_tmux_window_id(thread.id, pending_win)
@@ -308,11 +345,12 @@ class ClaudeChatCog(commands.Cog):
         else:
             window_number = None
 
-        # Re-summarize title on subsequent messages (#121).
-        # Only runs when a topic already exists and the thread is not manually
-        # renamed (locked).  Returns None when the LLM deems the current topic
-        # still valid (verbatim match) — so no rename API call is triggered.
-        if topic and not locked:
+        # Re-summarize title on subsequent messages (#121) — opt-in only (#414).
+        # Off by default because it renamed threads too eagerly; enable via
+        # CLORD_THREAD_RETITLE=1. Only runs when a topic already exists and the
+        # thread is not manually renamed (locked). Returns None when the LLM
+        # deems the current topic still valid — so no rename API call is fired.
+        if topic and not locked and self._thread_retitle:
             with contextlib.suppress(Exception):
                 new_topic = await topic_module.maybe_retitle(first_message or "", topic)
                 if new_topic is not None:
@@ -342,13 +380,31 @@ class ClaudeChatCog(commands.Cog):
             # just deleted concurrently).
             topic = parse_topic_from_name(thread.name) or "新しいスレッド"
 
+        # Resolve the Issue/PR number (#414). The git branch is authoritative
+        # and re-read every call (so a branch switch is followed); the first
+        # message's #NNN / issue URL is only a fallback used until a number is
+        # known. Never auto-cleared — a known number persists until a *different*
+        # branch number appears.
+        detected_ref = await self._detect_issue_ref(
+            working_dir, first_message, current=issue_ref, allow_text=is_first_message
+        )
+        if detected_ref and detected_ref != issue_ref:
+            issue_ref = detected_ref
+            if record is not None:
+                await self.repo.set_issue_ref(thread.id, detected_ref)
+            else:
+                self._pending_issue_ref[thread.id] = detected_ref
+
         # lamp=False (default, #329) keeps the topic but drops the leading
         # status emoji, so the name no longer changes on state transitions and
-        # the only rename is the one-off topic naming.
-        new_name = build_name(topic, state, window_number, lamp=self._thread_lamp)
+        # the only rename is the one-off topic naming. The #<issue> number (#414)
+        # is shown when known.
+        new_name = build_name(
+            topic, state, window_number, lamp=self._thread_lamp, issue_ref=issue_ref
+        )
         if (thread.name or "") == new_name:
             return
-        with contextlib.suppress(discord.HTTPException, TimeoutError, asyncio.TimeoutError):
+        try:
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
             logger.info(
                 "%s lamp → %s (event-driven) %r",
@@ -356,6 +412,91 @@ class ClaudeChatCog(commands.Cog):
                 state,
                 new_name,
             )
+        except (  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
+            discord.HTTPException,
+            TimeoutError,
+            asyncio.TimeoutError,
+        ) as exc:
+            # #423: previously suppressed silently — a failed rename left a stuck
+            # title (e.g. the monitoring thread) with no trace of *why*. Log the
+            # reason (HTTP status/code if any) but keep swallowing: a cosmetic
+            # rename must never break the response path.
+            logger.warning(
+                "%s thread rename failed: %r → %r: %s status=%s code=%s: %s",
+                log_ctx(thread_id=thread.id),
+                thread.name,
+                new_name,
+                type(exc).__name__,
+                getattr(exc, "status", None),
+                getattr(exc, "code", None),
+                exc,
+            )
+            # #429: a 403 means the bot lacks "Manage Threads" in this server, so it
+            # can post but never rename. Surface that to the user once per process
+            # (re-hint after a restart so it stays visible until the perm is added).
+            # Only for 403 — timeouts / other errors aren't user-actionable.
+            if isinstance(exc, discord.Forbidden) and thread.id not in self._rename_hint_sent:
+                self._rename_hint_sent.add(thread.id)
+                with contextlib.suppress(discord.HTTPException):
+                    # `-# ` renders as Discord subtext (small, muted) so the hint is
+                    # unobtrusive — one quiet line, not a full warning message (#429).
+                    await thread.send(
+                        "-# スレッド名を自動更新できませんでした"
+                        "（bot に「スレッドの管理 / Manage Threads」権限が必要）"
+                    )
+
+    async def _detect_issue_ref(
+        self,
+        working_dir: str | None,
+        first_message: str,
+        *,
+        current: str | None,
+        allow_text: bool,
+    ) -> str | None:
+        """Resolve the thread's Issue/PR number (#414), or ``None``.
+
+        Priority: the session's git branch (authoritative, re-read each call) →
+        the first message's ``#NNN`` / issue URL (only when ``allow_text`` — i.e.
+        the thread's first message, #428 — and no number is known yet) → the
+        current value (no change). Reading text on later messages would let a
+        casual mid-thread ``#1`` be captured and stick forever.
+        """
+        branch_ref = await self._read_branch_issue_ref(working_dir)
+        if branch_ref:
+            return branch_ref
+        if allow_text and not current:
+            return issue_ref_module.extract_from_text(first_message or "")
+        return current
+
+    async def _read_branch_issue_ref(self, working_dir: str | None) -> str | None:
+        """Read the git branch of ``working_dir`` and extract its issue number."""
+        if not working_dir:
+            return None
+        branch = await asyncio.to_thread(self._git_current_branch, working_dir)
+        return issue_ref_module.extract_from_branch(branch)
+
+    @staticmethod
+    def _git_current_branch(working_dir: str) -> str | None:
+        """Return the current git branch name of ``working_dir`` (best-effort).
+
+        Never raises — returns ``None`` on any error or detached HEAD. Uses a
+        list-arg subprocess (no shell) per the security policy.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", working_dir, "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -443,7 +584,18 @@ class ClaudeChatCog(commands.Cog):
             # Continue in existing thread
             record = await self.repo.get(channel.id)
             session_id = (record.session_id or None) if record else None
-            seed_message = await channel.send(prompt)
+            try:
+                seed_message = await channel.send(prompt)
+            except discord.Forbidden:
+                # #75: bot lacks "Send Messages in Threads" → tell the user the
+                # exact missing permission instead of a silent 50001 traceback.
+                logger.warning(
+                    "%s seed send forbidden (missing send permission)",
+                    log_ctx(thread_id=channel.id),
+                    exc_info=True,
+                )
+                await respond(_SEND_PERMISSION_HELP, ephemeral=True)
+                return
             await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
             await respond("Session completed.", silent=True)
         else:
@@ -808,25 +960,45 @@ class ClaudeChatCog(commands.Cog):
             auto_archive_duration=archive_minutes,
         )
         # Post the prompt so StatusManager has a Message to add reactions to.
-        seed_message = await thread.send(prompt)
+        try:
+            seed_message = await thread.send(prompt)
+        except discord.Forbidden:
+            # #75: bot can create the thread but lacks "Send Messages in
+            # Threads".  The thread itself is unreachable, so surface the
+            # permission guidance in the parent channel where the user can see
+            # it, then re-raise so the caller (/clord, /api/spawn) knows the
+            # spawn failed instead of returning a dead thread.
+            logger.warning(
+                "%s spawn seed send forbidden (missing send permission)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(_SEND_PERMISSION_HELP)
+            raise
         # Run Claude in the background so /api/spawn returns immediately.
         # The caller gets the thread reference without waiting for Claude to finish.
         asyncio.create_task(self._run_claude(seed_message, thread, prompt, session_id=session_id))
         return thread
 
     async def cog_unload(self) -> None:
-        """Mark all mid-run Claude sessions for auto-resume on the next bot startup.
+        """Record all mid-run Claude sessions so they get a restart notice.
 
         Called by discord.py whenever the cog is removed — including during a
         clean shutdown triggered by ``systemctl restart/stop``, ``bot.close()``,
-        or any other SIGTERM-based shutdown.  This ensures that sessions which
-        were actively running when the bot was killed will be automatically
-        resumed (with a "bot restarted" prompt) as soon as the bot comes back.
+        or any other SIGTERM-based shutdown.  Sessions that were actively running
+        when the bot was killed are recorded so that, on the next startup,
+        ``on_ready`` posts a quiet restart notice into each thread.
+
+        #406: we do **not** re-prompt Claude on restart.  The ``claude`` process
+        in tmux survives a bot restart and the observers (TranscriptMirror + menu
+        watchdog) self-restore, so injecting a "continue your work" prompt only
+        caused unwanted autonomous progress (意図しない前進).
 
         Idle sessions (where Claude has already replied and is waiting for the
         next human message) are NOT in ``_active_runners`` and therefore are not
-        marked — they resume naturally via message-triggered resume when the user
-        sends their next message.
+        recorded — they resume naturally via message-triggered resume when the
+        user sends their next message.
 
         No-op when ``_resume_repo`` is not configured.
         """
@@ -834,7 +1006,7 @@ class ClaudeChatCog(commands.Cog):
             return
 
         logger.info(
-            "Shutdown detected: marking %d active session(s) for restart-resume",
+            "Shutdown detected: recording %d active session(s) for restart notice",
             len(self._active_runners),
         )
         for thread_id in list(self._active_runners):
@@ -844,17 +1016,16 @@ class ClaudeChatCog(commands.Cog):
                 if record is not None:
                     session_id = record.session_id
 
+                # resume_prompt is intentionally None (#406): on_ready posts a
+                # quiet notice, it never re-runs Claude with a stored prompt.
                 await self._resume_repo.mark(
                     thread_id,
                     session_id=session_id,
                     reason="bot_shutdown",
-                    resume_prompt=(
-                        "ボットが再起動しました。"
-                        "前の作業の続きを確認し、必要な残作業があれば完了してください。"
-                    ),
+                    resume_prompt=None,
                 )
                 logger.info(
-                    "Marked thread %d for restart-resume (session=%s)", thread_id, session_id
+                    "Recorded thread %d for restart notice (session=%s)", thread_id, session_id
                 )
             except Exception:
                 logger.warning(
@@ -913,45 +1084,44 @@ class ClaudeChatCog(commands.Cog):
                 )
                 continue
 
-            resume_prompt = entry.resume_prompt or (
-                "ボットが再起動から復帰しました。"
-                "前の作業の続きを確認し、必要な残作業を完了してください。"
-            )
-
+            # #406: Do NOT re-prompt Claude on restart.  The ``claude`` process
+            # in tmux survives a bot restart, and the observers (TranscriptMirror
+            # for the reply text + the always-on menu watchdog for AskUserQuestion
+            # /plan menus) self-restore on startup.  Re-running Claude with a
+            # "continue your remaining work" prompt only caused unwanted autonomous
+            # progress (意図しない前進) and made the conversation appear to "jump"
+            # when the queued tmux activity surfaced all at once.  Just post a
+            # quiet, human-facing notice that recent display may have lagged.
             logger.info(
-                "Resuming session in thread %d (session_id=%s, reason=%s)",
+                "Restart notice for thread %d (session_id=%s, reason=%s) — "
+                "observers self-restored; not re-prompting Claude (#406)",
                 thread_id,
                 entry.session_id,
                 entry.reason,
             )
             try:
-                # Post directly into the existing thread — no new thread needed
-                seed_message = await thread.send(
-                    f"🔄 **Bot が再起動から復帰しました。**\n{resume_prompt}"
-                )
-                asyncio.create_task(
-                    self._run_claude(
-                        seed_message,
-                        thread,
-                        resume_prompt,
-                        session_id=entry.session_id,
-                        try_continue=True,
-                    )
+                await thread.send(
+                    "-# 🔄 C-lord を再起動しました。少し前の表示が遅延した可能性があります。"
                 )
             except Exception:
-                logger.error("Failed to resume session in thread %d", thread_id, exc_info=True)
+                logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
 
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
 
-        If Claude is already running in this thread, sends SIGINT to the active
-        session (graceful interrupt, like pressing Escape) and waits for it to
-        finish cleaning up before starting the new session.  This prevents two
-        Claude processes from running in parallel in the same thread.
+        A new message while a turn is already in flight **interrupts** that turn
+        and starts fresh with the new instruction — the documented behaviour (see
+        USER_GUIDE → "Interrupting").  :meth:`_preempt_prior_turn` does the
+        teardown, which also covers a turn parked on a bridged
+        AskUserQuestion/plan menu whose ``timeout=None`` await previously wedged
+        the thread forever (#315).
 
-        A per-thread asyncio.Lock serializes concurrent calls so that a second
-        message arriving before the first registers in ``_active_runners``
-        cannot spawn a duplicate ``_run_claude``.
+        A per-thread asyncio.Lock serializes the *setup* of concurrent calls so a
+        second message arriving before the first registers cannot spawn a
+        duplicate ``_run_claude``.  The lock is **not** held across the turn
+        itself (the run is dispatched as its own task), so a turn that blocks on a
+        bridged menu can never hold the lock — that held-across-run lock was the
+        #315 deadlock.
         """
         thread = message.channel
         assert isinstance(thread, discord.Thread)
@@ -963,23 +1133,23 @@ class ClaudeChatCog(commands.Cog):
             prompt, image_paths = await self._build_prompt_and_images(message)
             prompt = await enrich_discord_references(prompt, message, self.bot)
 
-            # Interrupt any active session in this thread before starting a new one.
-            existing_runner = self._active_runners.get(thread.id)
-            existing_task = self._active_tasks.get(thread.id)
-            if existing_runner is not None:
-                await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
-                await existing_runner.interrupt(silent=True)
-                # Wait for the interrupted _run_claude to finish its finally block
-                # (which releases the semaphore and removes entries from dicts).
-                if existing_task is not None and not existing_task.done():
-                    with contextlib.suppress(Exception):
-                        await existing_task
+            # Interrupt any in-flight turn for this thread before starting the new
+            # one.  We key on ``_active_tasks`` (set synchronously below, under
+            # this same lock) rather than ``_active_runners`` (registered later,
+            # inside ``_run_claude``): this removes the registration race the lock
+            # was added for, without holding the lock across the run — so a turn
+            # parked on a bridged menu can no longer wedge the thread (#315).
+            prev_task = self._active_tasks.get(thread.id)
+            prev_runner = self._active_runners.get(thread.id)
+            had_active = prev_task is not None and not prev_task.done()
+            if prev_task is not None and had_active:
+                await self._preempt_prior_turn(thread, prev_task, prev_runner)
 
             # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
             # death) but a prior session's transcript is still on disk, resume it via
             # --continue instead of starting fresh and discarding the history.
             # Conditions:
-            #   - existing_runner is None: an interrupted-but-live session stays alive
+            #   - no in-flight turn: an interrupted-but-live session stays alive
             #     in tmux and should just receive send_input, not --continue.
             #   - session_id is not None: a /clear'd thread has its session_id reset,
             #     so it stays fresh — preserving the #123 Part 1 invariant.
@@ -987,21 +1157,78 @@ class ClaudeChatCog(commands.Cog):
             # This extends the --continue fallback (previously only on the
             # restart-resume path, #123 Part 2) to the ordinary reply path.
             try_continue = False
-            if session_id is not None and existing_runner is None:
+            if session_id is not None and not had_active:
                 parent_channel_id = getattr(thread, "parent_id", None) or thread.id
                 tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
                 if tmux_manager is not None:
                     pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
                     try_continue = not pane_alive
 
-            await self._run_claude(
-                message,
-                thread,
-                prompt,
-                session_id=session_id,
-                image_paths=image_paths,
-                try_continue=try_continue,
+            # Run as its own task so the per-thread lock is NOT held for the
+            # (possibly long, possibly menu-parked) duration of the turn — that
+            # held-across-run lock was the #315 deadlock.  Registering the task
+            # here, under the lock, preserves the no-duplicate-run invariant: a
+            # second reply that gets the lock sees this task and pre-empts it.
+            task = asyncio.create_task(
+                self._run_claude(
+                    message,
+                    thread,
+                    prompt,
+                    session_id=session_id,
+                    image_paths=image_paths,
+                    try_continue=try_continue,
+                )
             )
+            self._active_tasks[thread.id] = task
+
+    async def _preempt_prior_turn(
+        self,
+        thread: discord.Thread,
+        prev_task: asyncio.Task,
+        prev_runner: TmuxClaudeRunner | None,
+    ) -> None:
+        """Interrupt the in-flight turn so the new message starts fresh (#315).
+
+        This is the documented behaviour (USER_GUIDE → "Interrupting"): a new
+        message while Claude is working interrupts the current turn and resumes
+        with the new instruction.  A graceful SIGINT breaks the runner's poll
+        loop, so a normally-progressing turn winds down on its own.  A turn parked
+        on a bridged menu, however, ignores the SIGINT — its ``await`` is on the
+        Discord button (``AskView`` is ``timeout=None``), not the poll loop — so
+        an empty ask-bus answer dismisses the menu (``bridge_pane_ask`` sends Esc
+        and returns) and a task cancel is the final backstop.  Together these
+        guarantee a parked menu can never wedge the thread (the #315 deadlock).
+        """
+        from ..discord_ui.ask_bus import ask_bus
+
+        await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
+        if prev_runner is not None:
+            with contextlib.suppress(Exception):
+                await prev_runner.interrupt(silent=True)
+        # No-op unless the turn is parked on a bridged menu; then it unblocks
+        # bridge_pane_ask so the run can wind down instead of waiting on a click.
+        ask_bus.post_answer(thread.id, [])
+        await self._drain_thread_task(prev_task)
+
+    async def _drain_thread_task(self, task: asyncio.Task, *, grace: float = 5.0) -> None:
+        """Tear down a prior turn so a new one can start cleanly (#315).
+
+        Waits up to ``grace`` seconds for ``task`` to finish on its own (the
+        graceful interrupt may already be winding it down); if it is still alive
+        — e.g. parked on a bridged menu whose ``await`` ignores the interrupt —
+        it is cancelled.  The cancellation propagates through ``bridge_pane_ask``
+        (which unregisters from the ask-bus in its ``finally``) and unwinds
+        ``_run_claude``'s ``finally`` (releasing the semaphore slot and clearing
+        ``_active_runners``), so a parked turn can never hold the thread hostage.
+        """
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+            task.cancel()
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            await task
 
     async def _build_prompt(self, message: discord.Message) -> str:
         """Build the prompt string (text only). Use _build_prompt_and_images for full processing."""
@@ -1165,11 +1392,19 @@ class ClaudeChatCog(commands.Cog):
                 #   (auto_topic_locked=1).
                 # - The tmux window-index is a *hint* shown at the end of the
                 #   name; the immutable tmux window-id is stored in the DB.
-                with contextlib.suppress(Exception):
+                try:
                     await self._apply_thread_naming(
                         thread=thread,
                         tmux_manager=tmux_manager,
                         first_message=prompt,
+                        working_dir=working_dir,
+                    )
+                except Exception:
+                    # #423: naming is best-effort and must not break the run, but a
+                    # failure before the rename (e.g. window lookup) was invisible.
+                    # Log it (with stacktrace) instead of swallowing silently.
+                    logger.warning(
+                        "%s thread naming failed", log_ctx(thread_id=thread.id), exc_info=True
                     )
 
             # Create a TmuxClaudeRunner for this thread.
@@ -1235,6 +1470,7 @@ class ClaudeChatCog(commands.Cog):
                         registry=self._registry,
                         ask_repo=self._ask_repo,
                         lounge_repo=self._lounge_repo,
+                        settings_repo=self._settings_repo,
                         stop_view=stop_view,
                         session_dir_manager=session_dir_manager,
                         tmux_manager=tmux_manager,
@@ -1248,8 +1484,14 @@ class ClaudeChatCog(commands.Cog):
                 # a zombie.  The individual helpers already log errors internally.
                 with contextlib.suppress(Exception):
                     await stop_view.disable()
-                self._active_runners.pop(thread.id, None)
-                self._active_tasks.pop(thread.id, None)
+                # Conditional pop: runs are no longer serialised by a lock held
+                # across the whole turn (#315), so a newer reply may have already
+                # replaced these entries with its own runner/task — only clear our
+                # own, never a successor's.
+                if self._active_runners.get(thread.id) is runner:
+                    self._active_runners.pop(thread.id, None)
+                if self._active_tasks.get(thread.id) is current_task:
+                    self._active_tasks.pop(thread.id, None)
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)

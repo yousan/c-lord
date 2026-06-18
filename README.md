@@ -190,8 +190,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Manual upgrade trigger** — `/upgrade` slash command lets authorised users trigger the upgrade pipeline directly from Discord (opt-in via `slash_command_enabled=True`)
 
 ### Session Management
-- **Session list** — `/sessions` lists all known sessions
-- **Resume info** — `/resume-info` shows the CLI command to continue the current session in a terminal
+- **Channel status** — `/clord-status` lists this channel's sessions with directory size, the `tmux attach` target, and the `claude --resume` command; `show_all` includes closed sessions (`docker ps -a` style). Supersedes the old `/sessions`, `/session-dirs`, `/resume-info`.
 - **Startup resume** — Interrupted sessions restart automatically after any bot reboot; `AutoUpgradeCog` (upgrade restarts) and `ClaudeChatCog.cog_unload()` (all other shutdowns) mark them automatically, or use `POST /api/mark-resume` manually
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
@@ -280,6 +279,43 @@ c-lord start --env /path/to/.env   # custom .env location
 
 Send a message in the configured channel — Claude will reply in a new thread.
 
+### Run as a Service (systemd --user — survives reboot)
+
+To keep c-lord running in the background and **start it automatically when the
+host reboots**, install it as a `systemd --user` service. From your clone:
+
+```bash
+bash scripts/install-systemd.sh
+```
+
+This generates `~/.config/systemd/user/c-lord.service` (pointing at this clone
+and your `uv`), enables it, and turns on **linger** so the service starts on
+boot even when no one is logged in. Then manage it with standard systemd:
+
+```bash
+systemctl --user restart c-lord.service     # after a `git pull`
+systemctl --user stop    c-lord.service
+systemctl --user status  c-lord.service
+journalctl --user -u c-lord.service -f      # live logs
+```
+
+Why `--user` instead of a system service: c-lord drives the user's `tmux`,
+`~/.claude` session files, `uv`, and the `claude` CLI, so it runs cleanest as
+**you**, with your environment — a root/system service would have to re-create
+all of that via `User=`/`Environment=`. `loginctl enable-linger "$USER"` is what
+makes a user service survive logout and start at boot; the installer runs it for
+you.
+
+> **Manual install:** copy [`deploy/c-lord.service`](deploy/c-lord.service), fix
+> the two `CHANGE-ME` paths (clone dir + `uv`), then
+> `systemctl --user daemon-reload && systemctl --user enable --now c-lord.service && loginctl enable-linger "$USER"`.
+
+> **WSL note:** if `systemctl --user` reports `Failed to connect to bus`, the
+> user D-Bus session isn't up. Ensure `systemd=true` under `[boot]` in
+> `/etc/wsl.conf` and reboot WSL (`wsl --shutdown`), or restart the bot by
+> killing it and letting `Restart=always` respawn it (`pkill -f c_lord.main` is
+> unsafe with multiple clones — kill by PID).
+
 ---
 
 ### Minimal Bot (Install as a Package)
@@ -360,6 +396,8 @@ When Claude's reply contains a URL (e.g. a GitHub Issues link), Discord would no
 ### Table Image Rendering (CLORD_RENDER_TABLE_IMAGES)
 
 When enabled, Markdown pipe tables in Claude's responses are rendered as PNG images using [Pillow](https://python-pillow.github.io/) and attached to the Discord message alongside the text. Each cell is split into text and emoji runs: **text is drawn with a CJK-capable font and emoji are drawn in full color** from a color emoji font, so 🟢/🔴 status lamps keep their color.
+
+**Inline markdown inside cells is collapsed to plain text** before drawing — the image cannot be made interactive, so leaving the raw syntax in would just leak noise. `[label](url)` / `![alt](url)` become `label` (the URL is unclickable in an image and only adds clutter), `**bold**` / `*italic*` / `~~strike~~` / `` `code` `` keep only their inner text. Underscore emphasis (`_x_`, `__x__`) is intentionally left untouched so identifiers such as `_is_allowed` / `__init__` are not mangled.
 
 **Installation:**
 
@@ -641,7 +679,7 @@ c_lord/
   cogs/
     claude_chat.py         # Interactive chat (thread creation, message handling)
     skill_command.py       # /skill slash command with autocomplete
-    session_manage.py      # /sessions, /resume-info
+    session_manage.py      # /clord-status
     scheduler.py           # Periodic Claude Code task executor
     webhook_trigger.py     # Webhook → Claude Code task execution (CI/CD)
     auto_upgrade.py        # Webhook → package upgrade + drain-aware restart

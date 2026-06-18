@@ -73,6 +73,10 @@ class AskView(discord.ui.View):
         self._thread_id = thread_id
         self._bus = bus if bus is not None else _default_ask_bus
         self._ask_repo = ask_repo
+        # multiSelect records the choice in the Select and submits via the
+        # ✅ confirm button (#418); single-select delivers immediately.
+        self._multi_select = question.multi_select
+        self._selected_values: list[str] = []
 
         options = question.options
         use_select = question.multi_select or len(options) > 4
@@ -93,7 +97,9 @@ class AskView(discord.ui.View):
                 ],
                 custom_id=f"ask_{thread_id}_{q_idx}_select",
             )
-            select.callback = self._select_callback
+            select.callback = (
+                self._multi_select_record if question.multi_select else self._select_callback
+            )
             self.add_item(select)
         elif options:
             for i, opt in enumerate(options[:4]):
@@ -105,6 +111,19 @@ class AskView(discord.ui.View):
                 )
                 btn.callback = _make_button_callback(self, opt.label)
                 self.add_item(btn)
+
+        # multiSelect needs an explicit submit affordance — the Select only
+        # records the choice, so without this button the user has no way to
+        # confirm (Discord's dismiss-to-submit is undiscoverable) (#418).
+        if question.multi_select and options:
+            confirm_btn = discord.ui.Button(
+                label="✅ 確定",
+                style=discord.ButtonStyle.success,
+                custom_id=f"ask_{thread_id}_{q_idx}_confirm",
+                row=1,
+            )
+            confirm_btn.callback = self._confirm_callback
+            self.add_item(confirm_btn)
 
         # Plan-approval menus (#251) suppress the free-text affordance: their
         # "Tell Claude what to change" option is selected like any other (and
@@ -152,6 +171,25 @@ class AskView(discord.ui.View):
     async def _select_callback(self, interaction: discord.Interaction) -> None:
         values: list[str] = interaction.data.get("values", [])  # type: ignore[union-attr]
         await self._deliver(interaction, values)
+
+    async def _multi_select_record(self, interaction: discord.Interaction) -> None:
+        """Record a multiSelect choice WITHOUT delivering — the user submits via
+        the ✅ confirm button (#418).  Echo the running selection so it is clear
+        what will be sent."""
+        self._selected_values = interaction.data.get("values", [])  # type: ignore[union-attr]
+        chosen = ", ".join(self._selected_values) or "（未選択）"
+        await interaction.response.edit_message(
+            content=f"-# 🔲 選択中: {chosen} — 「✅ 確定」で送信",
+        )
+
+    async def _confirm_callback(self, interaction: discord.Interaction) -> None:
+        """Deliver the recorded multiSelect choice when ✅ 確定 is pressed (#418)."""
+        if not self._selected_values:
+            await interaction.response.send_message(
+                "1つ以上選択してから「✅ 確定」を押してください。", ephemeral=True
+            )
+            return
+        await self._deliver(interaction, self._selected_values)
 
     async def _other_callback(self, interaction: discord.Interaction) -> None:
         modal = AskModal(title="Your answer")

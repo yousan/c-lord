@@ -25,16 +25,95 @@ from c_lord.cogs._run_helper import (
 from c_lord.concurrency import SessionRegistry
 
 
+class TestPersistedContextWindow:
+    """#370: the window total is persisted per-model in the settings KV store.
+
+    tier is stable per (host, account, model), so a value learned once survives
+    bot restarts and other sessions on the same model — the /context probe
+    (which renders into the human-visible tmux pane) then fires at most once per
+    model per host, instead of once per session / bot-restart.
+    """
+
+    def _config(self, *, probe_total: int | None, settings_repo: object | None):
+        cfg = MagicMock()
+        cfg.runner.model = "opus"
+        cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        cfg.settings_repo = settings_repo
+        return cfg
+
+    def test_disk_hit_skips_probe(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value="1000000")
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=1_000_000, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-disk", "claude-opus-4-8", 50_000)
+        )
+
+        assert total == 1_000_000
+        settings.get.assert_awaited_once_with("context_window:claude-opus-4-8")
+        cfg.runner.probe_context_window.assert_not_awaited()
+
+    def test_disk_miss_probes_then_persists(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value=None)
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=1_000_000, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-miss", "claude-opus-4-8", 50_000)
+        )
+
+        assert total == 1_000_000
+        cfg.runner.probe_context_window.assert_awaited_once()
+        settings.set.assert_awaited_once_with("context_window:claude-opus-4-8", "1000000")
+
+    def test_probe_failure_is_not_persisted(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value=None)
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=None, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-failpersist", "claude-opus-4-8", 20_000)
+        )
+
+        # Probe failed → fallback used, and nothing is written to disk (a
+        # transient failure must not lock a wrong window in for every future
+        # session — mirrors the in-memory "do not cache on failure" rule).
+        assert total == 200_000
+        settings.set.assert_not_awaited()
+
+
 class TestPostContextUsage:
     """_post_context_usage posts the context line and caches the denominator."""
 
-    def _config(self, *, working_dir: str | None = "/tmp/x", probe_total: int | None = 1_000_000):
+    def _config(
+        self,
+        *,
+        working_dir: str | None = "/tmp/x",
+        probe_total: int | None = 1_000_000,
+        settings_repo: object | None = None,
+    ):
         cfg = MagicMock()
         cfg.thread.id = 12345
         cfg.thread.send = AsyncMock()
         cfg.runner.working_dir = working_dir
         cfg.runner.model = "opus"
         cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        # Default to None so existing tests exercise the no-persistence path; a
+        # bare MagicMock would make ``await settings_repo.get(...)`` blow up.
+        cfg.settings_repo = settings_repo
         return cfg
 
     def _patch_usage(self, monkeypatch, used: int | None):
@@ -845,6 +924,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -892,6 +972,7 @@ class TestRecoverMissedPaneAsk:
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -925,6 +1006,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
 
         async def gen_with_reply(*args, **kwargs):
             yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
@@ -945,6 +1027,47 @@ class TestRecoverMissedPaneAsk:
             await run_claude_in_thread(thread, runner, repo, "hello", None)
 
         bridge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stopped_run_does_not_rebridge_post_turn(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """A pre-empted (stopped) run must NOT re-bridge its leftover menu (#315).
+
+        When a follow-up message interrupts a turn parked on a menu, the run is
+        torn down (``runner.stopped`` is True).  Re-bridging here would re-park it
+        on a fresh ``timeout=None`` await, so the new turn could never start — the
+        exact failure observed on staging (the ⚡ fired but no new run began).
+        """
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = True  # deliberately pre-empted by a follow-up message
+        runner.run = self._make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
+            ]
+        )
+        runner.peek_pending_ask = AsyncMock(
+            return_value=AskQuestion(
+                question="Which environment?",
+                header="Deploy",
+                options=[AskOption(label="Production", description="本番")],
+            )
+        )
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_not_awaited()
+        runner.peek_pending_ask.assert_not_called()
 
 
 class TestMakeErrorEmbed:

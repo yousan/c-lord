@@ -549,26 +549,45 @@ class TestInterruptOnNewMessage:
         thread.parent_id = 999
         thread.send = AsyncMock()
         msg = MagicMock(spec=discord.Message)
+        msg.id = 1
         msg.channel = thread
         msg.content = "new instruction"
         msg.attachments = []
+        msg.reference = None  # no Discord-reply → enrich_discord_references is a no-op
         msg.author = MagicMock()
         msg.author.bot = False
         return msg
 
+    def _plant_active_turn(self, cog: ClaudeChatCog, thread_id: int) -> MagicMock:
+        """Make ``thread_id`` look like it has an in-flight turn.
+
+        Plants an active task plus a runner whose ``interrupt`` lets the task
+        finish (mirroring a SIGINT breaking the runner's poll loop).  Returns the
+        runner so the caller can assert it was interrupted (#315).
+        """
+        runner = MagicMock()
+        done = asyncio.Event()
+        runner.interrupt = AsyncMock(side_effect=lambda *a, **k: done.set())
+        cog._active_runners[thread_id] = runner
+
+        async def active_turn() -> None:
+            try:
+                await done.wait()
+            finally:
+                cog._active_runners.pop(thread_id, None)
+                cog._active_tasks.pop(thread_id, None)
+
+        cog._active_tasks[thread_id] = asyncio.ensure_future(active_turn())
+        return runner
+
     @pytest.mark.asyncio
-    async def test_interrupt_called_when_runner_active(self) -> None:
-        """When a runner is active for a thread, _handle_thread_reply must interrupt it."""
+    async def test_interrupt_called_when_prior_turn_active(self) -> None:
+        """A new message interrupts the in-flight turn (USER_GUIDE behaviour, #315)."""
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
 
-        # Plant an active runner in the cog
-        existing_runner = MagicMock()
-        existing_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = existing_runner
-
-        # Stub _run_claude so we don't actually spawn Claude
+        existing_runner = self._plant_active_turn(cog, thread_id)
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
@@ -576,16 +595,14 @@ class TestInterruptOnNewMessage:
         existing_runner.interrupt.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_interrupt_message_sent_to_thread(self) -> None:
-        """The thread should receive a notification when the session is interrupted."""
+    async def test_interrupt_message_sent_when_preempting(self) -> None:
+        """The thread is notified when an in-flight turn is interrupted (#315)."""
         cog = _make_cog()
         thread_id = 42
         message = self._make_thread_message(thread_id)
         thread = message.channel
 
-        existing_runner = MagicMock()
-        existing_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = existing_runner
+        self._plant_active_turn(cog, thread_id)
         cog._run_claude = AsyncMock()
 
         await cog._handle_thread_reply(message)
@@ -640,6 +657,11 @@ class TestInterruptOnNewMessage:
 
         await cog._handle_thread_reply(message)
 
+        # The new turn now runs as its own task off the lock (#315) — let it run.
+        spawned = cog._active_tasks.get(thread_id)
+        assert spawned is not None
+        await asyncio.wait_for(spawned, timeout=1.0)
+
         assert call_order == ["task_done", "new_session_started"]
 
     @pytest.mark.asyncio
@@ -664,6 +686,74 @@ class TestInterruptOnNewMessage:
         cog._run_claude.assert_called_once()
         _, kwargs = cog._run_claude.call_args
         assert kwargs.get("session_id") == "abc-123"
+
+    @pytest.mark.asyncio
+    async def test_parked_menu_run_does_not_wedge_thread(self) -> None:
+        """A turn parked on a bridged menu must not wedge the thread (#315).
+
+        Production repro of the deadlock: the per-thread lock used to be held
+        across the *entire* ``_run_claude``, so a turn parked on an
+        AskUserQuestion / Plan-approval menu bridged to Discord buttons and never
+        clicked (``AskView`` is ``timeout=None``, up to 24h) held the lock
+        forever — every later message blocked on ``async with lock`` and never
+        reached tmux, with no error and no log. The fix dispatches the run off the
+        lock and pre-empts a menu-parked turn (detected via the ask-bus) so the
+        new message runs.
+        """
+        from c_lord.discord_ui.ask_bus import ask_bus
+
+        cog = _make_cog()
+        thread_id = 42
+        run_calls: list[str] = []
+
+        async def run_claude_stub(user_message, thread, prompt, **kwargs) -> None:
+            run_calls.append(prompt)
+            if len(run_calls) == 1:
+                # Model a turn parked on a bridged menu: register an ask-bus
+                # waiter (as bridge_pane_ask does) and block on the Discord button.
+                runner = MagicMock()
+                runner.interrupt = AsyncMock()
+                cog._active_runners[thread_id] = runner
+                cog._active_tasks[thread_id] = asyncio.current_task()
+                answer_q = ask_bus.register(thread_id)
+                try:
+                    await answer_q.get()  # timeout=None — the #315 park point
+                finally:
+                    ask_bus.unregister(thread_id)
+                    cog._active_runners.pop(thread_id, None)
+                    cog._active_tasks.pop(thread_id, None)
+
+        cog._run_claude = run_claude_stub
+
+        # First message starts the turn, which parks on the bridged menu.
+        task1 = asyncio.ensure_future(
+            cog._handle_thread_reply(self._make_thread_message(thread_id))
+        )
+        await asyncio.sleep(0.05)
+        assert run_calls == ["new instruction"], "first turn should start and park"
+        assert ask_bus.is_active(thread_id), "first turn should be parked on the menu"
+        existing_runner = cog._active_runners[thread_id]
+
+        # Second message must pre-empt the menu-parked turn and run — not hang on
+        # the (previously held-across-run) per-thread lock.
+        try:
+            await asyncio.wait_for(
+                cog._handle_thread_reply(self._make_thread_message(thread_id)),
+                timeout=2.0,
+            )
+        except TimeoutError:
+            ask_bus.unregister(thread_id)
+            task1.cancel()
+            pytest.fail(
+                "DEADLOCK: a menu-parked turn blocked a new message — Discord "
+                "input would never reach tmux (#315 repro)."
+            )
+
+        existing_runner.interrupt.assert_called_once()
+        await asyncio.sleep(0.05)
+        assert len(run_calls) == 2, "the new message's own turn should have run"
+        assert not ask_bus.is_active(thread_id), "the bridged menu should be dismissed"
+        await asyncio.wait_for(task1, timeout=1.0)
 
     @pytest.mark.asyncio
     async def test_active_tasks_dict_initialized(self) -> None:
@@ -927,8 +1017,13 @@ class TestOnReady:
         bot.get_channel.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_on_ready_deletes_before_spawning(self) -> None:
-        """Row must be deleted BEFORE _run_claude is called (single-fire guarantee)."""
+    async def test_on_ready_deletes_before_acting(self) -> None:
+        """Row must be deleted BEFORE acting on it (single-fire guarantee).
+
+        #406: the "action" is now posting a quiet restart notice (no re-prompt),
+        but the delete-first ordering that prevents a double-fire across a racy
+        reconnect must be preserved.
+        """
         from unittest.mock import AsyncMock, MagicMock, patch
 
         import discord
@@ -939,7 +1034,7 @@ class TestOnReady:
             id=7,
             thread_id=555,
             session_id="sess-abc",
-            reason="self_restart",
+            reason="bot_shutdown",
             resume_prompt="Continue please.",
             created_at="2026-02-21 20:00:00",
         )
@@ -949,7 +1044,6 @@ class TestOnReady:
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 555
-        thread.send = AsyncMock(return_value=MagicMock())
         parent = MagicMock(spec=discord.TextChannel)
         thread.parent = parent
 
@@ -960,18 +1054,17 @@ class TestOnReady:
 
         call_order: list[str] = []
         resume_repo.delete.side_effect = lambda _: call_order.append("delete")
+        thread.send = AsyncMock(side_effect=lambda *a, **k: call_order.append("notice"))
 
-        async def fake_run_claude(*args, **kwargs):
-            call_order.append("run_claude")
-
-        with patch.object(cog, "_run_claude", side_effect=fake_run_claude):
+        with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
             await cog.on_ready()
-            # create_task schedules the coroutine; yield to the event loop so it runs.
             await asyncio.sleep(0)
 
-        assert call_order == ["delete", "run_claude"], (
-            "delete() must be called before _run_claude to prevent double-resume"
+        assert call_order == ["delete", "notice"], (
+            "delete() must be called before the restart notice to prevent double-fire"
         )
+        # #406: no re-prompt — Claude is never re-run on restart.
+        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_on_ready_skips_non_thread_channels(self) -> None:
@@ -1003,6 +1096,66 @@ class TestOnReady:
         await cog.on_ready()
         # delete was still called (single-fire)
         resume_repo.delete.assert_called_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_on_ready_posts_quiet_notice_and_does_not_reprompt(self) -> None:
+        """#406: restart must NOT re-prompt Claude — only post a quiet notice.
+
+        The ``claude`` process in tmux survives a bot restart, and the observers
+        (TranscriptMirror + menu watchdog) self-restore on startup.  Re-running
+        Claude with a "continue your work" prompt therefore only causes unwanted
+        autonomous progress (意図しない前進) and makes the conversation appear to
+        "jump".  on_ready must instead post a subtle ``-#`` subtext notice and
+        leave the live session alone.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import discord
+
+        from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
+
+        entry = PendingResume(
+            id=9,
+            thread_id=555,
+            session_id="sess-abc",
+            reason="bot_shutdown",
+            resume_prompt=(
+                "ボットが再起動しました。前の作業の続きを確認し、必要な残作業があれば完了してください。"
+            ),
+            created_at="2026-06-12 05:00:00",
+        )
+        resume_repo = MagicMock(spec=PendingResumeRepository)
+        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.delete = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.send = AsyncMock(return_value=MagicMock())
+        thread.parent = MagicMock(spec=discord.TextChannel)
+
+        bot = MagicMock()
+        bot.get_channel.return_value = thread
+
+        cog = ClaudeChatCog(
+            bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo
+        )
+
+        with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
+            await cog.on_ready()
+            # create_task (if any) is scheduled; yield so it would run.
+            await asyncio.sleep(0)
+
+        # No re-prompt: Claude must not be re-run on restart.
+        mock_run.assert_not_called()
+        # Single-fire still guaranteed (row deleted before acting).
+        resume_repo.delete.assert_called_once_with(9)
+        # A quiet (-# subtext) notice was posted — and it is NOT the old loud
+        # "complete your remaining work" instruction injected into the session.
+        thread.send.assert_called_once()
+        sent = thread.send.call_args.args[0]
+        assert sent.startswith("-#"), f"notice must be quiet -# subtext, got: {sent!r}"
+        assert "完了してください" not in sent
+        assert "残作業" not in sent
 
 
 class TestCogUnloadMarkForResume:
@@ -1788,8 +1941,15 @@ class TestThreadLockSerialization:
         t2 = asyncio.create_task(cog._handle_thread_reply(msg2))
         await asyncio.gather(t1, t2)
 
-        # With serialization, call_log should be [start, end, start, end]
-        # Without it, it would be [start, start, end, end]
+        # Runs are dispatched as their own tasks off the lock now (#315); the
+        # second message pre-empts the first, which is drained before the second
+        # run starts — so the two never overlap.  Wait for the last spawned run.
+        spawned = cog._active_tasks.get(42)
+        if spawned is not None:
+            await asyncio.wait_for(spawned, timeout=2.0)
+
+        # No overlap: the runs execute one after the other, never concurrently.
+        # With overlap it would be [start, start, end, end].
         assert call_log == ["start", "end", "start", "end"]
 
 
@@ -1994,6 +2154,7 @@ class TestApplyThreadNamingRetitle:
         cog.repo.get = AsyncMock(return_value=record)
         cog.repo.set_topic = AsyncMock()
         cog.repo.set_tmux_window_id = AsyncMock()
+        cog.repo.set_issue_ref = AsyncMock()
 
         thread = MagicMock(spec=discord.Thread)
         thread.id = 55555
@@ -2004,12 +2165,13 @@ class TestApplyThreadNamingRetitle:
 
         return cog, thread, tmux_manager
 
-    def _make_record(self, *, topic, locked=0, state="running"):
+    def _make_record(self, *, topic, locked=0, state="running", issue_ref=None):
         record = MagicMock()
         record.topic = topic
         record.auto_topic_locked = locked
         record.state = state
         record.tmux_window_id = "@1"
+        record.issue_ref = issue_ref
         return record
 
     @pytest.mark.asyncio
@@ -2021,6 +2183,7 @@ class TestApplyThreadNamingRetitle:
 
         record = self._make_record(topic="認証リファクタ")
         cog, thread, tmux = self._make_cog_with_repo(record)
+        cog._thread_retitle = True  # #414: retitle is opt-in; enable for this path
         thread.name = "🟢 W1 │ 認証リファクタ"
 
         instruction = "次はDockerfileを最適化してCI/CDを改善してください"
@@ -2149,6 +2312,207 @@ class TestApplyThreadNamingRetitle:
 
         mock_retitle.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_retitle_disabled_by_default(self):
+        """#414: maybe_retitle is NOT called when thread_retitle is off (default)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        record = self._make_record(topic="認証リファクタ")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        assert cog._thread_retitle is False  # default off (#414)
+
+        with patch.object(
+            cc_module.topic_module, "maybe_retitle", new=AsyncMock(return_value="別タイトル")
+        ) as mock_retitle:
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="次はDockerを最適化してCIを改善してください",
+            )
+
+        mock_retitle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rename_failure_is_logged_not_silent(self, caplog):
+        """#423: a swallowed thread.edit failure must surface in the log (not silent).
+
+        Previously the rename was wrapped in ``contextlib.suppress`` so a stuck
+        title (e.g. the monitoring thread) left no trace of *why* it failed.
+        """
+        import logging
+
+        record = self._make_record(topic="挨拶")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "monitoring"  # differs from computed 'W1 │ 挨拶' → edit fires
+
+        resp = MagicMock()
+        resp.status = 403
+        resp.reason = "Forbidden"
+        thread.edit = AsyncMock(side_effect=discord.HTTPException(resp, "Missing Permissions"))
+
+        with caplog.at_level(logging.WARNING):
+            # Must NOT propagate — the response path keeps working.
+            await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
+
+        assert any("rename failed" in r.getMessage() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
+    async def test_rename_403_posts_hint_once(self):
+        """#429: a 403 (Missing Access) posts a one-time Manage-Threads hint."""
+        record = self._make_record(topic="挨拶")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "monitoring"  # differs → edit fires
+        thread.send = AsyncMock()
+        resp = MagicMock()
+        resp.status = 403
+        resp.reason = "Forbidden"
+        thread.edit = AsyncMock(side_effect=discord.Forbidden(resp, "Missing Access"))
+
+        await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
+        assert thread.send.await_count == 1
+        sent = thread.send.await_args.args[0] if thread.send.await_args.args else ""
+        assert "Manage Threads" in sent or "スレッドの管理" in sent
+
+        # Second 403 on the same thread must NOT re-post (one hint per process).
+        await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi again")
+        assert thread.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rename_timeout_does_not_post_hint(self):
+        """#429: only 403 (permission) gets a hint — timeouts are not user-actionable."""
+        record = self._make_record(topic="挨拶")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+        thread.name = "monitoring"
+        thread.send = AsyncMock()
+        thread.edit = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        await cog._apply_thread_naming(thread=thread, tmux_manager=tmux, first_message="hi")
+        thread.send.assert_not_awaited()
+
+
+class TestApplyThreadNamingIssueRef:
+    """#414: the Issue/PR number is auto-detected from the branch / first message."""
+
+    def _make_cog_with_repo(self, record):
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=record)
+        cog.repo.set_topic = AsyncMock()
+        cog.repo.set_tmux_window_id = AsyncMock()
+        cog.repo.set_issue_ref = AsyncMock()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 55555
+        thread.name = "W1 │ 認証リファクタ"
+
+        tmux_manager = MagicMock()
+        tmux_manager.get_window_info = MagicMock(return_value=("@1", 1))
+        return cog, thread, tmux_manager
+
+    def _make_record(self, *, topic="認証リファクタ", issue_ref=None):
+        record = MagicMock()
+        record.topic = topic
+        record.auto_topic_locked = 0
+        record.state = "running"
+        record.tmux_window_id = "@1"
+        record.issue_ref = issue_ref
+        return record
+
+    @pytest.mark.asyncio
+    async def test_branch_number_persisted_and_shown_in_name(self):
+        """A branch like fix/404-x yields #404 — persisted and rendered."""
+        from unittest.mock import patch
+
+        record = self._make_record(issue_ref=None)
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="fix/404-add-thing"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="続きをお願いします",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_awaited_once_with(55555, "404")
+        thread.edit.assert_awaited_once()
+        name = thread.edit.await_args.kwargs.get("name", "")
+        assert "#404" in name
+
+    @pytest.mark.asyncio
+    async def test_first_message_number_used_when_branch_has_none(self):
+        """No branch number → the FIRST message's #NNN is used (#414/#428)."""
+        from unittest.mock import patch
+
+        from c_lord.cogs import claude_chat as cc_module
+
+        # First message = no topic yet (topic gets generated this turn).
+        record = self._make_record(topic=None, issue_ref=None)
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with (
+            patch.object(cog, "_git_current_branch", return_value="main"),
+            patch.object(
+                cc_module.topic_module,
+                "generate_topic",
+                new=AsyncMock(return_value=("トピック", "llm")),
+            ),
+        ):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="#512 を直してください",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_awaited_once_with(55555, "512")
+
+    @pytest.mark.asyncio
+    async def test_later_message_hashref_not_captured(self):
+        """#428: a #NNN in a LATER message (topic already set) must NOT be captured.
+
+        Text detection is first-message-only; otherwise a casual '#1' mid-thread
+        sticks forever (the monitoring-thread false positive).
+        """
+        from unittest.mock import patch
+
+        record = self._make_record(topic="既存トピック", issue_ref=None)
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="main"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="ついでに #999 も見ておいて",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_not_awaited()  # #999 ignored (not first message)
+
+    @pytest.mark.asyncio
+    async def test_known_number_not_overwritten_by_casual_mention(self):
+        """An already-known number is kept; a later #NNN in text does not replace it."""
+        from unittest.mock import patch
+
+        record = self._make_record(issue_ref="404")
+        cog, thread, tmux = self._make_cog_with_repo(record)
+
+        with patch.object(cog, "_git_current_branch", return_value="main"):
+            await cog._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux,
+                first_message="ついでに #999 も見て",
+                working_dir="/tmp/clone",
+            )
+
+        cog.repo.set_issue_ref.assert_not_awaited()  # #404 stays
+
+    def test_git_current_branch_missing_repo_returns_none(self):
+        """_git_current_branch never raises on a non-repo path."""
+        cog = _make_cog()
+        assert cog._git_current_branch("/nonexistent/path/xyz") is None
+
 
 class TestThreadLampDisabled:
     """#329: thread-name status lamp (🟢🟡) is off by default.
@@ -2272,6 +2636,11 @@ class TestDiscordLinkEnrichmentWireIn:
         msg.author.bot = False
 
         await cog._handle_thread_reply(msg)
+        # The run is now dispatched as its own task off the lock (#315) — await it
+        # so the enriched prompt actually reaches _run_claude.
+        spawned = cog._active_tasks.get(42)
+        assert spawned is not None
+        await asyncio.wait_for(spawned, timeout=1.0)
 
         cog._run_claude.assert_awaited_once()
         prompt_arg = cog._run_claude.await_args.args[2]

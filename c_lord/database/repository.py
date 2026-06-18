@@ -35,6 +35,9 @@ class SessionRecord:
     # Issue #281: persisted state-sync rename rate-limit deadline (wall-clock
     # "YYYY-MM-DD HH:MM:SS"); survives restarts so the rename window is honoured.
     rename_backoff_until: str | None = None
+    # Issue #414: the Issue/PR number this thread is working on, shown in the
+    # thread name as "#<n>". Auto-detected from the git branch / first message.
+    issue_ref: str | None = None
 
 
 class SessionRepository:
@@ -167,6 +170,18 @@ class SessionRepository:
             await db.execute(
                 "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
                 (thread_id,),
+            )
+            await db.commit()
+
+    async def set_issue_ref(self, thread_id: int, issue_ref: str | None) -> None:
+        """Persist the Issue/PR number shown in the thread name (Issue #414).
+
+        ``issue_ref`` is a bare digit string (e.g. ``"404"``) or ``None`` to clear.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET issue_ref = ? WHERE thread_id = ?",
+                (issue_ref, thread_id),
             )
             await db.commit()
 

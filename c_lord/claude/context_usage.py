@@ -64,11 +64,23 @@ class ContextUsage:
         return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
 
 
+# Claude Code writes a synthetic assistant entry (this placeholder model id,
+# all-zero usage) for failed tool-call parses and no-op turns.  These do not
+# occupy context and must not be treated as the latest real turn (#425).
+_SYNTHETIC_MODEL = "<synthetic>"
+
+
 def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
-    """Return the usage of the most recent assistant turn in ``jsonl_path``.
+    """Return the usage of the most recent *real* assistant turn in ``jsonl_path``.
+
+    Synthetic / no-op assistant entries are skipped: Claude Code emits a
+    ``<synthetic>``-model entry with all-zero usage for failed tool-call parses
+    and no-op turns.  Reporting one would show 0 tokens used (a wrong
+    ``0% context`` line) and key the context-window probe on a phantom model
+    (#425), so the last entry carrying real usage is used instead.
 
     Returns ``None`` when the file is missing or contains no assistant message
-    with a ``usage`` block.  Malformed lines are skipped.
+    with real ``usage``.  Malformed lines are skipped.
     """
     if not jsonl_path.is_file():
         return None
@@ -89,13 +101,18 @@ def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
             usage = message.get("usage")
             if not isinstance(usage, dict):
                 continue
-            latest = ContextUsage(
+            candidate = ContextUsage(
                 input_tokens=int(usage.get("input_tokens", 0) or 0),
                 output_tokens=int(usage.get("output_tokens", 0) or 0),
                 cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
                 cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
                 model=message.get("model"),
             )
+            # Skip synthetic / no-op entries (#425): they carry no real context
+            # tokens, so the last entry with real usage is the true window state.
+            if candidate.model == _SYNTHETIC_MODEL or candidate.used == 0:
+                continue
+            latest = candidate
     return latest
 
 

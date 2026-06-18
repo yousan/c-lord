@@ -1470,6 +1470,39 @@ class TestIsGenerating:
         """Empty pane text → False."""
         assert TmuxClaudeRunner._is_generating("") is False
 
+    def test_is_generating_spinner_pushed_off_bottom_six(self) -> None:
+        """#365 follow-up: the live spinner is pushed >6 lines off the bottom.
+
+        Real incident (prod thread 1514448641635385447, 08:51 JST): a continuing
+        turn finalized after 14s and fired the owner mention before the real
+        answer. Root cause — while Claude runs a tool, the tool-result preview +
+        input box + footer push the spinner's timer line 10-20 lines off the
+        bottom (the same layout #190 documented for the lamp). ``_is_generating``
+        only scanned the bottom 6 lines, missed the spinner, reported "not
+        generating", and the completion detector finalized the turn early.
+
+        Detection must scan the live-spinner timer ``(Ns ·`` over a wide bottom
+        window (as the #190 lamp detector already does), not just the bottom 6.
+        """
+        text = "\n".join(
+            [
+                "❯ 前のターンの質問",
+                "",
+                "● 調査しています。まず関連ファイルを読みます。",
+                "✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)",
+                "  ⎿ Bash(uv run pytest tests/test_tmux_runner.py -q)",
+                "     ........................................ [ 41%]",
+                "     ........................................ [ 83%]",
+                "     .............................            [100%]",
+                "     173 passed in 120s",
+                "─" * 40,
+                "❯",
+                "─" * 40,
+                "-- INSERT -- ⏵⏵ bypass permissions on",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is True
+
 
 class TestToolExecutionCompletion:
     """Tests that tool execution does not trigger false early completion."""
@@ -2502,6 +2535,53 @@ class TestRunYieldsPaneAsk:
         with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
             await runner.answer_menu(0)
         tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_multi_toggles_each_then_submits(self, runner, tmux_manager) -> None:
+        """#418: multiSelect — Space-toggle each selected option, then navigate to
+        the 'Submit' row (option_count+1, just past 'Type something') and Enter to
+        open the review screen, then a final Enter confirms 'Submit answers'.
+
+        Verified on a live Claude Code TUI: Space toggles the checkbox under the
+        cursor; the 'Submit' row sits one below the 'Type something' affordance
+        (index option_count+1); reaching it + Enter opens the 'Submit answers'
+        review screen whose cursor defaults to submit, so a bare Enter records
+        every toggled value.
+        """
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_multi([0, 2], 4)
+        assert tmux_manager.send_keys.call_args_list == [
+            call(12345, "Space"),  # toggle option 0 (cursor starts here)
+            call(12345, "Down"),
+            call(12345, "Down"),
+            call(12345, "Space"),  # to option 2, toggle
+            call(12345, "Down"),
+            call(12345, "Down"),
+            call(12345, "Down"),  # to Submit row (index 5 = 4 + 1)
+            call(12345, "Enter"),  # open the 'Submit answers' review screen
+            call(12345, "Enter"),  # confirm review (cursor defaults to Submit)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_answer_menu_multi_dedupes_and_orders(self, runner, tmux_manager) -> None:
+        """Indices are toggled in ascending order with no double-toggle (#418)."""
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_multi([2, 0, 2], 3)
+        # Only options 0 and 2 toggled once each, then Submit row (index 4).
+        assert tmux_manager.send_keys.call_args_list == [
+            call(12345, "Space"),  # option 0
+            call(12345, "Down"),
+            call(12345, "Down"),
+            call(12345, "Space"),  # option 2
+            call(12345, "Down"),
+            call(12345, "Down"),  # to Submit row (index 4 = 3 + 1)
+            call(12345, "Enter"),
+            call(12345, "Enter"),
+        ]
 
     @pytest.mark.asyncio
     async def test_answer_menu_text_types_onto_row_then_confirms(

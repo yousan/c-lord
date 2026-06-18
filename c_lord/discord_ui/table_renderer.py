@@ -72,6 +72,58 @@ def has_tables(content: str) -> bool:
     return bool(_TABLE_PATTERN.search(content))
 
 
+# Inline markdown constructs we collapse to plain text before drawing a cell.
+# A table is rendered as a PNG, so none of these can be made interactive — a
+# link in an image is not clickable — and leaving the raw syntax in just leaks
+# noise into the cell (#415).
+_CODE_SPAN = re.compile(r"`+([^`]*?)`+")
+_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_BOLD = re.compile(r"\*\*([^*]+?)\*\*")
+_ITALIC = re.compile(r"\*([^*]+?)\*")
+_STRIKE = re.compile(r"~~([^~]+?)~~")
+_PLACEHOLDER = re.compile("\x00(\\d+)\x00")
+
+
+def _strip_inline_markdown(text: str) -> str:
+    """Reduce inline GFM markdown in *text* to the plain text a reader wants.
+
+    The cell is drawn into an image, so inline syntax cannot be made
+    interactive; rendering it verbatim only leaks ``**``, ``[label](url)`` and
+    backticks into the picture. Each construct collapses to its display text:
+
+    - ``[label](url)`` / ``![alt](url)`` -> ``label`` (the URL is unclickable in
+      an image, so only the label is kept — this also removes long, noisy URLs)
+    - ``**bold**`` -> ``bold``; ``*italic*`` -> ``italic``; ``~~s~~`` -> ``s``
+    - `` `code` `` -> ``code``
+
+    Underscore emphasis (``_x_`` / ``__x__``) is intentionally **not** stripped:
+    identifiers like ``_is_allowed`` / ``__init__`` / ``foo_bar`` use
+    underscores, and GFM likewise does not treat intra-word ``_`` as emphasis.
+    Code-span contents are protected so symbols inside them survive untouched.
+    """
+    if not text:
+        return text
+
+    # 1. Stash code-span contents so emphasis stripping can't touch symbols
+    #    inside them (e.g. `a*b*c` must not lose its asterisks).
+    saved: list[str] = []
+
+    def _stash(match: re.Match[str]) -> str:
+        saved.append(match.group(1))
+        return f"\x00{len(saved) - 1}\x00"
+
+    text = _CODE_SPAN.sub(_stash, text)
+
+    # 2. Links / images -> label, then emphasis / strikethrough.
+    text = _LINK.sub(r"\1", text)
+    text = _STRIKE.sub(r"\1", text)
+    text = _BOLD.sub(r"\1", text)  # before italic so ***x*** -> *x* -> x
+    text = _ITALIC.sub(r"\1", text)
+
+    # 3. Restore the protected code-span contents (without the backticks).
+    return _PLACEHOLDER.sub(lambda m: saved[int(m.group(1))], text)
+
+
 def _display_width(text: str) -> int:
     """Display width of *text*, counting East Asian Wide/Fullwidth glyphs as 2."""
     return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
@@ -243,8 +295,12 @@ def render_table_image(table_md: str) -> bytes | None:
     rows = [(r + [""] * max(0, n_cols - len(r)))[:n_cols] for r in rows]
     grid = [headers, *rows]
 
-    # Wrap every cell so lines stay within MAX_COL_WIDTH (bounds image width).
-    grid = [[_wrap_cell(cell, MAX_COL_WIDTH) for cell in row] for row in grid]
+    # Collapse inline markdown (links/bold/code) to plain text — it can't be
+    # made interactive in an image and otherwise leaks as raw syntax (#415) —
+    # then wrap every cell so lines stay within MAX_COL_WIDTH (bounds image width).
+    grid = [
+        [_wrap_cell(_strip_inline_markdown(cell), MAX_COL_WIDTH) for cell in row] for row in grid
+    ]
 
     ascent, descent = text_font.getmetrics()
     text_h = ascent + descent

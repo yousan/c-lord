@@ -599,6 +599,18 @@ _GENERATION_STATUS_RE = re.compile(r"^(?!❯)[\u2700-\u27BF*·] .+$")
 # Additional explicit markers.
 _GENERATION_STATUS_MARKERS = ("Tip:", "·")
 
+# #365 (follow-up): the live working spinner shows a "(<elapsed> · …)" timer that
+# only exists while Claude is actively generating/executing, e.g.
+#   ✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)
+# While a tool runs, its result preview + the input box + footer push that timer
+# line 10-20 lines off the bottom, so a bottom-6-only scan misses it and the turn
+# is finalized early (premature mention before the real answer). We scan the
+# timer across a WIDE bottom window — the same heuristic the #190 lamp detector
+# (`thread_state_sync._pane_lamp_state`) already uses. Matching the timer (not the
+# bare glyph) avoids false-positives on stale completed spinners in scrollback.
+_RUNNING_PROBE_LINES = 30
+_RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
+
 # Markers that indicate Claude has actually started producing output:
 #   ● — assistant response paragraph
 #   ⎿ — tool result
@@ -1203,6 +1215,17 @@ class TmuxClaudeRunner:
             error=error,
         )
 
+    @property
+    def stopped(self) -> bool:
+        """True once :meth:`interrupt` or :meth:`kill` has been called.
+
+        Lets callers (e.g. ``_run_helper``'s post-turn menu recovery) tell a turn
+        that was deliberately pre-empted from one that ended on its own, so a
+        pre-empted turn is not re-bridged into a fresh menu it would re-park on
+        (#315).
+        """
+        return self._stopped
+
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).
 
@@ -1433,6 +1456,48 @@ class TmuxClaudeRunner:
         )
         await self._navigate_menu(index)
 
+    async def answer_menu_multi(self, indices: list[int], option_count: int) -> None:
+        """Answer a multiSelect AskUserQuestion: toggle each option then Submit (#418).
+
+        ``answer_menu`` (Down×index + Enter) is single-select only, so the bridge
+        used to drop every checkbox but the first.  The multiSelect TUI, verified
+        on a live Claude Code TUI, works differently:
+
+        - the cursor starts on option 0;
+        - **Space** toggles the checkbox under the cursor (``[ ]`` ⇄ ``[✔]``);
+        - a **"Submit"** row sits just past the real options and the
+          "Type something" affordance, i.e. at index ``option_count + 1``
+          (mirroring the ``option_count`` index :meth:`answer_menu_text` uses for
+          the "Type something" row); ``Down`` to it and ``Enter`` opens the
+          "Submit answers" review screen whose cursor defaults to submit, so a
+          final ``Enter`` records every toggled value.
+
+        Keys are sent one-per-call with ``_MENU_NAV_DELAY`` spacing — batching is
+        dropped by the TUI (#171).
+        """
+        logger.info(
+            "Answering multiSelect AskUserQuestion menu: indices=%s (thread=%d)",
+            indices,
+            self._thread_id,
+        )
+        cursor = 0
+        for idx in sorted({i for i in indices if i >= 0}):
+            for _ in range(idx - cursor):
+                await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+                await asyncio.sleep(_MENU_NAV_DELAY)
+            cursor = idx
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Space")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        # Navigate to the "Submit" row (one past "Type something") and open the
+        # "Submit answers" review screen.
+        for _ in range(max(0, (option_count + 1) - cursor)):
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        await asyncio.sleep(_MENU_NAV_DELAY)
+        # Confirm the review screen (cursor defaults to "Submit answers").
+        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+
     async def answer_menu_text(self, text_option_index: int, text: str) -> None:
         """Answer via the free-text ("Type something.") affordance (#172).
 
@@ -1630,6 +1695,17 @@ class TmuxClaudeRunner:
         the ellipsis off the end and the turn was wrongly finalized early (#179).
         """
         lines = text.rstrip().splitlines()
+        # #365 follow-up: scan the live-spinner "(Ns ·" timer across a WIDE bottom
+        # window. While a tool runs, its result preview + input box + footer push
+        # the timer line 10-20 lines off the bottom; a bottom-6-only scan misses
+        # it and the turn is finalized early. The timer only exists while actively
+        # working, so a wide scan does not false-positive on idle panes.
+        for line in lines[-_RUNNING_PROBE_LINES:]:
+            if _RUNNING_SPINNER_RE.search(line):
+                return True
+        # Fallback: an ellipsis-bearing status glyph in the bottom few lines —
+        # catches a spinner that has no timer line yet (just "✻ Running…"). Kept
+        # narrow so a stale in-progress spinner up in scrollback is not matched.
         for line in lines[-6:]:
             stripped = line.strip()
             if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:

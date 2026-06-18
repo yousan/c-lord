@@ -111,6 +111,69 @@ class TestReadLatestUsage:
         assert usage is not None
         assert usage.used == 1000
 
+    def test_skips_trailing_synthetic_zero_usage_entry(self, tmp_path: Path) -> None:
+        """#425: Claude Code writes a synthetic assistant entry (model
+        ``<synthetic>``, all-zero usage) for failed tool-call parses / no-op
+        turns.  If it is the last entry, reporting it would show 0 tokens used
+        (a wrong "0% context" line) and key the context-window probe on a phantom
+        model.  The last entry with real usage must be returned instead.
+        """
+        f = tmp_path / "s.jsonl"
+        self._write(
+            f,
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-opus-4-8",
+                        "usage": {
+                            "input_tokens": 5,
+                            "cache_creation_input_tokens": 1_000,
+                            "cache_read_input_tokens": 300_000,
+                            "output_tokens": 120,
+                        },
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "<synthetic>",
+                        "usage": {
+                            "input_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 0,
+                        },
+                    },
+                },
+            ],
+        )
+        usage = read_latest_usage(f)
+        assert usage is not None
+        # The real opus turn is reported, not the trailing synthetic one.
+        assert usage.model == "claude-opus-4-8"
+        assert usage.used == 5 + 1_000 + 300_000
+
+    def test_returns_none_when_only_synthetic_entries(self, tmp_path: Path) -> None:
+        """All entries synthetic/zero-usage → nothing meaningful to report."""
+        f = tmp_path / "s.jsonl"
+        self._write(
+            f,
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "<synthetic>",
+                        "usage": {"input_tokens": 0},
+                    },
+                }
+            ],
+        )
+        assert read_latest_usage(f) is None
+
 
 class TestParseContextTotal:
     def test_parses_1m_suffix(self) -> None:

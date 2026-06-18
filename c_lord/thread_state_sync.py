@@ -345,7 +345,9 @@ class ThreadStateSyncLoop:
         if not record.topic:
             return
 
-        new_name = build_name(record.topic, new_state, window_number)
+        # #414: keep the Issue/PR number in the lamp-sync rename too, otherwise
+        # the slow sidebar repaint would drop it from the name.
+        new_name = build_name(record.topic, new_state, window_number, issue_ref=record.issue_ref)
 
         # Fetch the Discord thread and rename if different.
         try:
@@ -576,6 +578,17 @@ class MenuWatchdogLoop:
             tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
         if tmux_manager is None:
             tmux_manager = getattr(self._bot, "tmux_manager", None)
+        if tmux_manager is None and session_name:
+            # #420: A channel without a /clord-init binding resolves no manager,
+            # and bot.tmux_manager is unwired (main.py never passes one). But the
+            # sweep already located the live tmux session this menu's window lives
+            # in (we captured the pane from it), so target that session directly —
+            # same construction resolve_tmux_manager itself uses. Without this the
+            # watchdog gives up every tick and the tmux→Discord mirror "cuts off":
+            # the stranded menu never reaches Discord buttons.
+            from .tmux import TmuxSessionManager
+
+            tmux_manager = TmuxSessionManager(session_name=session_name)
         if tmux_manager is None:
             logger.warning("menu watchdog: no tmux manager for thread=%d", thread_id)
             return

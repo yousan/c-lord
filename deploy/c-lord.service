@@ -1,0 +1,45 @@
+# c-lord — systemd --user unit (Discord <-> Claude Code bridge)
+#
+# Easiest install (auto-detects your clone path + uv, enables linger):
+#     bash scripts/install-systemd.sh
+#
+# To install by hand instead:
+#   1. Copy this file to ~/.config/systemd/user/c-lord.service
+#   2. Fix the two CHANGE-ME paths below (clone dir + uv path)
+#   3. systemctl --user daemon-reload
+#      systemctl --user enable --now c-lord.service
+#      loginctl enable-linger "$USER"      # start on boot without a login
+#
+# Why --user (not a system service): c-lord drives the user's tmux, ~/.claude
+# session files, uv, and the `claude` CLI, so it runs cleanest as *you* with
+# your environment. linger is what makes a --user service survive logout and
+# start at boot.
+#
+# Paths below assume the clone is at ~/c-lord and uv is at ~/.local/bin/uv.
+# `%h` expands to your home directory.
+
+[Unit]
+Description=c-lord (Discord <-> Claude Code bridge)
+Documentation=https://github.com/yousan/c-lord
+After=network-online.target
+Wants=network-online.target
+# Stop retrying if it crash-loops 5x within 60s (avoid a hot restart loop).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# CHANGE-ME: absolute path to your c-lord clone (holds .env, data/, sessions).
+WorkingDirectory=%h/c-lord
+# CHANGE-ME: `command -v uv` (often %h/.local/bin/uv).
+ExecStart=%h/.local/bin/uv run python -m c_lord.main
+Restart=always
+RestartSec=5
+# systemd --user services get a minimal PATH. Include every dir holding a CLI
+# c-lord shells out to — at least uv, the `claude` CLI, tmux and git. Adjust to
+# match your `echo $PATH` (e.g. add %h/.bun/bin if claude was installed via bun).
+# The install-systemd.sh helper captures your live $PATH automatically.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

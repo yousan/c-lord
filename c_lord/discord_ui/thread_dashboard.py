@@ -5,6 +5,23 @@ threads are processing automatically vs. waiting for user input.
 When a thread transitions to WAITING_INPUT, the bot mentions the owner
 so Discord's notification system surfaces the request immediately.
 
+Why the mention is its OWN message (not appended to Claude's final reply)
+------------------------------------------------------------------------
+Two different actors post: Claude posts the answer itself via the discord-reply
+skill (``POST /api/reply``), while c-lord posts this ``@owner`` mention when the
+bot's turn-completion detector fires (WAITING_INPUT). Merging them into one
+message was considered (issue discussion under #365) and is intentionally NOT
+done:
+
+* Editing Claude's last message to append ``@owner`` does **not** work — Discord
+  edits do not trigger a push notification, which defeats the entire purpose of
+  the mention (pinging the owner's device).
+* Having the skill append ``@owner`` to Claude's final reply *would* ping (it is
+  a new message), but it moves the notification's reliability from the bot
+  (which authoritatively detects "turn done") to Claude (which does not reliably
+  know which of its replies is the final one). That trade-off was judged not
+  worth it, so the mention stays a separate, bot-authored message.
+
 Issue: https://github.com/yousan/c-lord/issues/67
 """
 

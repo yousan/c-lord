@@ -37,7 +37,7 @@ Refs #
 
 ## Staging Evidence (証跡)
 
-> 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。**証跡は催促される前に貼る（必須）。** Discord 実画面は AI が `scripts/discord_evidence_shot.sh`（#243）で撮り、`scripts/evidence_upload.py <png>... --issue <N>` で GitHub Release アセット（`evidence` prerelease）にアップロードして出力 URL を貼る（#390。git ツリーには commit しない／Discord CDN の添付 URL は期限付きなので直貼り禁止）。原因側の tmux ペイン PNG（#286）とペアで貼る。
+> 挙動/UI を変える報告は**スクショを主証跡**にする（テキストログは補助）。**証跡は催促される前に貼る（必須）。** Discord 実画面は AI が `scripts/discord_evidence_shot.sh`（#243）で撮り、`scripts/evidence_upload.py <png>... --issue <N>` で GitHub Release アセット（`evidence` prerelease）にアップロードして出力 URL を貼る（#390。git ツリーには commit しない／Discord CDN の添付 URL は期限付きなので直貼り禁止）。原因側の tmux ペイン PNG（#286）とペアで貼る。**`dod-gate` は本文に証跡画像（`![...](URL)`）も Release アセット URL も無い非免除 PR を落とす（#391）。証跡が真に不要なら `no-runtime-change` / `documentation` ラベルを付ける。**
 
 <!-- REQUIRED for behavior changes (bug fixes / features).
      Skip ONLY for pure-docs or provably no-behavior-change refactors —
@@ -78,7 +78,7 @@ Discord screenshot (user-provided): <attach / link>
 
 See CLAUDE.md → "Definition of Done (DoD)". Merge only when ALL are checked.
 
-> **Label exemptions** (`no-runtime-change` or `documentation` label): the DoD-completion checklist below is waived (notably **TDD evidence** and **Staging Evidence**).
+> **Label exemptions** (`no-runtime-change` or `documentation` label): the DoD-completion checklist below is waived (notably **TDD evidence**, **Staging Evidence**, and the **evidence-link requirement** #391).
 > **`Closes` discipline is always enforced**, regardless of label: if you use `Closes`/`Resolves #N`, the Acceptance Criteria above must still be fully checked (else use `Refs #N`).
 
 - [ ] Every Acceptance Criterion above is checked

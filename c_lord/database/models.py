@@ -146,6 +146,10 @@ _MIGRATIONS = [
     # so a bot restart honours Discord's ~10-min per-channel rename window
     # instead of forgetting it (in-memory backoff resets on restart → 429).
     "ALTER TABLE sessions ADD COLUMN rename_backoff_until TEXT",
+    # Issue #414: the Issue/PR number the thread is working on, auto-detected
+    # from the session's git branch or first message and shown in the thread
+    # name as "#<n>". Persisted so it is stable across restarts.
+    "ALTER TABLE sessions ADD COLUMN issue_ref TEXT",
 ]
 
 
