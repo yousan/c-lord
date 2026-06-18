@@ -126,3 +126,48 @@ def test_decision_flipped_restatement_not_suppressed_after_boundary_clear() -> N
     reg.register(399, _pane_context())
     reg.clear_thread(399)
     assert reg.consume_match(399, _flushed_markdown()) is False
+
+
+# -- #399 plan double-post fix: order-independent (bidirectional) dedup --------
+# The plan path flushes the pre-menu prose to jsonl BEFORE the menu resolves, so
+# the mirror posts it FIRST (before the pane-bridge registers). The dedup must
+# work in BOTH orders: each source skips/suppresses the OTHER source's entry,
+# never its own (no self-suppression of a legitimate repeat).
+
+
+def test_pane_skips_when_mirror_already_posted() -> None:
+    """plan order: mirror posts the prose first (registers source='mirror');
+    the pane-bridge must then find it and skip its own post."""
+    reg = BridgedContextRegistry()
+    ctx = _pane_context()
+    reg.register(399, _flushed_markdown(), source="mirror")
+    # pane-bridge looks for a mirror-sourced delivery of the same prose
+    assert reg.consume_match(399, ctx, source="mirror") is True
+
+
+def test_mirror_suppresses_when_pane_already_posted() -> None:
+    """ask order (unchanged): pane posts first (source='pane'); the mirror
+    flush must find it and suppress."""
+    reg = BridgedContextRegistry()
+    reg.register(399, _pane_context(), source="pane")
+    assert reg.consume_match(399, _flushed_markdown(), source="pane") is True
+
+
+def test_no_self_suppression_across_sources() -> None:
+    """A mirror entry must NOT be consumed by a mirror-side check, and a pane
+    entry must NOT be consumed by a pane-side check — each side only matches the
+    other's source, so a legitimate same-source repeat is never swallowed."""
+    reg = BridgedContextRegistry()
+    reg.register(399, _pane_context(), source="mirror")
+    # The mirror checking for pane entries finds nothing → it will post.
+    assert reg.consume_match(399, _flushed_markdown(), source="pane") is False
+    # The pane checking for mirror entries still finds it.
+    assert reg.consume_match(399, _pane_context(), source="mirror") is True
+
+
+def test_default_source_is_pane_backward_compatible() -> None:
+    """Legacy 2-arg calls keep the original ask semantics (pane registers,
+    mirror consumes pane)."""
+    reg = BridgedContextRegistry()
+    reg.register(399, _pane_context())  # defaults to source='pane'
+    assert reg.consume_match(399, _flushed_markdown()) is True  # defaults to matching 'pane'

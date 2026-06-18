@@ -255,3 +255,27 @@ async def test_context_send_failure_does_not_break_bridge(monkeypatch):
 
     assert calls["n"] == 2  # embed still sent
     assert bridged_context.consume_match(thread.id, _CONTEXT) is False
+
+
+@pytest.mark.asyncio
+async def test_pane_skips_context_when_mirror_already_posted(monkeypatch):
+    """#399 plan order: if the mirror already delivered the prose (registered
+    source='mirror'), bridge_pane_ask must NOT post a duplicate context message
+    — but it must still post the menu embed."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(399_0007)
+    q = _question()
+    q.context = _CONTEXT
+    # Mirror got there first (plan-style early flush).
+    bridged_context.register(thread.id, _CONTEXT, source="mirror")
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    sends = thread.send.await_args_list
+    context_sends = [s for s in sends if "content" in s.kwargs and "embed" not in s.kwargs]
+    assert context_sends == []  # no duplicate context post
+    embed_sends = [s for s in sends if "embed" in s.kwargs]
+    assert len(embed_sends) == 1  # menu still shown

@@ -375,6 +375,11 @@ class TranscriptMirror:
             if _pending_text is None:
                 return
             await self._try_sink(_pending_text)
+            # #399: an intermediate text posted silently may be the prose above
+            # a not-yet-bridged menu (the plan path flushes it BEFORE the menu).
+            # Register it as source="mirror" so the later pane-bridge skips its
+            # own duplicate (order-independent dedup — see bridged_context).
+            bridged_context.register(self.thread_id, _pending_text, source="mirror")
             # Merge the snapshot back so subsequent tool output accumulates.
             progress_buf[:0] = _pending_progress
             _pending_text = None
@@ -459,7 +464,7 @@ class TranscriptMirror:
                         # it as the menu's context message, re-posting it here
                         # would duplicate it. Still record its uuid (#215) so
                         # a restart does not re-post it as a missed final.
-                        if bridged_context.consume_match(self.thread_id, body):
+                        if bridged_context.consume_match(self.thread_id, body, source="pane"):
                             await _flush_pending_silently()
                             _last_text_uuid = event.get("uuid") or _last_text_uuid
                             logger.info(

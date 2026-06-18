@@ -1222,3 +1222,44 @@ async def test_stale_registry_entry_cleared_at_turn_boundary(tmp_path: Path) -> 
     assert any("楽観ロック" in p for p in posted + replied), (
         "stale registry entry swallowed a real message after a turn boundary"
     )
+
+
+async def test_mirror_registers_flushed_intermediate_text_as_mirror_source(tmp_path: Path) -> None:
+    """#399 plan order: the mirror flushes the pre-menu prose as an intermediate
+    text BEFORE the menu. It must register that text as source='mirror' so the
+    later pane-bridge skips its own duplicate post."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    prose = "保存先の判断ポイント。メモは bot スコープかローカルかで決まります。私の推しはホーム直下です。" * 2
+
+    bridged_context.clear()
+    mirror = TranscriptMirror(
+        thread_id=99500, project_dir=project, sink=sink, poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # Intermediate prose, then a tool event forces a silent flush of it.
+        _write_event(jsonl, _assistant_text(prose))
+        _write_event(jsonl, _assistant_tool_use("Write", "plan.md"))
+        await asyncio.sleep(0.4)
+        # The mirror posted the prose...
+        assert any("保存先の判断ポイント" in p for p in posted)
+        # ...and registered it as 'mirror' so a pane-bridge would now skip.
+        assert bridged_context.consume_match(99500, prose, source="mirror") is True
+    finally:
+        await mirror.stop()
+        bridged_context.clear()

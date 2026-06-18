@@ -97,7 +97,14 @@ async def bridge_pane_ask(
     # delivered text so the mirror suppresses the CLI's post-resolution flush
     # of the same text (AC3); on send failure nothing is registered — the
     # late flush then delivers it instead.
-    if question.context:
+    #
+    # Order-independence (plan path): ExitPlanMode flushes the prose as a normal
+    # text event BEFORE the menu, so the mirror may have already posted it. Skip
+    # our own post when a mirror-sourced delivery of the same text exists, else
+    # we double-post (the dedup is bidirectional — see bridged_context).
+    if question.context and not _bridged_context.consume_match(
+        thread.id, question.context, source="mirror"
+    ):
         chunks, truncated = _context_chunks(question.context)
         try:
             for chunk in chunks:
@@ -110,7 +117,7 @@ async def bridge_pane_ask(
             # Register only when the FULL text was delivered: suppressing the
             # flush twin of a partially-posted text would lose the rest.
             if not truncated:
-                _bridged_context.register(thread.id, question.context)
+                _bridged_context.register(thread.id, question.context, source="pane")
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
     msg = await thread.send(

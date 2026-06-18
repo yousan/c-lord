@@ -1,11 +1,25 @@
-"""#399 AC3: registry of pane-bridged context texts for transcript-mirror dedup.
+"""#399 AC3: registry that dedups the pre-menu prose across its two delivery paths.
 
-When Claude talks (経緯・推し) and then opens an AskUserQuestion / plan menu,
-the CLI buffers the whole jsonl chunk until the menu resolves. The pane-ask
-bridge therefore posts that prose to Discord live (``bridge_pane_ask``), and
-the CLI flushes the SAME text to the jsonl after resolution — which the
-transcript mirror would then re-post. This registry lets the bridge mark a
-text as already delivered so the mirror can suppress the duplicate.
+When Claude talks (経緯・推し) and then opens an AskUserQuestion / plan menu, the
+prose can reach Discord by two independent paths and we want it exactly once:
+
+- the **pane-bridge** (``bridge_pane_ask``), which reads the prose from the TUI
+  pane and posts it as the menu's context message; and
+- the **transcript mirror**, which posts the prose when the CLI flushes it to
+  the jsonl.
+
+Which path fires first depends on the CLI's flush timing, which differs by menu
+type (verified on staging, CLI v2.1.177):
+
+- **AskUserQuestion**: the CLI buffers the prose until the menu resolves, so the
+  pane-bridge posts first and the later flush must be suppressed by the mirror.
+- **ExitPlanMode**: the CLI flushes the prose as a normal text event BEFORE the
+  menu, so the mirror posts first and the pane-bridge must then skip.
+
+The registry is therefore **bidirectional and order-independent**: each entry
+carries its delivering ``source`` ("pane" / "mirror"), and each side only ever
+matches the OTHER source's entries — whoever delivers first wins, the second
+skips, and neither suppresses its own legitimate repeat.
 
 The two copies are never byte-identical: the pane carries the TUI *rendering*
 (markdown stripped, hard-wrapped, box-drawn), the jsonl carries the raw
@@ -72,14 +86,27 @@ def _match_kind(a: str, b: str) -> str | None:
 
 
 class BridgedContextRegistry:
-    """Per-thread, one-shot, TTL-bound store of already-delivered texts."""
+    """Per-thread, one-shot, TTL-bound store of already-delivered texts.
+
+    Each entry carries the *source* that delivered it ("pane" or "mirror").
+    Dedup is bidirectional and order-independent: a side only ever matches the
+    OTHER source's entries, so whichever path delivers the prose first wins and
+    the second skips — and a side never suppresses its own legitimate repeat.
+
+    - AskUserQuestion order: the CLI buffers the prose until the menu resolves,
+      so the pane-bridge posts first (source="pane") and the later jsonl flush
+      is suppressed by the mirror (which matches source="pane").
+    - ExitPlanMode order: the CLI flushes the prose as a normal text event
+      *before* the menu, so the mirror posts first (source="mirror") and the
+      pane-bridge then skips (matching source="mirror").
+    """
 
     def __init__(self) -> None:
-        # thread_id -> [(registered_at_monotonic, normalized_text), ...]
-        self._entries: dict[int, list[tuple[float, str]]] = {}
+        # thread_id -> [(registered_at_monotonic, normalized_text, source), ...]
+        self._entries: dict[int, list[tuple[float, str, str]]] = {}
 
-    def register(self, thread_id: int, text: str) -> None:
-        """Record *text* as delivered to Discord for *thread_id*."""
+    def register(self, thread_id: int, text: str, source: str = "pane") -> None:
+        """Record *text* as delivered to Discord by *source* for *thread_id*."""
         norm = _normalize(text)
         if len(norm) < _MIN_NORM_LEN:
             return
@@ -88,23 +115,31 @@ class BridgedContextRegistry:
         # calls consume_match, so without this the registry grows forever.
         for tid in list(self._entries):
             bucket = self._entries[tid]
-            bucket[:] = [(t, n) for t, n in bucket if now - t < _TTL_SECONDS]
+            bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
             if not bucket:
                 del self._entries[tid]
         bucket = self._entries.setdefault(thread_id, [])
-        bucket.append((now, norm))
+        bucket.append((now, norm, source))
         del bucket[:-_MAX_PER_THREAD]
 
-    def consume_match(self, thread_id: int, text: str) -> bool:
-        """True iff *text* matches a live entry — which is then removed."""
+    def consume_match(self, thread_id: int, text: str, source: str = "pane") -> bool:
+        """True iff *text* matches a live entry from *source* — removed on hit.
+
+        *source* is the source to match against (the OTHER side's deliveries):
+        the mirror passes ``source="pane"``, the pane-bridge passes
+        ``source="mirror"``. Entries from the caller's own source are ignored,
+        so a legitimate same-source repeat is never swallowed.
+        """
         bucket = self._entries.get(thread_id)
         if not bucket:
             return False
         now = time.monotonic()
-        bucket[:] = [(t, n) for t, n in bucket if now - t < _TTL_SECONDS]
+        bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
         norm = _normalize(text)
         if len(norm) >= _MIN_NORM_LEN:
-            for i, (_, cand) in enumerate(bucket):
+            for i, (_, cand, cand_source) in enumerate(bucket):
+                if cand_source != source:
+                    continue
                 kind = _match_kind(cand, norm)
                 if kind is not None:
                     del bucket[i]
