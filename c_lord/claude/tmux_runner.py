@@ -370,7 +370,18 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
             continue
         question = s
 
-    return AskQuestion(question=question, header=header, options=options, multi_select=multi_select)
+    # #399: carry the prose spoken directly above the menu (経緯・推し). Only
+    # when the ☐ header anchored the menu — the scrolled-off fallback window
+    # gives no reliable upper bound, so guessing there risks chrome leaks.
+    context = _extract_pane_context(lines, header_idx) if header_idx >= 0 else ""
+
+    return AskQuestion(
+        question=question,
+        header=header,
+        options=options,
+        multi_select=multi_select,
+        context=context,
+    )
 
 
 # -- Plan approval (ExitPlanMode) TUI menu parsing (#251) ---------------------
@@ -438,12 +449,17 @@ def _parse_plan_from_pane(text: str) -> AskQuestion | None:
     body = _extract_plan_body(lines, sig_idx)
     if body:
         question = f"{body}\n\n{question}"
+    # #399 (AC4): prose spoken before ExitPlanMode sits above the plan box —
+    # same buffering gap as AskUserQuestion, same narrow extraction.
+    body_starts = [i for i, line in enumerate(lines[:sig_idx]) if _PLAN_BODY_START in line]
+    context = _extract_pane_context(lines, max(body_starts)) if body_starts else ""
     return AskQuestion(
         question=question,
         header="📋 Plan ready — approve?",
         options=options,
         multi_select=False,
         allow_other=False,
+        context=context,
     )
 
 
@@ -468,6 +484,104 @@ def _extract_plan_body(lines: list[str], sig_idx: int) -> str:
         out.append(s)
     # Collapse the leading/trailing blank padding the TUI adds.
     return "\n".join(out).strip()
+
+
+# -- #399: prose context above a menu ------------------------------------------
+# When Claude talks (経緯・推し) and then opens an AskUserQuestion / plan menu,
+# the CLI buffers the whole jsonl chunk — preceding text block included — until
+# the menu resolves, so the transcript mirror structurally cannot deliver that
+# prose while the menu is open (#359 S2). The pane is the only live source.
+#
+# To avoid reviving the #53 TUI-scrape path, extraction is deliberately narrow:
+# ONLY the last column-0 "● " response block sitting directly above the menu
+# frame is carried, and nothing at all when that block is a tool invocation
+# ("● Bash(date)"), tool output ("⎿ …"), the echoed user prompt ("❯ …"), or
+# known chrome. The blast radius of a future chrome change is thus confined to
+# the single context message attached to the ask bridge.
+#
+# Tool invocations render as "● ToolName(args)" with an ASCII identifier —
+# prose virtually never starts with one ("● 案A(楽観ロック)…" does not match
+# because 案 is not [A-Za-z]). MCP tools render "● plugin:x:y - reply (MCP)(…)".
+_TOOL_INVOCATION_RE = re.compile(r"^●\s+[A-Za-z][\w.:|-]*(?:\s+-\s+\S+)*\s*\(")
+# Chrome painted between the response and a plan box.
+_PRE_MENU_CHROME = ("Ready to code?",)
+# Column-0 ● blocks that are TUI affordances, not assistant prose.
+_CONTEXT_CHROME_BLOCKS = ("Updated plan", "User answered Claude's questions")
+# Upper bound on the upward scan for the block start — a prose block before a
+# menu is short; anything larger is a runaway and must not be carried.
+_CONTEXT_SCAN_LIMIT = 120
+# Chrome that can be painted INSIDE the walked-up region during a mid-redraw
+# ghost frame (#32 class). Any hit kills the whole extraction — fail closed.
+_CONTEXT_INTERIOR_BAIL = (
+    re.compile(r"\(esc to interrupt.*"),
+    re.compile(r"Context left until auto-compact.*"),
+    re.compile(r"[\u2800-\u28FF] .+"),  # braille spinner frames ("⠧ Worked for 5m 3s")
+)
+
+
+def _extract_pane_context(lines: list[str], boundary_idx: int) -> str:
+    """Return the cleaned ``●`` prose block directly above ``boundary_idx``.
+
+    ``boundary_idx`` is the menu's anchor line (the ``☐`` header for
+    AskUserQuestion, the ``Here is Claude's plan:`` header for plans). Returns
+    ``""`` whenever the block directly above is anything but clean assistant
+    prose — missing, a tool block, the echoed user prompt, another menu, or
+    chrome. Conservative by design (#53): no guess is ever bridged.
+    """
+
+    def _is_skippable(line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return True
+        if _SEPARATOR_RE.match(s) or _PLAN_RULE_RE.match(s):
+            return True
+        if s in _PRE_MENU_CHROME:
+            return True
+        # Spinner / completion summaries ("✻ Baked for 37s").
+        return bool(_GENERATION_STATUS_RE.match(s))
+
+    # Skip the chrome padding between the menu frame and the content above it.
+    i = boundary_idx - 1
+    while i >= 0 and _is_skippable(lines[i]):
+        i -= 1
+    if i < 0:
+        return ""
+
+    # Walk up to the block start (a column-0 "● " line). Hitting anything that
+    # marks a different kind of block first means there is no prose to carry.
+    start = -1
+    for j in range(i, max(-1, i - _CONTEXT_SCAN_LIMIT), -1):
+        line = lines[j]
+        s = line.strip()
+        if line.startswith("● "):
+            start = j
+            break
+        if s.startswith(("❯", "⎿", "●")) or "☐" in s or _ASK_SIGNATURE in s or _PLAN_SIGNATURE in s:
+            return ""
+    if start < 0:
+        return ""
+
+    head = lines[start].strip()
+    if _TOOL_INVOCATION_RE.match(head):
+        return ""
+    if head[2:].lstrip().startswith(_CONTEXT_CHROME_BLOCKS):
+        return ""
+
+    # Validate the block INTERIOR (review blocker 2): a mid-redraw ghost frame
+    # can paint chrome between the ● head and the menu. Only space-indented
+    # continuations and blanks are prose; any other column-0 line or known
+    # status/hint line means the region is not a clean prose block → carry
+    # nothing (fail closed), never "most of it".
+    block = lines[start : i + 1]
+    for line in block[1:]:
+        s = line.strip()
+        if not s:
+            continue
+        if any(p.fullmatch(s) for p in _CONTEXT_INTERIOR_BAIL):
+            return ""
+        if not line.startswith(" "):
+            return ""
+    return _clean_tui_lines(block)
 
 
 # TUI status bar patterns at the very bottom.
@@ -910,8 +1024,10 @@ class TmuxClaudeRunner:
                 if ask_stable >= _ASK_ALERT_DELAY and ask_sig != last_bridged_ask:
                     last_bridged_ask = ask_sig
                     logger.info(
-                        "Interactive menu detected, bridging to Discord (thread=%d)",
+                        "Interactive menu detected, bridging to Discord "
+                        "(thread=%d, context_chars=%d)",
                         self._thread_id,
+                        len(ask_q.context),
                     )
                     yield StreamEvent(
                         raw={},

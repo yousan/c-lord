@@ -85,6 +85,12 @@ class AskQuestion:
     # Claude what to change") uses a different keystroke flow, so a generic
     # Other modal would mis-send keys into the open TUI menu.
     allow_other: bool = True
+    # #399: the assistant prose spoken directly above the menu (経緯・推し),
+    # extracted from the pane. The CLI buffers the jsonl chunk containing the
+    # menu until resolution, so without this the question reaches Discord with
+    # zero decision context. Empty when no clean prose block sits above the
+    # menu (tool blocks / chrome are never carried — see _extract_pane_context).
+    context: str = ""
 
 
 @dataclass
