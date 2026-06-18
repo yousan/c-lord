@@ -164,18 +164,57 @@ Enter-ed twice) — mirroring the auto-accept used for trust/permission prompts.
 The answers are already locked in via the bridge, so no further user input is
 needed.
 
+## Pre-menu prose (経緯・推し) (#399)
+
+Claude usually *talks* right before opening a menu — explaining the options and
+giving a recommendation. That prose lives in the same Claude turn-chunk as the
+`AskUserQuestion` tool call, which the CLI **buffers in the JSONL until the menu
+resolves**. Since text reaches Discord only via the transcript mirror, the
+prose used to arrive only *after* the user answered (or never, when text and
+tool_use merged into one event) — so the user was asked to choose with **no
+decision context on Discord**.
+
+c-lord now extracts that prose from the **pane** (`_extract_pane_context`): the
+single `●` response block directly above the menu frame, and **nothing else** —
+tool blocks (`● Bash(...)`/`⎿`), the echoed user prompt, and any unclassified
+chrome line abort the extraction (fail-closed, to avoid reviving the #53
+TUI-scrape leak class). It rides on `AskQuestion.context` and
+`bridge_pane_ask` posts it as its **own silent message immediately before** the
+menu embed (the embed is wiped on resolution, so the context must be a separate
+message to stay readable).
+
+**De-duplication** (`bridged_context`): the CLI eventually flushes the same
+prose to the JSONL, which the mirror would re-post. The two delivery paths
+(pane-bridge, mirror) dedup against each other in an **order-independent** way —
+each entry is tagged with its source and each side only matches the *other*
+source:
+
+- **AskUserQuestion**: prose is buffered until resolution, so the pane-bridge
+  posts first and the later flush is suppressed by the mirror.
+- **ExitPlanMode**: the CLI flushes the prose as a normal text event *before*
+  the menu, so the mirror posts first and the pane-bridge then skips.
+
+Either way the prose appears **exactly once**, before the menu.
+
 ## Limitations
 
 - **Free text on the Submit screen is not re-editable from Discord.** The review
   screen is auto-submitted as-is; to change an answer, use `/attach`.
+- **Pre-menu prose extraction is best-effort and fail-closed** (#399): if the
+  block above the menu isn't a clean `●` prose block (tool output, chrome, or
+  the header scrolled off), no context is carried rather than risk leaking
+  chrome. The mirror still delivers it (late) in that case.
 
 ## Source map
 
 | Concern | Location |
 |---|---|
 | Parse menu from pane | `c_lord/claude/tmux_runner.py::_parse_ask_from_pane` |
+| Extract pre-menu prose (#399) | `tmux_runner.py::_extract_pane_context` |
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
-| Show buttons / route answer | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
+| Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
+| Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
+| Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |

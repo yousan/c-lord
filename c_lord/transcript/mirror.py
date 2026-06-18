@@ -30,6 +30,7 @@ from pathlib import Path
 
 from ..claude.types import AskQuestion, _parse_ask_questions
 from ..discord_ui.ask_bus import ask_bus
+from ..discord_ui.bridged_context import bridged_context
 from .formatter import RenderedEvent, render_event
 from .tail import tail_events
 
@@ -374,6 +375,11 @@ class TranscriptMirror:
             if _pending_text is None:
                 return
             await self._try_sink(_pending_text)
+            # #399: an intermediate text posted silently may be the prose above
+            # a not-yet-bridged menu (the plan path flushes it BEFORE the menu).
+            # Register it as source="mirror" so the later pane-bridge skips its
+            # own duplicate (order-independent dedup — see bridged_context).
+            bridged_context.register(self.thread_id, _pending_text, source="mirror")
             # Merge the snapshot back so subsequent tool output accumulates.
             progress_buf[:0] = _pending_progress
             _pending_text = None
@@ -435,6 +441,10 @@ class TranscriptMirror:
                     # Turn boundary: flush pending as the final reply.
                     await _flush_pending_as_reply()
                     await _commit_cursor()
+                    # #399: disarm unconsumed pane-bridge entries — the
+                    # legitimate flush always precedes its turn end, so a
+                    # surviving entry could only swallow a future real message.
+                    bridged_context.clear_thread(self.thread_id)
                     continue
 
                 rendered = render_event(event)
@@ -447,10 +457,29 @@ class TranscriptMirror:
                         await _flush_pending_silently()
                         progress_buf.append(_format_body(rendered))
                     elif rendered.kind == "assistant_text":
+                        body = _format_body(rendered)
+                        # #399 AC3: the CLI flushes the prose preceding an
+                        # AskUserQuestion/plan menu only after the menu
+                        # resolves; if the pane-ask bridge already delivered
+                        # it as the menu's context message, re-posting it here
+                        # would duplicate it. Still record its uuid (#215) so
+                        # a restart does not re-post it as a missed final.
+                        if bridged_context.consume_match(self.thread_id, body, source="pane"):
+                            await _flush_pending_silently()
+                            _last_text_uuid = event.get("uuid") or _last_text_uuid
+                            logger.info(
+                                "TranscriptMirror: suppressed pane-bridged ask context thread=%d",
+                                self.thread_id,
+                            )
+                            # Commit immediately: the text IS delivered, and a
+                            # turn-end marker may never arrive — without this a
+                            # hard-killed bot would re-post it on restart (#215).
+                            await _commit_cursor()
+                            continue
                         # Another text while one is pending → previous was intermediate.
                         if _pending_text is not None:
                             await _flush_pending_silently()
-                        _pending_text = _format_body(rendered)
+                        _pending_text = body
                         _pending_progress = list(progress_buf)
                         _last_text_uuid = event.get("uuid") or _last_text_uuid
                         progress_buf.clear()
@@ -458,6 +487,7 @@ class TranscriptMirror:
                         # Human turn: previous assistant turn is over → flush as reply.
                         await _flush_pending_as_reply()
                         await _commit_cursor()
+                        bridged_context.clear_thread(self.thread_id)  # #399 (see turn_end)
                         await self._post(rendered)
                     else:
                         await _flush_pending_silently()

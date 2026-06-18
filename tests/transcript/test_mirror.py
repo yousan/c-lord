@@ -1068,3 +1068,271 @@ async def test_mirror_does_not_repost_history_on_resume_rewrite(tmp_path: Path) 
     assert any("brand new answer" in s for s in reply_sink_calls), reply_sink_calls
     assert not any("old answer 1" in s for s in reply_sink_calls), reply_sink_calls
     assert not any("old answer 2" in s for s in reply_sink_calls), reply_sink_calls
+
+
+# -- #399 AC3: suppress the post-resolution flush of pane-bridged context ----
+
+
+def _pane_bridged_pair() -> tuple[str, str]:
+    """(pane-rendered context, raw markdown the CLI flushed) — real captures."""
+    from c_lord.claude.tmux_runner import _parse_ask_from_pane
+
+    fixtures = Path(__file__).parent.parent / "fixtures"
+    pane = (fixtures / "panes" / "ask_context_prose_above_menu.txt").read_text()
+    q = _parse_ask_from_pane(pane)
+    assert q is not None and q.context
+    md = (fixtures / "transcripts" / "i399_prose_flushed_markdown.txt").read_text()
+    return q.context, md
+
+
+async def test_mirror_suppresses_pane_bridged_context(tmp_path: Path) -> None:
+    """#399 AC3: when the pane-ask bridge already posted the pre-menu prose,
+    the CLI's post-resolution flush of the same text (raw markdown) must not be
+    re-posted — but later, different text still flows normally."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    bridged_context.clear()
+    bridged_context.register(99399, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99399,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # The flush-at-resolution: prose (markdown), then continuation, turn end.
+        _write_event(jsonl, _assistant_text(flushed_md))
+        _write_event(jsonl, _assistant_text("選択を受けて続行します。"))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    everything = posted + replied
+    assert not any("楽観ロック" in p for p in everything), (
+        "pane-bridged context was re-posted by the mirror"
+    )
+    # The rest of the turn still flows.
+    assert any("選択を受けて続行します。" in p for p in everything)
+
+
+async def test_mirror_commits_uuid_of_suppressed_text_when_turn_ends(tmp_path: Path) -> None:
+    """If the suppressed text is the turn's last text, its uuid must still be
+    committed (#215) so a restart does not re-post it as a missed final answer."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    cursor: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    async def cursor_sink(uuid: str) -> None:
+        cursor.append(uuid)
+
+    bridged_context.clear()
+    bridged_context.register(99400, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99400,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        reply_cursor_sink=cursor_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        event = _assistant_text(flushed_md)
+        event["uuid"] = "uuid-399-suppressed"
+        _write_event(jsonl, event)
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    assert replied == []  # nothing re-posted
+    assert "uuid-399-suppressed" in cursor
+
+
+async def test_mirror_commits_suppressed_uuid_without_turn_end_marker(tmp_path: Path) -> None:
+    """#399 hardening: when the suppressed text is the last event and NO
+    turn-end marker ever arrives (current CLI builds often emit none), the
+    uuid must still be committed — otherwise a bot restart re-posts the
+    already-delivered context via #215 recovery."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    cursor: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def cursor_sink(uuid: str) -> None:
+        cursor.append(uuid)
+
+    bridged_context.clear()
+    bridged_context.register(99401, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99401,
+        project_dir=project,
+        sink=sink,
+        reply_cursor_sink=cursor_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.2,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        event = _assistant_text(flushed_md)
+        event["uuid"] = "uuid-399-idle-suppressed"
+        _write_event(jsonl, event)
+        # NO turn_end marker — only the idle window passes. The uuid must be
+        # committed while the mirror is still RUNNING (a hard-killed bot never
+        # reaches the graceful-stop commit).
+        await asyncio.sleep(0.6)
+        assert "uuid-399-idle-suppressed" in cursor
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+
+async def test_stale_registry_entry_cleared_at_turn_boundary(tmp_path: Path) -> None:
+    """#399 review blocker 3: an entry whose flush never arrived (CLI killed /
+    menu Esc'd) must be disarmed at the next turn boundary — otherwise a later
+    similar-but-different REAL message gets swallowed (reproduced at
+    SequenceMatcher ratio 0.97 with one decision-flipping sentence changed)."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    bridged_context.clear()
+    bridged_context.register(99402, pane_ctx)
+    mirror = TranscriptMirror(
+        thread_id=99402,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # Turn ends WITHOUT the flush ever arriving (menu was Esc'd).
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.2)
+        # Next turn: Claude restates the (similar) prose as a REAL message.
+        _write_event(jsonl, _assistant_text(flushed_md))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    assert any("楽観ロック" in p for p in posted + replied), (
+        "stale registry entry swallowed a real message after a turn boundary"
+    )
+
+
+async def test_mirror_registers_flushed_intermediate_text_as_mirror_source(tmp_path: Path) -> None:
+    """#399 plan order: the mirror flushes the pre-menu prose as an intermediate
+    text BEFORE the menu. It must register that text as source='mirror' so the
+    later pane-bridge skips its own duplicate post."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    prose = (
+        "保存先の判断ポイント。メモは bot スコープかローカルかで決まります。私の推しはホーム直下です。"
+        * 2
+    )
+
+    bridged_context.clear()
+    mirror = TranscriptMirror(thread_id=99500, project_dir=project, sink=sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # Intermediate prose, then a tool event forces a silent flush of it.
+        _write_event(jsonl, _assistant_text(prose))
+        _write_event(jsonl, _assistant_tool_use("Write", "plan.md"))
+        await asyncio.sleep(0.4)
+        # The mirror posted the prose...
+        assert any("保存先の判断ポイント" in p for p in posted)
+        # ...and registered it as 'mirror' so a pane-bridge would now skip.
+        assert bridged_context.consume_match(99500, prose, source="mirror") is True
+    finally:
+        await mirror.stop()
+        bridged_context.clear()

@@ -25,6 +25,7 @@ from ..claude.types import AskQuestion
 from ..database.ask_repo import PendingAskRepository
 from .ask_bus import ask_bus as _ask_bus
 from .ask_view import AskView
+from .bridged_context import bridged_context as _bridged_context
 from .embeds import ask_embed
 
 if TYPE_CHECKING:
@@ -46,6 +47,28 @@ ASK_ANSWER_TIMEOUT = 86_400  # 24 h
 _PANE_RESOLVE_POLL = 2.0
 _PANE_RESOLVE_MISSES = 2
 
+# #399: the prose context above the menu is posted as its own message(s).
+# Up to _CONTEXT_MAX_MSGS sequential chunks deliver the text IN FULL — clipping
+# while registering the full text would suppress the flush and lose the
+# clipped part forever (review blocker 1). Beyond the budget the TAIL is kept
+# (the recommendation 推し is conventionally last) and the text is NOT
+# registered, so the later jsonl flush delivers the full text as a late
+# duplicate — degraded mode is duplication, never loss.
+_CONTEXT_MSG_LIMIT = 1900
+_CONTEXT_MAX_MSGS = 3
+
+
+def _context_chunks(text: str) -> tuple[list[str], bool]:
+    """Split *text* into ≤``_CONTEXT_MSG_LIMIT`` chunks. Returns (chunks, truncated)."""
+    budget = _CONTEXT_MSG_LIMIT * _CONTEXT_MAX_MSGS
+    truncated = len(text) > budget
+    if truncated:
+        text = text[-budget:]
+    chunks = [text[i : i + _CONTEXT_MSG_LIMIT] for i in range(0, len(text), _CONTEXT_MSG_LIMIT)]
+    if truncated and chunks:
+        chunks[0] = "…" + chunks[0]
+    return chunks, truncated
+
 
 async def bridge_pane_ask(
     thread: discord.Thread,
@@ -64,6 +87,38 @@ async def bridge_pane_ask(
     - timeout / no answer → ``runner.cancel_menu()`` (Esc)
     """
     answer_queue = _ask_bus.register(thread.id)
+
+    # #399: deliver the prose Claude spoke right above the menu (経緯・推し) as
+    # its own silent message BEFORE the menu embed. The CLI buffers the jsonl
+    # chunk containing the menu until resolution, so the transcript mirror
+    # cannot deliver this text while the menu is open — and the embed message
+    # is wiped (``embed=None``) once the menu resolves, so the context must
+    # live in a message of its own to stay readable afterwards. Register the
+    # delivered text so the mirror suppresses the CLI's post-resolution flush
+    # of the same text (AC3); on send failure nothing is registered — the
+    # late flush then delivers it instead.
+    #
+    # Order-independence (plan path): ExitPlanMode flushes the prose as a normal
+    # text event BEFORE the menu, so the mirror may have already posted it. Skip
+    # our own post when a mirror-sourced delivery of the same text exists, else
+    # we double-post (the dedup is bidirectional — see bridged_context).
+    if question.context and not _bridged_context.consume_match(
+        thread.id, question.context, source="mirror"
+    ):
+        chunks, truncated = _context_chunks(question.context)
+        try:
+            for chunk in chunks:
+                await thread.send(content=chunk, silent=True)
+        except discord.HTTPException:
+            logger.warning(
+                "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
+            )
+        else:
+            # Register only when the FULL text was delivered: suppressing the
+            # flush twin of a partially-posted text would lose the rest.
+            if not truncated:
+                _bridged_context.register(thread.id, question.context, source="pane")
+
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
     msg = await thread.send(
         embed=ask_embed(
