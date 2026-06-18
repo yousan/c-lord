@@ -189,10 +189,35 @@ find_pids() {
   done
 }
 
+instance_leaders() {
+  # find_pids のうち「親が同じ clone の c_lord.main プロセスでない」pid =
+  # 論理インスタンスの代表 (プロセスツリーの根) だけを返す (#437)。
+  #
+  # なぜ必要か: `uv run python -m c_lord.main` は uv ラッパ(親)+python(子) の
+  # 2 プロセスになり、どちらの cmdline にも c_lord.main が入るので pgrep は
+  # 両方に当たる。これは「正常な 1 インスタンス」であって二重起動ではない
+  # (prod は systemd → start-clord.sh → uv run … でこの形。docs/STAGING.md
+  # 参照)。子 (親が同 clone の matched pid である pid) を除けば、本当に独立
+  # した起動だけが代表として残り、parent+child は 1 と数えられる。
+  local pids pid ppid
+  pids="$(find_pids)"
+  [ -z "$pids" ] && return 0
+  for pid in $pids; do
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    # 親が matched 集合に居れば、この pid は子 → 代表ではない (出力しない)。
+    printf '%s\n' "$pids" | /usr/bin/grep -qx "$ppid" || echo "$pid"
+  done
+}
+
+count_instances() {
+  # 論理インスタンス数 (parent+child を 1 と数える)。0 なら 0 を返す。
+  instance_leaders | /usr/bin/grep -c . || true
+}
+
 cmd_status() {
   local pids count branch expected channel
   pids="$(find_pids)"
-  count=$(echo "$pids" | /usr/bin/grep -c . || true)
+  count="$(count_instances)" # 論理インスタンス数 (uv ラッパ+子 = 1, #437)
   branch="$(git -C "$CLONE_DIR" branch --show-current 2>/dev/null || echo '(not a git repo)')"
   expected="$(env_get EXPECTED_BOT_USER_ID)"
   channel="$(env_get DISCORD_CHANNEL_ID)"
@@ -342,10 +367,21 @@ cmd_restart() {
         done
         die "誤った identity で起動したため停止した (ログ: $log)"
       fi
-      local count
-      count="$(find_pids | /usr/bin/grep -c . || true)"
-      echo "instances: $count"
-      [ "$count" = "1" ] || die "単一インスタンスでない (count=$count)"
+      # 論理インスタンスが 1 に収束するのを待つ (#437)。parent+child(uv ラッパ
+      # +python) は 1 と数える。staging は venv python 直起動で即 1 になるが、
+      # 万一 churn しても収束を待ってから単一を保証する。
+      local inst tries=0
+      while :; do
+        inst="$(count_instances)"
+        [ "$inst" = "1" ] && break
+        tries=$((tries + 1))
+        if [ "$tries" -ge 5 ]; then
+          echo "instances: $inst"
+          die "単一インスタンスに収束しない (instances=$inst)"
+        fi
+        sleep 1
+      done
+      echo "instances: $inst"
       echo "OK"
       return 0
     fi
@@ -395,7 +431,11 @@ BRANCH="$POSITIONAL"
 
 case "$COMMAND" in
 status)
+  # cmd_status の終了コード (二重起動疑い = 2) を後続の lease 出力で潰さず
+  # スクリプトの終了コードに伝播させる (#437): 機械からは exit code で単一性を
+  # 判定できる必要がある。
   cmd_status
+  status_rc=$?
   if [ -f "$LEASE_FILE" ]; then
     if lease_is_valid; then
       echo "lease:     $(lease_describe)"
@@ -405,6 +445,7 @@ status)
   else
     echo "lease:     (none)"
   fi
+  exit "$status_rc"
   ;;
 borrow) cmd_borrow "$OWNER" "$PURPOSE" "$TTL_HOURS" ;;
 release) cmd_release "$OWNER" ;;
