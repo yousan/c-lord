@@ -92,6 +92,17 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
 
+### Mirror Recovery
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/resync` | Reconnect this thread's Discord mirror to its tmux pane | Thread only |
+| `/resync-channel` | Reconnect the mirror for every thread in this channel | Channel or thread |
+
+**`/resync`** is a safety valve for when the tmux→Discord *mirror* feels out of sync — a selection menu's buttons never appeared, or a tool embed looks stale. It re-projects the **current** tmux state onto Discord: (1) re-bridges any stranded TUI menu so its buttons (re)appear, and (2) posts a fresh PNG snapshot of the pane so you can see the live state. It does this immediately, without waiting for the 60s menu-watchdog sweep or a bot restart.
+
+It does **not** touch the Claude process or the conversation — the session is untouched. To restart the Claude process while keeping the conversation, use `/restart-claude`. To wipe the context and start fresh, use `/clear`. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
+
 ### Upgrade
 
 | Command | Description | Where |
@@ -116,6 +127,8 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!clord-status [all]` | List this channel's sessions (`all` = include closed) | `!clord-status all` | `/clord-status` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
 | `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
+| `!resync` | Reconnect this thread's Discord mirror to tmux | `!resync` | `/resync` |
+| `!resync-channel` | Reconnect the mirror for every thread in the channel | `!resync-channel` | `/resync-channel` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
