@@ -34,6 +34,7 @@ from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
 from ..discord_ui.embeds import stopped_embed
+from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import StopView
@@ -603,7 +604,21 @@ class ClaudeChatCog(commands.Cog):
             if not isinstance(channel, discord.TextChannel):
                 await respond("This command must be used in a text channel.", ephemeral=True)
                 return
-            thread = await self.spawn_session(channel, prompt)
+            try:
+                thread = await self.spawn_session(channel, prompt)
+            except ThreadCreateForbiddenError:
+                # #443: bot lacks View Channel / Create Public Threads here.
+                # Reply via the interaction (ephemeral) — the channel itself is
+                # unreachable, so this is the only path that reaches the user.
+                await respond(create_thread_permission_help(), ephemeral=True)
+                return
+            except discord.Forbidden:
+                # #75: seed send into the new thread failed; spawn_session has
+                # already notified the parent channel.  Acknowledge via the
+                # interaction too so the slash command does not surface a raw
+                # traceback (defer with no followup = hung "thinking" spinner).
+                await respond(_SEND_PERMISSION_HELP, ephemeral=True)
+                return
             await respond(f"Session started → {thread.mention}")
 
     @app_commands.command(name="clord", description="Start a new Claude Code session")
@@ -917,9 +932,22 @@ class ClaudeChatCog(commands.Cog):
         """Create a new thread and start a Claude Code session."""
         thread_name = message.content[:100] if message.content else "Claude Chat"
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
-        thread = await message.create_thread(
-            name=thread_name, auto_archive_duration=archive_minutes
-        )
+        try:
+            thread = await message.create_thread(
+                name=thread_name, auto_archive_duration=archive_minutes
+            )
+        except discord.Forbidden:
+            # #443: the bot can see this channel (it received the message) but
+            # lacks "Create Public Threads".  Tell the user in-channel; if
+            # "Send Messages" is also missing, suppress (nothing else we can do).
+            logger.warning(
+                "%s create_thread forbidden on message trigger (missing Create Public Threads)",
+                log_ctx(thread_id=message.id),
+                exc_info=True,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await message.reply(create_thread_permission_help())
+            return
         prompt, image_paths = await self._build_prompt_and_images(message)
         prompt = await enrich_discord_references(prompt, message, self.bot)
         await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
@@ -954,11 +982,23 @@ class ClaudeChatCog(commands.Cog):
         """
         name = (thread_name or prompt)[:100]
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
-        thread = await channel.create_thread(
-            name=name,
-            type=discord.ChannelType.public_thread,
-            auto_archive_duration=archive_minutes,
-        )
+        try:
+            thread = await channel.create_thread(
+                name=name,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=archive_minutes,
+            )
+        except discord.Forbidden as exc:
+            # #443: bot was denied "View Channel" and/or "Create Public Threads"
+            # on this channel.  The channel itself is unreachable (a notice
+            # posted there would fail with another Forbidden), so signal the
+            # caller to surface the permission help via the interaction instead.
+            logger.warning(
+                "%s create_thread forbidden (missing View Channel / Create Public Threads)",
+                log_ctx(channel_id=channel.id),
+                exc_info=True,
+            )
+            raise ThreadCreateForbiddenError() from exc
         # Post the prompt so StatusManager has a Message to add reactions to.
         try:
             seed_message = await thread.send(prompt)

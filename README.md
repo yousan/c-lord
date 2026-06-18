@@ -450,12 +450,27 @@ Long cells are wrapped to a bounded width (`MAX_COL_WIDTH`, display-width aware 
 2. Create a bot and copy the token
 3. Enable **Message Content Intent** under Privileged Gateway Intents
 4. Invite the bot with these permissions:
+   - View Channel
    - Send Messages
    - Create Public Threads
    - Send Messages in Threads
    - Add Reactions
    - Manage Messages (for reaction cleanup)
    - Read Message History
+
+> **Private / permission-locked channels:** if a channel denies **View Channel**
+> to `@everyone` (a private channel), the server-wide invite above is *not* enough
+> — Discord's channel-level deny overrides it. You must add the **bot's role**
+> (or the bot member) to that channel's permission overrides and grant at least
+> **View Channel**, **Create Public Threads**, **Send Messages**, and **Send
+> Messages in Threads**. Granting "Manage Threads" alone does **not** help.
+>
+> When the bot is missing these on a channel, **`/clord` replies (ephemerally)
+> with the exact permissions to grant** (#443). Note one limitation: if the bot
+> lacks **View Channel** entirely, it never receives plain messages in that
+> channel, so starting a session by *posting a message* cannot be detected there
+> — use `/clord` (a slash command is delivered regardless of channel visibility),
+> or grant View Channel.
 
 ---
 
