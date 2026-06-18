@@ -9,7 +9,11 @@ Evidence).
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "staging.sh"
@@ -323,3 +327,101 @@ class TestRestartBranchSync:
         assert "fast-forward" in (result.stdout + result.stderr).lower()
         # 黙って origin の c2 に飛んだり起動したりしない (HEAD は触らず止まる)
         assert _git(clone, "rev-parse", "HEAD") == local_head
+
+
+class TestInstanceCounting:
+    """status / restart は parent+child（uv ラッパ + python 子）を 1 インスタンスと数える (#437).
+
+    `uv run python -m c_lord.main` は uv ラッパ（親）+ python（実体・子）の 2 プロセスになり、
+    `pgrep -f c_lord.main` は両方に当たる。これを 2 と誤カウントすると、検証者は「正常な
+    parent+child」を「二重起動」と誤検出してしまう。論理インスタンス = 親が同一 clone の
+    c_lord.main でない pid（= プロセスツリーの代表）だけを数える。
+
+    テストは実プロセス（cwd=clone・cmdline に c_lord.main を含む sleep）を spawn して検証する。
+    本物の bot や Discord 接続は不要。find_pids は cwd 一致で絞るので、この clone(tmp) の
+    fake だけが対象になり、ホスト上の実 bot とは混ざらない。
+    """
+
+    def _clone_env(self, tmp_path: Path) -> Path:
+        (tmp_path / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\nEXPECTED_BOT_USER_ID=42\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    @staticmethod
+    def _spawn_single(clone: Path) -> subprocess.Popen[bytes]:
+        """staging 起動形: 単一 python プロセス（cmdline ~ c_lord.main, cwd=clone）。"""
+        return subprocess.Popen(
+            ["bash", "-c", 'exec -a "python -m c_lord.main" sleep 300'],
+            cwd=str(clone),
+            start_new_session=True,
+        )
+
+    @staticmethod
+    def _spawn_uv_style(clone: Path) -> subprocess.Popen[bytes]:
+        """prod 起動形: uv ラッパ（親）+ python（子）。子の ppid は親。両方 cmdline 一致。"""
+        script = (
+            'exec -a "uv run python -m c_lord.main" '
+            "bash -c 'exec -a \"python -m c_lord.main child\" sleep 300 & wait'"
+        )
+        return subprocess.Popen(
+            ["bash", "-c", script],
+            cwd=str(clone),
+            start_new_session=True,
+        )
+
+    @staticmethod
+    def _count_procs(clone: Path) -> int:
+        """staging.sh とは独立に、cwd=clone かつ cmdline ~ c_lord.main のプロセス数を数える。"""
+        out = subprocess.run(
+            ["pgrep", "-f", r"c_lord\.main"], capture_output=True, text=True
+        ).stdout.split()
+        n = 0
+        for pid in out:
+            with contextlib.suppress(OSError):
+                if os.readlink(f"/proc/{pid}/cwd") == str(clone):
+                    n += 1
+        return n
+
+    def _wait_procs(self, clone: Path, n: int, timeout: float = 6.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._count_procs(clone) >= n:
+                return
+            time.sleep(0.1)
+        raise AssertionError(f"fake procs (cwd={clone}) が {n} に到達しない")
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen[bytes]) -> None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+    def test_status_counts_uv_wrapper_and_child_as_one(self, tmp_path: Path) -> None:
+        """AC1: uv ラッパ(親)+python(子) は instances: 1（二重起動の誤検出をしない）。"""
+        clone = self._clone_env(tmp_path)
+        proc = self._spawn_uv_style(clone)
+        try:
+            self._wait_procs(clone, 2)  # 親+子の両方が上がるのを待つ
+            result = run_script(["status"], cwd=clone)
+            assert "instances: 1" in result.stdout, result.stdout
+            assert "二重起動" not in result.stdout, result.stdout
+            assert result.returncode == 0, result.stdout
+        finally:
+            self._kill(proc)
+
+    def test_status_counts_two_independent_bots_as_two(self, tmp_path: Path) -> None:
+        """本物の二重起動（独立した 2 プロセス）はちゃんと instances: 2 で検出する。"""
+        clone = self._clone_env(tmp_path)
+        p1 = self._spawn_single(clone)
+        p2 = self._spawn_single(clone)
+        try:
+            self._wait_procs(clone, 2)
+            result = run_script(["status"], cwd=clone)
+            assert "instances: 2" in result.stdout, result.stdout
+            assert result.returncode == 2, result.stdout  # WARNING: 二重起動の疑い
+        finally:
+            self._kill(p1)
+            self._kill(p2)
