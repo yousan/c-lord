@@ -305,7 +305,11 @@ async def setup_bridge(
     if os.getenv("CLORD_MENU_WATCHDOG", "1") not in ("0", "false", "no"):
         from .thread_state_sync import MenuWatchdogLoop
 
-        menu_watchdog = MenuWatchdogLoop(bot, is_processing=chat_cog.is_processing)
+        # repo wired so the sweep only bridges windows THIS bot owns on a shared
+        # tmux server — never another bot's menu (#438).
+        menu_watchdog = MenuWatchdogLoop(
+            bot, is_processing=chat_cog.is_processing, repo=session_repo
+        )
         menu_watchdog.start()
         bot.menu_watchdog = menu_watchdog  # type: ignore[attr-defined]
 
