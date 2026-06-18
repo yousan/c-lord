@@ -82,11 +82,18 @@ cd /home/yousan/c-lord-staging-1
 bash scripts/staging.sh status             # identity / branch / pid / instances / log
 bash scripts/staging.sh stop               # この clone の bot を安全停止
 bash scripts/staging.sh restart            # 現在のブランチで安全再起動
-bash scripts/staging.sh restart <branch>   # branch に切り替えて再起動 (PR 検証用)
+bash scripts/staging.sh restart <branch>   # branch を origin の最新に同期して再起動 (PR 検証用)
 ```
 
 `restart` は: /proc/cwd で自分の bot だけを同定 → PID 直 kill → setsid + venv python で起動 →
 per-run ログ → `Logged in as` を待って identity を検証(mismatch なら非0で失敗)→ 単一インスタンス確認、まで自動で行う。
+
+`restart <branch>` は起動前に **`git fetch origin <branch>` → checkout → `git merge --ff-only origin/<branch>`** まで行い、
+ローカルブランチを **origin の最新に確実に同期**する(#436)。単なる `checkout` は fetch 済みでも
+ローカルブランチを古い HEAD のまま切り替えるだけなので、これが無いと「最新の fix を回したつもりで
+**古いコードを検証**」して偽の RED/GREEN を得る(#399 検証中に実害)。ローカルが origin と分岐していて
+ff できない場合は、**黙って古いコードを起動せず明示エラーで停止**する(`git reset --hard origin/<branch>` で
+破棄するか push してから再実行)。起動ログには回しているコミットが `checked out <branch> @ <short-sha>` と出る。
 
 **禁止事項(全て実害のあった事故パターン — #322 根因D)**:
 - `pgrep -f "c_lord.main" | xargs kill` 系の**パターン kill**(本番・自分のシェルに当たる/相対パス起動を取り逃す)

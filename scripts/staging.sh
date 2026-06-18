@@ -270,13 +270,32 @@ check_log_identity() {
 
 cmd_restart() {
   local branch_arg="${1:-}"
-  [ -x "$VENV_PY" ] || die "no .venv in $CLONE_DIR ($VENV_PY がない)。uv sync --dev を先に実行。"
 
+  # ブランチ同期は venv チェックより前に行う (#436)。理由 2 つ:
+  #  1) 単なる `git checkout <branch>` はローカルブランチを古い HEAD のまま
+  #     切り替えるだけで、fetch 済みでも origin に追従しない。検証者は
+  #     「最新の fix を回したつもりで古いコード」を起動し偽 RED/GREEN を得る
+  #     (#399 検証中に実害: d09fd57 を push・fetch 済みなのに 1 つ前の
+  #     47c3f02 を起動していた)。fetch → checkout → origin/<branch> へ
+  #     fast-forward まで行って初めて「最新を回している」と言える。
+  #  2) launch 前に確実に同期させ、回しているコミットを起動ログに出すため。
+  # ff 不能 (ローカルが分岐) なら黙って古いコードを起動せず明示エラーで止める。
   if [ -n "$branch_arg" ]; then
-    git -C "$CLONE_DIR" fetch origin "$branch_arg" -q 2>/dev/null || true
-    git -C "$CLONE_DIR" checkout "$branch_arg" -q || die "branch '$branch_arg' に checkout できない"
-    echo "checked out: $(git -C "$CLONE_DIR" log --oneline -1)"
+    git -C "$CLONE_DIR" fetch origin "$branch_arg" -q \
+      || die "git fetch origin '$branch_arg' に失敗 (ブランチ名 / ネットワークを確認)。restart は origin に push 済みのブランチを対象にする。"
+    git -C "$CLONE_DIR" checkout "$branch_arg" -q \
+      || die "branch '$branch_arg' に checkout できない"
+    if ! git -C "$CLONE_DIR" merge --ff-only "origin/$branch_arg" -q; then
+      die "branch '$branch_arg' を origin/$branch_arg に fast-forward できない (local=$(git -C "$CLONE_DIR" rev-parse --short HEAD) origin=$(git -C "$CLONE_DIR" rev-parse --short "origin/$branch_arg" 2>/dev/null))。ローカルに origin へ無いコミットがある — 'git -C $CLONE_DIR reset --hard origin/$branch_arg' で破棄するか push してから再実行。"
+    fi
   fi
+  # 起動するコミットを必ず明示する (#436 AC: 検証者が回している HEAD を一目で)。
+  local head_branch head_sha
+  head_branch="$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  head_sha="$(git -C "$CLONE_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "$head_sha" ] && echo "checked out $head_branch @ $head_sha"
+
+  [ -x "$VENV_PY" ] || die "no .venv in $CLONE_DIR ($VENV_PY がない)。uv sync --dev を先に実行。"
 
   cmd_stop
 

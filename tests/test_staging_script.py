@@ -25,6 +25,15 @@ def run_script(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 class TestScriptGuards:
     def test_script_exists_and_is_executable(self) -> None:
         assert SCRIPT.is_file()
@@ -228,3 +237,89 @@ class TestLease:
         result = run_script(["stop", "--owner", "sess-B"], cwd=clone)
         assert result.returncode != 0
         assert "sess-A" in result.stdout + result.stderr
+
+
+class TestRestartBranchSync:
+    """restart <branch> は origin/<branch> へ確実に同期してから起動する (#436).
+
+    単なる `git checkout <branch>` はローカルブランチを古い HEAD のまま切り替える
+    だけで、`git fetch` 済みでも origin に追従しない。検証者は「最新の fix を回した
+    つもりで古いコード」を起動し、偽の RED/GREEN を得る (#399 検証中に実害)。
+    """
+
+    def _origin_and_clone(self, tmp_path: Path) -> tuple[Path, str, str]:
+        """origin/feature を 2 コミット先 (c2) に進め、clone は feature@c1 で stale。
+
+        戻り値: (clone, c1, c2) — c1=stale ローカル HEAD, c2=origin/feature。
+        """
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        _git(origin, "init", "-q", "-b", "main")
+        _git(origin, "config", "user.email", "t@example.com")
+        _git(origin, "config", "user.name", "t")
+        (origin / "VERSION").write_text("c1\n", encoding="utf-8")
+        _git(origin, "add", "-A")
+        _git(origin, "commit", "-qm", "c1")
+        _git(origin, "branch", "feature")  # feature@c1
+
+        clone = tmp_path / "clone"
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(clone)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _git(clone, "config", "user.email", "t@example.com")
+        _git(clone, "config", "user.name", "t")
+        _git(clone, "checkout", "-q", "feature")  # ローカル feature@c1 (stale)
+        c1 = _git(clone, "rev-parse", "HEAD")
+
+        # origin/feature を c2 に進める (clone はまだ知らない)
+        _git(origin, "checkout", "-q", "feature")
+        (origin / "VERSION").write_text("c2\n", encoding="utf-8")
+        _git(origin, "commit", "-aqm", "c2")
+        c2 = _git(origin, "rev-parse", "HEAD")
+        _git(origin, "checkout", "-q", "main")  # fetch 専用にしておく
+
+        (clone / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\nEXPECTED_BOT_USER_ID=42\n",
+            encoding="utf-8",
+        )
+        return clone, c1, c2
+
+    def test_restart_fast_forwards_branch_to_origin(self, tmp_path: Path) -> None:
+        """AC1/AC2: restart <branch> は HEAD を origin/<branch> に ff し、回す sha を出す。
+
+        .venv が無いので launch 自体は後段で落ちるが、ブランチ同期はそれより前に
+        完了していなければならない (古いコードを起動させない)。
+        """
+        clone, c1, c2 = self._origin_and_clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-S", "--purpose", "sync test"], cwd=clone)
+        assert _git(clone, "rev-parse", "HEAD") == c1  # 前提: stale
+
+        result = run_script(["restart", "feature", "--owner", "sess-S"], cwd=clone)
+
+        after = _git(clone, "rev-parse", "HEAD")
+        assert after == c2, (
+            f"branch not fast-forwarded to origin (after={after[:7]} want={c2[:7]})\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+        # AC2: 回しているコミットを一目で確認できる行
+        assert f"checked out feature @ {c2[:7]}" in result.stdout
+
+    def test_restart_refuses_when_local_diverges(self, tmp_path: Path) -> None:
+        """AC1: ff 不能 (ローカルが分岐) なら黙って古いコードを起動せず明示エラーで止まる。"""
+        clone, _, _ = self._origin_and_clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-S", "--purpose", "diverge test"], cwd=clone)
+        # ローカル feature に origin に無いコミットを積む → origin/feature と分岐
+        (clone / "LOCAL").write_text("local only\n", encoding="utf-8")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-qm", "local-only")
+        local_head = _git(clone, "rev-parse", "HEAD")
+
+        result = run_script(["restart", "feature", "--owner", "sess-S"], cwd=clone)
+
+        assert result.returncode != 0
+        assert "fast-forward" in (result.stdout + result.stderr).lower()
+        # 黙って origin の c2 に飛んだり起動したりしない (HEAD は触らず止まる)
+        assert _git(clone, "rev-parse", "HEAD") == local_head
