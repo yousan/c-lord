@@ -15,6 +15,7 @@ Legacy shim (kept for backward compatibility):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -71,6 +72,11 @@ _CONTEXT_WINDOW_KEY_PREFIX = "context_window:"
 TOOL_RESULT_MAX_CHARS = 3000
 
 _TIMEOUT_PATTERN = re.compile(r"Timed out after (\d+) seconds")
+
+# CLI version: fetched once per process via ``claude --version``, then cached.
+# ``None`` before the first fetch; empty string on failure (so we skip retrying).
+_cli_version: str | None = None
+_cli_version_fetched: bool = False
 
 
 def _make_error_embed(error: str) -> discord.Embed:
@@ -134,8 +140,6 @@ async def _cleanup_session_dir(config: RunConfig) -> None:
     Runs git operations in a thread pool to avoid blocking the event loop.
     Logs the outcome but never raises — cleanup failures are non-fatal.
     """
-    import asyncio
-
     assert config.session_dir_manager is not None  # caller ensures this
 
     try:
@@ -175,8 +179,6 @@ async def _cleanup_session_dir(config: RunConfig) -> None:
 
 async def _cleanup_tmux_session(config: RunConfig) -> None:
     """Kill the tmux session for this thread. Non-fatal on failure."""
-    import asyncio
-
     assert config.tmux_manager is not None  # caller ensures this
 
     try:
@@ -262,12 +264,49 @@ async def _resolve_context_window(
     return fallback_window(model or getattr(config.runner, "model", None), used)
 
 
+async def _get_cli_version() -> str | None:
+    """Return the ``claude`` CLI version string, fetched once and cached.
+
+    Runs ``claude --version`` on the first call; subsequent calls return the
+    cached value without spawning a subprocess.  Returns ``None`` on failure.
+    """
+    global _cli_version, _cli_version_fetched
+    if _cli_version_fetched:
+        return _cli_version
+    _cli_version_fetched = True
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude",
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        # ``claude --version`` outputs something like ``Claude Code 1.2.3``
+        parts = stdout.decode().strip().split()
+        _cli_version = parts[-1] if parts else None
+    except Exception:
+        _cli_version = None
+    return _cli_version
+
+
+async def _context_footer_enabled(settings_repo: object | None, field: str) -> bool:
+    """Return True unless ``context_footer.<field>`` is explicitly set to ``"0"``."""
+    if settings_repo is None:
+        return True
+    with contextlib.suppress(Exception):
+        val = await settings_repo.get(f"context_footer.{field}", default="1")  # type: ignore[attr-defined]
+        return val != "0"
+    return True
+
+
 async def _post_context_usage(config: RunConfig, session_id: str | None) -> None:
     """Post a subtle context-window usage line after a completed turn.
 
     Numerator (tokens in context) comes from the session transcript; the
-    denominator from :func:`_resolve_context_window`.  Best-effort — any failure
-    is swallowed so it never disturbs the turn.
+    denominator from :func:`_resolve_context_window`.  Optional extras (model,
+    effort, CLI version, cost) are appended when enabled via ``context_footer.*``
+    settings.  Best-effort — any failure is swallowed so it never disturbs the turn.
     """
     working_dir = getattr(config.runner, "working_dir", None)
     if not session_id or not working_dir:
@@ -283,15 +322,45 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     if usage is None:
         return
     total = await _resolve_context_window(config, session_id, usage.model, usage.used)
-    line = format_context_line(usage.used, total)
+
+    settings_repo = getattr(config, "settings_repo", None)
+
+    model: str | None = None
+    if await _context_footer_enabled(settings_repo, "model"):
+        model = usage.model
+
+    effort: str | None = None
+    if await _context_footer_enabled(settings_repo, "effort"):
+        raw_effort = getattr(config.runner, "effort", None)
+        effort = raw_effort if isinstance(raw_effort, str) else None
+
+    cli_version: str | None = None
+    if await _context_footer_enabled(settings_repo, "cli_version"):
+        with contextlib.suppress(Exception):
+            cli_version = await _get_cli_version()
+
+    cost_usd: float | None = None
+    if await _context_footer_enabled(settings_repo, "cost"):
+        get_cost = getattr(config.runner, "get_cost_from_pane", None)
+        if callable(get_cost):
+            with contextlib.suppress(Exception):
+                raw_cost = await get_cost()
+                cost_usd = raw_cost if isinstance(raw_cost, (int, float)) else None
+
+    line = format_context_line(
+        usage.used,
+        total,
+        model=model,
+        effort=effort,
+        cli_version=cli_version,
+        cost_usd=cost_usd,
+    )
 
     # Prefer appending to Claude's last reply message — keeps the addendum
     # inside the same bubble (no fresh avatar/timestamp chrome).  In jsonl
     # bridge mode the transcript_mirror.reply_sink races with run_claude's
     # loop end, so the message may not be registered yet — poll briefly
     # before falling back to a fresh send.
-    import asyncio
-
     from ..skills.reply_tracker import get_last_reply_message
 
     last_reply = None

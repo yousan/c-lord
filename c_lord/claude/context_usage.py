@@ -42,6 +42,9 @@ _CONTEXT_TOTAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ``Cost: $X.XXXX  Session: ...`` ccstatusline row 2.
+_COST_RE = re.compile(r"Cost:\s+\$([\d.]+)")
+
 
 @dataclass(frozen=True)
 class ContextUsage:
@@ -116,6 +119,20 @@ def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
     return latest
 
 
+def parse_cost_from_pane(pane_text: str) -> float | None:
+    """Extract the per-turn cost from the ccstatusline ``Cost: $X.XXXX`` row.
+
+    Returns the turn cost in USD, or ``None`` when not found.
+    """
+    match = _COST_RE.search(pane_text)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 def _scale(suffix: str) -> int:
     return {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(suffix.lower(), 1)
 
@@ -181,17 +198,44 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def format_context_line(used: int, total: int) -> str:
+def _shorten_model(model: str) -> str:
+    """Strip the ``claude-`` prefix: ``claude-sonnet-4-6`` → ``sonnet-4-6``."""
+    return re.sub(r"^claude-", "", model)
+
+
+def format_context_line(
+    used: int,
+    total: int,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    cli_version: str | None = None,
+    cost_usd: float | None = None,
+) -> str:
     """Build the Discord message announcing context usage.
 
     Below the auto-compact threshold this is a subtle ``-#`` line; at or above
     it the message is promoted to a visible warning so the user can ``/clear``
-    or ``/compact`` before auto-compact kicks in.
+    or ``/compact`` before auto-compact kicks in.  Optional keyword arguments
+    append model, effort, CLI version, and cost separated by ``·``.
     """
     pct = min(100.0, used / total * 100) if total else 0.0
     used_str, total_str = _fmt_tokens(used), _fmt_tokens(total)
+
+    extras: list[str] = []
+    if model:
+        extras.append(_shorten_model(model))
+    if effort:
+        extras.append(effort)
+    if cli_version:
+        extras.append(f"CLI {cli_version}")
+    if cost_usd is not None:
+        extras.append(f"${cost_usd:.4f}")
+    suffix = (" · " + " · ".join(extras)) if extras else ""
+
     if pct >= AUTOCOMPACT_THRESHOLD:
         return (
-            f"⚠️ Context {pct:.0f}% full ({used_str}/{total_str}) — auto-compact may run next turn"
+            f"⚠️ Context {pct:.0f}% full ({used_str}/{total_str})"
+            f" — auto-compact may run next turn{suffix}"
         )
-    return f"-# \U0001f4ca {pct:.0f}% context ({used_str}/{total_str})"
+    return f"-# \U0001f4ca {pct:.0f}% context ({used_str}/{total_str}){suffix}"
