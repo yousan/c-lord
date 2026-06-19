@@ -1384,3 +1384,57 @@ class TestLiveToolTimer:
 
         # All timers should be cleared after run completes
         # (verified indirectly: no ghost tasks, session finishes cleanly)
+
+
+class TestGetCliVersion:
+    """_get_cli_version() must parse the first token from ``claude --version``."""
+
+    def _make_proc(self, output: str):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(output.encode(), b""))
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_parses_version_from_first_token(self, monkeypatch) -> None:
+        """``2.1.181 (Claude Code)`` → ``"2.1.181"`` (parts[0], not parts[-1])."""
+        from c_lord.cogs import _run_helper
+
+        _run_helper._cli_version_fetched = False
+        _run_helper._cli_version = None
+
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=self._make_proc("2.1.181 (Claude Code)\n")),
+        )
+        version = await _run_helper._get_cli_version()
+        assert version == "2.1.181"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failure(self, monkeypatch) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._cli_version_fetched = False
+        _run_helper._cli_version = None
+
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError("claude not found")),
+        )
+        version = await _run_helper._get_cli_version()
+        assert version is None
+
+    @pytest.mark.asyncio
+    async def test_caches_after_first_call(self, monkeypatch) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._cli_version_fetched = False
+        _run_helper._cli_version = None
+
+        exec_mock = AsyncMock(return_value=self._make_proc("1.0.0 (Claude Code)\n"))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        await _run_helper._get_cli_version()
+        await _run_helper._get_cli_version()
+        exec_mock.assert_awaited_once()

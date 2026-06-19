@@ -17,7 +17,7 @@ import re
 from collections.abc import AsyncGenerator
 
 from ..tmux import TmuxSessionManager
-from .context_usage import parse_context_total
+from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import AskOption, AskQuestion, MessageType, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -1216,6 +1216,11 @@ class TmuxClaudeRunner:
         )
 
     @property
+    def effort(self) -> str | None:
+        """Reasoning effort passed to the CLI (``--effort``), or ``None`` for default."""
+        return self._effort
+
+    @property
     def stopped(self) -> bool:
         """True once :meth:`interrupt` or :meth:`kill` has been called.
 
@@ -1276,6 +1281,18 @@ class TmuxClaudeRunner:
 
         logger.info("probe_context_window: could not parse /context (thread=%d)", self._thread_id)
         return None
+
+    async def get_cost_from_pane(self) -> float | None:
+        """Extract the per-turn cost from the ccstatusline ``Cost: $X.XXXX`` row.
+
+        Captures the current pane without sending any command, so it is safe to
+        call between turns.  Returns ``None`` when Claude is not running or the
+        cost row is absent.
+        """
+        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            return None
+        pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        return parse_cost_from_pane(_normalize_capture(pane))
 
     # ------------------------------------------------------------------
     # Private helpers

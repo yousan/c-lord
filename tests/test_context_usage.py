@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from c_lord.claude.context_usage import (
     MODEL_CONTEXT_WINDOW,
     ContextUsage,
@@ -18,6 +20,7 @@ from c_lord.claude.context_usage import (
     fallback_window,
     format_context_line,
     parse_context_total,
+    parse_cost_from_pane,
     read_latest_usage,
 )
 
@@ -292,6 +295,72 @@ class TestFormatContextLine:
         line = format_context_line(used=60_000, total=200_000)
         assert "60k" in line
         assert "200k" in line
+
+    def test_model_appended_shortened(self) -> None:
+        line = format_context_line(used=60_000, total=200_000, model="claude-sonnet-4-6")
+        assert "sonnet-4-6" in line
+        assert "claude-sonnet-4-6" not in line
+
+    def test_model_without_claude_prefix_unchanged(self) -> None:
+        line = format_context_line(used=60_000, total=200_000, model="opus-4-8")
+        assert "opus-4-8" in line
+
+    def test_effort_appended(self) -> None:
+        line = format_context_line(used=60_000, total=200_000, effort="medium")
+        assert "medium" in line
+
+    def test_cli_version_appended(self) -> None:
+        line = format_context_line(used=60_000, total=200_000, cli_version="1.2.3")
+        assert "CLI 1.2.3" in line
+
+    def test_cost_appended(self) -> None:
+        line = format_context_line(used=60_000, total=200_000, cost_usd=0.0042)
+        assert "$0.0042" in line
+
+    def test_all_extras_joined_with_dot(self) -> None:
+        line = format_context_line(
+            used=60_000,
+            total=200_000,
+            model="claude-sonnet-4-6",
+            effort="medium",
+            cli_version="1.2.3",
+            cost_usd=0.0042,
+        )
+        assert "sonnet-4-6" in line
+        assert "medium" in line
+        assert "CLI 1.2.3" in line
+        assert "$0.0042" in line
+        assert " · " in line
+
+    def test_warning_line_includes_extras(self) -> None:
+        line = format_context_line(
+            used=170_000, total=200_000, model="claude-opus-4-8", cost_usd=0.12
+        )
+        assert "⚠" in line
+        assert "opus-4-8" in line
+        assert "$0.1200" in line
+
+    def test_none_extras_omitted(self) -> None:
+        line = format_context_line(used=60_000, total=200_000, model=None, effort=None)
+        assert " · " not in line
+
+
+class TestParseCostFromPane:
+    def test_parses_standard_ccstatusline(self) -> None:
+        pane = "Model: claude-sonnet-4-6  Style: auto\nCost: $0.0042  Session: $0.1234\n❯ "
+        assert parse_cost_from_pane(pane) == pytest.approx(0.0042)
+
+    def test_returns_none_when_not_found(self) -> None:
+        assert parse_cost_from_pane("no cost info here") is None
+
+    def test_parses_larger_cost(self) -> None:
+        pane = "Cost: $1.2345  Session: $5.6789"
+        assert parse_cost_from_pane(pane) == pytest.approx(1.2345)
+
+    def test_ignores_session_cost(self) -> None:
+        pane = "Cost: $0.0010  Session: $9.9999"
+        cost = parse_cost_from_pane(pane)
+        assert cost == pytest.approx(0.0010)
 
 
 def test_context_usage_used_property() -> None:
