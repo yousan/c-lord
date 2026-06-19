@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ from .concurrency import SessionRegistry
 from .coordination.service import CoordinationService
 from .discord_ui.ask_bus import ask_bus
 from .discord_ui.ask_view import AskView
+from .discord_ui.permission_help import command_error_help
 
 if TYPE_CHECKING:
     from .database.ask_repo import PendingAskRepository
@@ -112,8 +114,41 @@ class ClaudeDiscordBot(commands.Bot):
     async def on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        """Log slash command errors that would otherwise be silently swallowed."""
+        """Log slash command errors AND surface an actionable reply (#444).
+
+        Logging alone (the pre-#444 behavior) left the user staring at Discord's
+        generic "アプリが応答しませんでした" with no idea what went wrong.  We now also
+        reply ephemerally with a sanitized message (no raw traceback): a
+        permission hint for ``discord.Forbidden``, otherwise a generic
+        "unexpected error" notice.  The reply itself is best-effort — if it also
+        fails (e.g. the interaction expired) we swallow that, since this is the
+        last-resort net.
+        """
         logger.error("Slash command error: %s", error, exc_info=error)
+        message = command_error_help(error)
+        with contextlib.suppress(discord.HTTPException):
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+
+    async def on_command_error(
+        self, context: commands.Context, error: commands.CommandError
+    ) -> None:
+        """Surface text-command (``!cmd``) errors to the user (#444).
+
+        discord.py's default handler only prints a traceback to stderr (invisible
+        on bot hosts), so before #444 a failing ``!clord``/``!stop`` looked like a
+        silent hang.  ``CommandNotFound`` is ignored (mentions and unrelated ``!``
+        text are not errors); everything else is logged and answered with a
+        sanitized message via ``ctx.send``.
+        """
+        if isinstance(error, commands.CommandNotFound):
+            return
+        logger.error("Text command error: %s", error, exc_info=error)
+        message = command_error_help(error)
+        with contextlib.suppress(discord.HTTPException):
+            await context.send(message)
 
     def _assert_expected_identity(self) -> None:
         """Fail fast when the logged-in identity is not the expected one.

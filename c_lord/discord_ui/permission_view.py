@@ -12,13 +12,14 @@ import logging
 import discord
 
 from ..claude.types import PermissionRequest
+from .error_reporting import ErrorReportingViewMixin
 
 logger = logging.getLogger(__name__)
 
 PERMISSION_TIMEOUT = 120  # 2 minutes to approve/deny
 
 
-class PermissionView(discord.ui.View):
+class PermissionView(ErrorReportingViewMixin, discord.ui.View):
     """Allow / Deny buttons for tool permission requests."""
 
     def __init__(self, runner, request: PermissionRequest) -> None:
