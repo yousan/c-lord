@@ -282,9 +282,9 @@ async def _get_cli_version() -> str | None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        # ``claude --version`` outputs something like ``Claude Code 1.2.3``
+        # ``claude --version`` outputs ``2.1.181 (Claude Code)`` — version is parts[0]
         parts = stdout.decode().strip().split()
-        _cli_version = parts[-1] if parts else None
+        _cli_version = parts[0] if parts else None
     except Exception:
         _cli_version = None
     return _cli_version
