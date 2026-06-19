@@ -168,6 +168,17 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         )
         sys.exit(1)
 
+    # Issue #451: DISCORD_OWNER_ID must be a numeric Discord snowflake.
+    # Fail loudly so users don't enter their username by mistake.
+    owner_id_raw = os.getenv("DISCORD_OWNER_ID", "")
+    if owner_id_raw and not owner_id_raw.isdigit():
+        logger.error(
+            "DISCORD_OWNER_ID must be a numeric Discord user ID (snowflake), got %r."
+            " Enable Developer Mode in Discord, then right-click your username → Copy User ID.",
+            owner_id_raw,
+        )
+        sys.exit(1)
+
     return {
         "token": token,
         "channel_id": channel_id,
@@ -179,7 +190,7 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT_SESSIONS", "3"),
         "timeout": os.getenv("SESSION_TIMEOUT_SECONDS", "300"),
-        "owner_id": os.getenv("DISCORD_OWNER_ID", ""),
+        "owner_id": owner_id_raw,
         "coordination_channel_id": os.getenv("COORDINATION_CHANNEL_ID", ""),
     }
 
