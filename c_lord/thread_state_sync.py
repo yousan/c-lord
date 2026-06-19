@@ -456,8 +456,19 @@ class MenuWatchdogLoop:
     Independent of the thread-name lamp (which is off by default, #329): the
     user's ability to see and answer AskUserQuestion/plan menus must not depend
     on an opt-in cosmetic feature.  Iterates every tmux window that carries an
-    ``@thread_id`` — no DB dependency — so it also recovers menus opened before
-    the bot (re)started.
+    ``@thread_id`` so it also recovers menus opened before the bot (re)started.
+
+    Ownership filter (#438): ``tmux list-windows -a`` returns every session on
+    the (shared) tmux server, including OTHER bots' sessions on the same host.
+    Bridging a foreign window would post another bot's menu into a thread we do
+    not own.  Each sweep is therefore restricted to windows this bot owns:
+      * AC2 — ``@thread_id`` must be a session in our own ``sessions.db``
+        (each bot has its own DB, so a foreign thread_id is absent), and
+      * AC1 — the window must live in a tmux session this bot manages
+        (binding-derived names + the global default).
+    ``repo`` defaults to ``None`` for backward compatibility (consumers that
+    do not wire it keep the old, unfiltered behaviour); ``setup.py`` always
+    passes it so the filter is on by default (zero-config).
     """
 
     def __init__(
@@ -466,10 +477,12 @@ class MenuWatchdogLoop:
         *,
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         is_processing: Callable[[int], bool] | None = None,
+        repo: SessionRepository | None = None,
     ) -> None:
         self._bot = bot
         self._interval = interval_seconds
         self._is_processing: Callable[[int], bool] = is_processing or (lambda _tid: False)
+        self._repo = repo
         self._task: asyncio.Task[None] | None = None
         # Per-thread background bridge task — one at a time per thread.
         self._ask_bridges: dict[int, asyncio.Task[None]] = {}
@@ -506,17 +519,59 @@ class MenuWatchdogLoop:
     async def tick(self) -> None:
         """One sweep over every tmux window bound to a thread. Public for tests."""
         windows = await asyncio.to_thread(_list_all_windows)
+        managed = await self._managed_session_names()
         for w in windows:
             tid = w.get("thread_id") or ""
             if not tid.isdigit():
                 continue
+            thread_id = int(tid)
             session_name = w.get("session_name", "")
+            # #438: skip windows this bot does not own BEFORE capturing the pane
+            # (a foreign bot's window on the shared tmux server). This is the
+            # whole guard against cross-bot menu bridging.
+            if not await self._owns_window(thread_id, session_name, managed):
+                continue
             window_name = w.get("window_name", "")
             pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
             try:
-                await self._maybe_bridge_open_menu(int(tid), session_name, window_name, pane_text)
+                await self._maybe_bridge_open_menu(thread_id, session_name, window_name, pane_text)
             except Exception:
                 logger.exception("menu watchdog failed for thread=%s", tid)
+
+    async def _managed_session_names(self) -> set[str] | None:
+        """tmux session names this bot manages, for the #438 ownership filter.
+
+        Returns ``None`` when undeterminable (no ChannelRepoCog) — in that case
+        the session-name guard (AC1) is skipped and ownership rests on the DB
+        guard (AC2) alone.
+        """
+        from .cogs.channel_repo import ChannelRepoCog
+
+        cog = self._bot.get_cog("ChannelRepoCog")
+        if not isinstance(cog, ChannelRepoCog):
+            return None
+        with contextlib.suppress(Exception):
+            return await cog.managed_session_names()
+        return None
+
+    async def _owns_window(
+        self, thread_id: int, session_name: str, managed: set[str] | None
+    ) -> bool:
+        """#438: does this tmux window belong to THIS bot? See class docstring.
+
+        AC2 (DB) is authoritative; AC1 (managed session set) is the second guard.
+        Both must hold. A window in a session we do not manage, or for a thread
+        absent from our ``sessions.db``, is another bot's — never bridge it.
+        """
+        # AC2 — the thread must be one of our own sessions.
+        if self._repo is not None and await self._repo.get(thread_id) is None:
+            return False
+        # AC1 — the window must live in a tmux session we manage. ``managed``
+        # includes the default session, so unbound-channel windows (#420) for an
+        # owned thread still pass. Skip the guard when undeterminable / no name.
+        if managed is None or not session_name:
+            return True
+        return session_name in managed
 
     async def _maybe_bridge_open_menu(
         self, thread_id: int, session_name: str, window_name: str, pane_text: str

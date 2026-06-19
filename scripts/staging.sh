@@ -189,10 +189,35 @@ find_pids() {
   done
 }
 
+instance_leaders() {
+  # find_pids のうち「親が同じ clone の c_lord.main プロセスでない」pid =
+  # 論理インスタンスの代表 (プロセスツリーの根) だけを返す (#437)。
+  #
+  # なぜ必要か: `uv run python -m c_lord.main` は uv ラッパ(親)+python(子) の
+  # 2 プロセスになり、どちらの cmdline にも c_lord.main が入るので pgrep は
+  # 両方に当たる。これは「正常な 1 インスタンス」であって二重起動ではない
+  # (prod は systemd → start-clord.sh → uv run … でこの形。docs/STAGING.md
+  # 参照)。子 (親が同 clone の matched pid である pid) を除けば、本当に独立
+  # した起動だけが代表として残り、parent+child は 1 と数えられる。
+  local pids pid ppid
+  pids="$(find_pids)"
+  [ -z "$pids" ] && return 0
+  for pid in $pids; do
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    # 親が matched 集合に居れば、この pid は子 → 代表ではない (出力しない)。
+    printf '%s\n' "$pids" | /usr/bin/grep -qx "$ppid" || echo "$pid"
+  done
+}
+
+count_instances() {
+  # 論理インスタンス数 (parent+child を 1 と数える)。0 なら 0 を返す。
+  instance_leaders | /usr/bin/grep -c . || true
+}
+
 cmd_status() {
   local pids count branch expected channel
   pids="$(find_pids)"
-  count=$(echo "$pids" | /usr/bin/grep -c . || true)
+  count="$(count_instances)" # 論理インスタンス数 (uv ラッパ+子 = 1, #437)
   branch="$(git -C "$CLONE_DIR" branch --show-current 2>/dev/null || echo '(not a git repo)')"
   expected="$(env_get EXPECTED_BOT_USER_ID)"
   channel="$(env_get DISCORD_CHANNEL_ID)"
@@ -270,13 +295,32 @@ check_log_identity() {
 
 cmd_restart() {
   local branch_arg="${1:-}"
-  [ -x "$VENV_PY" ] || die "no .venv in $CLONE_DIR ($VENV_PY がない)。uv sync --dev を先に実行。"
 
+  # ブランチ同期は venv チェックより前に行う (#436)。理由 2 つ:
+  #  1) 単なる `git checkout <branch>` はローカルブランチを古い HEAD のまま
+  #     切り替えるだけで、fetch 済みでも origin に追従しない。検証者は
+  #     「最新の fix を回したつもりで古いコード」を起動し偽 RED/GREEN を得る
+  #     (#399 検証中に実害: d09fd57 を push・fetch 済みなのに 1 つ前の
+  #     47c3f02 を起動していた)。fetch → checkout → origin/<branch> へ
+  #     fast-forward まで行って初めて「最新を回している」と言える。
+  #  2) launch 前に確実に同期させ、回しているコミットを起動ログに出すため。
+  # ff 不能 (ローカルが分岐) なら黙って古いコードを起動せず明示エラーで止める。
   if [ -n "$branch_arg" ]; then
-    git -C "$CLONE_DIR" fetch origin "$branch_arg" -q 2>/dev/null || true
-    git -C "$CLONE_DIR" checkout "$branch_arg" -q || die "branch '$branch_arg' に checkout できない"
-    echo "checked out: $(git -C "$CLONE_DIR" log --oneline -1)"
+    git -C "$CLONE_DIR" fetch origin "$branch_arg" -q \
+      || die "git fetch origin '$branch_arg' に失敗 (ブランチ名 / ネットワークを確認)。restart は origin に push 済みのブランチを対象にする。"
+    git -C "$CLONE_DIR" checkout "$branch_arg" -q \
+      || die "branch '$branch_arg' に checkout できない"
+    if ! git -C "$CLONE_DIR" merge --ff-only "origin/$branch_arg" -q; then
+      die "branch '$branch_arg' を origin/$branch_arg に fast-forward できない (local=$(git -C "$CLONE_DIR" rev-parse --short HEAD) origin=$(git -C "$CLONE_DIR" rev-parse --short "origin/$branch_arg" 2>/dev/null))。ローカルに origin へ無いコミットがある — 'git -C $CLONE_DIR reset --hard origin/$branch_arg' で破棄するか push してから再実行。"
+    fi
   fi
+  # 起動するコミットを必ず明示する (#436 AC: 検証者が回している HEAD を一目で)。
+  local head_branch head_sha
+  head_branch="$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  head_sha="$(git -C "$CLONE_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "$head_sha" ] && echo "checked out $head_branch @ $head_sha"
+
+  [ -x "$VENV_PY" ] || die "no .venv in $CLONE_DIR ($VENV_PY がない)。uv sync --dev を先に実行。"
 
   cmd_stop
 
@@ -323,10 +367,21 @@ cmd_restart() {
         done
         die "誤った identity で起動したため停止した (ログ: $log)"
       fi
-      local count
-      count="$(find_pids | /usr/bin/grep -c . || true)"
-      echo "instances: $count"
-      [ "$count" = "1" ] || die "単一インスタンスでない (count=$count)"
+      # 論理インスタンスが 1 に収束するのを待つ (#437)。parent+child(uv ラッパ
+      # +python) は 1 と数える。staging は venv python 直起動で即 1 になるが、
+      # 万一 churn しても収束を待ってから単一を保証する。
+      local inst tries=0
+      while :; do
+        inst="$(count_instances)"
+        [ "$inst" = "1" ] && break
+        tries=$((tries + 1))
+        if [ "$tries" -ge 5 ]; then
+          echo "instances: $inst"
+          die "単一インスタンスに収束しない (instances=$inst)"
+        fi
+        sleep 1
+      done
+      echo "instances: $inst"
       echo "OK"
       return 0
     fi
@@ -376,7 +431,11 @@ BRANCH="$POSITIONAL"
 
 case "$COMMAND" in
 status)
+  # cmd_status の終了コード (二重起動疑い = 2) を後続の lease 出力で潰さず
+  # スクリプトの終了コードに伝播させる (#437): 機械からは exit code で単一性を
+  # 判定できる必要がある。
   cmd_status
+  status_rc=$?
   if [ -f "$LEASE_FILE" ]; then
     if lease_is_valid; then
       echo "lease:     $(lease_describe)"
@@ -386,6 +445,7 @@ status)
   else
     echo "lease:     (none)"
   fi
+  exit "$status_rc"
   ;;
 borrow) cmd_borrow "$OWNER" "$PURPOSE" "$TTL_HOURS" ;;
 release) cmd_release "$OWNER" ;;

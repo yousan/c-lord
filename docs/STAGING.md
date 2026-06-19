@@ -82,17 +82,50 @@ cd /home/yousan/c-lord-staging-1
 bash scripts/staging.sh status             # identity / branch / pid / instances / log
 bash scripts/staging.sh stop               # この clone の bot を安全停止
 bash scripts/staging.sh restart            # 現在のブランチで安全再起動
-bash scripts/staging.sh restart <branch>   # branch に切り替えて再起動 (PR 検証用)
+bash scripts/staging.sh restart <branch>   # branch を origin の最新に同期して再起動 (PR 検証用)
 ```
 
 `restart` は: /proc/cwd で自分の bot だけを同定 → PID 直 kill → setsid + venv python で起動 →
 per-run ログ → `Logged in as` を待って identity を検証(mismatch なら非0で失敗)→ 単一インスタンス確認、まで自動で行う。
+
+`restart <branch>` は起動前に **`git fetch origin <branch>` → checkout → `git merge --ff-only origin/<branch>`** まで行い、
+ローカルブランチを **origin の最新に確実に同期**する(#436)。単なる `checkout` は fetch 済みでも
+ローカルブランチを古い HEAD のまま切り替えるだけなので、これが無いと「最新の fix を回したつもりで
+**古いコードを検証**」して偽の RED/GREEN を得る(#399 検証中に実害)。ローカルが origin と分岐していて
+ff できない場合は、**黙って古いコードを起動せず明示エラーで停止**する(`git reset --hard origin/<branch>` で
+破棄するか push してから再実行)。起動ログには回しているコミットが `checked out <branch> @ <short-sha>` と出る。
 
 **禁止事項(全て実害のあった事故パターン — #322 根因D)**:
 - `pgrep -f "c_lord.main" | xargs kill` 系の**パターン kill**(本番・自分のシェルに当たる/相対パス起動を取り逃す)
 - kill を**並列ツールバッチに入れる**(キャンセルしても発射済みの kill は戻らない)
 - `nohup uv run ...` での起動(Bash ツール teardown で exit 144 死する)
 - 本番 (`/home/yousan/c-lord`) への手動 kill+nohup(supervised — #195 の二重 bot 事故になる)
+
+## supervision モデル — 誰が respawn するか (#437)
+
+「prod に c_lord.main が **2 プロセス**見えるが二重起動か?」「`staging.sh stop` したのに復活するか?」を
+切り分けるための、起動・監視の実態:
+
+| | prod (`/home/yousan/c-lord`) | staging (`/home/yousan/c-lord-staging-N`) |
+|---|---|---|
+| 起動者 | **`systemd --user c-lord.service`**(`Restart=always`, `RestartSec=5`) | **`scripts/staging.sh`**(手動) |
+| 起動コマンド | `start-clord.sh` → `exec uv run python -m c_lord.main` | `setsid <venv>/bin/python -m c_lord.main`(uv ラッパ無し) |
+| プロセス数 | **2 が正常**: `uv` ラッパ(親) + `python` 実体(子) | **1**: `python` のみ |
+| 死んだら | systemd が 5 秒後に respawn | **respawn しない**(stop したら止まったまま) |
+
+- **prod の「2 プロセス」は二重起動ではない**。`uv run python -m c_lord.main` は uv ラッパ(親)を
+  立て、その子として実体の `python` を exec する。`pgrep -f c_lord.main` は cmdline に `c_lord.main` を
+  含む**両方**に当たるので 2 に見えるだけ。親子は `ps -o ppid=` で確認できる(子の ppid = 親の pid)。
+  `staging.sh status` / `restart` は**この parent+child を 1 インスタンスと数える**(`instance_leaders`:
+  親が同一 clone の matched pid である pid = 子 を代表から除く)。本物の二重起動(独立した 2 起動)は
+  ちゃんと `instances: 2` + 終了コード 2 で検出する。
+- **staging には systemd ユニットも guard も無い**。`staging.sh` は `setsid` で venv python を直起動する
+  だけなので、`stop` 後に勝手に復活する経路は無い。staging で churn(pid が数秒おきに変わる)を見たら、
+  それは respawn ではなく**手動 `restart` の競合**を疑う。
+- **`start-clord.sh --guard`**(ログインフックモード)は存在するが、**prod しか起動しない**
+  (`cd $HOME/c-lord`)。二重起動防止に global な `pgrep -f c_lord.main` を使うため、staging bot が
+  動いていると「既に起動済み」と判断して prod を起こさない、という相互作用がある。現状 `~/.zprofile`
+  等のシェルプロファイルには未配線。
 
 ## 占有(借用)プロトコル (#328)
 
