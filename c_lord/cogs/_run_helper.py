@@ -344,8 +344,10 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         get_cost = getattr(config.runner, "get_cost_from_pane", None)
         if callable(get_cost):
             with contextlib.suppress(Exception):
-                raw_cost = await get_cost()
-                cost_usd = raw_cost if isinstance(raw_cost, (int, float)) else None
+                coro = get_cost()
+                if asyncio.iscoroutine(coro):
+                    raw_cost = await coro
+                    cost_usd = raw_cost if isinstance(raw_cost, (int, float)) else None
 
     line = format_context_line(
         usage.used,
