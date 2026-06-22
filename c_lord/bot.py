@@ -200,17 +200,22 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Sync slash commands — guild sync first for instant propagation,
-        # then global sync so commands are available outside the guild too.
+        # Sync slash commands to the guild only — instant propagation, no duplicates.
+        # Global sync is intentionally omitted: c-lord is installed per-server, so
+        # guild-scoped commands are sufficient and avoid the double-entry that arises
+        # when the same command exists as both a guild command and a global command.
         try:
             channel = self.get_channel(self.channel_id)
             guild = getattr(channel, "guild", None)
             if guild is not None:
                 self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
-                logger.info("Synced slash commands to guild %d (instant)", guild.id)
-            synced = await self.tree.sync()
-            logger.info("Synced %d slash commands (global)", len(synced))
+                synced = await self.tree.sync(guild=guild)
+                logger.info("Synced %d slash commands to guild %d (instant)", len(synced), guild.id)
+            else:
+                logger.warning(
+                    "Could not resolve guild from channel %d; slash commands not synced",
+                    self.channel_id,
+                )
         except Exception:
             logger.exception("Failed to sync slash commands")
 

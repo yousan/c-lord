@@ -222,3 +222,61 @@ class TestOnError:
 
         assert any(r.levelno >= logging.ERROR for r in caplog.records)
         assert any("zombie" in r.message.lower() for r in caplog.records)
+
+
+class TestSlashCommandSync:
+    """Slash command sync must use guild-only sync to avoid duplicate entries.
+
+    Before the fix, the bot called both tree.sync(guild=guild) AND tree.sync()
+    (global), causing the same command to appear twice in Discord's command list.
+    """
+
+    @pytest.mark.asyncio
+    async def test_global_sync_not_called(self) -> None:
+        """tree.sync() without a guild argument must NOT be called."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+
+        guild = MagicMock()
+        channel = MagicMock()
+        channel.guild = guild
+
+        bot.tree.copy_global_to = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        # sync must have been called exactly once, with guild= kwarg
+        bot.tree.sync.assert_called_once_with(guild=guild)
+
+    @pytest.mark.asyncio
+    async def test_guild_sync_called(self) -> None:
+        """tree.copy_global_to and tree.sync(guild=...) must be called."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+
+        guild = MagicMock()
+        channel = MagicMock()
+        channel.guild = guild
+
+        bot.tree.copy_global_to = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.copy_global_to.assert_called_once_with(guild=guild)
+        bot.tree.sync.assert_called_once_with(guild=guild)
