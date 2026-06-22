@@ -152,7 +152,12 @@ class SessionDirManager:
         # final answers via REST API instead of relying on capture-pane
         # scraping. Gated by USE_SKILL_REPLY env so old path stays default.
         # Runs on every call to keep api_url / api_secret in sync.
-        from .skills.injector import inject_skills, remove_injected_skills, skills_enabled
+        from .skills.injector import (
+            inject_read_skill,
+            inject_skills,
+            remove_injected_skills,
+            skills_enabled,
+        )
 
         if skills_enabled():
             try:
@@ -161,12 +166,22 @@ class SessionDirManager:
                 # Don't fail session creation on a skill write error.
                 logger.warning("Failed to inject skills for thread %d: %s", thread_id, exc)
         else:
-            # jsonl bridge mode etc.: scrub any stale skill left by a prior
-            # skill-mode session so Claude isn't pointed at a dead REST API.
+            # jsonl bridge mode etc.: scrub any stale REST-API output skill left
+            # by a prior skill-mode session so Claude isn't pointed at a dead
+            # REST API.
             try:
                 remove_injected_skills(target)
             except OSError as exc:
                 logger.warning("Failed to remove stale skills for thread %d: %s", thread_id, exc)
+
+        # Issue #259: discord-read is bridge-independent (it curls the Discord
+        # REST API directly, not c-lord's API), so inject it in every mode —
+        # including jsonl, where the output skills above are scrubbed. This is
+        # what lets Claude read other channels regardless of cwd or #71 state.
+        try:
+            inject_read_skill(target)
+        except OSError as exc:
+            logger.warning("Failed to inject discord-read for thread %d: %s", thread_id, exc)
 
         return target
 

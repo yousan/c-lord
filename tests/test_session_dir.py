@@ -223,6 +223,30 @@ class TestCreateSessionDir:
 
         assert not skill_dir.exists(), "stale skill must be removed when skills disabled"
 
+    def test_injects_discord_read_even_when_output_skills_disabled(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Issue #259: discord-read is bridge-independent. Even with output
+        skills disabled (jsonl mode), the read skill must still be injected so
+        Claude can read other channels regardless of cwd or #71 state."""
+        monkeypatch.setenv("USE_SKILL_REPLY", "0")
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(777)
+
+        reply = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        read = Path(target) / ".claude" / "skills" / "discord-read" / "SKILL.md"
+        assert not reply.exists(), "output skill must stay disabled"
+        assert read.exists(), "discord-read must be injected regardless of bridge mode"
+
     def test_injects_skills_by_default(self, tmp_path: Path, monkeypatch) -> None:
         """Issue #53: with the env unset, skill injection is on by default."""
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
