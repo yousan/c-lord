@@ -200,17 +200,33 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Sync slash commands — guild sync first for instant propagation,
-        # then global sync so commands are available outside the guild too.
+        # Sync slash commands to the guild only — instant propagation, no duplicates.
+        #
+        # Previously the bot called both tree.sync(guild=guild) AND tree.sync() (global),
+        # which caused every command to appear twice in Discord's command picker.
+        # The fix has two steps:
+        #   1. Register commands as guild-scoped (instant, sufficient for per-server installs)
+        #   2. Wipe any previously-registered global commands so the duplicates disappear
         try:
             channel = self.get_channel(self.channel_id)
             guild = getattr(channel, "guild", None)
             if guild is not None:
+                # Step 1: guild sync (instant propagation)
                 self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
-                logger.info("Synced slash commands to guild %d (instant)", guild.id)
-            synced = await self.tree.sync()
-            logger.info("Synced %d slash commands (global)", len(synced))
+                synced = await self.tree.sync(guild=guild)
+                logger.info("Synced %d slash commands to guild %d (instant)", len(synced), guild.id)
+
+                # Step 2: clear global commands so previously-registered globals are removed.
+                # This is a migration: on first run after the fix it removes the old global
+                # registrations; on subsequent runs it is a cheap no-op (empty list → empty list).
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                logger.info("Cleared global slash commands (removes legacy duplicates)")
+            else:
+                logger.warning(
+                    "Could not resolve guild from channel %d; slash commands not synced",
+                    self.channel_id,
+                )
         except Exception:
             logger.exception("Failed to sync slash commands")
 

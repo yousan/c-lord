@@ -222,3 +222,92 @@ class TestOnError:
 
         assert any(r.levelno >= logging.ERROR for r in caplog.records)
         assert any("zombie" in r.message.lower() for r in caplog.records)
+
+
+class TestSlashCommandSync:
+    """Slash command sync must register guild-only and wipe global commands.
+
+    Before the fix, the bot called both tree.sync(guild=guild) AND tree.sync()
+    (global), causing the same command to appear twice in Discord's command list.
+    The fix has two parts:
+      1. Register as guild commands (instant)
+      2. Explicitly clear global commands so previously-registered globals disappear
+    """
+
+    def _make_bot_with_mocks(self) -> tuple:
+        from unittest.mock import AsyncMock, MagicMock
+
+        bot = ClaudeDiscordBot(channel_id=123)
+        guild = MagicMock()
+        channel = MagicMock()
+        channel.guild = guild
+        bot.tree.copy_global_to = MagicMock()
+        bot.tree.clear_commands = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+        return bot, guild
+
+    @pytest.mark.asyncio
+    async def test_guild_sync_called(self) -> None:
+        """tree.copy_global_to and tree.sync(guild=...) must be called."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.copy_global_to.assert_called_once_with(guild=guild)
+        # First sync call must be the guild sync
+        first_call = bot.tree.sync.call_args_list[0]
+        assert first_call.kwargs.get("guild") == guild
+
+    @pytest.mark.asyncio
+    async def test_global_commands_cleared(self) -> None:
+        """clear_commands(guild=None) + tree.sync() must be called to wipe legacy globals."""
+        from unittest.mock import AsyncMock, call, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.clear_commands.assert_called_once_with(guild=None)
+        # Second sync call must be the global clear (no guild kwarg)
+        assert call() in bot.tree.sync.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_sync_order_guild_before_global_clear(self) -> None:
+        """Guild sync must happen before the global clear."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+        call_order: list[str] = []
+
+        orig_sync = bot.tree.sync.side_effect
+
+        async def tracking_sync(**kwargs: object) -> list:
+            if "guild" in kwargs:
+                call_order.append("guild")
+            else:
+                call_order.append("global_clear")
+            return []
+
+        bot.tree.sync.side_effect = tracking_sync
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        assert call_order == ["guild", "global_clear"]
