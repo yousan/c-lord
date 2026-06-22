@@ -116,7 +116,8 @@ c-lord のクローン (parallel worktree, 別ディレクトリの clone 等) �
 **前提と制約**:
 - `c_lord/cogs/_run_helper.py` は **bot が spawn する子 Claude の env から `DISCORD_BOT_TOKEN` を strip する** (security audit に記載)。bot 経由で立った Claude は環境変数からは token を読めない
 - 手動で `claude` コマンドを叩いて立ち上げた tmux window 内 Claude には strip が掛からないので、**bot の `.env` ファイル**を直接読めばよい
-- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多い。**メッセージの読み取りは MCP に頼らず、`.env` の bot token を読んで Discord REST API を `curl` で叩く**のが確実 — MCP が `Missing Access` を返しても**そこで諦めず curl にフォールバックすること**。MCP は c-lord のスタック外（利用者環境にある保証もない）なので読み取りの基盤にしない。読み取り経路を skill + API として c-lord 内に正式実装する作業は #259、設計方針は #234 を参照
+- Discord MCP plugin (`plugin:discord:discord`) は別チャンネルへ `Missing Access` で失敗することが多い。**メッセージの読み取りは MCP に頼らず、`.env` の bot token を読んで Discord REST API を `curl` で叩く**のが確実 — MCP が `Missing Access` を返しても**そこで諦めず curl にフォールバックすること**。MCP は c-lord のスタック外（利用者環境にある保証もない）なので読み取りの基盤にしない。
+- **bot が spawn する子 Claude には `discord-read` skill が自動注入される (#259)**。この skill が上記の「MCP は使わない / `Missing Access` でも curl にフォールバック / token は c-lord の `.env` から実行時に変数へ読む」手順を、**cwd が利用者リポジトリ（c-lord 外）のセッションにも**届ける。token は SKILL.md に焼き込まず `.env` の絶対パスだけを渡す（`c_lord/skills/discord_read.py`、accepted risk は `docs/SECURITY.md`）。設計方針は #234。
 
 **Token 取得**: **本番 `.env` を絶対パスで直接読む** (`/home/yousan/c-lord/.env`。パスは運用に合わせて)。
 

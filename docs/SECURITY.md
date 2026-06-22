@@ -30,8 +30,36 @@ The bridge's security goal is:
 | Claude Code modifying its own config | This is expected behavior (CLAUDE.md, memory files, etc.) |
 | Discord server admin abuse | If someone has admin on your Discord server, they already have control |
 | Physical access to the host | Out of scope — standard server security applies |
+| Claude reading the bot token from c-lord's `.env` | Accepted (#259). Same-UID processes can already read `.env`; the spawn-read skill relies on that. See below. |
 
 **The security boundary is at the Discord layer, not the CLI layer.** Once a session starts, Claude Code has full CLI-level access. The bridge's job is to ensure only the right person can start sessions.
+
+### Accepted risk: `discord-read` skill exposes the bot token to the session (#259)
+
+The injected `discord-read` skill (`c_lord/skills/discord_read.py`) tells Claude
+to read other Discord channels by reading `DISCORD_BOT_TOKEN` from c-lord's
+`.env` at runtime and `curl`-ing the Discord REST API (instead of the MCP
+plugin, which fails with `Missing Access` on channels the bot can otherwise
+see — #454).
+
+This means the bot token is **readable by the Claude session** (it `grep`s the
+`.env` file). We accept this:
+
+- It exposes nothing new: any process running as the same Unix user can already
+  `cat` the `.env` file. Hiding the token from a same-UID Claude is security
+  theater (see #234) — the real isolation boundary is the OS file permissions
+  on `.env`, which separate different Unix users.
+- The skill **never bakes the literal token into a file**. Only the `.env`
+  *path* is written into `SKILL.md` (which lives inside the cloned user repo
+  working tree, where a literal token could be `git commit`-ed and pushed). The
+  token is read into a shell variable at runtime, so it does not appear in the
+  command text that the transcript mirror (#71) echoes to Discord.
+
+> Note: the env-var stripping described under "Environment Isolation" below
+> (`_STRIPPED_ENV_KEYS`) is **not currently implemented** in the tmux-based
+> architecture — see #458. Regardless of that, the spawn-read path reads the
+> token from the `.env` *file*, not from an environment variable, so the
+> accepted-risk reasoning above does not depend on it.
 
 ## Input Validation
 

@@ -8,15 +8,21 @@ import shutil
 from pathlib import Path
 
 from .discord_prompt_choice import render_discord_prompt_choice_skill
+from .discord_read import render_discord_read_skill
 from .discord_reply import render_discord_reply_skill
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://127.0.0.1:8080"
 
-# Skill directories inject_skills writes. Kept here so remove_injected_skills
-# stays symmetric with what we create.
+# Output-path skills that depend on the c-lord REST API. inject_skills writes
+# them and remove_injected_skills scrubs them; their lifecycle is tied to
+# skills_enabled() (skill-reply mode). discord-read is intentionally NOT here —
+# it curls the Discord REST API directly (no c-lord API), so it is injected in
+# every bridge mode by inject_read_skill() and never scrubbed. See #259.
 INJECTED_SKILL_NAMES: tuple[str, ...] = ("discord-reply", "discord-prompt-choice")
+
+READ_SKILL_NAME = "discord-read"
 
 
 def inject_skills(
@@ -24,6 +30,7 @@ def inject_skills(
     thread_id: int,
     api_url: str | None = None,
     api_secret: str | None = None,
+    env_path: str | None = None,
 ) -> list[str]:
     """Write the c-lord skill bundle into ``<session_dir>/.claude/skills/``.
 
@@ -38,6 +45,11 @@ def inject_skills(
         api_secret: Bearer token the API server requires. When omitted,
             falls back to the ``CLORD_API_SECRET`` env var. If neither is
             set, the auth-less template is rendered.
+        env_path: Absolute path to c-lord's ``.env`` file, baked into the
+            ``discord-read`` skill so Claude can read ``DISCORD_BOT_TOKEN`` at
+            runtime (#259). When omitted, falls back to the ``CLORD_ENV_PATH``
+            env var; if still unset, the path-less read template is rendered.
+            Only the path is ever written — never the token value.
 
     Returns:
         Absolute paths to the SKILL.md files written.
@@ -48,6 +60,9 @@ def inject_skills(
 
     if api_secret is None:
         api_secret = os.getenv("CLORD_API_SECRET") or None
+
+    if env_path is None:
+        env_path = os.getenv("CLORD_ENV_PATH") or None
 
     skills_root = Path(session_dir) / ".claude" / "skills"
 
@@ -85,7 +100,54 @@ def inject_skills(
         thread_id,
         choice_path,
     )
+
+    # Issue #259: discord-read is bridge-independent, so inject it here too for
+    # convenience (skill mode) — but the authoritative, always-on injection is
+    # inject_read_skill(), called by session_dir regardless of bridge mode.
+    written.append(inject_read_skill(session_dir, env_path=env_path))
     return written
+
+
+def inject_read_skill(
+    session_dir: str | os.PathLike[str],
+    env_path: str | None = None,
+) -> str:
+    """Write the ``discord-read`` skill into ``<session_dir>/.claude/skills/``.
+
+    Unlike :func:`inject_skills`, this is injected in **every** bridge mode
+    (skill-reply *and* jsonl mirror): reading other Discord channels via curl
+    is independent of how Claude's *output* reaches Discord, and it does not
+    touch the c-lord REST API. So it is never scrubbed by
+    :func:`remove_injected_skills`. See #259.
+
+    Idempotent (overwrites). Only the ``.env`` *path* is baked in — never the
+    token value.
+
+    Args:
+        session_dir: Path to the per-thread session directory.
+        env_path: Absolute path to c-lord's ``.env``. Defaults to the
+            ``CLORD_ENV_PATH`` env var; if unset, the path-less read template
+            is rendered.
+
+    Returns:
+        Absolute path to the SKILL.md written.
+    """
+    if env_path is None:
+        env_path = os.getenv("CLORD_ENV_PATH") or None
+
+    read_dir = Path(session_dir) / ".claude" / "skills" / READ_SKILL_NAME
+    read_dir.mkdir(parents=True, exist_ok=True)
+    read_path = read_dir / "SKILL.md"
+    read_path.write_text(
+        render_discord_read_skill(env_path=env_path),
+        encoding="utf-8",
+    )
+    logger.info(
+        "Injected discord-read skill at %s (env_path=%s)",
+        read_path,
+        env_path or "(none)",
+    )
+    return str(read_path)
 
 
 def remove_injected_skills(session_dir: str | os.PathLike[str]) -> list[str]:
