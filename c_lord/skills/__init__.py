@@ -10,13 +10,16 @@ Discord by curl-ing the c-lord REST API, replacing the legacy
 from __future__ import annotations
 
 from .discord_prompt_choice import render_discord_prompt_choice_skill
+from .discord_read import render_discord_read_skill
 from .discord_reply import DISCORD_REPLY_SKILL, render_discord_reply_skill
-from .injector import inject_skills, remove_injected_skills
+from .injector import inject_read_skill, inject_skills, remove_injected_skills
 
 __all__ = [
     "DISCORD_REPLY_SKILL",
+    "inject_read_skill",
     "inject_skills",
     "remove_injected_skills",
     "render_discord_prompt_choice_skill",
+    "render_discord_read_skill",
     "render_discord_reply_skill",
 ]
