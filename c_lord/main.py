@@ -136,8 +136,10 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     single source of truth for every key it defines. Keys absent from the
     file still fall back to the process env (env-var-only setups keep working).
     """
+    resolved_env_path: str | None = None
     if env_path is not None:
         load_dotenv(env_path, override=True)
+        resolved_env_path = str(Path(env_path).resolve())
     else:
         # find_dotenv(usecwd=True): search from the CURRENT DIRECTORY upward,
         # not from this package's location. README documents the bare launch as
@@ -147,6 +149,14 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         found = find_dotenv(usecwd=True)
         if found:
             load_dotenv(found, override=True)
+            resolved_env_path = str(Path(found).resolve())
+
+    # Issue #259: expose the resolved .env path so the injected discord-read
+    # skill can tell Claude where to read DISCORD_BOT_TOKEN from at runtime.
+    # Only the path is shared — never the token. Skip if no .env file was used
+    # (env-var-only setups); the read skill then renders its path-less variant.
+    if resolved_env_path:
+        os.environ.setdefault("CLORD_ENV_PATH", resolved_env_path)
 
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token:
