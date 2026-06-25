@@ -225,13 +225,13 @@ class TestOnError:
 
 
 class TestSlashCommandSync:
-    """Slash command sync must register guild-only and wipe global commands.
+    """Slash command sync must register GLOBALLY so commands work in every guild.
 
-    Before the fix, the bot called both tree.sync(guild=guild) AND tree.sync()
-    (global), causing the same command to appear twice in Discord's command list.
-    The fix has two parts:
-      1. Register as guild commands (instant)
-      2. Explicitly clear global commands so previously-registered globals disappear
+    #462 regression: #461 registered commands only on the one guild derived from
+    channel_id (and wiped globals), so the bot — which serves multiple servers —
+    lost its slash commands on every OTHER server. The fix registers globally
+    (Discord's multi-guild standard) and clears the legacy guild-scoped commands
+    on the primary guild so they don't duplicate against the global ones.
     """
 
     def _make_bot_with_mocks(self) -> tuple:
@@ -248,27 +248,8 @@ class TestSlashCommandSync:
         return bot, guild
 
     @pytest.mark.asyncio
-    async def test_guild_sync_called(self) -> None:
-        """tree.copy_global_to and tree.sync(guild=...) must be called."""
-        from unittest.mock import AsyncMock, patch
-
-        bot, guild = self._make_bot_with_mocks()
-
-        with (
-            patch.object(bot, "_assert_expected_identity"),
-            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
-            patch("c_lord.bot.isinstance", return_value=False),
-        ):
-            await bot.on_ready()
-
-        bot.tree.copy_global_to.assert_called_once_with(guild=guild)
-        # First sync call must be the guild sync
-        first_call = bot.tree.sync.call_args_list[0]
-        assert first_call.kwargs.get("guild") == guild
-
-    @pytest.mark.asyncio
-    async def test_global_commands_cleared(self) -> None:
-        """clear_commands(guild=None) + tree.sync() must be called to wipe legacy globals."""
+    async def test_global_sync_called(self) -> None:
+        """tree.sync() with NO guild kwarg must be called to register globally."""
         from unittest.mock import AsyncMock, call, patch
 
         bot, guild = self._make_bot_with_mocks()
@@ -280,25 +261,57 @@ class TestSlashCommandSync:
         ):
             await bot.on_ready()
 
-        bot.tree.clear_commands.assert_called_once_with(guild=None)
-        # Second sync call must be the global clear (no guild kwarg)
+        # A global sync (no guild kwarg) must have happened
         assert call() in bot.tree.sync.call_args_list
 
     @pytest.mark.asyncio
-    async def test_sync_order_guild_before_global_clear(self) -> None:
-        """Guild sync must happen before the global clear."""
+    async def test_copy_global_to_not_called(self) -> None:
+        """copy_global_to must NOT be used — that re-creates the per-guild duplicates."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.copy_global_to.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_guild_commands_cleared(self) -> None:
+        """clear_commands(guild=guild) + sync(guild=guild) must wipe legacy guild commands."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.clear_commands.assert_called_once_with(guild=guild)
+        # A guild-scoped sync (to push the now-empty guild command set) must have happened
+        guild_syncs = [c for c in bot.tree.sync.call_args_list if c.kwargs.get("guild") == guild]
+        assert len(guild_syncs) == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_order_guild_clear_before_global(self) -> None:
+        """Legacy guild clear must happen before the global registration."""
         from unittest.mock import AsyncMock, patch
 
         bot, guild = self._make_bot_with_mocks()
         call_order: list[str] = []
 
-        orig_sync = bot.tree.sync.side_effect
-
         async def tracking_sync(**kwargs: object) -> list:
-            if "guild" in kwargs:
-                call_order.append("guild")
+            if kwargs.get("guild") is not None:
+                call_order.append("guild_clear")
             else:
-                call_order.append("global_clear")
+                call_order.append("global")
             return []
 
         bot.tree.sync.side_effect = tracking_sync
@@ -310,4 +323,26 @@ class TestSlashCommandSync:
         ):
             await bot.on_ready()
 
-        assert call_order == ["guild", "global_clear"]
+        assert call_order == ["guild_clear", "global"]
+
+    @pytest.mark.asyncio
+    async def test_global_sync_runs_even_without_guild(self) -> None:
+        """If the channel's guild can't be resolved, global sync must still run."""
+        from unittest.mock import AsyncMock, MagicMock, call, patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+        channel = MagicMock()
+        channel.guild = None  # cannot resolve guild
+        bot.tree.clear_commands = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        # Global sync still happened so commands are registered everywhere
+        assert call() in bot.tree.sync.call_args_list
