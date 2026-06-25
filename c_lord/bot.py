@@ -200,33 +200,31 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Sync slash commands to the guild only — instant propagation, no duplicates.
+        # Register slash commands GLOBALLY so they are available in every guild the
+        # bot is in. c-lord is one bot instance that can serve multiple servers, and
+        # global registration is Discord's recommended approach for multi-guild bots.
         #
-        # Previously the bot called both tree.sync(guild=guild) AND tree.sync() (global),
-        # which caused every command to appear twice in Discord's command picker.
-        # The fix has two steps:
-        #   1. Register commands as guild-scoped (instant, sufficient for per-server installs)
-        #   2. Wipe any previously-registered global commands so the duplicates disappear
+        # #462: a previous version (#461) registered commands only on the single guild
+        # derived from channel_id (and wiped the globals). That hid the commands from
+        # every OTHER server the bot was in. The trade-off of going global is that
+        # command *definition* changes take up to ~1h to propagate; normal use is
+        # unaffected once registered.
+        #
+        # Migration: before the global sync, clear any legacy guild-scoped commands on
+        # the primary guild — left in place they would duplicate against the global
+        # ones in Discord's command picker (the #460 double-entry bug). Pushing an
+        # empty guild command set removes them. On servers that never had guild
+        # commands this is a no-op.
         try:
             channel = self.get_channel(self.channel_id)
             guild = getattr(channel, "guild", None)
             if guild is not None:
-                # Step 1: guild sync (instant propagation)
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                logger.info("Synced %d slash commands to guild %d (instant)", len(synced), guild.id)
+                self.tree.clear_commands(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("Cleared legacy guild-scoped slash commands on guild %d", guild.id)
 
-                # Step 2: clear global commands so previously-registered globals are removed.
-                # This is a migration: on first run after the fix it removes the old global
-                # registrations; on subsequent runs it is a cheap no-op (empty list → empty list).
-                self.tree.clear_commands(guild=None)
-                await self.tree.sync()
-                logger.info("Cleared global slash commands (removes legacy duplicates)")
-            else:
-                logger.warning(
-                    "Could not resolve guild from channel %d; slash commands not synced",
-                    self.channel_id,
-                )
+            synced = await self.tree.sync()
+            logger.info("Synced %d global slash commands (available in all guilds)", len(synced))
         except Exception:
             logger.exception("Failed to sync slash commands")
 
