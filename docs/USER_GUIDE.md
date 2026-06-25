@@ -208,6 +208,12 @@ Send follow-up messages → Claude continues in same session
 Bot restart → tmux session keeps running; observers re-attach and a quiet
               "C-lord を再起動しました" notice is posted. Claude is NOT
               re-prompted (#406) — send a new message to continue.
+    ↓
+tmux session gone (killed together with the bot / tmux-server death):
+              the next message recreates the window and resumes the prior
+              conversation from the on-disk transcript (claude --continue),
+              announced with "🔄 …会話を復元して続けます" so the replayed
+              context reads as a restore, not a broken bot (#464).
 ```
 
 ### What Happens Under the Hood

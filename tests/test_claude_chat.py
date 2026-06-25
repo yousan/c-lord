@@ -919,6 +919,40 @@ class TestResumeAfterPaneDeath:
         assert kwargs.get("try_continue") is True
 
     @pytest.mark.asyncio
+    async def test_recovery_is_announced_to_user(self) -> None:
+        """#464 ②: when the dead pane is auto-resumed, tell the user.
+
+        During the 2026-06-25 incident the tmux server was gone and the reply
+        path silently re-emitted the prior turn's output via ``--continue``,
+        which looked like the bot was broken / replaying garbage.  A visible
+        notice makes the recovery legible instead of confusing.
+        """
+        cog = self._cog_with_pane(running=False)
+        record = MagicMock()
+        record.session_id = "abc-123"
+        cog.repo.get = AsyncMock(return_value=record)
+        msg = self._make_thread_message()
+
+        await cog._handle_thread_reply(msg)
+
+        sent = [c.args[0] for c in msg.channel.send.call_args_list if c.args]
+        assert any("復元" in s for s in sent), f"no recovery notice sent; got {sent}"
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_notice_when_pane_alive(self) -> None:
+        """Pane alive → normal live continuation; must NOT post a recovery notice."""
+        cog = self._cog_with_pane(running=True)
+        record = MagicMock()
+        record.session_id = "abc-123"
+        cog.repo.get = AsyncMock(return_value=record)
+        msg = self._make_thread_message()
+
+        await cog._handle_thread_reply(msg)
+
+        sent = [c.args[0] for c in msg.channel.send.call_args_list if c.args]
+        assert not any("復元" in s for s in sent), f"unexpected recovery notice: {sent}"
+
+    @pytest.mark.asyncio
     async def test_no_continue_when_session_cleared(self) -> None:
         """/clear invariant (#123 Part 1): session was reset → stay fresh, never --continue."""
         cog = self._cog_with_pane(running=False)
