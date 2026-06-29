@@ -33,6 +33,7 @@ from ..database.repository import SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
+from ..discord_ui.authorization import Authorizer
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
@@ -117,6 +118,13 @@ class ClaudeChatCog(commands.Cog):
         self._thread_retitle = thread_retitle_enabled(thread_retitle)
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
+        # #466: one allowlist predicate shared by message gating (_is_allowed)
+        # and button gating (View.interaction_check). Published on the bot so
+        # cross-cog Views (AutoUpgrade) and the persistent-view restore path
+        # (bot.py) enforce the same allowlist without extra wiring.
+        self._authorizer = Authorizer(allowed_user_ids, allowed_role_name)
+        if getattr(bot, "authorizer", None) is None:
+            bot.authorizer = self._authorizer
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_runners: dict[int, TmuxClaudeRunner] = {}
@@ -158,14 +166,11 @@ class ClaudeChatCog(commands.Cog):
 
         OR logic: allowed_user_ids match OR allowed_role_name match.
         When neither is configured, everyone is allowed.
+
+        Delegates to :class:`Authorizer` so message gating and button gating
+        (View.interaction_check, #466) apply the exact same rule.
         """
-        if self._allowed_user_ids is not None and member.id in self._allowed_user_ids:
-            return True
-        if self._allowed_role_name is not None:
-            if isinstance(member, discord.Member):
-                return any(r.name == self._allowed_role_name for r in member.roles)
-            return False  # DM — no role info
-        return self._allowed_user_ids is None
+        return self._authorizer.is_allowed(member)
 
     def _is_message_authorized(self, message: discord.Message) -> bool:
         """Whether *message* is allowed to drive Claude.
@@ -1568,7 +1573,7 @@ class ClaudeChatCog(commands.Cog):
             with contextlib.suppress(Exception):
                 await self.repo.update_trigger_message(thread.id, user_message.id)
 
-            stop_view = StopView(runner)
+            stop_view = StopView(runner, authorizer=self._authorizer)
             if window_name:
                 stop_msg = await thread.send(
                     f"-# ⏺ Session running (`{window_name}`)",
@@ -1596,6 +1601,7 @@ class ClaudeChatCog(commands.Cog):
                         tmux_manager=tmux_manager,
                         image_paths=image_paths,
                         working_dir=working_dir or None,
+                        authorizer=self._authorizer,
                     )
                 )
             finally:
