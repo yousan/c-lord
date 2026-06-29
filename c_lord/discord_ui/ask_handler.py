@@ -25,6 +25,7 @@ from ..claude.types import AskQuestion
 from ..database.ask_repo import PendingAskRepository
 from .ask_bus import ask_bus as _ask_bus
 from .ask_view import AskView
+from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
 from .embeds import ask_embed
 
@@ -75,6 +76,7 @@ async def bridge_pane_ask(
     question: AskQuestion,
     runner: TmuxClaudeRunner,
     ask_repo: PendingAskRepository | None = None,
+    authorizer: Authorizer | None = None,
 ) -> None:
     """Bridge one in-pane AskUserQuestion menu to Discord buttons (#166).
 
@@ -119,7 +121,7 @@ async def bridge_pane_ask(
             if not truncated:
                 _bridged_context.register(thread.id, question.context, source="pane")
 
-    view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo)
+    view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)
     msg = await thread.send(
         embed=ask_embed(
             question.question, question.header, question.options, question.multi_select
@@ -208,6 +210,7 @@ async def collect_ask_answers(
     questions: list[AskQuestion],
     session_id: str,
     ask_repo: PendingAskRepository | None = None,
+    authorizer: Authorizer | None = None,
 ) -> str | None:
     """Show Discord UI for each question and return the formatted answer string.
 
@@ -246,7 +249,9 @@ async def collect_ask_answers(
         # race between the user clicking and the queue being registered.
         answer_queue = _ask_bus.register(thread.id)
 
-        view = AskView(q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo)
+        view = AskView(
+            q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo, authorizer=authorizer
+        )
         msg = await thread.send(
             embed=ask_embed(q.question, q.header, q.options, q.multi_select), view=view
         )

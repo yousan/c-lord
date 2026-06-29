@@ -16,6 +16,7 @@ from .concurrency import SessionRegistry
 from .coordination.service import CoordinationService
 from .discord_ui.ask_bus import ask_bus
 from .discord_ui.ask_view import AskView
+from .discord_ui.authorization import Authorizer
 from .discord_ui.permission_help import command_error_help
 
 if TYPE_CHECKING:
@@ -74,6 +75,11 @@ class ClaudeDiscordBot(commands.Bot):
         # kills the process on mismatch (guards against booting with an
         # inherited production token — the #322 env-contamination class).
         self.expected_bot_user_id: int | None = expected_bot_user_id
+        # #466: allowlist predicate, published by ClaudeChatCog on load.  Used
+        # here to re-arm restored persistent AskViews and by AutoUpgradeCog so
+        # button clicks enforce the same allowlist as messages.  None until a
+        # cog sets it (⇒ no allowlist ⇒ everyone may click — zero-config).
+        self.authorizer: Authorizer | None = None
 
     async def process_commands(self, message: discord.Message, /) -> None:
         """Override to allow webhook messages to trigger text commands.
@@ -363,6 +369,7 @@ class ClaudeDiscordBot(commands.Bot):
                     q_idx=q_idx,
                     bus=ask_bus,
                     ask_repo=self.ask_repo,
+                    authorizer=self.authorizer,
                 )
                 self.add_view(view)
                 logger.debug(

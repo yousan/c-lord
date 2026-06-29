@@ -22,6 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from ..discord_ui.authorization import AuthorizedViewMixin, Authorizer
 from ..protocols import DrainAware
 from ..thread_settings import resolve_auto_archive_duration
 
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 _STEP_TIMEOUT = 120
 
 
-class UpgradeApprovalView(discord.ui.View):
+class UpgradeApprovalView(AuthorizedViewMixin, discord.ui.View):
     """A Discord View with a single approval button for upgrade/restart gates.
 
     Posts to the parent channel (not the upgrade thread) so users can approve
@@ -56,10 +57,12 @@ class UpgradeApprovalView(discord.ui.View):
         approved_event: asyncio.Event,
         bot_id: int | None = None,
         label: str = "✅ Approve",
+        authorizer: Authorizer | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self._event = approved_event
         self._bot_id = bot_id
+        self._authorizer = authorizer
         # Override the default label set by the decorator
         for child in self.children:
             if isinstance(child, discord.ui.Button):
@@ -458,7 +461,11 @@ class AutoUpgradeCog(commands.Cog):
         parent = getattr(thread, "parent", None)
         if parent is not None:
             bot_id = self.bot.user.id if self.bot.user else None
-            view = UpgradeApprovalView(approved_event=approved, bot_id=bot_id)
+            view = UpgradeApprovalView(
+                approved_event=approved,
+                bot_id=bot_id,
+                authorizer=getattr(self.bot, "authorizer", None),
+            )
             try:
                 channel_msg = await parent.send(
                     f"🔔 **Approval needed** — {text}\n"

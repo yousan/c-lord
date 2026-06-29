@@ -13,6 +13,7 @@ The bridge's security goal is:
 | Threat | Mitigation |
 |--------|-----------|
 | Unauthorized users invoking Claude | `allowed_user_ids` allowlist in `ClaudeChatCog` and `SkillCommandCog` |
+| Unauthorized users clicking decision buttons (Allow/Approve/Stop) | Same allowlist enforced in every View via `AuthorizedViewMixin.interaction_check` (#466) |
 | Shell injection via user prompts | `create_subprocess_exec` (no shell), `--` separator before prompt arg |
 | Flag injection via prompts | `--` separator prevents `-p`, `--resume` etc. in prompt text |
 | Session hijacking via crafted IDs | Strict regex validation: `^[a-f0-9\-]+$` |
@@ -143,6 +144,26 @@ class ClaudeChatCog(commands.Cog):
 - When `allowed_user_ids` is set: only listed Discord user IDs can invoke Claude
 - When `allowed_user_ids` is `None`: all users in the channel can invoke Claude (for trusted private servers)
 - The same check applies to `SkillCommandCog`
+
+#### Interactive buttons enforce the same allowlist (#466)
+
+The allowlist gates not only *messages* but every interactive button c-lord
+posts — tool-permission **Allow/Deny**, plan **Approve/Cancel**, MCP
+elicitation, AskUserQuestion choices, the **Stop** button, and the
+auto-upgrade **Approve** button. Because c-lord threads are *public*, any
+server member who can see the channel could otherwise click these and decide
+on the session owner's behalf (e.g. approve a tool permission → let Claude run
+something).
+
+Each `discord.ui.View` mixes in `AuthorizedViewMixin`
+(`c_lord/discord_ui/authorization.py`), whose `interaction_check` consults the
+same `Authorizer` (built from `allowed_user_ids` / `allowed_role_name`). A
+non-allowlisted click runs no callback and gets an ephemeral "権限がありません"
+notice. When no allowlist is configured, everyone may click (zero-config —
+unchanged). The allowlist is built once in `ClaudeChatCog` and shared with the
+in-session Views (via `RunConfig`), the persistent-view restore path
+(`bot.py`), and `AutoUpgradeCog` — so configuring the allowlist alone protects
+every button, no extra wiring.
 
 ### Channel-Level Authorization
 

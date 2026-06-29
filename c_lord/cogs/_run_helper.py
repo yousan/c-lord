@@ -442,6 +442,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             pending_pane_ask,
             runner,
             ask_repo=config.ask_repo,
+            authorizer=config.authorizer,
         )
     elif not run_errored and not processor.pending_ask and skills_enabled():
         # Issue #67: surface a fallback notice when the skill-reply path was
@@ -471,6 +472,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             processor.pending_ask,
             processor.session_id,
             ask_repo=config.ask_repo,
+            authorizer=config.authorizer,
         )
         if answer_prompt:
             logger.info(

@@ -11,6 +11,7 @@ import logging
 
 import discord
 
+from .authorization import AuthorizedViewMixin, Authorizer
 from .error_reporting import ErrorReportingViewMixin
 
 logger = logging.getLogger(__name__)
@@ -19,13 +20,14 @@ logger = logging.getLogger(__name__)
 PLAN_APPROVAL_TIMEOUT = 300
 
 
-class PlanApprovalView(ErrorReportingViewMixin, discord.ui.View):
+class PlanApprovalView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """Two-button view: ✅ Approve | ❌ Cancel for plan mode."""
 
-    def __init__(self, runner, request_id: str) -> None:
+    def __init__(self, runner, request_id: str, authorizer: Authorizer | None = None) -> None:
         super().__init__(timeout=PLAN_APPROVAL_TIMEOUT)
         self._runner = runner
         self._request_id = request_id
+        self._authorizer = authorizer
 
     @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
