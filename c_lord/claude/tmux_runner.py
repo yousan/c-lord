@@ -1042,6 +1042,12 @@ class TmuxClaudeRunner:
                             )
                             if recovered is not None and recovered.context:
                                 ask_q = recovered
+                                logger.info(
+                                    "Recovered pre-menu context via tall capture "
+                                    "(thread=%d, context_chars=%d)",
+                                    self._thread_id,
+                                    len(recovered.context),
+                                )
                     logger.info(
                         "Interactive menu detected, bridging to Discord "
                         "(thread=%d, context_chars=%d)",
