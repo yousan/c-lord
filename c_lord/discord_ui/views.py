@@ -8,6 +8,7 @@ from typing import Protocol, runtime_checkable
 
 import discord
 
+from .authorization import AuthorizedViewMixin, Authorizer
 from .embeds import stopped_embed
 from .error_reporting import ErrorReportingViewMixin
 
@@ -22,7 +23,7 @@ class Interruptable(Protocol):
     async def interrupt(self) -> None: ...
 
 
-class StopView(ErrorReportingViewMixin, discord.ui.View):
+class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """A ⏹ Stop button attached to the session status message.
 
     Clicking it sends SIGINT to the active Claude runner (graceful interrupt,
@@ -35,9 +36,10 @@ class StopView(ErrorReportingViewMixin, discord.ui.View):
     button at the bottom of the thread (most recently visible position).
     """
 
-    def __init__(self, runner: Interruptable) -> None:
+    def __init__(self, runner: Interruptable, authorizer: Authorizer | None = None) -> None:
         super().__init__(timeout=None)
         self._runner = runner
+        self._authorizer = authorizer
         self._stopped = False
         self._message: discord.Message | None = None
 

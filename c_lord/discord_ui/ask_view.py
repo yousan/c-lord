@@ -29,6 +29,7 @@ import discord
 
 from .ask_bus import AskAnswerBus
 from .ask_bus import ask_bus as _default_ask_bus
+from .authorization import AuthorizedViewMixin, Authorizer
 from .error_reporting import ErrorReportingViewMixin
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ _RESTART_MSG = (
 )
 
 
-class AskView(ErrorReportingViewMixin, discord.ui.View):
+class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """Renders buttons or a select menu for a single AskUserQuestion prompt.
 
     This is a **persistent** view — ``timeout=None``.  Register it with the
@@ -69,8 +70,10 @@ class AskView(ErrorReportingViewMixin, discord.ui.View):
         q_idx: int,
         bus: AskAnswerBus | None = None,
         ask_repo: PendingAskRepository | None = None,
+        authorizer: Authorizer | None = None,
     ) -> None:
         super().__init__(timeout=None)  # persistent — survives bot restarts
+        self._authorizer = authorizer
         self._thread_id = thread_id
         self._bus = bus if bus is not None else _default_ask_bus
         self._ask_repo = ask_repo

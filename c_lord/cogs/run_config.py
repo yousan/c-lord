@@ -19,6 +19,7 @@ from ..database.ask_repo import PendingAskRepository
 from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
+from ..discord_ui.authorization import Authorizer
 from ..discord_ui.status import StatusManager
 
 if TYPE_CHECKING:
@@ -82,6 +83,10 @@ class RunConfig:
     # sessions DB so TranscriptMirrorCog can restart mirrors after a bot
     # restart (CLORD_BRIDGE_MODE=jsonl). None when no session_dir_manager.
     working_dir: str | None = None
+    # #466: allowlist predicate forwarded to interactive Views so button
+    # clicks (permission / plan / elicitation / ask) are gated to the same
+    # allowed users as messages. None ⇒ no allowlist ⇒ everyone may click.
+    authorizer: Authorizer | None = None
 
     # Prevent accidental field mutation — RunConfig is a value object.
     # Use dataclasses.replace() to create modified copies.

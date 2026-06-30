@@ -343,7 +343,7 @@ class EventProcessor:
         # ExitPlanMode does not carry a request_id in the current CLI protocol;
         # we use the session_id as a stable identifier for the inject payload.
         request_id = self._state.session_id or "plan"
-        view = PlanApprovalView(self._config.runner, request_id)
+        view = PlanApprovalView(self._config.runner, request_id, authorizer=self._config.authorizer)
         with contextlib.suppress(Exception):
             await self._config.thread.send(embed=embed, view=view)
         logger.info("Plan approval prompt posted (session=%s)", request_id)
@@ -352,7 +352,9 @@ class EventProcessor:
         """Post permission embed with Allow/Deny buttons."""
         assert event.permission_request is not None
         embed = permission_embed(event.permission_request)
-        view = PermissionView(self._config.runner, event.permission_request)
+        view = PermissionView(
+            self._config.runner, event.permission_request, authorizer=self._config.authorizer
+        )
         with contextlib.suppress(Exception):
             await self._config.thread.send(embed=embed, view=view)
         logger.info(
@@ -381,6 +383,7 @@ class EventProcessor:
             event.pane_ask,
             runner,
             ask_repo=self._config.ask_repo,
+            authorizer=self._config.authorizer,
         )
         logger.info(
             "AskUserQuestion bridged and answered for thread %d",
@@ -393,9 +396,9 @@ class EventProcessor:
         req = event.elicitation
         embed = elicitation_embed(req)
         if req.mode == "url-mode":
-            view = ElicitationUrlView(self._config.runner, req)
+            view = ElicitationUrlView(self._config.runner, req, authorizer=self._config.authorizer)
         else:
-            view = ElicitationFormView(self._config.runner, req)
+            view = ElicitationFormView(self._config.runner, req, authorizer=self._config.authorizer)
         with contextlib.suppress(Exception):
             await self._config.thread.send(embed=embed, view=view)
         logger.info(
