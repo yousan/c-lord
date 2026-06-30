@@ -183,6 +183,20 @@ TUI-scrape leak class). It rides on `AskQuestion.context` and
 menu embed (the embed is wiped on resolution, so the context must be a separate
 message to stay readable).
 
+**Long prose recovery via a transient tall capture (#468).** Claude Code runs as
+a full-screen TUI whose *alternate screen keeps no scrollback*, so a normal
+`capture_pane` only ever returns the visible rows. When the prose is taller than
+the window (default 40 rows), its head scrolls off and `_extract_pane_context`
+recovers nothing (`context_chars=0`) — the failure looked like "short prose works,
+long prose doesn't". The JSONL can't help either: the prose is only flushed there
+*after* the menu resolves. Since Claude redraws its whole conversation from memory
+on `SIGWINCH`, c-lord now does a **transient tall re-capture** when the first
+extraction yields empty context: it briefly grows the window
+(`TmuxSessionManager.capture_pane_tall`), waits for the redraw to settle,
+re-captures, restores the original window size exactly, and re-extracts. The
+recovery only fires on empty context, so menus whose context already extracted are
+untouched (no resize round-trip).
+
 **De-duplication** (`bridged_context`): the CLI eventually flushes the same
 prose to the JSONL, which the mirror would re-post. The two delivery paths
 (pane-bridge, mirror) dedup against each other in an **order-independent** way —
@@ -201,9 +215,14 @@ Either way the prose appears **exactly once**, before the menu.
 - **Free text on the Submit screen is not re-editable from Discord.** The review
   screen is auto-submitted as-is; to change an answer, use `/attach`.
 - **Pre-menu prose extraction is best-effort and fail-closed** (#399): if the
-  block above the menu isn't a clean `●` prose block (tool output, chrome, or
-  the header scrolled off), no context is carried rather than risk leaking
-  chrome. The mirror still delivers it (late) in that case.
+  block above the menu isn't a clean `●` prose block (tool output, chrome), no
+  context is carried rather than risk leaking chrome. The mirror still delivers
+  it (late) in that case.
+- **Prose taller than the transient capture height is still truncated** (#468):
+  the tall re-capture recovers prose up to `capture_pane_tall`'s height
+  (240 rows). Prose longer than that still loses its head and falls back to the
+  late mirror flush — the same degraded mode as before, just with a much higher
+  ceiling.
 
 ## Source map
 
@@ -211,6 +230,7 @@ Either way the prose appears **exactly once**, before the menu.
 |---|---|
 | Parse menu from pane | `c_lord/claude/tmux_runner.py::_parse_ask_from_pane` |
 | Extract pre-menu prose (#399) | `tmux_runner.py::_extract_pane_context` |
+| Recover long prose via transient tall capture (#468) | `c_lord/tmux.py::TmuxSessionManager.capture_pane_tall`, wired in `tmux_runner.py::run` (poll loop) |
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
 | Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |

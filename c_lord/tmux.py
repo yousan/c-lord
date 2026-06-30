@@ -1181,6 +1181,107 @@ class TmuxSessionManager:
 
         return result.stdout
 
+    def capture_pane_tall(
+        self,
+        thread_id: int,
+        tall_rows: int = 240,
+        history_lines: int = 500,
+        settle_timeout: float = 3.0,
+        poll_interval: float = 0.25,
+    ) -> str:
+        """Capture the pane after transiently enlarging the window height (#468).
+
+        Claude Code runs as a full-screen TUI whose alternate screen keeps no
+        scrollback, so :meth:`capture_pane` only ever returns the *visible*
+        rows. When the prose above an AskUserQuestion menu is taller than the
+        window, its head scrolls off and is unrecoverable — and
+        ``_extract_pane_context`` then returns ``""`` (the pre-menu 経緯/推し is
+        lost, so the question reaches Discord with no decision context).
+
+        Claude redraws its whole conversation from memory on SIGWINCH, so
+        briefly growing the window reveals the scrolled-off prose. We grow, wait
+        for the redraw to settle, capture, then restore the original size
+        *exactly* (so an attached human's view is unchanged). Returns raw text
+        (``-e``) like :meth:`capture_pane`; callers normalize. Empty string on
+        failure / no window.
+        """
+        if not self._check_available():
+            return ""
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return ""
+
+        target = f"{self.session_name}:{window}"
+
+        size = _run(
+            ["tmux", "display-message", "-p", "-t", target, "#{window_width} #{window_height}"]
+        )
+        if size.returncode != 0:
+            # Can't read the current size → never risk leaving the window resized.
+            return self.capture_pane(thread_id, history_lines)
+        try:
+            width_s, height_s = size.stdout.split()
+            orig_width, orig_height = int(width_s), int(height_s)
+        except ValueError:
+            return self.capture_pane(thread_id, history_lines)
+
+        if orig_height >= tall_rows:
+            # Already tall enough — a resize round-trip would gain nothing.
+            return self.capture_pane(thread_id, history_lines)
+
+        def _resize(height: int) -> None:
+            _run(
+                [
+                    "tmux",
+                    "resize-window",
+                    "-t",
+                    target,
+                    "-x",
+                    str(orig_width),
+                    "-y",
+                    str(height),
+                ]
+            )
+
+        text = ""
+        try:
+            _resize(tall_rows)
+            # Poll until the redraw settles (two consecutive identical captures).
+            # The menu is idle-waiting for input, so there is no spinner to make
+            # the pane flap — once Claude has re-laid-out the conversation the
+            # capture stops changing. Bounded by ``settle_timeout`` so a slow or
+            # never-settling redraw degrades to a best-effort capture, never a
+            # hang. ``settle_timeout=0`` (tests) does exactly one capture.
+            attempts = max(1, int(settle_timeout / poll_interval))
+            prev: str | None = None
+            for i in range(attempts):
+                result = _run(
+                    [
+                        "tmux",
+                        "capture-pane",
+                        "-e",
+                        "-p",
+                        "-J",
+                        "-t",
+                        target,
+                        "-S",
+                        f"-{history_lines}",
+                    ]
+                )
+                cur = result.stdout if result.returncode == 0 else ""
+                if cur:
+                    text = cur
+                if cur and cur == prev:
+                    break
+                prev = cur
+                if i < attempts - 1:
+                    time.sleep(poll_interval)
+        finally:
+            _resize(orig_height)
+
+        return text
+
     def capture_screen(self, thread_id: int) -> str:
         """Capture the *visible* pane as ANSI text for a screenshot (#285).
 

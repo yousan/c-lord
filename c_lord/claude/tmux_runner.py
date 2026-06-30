@@ -1023,6 +1023,31 @@ class TmuxClaudeRunner:
                 ask_sig = "\n".join(o.label for o in ask_q.options)
                 if ask_stable >= _ASK_ALERT_DELAY and ask_sig != last_bridged_ask:
                     last_bridged_ask = ask_sig
+                    # #468: long pre-menu prose (経緯・推し) scrolls off the
+                    # alternate screen and is lost to the normal capture
+                    # (context_chars=0), so the question would reach Discord with
+                    # no decision context. Claude redraws its whole conversation
+                    # on SIGWINCH, so re-capture at a taller height to recover
+                    # the prose, then the window is restored. Only when context
+                    # is empty (the failing case) — avoids a resize round-trip on
+                    # every menu.
+                    if not ask_q.context and hasattr(self._tmux, "capture_pane_tall"):
+                        tall = await asyncio.to_thread(
+                            self._tmux.capture_pane_tall, self._thread_id
+                        )
+                        if isinstance(tall, str) and tall:
+                            norm_tall = _normalize_capture(tall)
+                            recovered = _parse_ask_from_pane(norm_tall) or _parse_plan_from_pane(
+                                norm_tall
+                            )
+                            if recovered is not None and recovered.context:
+                                ask_q = recovered
+                                logger.info(
+                                    "Recovered pre-menu context via tall capture "
+                                    "(thread=%d, context_chars=%d)",
+                                    self._thread_id,
+                                    len(recovered.context),
+                                )
                     logger.info(
                         "Interactive menu detected, bridging to Discord "
                         "(thread=%d, context_chars=%d)",
