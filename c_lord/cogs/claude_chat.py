@@ -1289,6 +1289,17 @@ class ClaudeChatCog(commands.Cog):
                     pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
                     try_continue = not pane_alive
 
+            # #464 ②: the dead pane is about to be auto-resumed via --continue.
+            # Announce it first, otherwise the resumed turn re-emits the prior
+            # turn's output and reads as the bot replaying garbage / being broken
+            # (exactly what the 2026-06-25 tmux-server-death incident looked like
+            # to the user). A visible notice makes the recovery legible.
+            if try_continue:
+                with contextlib.suppress(discord.HTTPException):
+                    await thread.send(
+                        "🔄 前回のセッションが落ちていたので、これまでの会話を復元して続けます。"
+                    )
+
             # Run as its own task so the per-thread lock is NOT held for the
             # (possibly long, possibly menu-parked) duration of the turn — that
             # held-across-run lock was the #315 deadlock.  Registering the task
