@@ -96,6 +96,30 @@ class TestResyncThread:
         assert respond.await_count >= 1
 
     @pytest.mark.asyncio
+    async def test_thread_no_window_gives_actionable_recovery_hint(self, monkeypatch):
+        """#464 ②-2: /resync on a stopped session must guide the user to restore
+        it (send a message) instead of dead-ending with a bare 'No tmux window
+        found for this thread.' — that bare message is what left the user stuck
+        during the 2026-06-25 incident."""
+        cog, bot, watchdog = _make_cog()
+        thread = _make_thread(12345)
+        monkeypatch.setattr(tss, "_list_all_windows", lambda: [])
+        cog._snapshot_pane = AsyncMock(return_value=b"PNGDATA")
+
+        respond, ack = _io()
+        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+
+        texts = []
+        for a, k in respond.await_args_list:
+            if a:
+                texts.append(a[0])
+            if k.get("content"):
+                texts.append(k["content"])
+        joined = " ".join(t for t in texts if isinstance(t, str))
+        assert "復元" in joined or "メッセージを送" in joined, joined
+        assert joined != "ℹ️ No tmux window found for this thread."
+
+    @pytest.mark.asyncio
     async def test_thread_scope_outside_thread_is_rejected(self):
         cog, bot, watchdog = _make_cog()
         channel = MagicMock(spec=discord.TextChannel)
