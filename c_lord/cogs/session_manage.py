@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 _Responder = Callable[..., Awaitable[None]]
 _Acknowledger = Callable[..., Awaitable[None]]
 
+# #464 ②-2: commands that inspect/reconnect a live session (/tmux-screenshot,
+# /resync) used to dead-end with a bare "No tmux window found for this thread."
+# when the work session was stopped (bot restart / tmux-server death). That left
+# the user stuck with no next step during the 2026-06-25 incident. Point them at
+# the recovery path instead: a normal message auto-resumes the on-disk session
+# via --continue (#270) and announces it (#465), so the session comes back.
+_SESSION_STOPPED_HINT = (
+    "ℹ️ この作業セッションは現在停止しています（tmux ウィンドウがありません）。\n"
+    "**このスレッドにメッセージを送れば自動で復元し、続きから再開します。**"
+)
+
 
 # Model management
 SETTING_CLAUDE_MODEL = "claude_model"
@@ -830,7 +841,7 @@ class SessionManageCog(commands.Cog):
 
         window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
         if window is None:
-            await respond("ℹ️ No tmux window found for this thread.", ephemeral=True)
+            await respond(_SESSION_STOPPED_HINT, ephemeral=True)
             return
 
         ansi = await asyncio.to_thread(tmux_mgr.capture_screen, thread_id)
@@ -970,7 +981,7 @@ class SessionManageCog(commands.Cog):
             await ack()
             session_name, window_name = await self._find_thread_window(thread_id)
             if not session_name or not window_name:
-                await respond("ℹ️ No tmux window found for this thread.", ephemeral=True)
+                await respond(_SESSION_STOPPED_HINT, ephemeral=True)
                 return
             # 1. Re-bridge any stranded TUI menu so its buttons (re)appear.
             await self._rebridge_menu(thread_id, session_name, window_name)

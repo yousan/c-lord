@@ -104,6 +104,8 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 
 It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
 
+If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` and `/tmux-screenshot` no longer dead-end with a bare "No tmux window found." Instead they tell you the session is stopped and that **sending a message auto-restores it** (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
+
 **`/restart-claude`** restarts the Claude *process* for this thread **while keeping the conversation**. Use it when the process is wedged (e.g. a stuck turn silently blocks further input). It kills the active runner and the tmux window so the old/stuck process is gone, but — unlike `/clear` — it does **not** reset the session. Your next message then resumes the same conversation via `--continue`, so the context survives. (The fresh process spawns on that next message through the normal reply path, which is what keeps session setup correct.)
 
 **The three recovery commands, by what they touch:**

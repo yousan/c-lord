@@ -495,6 +495,26 @@ class TestTmuxScreenshot:
         assert sent and sent[-1]["ephemeral"] is True
         assert all(s["file"] is None for s in sent)
 
+    async def test_impl_no_window_gives_actionable_recovery_hint(self):
+        """#464 ②-2: a stopped session must not dead-end with a bare 'No tmux
+        window found for this thread.' — tell the user that sending a message
+        auto-restores it (the #270/#465 dead-pane recovery)."""
+        cog = _make_cog()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 123
+        thread.parent_id = 456
+
+        tmux_mgr = MagicMock()
+        tmux_mgr._find_window_for_thread = MagicMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        msg = sent[-1]["content"] or ""
+        assert "復元" in msg or "メッセージを送" in msg, msg
+        assert msg != "ℹ️ No tmux window found for this thread."
+
     async def test_impl_render_unavailable_sends_ephemeral(self, monkeypatch):
         import c_lord.cogs.session_manage as sm
 
