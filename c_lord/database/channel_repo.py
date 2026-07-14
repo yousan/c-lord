@@ -77,10 +77,20 @@ def derive_session_name(source_repo: str) -> str:
         'https://github.com/org/my-project.git' → 'my-project'
         'git@github.com:org/my-project.git'     → 'my-project'
         '/home/user/repos/my-project'           → 'my-project'
+        'git@github.com:org/NiyaReco.love.git'  → 'NiyaReco_love'
+
+    tmux forbids ``.`` and ``:`` in session names — its target syntax
+    ``session:window.pane`` uses them as separators — and silently rewrites
+    them to ``_`` when a session is created. We mirror that rewrite here so the
+    name c-lord later hands to ``tmux -t`` matches the one tmux actually stored.
+    Otherwise a dotted repo name (e.g. ``NiyaReco.love``) makes every window
+    op target a non-existent session and Claude never starts (#474).
     """
     name = source_repo.rstrip("/").rsplit("/", 1)[-1]
     if name.endswith(".git"):
         name = name[:-4]
+    # Match tmux's own `.`/`:` → `_` substitution (see session_check_name).
+    name = name.replace(".", "_").replace(":", "_")
     return name or "clord"
 
 

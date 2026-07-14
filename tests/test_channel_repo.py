@@ -158,6 +158,20 @@ class TestDeriveSessionName:
     def test_dot_git_only_returns_fallback(self) -> None:
         assert derive_session_name(".git") == "clord"
 
+    def test_dotted_repo_name_sanitized_for_tmux(self) -> None:
+        # tmux forbids '.' in session names and silently rewrites it to '_'
+        # (its target syntax `session:window.pane` uses '.'/':' as separators).
+        # derive_session_name must mirror that rewrite so the name c-lord hands
+        # to `tmux -t` matches the one tmux actually stored — otherwise every
+        # window op for a dotted repo targets a non-existent session and Claude
+        # never starts ("Failed to start Claude in tmux"). (#474)
+        assert derive_session_name("git@github.com:sakana1235/NiyaReco.love.git") == "NiyaReco_love"
+        assert derive_session_name("https://github.com/foo/site.dev") == "site_dev"
+
+    def test_colon_in_name_sanitized_for_tmux(self) -> None:
+        # ':' is likewise illegal in a tmux session name.
+        assert derive_session_name("/home/user/repos/weird:name") == "weird_name"
+
 
 # ===========================================================================
 # normalize_repo_url tests (#88)
