@@ -19,6 +19,10 @@ import re
 import subprocess
 import threading
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
 # unrelated trailing-numeric path components (PIDs, ports, etc.).
@@ -50,6 +54,18 @@ _SORT_TMP_BASE = 9000
 # this default when none is attached) at creation, so they still look right and
 # then stay fixed. Chosen large enough for a usable Claude TUI.
 DEFAULT_MANAGED_WINDOW_SIZE = (160, 40)
+
+# #471: /tmux-screenshot height. capture_screen() only ever sees the *visible*
+# window (DEFAULT_MANAGED_WINDOW_SIZE → 40 rows), so a screenshot cut off the
+# conversation history. Claude Code runs as a full-screen TUI whose alternate
+# screen keeps no scrollback, so the only way to reveal more history is to
+# transiently grow the window before capture (SIGWINCH → Claude redraws more of
+# the conversation), then restore the exact original size — the same trick as
+# capture_pane_tall (#468). This is the default target height in rows; override
+# with CLORD_TMUX_SCREENSHOT_ROWS, or set it to 0 to disable the growth and
+# capture the current window as-is.
+DEFAULT_SCREENSHOT_ROWS = 100
+_SCREENSHOT_ROWS_ENV = "CLORD_TMUX_SCREENSHOT_ROWS"
 
 # Effort levels the ``claude --effort`` flag accepts (commander-validated; it
 # hard-errors on anything else).  ``ultracode``/``auto`` are real effort levels
@@ -102,6 +118,38 @@ def parse_work_number(window_name: str) -> int | None:
     return None
 
 
+def _screenshot_rows_from_env() -> int:
+    """Read the configured tmux-screenshot height (rows) from the environment.
+
+    ``CLORD_TMUX_SCREENSHOT_ROWS`` overrides :data:`DEFAULT_SCREENSHOT_ROWS`. A
+    non-integer or negative value is ignored (falls back to the default) with a
+    warning, so a typo can't silently break the taller screenshot. ``0`` is a
+    valid, explicit "don't grow the window — capture it as-is".
+    """
+    raw = os.getenv(_SCREENSHOT_ROWS_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_SCREENSHOT_ROWS
+    try:
+        rows = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r (not an integer); using default %d",
+            _SCREENSHOT_ROWS_ENV,
+            raw,
+            DEFAULT_SCREENSHOT_ROWS,
+        )
+        return DEFAULT_SCREENSHOT_ROWS
+    if rows < 0:
+        logger.warning(
+            "Negative %s=%r; using default %d",
+            _SCREENSHOT_ROWS_ENV,
+            raw,
+            DEFAULT_SCREENSHOT_ROWS,
+        )
+        return DEFAULT_SCREENSHOT_ROWS
+    return rows
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
     return subprocess.run(
@@ -147,8 +195,19 @@ class TmuxSessionManager:
     window option.
     """
 
-    def __init__(self, session_name: str | None = None, mapping_path: str | None = None) -> None:
+    def __init__(
+        self,
+        session_name: str | None = None,
+        mapping_path: str | None = None,
+        screenshot_rows: int | None = None,
+    ) -> None:
         self.session_name: str = session_name or SESSION_NAME
+        # #471: target height (rows) for /tmux-screenshot. Defaults to the env
+        # (CLORD_TMUX_SCREENSHOT_ROWS) / DEFAULT_SCREENSHOT_ROWS so every manager
+        # picks up the config with no wiring; an explicit arg wins (tests / API).
+        self.screenshot_rows: int = (
+            screenshot_rows if screenshot_rows is not None else _screenshot_rows_from_env()
+        )
         self._available: bool | None = None
         self._next_work_id: int = 1
         self._thread_to_window: dict[int, str] = {}
@@ -1181,54 +1240,45 @@ class TmuxSessionManager:
 
         return result.stdout
 
-    def capture_pane_tall(
+    def _capture_after_grow(
         self,
-        thread_id: int,
-        tall_rows: int = 240,
-        history_lines: int = 500,
+        target: str,
+        capture_args: list[str],
+        tall_rows: int,
+        fallback: Callable[[], str],
         settle_timeout: float = 3.0,
         poll_interval: float = 0.25,
     ) -> str:
-        """Capture the pane after transiently enlarging the window height (#468).
+        """Grow *target* to ``tall_rows``, let the TUI redraw, capture, restore.
 
         Claude Code runs as a full-screen TUI whose alternate screen keeps no
-        scrollback, so :meth:`capture_pane` only ever returns the *visible*
-        rows. When the prose above an AskUserQuestion menu is taller than the
-        window, its head scrolls off and is unrecoverable — and
-        ``_extract_pane_context`` then returns ``""`` (the pre-menu 経緯/推し is
-        lost, so the question reaches Discord with no decision context).
-
-        Claude redraws its whole conversation from memory on SIGWINCH, so
-        briefly growing the window reveals the scrolled-off prose. We grow, wait
-        for the redraw to settle, capture, then restore the original size
-        *exactly* (so an attached human's view is unchanged). Returns raw text
-        (``-e``) like :meth:`capture_pane`; callers normalize. Empty string on
-        failure / no window.
+        scrollback, so a plain capture only ever returns the *visible* rows.
+        Growing the window makes Claude redraw more of its conversation from
+        memory (SIGWINCH). We grow, poll until the redraw settles (two
+        consecutive identical captures — bounded by ``settle_timeout`` so a slow
+        or never-settling redraw degrades to a best-effort frame, never a hang;
+        ``settle_timeout=0`` does exactly one capture), run ``capture_args``,
+        then restore the exact original size in a ``finally`` so an attached
+        human's view is unchanged. ``fallback`` supplies the result when the
+        size can't be read or the window is already ``>= tall_rows`` (a resize
+        round-trip would gain nothing / risk a needless SIGWINCH). Shared by
+        :meth:`capture_pane_tall` (#468) and :meth:`capture_screen` (#471).
         """
-        if not self._check_available():
-            return ""
-
-        window = self._find_window_for_thread(thread_id)
-        if window is None:
-            return ""
-
-        target = f"{self.session_name}:{window}"
-
         size = _run(
             ["tmux", "display-message", "-p", "-t", target, "#{window_width} #{window_height}"]
         )
         if size.returncode != 0:
             # Can't read the current size → never risk leaving the window resized.
-            return self.capture_pane(thread_id, history_lines)
+            return fallback()
         try:
             width_s, height_s = size.stdout.split()
             orig_width, orig_height = int(width_s), int(height_s)
         except ValueError:
-            return self.capture_pane(thread_id, history_lines)
+            return fallback()
 
         if orig_height >= tall_rows:
             # Already tall enough — a resize round-trip would gain nothing.
-            return self.capture_pane(thread_id, history_lines)
+            return fallback()
 
         def _resize(height: int) -> None:
             _run(
@@ -1247,28 +1297,10 @@ class TmuxSessionManager:
         text = ""
         try:
             _resize(tall_rows)
-            # Poll until the redraw settles (two consecutive identical captures).
-            # The menu is idle-waiting for input, so there is no spinner to make
-            # the pane flap — once Claude has re-laid-out the conversation the
-            # capture stops changing. Bounded by ``settle_timeout`` so a slow or
-            # never-settling redraw degrades to a best-effort capture, never a
-            # hang. ``settle_timeout=0`` (tests) does exactly one capture.
             attempts = max(1, int(settle_timeout / poll_interval))
             prev: str | None = None
             for i in range(attempts):
-                result = _run(
-                    [
-                        "tmux",
-                        "capture-pane",
-                        "-e",
-                        "-p",
-                        "-J",
-                        "-t",
-                        target,
-                        "-S",
-                        f"-{history_lines}",
-                    ]
-                )
+                result = _run(capture_args)
                 cur = result.stdout if result.returncode == 0 else ""
                 if cur:
                     text = cur
@@ -1282,13 +1314,82 @@ class TmuxSessionManager:
 
         return text
 
-    def capture_screen(self, thread_id: int) -> str:
-        """Capture the *visible* pane as ANSI text for a screenshot (#285).
+    def capture_pane_tall(
+        self,
+        thread_id: int,
+        tall_rows: int = 240,
+        history_lines: int = 500,
+        settle_timeout: float = 3.0,
+        poll_interval: float = 0.25,
+    ) -> str:
+        """Capture the pane after transiently enlarging the window height (#468).
+
+        Claude Code runs as a full-screen TUI whose alternate screen keeps no
+        scrollback, so :meth:`capture_pane` only ever returns the *visible*
+        rows. When the prose above an AskUserQuestion menu is taller than the
+        window, its head scrolls off and is unrecoverable — and
+        ``_extract_pane_context`` then returns ``""`` (the pre-menu 経緯/推し is
+        lost, so the question reaches Discord with no decision context).
+
+        Claude redraws its whole conversation from memory on SIGWINCH, so
+        briefly growing the window reveals the scrolled-off prose. Delegates the
+        grow → settle → capture → restore round-trip to
+        :meth:`_capture_after_grow`; the menu is idle-waiting for input (no
+        spinner) so the capture settles quickly. Falls back to a scrollback
+        :meth:`capture_pane` when the window is already tall enough. Returns raw
+        text (``-e``) like :meth:`capture_pane`; callers normalize. Empty string
+        on failure / no window.
+        """
+        if not self._check_available():
+            return ""
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return ""
+
+        target = f"{self.session_name}:{window}"
+        capture_args = [
+            "tmux",
+            "capture-pane",
+            "-e",
+            "-p",
+            "-J",
+            "-t",
+            target,
+            "-S",
+            f"-{history_lines}",
+        ]
+        return self._capture_after_grow(
+            target,
+            capture_args,
+            tall_rows,
+            lambda: self.capture_pane(thread_id, history_lines),
+            settle_timeout,
+            poll_interval,
+        )
+
+    def capture_screen(
+        self,
+        thread_id: int,
+        rows: int | None = None,
+        settle_timeout: float = 3.0,
+        poll_interval: float = 0.25,
+    ) -> str:
+        """Capture the pane as ANSI text for a screenshot (#285, #471).
 
         Unlike :meth:`capture_pane` (which pulls scrollback and joins wrapped
-        lines for the event stream), this grabs only the on-screen region with
-        escape sequences preserved (``-e``) and no wrapped-line joining, so the
-        PNG renderer reproduces the exact current screen.
+        lines for the event stream), this grabs the on-screen region with escape
+        sequences preserved (``-e``) and no wrapped-line joining, so the PNG
+        renderer reproduces the exact current screen.
+
+        Because Claude's TUI keeps no scrollback, the only way to show *more*
+        history than the ~40-row live window is to transiently grow the window
+        so Claude redraws more of the conversation (#471); the taller visible
+        screen is then captured and the original size restored exactly (via
+        :meth:`_capture_after_grow`). ``rows`` defaults to
+        :attr:`screenshot_rows` (env ``CLORD_TMUX_SCREENSHOT_ROWS`` /
+        :data:`DEFAULT_SCREENSHOT_ROWS`); ``rows=0`` disables the growth and
+        captures the current window as-is.
 
         Returns the raw ANSI text, or empty string on failure / no window.
         """
@@ -1302,12 +1403,19 @@ class TmuxSessionManager:
         target = f"{self.session_name}:{window}"
         # -e: keep ANSI colors/hyperlinks. No -S (visible region only) and no
         # -J (preserve the exact on-screen layout) — this is a screenshot of
-        # the *current* screen, not a scrollback dump.
-        result = _run(["tmux", "capture-pane", "-e", "-p", "-t", target])
-        if result.returncode != 0:
-            return ""
+        # the *current* screen (after the optional growth), not a scrollback dump.
+        capture_args = ["tmux", "capture-pane", "-e", "-p", "-t", target]
 
-        return result.stdout
+        def _capture_visible() -> str:
+            result = _run(capture_args)
+            return result.stdout if result.returncode == 0 else ""
+
+        target_rows = self.screenshot_rows if rows is None else rows
+        if target_rows and target_rows > 0:
+            return self._capture_after_grow(
+                target, capture_args, target_rows, _capture_visible, settle_timeout, poll_interval
+            )
+        return _capture_visible()
 
     def list_window_tabs(self) -> list[tuple[int, str, bool]]:
         """List this session's windows as ``(index, name, is_active)`` tuples.
