@@ -58,7 +58,7 @@ Bot → Channel (= 1 リポジトリ + 1 tmux session) → Thread (= 1 tmux wind
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
 | `/model show` | 現在の Claude モデルを表示 | どこでも |
-| `/model set <model>` | 新規セッション用のグローバルモデルを変更 | どこでも |
+| `/model set <model>` | 新規セッション用のグローバルモデルを変更。tier エイリアス（`sonnet`/`opus`/`haiku`、各 tier の最新に解決）を選ぶか、任意のモデルID（例 `claude-fable-5`）を直接入力できる（可否は CLI が判定） | どこでも |
 
 選択可能なモデル: `haiku`（高速）、`sonnet`（バランス型、デフォルト）、`opus`（高性能）。
 

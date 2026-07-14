@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -58,12 +59,33 @@ _SESSION_STOPPED_HINT = (
 
 # Model management
 SETTING_CLAUDE_MODEL = "claude_model"
+
+# Tier aliases the Claude CLI resolves to the *latest* model of that tier
+# (``claude --help``: "Provide an alias for the latest model"). Labels are kept
+# version-agnostic on purpose — hardcoding "4.7"/"5" would go stale and mislead,
+# since the alias already tracks the latest (#478).
 _VALID_MODELS = {"haiku", "sonnet", "opus"}
 _MODEL_CHOICES = [
-    app_commands.Choice(name="Haiku 4.5 (fast, cost-effective)", value="haiku"),
-    app_commands.Choice(name="Sonnet 4.6 (balanced, default)", value="sonnet"),
-    app_commands.Choice(name="Opus 4.7 (powerful, deep reasoning)", value="opus"),
+    app_commands.Choice(name="Sonnet — latest balanced (default)", value="sonnet"),
+    app_commands.Choice(name="Opus — most capable, deep reasoning", value="opus"),
+    app_commands.Choice(name="Haiku — fastest, low cost", value="haiku"),
 ]
+
+# A model string is either a tier alias or a full model ID passed straight to the
+# CLI (e.g. ``claude-fable-5``), so tier-external / brand-new models can be
+# selected without a c-lord release (#478). It is interpolated into a tmux
+# ``send-keys`` command (``--model {model}``) — a shell context — so it MUST match
+# this strict allowlist before use: a leading letter then letters/digits/``.-_``,
+# max 64 chars. This blocks spaces, shell metacharacters, and a leading ``-``
+# (flag injection). Whether the model actually *exists* is left to the CLI to
+# decide; c-lord keeps no model registry (security-audit, #478).
+_MODEL_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+
+
+def _is_valid_model_id(model: str) -> bool:
+    """True if ``model`` is a safe, well-formed model string (alias or full ID)."""
+    return bool(_MODEL_ID_RE.fullmatch(model))
+
 
 # Thread auto-archive duration management. Discord only accepts the four values
 # in VALID_DURATIONS (see c_lord/thread_settings.py).
@@ -284,9 +306,12 @@ class SessionManageCog(commands.Cog):
 
     async def _model_set_impl(self, *, model: str, respond: _Responder) -> None:
         """Shared core for /model set and !model-set (#209 follow-up)."""
-        if model not in _VALID_MODELS:
+        model = (model or "").strip()
+        if not _is_valid_model_id(model):
             await respond(
-                f"❌ Unknown model `{model}`. Valid choices: {', '.join(sorted(_VALID_MODELS))}",
+                f"❌ Invalid model `{model}`. Use an alias "
+                f"({'/'.join(sorted(_VALID_MODELS))}) or a model ID like "
+                "`claude-fable-5` (letters, digits, `.` `-` `_`; no spaces).",
                 ephemeral=True,
             )
             return
@@ -307,9 +332,26 @@ class SessionManageCog(commands.Cog):
         )
         await respond(embed=embed)
 
+    async def _model_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for /model set: suggest the tier aliases, and — so any
+        well-formed model ID (e.g. ``claude-fable-5``) can be entered without a
+        c-lord release — surface a "use custom" entry for a typed, well-formed,
+        non-alias value (#478). Fixed ``choices`` would forbid free-form input;
+        autocomplete only *suggests*, so the typed value is still submittable."""
+        typed = (current or "").strip()
+        low = typed.lower()
+        choices = [c for c in _MODEL_CHOICES if not low or low in c.value or low in c.name.lower()]
+        if typed and typed not in _VALID_MODELS and _is_valid_model_id(typed):
+            choices.append(
+                app_commands.Choice(name=f'Use "{typed}" (custom model ID)', value=typed)
+            )
+        return choices[:25]
+
     @model_group.command(name="set", description="Change the global Claude model for new sessions")
-    @app_commands.describe(model="Model to use for all new Claude sessions")
-    @app_commands.choices(model=_MODEL_CHOICES)
+    @app_commands.describe(model="Alias (sonnet/opus/haiku) or a model ID like claude-fable-5")
+    @app_commands.autocomplete(model=_model_autocomplete)
     async def model_set(self, interaction: discord.Interaction, model: str) -> None:
         """Set the global default model stored in settings_repo."""
         respond, _ = self._slash_io(interaction)
@@ -319,7 +361,10 @@ class SessionManageCog(commands.Cog):
     async def model_set_text(self, ctx: commands.Context, model: str | None = None) -> None:
         """Text/mention twin of /model set — webhook-invokable for E2E (#209)."""
         if not model:
-            await ctx.send(f"Usage: `!model-set <{'/'.join(sorted(_VALID_MODELS))}>`")
+            await ctx.send(
+                f"Usage: `!model-set <{'/'.join(sorted(_VALID_MODELS))}|MODEL_ID>` "
+                "(e.g. `claude-fable-5`)"
+            )
             return
         respond, _ = self._ctx_io(ctx)
         await self._model_set_impl(model=model, respond=respond)
