@@ -210,6 +210,27 @@ source:
 
 Either way the prose appears **exactly once**, before the menu.
 
+## Concurrency & stuck-menu safety (#485)
+
+A concurrent second session starting in the same tmux session used to desync the
+menu state and fabricate an answer the user never gave. Three layers now prevent
+it:
+
+1. **The window→thread map is swapped atomically** (`tmux.py::_rebuild_mapping`
+   builds a fresh dict and rebinds it once). The old `clear()`+repopulate left
+   the shared map momentarily empty, so a concurrent capture/send saw the window
+   as missing (`_find_window_for_thread` → `None`).
+2. **An empty pane capture is treated as "unknown", not "menu gone"**
+   (`tmux_runner.py::peek_menu_state` returns `(menu, capture_ok)`; the resolve
+   watcher in `bridge_pane_ask` keeps waiting on an empty capture). Otherwise a
+   momentary capture failure marked a still-open menu "✅ 端末で回答済み".
+3. **A normal reply never selects an open menu** (`tmux.py::send_input` dismisses
+   an open AskUserQuestion/plan menu with Esc *before* typing). Without this, a
+   reply typed into a pane whose menu was still open had its trailing Enter
+   select the highlighted default option — recording a choice the user never
+   made. Last line of defense: even if a menu is somehow stuck open, a message
+   cancels it and is delivered as text, never as a selection.
+
 ## Limitations
 
 - **Free text on the Submit screen is not re-editable from Discord.** The review
