@@ -49,6 +49,11 @@ def _user_tool_result(output: str) -> dict:
     }
 
 
+def _user_str(content: str) -> dict:
+    """A ``user``-role event whose content is a bare string (pane input / marker)."""
+    return {"type": "user", "message": {"role": "user", "content": content}}
+
+
 async def test_mirror_posts_rendered_events_to_sink(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
@@ -324,6 +329,58 @@ async def test_mirror_minimal_attaches_progress_file_when_tools_buffered(
     assert os.path.exists(path) or not os.path.exists(path)  # file may be cleaned up
     # plain sink not called for this assistant_text
     assert not any("done" in c for c in sink_calls)
+
+
+async def test_mirror_minimal_bash_mode_buffered_not_leaked_as_bubble(tmp_path: Path) -> None:
+    """#487: Claude Code bash-mode markers (``! command``) are buffered into the
+    progress file like tool activity — never posted raw as a 👤 thread bubble."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    sink_calls: list[str] = []
+    progress_contents: list[str] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def file_sink(text: str, file_path: str) -> None:
+        # Read inside the callback — the mirror unlinks the temp file afterwards.
+        with open(file_path, encoding="utf-8") as f:
+            progress_contents.append(f.read())
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        file_sink=file_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(jsonl, _user_str("<bash-input> google-chrome --headless</bash-input>"))
+        _write_event(
+            jsonl,
+            _user_str("<bash-stdout></bash-stdout><bash-stderr>Missing X server</bash-stderr>"),
+        )
+        _write_event(jsonl, _assistant_text("done"))
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+
+    # No raw bash-mode tag ever reached the thread bubble (plain sink).
+    assert not any("<bash-input>" in c or "<bash-stdout>" in c for c in sink_calls)
+    # The bash command + output landed in the progress file (the "raw mirror" layer).
+    assert progress_contents, "progress file_sink should have been called"
+    joined = "\n".join(progress_contents)
+    assert "google-chrome --headless" in joined
+    assert "Missing X server" in joined
 
 
 async def test_mirror_minimal_no_file_sink_fallback_to_sink(tmp_path: Path) -> None:
