@@ -89,6 +89,9 @@ _STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸", "-- NORMAL")
 # Pause after pressing ``i`` so the TUI commits the INSERT-mode switch before the
 # literal text arrives (verified on staging: the switch is near-instant).
 _INSERT_SETTLE = 0.15
+# #485: pause after Esc-dismissing a stuck menu so the TUI closes it before the
+# message is typed (otherwise the text could still land on the closing menu).
+_MENU_DISMISS_SETTLE = 0.3
 
 
 def parse_work_number(window_name: str) -> int | None:
@@ -179,6 +182,26 @@ def _pane_in_insert_mode(pane_text: str) -> bool | None:
     if any(anchor in zone for anchor in _STATUS_BAR_ANCHORS):
         return False
     return None
+
+
+def _pane_has_open_menu(pane_text: str) -> bool:
+    """True if the pane shows an open AskUserQuestion / plan-approval menu (#485).
+
+    Used by :meth:`TmuxSessionManager.send_input` to dismiss a stuck menu before
+    typing, so a plain reply can never select the highlighted option. The pane
+    parsers live in ``claude.tmux_runner`` which imports this module, so they are
+    imported lazily here to avoid a circular import.
+    """
+    try:
+        from .claude.tmux_runner import (
+            _normalize_capture,
+            _parse_ask_from_pane,
+            _parse_plan_from_pane,
+        )
+    except ImportError:  # pragma: no cover - defensive
+        return False
+    norm = _normalize_capture(pane_text)
+    return _parse_ask_from_pane(norm) is not None or _parse_plan_from_pane(norm) is not None
 
 
 def _tmux_available() -> bool:
@@ -379,7 +402,15 @@ class TmuxSessionManager:
         Also updates ``_next_work_id`` to be one past the highest existing
         work window number.
         """
-        self._thread_to_window.clear()
+        # #485: build a fresh map locally and swap it in atomically at the end,
+        # instead of clear()+repopulate in place. The old in-place rebuild left
+        # ``_thread_to_window`` momentarily EMPTY, so concurrent callers (capture
+        # and send_keys run in thread executors) read ``None`` for a live window
+        # and mis-fired — dropped keystrokes, and a bridge falsely concluding the
+        # AskUserQuestion menu had resolved. A local build + single assignment
+        # means readers only ever observe a complete map (old or new, never
+        # partial). Reproduced in tests/test_tmux_mapping_race.py.
+        new_map: dict[int, str] = {}
 
         result = _run(
             [
@@ -392,13 +423,14 @@ class TmuxSessionManager:
             ]
         )
         if result.returncode != 0:
+            # Keep the current (complete) mapping rather than wiping it to empty.
             return
 
         # Pass 0: restore from persistent mapping file for windows whose
         # @thread_id was cleared and whose pane has cd'd away (issue #113 Fix-B).
         # Must run after we know the session exists but before the window scan,
         # so that subsequent @thread_id reads in the scan pick up the repaired values.
-        self._load_from_mapping_file()
+        self._load_from_mapping_file(new_map)
 
         max_id = 0
         for line in result.stdout.strip().splitlines():
@@ -451,7 +483,7 @@ class TmuxSessionManager:
                     )
 
             if thread_id is not None:
-                self._thread_to_window[thread_id] = window_name
+                new_map[thread_id] = window_name
 
             # Count both ``w{N}`` and legacy ``work{N}`` windows toward the high
             # watermark so numbering stays monotonic across the prefix rename.
@@ -459,6 +491,9 @@ class TmuxSessionManager:
             if n is not None:
                 max_id = max(max_id, n)
 
+        # Atomic swap (#485): a single rebinding, so no reader ever sees a
+        # partially-built map. dict assignment is atomic under CPython's GIL.
+        self._thread_to_window = new_map
         self._next_work_id = max_id + 1
 
     def _save_mapping(self) -> None:
@@ -475,12 +510,14 @@ class TmuxSessionManager:
         except OSError as exc:
             logger.warning("Failed to save window mapping to %s: %s", self._mapping_path, exc)
 
-    def _load_from_mapping_file(self) -> None:
-        """Restore @thread_id from the persistent mapping file.
+    def _load_from_mapping_file(self, target: dict[int, str]) -> None:
+        """Restore @thread_id from the persistent mapping file into *target*.
 
         Called at the start of _rebuild_mapping to recover mappings that were
         cleared by a tmux restart, even when the pane has cd'd away from the
-        session directory (issue #113 Fix-B).
+        session directory (issue #113 Fix-B). Populates the *target* map the
+        caller is building (#485: rebuild is now build-local-then-swap), not
+        ``self._thread_to_window`` directly.
         No-op when mapping_path is empty (disabled or test mode).
         """
         if not self._mapping_path:
@@ -495,7 +532,7 @@ class TmuxSessionManager:
             if not tid_str.isdigit():
                 continue
             thread_id = int(tid_str)
-            if thread_id in self._thread_to_window:
+            if thread_id in target:
                 continue  # already resolved by @thread_id option or path regex
 
             # Verify the window still exists in the session
@@ -544,7 +581,7 @@ class TmuxSessionManager:
                     str(thread_id),
                 ]
             )
-            self._thread_to_window[thread_id] = window_name
+            target[thread_id] = window_name
             logger.info(
                 "Restored thread_id %d for window %s from mapping file",
                 thread_id,
@@ -1114,15 +1151,33 @@ class TmuxSessionManager:
         from .transcript.formatter import ZWSP_MARKER
         from .transcript.mirror import bridge_mode_jsonl
 
+        # #485: if an interactive menu (AskUserQuestion / plan approval) is open
+        # in the pane, a plain message's trailing Enter would SELECT the
+        # highlighted option — fabricating an answer the user never made (a
+        # normal reply "…提案して" was recorded as the choice "本文を削除"). This
+        # happens when the bridge lost track of the menu (concurrent-session
+        # churn left it open). Dismiss it with Esc first so the message reaches
+        # Claude as text, never a selection. Safe in the normal case too:
+        # replying with text instead of clicking cancels the menu and delivers
+        # the message. Last line of defense — see tests/test_send_input_menu_guard.py.
+        visible = _run(["tmux", "capture-pane", "-p", "-t", target])
+        if visible.returncode == 0 and _pane_has_open_menu(visible.stdout):
+            logger.warning(
+                "send_input: interactive menu open in pane (thread=%d); dismissing "
+                "with Esc so this reply can't select an option (#485)",
+                thread_id,
+            )
+            _run(["tmux", "send-keys", "-t", target, "Escape"])
+            time.sleep(_MENU_DISMISS_SETTLE)
+            visible = _run(["tmux", "capture-pane", "-p", "-t", target])
+
         # #147: Claude's vim-mode input box drops to NORMAL after some
         # operations (e.g. an Escape sent by cancel_menu()).  Sending literal
         # text in NORMAL makes each character a vim command, corrupting the
-        # message.  Capture the current frame and, if not positively in INSERT,
-        # press ``i`` first.  We only correct when the pane is positively NOT in
-        # INSERT (a recognised status bar without ``-- INSERT``); an
-        # indeterminate frame is left untouched so we never inject a stray ``i``
-        # into an already-INSERT box (AC2).
-        visible = _run(["tmux", "capture-pane", "-p", "-t", target])
+        # message.  If not positively in INSERT, press ``i`` first.  We only
+        # correct when the pane is positively NOT in INSERT (a recognised status
+        # bar without ``-- INSERT``); an indeterminate frame is left untouched so
+        # we never inject a stray ``i`` into an already-INSERT box (AC2).
         if visible.returncode == 0 and _pane_in_insert_mode(visible.stdout) is False:
             logger.debug("send_input: pane in NORMAL mode, entering INSERT (thread=%d)", thread_id)
             _run(["tmux", "send-keys", "-t", target, "i"])

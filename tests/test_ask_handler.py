@@ -59,6 +59,11 @@ async def test_tui_resolution_unblocks_bridge(monkeypatch):
     runner = MagicMock()
     # Menu is open on the first peek, then gone (answered/cancelled in the TUI).
     runner.peek_pending_ask = AsyncMock(side_effect=[_question(), None, None, None, None])
+    # #485: _wait_tui_resolved now prefers peek_menu_state -> (menu, capture_ok).
+    # Healthy captures throughout; menu present once, then gone -> resolves.
+    runner.peek_menu_state = AsyncMock(
+        side_effect=[(_question(), True), (None, True), (None, True), (None, True), (None, True)]
+    )
     runner.answer_menu = AsyncMock()
     runner.answer_menu_text = AsyncMock()
     runner.cancel_menu = AsyncMock()
@@ -87,6 +92,7 @@ async def test_discord_click_still_answers_menu(monkeypatch):
     runner = MagicMock()
     # Menu stays open throughout — the click should win the race.
     runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.peek_menu_state = AsyncMock(return_value=(_question(), True))  # #485
     runner.answer_menu = AsyncMock()
     runner.answer_menu_text = AsyncMock()
     runner.cancel_menu = AsyncMock()
@@ -115,6 +121,7 @@ async def test_multi_select_click_toggles_all_options(monkeypatch):
     thread, _msg = _thread(418_0001)
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=_multi_question())
+    runner.peek_menu_state = AsyncMock(return_value=(_multi_question(), True))  # #485
     runner.answer_menu = AsyncMock()
     runner.answer_menu_multi = AsyncMock()
     runner.answer_menu_text = AsyncMock()
@@ -144,6 +151,7 @@ async def test_multi_select_other_freetext_uses_text_path(monkeypatch):
     thread, _msg = _thread(418_0002)
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=_multi_question())
+    runner.peek_menu_state = AsyncMock(return_value=(_multi_question(), True))  # #485
     runner.answer_menu = AsyncMock()
     runner.answer_menu_multi = AsyncMock()
     runner.answer_menu_text = AsyncMock()
@@ -175,6 +183,7 @@ def _resolved_runner() -> MagicMock:
     """Runner whose menu resolves in the TUI right away (fast test exit)."""
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=None)
+    runner.peek_menu_state = AsyncMock(return_value=(None, True))  # #485: healthy, no menu
     runner.answer_menu = AsyncMock()
     runner.answer_menu_text = AsyncMock()
     runner.cancel_menu = AsyncMock()
