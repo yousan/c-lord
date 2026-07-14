@@ -127,6 +127,76 @@ def test_user_input_without_marker_is_mirrored() -> None:
     assert "typed directly in tmux" in out.body
 
 
+# --- Claude Code bash-mode (``! command``) markers (#487) ---
+# The CLI stores a ``!``-prefixed pane command as ``user``-role string events
+# wrapped in ``<bash-input>`` / ``<bash-stdout>`` / ``<bash-stderr>`` tags. These
+# are a bash *execution*, not human-typed input, so they must be classified as
+# tool activity (folded into progress.txt in minimal mode) — never posted raw
+# as a 👤 user_input bubble.
+
+
+def test_user_bash_input_marker_classified_as_tool_use_not_raw() -> None:
+    ev = _user("<bash-input> ls -la</bash-input>")
+    out = render_event(ev)
+    assert out is not None
+    # A bash execution, mirrored like the Bash tool — not a human 👤 input.
+    assert out.kind == "tool_use"
+    assert "Bash" in out.body and "ls -la" in out.body
+    # The raw storage tag must never reach Discord.
+    assert "<bash-input>" not in out.body
+    assert "</bash-input>" not in out.body
+
+
+def test_user_bash_input_real_capture_is_not_leaked_as_user_input() -> None:
+    # Verbatim string captured from a real JSONL transcript (the reported bug).
+    ev = _user(
+        "<bash-input> google-chrome --user-data-dir=$HOME/.clord/discord-evidence-profile "
+        '"https://discord.com/channels/1285582352596209694/1514545583459926117"</bash-input>'
+    )
+    out = render_event(ev)
+    assert out is not None
+    assert out.kind != "user_input"  # regression guard for the leak
+    assert "<bash-input>" not in out.body
+    assert "google-chrome" in out.body
+
+
+def test_user_bash_output_marker_classified_as_tool_result_not_raw() -> None:
+    ev = _user("<bash-stdout>hello stdout</bash-stdout><bash-stderr>some warning</bash-stderr>")
+    out = render_event(ev)
+    assert out is not None
+    assert out.kind == "tool_result"
+    assert "hello stdout" in out.body
+    assert "some warning" in out.body
+    for tag in ("<bash-stdout>", "</bash-stdout>", "<bash-stderr>", "</bash-stderr>"):
+        assert tag not in out.body
+
+
+def test_user_bash_output_stderr_only_real_capture() -> None:
+    ev = _user(
+        "<bash-stdout></bash-stdout><bash-stderr>"
+        "[ERROR:ui/aura/env.cc:257] The platform failed to initialize.  Exiting.\n"
+        "</bash-stderr>"
+    )
+    out = render_event(ev)
+    assert out is not None
+    assert out.kind == "tool_result"
+    assert "failed to initialize" in out.body
+    assert "<bash-stderr>" not in out.body
+
+
+def test_user_bash_output_empty_is_dropped() -> None:
+    ev = _user("<bash-stdout></bash-stdout><bash-stderr></bash-stderr>")
+    assert render_event(ev) is None
+
+
+def test_user_bash_output_no_output_placeholder_is_dropped() -> None:
+    # Claude Code emits this placeholder when a ``!`` command produced no output.
+    ev = _user(
+        "<bash-stdout>(Bash completed with no output)</bash-stdout><bash-stderr></bash-stderr>"
+    )
+    assert render_event(ev) is None
+
+
 def test_framing_event_types_are_skipped() -> None:
     for t in (
         "file-history-snapshot",
