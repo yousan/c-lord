@@ -1592,6 +1592,23 @@ class TmuxClaudeRunner:
         pane = _normalize_capture(raw)
         return _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
 
+    async def peek_menu_state(self) -> tuple[AskQuestion | None, bool]:
+        """Return ``(open menu or None, capture_ok)`` (#485).
+
+        ``capture_ok`` is False when the pane capture came back **empty** — a
+        tmux/window hiccup (e.g. the window mapping momentarily unresolved), NOT
+        evidence the menu closed. The bridge's resolve-watcher must treat that as
+        "unknown, keep waiting" rather than "menu gone"; treating an empty
+        capture as resolution is what let a still-open menu be marked answered,
+        then get selected by the next reply. Distinct from
+        :meth:`peek_pending_ask` (kept as-is for the post-turn recovery caller).
+        """
+        raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        capture_ok = bool(raw.strip())
+        pane = _normalize_capture(raw)
+        menu = _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
+        return menu, capture_ok
+
     @staticmethod
     def _extract_response(pane_text: str) -> str:
         """Extract Claude's latest response from the TUI pane text.

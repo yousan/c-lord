@@ -155,7 +155,17 @@ async def bridge_pane_ask(
         misses = 0
         while misses < _PANE_RESOLVE_MISSES:
             await asyncio.sleep(_PANE_RESOLVE_POLL)
-            if await runner.peek_pending_ask() is None:
+            # #485: an EMPTY pane capture (window mapping momentarily unresolved
+            # under concurrent-session churn) is NOT evidence the menu closed.
+            # Counting it as a miss is what falsely resolved a still-open menu,
+            # which the next reply then selected. Only count a miss when the
+            # capture succeeded and showed no menu; ignore empty captures.
+            if hasattr(runner, "peek_menu_state"):
+                menu, capture_ok = await runner.peek_menu_state()
+                if not capture_ok:
+                    continue  # unknown — keep waiting, do not count as gone
+                misses = misses + 1 if menu is None else 0
+            elif await runner.peek_pending_ask() is None:
                 misses += 1
             else:
                 misses = 0
