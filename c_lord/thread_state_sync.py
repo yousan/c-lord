@@ -658,7 +658,13 @@ class MenuWatchdogLoop:
         )
         self._ask_bridges[thread_id] = asyncio.create_task(
             bridge_pane_ask(
-                channel, question, runner, ask_repo=getattr(self._bot, "ask_repo", None)
+                channel,
+                question,
+                runner,
+                ask_repo=getattr(self._bot, "ask_repo", None),
+                # #480: watchdog bridges a menu no Discord turn is watching
+                # (terminal-driven), so ping the bot owner as the fallback.
+                notify_user_id=getattr(self._bot, "owner_id", None),
             ),
             name=f"menu-watchdog-{thread_id}",
         )

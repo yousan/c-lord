@@ -160,6 +160,9 @@ class SchedulerCog(commands.Cog):
                     prompt=task["prompt"],
                     session_id=None,
                     registry=registry,
+                    # #480: scheduled turns have no human poster — fall back to
+                    # the bot owner so a question-mode pause still pings someone.
+                    notify_user_id=getattr(self.bot, "owner_id", None),
                 )
             )
 

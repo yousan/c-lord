@@ -19,7 +19,9 @@ import pytest
 from c_lord.claude.types import (
     AskOption,
     AskQuestion,
+    ElicitationRequest,
     MessageType,
+    PermissionRequest,
     StreamEvent,
     ToolCategory,
     ToolUseEvent,
@@ -542,3 +544,117 @@ class TestCompactHandling:
         await processor.process(event)
 
         status._reset_stall_timer.assert_called_once()
+
+
+def _mention_contents(thread: MagicMock) -> list[str]:
+    """Return the ``content`` of every thread.send call that carries an @mention.
+
+    A Discord push notification is only guaranteed when the *message content*
+    (not an embed) contains ``<@id>`` — so #480's fix is observable exactly as
+    "at least one send whose content mentions the notify user".
+    """
+    out: list[str] = []
+    for call in thread.send.call_args_list:
+        content = call.kwargs.get("content")
+        if content is None and call.args and isinstance(call.args[0], str):
+            content = call.args[0]
+        if isinstance(content, str) and "<@" in content:
+            out.append(content)
+    return out
+
+
+class TestInteractivePromptNotification:
+    """#480: question-mode prompts must @-mention the turn's poster.
+
+    Permission / plan / elicitation / AskUserQuestion pauses block the turn
+    awaiting the user's input, but historically posted a button embed with no
+    message-content mention — so users whose thread notifications are
+    "mentions only" got no push. These tests assert the notify user is pinged
+    via message content (embeds do not ping).
+    """
+
+    @pytest.mark.asyncio
+    async def test_permission_request_pings_notify_user(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        config = _make_config(thread, runner, notify_user_id=999)
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.SYSTEM,
+                permission_request=PermissionRequest(
+                    request_id="r1", tool_name="Bash", tool_input={"command": "echo hi"}
+                ),
+            )
+        )
+
+        mentions = _mention_contents(thread)
+        assert any("<@999>" in m for m in mentions), (
+            f"permission prompt must ping notify user 999; sends={thread.send.call_args_list}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_plan_approval_pings_notify_user(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        config = _make_config(thread, runner, notify_user_id=999)
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.ASSISTANT,
+                is_plan_approval=True,
+                is_partial=False,
+                text="# Plan\n1. do thing",
+            )
+        )
+
+        mentions = _mention_contents(thread)
+        assert any("<@999>" in m for m in mentions), (
+            f"plan approval must ping notify user 999; sends={thread.send.call_args_list}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_elicitation_pings_notify_user(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        config = _make_config(thread, runner, notify_user_id=999)
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.SYSTEM,
+                elicitation=ElicitationRequest(
+                    request_id="e1",
+                    server_name="srv",
+                    mode="url-mode",
+                    message="Authorize",
+                    url="https://example.com/auth",
+                ),
+            )
+        )
+
+        mentions = _mention_contents(thread)
+        assert any("<@999>" in m for m in mentions), (
+            f"elicitation must ping notify user 999; sends={thread.send.call_args_list}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_mention_when_notify_user_unset(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """With no notify user (e.g. automated turn, owner unset), never ping."""
+        config = _make_config(thread, runner)  # notify_user_id defaults to None
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.SYSTEM,
+                permission_request=PermissionRequest(
+                    request_id="r1", tool_name="Bash", tool_input={"command": "echo hi"}
+                ),
+            )
+        )
+
+        assert _mention_contents(thread) == []

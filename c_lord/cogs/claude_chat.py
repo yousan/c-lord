@@ -1613,6 +1613,10 @@ class ClaudeChatCog(commands.Cog):
                         image_paths=image_paths,
                         working_dir=working_dir or None,
                         authorizer=self._authorizer,
+                        # #480: ping the poster of THIS turn when an interactive
+                        # prompt (permission/plan/elicitation/ask) blocks it —
+                        # a mid-turn pause never reaches the turn-end mention.
+                        notify_user_id=user_message.author.id,
                     )
                 )
             finally:

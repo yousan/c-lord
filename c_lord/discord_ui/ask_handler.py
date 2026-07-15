@@ -71,12 +71,22 @@ def _context_chunks(text: str) -> tuple[list[str], bool]:
     return chunks, truncated
 
 
+def _mention(user_id: int | None) -> str | None:
+    """Message content that pings *user_id*, or None (#480).
+
+    A blocked AskUserQuestion menu only pushes a notification when the *message
+    content* (not the embed) carries ``<@id>``. None ⇒ post without a mention.
+    """
+    return f"<@{user_id}>" if user_id is not None else None
+
+
 async def bridge_pane_ask(
     thread: discord.Thread,
     question: AskQuestion,
     runner: TmuxClaudeRunner,
     ask_repo: PendingAskRepository | None = None,
     authorizer: Authorizer | None = None,
+    notify_user_id: int | None = None,
 ) -> None:
     """Bridge one in-pane AskUserQuestion menu to Discord buttons (#166).
 
@@ -123,6 +133,7 @@ async def bridge_pane_ask(
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)
     msg = await thread.send(
+        content=_mention(notify_user_id),
         embed=ask_embed(
             question.question, question.header, question.options, question.multi_select
         ),
@@ -211,6 +222,7 @@ async def collect_ask_answers(
     session_id: str,
     ask_repo: PendingAskRepository | None = None,
     authorizer: Authorizer | None = None,
+    notify_user_id: int | None = None,
 ) -> str | None:
     """Show Discord UI for each question and return the formatted answer string.
 
@@ -253,7 +265,9 @@ async def collect_ask_answers(
             q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo, authorizer=authorizer
         )
         msg = await thread.send(
-            embed=ask_embed(q.question, q.header, q.options, q.multi_select), view=view
+            content=_mention(notify_user_id),
+            embed=ask_embed(q.question, q.header, q.options, q.multi_select),
+            view=view,
         )
 
         try:
