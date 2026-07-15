@@ -426,6 +426,20 @@ c-lord renders text and emoji separately, picking the first font found in each g
 
 If no color emoji font is present, c-lord falls back to a monochrome emoji font (glyph shapes, no color), then to drawing the raw character. Use the **CBDT** Noto Color Emoji — Pillow renders it with `embedded_color=True`.
 
+> **Seeing empty boxes (□) instead of Japanese text in a screenshot?** That's a
+> missing font on *this* machine/user, not a bug — none of the paths above
+> were found, so rendering fell back to a Latin-only font. It's a per-user,
+> per-host install (`~/.local/share/fonts/`), so it won't carry over to a
+> different Linux user account or a fresh host even if it already works
+> elsewhere.
+>
+> **If you're not comfortable running terminal commands yourself, that's
+> fine — just hand the block below to your AI assistant** (your Claude Code
+> session, or the c-lord Claude thread itself) and ask it to run it for you.
+> It's written to be safe for an AI to execute unattended: it only writes to
+> your own home directory, needs no `sudo`, and touches nothing outside
+> `~/.local/share/fonts/`.
+
 **Quick install for Japanese + color emoji (Linux):**
 ```bash
 mkdir -p ~/.local/share/fonts
