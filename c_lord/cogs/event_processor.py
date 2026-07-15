@@ -126,6 +126,19 @@ class EventProcessor:
     # Public methods
     # ------------------------------------------------------------------
 
+    @property
+    def _notify_mention(self) -> str | None:
+        """Message content that pings the turn's poster, or None (#480).
+
+        Interactive prompts (permission / plan / elicitation / ask) block the
+        turn awaiting input. Discord only pushes reliably when the *message
+        content* carries ``<@id>`` — an embed never pings — so each prompt is
+        posted with this content. None when no notify user is configured, in
+        which case the prompt is posted with no content (unchanged behaviour).
+        """
+        uid = self._config.notify_user_id
+        return f"<@{uid}>" if uid is not None else None
+
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
         if event.message_type == MessageType.SYSTEM:
@@ -345,7 +358,7 @@ class EventProcessor:
         request_id = self._state.session_id or "plan"
         view = PlanApprovalView(self._config.runner, request_id, authorizer=self._config.authorizer)
         with contextlib.suppress(Exception):
-            await self._config.thread.send(embed=embed, view=view)
+            await self._config.thread.send(content=self._notify_mention, embed=embed, view=view)
         logger.info("Plan approval prompt posted (session=%s)", request_id)
 
     async def _handle_permission_request(self, event: StreamEvent) -> None:
@@ -356,7 +369,7 @@ class EventProcessor:
             self._config.runner, event.permission_request, authorizer=self._config.authorizer
         )
         with contextlib.suppress(Exception):
-            await self._config.thread.send(embed=embed, view=view)
+            await self._config.thread.send(content=self._notify_mention, embed=embed, view=view)
         logger.info(
             "Permission request posted: %s (request_id=%s)",
             event.permission_request.tool_name,
@@ -384,6 +397,7 @@ class EventProcessor:
             runner,
             ask_repo=self._config.ask_repo,
             authorizer=self._config.authorizer,
+            notify_user_id=self._config.notify_user_id,
         )
         logger.info(
             "AskUserQuestion bridged and answered for thread %d",
@@ -400,7 +414,7 @@ class EventProcessor:
         else:
             view = ElicitationFormView(self._config.runner, req, authorizer=self._config.authorizer)
         with contextlib.suppress(Exception):
-            await self._config.thread.send(embed=embed, view=view)
+            await self._config.thread.send(content=self._notify_mention, embed=embed, view=view)
         logger.info(
             "Elicitation posted: %s (%s, request_id=%s)",
             req.server_name,
