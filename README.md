@@ -385,7 +385,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
-| `CLORD_BRIDGE_MODE` | Set to `jsonl` to enable TranscriptMirror (tails Claude Code JSONL transcripts and forwards events to Discord threads) | (optional) |
+| `CLORD_BRIDGE_MODE` | `jsonl` (default) tails Claude Code JSONL transcripts and forwards events to Discord threads (TranscriptMirror, #216). Set to `skill` to use the legacy discord-reply skill-push path instead (#53) — Claude must actively call a skill each turn to reach Discord, which is less reliable. | `jsonl` |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
 

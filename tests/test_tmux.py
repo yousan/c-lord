@@ -580,7 +580,10 @@ class TestTmuxSessionManager:
         cmd_str = " ".join(args[3:])
         assert "--effort" not in cmd_str
 
-    def test_send_input_sends_text_and_enter(self) -> None:
+    def test_send_input_sends_text_and_enter(self, monkeypatch) -> None:
+        # #492: pin skill mode — this test checks general send_input mechanics,
+        # not the jsonl ZWSP marker (that has its own dedicated tests below).
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
@@ -646,7 +649,7 @@ class TestTmuxSessionManager:
         import os
 
         prev = os.environ.get("CLORD_BRIDGE_MODE")
-        os.environ.pop("CLORD_BRIDGE_MODE", None)
+        os.environ["CLORD_BRIDGE_MODE"] = "skill"
         try:
             mgr = TmuxSessionManager(mapping_path="")
             mgr._available = True
@@ -664,10 +667,12 @@ class TestTmuxSessionManager:
             text_call = mock_run.call_args_list[2]
             args = text_call[0][0]
             assert "hi" in args
-            # No ZWSP under default mode (backward compat with skill path).
+            # No ZWSP under skill mode.
             assert "​hi" not in args
         finally:
-            if prev is not None:
+            if prev is None:
+                os.environ.pop("CLORD_BRIDGE_MODE", None)
+            else:
                 os.environ["CLORD_BRIDGE_MODE"] = prev
 
     # -- #147: vim NORMAL-mode correction before literal input --------------
@@ -694,8 +699,9 @@ class TestTmuxSessionManager:
         "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
 
-    def test_send_input_enters_insert_when_normal_mode(self) -> None:
+    def test_send_input_enters_insert_when_normal_mode(self, monkeypatch) -> None:
         """NORMAL mode → press ``i`` (key) before sending the literal text (#147)."""
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
@@ -722,8 +728,9 @@ class TestTmuxSessionManager:
         # Then Enter.
         assert "Enter" in calls[4][0][0]
 
-    def test_send_input_no_extra_i_when_insert_mode(self) -> None:
+    def test_send_input_no_extra_i_when_insert_mode(self, monkeypatch) -> None:
         """INSERT mode → no extra ``i`` injected (AC2: no regression / double-i) (#147)."""
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
