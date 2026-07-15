@@ -173,15 +173,16 @@ def remove_injected_skills(session_dir: str | os.PathLike[str]) -> list[str]:
 
 
 def skills_enabled() -> bool:
-    """Return True unless explicitly disabled via env var.
+    """Return True unless disabled via env var or the (default) jsonl bridge mode.
 
-    Skill-based reply has historically been the only path for posting Claude's
-    answers to Discord (#53).  Issue #71 introduces the JSONL transcript
-    mirror as a replacement; while it is enabled (``CLORD_BRIDGE_MODE=jsonl``)
-    the skill must NOT be injected — otherwise every event would be posted
-    twice.  ``USE_SKILL_REPLY=0`` remains available as a manual override.
+    Issue #71 introduced the JSONL transcript mirror; #216 decided it is the
+    real delivery path, and #492 makes that the *default* — skill-based reply
+    (#53) is now a legacy opt-in via ``CLORD_BRIDGE_MODE=skill``. While jsonl
+    mode is active the skill must NOT be injected — otherwise every event
+    would be posted twice. ``USE_SKILL_REPLY=0`` remains available as a manual
+    override to force skill mode off regardless of ``CLORD_BRIDGE_MODE``.
     """
     value = os.getenv("USE_SKILL_REPLY", "").strip().lower()
     if value in {"0", "false", "no", "off"}:
         return False
-    return os.getenv("CLORD_BRIDGE_MODE", "skill").strip().lower() != "jsonl"
+    return os.getenv("CLORD_BRIDGE_MODE", "jsonl").strip().lower() != "jsonl"

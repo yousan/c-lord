@@ -30,7 +30,8 @@ def _row(thread_id: int, working_dir: str | None) -> MagicMock:
 async def test_cog_stays_idle_when_bridge_mode_not_jsonl(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
+    # #492: jsonl is now the default, so "not jsonl" must be pinned explicitly.
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
     bot = MagicMock()
     repo = _make_repo([_row(1, str(tmp_path))])
     cog = TranscriptMirrorCog(bot, session_repo=repo)
@@ -78,7 +79,8 @@ async def test_start_for_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path
 async def test_start_for_noop_when_not_jsonl_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
+    # #492: jsonl is now the default, so "not jsonl" must be pinned explicitly.
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
     bot = MagicMock()
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
     assert cog.start_for(1, str(tmp_path)) is False
