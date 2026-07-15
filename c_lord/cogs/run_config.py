@@ -87,6 +87,14 @@ class RunConfig:
     # clicks (permission / plan / elicitation / ask) are gated to the same
     # allowed users as messages. None ⇒ no allowlist ⇒ everyone may click.
     authorizer: Authorizer | None = None
+    # #480: Discord user to @-mention when an interactive prompt (permission /
+    # plan / elicitation / AskUserQuestion) pauses the turn awaiting input.
+    # A question-mode pause is mid-turn, so it never reaches the turn-end
+    # WAITING_INPUT mention — without a content mention here, users whose
+    # thread notifications are "mentions only" get no push. Set to the turn's
+    # poster (its author); automated/terminal-driven turns fall back to the
+    # bot owner. None ⇒ no one to ping ⇒ posted without a mention (silent-safe).
+    notify_user_id: int | None = None
 
     # Prevent accidental field mutation — RunConfig is a value object.
     # Use dataclasses.replace() to create modified copies.

@@ -16,7 +16,7 @@ import pytest
 from c_lord.claude.types import AskOption, AskQuestion
 from c_lord.discord_ui import ask_handler
 from c_lord.discord_ui.ask_bus import ask_bus
-from c_lord.discord_ui.ask_handler import bridge_pane_ask
+from c_lord.discord_ui.ask_handler import bridge_pane_ask, collect_ask_answers
 
 
 def _question() -> AskQuestion:
@@ -345,3 +345,58 @@ async def test_pane_skips_context_when_mirror_already_posted(monkeypatch):
     assert context_sends == []  # no duplicate context post
     embed_sends = [s for s in sends if "embed" in s.kwargs]
     assert len(embed_sends) == 1  # menu still shown
+
+
+@pytest.mark.asyncio
+async def test_bridge_pane_ask_pings_notify_user(monkeypatch):
+    """#480: the menu embed must carry an @mention in message content so the
+    blocked turn pushes a notification (an embed alone never pings)."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(480_0001)
+
+    await asyncio.wait_for(
+        bridge_pane_ask(thread, _question(), _resolved_runner(), notify_user_id=999),
+        timeout=3.0,
+    )
+
+    embed_sends = [s for s in thread.send.await_args_list if "embed" in s.kwargs]
+    assert embed_sends, "expected the menu embed to be sent"
+    assert any("<@999>" in (s.kwargs.get("content") or "") for s in embed_sends), (
+        f"menu embed must ping notify user 999; sends={thread.send.await_args_list}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_pane_ask_no_mention_when_notify_user_unset(monkeypatch):
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(480_0002)
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), _resolved_runner()), timeout=3.0)
+
+    embed_sends = [s for s in thread.send.await_args_list if "embed" in s.kwargs]
+    assert all(not (s.kwargs.get("content") or "").startswith("<@") for s in embed_sends)
+
+
+@pytest.mark.asyncio
+async def test_collect_ask_answers_pings_notify_user(monkeypatch):
+    """#480: the drain-path AskUserQuestion menu also pings the notify user."""
+    thread, _msg = _thread(480_0003)
+
+    async def _click_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["A1"])
+
+    await asyncio.gather(
+        asyncio.wait_for(
+            collect_ask_answers(thread, [_question()], "sess-1", notify_user_id=999),
+            timeout=3.0,
+        ),
+        _click_soon(),
+    )
+
+    embed_sends = [s for s in thread.send.await_args_list if "embed" in s.kwargs]
+    assert any("<@999>" in (s.kwargs.get("content") or "") for s in embed_sends), (
+        f"collect menu must ping notify user 999; sends={thread.send.await_args_list}"
+    )

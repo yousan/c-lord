@@ -277,6 +277,8 @@ class SkillCommandCog(commands.Cog):
                     registry=self._registry,
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
+                    # #480: ping the invoking user if a question-mode pause blocks the skill.
+                    notify_user_id=user.id,
                 )
             )
             return
@@ -325,6 +327,8 @@ class SkillCommandCog(commands.Cog):
                 registry=self._registry,
                 session_dir_manager=sdm,
                 tmux_manager=tmux,
+                # #480: ping the invoking user if a question-mode pause blocks the skill.
+                notify_user_id=user.id,
             )
         )
 
