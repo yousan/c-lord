@@ -147,9 +147,11 @@ class TestCreateSessionDir:
         mock_run.assert_not_called()
 
     def test_injects_skills_when_flag_enabled(self, tmp_path: Path, monkeypatch) -> None:
-        """Issue #52: with USE_SKILL_REPLY=true the discord-reply SKILL.md
-        is dropped into the freshly cloned session dir."""
+        """Issue #52: with USE_SKILL_REPLY=true (and skill bridge mode active)
+        the discord-reply SKILL.md is dropped into the freshly cloned session
+        dir."""
         monkeypatch.setenv("USE_SKILL_REPLY", "true")
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         base = str(tmp_path / "sessions")
 
         def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
@@ -171,6 +173,7 @@ class TestCreateSessionDir:
         """When the dir already exists, the skill is still (re)written so
         api_url / api_secret stay in sync with current env values."""
         monkeypatch.setenv("USE_SKILL_REPLY", "true")
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         base = str(tmp_path / "sessions")
         existing = Path(base) / "555"
         existing.mkdir(parents=True)
@@ -247,9 +250,12 @@ class TestCreateSessionDir:
         assert not reply.exists(), "output skill must stay disabled"
         assert read.exists(), "discord-read must be injected regardless of bridge mode"
 
-    def test_injects_skills_by_default(self, tmp_path: Path, monkeypatch) -> None:
-        """Issue #53: with the env unset, skill injection is on by default."""
+    def test_no_skill_injection_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        """Issue #216/#492: with everything unset, jsonl bridge mode is the
+        default, so skill injection is OFF by default (superseded #53's
+        "on by default")."""
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
         base = str(tmp_path / "sessions")
 
         def fake_run(args, cwd=None):  # noqa: ANN001
@@ -263,7 +269,27 @@ class TestCreateSessionDir:
             target = mgr.create_session_dir(456)
 
         skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
-        assert skill.exists(), "skill should be injected by default (#53)"
+        assert not skill.exists(), "skill should NOT be injected by default (#492)"
+
+    def test_injects_skills_when_bridge_mode_skill(self, tmp_path: Path, monkeypatch) -> None:
+        """Explicit CLORD_BRIDGE_MODE=skill (the legacy opt-in, #492) still
+        injects the skill even with USE_SKILL_REPLY unset."""
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
+        base = str(tmp_path / "sessions")
+
+        def fake_run(args, cwd=None):  # noqa: ANN001
+            if "clone" in args:
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        with patch("c_lord.session_dir._run", side_effect=fake_run):
+            mgr = SessionDirManager(base_dir=base, source_repo="/repo")
+            Path(base).mkdir(parents=True)
+            target = mgr.create_session_dir(456)
+
+        skill = Path(target) / ".claude" / "skills" / "discord-reply" / "SKILL.md"
+        assert skill.exists(), "skill should be injected under explicit skill bridge mode"
 
     def test_clone_failure_raises(self, tmp_path: Path) -> None:
         base = str(tmp_path / "sessions")

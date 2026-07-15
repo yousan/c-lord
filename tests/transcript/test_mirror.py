@@ -163,8 +163,9 @@ async def test_mirror_sink_errors_do_not_kill_task(tmp_path: Path) -> None:
 
 
 def test_bridge_mode_jsonl_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#492: unset defaults to jsonl (the mode #216 decided is the real path)."""
     monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
-    assert bridge_mode_jsonl() is False
+    assert bridge_mode_jsonl() is True
 
     monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
     assert bridge_mode_jsonl() is False

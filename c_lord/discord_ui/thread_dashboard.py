@@ -172,8 +172,12 @@ class ThreadStatusDashboard:
         # Send mention outside the lock to avoid holding it during an HTTP call
         if should_mention and thread is not None:
             try:
+                # #495: the mention trails the text so the Discord push preview
+                # leads with "Claude has finished…" instead of "@you". A user
+                # mention pings anywhere in the content, so trailing it does not
+                # weaken the notification.
                 await thread.send(
-                    f"🟡 <@{self._owner_id}> Claude has finished — your reply is needed here."
+                    f"🟡 Claude has finished — your reply is needed here. <@{self._owner_id}>"
                 )
             except discord.HTTPException:
                 logger.debug("Failed to send owner mention in thread %d", thread_id, exc_info=True)
