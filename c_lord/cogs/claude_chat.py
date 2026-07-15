@@ -1649,4 +1649,8 @@ class ClaudeChatCog(commands.Cog):
                             ThreadState.WAITING_INPUT,
                             description,
                             thread=thread,
+                            # #481: ping the poster of THIS turn, not a fixed
+                            # owner — so completion reaches whoever is waiting
+                            # (any guild / any authorized user, owner or not).
+                            notify_user_id=user_message.author.id,
                         )

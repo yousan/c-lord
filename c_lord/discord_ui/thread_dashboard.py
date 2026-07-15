@@ -2,13 +2,14 @@
 
 Posts and maintains a pinned embed in the main channel that shows which
 threads are processing automatically vs. waiting for user input.
-When a thread transitions to WAITING_INPUT, the bot mentions the owner
-so Discord's notification system surfaces the request immediately.
+When a thread transitions to WAITING_INPUT, the bot mentions the turn's poster
+(``notify_user_id``, falling back to the configured owner) so Discord's
+notification system surfaces the request immediately (#481).
 
 Why the mention is its OWN message (not appended to Claude's final reply)
 ------------------------------------------------------------------------
 Two different actors post: Claude posts the answer itself via the discord-reply
-skill (``POST /api/reply``), while c-lord posts this ``@owner`` mention when the
+skill (``POST /api/reply``), while c-lord posts this ``@poster`` mention when the
 bot's turn-completion detector fires (WAITING_INPUT). Merging them into one
 message was considered (issue discussion under #365) and is intentionally NOT
 done:
@@ -125,12 +126,13 @@ class ThreadStatusDashboard:
         state: ThreadState,
         description: str,
         thread: discord.Thread | None = None,
+        notify_user_id: int | None = None,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
         When transitioning to ``WAITING_INPUT`` for the first time, the bot
-        posts a reply in *thread* mentioning the owner so Discord surfaces the
-        notification immediately.
+        posts a reply in *thread* mentioning the turn's poster so Discord
+        surfaces the notification immediately.
 
         Parameters
         ----------
@@ -141,7 +143,13 @@ class ThreadStatusDashboard:
         description:
             Short human-readable summary (e.g. the first 100 chars of the prompt).
         thread:
-            The ``discord.Thread`` object, required for owner mentions.
+            The ``discord.Thread`` object, required for mentions.
+        notify_user_id:
+            #481: the Discord user to @-mention on the WAITING_INPUT transition —
+            the poster of this turn. Falls back to the configured ``owner_id``
+            when ``None``. This makes the completion ping reach whoever is
+            actually waiting (any guild, any authorized user) instead of a single
+            fixed owner, and still fires when no owner is configured.
         """
         async with self._lock:
             prev_state = self._threads[thread_id].state if thread_id in self._threads else None
@@ -159,11 +167,13 @@ class ThreadStatusDashboard:
                 if description:
                     info.description = description
 
-            # Mention owner on first WAITING_INPUT transition
+            # #481: mention the turn's poster (notify_user_id); fall back to the
+            # configured owner. Mention on the first WAITING_INPUT transition.
+            mention_id = notify_user_id if notify_user_id is not None else self._owner_id
             should_mention = (
                 state == ThreadState.WAITING_INPUT
                 and prev_state != ThreadState.WAITING_INPUT
-                and self._owner_id is not None
+                and mention_id is not None
                 and thread is not None
             )
 
@@ -177,10 +187,12 @@ class ThreadStatusDashboard:
                 # mention pings anywhere in the content, so trailing it does not
                 # weaken the notification.
                 await thread.send(
-                    f"🟡 Claude has finished — your reply is needed here. <@{self._owner_id}>"
+                    f"🟡 Claude has finished — your reply is needed here. <@{mention_id}>"
                 )
             except discord.HTTPException:
-                logger.debug("Failed to send owner mention in thread %d", thread_id, exc_info=True)
+                logger.debug(
+                    "Failed to send completion mention in thread %d", thread_id, exc_info=True
+                )
 
     async def remove(self, thread_id: int) -> None:
         """Remove a thread from the dashboard and refresh."""
