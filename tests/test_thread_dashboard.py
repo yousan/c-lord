@@ -186,6 +186,51 @@ class TestOwnerMention:
         )
 
     @pytest.mark.asyncio
+    async def test_mentions_notify_user_over_owner(self) -> None:
+        """#481: the completion mention targets the turn's poster, not a fixed owner."""
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(
+            10, ThreadState.WAITING_INPUT, "w", thread=thread, notify_user_id=999
+        )
+
+        sent_text = thread.send.call_args.args[0]
+        assert "<@999>" in sent_text, f"should mention the poster (999); got: {sent_text!r}"
+        assert "<@42>" not in sent_text, f"should NOT mention the fixed owner (42); got: {sent_text!r}"
+
+    @pytest.mark.asyncio
+    async def test_mentions_author_even_when_owner_unset(self) -> None:
+        """#481: with no owner configured (e.g. another guild), the poster is still pinged."""
+        dashboard, _ = _make_dashboard(owner_id=None)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(
+            10, ThreadState.WAITING_INPUT, "w", thread=thread, notify_user_id=999
+        )
+
+        thread.send.assert_called_once()
+        sent_text = thread.send.call_args.args[0]
+        assert "<@999>" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_owner_when_no_notify_user(self) -> None:
+        """Backward compat: without notify_user_id, the owner is still mentioned."""
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        sent_text = thread.send.call_args.args[0]
+        assert "<@42>" in sent_text
+
+    @pytest.mark.asyncio
     async def test_mention_not_sent_if_already_waiting(self) -> None:
         """Repeated WAITING_INPUT transitions should NOT spam mentions."""
         dashboard, _ = _make_dashboard(owner_id=42)
