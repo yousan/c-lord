@@ -218,8 +218,15 @@ class TranscriptMirrorCog(commands.Cog):
                 )
                 return
             runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
+            # #480: this menu was raised outside a Discord-driven turn (terminal /
+            # autonomous continuation), so there is no per-turn poster — fall back
+            # to the bot owner so the blocking question still pings someone.
             await bridge_pane_ask(
-                channel, question, runner, ask_repo=getattr(bot, "ask_repo", None)
+                channel,
+                question,
+                runner,
+                ask_repo=getattr(bot, "ask_repo", None),
+                notify_user_id=getattr(bot, "owner_id", None),
             )
 
         return ask_bridge

@@ -184,6 +184,9 @@ class WebhookTriggerCog(commands.Cog):
                     session_id=None,
                     status=None,
                     registry=self._registry,
+                    # #480: no human poster on a webhook (CI/CD) turn — fall back
+                    # to the bot owner so a question-mode pause still pings someone.
+                    notify_user_id=getattr(self.bot, "owner_id", None),
                 )
             )
 

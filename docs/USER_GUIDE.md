@@ -146,6 +146,13 @@ When Claude proposes a plan, an embed shows the full plan text with **Approve** 
 
 When Claude needs permission to run a tool, an embed shows the tool name and input with **Allow** / **Deny** buttons. Auto-denies after 2 minutes.
 
+### @-mention when your input is needed
+
+All of the prompts above (**AskUserQuestion / plan approval / tool permission / MCP elicitation**) pause the turn mid-flight, blocking on your answer. When one appears, c-lord posts a message that `@`-mentions **the person who sent that turn**, so you get a push notification even if your thread notifications are set to "mentions only" (a Discord embed on its own never pushes).
+
+- The mention targets **whoever posted the turn** (the thread creator for the first prompt, or the replier for a follow-up).
+- For turns with no human poster (webhook / scheduled runs) or turns driven directly in the tmux pane, the mention falls back to `DISCORD_OWNER_ID` when set (no mention when it is unset).
+
 ### TodoWrite Progress
 
 When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated in-place:

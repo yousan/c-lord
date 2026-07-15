@@ -191,8 +191,8 @@ class TestModelSetTextTwin:
     async def test_invalid_model(self):
         cog = _make_cog()
         ctx = _make_ctx()
-        await cog.model_set_text.callback(cog, ctx, model="nope")
-        assert "Unknown model" in ctx.send.call_args.args[0]
+        await cog.model_set_text.callback(cog, ctx, model="no pe")  # space → malformed
+        assert "Invalid" in ctx.send.call_args.args[0]
 
     async def test_valid_model_persisted(self):
         cog = _make_cog()

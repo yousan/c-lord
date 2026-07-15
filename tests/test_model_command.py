@@ -170,15 +170,32 @@ class TestModelSet:
             "haiku" in str(f.value).lower() for f in embed.fields
         )
 
-    async def test_set_invalid_model_rejected(self):
-        """Setting an unsupported model shows an error, does not save."""
+    async def test_set_malformed_model_rejected(self):
+        """A malformed model string (spaces/shell metachars) is rejected, not saved (#478)."""
         cog = _make_cog()
         interaction = _make_channel_interaction()
-        await cog.model_set.callback(cog, interaction, model="gpt-4")
-        # settings_repo.set should NOT be called for invalid models
+        await cog.model_set.callback(cog, interaction, model="bad model")
+        # settings_repo.set should NOT be called for malformed models
         cog.settings_repo.set.assert_not_awaited()
         call_args = interaction.response.send_message.call_args
         assert call_args.kwargs.get("ephemeral") is True
+
+    async def test_set_freeform_model_id_accepted(self):
+        """A well-formed tier-external model ID (e.g. claude-fable-5) is accepted
+        and saved without needing a c-lord release (#478)."""
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        await cog.model_set.callback(cog, interaction, model="claude-fable-5")
+        cog.settings_repo.set.assert_awaited_once_with(SETTING_CLAUDE_MODEL, "claude-fable-5")
+
+    @pytest.mark.parametrize("bad", ["bad model", "-flag", "a;b", "a$(x)", "", "a/b", "x" * 65])
+    async def test_set_rejects_unsafe_model_strings(self, bad: str):
+        """Model strings reach a tmux/shell context via ``--model {model}``, so
+        unsafe ones must be rejected locally before use (security-audit, #478)."""
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        await cog.model_set.callback(cog, interaction, model=bad)
+        cog.settings_repo.set.assert_not_awaited()
 
     async def test_set_model_no_settings_repo(self):
         """When settings_repo is None, set sends ephemeral error."""
@@ -234,10 +251,42 @@ class TestModelCommandGrouping:
         assert "model-show" not in top_level
         assert "model-set" not in top_level
 
-    def test_opus_choice_label_is_current(self):
-        """The Opus choice label must reflect the current model version (Opus 4.7), not 4.6."""
+    def test_choice_labels_are_version_agnostic(self):
+        """Dropdown labels must NOT hardcode a version number (#478): each alias
+        resolves to the *latest* model of its tier, so '4.6'/'4.7'/'5' would lie."""
+        import re as _re
+
         from c_lord.cogs.session_manage import _MODEL_CHOICES
 
-        opus = next(c for c in _MODEL_CHOICES if c.value == "opus")
-        assert "4.6" not in opus.name
-        assert "4.7" in opus.name
+        for c in _MODEL_CHOICES:
+            assert not _re.search(r"\d", c.name), f"version number in label: {c.name!r}"
+
+    def test_dropdown_is_three_tier_aliases(self):
+        """The shipped dropdown stays the three tier aliases; tier-external models
+        (e.g. Fable) are reached via free-form input, not the list (#478)."""
+        from c_lord.cogs.session_manage import _MODEL_CHOICES
+
+        assert {c.value for c in _MODEL_CHOICES} == {"sonnet", "opus", "haiku"}
+
+
+class TestModelAutocomplete:
+    """/model set uses autocomplete (not fixed choices) so any model ID can be
+    typed, while still suggesting the tier aliases (#478)."""
+
+    async def test_suggests_tier_aliases_when_empty(self):
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        choices = await cog._model_autocomplete(interaction, "")
+        assert {"sonnet", "opus", "haiku"} <= {c.value for c in choices}
+
+    async def test_offers_custom_entry_for_wellformed_id(self):
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        choices = await cog._model_autocomplete(interaction, "claude-fable-5")
+        assert any(c.value == "claude-fable-5" for c in choices)
+
+    async def test_no_custom_entry_for_malformed(self):
+        cog = _make_cog()
+        interaction = _make_channel_interaction()
+        choices = await cog._model_autocomplete(interaction, "bad model")
+        assert all(c.value != "bad model" for c in choices)
