@@ -158,6 +158,34 @@ class TestOwnerMention:
         assert "<@42>" in sent_text
 
     @pytest.mark.asyncio
+    async def test_mention_trails_the_text_not_leads(self) -> None:
+        """#495: the @mention must trail the descriptive text.
+
+        A Discord push preview renders the message content in order, so leading
+        with ``<@id>`` shows "@you …" first. Putting the mention at the END makes
+        the preview lead with "Claude has finished — your reply is needed here",
+        which is the useful part. The mention still pings anywhere in content.
+        """
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        sent_text = thread.send.call_args.args[0]
+        mention = "<@42>"
+        assert mention in sent_text, "mention must still be present so it pings"
+        # The descriptive text must come BEFORE the mention.
+        assert sent_text.index("Claude has finished") < sent_text.index(mention), (
+            f"mention should trail the descriptive text; got: {sent_text!r}"
+        )
+        # And the content must not lead with the mention.
+        assert not sent_text.lstrip().startswith(mention), (
+            f"content must not lead with the mention; got: {sent_text!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_mention_not_sent_if_already_waiting(self) -> None:
         """Repeated WAITING_INPUT transitions should NOT spam mentions."""
         dashboard, _ = _make_dashboard(owner_id=42)
