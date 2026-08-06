@@ -399,6 +399,11 @@ class TmuxSessionManager:
         current path (``<session_dir_base>/<thread_id>``) and repair the
         ``@thread_id`` option so future lookups stay cheap. (Issue #69.)
 
+        Several windows can claim the same thread — tmux-resurrect restores a
+        stale window next to the live one, both sitting in the thread's session
+        dir. Such a conflict is resolved in favour of the window actually
+        running Claude, never by list order (issue #501).
+
         Also updates ``_next_work_id`` to be one past the highest existing
         work window number.
         """
@@ -432,7 +437,15 @@ class TmuxSessionManager:
         # so that subsequent @thread_id reads in the scan pick up the repaired values.
         self._load_from_mapping_file(new_map)
 
+        # #501: collect the claims first instead of writing straight into the
+        # map. The old loop assigned as it walked, so when two windows claimed
+        # one thread the LAST in index order silently won — binding the thread
+        # to a dead shell while Claude ran in the first. Gathering first lets
+        # _resolve_claim() pick by evidence (who is running Claude) instead.
         max_id = 0
+        opt_claims: dict[int, list[str]] = {}
+        path_claims: dict[int, list[tuple[str, str]]] = {}
+
         for line in result.stdout.strip().splitlines():
             if not line:
                 continue
@@ -441,8 +454,6 @@ class TmuxSessionManager:
             pane_path = parts[1] if len(parts) > 1 else ""
             if not window_name:
                 continue
-
-            thread_id: int | None = None
 
             opt_result = _run(
                 [
@@ -455,35 +466,12 @@ class TmuxSessionManager:
                     "@thread_id",
                 ]
             )
-            if opt_result.returncode == 0:
-                tid_str = opt_result.stdout.strip()
-                if tid_str.isdigit():
-                    thread_id = int(tid_str)
-
-            if thread_id is None and pane_path:
+            if opt_result.returncode == 0 and opt_result.stdout.strip().isdigit():
+                opt_claims.setdefault(int(opt_result.stdout.strip()), []).append(window_name)
+            elif pane_path:
                 m = _THREAD_ID_FROM_PATH_RE.search(pane_path)
                 if m:
-                    thread_id = int(m.group(1))
-                    _run(
-                        [
-                            "tmux",
-                            "set-option",
-                            "-w",
-                            "-t",
-                            f"{self.session_name}:{window_name}",
-                            "@thread_id",
-                            str(thread_id),
-                        ]
-                    )
-                    logger.info(
-                        "Recovered thread_id %d for window %s from pane path %s",
-                        thread_id,
-                        window_name,
-                        pane_path,
-                    )
-
-            if thread_id is not None:
-                new_map[thread_id] = window_name
+                    path_claims.setdefault(int(m.group(1)), []).append((window_name, pane_path))
 
             # Count both ``w{N}`` and legacy ``work{N}`` windows toward the high
             # watermark so numbering stays monotonic across the prefix rename.
@@ -491,10 +479,113 @@ class TmuxSessionManager:
             if n is not None:
                 max_id = max(max_id, n)
 
+        # Windows that already carry @thread_id win over path-derived guesses.
+        for thread_id, windows in opt_claims.items():
+            new_map[thread_id] = self._resolve_claim(thread_id, windows, clear_losers=True)
+
+        # Path fallback (#69) — only for threads no window has claimed outright,
+        # so a stale pane sitting in the session dir can never steal a thread
+        # from the window that owns the option (#501).
+        for thread_id, matches in path_claims.items():
+            if thread_id in opt_claims:
+                logger.debug(
+                    "Ignoring path-derived claim(s) %s for thread %d — already owned by %s",
+                    ", ".join(w for w, _ in matches),
+                    thread_id,
+                    new_map[thread_id],
+                )
+                continue
+            winner = self._resolve_claim(thread_id, [w for w, _ in matches], clear_losers=False)
+            pane_path = next(p for w, p in matches if w == winner)
+            _run(
+                [
+                    "tmux",
+                    "set-option",
+                    "-w",
+                    "-t",
+                    f"{self.session_name}:{winner}",
+                    "@thread_id",
+                    str(thread_id),
+                ]
+            )
+            new_map[thread_id] = winner
+            logger.info(
+                "Recovered thread_id %d for window %s from pane path %s",
+                thread_id,
+                winner,
+                pane_path,
+            )
+
         # Atomic swap (#485): a single rebinding, so no reader ever sees a
         # partially-built map. dict assignment is atomic under CPython's GIL.
         self._thread_to_window = new_map
         self._next_work_id = max_id + 1
+
+    def _window_has_claude(self, window_name: str) -> bool:
+        """True when *window_name*'s pane runs ``claude`` in the foreground."""
+        result = _run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{self.session_name}:{window_name}",
+                "-F",
+                "#{pane_current_command}",
+            ]
+        )
+        if result.returncode != 0:
+            return False
+        return "claude" in result.stdout.strip().lower()
+
+    def _resolve_claim(self, thread_id: int, windows: list[str], *, clear_losers: bool) -> str:
+        """Pick which of *windows* owns *thread_id* when several claim it.
+
+        Preference order: the window actually running Claude, then the window
+        the map already points at (continuity across rebuilds), then first in
+        list order. Index order alone is *not* a signal — in #501 the dead
+        window happened to sort last and won every rebuild.
+
+        With ``clear_losers`` the runners-up have their ``@thread_id`` unset so
+        the conflict self-heals, but only when Claude positively identified the
+        winner. Without that evidence we leave tmux untouched: a freshly
+        created window whose Claude has not started yet must not be stripped.
+        """
+        if len(windows) == 1:
+            return windows[0]
+
+        live = [w for w in windows if self._window_has_claude(w)]
+        if live:
+            winner, reason = live[0], "running claude"
+        elif (known := self._thread_to_window.get(thread_id)) in windows:
+            winner, reason = known, "already bound"
+        else:
+            winner, reason = windows[0], "first in list order"
+
+        logger.warning(
+            "Duplicate @thread_id %d claimed by %s; binding to %s (%s)",
+            thread_id,
+            ", ".join(windows),
+            winner,
+            reason,
+        )
+
+        if clear_losers and live:
+            for loser in windows:
+                if loser == winner:
+                    continue
+                _run(
+                    [
+                        "tmux",
+                        "set-option",
+                        "-uw",
+                        "-t",
+                        f"{self.session_name}:{loser}",
+                        "@thread_id",
+                    ]
+                )
+                logger.info("Cleared stale @thread_id %d from window %s", thread_id, loser)
+
+        return winner
 
     def _save_mapping(self) -> None:
         """Persist the current thread→window mapping to disk (issue #113).
@@ -1539,22 +1630,7 @@ class TmuxSessionManager:
         if window is None:
             return False
 
-        target = f"{self.session_name}:{window}"
-        result = _run(
-            [
-                "tmux",
-                "list-panes",
-                "-t",
-                target,
-                "-F",
-                "#{pane_current_command}",
-            ]
-        )
-        if result.returncode != 0:
-            return False
-
-        command = result.stdout.strip()
-        return "claude" in command.lower()
+        return self._window_has_claude(window)
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
