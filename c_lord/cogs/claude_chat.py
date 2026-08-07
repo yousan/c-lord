@@ -186,6 +186,11 @@ class ClaudeChatCog(commands.Cog):
         Any other bot is rejected. Human users must satisfy :meth:`_is_allowed`
         (owner / role), so a configured ``DISCORD_OWNER_ID`` restricts access to
         the owner **without** locking out webhooks or trusted bots.
+
+        Applies to every request that has a message behind it: ``on_message``
+        and the text commands ``!clord`` / ``!attach`` (#507). Slash commands
+        have no message and can never be webhook-driven, so they gate on
+        :meth:`_is_allowed` directly.
         """
         if message.webhook_id:
             return True
@@ -543,15 +548,27 @@ class ClaudeChatCog(commands.Cog):
         prompt: str,
         respond: _Responder,
         ack: _Responder,
+        message: discord.Message | None = None,
     ) -> None:
         """Shared core for /clord and !clord (#209 follow-up).
 
         In a thread → continue the session; in a channel → create a new thread
         via ``spawn_session``. ``ack`` defers (slash) or is a no-op (text); after
         it, all replies go through ``respond``'s post-ack path.
+
+        ``message`` is the invoking message for the text command; ``None`` for
+        slash, which has no message behind it. When present, authorization goes
+        through :meth:`_is_message_authorized` so a configured
+        ``DISCORD_OWNER_ID`` does not lock out webhooks / trusted bots (#507).
         """
-        # Authorization check
-        if not self._is_allowed(user):
+        # Authorization check. `!clord` is reachable from webhooks by design —
+        # ClaudeDiscordBot.process_commands lets them through — so a message-
+        # backed invocation must use the same rule as on_message, not the
+        # human-only allowlist (#507).
+        authorized = (
+            self._is_message_authorized(message) if message is not None else self._is_allowed(user)
+        )
+        if not authorized:
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
@@ -675,6 +692,7 @@ class ClaudeChatCog(commands.Cog):
             prompt=prompt,
             respond=respond,
             ack=ack,
+            message=ctx.message,
         )
 
     async def _stop_impl(self, channel: object, respond: _Responder) -> None:
@@ -785,7 +803,9 @@ class ClaudeChatCog(commands.Cog):
             await ctx.send("This command can only be used in a thread.")
             return
 
-        if not self._is_allowed(ctx.author):
+        # Message-backed invocation: webhooks reach text commands by design, so
+        # use the same rule as on_message rather than the human allowlist (#507).
+        if not self._is_message_authorized(ctx.message):
             await ctx.send("You are not authorized to use this command.")
             return
 
