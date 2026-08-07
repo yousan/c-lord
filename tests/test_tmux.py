@@ -308,29 +308,34 @@ class TestTmuxSessionManager:
         """
         mgr = TmuxSessionManager(mapping_path="")
 
-        with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows with pane_current_path
-                MagicMock(
+        # Dispatch on the command rather than a fixed call sequence: #501 moved
+        # the repairing set-option after the scan, and an ordered side_effect
+        # list silently hands a set-option's reply to the next show-option.
+        def fake_run(args: list[str]) -> MagicMock:
+            if "list-windows" in args:
+                return MagicMock(
                     returncode=0,
                     stdout=(
                         "work1\t/home/u/c-lord-sessions/999/1501841644457300038\n"
                         "work2\t/home/u/other\n"
                     ),
-                ),
-                # show-option @thread_id for work1 → option unset (rc=1)
-                MagicMock(returncode=1, stdout=""),
-                # set-option to repair @thread_id for work1
-                MagicMock(returncode=0),
-                # show-option @thread_id for work2 → option unset (rc=1)
-                MagicMock(returncode=1, stdout=""),
-            ]
+                )
+            if "show-option" in args:
+                return MagicMock(returncode=1, stdout="")  # option unset
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
             mgr._rebuild_mapping()
 
         # Recovered from path
         assert mgr._thread_to_window == {1501841644457300038: "work1"}
         # work2 has no recoverable thread_id → not mapped
         assert 2 not in mgr._thread_to_window
+        # …and the option was repaired on work1 so later lookups stay cheap.
+        assert any(
+            "set-option" in call.args[0] and call.args[0][-1] == "1501841644457300038"
+            for call in mock_run.call_args_list
+        )
 
     def test_rebuild_mapping_prefers_option_over_path(self) -> None:
         """When @thread_id is set, it wins over pane_current_path inference."""
