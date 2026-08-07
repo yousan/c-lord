@@ -169,7 +169,24 @@ class TestStopCommand:
         assert embed.color.value == 0xFFA500
 
 
-def _make_thread_ctx(thread_id: int = 12345, parent_id: int | None = None) -> MagicMock:
+def _attach_human_message(ctx: MagicMock, webhook_id: int | None = None) -> MagicMock:
+    """Give *ctx* a realistic ``ctx.message``.
+
+    Without this, ``ctx.message.webhook_id`` and ``ctx.author.bot`` are
+    auto-created (truthy) MagicMocks, so a context meant to represent a *human*
+    would be read as a webhook / bot by ``_is_message_authorized`` (#507).
+    A real human message has ``webhook_id is None`` and ``author.bot is False``.
+    """
+    ctx.author.bot = webhook_id is not None
+    ctx.message = MagicMock(spec=discord.Message)
+    ctx.message.webhook_id = webhook_id
+    ctx.message.author = ctx.author
+    return ctx
+
+
+def _make_thread_ctx(
+    thread_id: int = 12345, parent_id: int | None = None, webhook_id: int | None = None
+) -> MagicMock:
     """Return a mocked commands.Context whose channel is a discord.Thread."""
     ctx = MagicMock()
     thread = MagicMock(spec=discord.Thread)
@@ -179,17 +196,17 @@ def _make_thread_ctx(thread_id: int = 12345, parent_id: int | None = None) -> Ma
     ctx.send = AsyncMock()
     ctx.author = MagicMock()
     ctx.author.id = 1
-    return ctx
+    return _attach_human_message(ctx, webhook_id)
 
 
-def _make_channel_ctx() -> MagicMock:
+def _make_channel_ctx(webhook_id: int | None = None) -> MagicMock:
     """Return a mocked commands.Context whose channel is NOT a thread."""
     ctx = MagicMock()
     ctx.channel = MagicMock(spec=discord.TextChannel)
     ctx.send = AsyncMock()
     ctx.author = MagicMock()
     ctx.author.id = 1
-    return ctx
+    return _attach_human_message(ctx, webhook_id)
 
 
 class TestStopTextCommand:
@@ -1699,6 +1716,7 @@ class TestAttachTextCommand:
         thread_id: int = 12345,
         in_thread: bool = True,
         author_id: int = 42,
+        webhook_id: int | None = None,
     ) -> MagicMock:
         """Return a commands.Context with a thread channel."""
         ctx = MagicMock()
@@ -1711,7 +1729,7 @@ class TestAttachTextCommand:
             ctx.channel = thread
         else:
             ctx.channel = MagicMock(spec=discord.TextChannel)
-        return ctx
+        return _attach_human_message(ctx, webhook_id)
 
     @pytest.mark.asyncio
     async def test_attach_text_success(self) -> None:
