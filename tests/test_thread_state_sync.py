@@ -1176,3 +1176,106 @@ async def test_watchdog_without_repo_is_backward_compatible():
     ):
         await loop.tick()
     bridge.assert_awaited_once()
+
+
+# -- #510: a dead pane's leftover menu is not a live question -----------------
+# After a reboot, tmux-resurrect restores the SHELL plus the saved screen
+# contents ("cat <pane_contents>; exec zsh") — claude itself is not restored.
+# The corpse's screen still parses as an open AskUserQuestion menu, so the
+# watchdog bridged it, waited out the 24h ASK_ANSWER_TIMEOUT, sent Esc into
+# zsh (a no-op), then re-bridged the same corpse — one @mention per day, for
+# a question that had actually been answered two weeks earlier.
+
+
+def _ghost_pane() -> str:
+    """Real capture of the w122 corpse pane (menu text above a zsh prompt)."""
+    return _fixture("ghost_menu_dead_pane.txt")
+
+
+def test_ghost_pane_still_parses_as_a_menu():
+    """The detector is NOT wrong — the corpse is textually indistinguishable.
+
+    Pins why the fix is a liveness check and not a parser change: this pane
+    yields the very menu Discord kept re-posting.
+    """
+    from c_lord.claude.tmux_runner import _normalize_capture, _parse_ask_from_pane
+
+    question = _parse_ask_from_pane(_normalize_capture(_ghost_pane()))
+    assert question is not None
+    assert question.header == "次のアクション"
+    assert [o.label for o in question.options] == [
+        "Issue化して再現条件を記録する",
+        "対策の設計に進む",
+        "まず babeln さんに共有するだけ",
+    ]
+
+
+def _tmux_stub(pane_text: str, foreground: str):
+    """subprocess.run stub: capture-pane → *pane_text*, pane command → *foreground*."""
+
+    def _run(argv, *_a, **_kw):
+        joined = " ".join(argv)
+        stdout = pane_text if "capture-pane" in joined else f"{foreground}\n"
+        return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+    return _run
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_menu_in_pane_where_claude_is_dead():
+    """#510 RED: zsh in the foreground → the menu is a leftover screen, not a question."""
+    loop, bot, thread = _make_loop()
+    pane = _ghost_pane()
+    with (
+        patch.object(thread_state_sync.subprocess, "run", _tmux_stub(pane, "zsh")),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(510, "sess", "w122", pane)
+        await asyncio.sleep(0)
+    bridge.assert_not_awaited()
+    assert 510 not in loop._ask_bridges
+
+
+@pytest.mark.asyncio
+async def test_watchdog_still_bridges_when_claude_is_running():
+    """Guard against over-suppression: a live claude pane must still bridge."""
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    with (
+        patch.object(thread_state_sync.subprocess, "run", _tmux_stub(pane, "claude")),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(511, "sess", "w1", pane)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(511)
+        assert task is not None
+        await task
+    bridge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_bridges_when_foreground_command_is_unknown():
+    """An unreadable pane command is UNKNOWN, never 'dead' (#485 philosophy).
+
+    tmux missing / window mapping momentarily unresolved must not silence a
+    real question — only a positively-read non-claude command suppresses.
+    """
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+
+    def _run(argv, *_a, **_kw):
+        joined = " ".join(argv)
+        if "capture-pane" in joined:
+            return MagicMock(returncode=0, stdout=pane, stderr="")
+        return MagicMock(returncode=1, stdout="", stderr="no such window")
+
+    with (
+        patch.object(thread_state_sync.subprocess, "run", _run),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(512, "sess", "w1", pane)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(512)
+        assert task is not None
+        await task
+    bridge.assert_awaited_once()

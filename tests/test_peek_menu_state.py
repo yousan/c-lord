@@ -45,3 +45,45 @@ async def test_no_menu_healthy_capture_is_gone() -> None:
     menu, capture_ok = await _runner("a normal shell pane, no menu here\n$ ").peek_menu_state()
     assert menu is None
     assert capture_ok is True  # healthy capture, genuinely no menu → resolvable
+
+
+# -- #510: a corpse pane's leftover menu resolves the bridge -------------------
+# An in-flight bridge polls peek_menu_state to notice the menu being answered in
+# the TUI. When claude is gone (reboot + tmux-resurrect restores only the shell
+# and the saved screen), the frozen text kept reading as "still open", so the
+# bridge sat on the 24h timeout instead of winding down.
+
+
+def _runner_with_command(capture_text: str, foreground):
+    tmux = MagicMock()
+    tmux.capture_pane.return_value = capture_text
+    tmux.pane_foreground_command.return_value = foreground
+    return TmuxClaudeRunner(tmux_manager=tmux, thread_id=123)
+
+
+async def test_menu_in_dead_pane_is_gone() -> None:
+    ghost = (_FIX / "ghost_menu_dead_pane.txt").read_text()
+    menu, capture_ok = await _runner_with_command(ghost, "zsh").peek_menu_state()
+    assert menu is None  # claude is not running → the text is a corpse, not a menu
+    assert capture_ok is True  # healthy read → the bridge may wind down
+
+
+async def test_menu_in_live_claude_pane_is_still_open() -> None:
+    menu_text = (_FIX / "ask_context_prose_above_menu.txt").read_text()
+    menu, capture_ok = await _runner_with_command(menu_text, "claude").peek_menu_state()
+    assert menu is not None
+    assert capture_ok is True
+
+
+async def test_unknown_foreground_command_does_not_suppress_menu() -> None:
+    """None = could not read the pane command = UNKNOWN, not 'dead'."""
+    menu_text = (_FIX / "ask_context_prose_above_menu.txt").read_text()
+    menu, capture_ok = await _runner_with_command(menu_text, None).peek_menu_state()
+    assert menu is not None
+    assert capture_ok is True
+
+
+async def test_peek_pending_ask_ignores_dead_pane() -> None:
+    """The post-turn recovery peek must not resurrect a corpse either."""
+    ghost = (_FIX / "ghost_menu_dead_pane.txt").read_text()
+    assert await _runner_with_command(ghost, "zsh").peek_pending_ask() is None

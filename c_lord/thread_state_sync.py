@@ -171,6 +171,36 @@ def _capture_pane_text(
     return result.stdout
 
 
+def _pane_foreground_command(session_name: str, window_name: str) -> str | None:
+    """Foreground command of ``session:window``'s pane, or None when unreadable (#510).
+
+    The sweep already knows the session/window it captured from, so it asks tmux
+    directly rather than routing through a :class:`TmuxSessionManager` (same
+    reason :func:`_capture_pane_text` exists). None means "could not tell",
+    never "dead" — see :func:`c_lord.tmux.pane_command_is_dead`.
+    """
+    if not session_name or not window_name:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{session_name}:{window_name}",
+                "-F",
+                "#{pane_current_command}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _list_all_windows() -> list[dict[str, str]]:
     """Run ``tmux list-windows -a`` and parse the result.
 
@@ -592,6 +622,23 @@ class MenuWatchdogLoop:
         from .claude.tmux_runner import _ASK_SIGNATURE, _PLAN_SIGNATURE
 
         if _ASK_SIGNATURE not in pane_text and _PLAN_SIGNATURE not in pane_text:
+            return
+        # #510: the signature can outlive claude. tmux-resurrect restores a dead
+        # pane's saved screen (``cat <dump>; exec zsh``) after a reboot, so the
+        # menu of a session that ended weeks ago is still on display — and
+        # bridging it pinged the owner once every 24h forever (the bridge's Esc
+        # lands in zsh, so the "menu" never resolves). Ask the process table.
+        from .tmux import pane_command_is_dead
+
+        command = await asyncio.to_thread(_pane_foreground_command, session_name, window_name)
+        if pane_command_is_dead(command):
+            logger.debug(
+                "menu watchdog: ignoring menu in dead pane (thread=%d %s:%s cmd=%s)",
+                thread_id,
+                session_name,
+                window_name,
+                command,
+            )
             return
         # A live turn's poll loop owns menus while it is processing (#166).
         if self._is_processing(thread_id):
