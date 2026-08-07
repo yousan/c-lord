@@ -31,6 +31,10 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1, stdout=""),
                 # _ensure_session → has-session (not exists)
                 MagicMock(returncode=1),
+                # #503: list-sessions → a server is already up, so the session is
+                # created directly. The server-start path has its own coverage in
+                # tests/test_tmux_server_cgroup.py.
+                MagicMock(returncode=0),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
                 # _find_window_by_working_dir → list-windows (no windows yet)
@@ -45,10 +49,14 @@ class TestTmuxSessionManager:
         assert name == "w1"
         assert mgr._thread_to_window[12345] == "w1"
 
+        # Look calls up by subcommand rather than by position: any new probe on
+        # the bootstrap path (e.g. #503's list-sessions) shifts every index and
+        # would break this test for no real reason.
+        def call_with(subcommand: str) -> list[str]:
+            return next(c[0][0] for c in mock_run.call_args_list if subcommand in c[0][0])
+
         # Verify new-window was called correctly
-        new_window_call = mock_run.call_args_list[4]
-        args = new_window_call[0][0]
-        assert "new-window" in args
+        args = call_with("new-window")
         assert SESSION_NAME in args
         assert "w1" in args
         assert "/work/dir" in args
@@ -57,9 +65,7 @@ class TestTmuxSessionManager:
         assert "-d" in args
 
         # Verify set-option was called to store thread_id
-        set_opt_call = mock_run.call_args_list[5]
-        args = set_opt_call[0][0]
-        assert "set-option" in args
+        args = call_with("set-option")
         assert "@thread_id" in args
         assert "12345" in args
 
@@ -387,6 +393,10 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
+                # #503: list-sessions → a server is already up, so the session is
+                # created directly. The server-start path (which goes through
+                # systemd-run) is covered in tests/test_tmux_server_cgroup.py.
+                MagicMock(returncode=0),
                 MagicMock(returncode=0),  # new-session → success
             ]
             assert mgr._ensure_session() is True
@@ -398,6 +408,7 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
+                MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=1, stderr="error"),  # new-session → fail
             ]
             assert mgr._ensure_session() is False
@@ -1000,6 +1011,7 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
+                MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session → success
             ]
             assert mgr._ensure_session() is True
@@ -1009,7 +1021,7 @@ class TestTmuxSessionManager:
         assert "custom" in has_call[0][0]
 
         # Verify new-session used custom name
-        new_call = mock_run.call_args_list[1]
+        new_call = mock_run.call_args_list[2]
         assert "custom" in new_call[0][0]
 
     def test_none_session_name_uses_default(self) -> None:
@@ -1650,6 +1662,7 @@ class TestSortWindows:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild list-windows (no session)
                 MagicMock(returncode=1),  # has-session (no)
+                MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
                 MagicMock(returncode=0),  # new-window

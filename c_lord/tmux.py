@@ -93,6 +93,31 @@ _INSERT_SETTLE = 0.15
 # message is typed (otherwise the text could still land on the closing menu).
 _MENU_DISMISS_SETTLE = 0.3
 
+# #503: c-lord is usually the first process on the host to touch tmux, so the
+# server it starts inherits c-lord's *own* cgroup. systemd kills a unit's whole
+# cgroup on stop, so a plain ``systemctl --user restart c-lord.service`` took
+# every tmux session down with it — including the human's unrelated work
+# sessions (2026-08-07: 16 sessions lost, twice). Routing the server start
+# through ``systemd-run --user`` puts it in its own transient unit instead.
+#
+# Both properties are required. ``tmux new-session -d`` exits as soon as the
+# server has forked, so with systemd's defaults the unit would count as finished
+# and the freshly started server would be reaped along with the cgroup.
+_SYSTEMD_RUN_ARGS = (
+    "systemd-run",
+    "--user",
+    "--quiet",
+    "--description=tmux server (started by c-lord, kept out of its cgroup)",
+    "--property=KillMode=process",
+    "--property=RemainAfterExit=yes",
+    "--",
+)
+# systemd-run returns once the transient unit has *started*; the tmux server
+# inside it needs a moment more before the session answers. Poll instead of
+# sleeping a fixed worst case.
+_SERVER_START_TIMEOUT = 5.0
+_SERVER_START_POLL = 0.1
+
 
 def parse_work_number(window_name: str) -> int | None:
     """Extract the ``N`` from a ``w{N}`` (or legacy ``work{N}``) window name.
@@ -330,16 +355,33 @@ class TmuxSessionManager:
             self._ensure_window_size_manual()  # #403
             return True
 
-        # Create with a temporary first window that will be replaced
-        result = _run(
-            [
-                "tmux",
-                "new-session",
-                "-d",
-                "-s",
-                self.session_name,
-            ]
-        )
+        if not self._create_global_session():
+            return False
+
+        logger.info("Created global tmux session: %s", self.session_name)
+        self._ensure_window_size_manual()  # #403
+        return True
+
+    def _create_global_session(self) -> bool:
+        """Create the global session with a temporary first window.
+
+        When no tmux server is running yet, *we* are about to start one — and a
+        server started as our child inherits our cgroup, so stopping c-lord's
+        systemd unit would kill every tmux session on the host. Launch it in its
+        own transient unit instead (#503). Once a server exists this does not
+        apply: the new session is created by that server, in *its* cgroup.
+        """
+        new_session = ["tmux", "new-session", "-d", "-s", self.session_name]
+
+        # Short-circuits to the plain path when a server is already up. If the
+        # detached start fails (no systemd — container / CI — or the unit did not
+        # come up) we fall through deliberately: a session in the wrong cgroup
+        # still beats no session, since the thread would otherwise stall with no
+        # reply at all.
+        if not self._tmux_server_running() and self._start_server_detached(new_session):
+            return True
+
+        result = _run(new_session)
         if result.returncode != 0:
             logger.warning(
                 "Failed to create tmux session %s: %s",
@@ -347,10 +389,39 @@ class TmuxSessionManager:
                 result.stderr.strip(),
             )
             return False
-
-        logger.info("Created global tmux session: %s", self.session_name)
-        self._ensure_window_size_manual()  # #403
         return True
+
+    @staticmethod
+    def _tmux_server_running() -> bool:
+        """True when a tmux server is already accepting connections."""
+        return _run(["tmux", "list-sessions"]).returncode == 0
+
+    def _start_server_detached(self, new_session: list[str]) -> bool:
+        """Start the tmux server outside our own cgroup via systemd-run (#503).
+
+        Returns True only once the session actually answers, so a systemd-run
+        that starts the unit but whose tmux then dies is reported as failure and
+        the caller can fall back.
+        """
+        result = _run([*_SYSTEMD_RUN_ARGS, *new_session])
+        if result.returncode == 0:
+            deadline = time.monotonic() + _SERVER_START_TIMEOUT
+            while time.monotonic() < deadline:
+                if _run(["tmux", "has-session", "-t", self.session_name]).returncode == 0:
+                    logger.info(
+                        "Started tmux server in its own systemd unit — a c-lord "
+                        "restart will no longer kill tmux sessions (#503)"
+                    )
+                    return True
+                time.sleep(_SERVER_START_POLL)
+
+        logger.warning(
+            "Could not start the tmux server in its own systemd unit (%s); falling "
+            "back to starting it in c-lord's cgroup — restarting c-lord will kill "
+            "every tmux session on this host (#503)",
+            result.stderr.strip() or f"exit {result.returncode}",
+        )
+        return False
 
     def _find_window_for_thread(self, thread_id: int) -> str | None:
         """Find the window name for a thread by checking ``@thread_id`` options.
