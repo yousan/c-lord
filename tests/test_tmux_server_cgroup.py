@@ -88,6 +88,46 @@ def test_server_start_is_placed_in_its_own_systemd_unit() -> None:
     assert systemd_call[-5:] == ["tmux", "new-session", "-d", "-s", "clord"]
 
 
+def test_socket_selecting_env_is_forwarded_into_the_unit() -> None:
+    """systemd-run does not inherit our env — TMUX_TMPDIR must be passed through.
+
+    Regression for a gap caught on staging: without this the unit started a
+    server on the *default* socket, died with "duplicate session", and the
+    readiness check on the intended socket timed out into the fallback — so the
+    server silently landed in c-lord's cgroup after all.
+    """
+    fake = _Tmux(server_running=False)
+
+    with (
+        patch("c_lord.tmux._run", side_effect=fake),
+        patch.dict("os.environ", {"TMUX_TMPDIR": "/tmp/isolated", "PATH": "/custom/bin"}),
+    ):
+        mgr = _mgr()
+        assert mgr._ensure_session() is True
+
+    systemd_call = next(c for c in fake.calls if c[0] == "systemd-run")
+    assert "--setenv=TMUX_TMPDIR=/tmp/isolated" in systemd_call
+    assert "--setenv=PATH=/custom/bin" in systemd_call
+    # Forwarded env must sit before the `--` separator, or systemd-run treats it
+    # as part of the command line.
+    assert systemd_call.index("--setenv=TMUX_TMPDIR=/tmp/isolated") < systemd_call.index("--")
+
+
+def test_unset_env_is_not_forwarded_as_empty() -> None:
+    """An unset variable must be omitted, not passed as VAR= (which clears it)."""
+    fake = _Tmux(server_running=False)
+
+    with (
+        patch("c_lord.tmux._run", side_effect=fake),
+        patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True),
+    ):
+        mgr = _mgr()
+        assert mgr._ensure_session() is True
+
+    systemd_call = next(c for c in fake.calls if c[0] == "systemd-run")
+    assert not any(a.startswith("--setenv=TMUX_TMPDIR") for a in systemd_call)
+
+
 def test_existing_server_creates_the_session_directly() -> None:
     """A server is already up: no transient unit, just talk to it."""
     fake = _Tmux(server_running=True)

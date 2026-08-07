@@ -110,8 +110,18 @@ _SYSTEMD_RUN_ARGS = (
     "--description=tmux server (started by c-lord, kept out of its cgroup)",
     "--property=KillMode=process",
     "--property=RemainAfterExit=yes",
-    "--",
+    # Unload the unit if it fails, so a bad start does not leave a "failed"
+    # entry behind forever. A successful start stays active (RemainAfterExit)
+    # and is therefore kept.
+    "--collect",
 )
+# systemd-run does NOT inherit our environment — the transient unit is started
+# by the systemd user manager and gets *its* environment. Anything that decides
+# which tmux server we end up talking to has to be forwarded explicitly, or the
+# unit quietly starts a server somewhere else and our readiness check times out.
+# Caught on staging: with TMUX_TMPDIR dropped, the unit hit the default socket
+# and died with "duplicate session" while we waited on the isolated one.
+_SYSTEMD_RUN_FORWARDED_ENV = ("TMUX_TMPDIR", "PATH")
 # systemd-run returns once the transient unit has *started*; the tmux server
 # inside it needs a moment more before the session answers. Poll instead of
 # sleeping a fixed worst case.
@@ -403,7 +413,12 @@ class TmuxSessionManager:
         that starts the unit but whose tmux then dies is reported as failure and
         the caller can fall back.
         """
-        result = _run([*_SYSTEMD_RUN_ARGS, *new_session])
+        forwarded = [
+            f"--setenv={name}={os.environ[name]}"
+            for name in _SYSTEMD_RUN_FORWARDED_ENV
+            if os.environ.get(name)
+        ]
+        result = _run([*_SYSTEMD_RUN_ARGS, *forwarded, "--", *new_session])
         if result.returncode == 0:
             deadline = time.monotonic() + _SERVER_START_TIMEOUT
             while time.monotonic() < deadline:
