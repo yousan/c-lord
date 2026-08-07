@@ -239,6 +239,21 @@ def _pane_has_open_menu(pane_text: str) -> bool:
     return _parse_ask_from_pane(norm) is not None or _parse_plan_from_pane(norm) is not None
 
 
+def pane_command_is_dead(command: object) -> bool:
+    """True only when *command* positively shows the pane is NOT running claude (#510).
+
+    A pane whose foreground process is a shell can still *show* an open menu:
+    tmux-resurrect restores the saved screen contents (``cat <dump>; exec zsh``)
+    without restoring claude, so a reboot leaves a corpse that parses exactly
+    like a live AskUserQuestion. Detecting that needs the process, not the text.
+
+    Anything unreadable (None, empty, a non-str from a mock/stub) is treated as
+    UNKNOWN → False, never "dead": a tmux hiccup must not silence a real
+    question. Same asymmetry as the empty-capture rule in #485.
+    """
+    return isinstance(command, str) and bool(command.strip()) and "claude" not in command.lower()
+
+
 def _tmux_available() -> bool:
     """Return True if tmux is installed and accessible."""
     result = _run(["tmux", "-V"])
@@ -1717,6 +1732,35 @@ class TmuxSessionManager:
             return False
 
         return self._window_has_claude(window)
+
+    def pane_foreground_command(self, thread_id: int) -> str | None:
+        """Foreground command of *thread_id*'s pane, or None when unreadable (#510).
+
+        Distinct from :meth:`is_claude_running`, which folds "no window" and
+        "tmux unavailable" into False.  Callers that suppress behaviour on a
+        dead pane need to tell *not claude* apart from *don't know*: pair this
+        with :func:`pane_command_is_dead`.
+        """
+        if not self._check_available():
+            return None
+
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return None
+
+        result = _run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{self.session_name}:{window}",
+                "-F",
+                "#{pane_current_command}",
+            ]
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
 
     # ── Cleanup ──────────────────────────────────────────────────────
 

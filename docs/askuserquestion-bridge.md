@@ -231,6 +231,32 @@ it:
    made. Last line of defense: even if a menu is somehow stuck open, a message
    cancels it and is delivered as text, never as a selection.
 
+## A menu only counts while claude is alive (#510)
+
+Pane text outlives the process that drew it. When claude exits — a crash, a
+`/exit`, or a machine reboot — its last screen stays on display, and
+tmux-resurrect will even restore that screen verbatim into a fresh shell
+(`cat <pane_dump>; exec zsh`) the next time the tmux server starts. Such a pane
+parses as a perfectly valid open AskUserQuestion.
+
+So **every menu peek asks the process table before trusting the text**:
+
+- `tmux.py::TmuxSessionManager.pane_foreground_command` reads
+  `#{pane_current_command}`, returning `None` when it cannot be read.
+- `tmux.py::pane_command_is_dead` turns that into a decision: dead **only** when
+  a command was positively read and it is not claude. Unreadable is *unknown*,
+  never dead — the same asymmetry as the empty-capture rule above, so a tmux
+  hiccup can never silence a real question.
+- The watchdog (`thread_state_sync.py::_maybe_bridge_open_menu`) skips dead
+  panes, and the resolve-watcher's peeks (`tmux_runner.py::peek_menu_state` /
+  `peek_pending_ask`) report "no menu" for them, so a bridge that is already
+  waiting winds down within seconds.
+
+Without this, a corpse pane was re-bridged forever: the bridge pinged the owner,
+waited out the 24 h `ASK_ANSWER_TIMEOUT`, sent its cancelling Esc into a shell
+(a no-op, so the "menu" never went away), and the watchdog bridged the same dead
+question again — one `@mention` per day for a question answered weeks earlier.
+
 ## Limitations
 
 - **Free text on the Submit screen is not re-editable from Discord.** The review
@@ -253,6 +279,7 @@ it:
 | Extract pre-menu prose (#399) | `tmux_runner.py::_extract_pane_context` |
 | Recover long prose via transient tall capture (#468) | `c_lord/tmux.py::TmuxSessionManager.capture_pane_tall`, wired in `tmux_runner.py::run` (poll loop) |
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
+| Ignore menus in a pane whose claude has exited (#510) | `c_lord/tmux.py::pane_command_is_dead`, `TmuxSessionManager.pane_foreground_command`, `thread_state_sync.py::_maybe_bridge_open_menu`, `tmux_runner.py::peek_menu_state` |
 | Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |

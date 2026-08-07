@@ -16,7 +16,7 @@ import logging
 import re
 from collections.abc import AsyncGenerator
 
-from ..tmux import TmuxSessionManager
+from ..tmux import TmuxSessionManager, pane_command_is_dead
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import AskOption, AskQuestion, MessageType, StreamEvent
 
@@ -1588,9 +1588,24 @@ class TmuxClaudeRunner:
         Recovers both AskUserQuestion and plan-approval (#251) menus, which share
         the pane_ask bridge.
         """
+        if await self._pane_is_dead():
+            return None
         raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
         pane = _normalize_capture(raw)
         return _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
+
+    async def _pane_is_dead(self) -> bool:
+        """True when the pane's foreground process is positively not claude (#510).
+
+        A menu drawn by a claude that has since exited stays on screen forever —
+        tmux-resurrect even restores it verbatim after a reboot. Text alone
+        cannot tell that apart from a live question, so every menu peek asks the
+        process table first. Unreadable ⇒ False (unknown, not dead).
+        """
+        getter = getattr(self._tmux, "pane_foreground_command", None)
+        if not callable(getter):  # pragma: no cover - legacy/stub managers
+            return False
+        return pane_command_is_dead(await asyncio.to_thread(getter, self._thread_id))
 
     async def peek_menu_state(self) -> tuple[AskQuestion | None, bool]:
         """Return ``(open menu or None, capture_ok)`` (#485).
@@ -1602,7 +1617,14 @@ class TmuxClaudeRunner:
         capture as resolution is what let a still-open menu be marked answered,
         then get selected by the next reply. Distinct from
         :meth:`peek_pending_ask` (kept as-is for the post-turn recovery caller).
+
+        #510: a pane whose claude has exited reports ``(None, True)`` — a
+        healthy read with no live menu — so an in-flight bridge winds down in
+        seconds instead of sitting on the 24h answer timeout and then re-posting
+        the same dead question every day.
         """
+        if await self._pane_is_dead():
+            return None, True
         raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
         capture_ok = bool(raw.strip())
         pane = _normalize_capture(raw)
