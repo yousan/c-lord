@@ -109,27 +109,36 @@ def _name_parts(record: SessionRecord | None, thread: discord.Thread) -> tuple[s
     return topic or _FALLBACK_TOPIC, issue_ref
 
 
-async def _edit(thread: discord.Thread, **fields: object) -> bool:
-    """``thread.edit(**fields)``, swallowing every failure. True when it landed.
+async def _edit(thread: discord.Thread, *, archived: bool, name: str | None = None) -> bool:
+    """Apply ``archived`` (and ``name`` when given) to ``thread``. True when it landed.
 
-    A rename is cosmetic; a 403 (no *Manage Threads*) or a rate-limit must not
-    take down the close/reopen it decorates.
+    Swallows every failure: a rename is cosmetic, and a 403 (no *Manage Threads*)
+    or a rate-limit must not take down the close/reopen it decorates.
+
+    ``name`` is passed as a separate keyword rather than splatted from a dict so
+    the call keeps ``discord.Thread.edit``'s precise parameter types.
     """
+    label = f"archived={archived}" + (f" name={name!r}" if name is not None else "")
     try:
-        await asyncio.wait_for(thread.edit(**fields), timeout=_RENAME_TIMEOUT_SECONDS)
+        coro = (
+            thread.edit(archived=archived)
+            if name is None
+            else thread.edit(name=name, archived=archived)
+        )
+        await asyncio.wait_for(coro, timeout=_RENAME_TIMEOUT_SECONDS)
     except (  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
         discord.HTTPException,
         TimeoutError,
         asyncio.TimeoutError,
     ) as exc:
         logger.warning(
-            "%s close/reopen thread.edit%r failed: %s",
+            "%s close/reopen thread.edit(%s) failed: %s",
             log_ctx(thread_id=thread.id),
-            fields,
+            label,
             exc,
         )
         return False
-    logger.info("%s thread.edit%r applied (#512)", log_ctx(thread_id=thread.id), fields)
+    logger.info("%s thread.edit(%s) applied (#512)", log_ctx(thread_id=thread.id), label)
     return True
 
 
@@ -167,11 +176,10 @@ async def _build_and_apply(
         )
         new_name = ""
 
-    fields: dict[str, object] = {"archived": archived}
-    if new_name and (thread.name if isinstance(thread.name, str) else "") != new_name:
-        fields["name"] = new_name
+    current = thread.name if isinstance(thread.name, str) else ""
+    rename_to = new_name if (new_name and new_name != current) else None
 
-    if not await _edit(thread, **fields) and "name" in fields:
+    if not await _edit(thread, archived=archived, name=rename_to) and rename_to is not None:
         # The rename half is what failed (no Manage Threads, or a rename
         # rate-limit we could not wait out). Keep the archive flag, drop the name.
         await _edit(thread, archived=archived)
