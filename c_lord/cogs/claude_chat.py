@@ -251,6 +251,20 @@ class ClaudeChatCog(commands.Cog):
             return await channel_cog.resolve_manager(channel_id, thread_id=thread_id)
         return None
 
+    async def _bind_thread_repo(self, thread_id: int, channel_id: int, repo: str) -> str | None:
+        """Bind a freshly created thread to *repo* (#514).
+
+        Must happen before ``_run_claude``: that is where the session dir is
+        cloned, and ``create_session_dir`` is idempotent, so a binding written
+        afterwards would never be reflected on disk.
+        """
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is None or not isinstance(channel_cog, ChannelRepoCog):
+            return None
+        return await channel_cog.bind_thread(thread_id, repo, channel_id)
+
     async def _resolve_tmux_manager(
         self, channel_id: int | None, thread_id: int | None = None
     ) -> TmuxSessionManager | None:
@@ -570,12 +584,17 @@ class ClaudeChatCog(commands.Cog):
         respond: _Responder,
         ack: _Responder,
         message: discord.Message | None = None,
+        repo: str | None = None,
     ) -> None:
         """Shared core for /clord and !clord (#209 follow-up).
 
         In a thread → continue the session; in a channel → create a new thread
         via ``spawn_session``. ``ack`` defers (slash) or is a no-op (text); after
         it, all replies go through ``respond``'s post-ack path.
+
+        ``repo`` (#514) names the repository for a *new* thread, making the
+        channel binding optional — the point being to pick a repo without first
+        having to find or rebind a channel.
 
         ``message`` is the invoking message for the text command; ``None`` for
         slash, which has no message behind it. When present, authorization goes
@@ -594,7 +613,28 @@ class ClaudeChatCog(commands.Cog):
             return
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
+        if repo is not None:
+            from ..database.channel_repo import validate_repo_url
+
+            try:
+                repo = validate_repo_url(repo)
+            except ValueError as exc:
+                await respond(f"⚠️ リポジトリ URL が不正です: {exc}", ephemeral=True)
+                return
+
         if isinstance(channel, discord.Thread):
+            if repo is not None:
+                # This thread's session dir is already cloned and
+                # create_session_dir() is idempotent, so rebinding here would
+                # change the record and nothing on disk — it would read as the
+                # option being ignored. Point at the command that does rebind.
+                await respond(
+                    "⚠️ `repo:` は新しいスレッドを立てるときだけ指定できます。\n"
+                    "このスレッドのリポジトリを変えるには `/clord-thread-init repo:<URL>` を"
+                    "使ってください。",
+                    ephemeral=True,
+                )
+                return
             parent_channel_id = channel.parent_id or channel.id
             sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
             tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=channel.id)
@@ -612,15 +652,19 @@ class ClaudeChatCog(commands.Cog):
                 if isinstance(channel, discord.abc.GuildChannel)
                 else (channel_id_fallback)
             )
-            sdm = await self._resolve_session_dir_manager(channel_id)
-            tmux = await self._resolve_tmux_manager(channel_id)
-            if sdm is None and tmux is None:
-                await respond(
-                    "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
-                    "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
-                    ephemeral=True,
-                )
-                return
+            # An explicit repo: stands in for the channel binding (#514) — that
+            # is the whole point of the option, so do not demand /clord-init.
+            if repo is None:
+                sdm = await self._resolve_session_dir_manager(channel_id)
+                tmux = await self._resolve_tmux_manager(channel_id)
+                if sdm is None and tmux is None:
+                    await respond(
+                        "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
+                        "`/clord repo:<URL> prompt:<やること>` でこの1回だけ指定するか、"
+                        "`/clord-init repo:<URL>` でチャンネルに設定してください。",
+                        ephemeral=True,
+                    )
+                    return
 
         await ack()
 
@@ -648,7 +692,7 @@ class ClaudeChatCog(commands.Cog):
                 await respond("This command must be used in a text channel.", ephemeral=True)
                 return
             try:
-                thread = await self.spawn_session(channel, prompt)
+                thread = await self.spawn_session(channel, prompt, repo=repo)
             except ThreadCreateForbiddenError:
                 # #443: bot lacks View Channel / Create Public Threads here.
                 # Reply via the interaction (ephemeral) — the channel itself is
@@ -664,9 +708,53 @@ class ClaudeChatCog(commands.Cog):
                 return
             await respond(f"Session started → {thread.mention}")
 
+    async def _repo_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Offer the channel default first, then every repo this bot knows (#514).
+
+        Showing the default is what tells the reader the option is skippable —
+        an empty box reads as something they are expected to fill in.
+        """
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is None or not isinstance(channel_cog, ChannelRepoCog):
+            return []
+
+        choices: list[app_commands.Choice[str]] = []
+        needle = current.lower()
+
+        parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
+        default = None
+        if parent_id is not None:
+            with contextlib.suppress(Exception):
+                default = await channel_cog.channel_repo(parent_id)
+        if default is not None and needle in default.lower():
+            choices.append(
+                app_commands.Choice(
+                    name=f"未指定ならこれ（このチャンネル）: {default}"[:100], value=default[:100]
+                )
+            )
+
+        with contextlib.suppress(Exception):
+            for repo in await channel_cog.known_repos():
+                if repo == default or needle not in repo.lower():
+                    continue
+                choices.append(app_commands.Choice(name=repo[:100], value=repo[:100]))
+                if len(choices) >= 25:
+                    break
+        return choices
+
     @app_commands.command(name="clord", description="Start a new Claude Code session")
-    @app_commands.describe(prompt="Message to send to Claude Code")
-    async def start_session(self, interaction: discord.Interaction, prompt: str) -> None:
+    @app_commands.describe(
+        prompt="Message to send to Claude Code",
+        repo="省略可 — 新しいスレッドで使うリポジトリ。未指定ならこのチャンネルの設定",
+    )
+    @app_commands.autocomplete(repo=_repo_autocomplete)
+    async def start_session(
+        self, interaction: discord.Interaction, prompt: str, repo: str | None = None
+    ) -> None:
         """Start a new Claude Code session or continue in an existing thread."""
         state = {"acked": False}
 
@@ -689,14 +777,36 @@ class ClaudeChatCog(commands.Cog):
             prompt=prompt,
             respond=respond,
             ack=ack,
+            repo=repo,
         )
+
+    @staticmethod
+    def _split_repo_prefix(prompt: str) -> tuple[str | None, str]:
+        """Peel a leading ``repo:<url>`` off a ``!clord`` prompt (#514).
+
+        Mirrors the slash option's spelling so the two twins read the same. Only
+        the *first* token counts, and only when something follows it — a prompt
+        that merely starts with the word "repository" is left alone.
+        """
+        if not prompt.startswith("repo:"):
+            return None, prompt
+        head, sep, rest = prompt.partition(" ")
+        repo = head[len("repo:") :]
+        if not sep or not repo or not rest.strip():
+            return None, prompt
+        return repo, rest.strip()
 
     @commands.command(name="clord")
     async def clord_text(self, ctx: commands.Context, *, prompt: str | None = None) -> None:
-        """Text/mention twin of /clord — invokable from webhooks for E2E (#209)."""
+        """Text/mention twin of /clord — invokable from webhooks for E2E (#209).
+
+        Usage: ``!clord <prompt>`` / ``!clord repo:<URL> <prompt>`` (#514).
+        """
         if not prompt:
-            await ctx.send("Usage: `!clord <prompt>`")
+            await ctx.send("Usage: `!clord [repo:<URL>] <prompt>`")
             return
+
+        repo, prompt = self._split_repo_prefix(prompt)
 
         async def ack(*_args: object, **_kwargs: object) -> None:
             return None
@@ -714,6 +824,7 @@ class ClaudeChatCog(commands.Cog):
             respond=respond,
             ack=ack,
             message=ctx.message,
+            repo=repo,
         )
 
     async def _stop_impl(self, channel: object, respond: _Responder) -> None:
@@ -1084,6 +1195,7 @@ class ClaudeChatCog(commands.Cog):
         prompt: str,
         thread_name: str | None = None,
         session_id: str | None = None,
+        repo: str | None = None,
     ) -> discord.Thread:
         """Create a new thread and start a Claude Code session without a user message.
 
@@ -1102,6 +1214,9 @@ class ClaudeChatCog(commands.Cog):
             session_id: Optional Claude session ID to resume via ``--resume``.
                         When supplied the new Claude process continues the
                         previous conversation rather than starting fresh.
+            repo: Optional repository for this thread (#514). Bound to the new
+                  thread before Claude starts, so the session dir is cloned
+                  from it instead of from the channel's binding.
 
         Returns:
             The newly created :class:`discord.Thread`.
@@ -1125,6 +1240,20 @@ class ClaudeChatCog(commands.Cog):
                 exc_info=True,
             )
             raise ThreadCreateForbiddenError() from exc
+
+        # #514: bind before anything clones. _run_claude resolves the session
+        # dir manager from this binding, and create_session_dir() is idempotent,
+        # so a binding written any later would never reach the disk.
+        if repo is not None:
+            bound = await self._bind_thread_repo(thread.id, channel.id, repo)
+            if bound is None:
+                logger.warning(
+                    "%s repo:%s requested but thread bindings are not enabled — "
+                    "falling back to the channel binding",
+                    log_ctx(thread_id=thread.id),
+                    repo,
+                )
+
         # Post the prompt so StatusManager has a Message to add reactions to.
         try:
             seed_message = await thread.send(prompt)
