@@ -133,13 +133,17 @@ class WebhookTriggerCog(commands.Cog):
         async with lock:
             await self._execute_trigger(message, matched_prefix, matched_trigger)
 
-    async def _resolve_tmux_manager(self, channel_id: int):
-        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+    async def _resolve_tmux_manager(self, channel_id: int, thread_id: int | None = None):
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
+
+        #427: pass ``thread_id`` whenever a thread is in scope so a thread bound
+        to its own repo resolves to that repo's session.
+        """
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_tmux_manager(channel_id)
+            return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
     async def _execute_trigger(
@@ -158,7 +162,7 @@ class WebhookTriggerCog(commands.Cog):
             name=prefix[:100], auto_archive_duration=archive_minutes
         )
 
-        tmux = await self._resolve_tmux_manager(message.channel.id)
+        tmux = await self._resolve_tmux_manager(message.channel.id, thread_id=thread.id)
         if tmux is None:
             await thread.send("⚠️ tmux is not configured for this channel.")
             return

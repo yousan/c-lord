@@ -811,6 +811,122 @@ class TmuxSessionManager:
                     return parts[0]
         return None
 
+    def _find_window_in_other_sessions(
+        self, thread_id: int, working_dir: str
+    ) -> tuple[str, str, str] | None:
+        """Find this thread's window living in a *different* tmux session (#427).
+
+        Returns ``(session_name, window_id, window_name)`` or None. The
+        ``window_id`` (``@123``) is what callers must address: it is unique
+        server-wide and survives renames and moves, whereas ``session:name`` is
+        ambiguous the moment two windows share a name — which is exactly what
+        happened on staging, where the move failed with ``can't find window``.
+
+        Path equality is the safety anchor, not ``@thread_id``: a parallel
+        c-lord instance (staging) can legitimately hold a window for the same
+        Discord thread, but it runs out of its own session-dir base so the pane
+        path never collides. ``@thread_id`` only breaks ties — several of the
+        windows this has to find lost that option to a tmux restart and are
+        identifiable by path alone.
+        """
+        result = _run(
+            [
+                "tmux",
+                "list-windows",
+                "-a",
+                "-F",
+                "#{session_name}\t#{window_id}\t#{window_name}\t"
+                "#{@thread_id}\t#{pane_current_path}",
+            ]
+        )
+        if result.returncode != 0:
+            return None
+
+        target = working_dir.rstrip("/")
+        fallback: tuple[str, str, str] | None = None
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) != 5:
+                continue
+            session, window_id, window, tid, pane_path = parts
+            if session == self.session_name or not window_id:
+                continue
+            pane_path = pane_path.rstrip("/")
+            if pane_path != target and not pane_path.startswith(target + "/"):
+                continue
+            if tid == str(thread_id):
+                return session, window_id, window
+            if fallback is None:
+                fallback = (session, window_id, window)
+        return fallback
+
+    def _adopt_window_from_other_session(self, thread_id: int, working_dir: str) -> str | None:
+        """Move this thread's existing window here from another session (#427).
+
+        ``resolve_tmux_manager`` now honours thread bindings, so a thread whose
+        repo differs from its channel's resolves to a *different* session than
+        the one its window was created in. Creating a fresh window there would
+        leave the original running: two Claude processes on one checkout, one of
+        them invisible to Discord. Move the window instead — the conversation,
+        the pane and its scrollback all come along.
+
+        Every tmux op targets the immutable ``window_id``; the rename to this
+        session's ``w{N}`` scheme happens *after* the move, so the new name only
+        has to be free in the destination.
+
+        Returns the window's new name, or None when there is nothing to adopt or
+        the move failed.
+        """
+        found = self._find_window_in_other_sessions(thread_id, working_dir)
+        if found is None:
+            return None
+        src_session, window_id, src_name = found
+
+        # Tag before moving: windows that lost @thread_id to a tmux restart were
+        # matched by path, and later lookups need the option to be there.
+        _run(["tmux", "set-option", "-w", "-t", window_id, "@thread_id", str(thread_id)])
+
+        result = _run(
+            [
+                "tmux",
+                "move-window",
+                # -d: don't steal the attached client's focus (same reason as
+                # the -d on new-window, #374).
+                "-d",
+                "-s",
+                window_id,
+                "-t",
+                f"{self.session_name}:",
+            ]
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to move window %s (%s:%s) -> %s: %s",
+                window_id,
+                src_session,
+                src_name,
+                self.session_name,
+                result.stderr.strip(),
+            )
+            return None
+
+        new_name = self._next_window_name()
+        _run(["tmux", "rename-window", "-t", window_id, new_name])
+
+        self._thread_to_window[thread_id] = new_name
+        self._save_mapping()
+        logger.info(
+            "Adopted tmux window %s (%s:%s) -> %s:%s (thread=%d, dir=%s)",
+            window_id,
+            src_session,
+            src_name,
+            self.session_name,
+            new_name,
+            thread_id,
+            working_dir,
+        )
+        return new_name
+
     # ── Public API ────────────────────────────────────────────────────
 
     def create_session(self, thread_id: int, working_dir: str) -> str:
@@ -861,6 +977,14 @@ class TmuxSessionManager:
                 )
                 self._save_mapping()
                 return adopted
+
+            # #427: the thread may already own a window in *another* session
+            # (its repo binding changed after that window was created). Move it
+            # here instead of starting a second Claude on the same checkout.
+            migrated = self._adopt_window_from_other_session(thread_id, working_dir)
+            if migrated is not None:
+                self._sort_windows_unlocked()
+                return migrated
 
             window_name = self._next_window_name()
 

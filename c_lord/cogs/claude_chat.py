@@ -245,12 +245,20 @@ class ClaudeChatCog(commands.Cog):
             return await channel_cog.resolve_manager(channel_id, thread_id=thread_id)
         return None
 
-    async def _resolve_tmux_manager(self, channel_id: int | None) -> TmuxSessionManager | None:
-        """Resolve a TmuxSessionManager for the given channel.
+    async def _resolve_tmux_manager(
+        self, channel_id: int | None, thread_id: int | None = None
+    ) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel (and optional thread).
 
-        Returns the per-channel manager from ChannelRepoCog if a binding exists,
-        or None. Does NOT fall back to a global bot.tmux_manager —
-        channels without a ``/clord-init`` binding get no manager.
+        Lookup order: thread binding → channel binding → None. Does NOT fall
+        back to a global bot.tmux_manager — a channel with neither a
+        ``/clord-init`` nor a ``/clord-thread-init`` binding gets no manager.
+
+        #427: ``thread_id`` used to be absent here while
+        ``_resolve_session_dir_manager`` already honoured it, so a thread bound
+        to another repo ran out of that repo's checkout inside the *parent
+        channel's* tmux session. Always pass ``thread_id`` when a thread is in
+        scope, so the two resolvers agree.
         """
         if channel_id is None:
             return None
@@ -258,7 +266,7 @@ class ClaudeChatCog(commands.Cog):
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_tmux_manager(channel_id)
+            return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
     async def _get_current_model(self) -> str | None:
@@ -576,7 +584,7 @@ class ClaudeChatCog(commands.Cog):
         if isinstance(channel, discord.Thread):
             parent_channel_id = channel.parent_id or channel.id
             sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
-            tmux = await self._resolve_tmux_manager(parent_channel_id)
+            tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=channel.id)
             if sdm is None and tmux is None:
                 await respond(
                     "⚠️ このスレッドにはリポジトリが紐づけられていません。\n"
@@ -774,7 +782,7 @@ class ClaudeChatCog(commands.Cog):
             return
 
         parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel.id
-        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=interaction.channel.id)
         if tmux_manager is None:
             await interaction.response.send_message(
                 "tmux is not configured for this bot.", ephemeral=True
@@ -810,7 +818,7 @@ class ClaudeChatCog(commands.Cog):
             return
 
         parent_id = getattr(ctx.channel, "parent_id", None) or ctx.channel.id
-        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=ctx.channel.id)
         if tmux_manager is None:
             await ctx.send("tmux is not configured for this bot.")
             return
@@ -845,7 +853,7 @@ class ClaudeChatCog(commands.Cog):
         # This ensures `is_claude_running` returns False next time, preventing
         # old context from being resumed via send_input.
         parent_id = getattr(channel, "parent_id", None) or thread_id
-        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
         if tmux_manager is not None:
             await asyncio.to_thread(tmux_manager.kill_session, thread_id)
 
@@ -923,7 +931,7 @@ class ClaudeChatCog(commands.Cog):
         # session row — that is what distinguishes restart from /clear and lets
         # the next message resume the conversation via --continue (#270, #123).
         parent_id = getattr(channel, "parent_id", None) or thread_id
-        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
         if tmux_manager is not None:
             await asyncio.to_thread(tmux_manager.kill_session, thread_id)
 
@@ -985,7 +993,7 @@ class ClaudeChatCog(commands.Cog):
 
         thread_id = channel.id
         parent_id = getattr(channel, "parent_id", None) or thread_id
-        tmux_manager = await self._resolve_tmux_manager(parent_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
         if tmux_manager is None:
             await respond("tmux is not configured for this thread.", ephemeral=True)
             return
@@ -1304,7 +1312,9 @@ class ClaudeChatCog(commands.Cog):
             try_continue = False
             if session_id is not None and not had_active:
                 parent_channel_id = getattr(thread, "parent_id", None) or thread.id
-                tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
+                tmux_manager = await self._resolve_tmux_manager(
+                    parent_channel_id, thread_id=thread.id
+                )
                 if tmux_manager is not None:
                     pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
                     try_continue = not pane_alive
@@ -1466,7 +1476,7 @@ class ClaudeChatCog(commands.Cog):
         session_dir_manager = await self._resolve_session_dir_manager(
             parent_channel_id, thread_id=thread.id
         )
-        tmux_manager = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
 
         if session_dir_manager is None and tmux_manager is None:
             await thread.send(
