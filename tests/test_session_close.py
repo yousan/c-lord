@@ -101,6 +101,25 @@ class TestCloseMarksThread:
         assert any(c.kwargs.get("archived") is True for c in thread.edit.call_args_list)
 
     @pytest.mark.asyncio
+    async def test_close_renames_and_archives_in_one_patch(self) -> None:
+        """#512: one PATCH, not two.
+
+        Discord allows ~2 thread renames per 10 minutes and refuses to rename an
+        archived thread at all (code 50083). Splitting this into
+        ``edit(name=…)`` + ``edit(archived=True)`` spends the allowance twice and
+        orders badly — observed live on staging as a 429 that silently dropped
+        the ``[終了]`` marker while the archive went through.
+        """
+        cog = self._cog(_record())
+        thread = _thread()
+        await cog.close_workspace_text.callback(cog, self._ctx(thread))
+
+        assert thread.edit.await_count == 1
+        kwargs = thread.edit.await_args.kwargs
+        assert kwargs.get("name") == "[終了] #404 認証リファクタ"
+        assert kwargs.get("archived") is True
+
+    @pytest.mark.asyncio
     async def test_close_rename_failure_does_not_block_archive(self) -> None:
         """A 403 on rename (no Manage Threads) must not cost us the archive."""
         cog = self._cog(_record())
@@ -152,6 +171,20 @@ class TestReopenCommand:
         cog.repo.set_closed.assert_awaited_once_with(555, False)
         names = [c.kwargs.get("name") for c in thread.edit.call_args_list if "name" in c.kwargs]
         assert names and not names[-1].startswith("[終了]")
+
+    @pytest.mark.asyncio
+    async def test_reopen_unarchives_in_the_same_patch(self) -> None:
+        """#512: reopening must clear ``archived`` — Discord rejects edits to an
+        archived thread (code 50083), so a rename that does not un-archive in the
+        same PATCH is refused outright."""
+        cog = self._cog(_record(closed_at="2026-08-18 12:00:00"))
+        thread = _thread()
+        thread.name = "[終了] #404 認証リファクタ"
+
+        await cog.reopen_workspace_text.callback(cog, self._ctx(thread))
+
+        assert thread.edit.await_count == 1
+        assert thread.edit.await_args.kwargs.get("archived") is False
 
     @pytest.mark.asyncio
     async def test_reopen_on_open_thread_is_a_noop_notice(self) -> None:

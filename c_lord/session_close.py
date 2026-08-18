@@ -42,9 +42,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Timeout for the one-off rename. Matches the naming path in ClaudeChatCog —
-#: long enough for a normal PATCH, short enough not to stall the close.
-_RENAME_TIMEOUT_SECONDS = 5.0
+#: Timeout for the one-off rename/archive PATCH.
+#:
+#: Deliberately generous. Discord rate-limits thread renames to ~2 per 10 minutes
+#: per thread and answers the third with a 429; discord.py handles that by
+#: sleeping for the advertised ``retry_after`` and retrying. A short ``wait_for``
+#: cancels that sleep, which loses the ``[終了]`` marker — and the marker is the
+#: whole point of the close. Observed backoffs are under a minute, and the
+#: command has already deferred its response, so waiting is the right trade.
+_RENAME_TIMEOUT_SECONDS = 60.0
 
 #: Title of the notice posted when someone writes into a closed thread.
 CLOSED_NOTICE_TITLE = f"⏹️ このスレッドは終了しています ({CLOSED_MARK})"
@@ -103,41 +109,44 @@ def _name_parts(record: SessionRecord | None, thread: discord.Thread) -> tuple[s
     return topic or _FALLBACK_TOPIC, issue_ref
 
 
-async def _rename(thread: discord.Thread, new_name: str) -> bool:
-    """Rename ``thread``, swallowing every failure. True when the name changed.
+async def _edit(thread: discord.Thread, **fields: object) -> bool:
+    """``thread.edit(**fields)``, swallowing every failure. True when it landed.
 
     A rename is cosmetic; a 403 (no *Manage Threads*) or a rate-limit must not
     take down the close/reopen it decorates.
     """
-    current = thread.name if isinstance(thread.name, str) else ""
-    if current == new_name:
-        return False
     try:
-        await asyncio.wait_for(thread.edit(name=new_name), timeout=_RENAME_TIMEOUT_SECONDS)
+        await asyncio.wait_for(thread.edit(**fields), timeout=_RENAME_TIMEOUT_SECONDS)
     except (  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
         discord.HTTPException,
         TimeoutError,
         asyncio.TimeoutError,
     ) as exc:
         logger.warning(
-            "%s close/reopen rename failed: %r → %r: %s",
+            "%s close/reopen thread.edit%r failed: %s",
             log_ctx(thread_id=thread.id),
-            current,
-            new_name,
+            fields,
             exc,
         )
         return False
-    logger.info("%s renamed → %r (#512)", log_ctx(thread_id=thread.id), new_name)
+    logger.info("%s thread.edit%r applied (#512)", log_ctx(thread_id=thread.id), fields)
     return True
 
 
-async def _build_and_rename(
-    repo: SessionRepository, thread: discord.Thread, *, closed: bool
+async def _build_and_apply(
+    repo: SessionRepository, thread: discord.Thread, *, closed: bool, archived: bool
 ) -> str:
-    """Rebuild ``thread``'s name with/without the ``[終了]`` marker and apply it.
+    """Rebuild ``thread``'s name with/without ``[終了]`` and apply it with ``archived``.
+
+    The name change and the archive flag go out as **one** ``PATCH``. Two separate
+    edits would spend two of the thread's ~2-per-10-minutes rename allowance and
+    could interleave badly — an archive landing first makes the following rename
+    fail outright ("Thread is archived", code 50083).
 
     Never raises: the name is decoration, and the close (or reopen) it decorates
-    must complete even if naming hits something unexpected.
+    must complete even if naming hits something unexpected. If the combined edit
+    fails, the archive flag is retried on its own — losing the marker is a
+    cosmetic regression, losing the archive/unarchive is a functional one.
     """
     try:
         record = await _safe_get(repo, thread.id)
@@ -156,29 +165,42 @@ async def _build_and_rename(
         logger.warning(
             "%s could not build the close/reopen name", log_ctx(thread_id=thread.id), exc_info=True
         )
-        return ""
-    await _rename(thread, new_name)
+        new_name = ""
+
+    fields: dict[str, object] = {"archived": archived}
+    if new_name and (thread.name if isinstance(thread.name, str) else "") != new_name:
+        fields["name"] = new_name
+
+    if not await _edit(thread, **fields) and "name" in fields:
+        # The rename half is what failed (no Manage Threads, or a rename
+        # rate-limit we could not wait out). Keep the archive flag, drop the name.
+        await _edit(thread, archived=archived)
     return new_name
 
 
 async def apply_closed_name(repo: SessionRepository, thread: discord.Thread) -> str:
-    """Rename ``thread`` to its ``[終了] …`` form. Returns the name it aimed for.
+    """Rename ``thread`` to ``[終了] …`` **and archive it**. Returns the aimed-for name.
 
     The ``W<N> │`` prefix is dropped because the tmux window it names is exactly
     what ``/close-workspace`` just killed — keeping it would point at a window
-    that no longer exists.
+    that no longer exists. Archiving (#271, declutter the sidebar) rides along in
+    the same PATCH; see :func:`_build_and_apply` for why they are not two calls.
     """
-    return await _build_and_rename(repo, thread, closed=True)
+    return await _build_and_apply(repo, thread, closed=True, archived=True)
 
 
 async def apply_open_name(repo: SessionRepository, thread: discord.Thread) -> str:
-    """Rename ``thread`` back to its open form (drops ``[終了]``). Returns the name.
+    """Rename ``thread`` back to its open form and un-archive it. Returns the name.
+
+    Un-archiving is not cosmetic here: Discord refuses to edit an archived thread
+    (code 50083), so the same PATCH has to clear the flag for the rename to be
+    accepted at all — and a reopened session belongs back in the sidebar anyway.
 
     ``W<N>`` is *not* restored here: the window is recreated only when the next
     turn actually runs, and the regular naming pass
     (``ClaudeChatCog._apply_thread_naming``) puts the number back then.
     """
-    return await _build_and_rename(repo, thread, closed=False)
+    return await _build_and_apply(repo, thread, closed=False, archived=False)
 
 
 async def _safe_get(repo: SessionRepository, thread_id: int) -> SessionRecord | None:

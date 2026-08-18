@@ -1271,10 +1271,13 @@ class SessionManageCog(commands.Cog):
         with contextlib.suppress(Exception):
             await self.repo.set_closed(thread_id, True)
 
-        # Rename to "[終了] …" BEFORE archiving: the rename is what makes the
-        # closed state visible in the sidebar, and an archived thread cannot be
-        # renamed without un-archiving it again. Best-effort — a 403 here must
-        # not cost us the archive below (#512).
+        # Rename to "[終了] …" **and** archive (#271) in a single PATCH. They must
+        # not be two calls: Discord refuses to rename an archived thread (code
+        # 50083), and each rename spends one of the thread's ~2-per-10-minutes
+        # allowance — two edits make a 429 (and a silently lost marker) twice as
+        # likely. apply_closed_name falls back to archive-only if the rename half
+        # fails, so a missing Manage Threads permission still leaves the thread
+        # archived (#512).
         new_name = await apply_closed_name(self.repo, channel)
         if new_name:
             results.append(f"🏷️ スレッド名: `{new_name}`")
@@ -1289,10 +1292,6 @@ class SessionManageCog(commands.Cog):
             color=COLOR_SUCCESS,
         )
         await respond(embed=embed)
-
-        # Archive the thread to declutter the sidebar (best-effort).
-        with contextlib.suppress(discord.HTTPException):
-            await channel.edit(archived=True)
 
     @app_commands.command(
         name="close-workspace",
