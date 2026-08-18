@@ -5,6 +5,7 @@ Format::
     <status_emoji> W<work_number> │ #<issue> <topic>   (with window + Issue/PR number)
     <status_emoji> W<work_number> │ <topic>            (with window, no number)
     <status_emoji> <topic>                             (dead, or no window number)
+    [終了] #<issue> <topic>                             (closed — /close-workspace'd)
 
 The ``#<issue>`` token (#414) is the Issue/PR number the thread is working on,
 auto-detected from the session's git branch or its first message; it is omitted
@@ -16,6 +17,13 @@ Examples::
     🟡 W2 │ 絵本-イラスト発注        (waiting for user input, no number)
     🔴 W1 │ エラーが発生             (error)
     ⚪ 終わったプロジェクト           (dead)
+    [終了] #404 認証リファクタ        (closed, #512)
+
+The ``[終了]`` marker (#512) means the session was **intentionally** closed with
+``/close-workspace`` — as opposed to ``dead``/⚪, which only means "no tmux window
+right now" (a crash, a bot restart, a dead tmux server). The distinction matters:
+a ``dead`` thread silently resumes on the next message (#270), a ``[終了]`` one
+holds the message and asks the user to reopen.
 
 Lamp states (#120):
 * ``running``  → 🟢 — Claude is actively executing
@@ -27,10 +35,13 @@ Lamp states (#120):
 
 Rules:
 * total length ≤ 30 chars (topic is truncated if needed to fit)
+* ``closed`` replaces the lamp emoji and the ``W<N> │`` prefix with ``[終了] ``
+  (the window it named no longer exists), and wins over ``state``
 * state ``dead`` drops the ``W<N> │`` prefix entirely
 * no window index also drops the prefix
-* the parser is the inverse: strips the leading emoji + optional ``W<N> │``
-  and the legacy trailing `` #N`` (backward-compat), returning only the topic body.
+* the parser is the inverse: strips the leading emoji, the optional ``W<N> │``
+  prefix, the ``[終了] `` closed marker, and the legacy trailing `` #N``
+  (backward-compat), returning only the topic body.
   Used when a user manually renames a thread via the Discord UI.
 """
 
@@ -50,11 +61,19 @@ STATUS_EMOJI: dict[str, str] = {
 
 _MAX_NAME_LEN = 30
 
+# #512: prefix marking a session the user closed on purpose (/close-workspace).
+# Deliberately plain text rather than an emoji: it must stay legible where emoji
+# don't render, and it reads as a state word rather than as one more lamp colour.
+CLOSED_MARK = "[終了]"
+_CLOSED_PREFIX = f"{CLOSED_MARK} "
+
 # Matches an optional leading status emoji + space.
 # Use unique emoji values to avoid duplicate alternates in the regex.
 _LEADING_EMOJI_RE = re.compile(
     r"^(?:" + "|".join(re.escape(e) for e in dict.fromkeys(STATUS_EMOJI.values())) + r")\s*"
 )
+# Matches the leading "[終了] " closed marker (#512).
+_CLOSED_PREFIX_RE = re.compile(r"^" + re.escape(CLOSED_MARK) + r"\s*")
 # Matches a leading "W<digits> │ " prefix (new format).
 _WORK_PREFIX_RE = re.compile(r"^W\d+\s*[│]\s*")
 # Matches a trailing " #<digits>" suffix (legacy backward-compat).
@@ -74,6 +93,7 @@ def build_name(
     *,
     lamp: bool = True,
     issue_ref: str | None = None,
+    closed: bool = False,
 ) -> str:
     """Build a thread name from its parts, capped at 30 characters.
 
@@ -97,27 +117,40 @@ def build_name(
     subset). The point is that the name then no longer depends on ``state``, so a
     state change never produces a different name and never triggers a Discord
     rename (which is rate-limited to ~2 per 10 min per thread).
+
+    ``closed=True`` (#512) means the user closed this session on purpose with
+    ``/close-workspace``. It overrides both the lamp emoji and the ``W<N> │``
+    prefix with ``[終了] ``: the lamp describes a *live* pane and the window
+    number names a tmux window, and after a close neither exists. Because the
+    marker replaces those two parts rather than adding to them, it costs the
+    topic ~2 characters of budget, not 6.
     """
     emoji = STATUS_EMOJI.get(state, STATUS_EMOJI["alive"])
-    prefix_emoji = f"{emoji} " if lamp else ""
+    prefix_emoji = "" if closed else (f"{emoji} " if lamp else "")
 
     ref = (issue_ref or "").lstrip("#").strip()
     ref_token = f"#{ref} " if ref else ""
 
-    if state not in _NO_PREFIX_STATES and window_number is not None:
+    if not closed and state not in _NO_PREFIX_STATES and window_number is not None:
         work = f"W{window_number} │ "
     else:
         work = ""
 
+    mark = _CLOSED_PREFIX if closed else ""
+
     topic_clean = (topic or "").strip()
     # Shed name parts in priority order when the budget is too tight: the topic
     # is most valuable, so drop the work prefix first, then the issue number.
-    for fixed in (f"{prefix_emoji}{work}{ref_token}", f"{prefix_emoji}{ref_token}", prefix_emoji):
+    for fixed in (
+        f"{mark}{prefix_emoji}{work}{ref_token}",
+        f"{mark}{prefix_emoji}{ref_token}",
+        f"{mark}{prefix_emoji}",
+    ):
         budget = _MAX_NAME_LEN - len(fixed)
         if budget >= 1:
             break
     else:
-        fixed = prefix_emoji
+        fixed = f"{mark}{prefix_emoji}"
         budget = _MAX_NAME_LEN - len(fixed)
 
     if len(topic_clean) > budget:
@@ -169,19 +202,20 @@ def thread_retitle_enabled(explicit: bool | None = None) -> bool:
 def parse_topic_from_name(name: str) -> str:
     """Inverse of :func:`build_name` — extract the topic body.
 
-    Strips the leading status emoji (if present), the ``W<N> │`` work prefix
-    (if present), the leading ``#<digits>`` issue/PR token (#414, if present),
-    and the legacy trailing `` #<digits>`` suffix (if present, for backward-compat
-    with the old format).
+    Strips the leading status emoji (if present), the ``[終了]`` closed marker
+    (#512, if present), the ``W<N> │`` work prefix (if present), the leading
+    ``#<digits>`` issue/PR token (#414, if present), and the legacy trailing
+    `` #<digits>`` suffix (if present, for backward-compat with the old format).
     Whitespace around the result is trimmed.
     Returns an empty string only when the input has no body at all.
 
-    Stripping the leading ``#<digits>`` keeps manual-rename detection clean: when
-    a user edits a thread title that already carries the number, the number is
-    not absorbed into the stored topic (which would otherwise double it on the
-    next rebuild).
+    Stripping the leading ``#<digits>`` (and the ``[終了]`` marker) keeps
+    manual-rename detection clean: when a user edits a thread title that already
+    carries them, they are not absorbed into the stored topic — which would
+    otherwise double them on the next rebuild (``[終了] [終了] …``).
     """
     body = _LEADING_EMOJI_RE.sub("", name or "")
+    body = _CLOSED_PREFIX_RE.sub("", body)
     body = _WORK_PREFIX_RE.sub("", body)
     body = _LEADING_REF_RE.sub("", body)
     body = _TRAILING_INDEX_RE.sub("", body)

@@ -92,7 +92,7 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `run` | tmux window exists and Claude is executing (🟢) |
 | `wait` | tmux window exists, turn done, waiting for your input (🟡) |
 | `err` | tmux window exists, an error is visible in the pane (🔴) |
-| `closed` | no tmux window but the session dir still exists (`/close-workspace`'d — still uses disk; resume by sending a message) (⚪) |
+| `closed` | no tmux window but the session dir still exists (still uses disk). Two ways to get here: `/close-workspace`'d (thread renamed `[終了] …`; a message is held and offers a 再開 button, #512) or the pane merely died (bot restart / tmux-server death — a message auto-resumes it via `--continue`, #270) (⚪) |
 
 ### Workspace Management
 
@@ -101,7 +101,28 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
+| `/close-workspace` | **終了**: close the tmux window, keep the session (see below) | Thread only |
+| `/reopen-workspace` | Reopen a 終了 thread so messages run again | Thread only |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
+
+**`/close-workspace` = 終了 (#271, #512).** It kills the tmux window and archives
+the thread but **keeps** the session directory, transcript, and DB row, so the
+conversation can be picked up later. What you see:
+
+- the thread is renamed **`[終了] #<issue> <topic>`** — the `W<N> │` window prefix
+  is dropped because the window it named is exactly what was just killed
+- writing in the thread afterwards **does not run Claude**. c-lord replies with
+  「⏹️ このスレッドは終了しています」 plus a **▶️ 再開する** button; pressing it
+  reopens the session and then runs the message you just sent, so nothing has to
+  be retyped. `/reopen-workspace` does the same without the button (but does not
+  re-send your message).
+
+This is deliberately different from a session whose pane merely *died* (bot
+restart, `kill -9`, tmux-server death): that one is not "終了", carries no marker,
+and still auto-resumes on the next message via `--continue` (#270).
+
+Use `/workspace-delete` instead when you want the disk back — that one is not
+resumable.
 
 ### Mirror Recovery
 
@@ -160,6 +181,8 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
 | `!session-cleanup [dry]` | Remove clean orphaned session dirs (`dry` = preview) | `!session-cleanup dry` | `/session-cleanup` |
+| `!close-workspace` | 終了: close the tmux window, keep the session | `!close-workspace` | `/close-workspace` |
+| `!reopen-workspace` | Reopen a 終了 thread | `!reopen-workspace` | `/reopen-workspace` |
 | `!workspace-delete` | Delete this thread's tmux window + session dir | `!workspace-delete` | `/workspace-delete` |
 
 > **Manage-Server note.** `/clord-init` and `/clord-thread-init` are gated by

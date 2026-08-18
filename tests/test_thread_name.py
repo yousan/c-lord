@@ -253,3 +253,41 @@ def test_thread_retitle_enabled_explicit_overrides_env(monkeypatch):
     assert thread_retitle_enabled(False) is False
     monkeypatch.delenv("CLORD_THREAD_RETITLE", raising=False)
     assert thread_retitle_enabled(True) is True
+
+
+# ── #512: 終了 (closed) marker ────────────────────────────────────────────────
+
+
+def test_build_name_closed_prefixes_marker():
+    """#512: a closed (/close-workspace'd) thread is marked ``[終了]`` up front."""
+    assert (
+        build_name("認証リファクタ", "dead", None, lamp=False, issue_ref="404", closed=True)
+        == "[終了] #404 認証リファクタ"
+    )
+
+
+def test_build_name_closed_drops_work_prefix_and_lamp():
+    """#512: the W<N> window no longer exists and the lamp is meaningless once closed."""
+    out = build_name("topic", "alive", 3, lamp=True, closed=True)
+    assert out == "[終了] topic"
+    assert "W3" not in out
+    assert not any(e in out for e in STATUS_EMOJI.values())
+
+
+def test_build_name_closed_keeps_issue_ref_and_truncates_topic():
+    """#512: under the 30-char cap the marker + number survive; the topic is trimmed."""
+    out = build_name("あ" * 40, "dead", None, lamp=False, issue_ref="404", closed=True)
+    assert out.startswith("[終了] #404 ")
+    assert len(out) <= 30
+
+
+def test_build_name_not_closed_is_unchanged():
+    """#512: closed=False (the default) must not alter any existing name."""
+    assert build_name("c-lord命名検討", "alive", 5) == "🟢 W5 │ c-lord命名検討"
+
+
+def test_parse_topic_strips_closed_marker():
+    """#512: the marker must not be absorbed into the stored topic on manual rename."""
+    assert parse_topic_from_name("[終了] #404 認証リファクタ") == "認証リファクタ"
+    assert parse_topic_from_name("[終了] W3 │ 認証リファクタ") == "認証リファクタ"
+    assert parse_topic_from_name("[終了] 認証リファクタ") == "認証リファクタ"

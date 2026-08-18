@@ -18,6 +18,7 @@
 |------|------|--------|
 | [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | トピックは初回固定（自動付け替えは既定オフ）。作業中の `#<Issue/PR番号>` をブランチ/本文から自動表示 |
 | [thread-lamp.md](./thread-lamp.md) | スレッド名のランプ 🟢/🟡 | 既定オフ（rename レート制限のため）。`CLORD_THREAD_LAMP=1` で有効化すると受信で 🟢・完了で 🟡 |
+| [session-close.md](./session-close.md) | セッションの終了と再開 | `/close-workspace` はスレッド名を `[終了] …` にし、以後の投稿は実行せず再開ボタン付きの案内を出す（落ちただけのペインの自動復元とは別物） |
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 
 > まだ3機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
