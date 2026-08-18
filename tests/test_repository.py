@@ -40,6 +40,20 @@ class TestSessionRepository:
         await repo.set_issue_ref(42, None)
         assert (await repo.get(42)).issue_ref is None
 
+    async def test_closed_at_defaults_none_and_roundtrips(self, repo):
+        # #512: an intentionally closed (/close-workspace'd) session is recorded so
+        # it can be told apart from a session whose pane merely crashed (#270).
+        await repo.save(thread_id=43, session_id="s2")
+        assert (await repo.get(43)).closed_at is None
+
+        await repo.set_closed(43, True)
+        record = await repo.get(43)
+        assert record.closed_at is not None
+        assert record.closed_at != ""
+
+        await repo.set_closed(43, False)
+        assert (await repo.get(43)).closed_at is None
+
     async def test_save_updates_existing(self, repo):
         await repo.save(thread_id=100, session_id="first")
         await repo.save(thread_id=100, session_id="second")

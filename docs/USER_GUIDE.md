@@ -178,6 +178,8 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 | `/model set <model>` | Change model for all new sessions | Available |
 | `/session-cleanup` | Remove clean orphaned session directories | Available |
 | `/tmux-list` | List all active tmux windows | Available |
+| `/close-workspace` | 終了: close the tmux window, keep the session (thread renamed `[終了] …`; a later message is held and offers a 再開 button) | Available |
+| `/reopen-workspace` | Reopen a 終了 thread so messages run again | Available |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Available |
 | `/upgrade` | Trigger bot upgrade (if enabled) | Available |
 

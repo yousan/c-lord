@@ -20,7 +20,10 @@ Every ``poll_interval`` seconds:
 
 The loop deliberately never touches the ``topic`` body — that is
 the user-visible stable identity. Only the leading status emoji and
-the leading ``W<N> │`` work-number hint are kept fresh.
+the leading ``W<N> │`` work-number hint are kept fresh.  A session closed with
+``/close-workspace`` keeps its ``[終了]`` marker here (#512): the loop sees it as
+``dead`` like any window-less thread, so without the flag the repaint would strip
+the marker off.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from .session_close import is_closed
 from .thread_name import build_name
 from .tmux import parse_work_number
 
@@ -377,7 +381,17 @@ class ThreadStateSyncLoop:
 
         # #414: keep the Issue/PR number in the lamp-sync rename too, otherwise
         # the slow sidebar repaint would drop it from the name.
-        new_name = build_name(record.topic, new_state, window_number, issue_ref=record.issue_ref)
+        # #512: likewise the ``[終了]`` marker. A closed session has no tmux window,
+        # so this loop computes state="dead" for it every tick — without the flag
+        # it would rebuild the plain name and quietly undo the marker that
+        # /close-workspace just applied.
+        new_name = build_name(
+            record.topic,
+            new_state,
+            window_number,
+            issue_ref=record.issue_ref,
+            closed=is_closed(record),
+        )
 
         # Fetch the Discord thread and rename if different.
         try:

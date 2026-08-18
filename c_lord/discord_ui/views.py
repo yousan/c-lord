@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Protocol, runtime_checkable
 
 import discord
@@ -106,3 +107,60 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             except RuntimeError as exc:
                 # aiohttp session already closed during bot shutdown (#91)
                 logger.warning("StopView.disable: could not delete message — %s", exc)
+
+
+class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+    """A ▶️ 再開する button attached to the "this thread is closed" notice (#512).
+
+    A message sent to a session the user closed with ``/close-workspace`` is
+    **held**, not run — c-lord posts :func:`c_lord.session_close.closed_notice_embed`
+    with this view instead. Clicking the button reopens the session and then runs
+    the message that was held, so the user does not have to retype it.
+
+    ``on_reopen`` is an async callable taking the button's
+    :class:`discord.Interaction`; it does the actual reopen (clear ``closed_at``,
+    restore the thread name, dispatch the held message). Keeping it injected
+    leaves this class free of cog/database imports.
+
+    ``timeout=None`` on purpose: the notice may sit unread for days, and a
+    timed-out button that silently stops working would strand the only visible
+    way back into the session.
+    """
+
+    def __init__(
+        self,
+        on_reopen: Callable[[discord.Interaction], Awaitable[None]],
+        authorizer: Authorizer | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self._on_reopen = on_reopen
+        self._authorizer = authorizer
+        self._reopened = False
+
+    @discord.ui.button(label="再開する", emoji="▶️", style=discord.ButtonStyle.primary)
+    async def reopen_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Reopen the session and run the held message."""
+        # Guard against a double click: reopening twice would dispatch the held
+        # message twice, i.e. run the user's instruction two times.
+        if self._reopened:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "▶️ このスレッドは再開済みです。", ephemeral=True
+                )
+            return
+        self._reopened = True
+
+        button.disabled = True
+        button.label = "再開しました"
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        # ``interaction.message`` is None for interactions that did not originate
+        # from a message (never the case for a button, but the type allows it).
+        if interaction.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+
+        await self._on_reopen(interaction)
+        self.stop()

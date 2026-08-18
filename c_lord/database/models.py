@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     auto_topic_locked INTEGER NOT NULL DEFAULT 0,
     topic_source TEXT,
     rename_backoff_until TEXT,
+    closed_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -150,6 +151,12 @@ _MIGRATIONS = [
     # from the session's git branch or first message and shown in the thread
     # name as "#<n>". Persisted so it is stable across restarts.
     "ALTER TABLE sessions ADD COLUMN issue_ref TEXT",
+    # Issue #512: when the user closed this session on purpose
+    # (/close-workspace). NULL = open. Persisting it is what lets c-lord tell an
+    # intentional 終了 apart from a pane that merely died (bot restart, tmux-server
+    # death) — the latter still auto-resumes via --continue (#270), the former
+    # holds the message and asks the user to reopen.
+    "ALTER TABLE sessions ADD COLUMN closed_at TEXT",
 ]
 
 

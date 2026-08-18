@@ -38,7 +38,8 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
-from ..discord_ui.views import StopView
+from ..discord_ui.views import ReopenSessionView, StopView
+from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
@@ -156,6 +157,11 @@ class ClaudeChatCog(commands.Cog):
         # Issue #414: issue/PR number resolved before the session row exists;
         # drained by _apply_thread_naming on the next call once the row is saved.
         self._pending_issue_ref: dict[int, str] = {}
+        # #512: thread ids reopened since the last turn. Consumed once, to swap the
+        # #464 crash-recovery wording ("前回のセッションが落ちていたので…") for the
+        # deliberate-reopen wording — a user who closed the session on purpose is
+        # not recovering from a crash and should not be told they are.
+        self._reopened_threads: set[int] = set()
         # Issue #429: thread ids already shown the "rename needs Manage Threads"
         # hint, so it is posted at most once per process per thread (not per turn).
         self._rename_hint_sent: set[int] = set()
@@ -418,8 +424,15 @@ class ClaudeChatCog(commands.Cog):
         # status emoji, so the name no longer changes on state transitions and
         # the only rename is the one-off topic naming. The #<issue> number (#414)
         # is shown when known.
+        # #512: a thread closed mid-turn keeps its [終了] marker here too, so the
+        # naming pass can never race the close and repaint the marker away.
         new_name = build_name(
-            topic, state, window_number, lamp=self._thread_lamp, issue_ref=issue_ref
+            topic,
+            state,
+            window_number,
+            lamp=self._thread_lamp,
+            issue_ref=issue_ref,
+            closed=is_closed(record),
         )
         if (thread.name or "") == new_name:
             return
@@ -1279,6 +1292,16 @@ class ClaudeChatCog(commands.Cog):
         thread = message.channel
         assert isinstance(thread, discord.Thread)
 
+        # #512: a session the user closed on purpose (/close-workspace) holds
+        # incoming messages instead of running them. Checked before the lock and
+        # before any prompt building so nothing is spent on a message we will not
+        # run. Note this keys on the persisted ``closed_at`` — NOT on "the tmux
+        # pane is dead", which is the crash case that must keep auto-resuming
+        # via --continue (#270, #464).
+        if is_closed(await self.repo.get(thread.id)):
+            await self._post_closed_notice(thread, message)
+            return
+
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             record = await self.repo.get(thread.id)
@@ -1325,10 +1348,18 @@ class ClaudeChatCog(commands.Cog):
             # (exactly what the 2026-06-25 tmux-server-death incident looked like
             # to the user). A visible notice makes the recovery legible.
             if try_continue:
+                # #512: same mechanism, different story. A user who just pressed
+                # 「再開する」 did not suffer a crash, so telling them the session
+                # "fell over" is simply false and reads as a new failure.
+                reopened = thread.id in self._reopened_threads
+                self._reopened_threads.discard(thread.id)
+                notice = (
+                    "🔄 終了していたセッションを復元して、続きから再開します。"
+                    if reopened
+                    else "🔄 前回のセッションが落ちていたので、これまでの会話を復元して続けます。"
+                )
                 with contextlib.suppress(discord.HTTPException):
-                    await thread.send(
-                        "🔄 前回のセッションが落ちていたので、これまでの会話を復元して続けます。"
-                    )
+                    await thread.send(notice)
 
             # Run as its own task so the per-thread lock is NOT held for the
             # (possibly long, possibly menu-parked) duration of the turn — that
@@ -1346,6 +1377,40 @@ class ClaudeChatCog(commands.Cog):
                 )
             )
             self._active_tasks[thread.id] = task
+
+    def mark_reopened(self, thread_id: int) -> None:
+        """Note that ``thread_id`` was just reopened from 終了 (#512).
+
+        Consumed once by the next ``--continue`` resume to pick the right wording
+        (deliberate reopen vs. crash recovery). Public so ``SessionManageCog``'s
+        ``/reopen-workspace`` can reach it through ``bot.get_cog`` — the same
+        loose-coupling pattern used for the transcript mirror.
+        """
+        self._reopened_threads.add(thread_id)
+
+    async def _reopen_thread(self, thread: discord.Thread) -> None:
+        """Clear the 終了 state and drop the ``[終了]`` marker from the name (#512)."""
+        await self.repo.set_closed(thread.id, False)
+        self.mark_reopened(thread.id)
+        await apply_open_name(self.repo, thread)
+        logger.info("%s session reopened (#512)", log_ctx(thread_id=thread.id))
+
+    async def _post_closed_notice(self, thread: discord.Thread, message: discord.Message) -> None:
+        """Tell the user the thread is closed and offer a one-click reopen (#512).
+
+        The button reopens **and then runs the message that was held**, so the
+        cost of hitting a closed thread is one click rather than retyping the
+        instruction.
+        """
+
+        async def _on_reopen(_interaction: discord.Interaction) -> None:
+            await self._reopen_thread(thread)
+            await self._handle_thread_reply(message)
+
+        view = ReopenSessionView(_on_reopen, authorizer=self._authorizer)
+        logger.info("%s message held — session is closed (#512)", log_ctx(thread_id=thread.id))
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(embed=closed_notice_embed(), view=view)
 
     async def _preempt_prior_turn(
         self,
