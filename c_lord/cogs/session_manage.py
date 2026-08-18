@@ -23,6 +23,7 @@ from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
+from ..session_close import apply_closed_name, apply_open_name, is_closed
 from ..session_dir import SessionDirManager
 from ..status_view import StatusRow, classify_status, render_status
 from ..thread_settings import (
@@ -1257,12 +1258,33 @@ class SessionManageCog(commands.Cog):
                 results.append("✅ Tmux window closed")
             else:
                 results.append("ℹ️ No tmux window found")
-            results.append("📂 Session directory kept — send a message to resume.")
+            results.append("📂 セッションは保持しています（履歴・作業ディレクトリはそのまま）。")
         else:
             results.append(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
                 " `/clord-init` で設定してください。"
             )
+
+        # #512: record the close so a later message can tell this apart from a
+        # pane that merely died — the latter still auto-resumes via --continue
+        # (#270), this one holds the message and offers the reopen button.
+        with contextlib.suppress(Exception):
+            await self.repo.set_closed(thread_id, True)
+
+        # Rename to "[終了] …" **and** archive (#271) in a single PATCH. They must
+        # not be two calls: Discord refuses to rename an archived thread (code
+        # 50083), and each rename spends one of the thread's ~2-per-10-minutes
+        # allowance — two edits make a 429 (and a silently lost marker) twice as
+        # likely. apply_closed_name falls back to archive-only if the rename half
+        # fails, so a missing Manage Threads permission still leaves the thread
+        # archived (#512).
+        new_name = await apply_closed_name(self.repo, channel)
+        if new_name:
+            results.append(f"🏷️ スレッド名: `{new_name}`")
+        results.append(
+            "▶️ 再開するには `/reopen-workspace`。"
+            "終了後にこのスレッドへ投稿すると、再開ボタン付きの案内が出ます。"
+        )
 
         embed = discord.Embed(
             title="🧹 Workspace Closed",
@@ -1271,13 +1293,9 @@ class SessionManageCog(commands.Cog):
         )
         await respond(embed=embed)
 
-        # Archive the thread to declutter the sidebar (best-effort).
-        with contextlib.suppress(discord.HTTPException):
-            await channel.edit(archived=True)
-
     @app_commands.command(
         name="close-workspace",
-        description="Close the tmux window but keep the session (resumes on next message)",
+        description="終了: close the tmux window, keep the session (reopen to continue)",
     )
     async def close_workspace(self, interaction: discord.Interaction) -> None:
         """Close the tmux window + archive the thread, keeping the session dir (#271)."""
@@ -1289,3 +1307,69 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /close-workspace — webhook-invokable for E2E (#271)."""
         respond, ack = self._ctx_io(ctx)
         await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    async def _reopen_workspace_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /reopen-workspace and !reopen-workspace (#512).
+
+        Inverse of :meth:`_close_workspace_impl`: clears ``closed_at`` and drops
+        the ``[終了]`` marker from the thread name, so the next message runs
+        normally again (resuming the kept session via ``--continue``, #270).
+
+        Deliberately does **not** recreate the tmux window — that happens on the
+        next message like any other resume, which keeps one spawn path instead of
+        two.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond(
+                "This command can only be used in a Claude chat thread.",
+                ephemeral=True,
+            )
+            return
+
+        await ack()
+
+        record = await self.repo.get(channel.id)
+        if record is None:
+            await respond("ℹ️ このスレッドには c-lord のセッションがありません。")
+            return
+        if not is_closed(record):
+            await respond("ℹ️ このスレッドは終了していません（そのままメッセージを送れます）。")
+            return
+
+        await self.repo.set_closed(channel.id, False)
+        # Let the chat cog know this was a deliberate reopen, so the resume it
+        # performs on the next message says so instead of reporting a crash
+        # ("前回のセッションが落ちていたので…", #464). Loose-coupled through
+        # bot.get_cog so this command stays usable when the cog is absent (#512).
+        mark_reopened = getattr(self.bot.get_cog("ClaudeChatCog"), "mark_reopened", None)
+        if mark_reopened is not None:
+            with contextlib.suppress(Exception):
+                mark_reopened(channel.id)
+        new_name = await apply_open_name(self.repo, channel)
+
+        embed = discord.Embed(
+            title="▶️ セッションを再開しました",
+            description=(
+                f"🏷️ スレッド名: `{new_name}`\n"
+                "💬 このスレッドにメッセージを送ると、これまでの会話の続きから再開します。"
+            ),
+            color=COLOR_SUCCESS,
+        )
+        await respond(embed=embed)
+
+    @app_commands.command(
+        name="reopen-workspace",
+        description="Reopen a closed (終了) thread so messages run again",
+    )
+    async def reopen_workspace(self, interaction: discord.Interaction) -> None:
+        """Clear the 終了 state set by /close-workspace (#512)."""
+        respond, ack = self._slash_io(interaction)
+        await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="reopen-workspace")
+    async def reopen_workspace_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /reopen-workspace — webhook-invokable for E2E (#512)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)

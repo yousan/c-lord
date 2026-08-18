@@ -38,6 +38,8 @@ class _Rec:
     rename_backoff_until: str | None = None
     # #414: Issue/PR number shown in the thread name
     issue_ref: str | None = None
+    # #512: set when the session was intentionally closed (/close-workspace)
+    closed_at: str | None = None
 
 
 def test_index_by_thread_id_keeps_only_digit_tids():
@@ -293,6 +295,41 @@ async def test_sync_one_keeps_issue_ref_in_name():
 
     fake_thread.edit.assert_awaited_once()
     assert "#404" in fake_thread.edit.await_args.kwargs["name"]
+
+
+async def test_sync_one_keeps_closed_marker_in_name():
+    """#512 AC5: the 60s sidebar repaint must not strip ``[終了]`` off a closed thread.
+
+    The lamp-sync loop rebuilds the name from the DB row every tick.  Without the
+    ``closed`` flag it would rebuild ``#404 やること`` and quietly undo the marker
+    ``/close-workspace`` just applied.
+    """
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "[終了] #404 やること"
+    fake_thread.edit = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    rec = _Rec(
+        thread_id=222,
+        state="dead",
+        topic="やること",
+        issue_ref="404",
+        closed_at="2026-08-18 12:00:00",
+    )
+
+    with patch.object(thread_state_sync, "discord") as discord_mock:
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = Exception
+        await loop._sync_one(rec, {})  # no tmux window → dead
+
+    # Name already matches the closed form, so no rename is sent at all.
+    fake_thread.edit.assert_not_awaited()
 
 
 async def test_sync_one_waiting_when_prompt_visible():

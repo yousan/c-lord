@@ -38,6 +38,9 @@ class SessionRecord:
     # Issue #414: the Issue/PR number this thread is working on, shown in the
     # thread name as "#<n>". Auto-detected from the git branch / first message.
     issue_ref: str | None = None
+    # Issue #512: timestamp of an intentional /close-workspace, or None when the
+    # session is open. Distinct from a merely dead tmux pane (#270).
+    closed_at: str | None = None
 
 
 class SessionRepository:
@@ -183,6 +186,31 @@ class SessionRepository:
                 "UPDATE sessions SET issue_ref = ? WHERE thread_id = ?",
                 (issue_ref, thread_id),
             )
+            await db.commit()
+
+    async def set_closed(self, thread_id: int, closed: bool) -> None:
+        """Mark the session closed (終了) or reopen it (Issue #512).
+
+        ``closed=True`` stamps ``closed_at`` with the local wall clock;
+        ``closed=False`` clears it back to ``NULL``.
+
+        This is what distinguishes a deliberate ``/close-workspace`` from a tmux
+        pane that merely died: a dead pane still auto-resumes on the next message
+        via ``--continue`` (#270), whereas a closed session holds the message and
+        shows the reopen notice instead.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if closed:
+                await db.execute(
+                    "UPDATE sessions SET closed_at = datetime('now', 'localtime') "
+                    "WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sessions SET closed_at = NULL WHERE thread_id = ?",
+                    (thread_id,),
+                )
             await db.commit()
 
     async def update_trigger_message(self, thread_id: int, message_id: int) -> None:

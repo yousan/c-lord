@@ -285,8 +285,8 @@ class TestCloseWorkspace:
 
         await cog.close_workspace_text.callback(cog, ctx)
 
-        thread.edit.assert_called_once()
-        assert thread.edit.call_args.kwargs.get("archived") is True
+        # Two edits since #512: the "[終了]" rename, then the archive.
+        assert any(c.kwargs.get("archived") is True for c in thread.edit.call_args_list)
 
     async def test_close_stops_mirror_before_archiving(self):
         """#379: close-workspace MUST stop the TranscriptMirror before archiving.
@@ -312,10 +312,14 @@ class TestCloseWorkspace:
         thread.parent_id = 999
         thread.edit = AsyncMock()
 
-        # Record global call order across stop_for and the archive edit.
+        # Record global call order across stop_for and the thread edits.  Since
+        # #512 there are two edits (the "[終了]" rename, then the archive), so the
+        # invariant under test is the *position* of stop_for, not the edit count.
         order: list[str] = []
         mirror_cog.stop_for.side_effect = lambda *a, **k: order.append("stop_for")
-        thread.edit.side_effect = lambda *a, **k: order.append("edit")
+        thread.edit.side_effect = lambda *a, **k: order.append(
+            "archive" if k.get("archived") else "rename"
+        )
 
         ctx = _make_ctx(channel=thread)
         await cog.close_workspace_text.callback(cog, ctx)
@@ -325,7 +329,7 @@ class TestCloseWorkspace:
         # Stopped for this exact thread.
         mirror_cog.stop_for.assert_awaited_once_with(555)
         # And stopped BEFORE the archive, so no echo can land post-archive.
-        assert order == ["stop_for", "edit"]
+        assert order.index("stop_for") < order.index("archive")
 
     async def test_close_works_when_mirror_cog_absent(self):
         """#379 zero-config: no TranscriptMirrorCog (bridge OFF) → no crash, still archives."""
@@ -344,8 +348,7 @@ class TestCloseWorkspace:
 
         await cog.close_workspace_text.callback(cog, ctx)
 
-        thread.edit.assert_called_once()
-        assert thread.edit.call_args.kwargs.get("archived") is True
+        assert any(c.kwargs.get("archived") is True for c in thread.edit.call_args_list)
 
     async def test_workspace_delete_stops_mirror(self):
         """#379: workspace-delete also tears the mirror down so it doesn't tail a removed JSONL."""
