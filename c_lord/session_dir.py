@@ -133,7 +133,11 @@ class SessionDirManager:
             else:
                 args.extend(["--depth=1", "--single-branch"])
 
-            args.extend([self._source_repo, target])
+            # `--` so a flag-shaped source_repo can never be read as a git
+            # option (`--upload-pack=<cmd>` executes it). Repo strings reach
+            # here from user input via `/clord repo:` (#514); channel_repo
+            # .validate_repo_url() is the other half of this guard.
+            args.extend(["--", self._source_repo, target])
 
             result = _run(args)
             if result.returncode != 0:

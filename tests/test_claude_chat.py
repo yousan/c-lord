@@ -1461,7 +1461,7 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="build a feature")
 
         interaction.response.defer.assert_called_once()
-        cog.spawn_session.assert_called_once_with(channel, "build a feature")
+        cog.spawn_session.assert_called_once_with(channel, "build a feature", repo=None)
         interaction.followup.send.assert_called_once()
         sent_text = interaction.followup.send.call_args.args[0]
         assert "<#12345>" in sent_text
@@ -1546,7 +1546,7 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="hello")
 
         interaction.response.defer.assert_called_once()
-        cog.spawn_session.assert_called_once_with(channel, "hello")
+        cog.spawn_session.assert_called_once_with(channel, "hello", repo=None)
 
 
 class TestClordTextCommand:
@@ -1582,7 +1582,7 @@ class TestClordTextCommand:
 
         await cog.clord_text.callback(cog, ctx, prompt="build a feature")
 
-        cog.spawn_session.assert_called_once_with(ctx.channel, "build a feature")
+        cog.spawn_session.assert_called_once_with(ctx.channel, "build a feature", repo=None)
         assert "<#12345>" in ctx.send.call_args.args[0]
 
     @pytest.mark.asyncio

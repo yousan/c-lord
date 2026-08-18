@@ -12,7 +12,7 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 
 - **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
 - **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
-- **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding will return an error directing the user to configure the binding first.
+- **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding returns an error directing the user to configure the binding first — *unless* `repo:` names one explicitly (#514), which works with no binding at all.
 - **Execution mode**: Claude Code runs exclusively in tmux TUI mode. The legacy subprocess mode was removed in v1.x.
 
 ## Slash Commands
@@ -22,12 +22,23 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/clord <prompt>` | Start a new Claude Code session | Channel or thread |
+| `/clord repo:<url> <prompt>` | Start a session on a **specific** repository | Channel only |
 | `/stop` | Stop the active session (session is preserved for resume) | Thread only |
 | `/clear` | Reset the session — next message starts fresh | Thread only |
 | `/compact [instructions]` | Compact (summarize) the session context to free the window | Thread only |
 | `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
 
 **`/clord`** creates a new thread and sends your prompt to Claude Code. If used inside an existing thread, it continues the same session.
+
+**`repo:` is optional** (#514). Leave it out and the thread uses the channel's `/clord-init` repository, as before. Give it and the new thread is cloned from *that* repository instead — no `/clord-init` needed, and no separate `/clord-thread-init` step:
+
+```
+/clord repo:git@github.com:yousan/dotclaude.git prompt:Claude 5 系に対応する
+```
+
+The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root. The thread's tmux session follows the chosen repository too (#427).
+
+`repo:` only applies when a thread is being **created**. Inside an existing thread it is refused with a pointer to `/clord-thread-init`, because that thread's working copy is already cloned and would not change.
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
 
@@ -132,7 +143,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 
 | Command | Description | Example | Slash equivalent |
 |---------|-------------|---------|------------------|
-| `!clord <prompt>` | Start a new session (channel) / continue (thread) | `!clord build X` | `/clord` |
+| `!clord [repo:<url>] <prompt>` | Start a new session (channel) / continue (thread) | `!clord repo:git@github.com:yousan/dotclaude.git build X` | `/clord` |
 | `!attach <window>` | Attach this thread to a tmux window | `!attach w13` | `/clord-attach` |
 | `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |

@@ -29,7 +29,11 @@ if TYPE_CHECKING:
     from ..database.channel_repo import ChannelRepository
     from ..database.thread_repo import ThreadRepository
 
-from ..database.channel_repo import derive_session_name, normalize_repo_url
+from ..database.channel_repo import (
+    derive_session_name,
+    normalize_repo_url,
+    validate_repo_url,
+)
 from ..session_dir import SessionDirManager
 from ..tmux import TmuxSessionManager
 
@@ -177,6 +181,44 @@ class ChannelRepoCog(commands.Cog):
                 names.add(derive_session_name(binding["source_repo"]))
         return names
 
+    async def bind_thread(self, thread_id: int, source_repo: str, channel_id: int) -> str | None:
+        """Bind a thread to *source_repo* and drop its cached managers (#514).
+
+        The extension point ``/clord repo:`` needs: writing the binding by hand
+        would leave ``_thread_manager_cache`` / ``_thread_tmux_cache`` holding
+        the previous answer, and the very next resolve would clone the wrong
+        repo. Returns the normalized repo URL, or None when this bot has no
+        thread-binding repository wired up.
+        """
+        if self._thread_repo is None:
+            return None
+        repo = normalize_repo_url(validate_repo_url(source_repo))
+        await self._thread_repo.save(thread_id=thread_id, source_repo=repo, channel_id=channel_id)
+        self.evict_thread_cache(thread_id)
+        logger.info("Bound thread %d -> %s (channel %d)", thread_id, repo, channel_id)
+        return repo
+
+    async def known_repos(self) -> list[str]:
+        """Every repo this bot already knows about, most recently bound first.
+
+        Feeds the ``/clord repo:`` autocomplete so the option offers real
+        choices instead of an empty box.
+        """
+        seen: dict[str, None] = {}
+        with contextlib.suppress(Exception):
+            for binding in reversed(await self._repo.list_all()):
+                seen.setdefault(binding["source_repo"], None)
+        if self._thread_repo is not None:
+            with contextlib.suppress(Exception):
+                for binding in reversed(await self._thread_repo.list_all()):
+                    seen.setdefault(binding["source_repo"], None)
+        return list(seen)
+
+    async def channel_repo(self, channel_id: int) -> str | None:
+        """The repo a channel is bound to, or None. Used to show the default."""
+        binding = await self._repo.get(channel_id)
+        return binding["source_repo"] if binding else None
+
     def evict_cache(self, channel_id: int) -> None:
         """Remove a cached channel manager (called on bind/unbind)."""
         self._manager_cache.pop(channel_id, None)
@@ -277,7 +319,11 @@ class ChannelRepoCog(commands.Cog):
             return
 
         # --- Bind channel to repo ---
-        repo = normalize_repo_url(repo)  # shrink derived URLs (PR/issue/blob/...) to repo (#88)
+        try:
+            repo = normalize_repo_url(validate_repo_url(repo))  # PR/issue/blob → repo root (#88)
+        except ValueError as exc:
+            await respond(f"⚠️ リポジトリ URL が不正です: {exc}", ephemeral=True)
+            return
         await self._repo.save(channel_id=channel_id, source_repo=repo)
         self.evict_cache(channel_id)
 
@@ -391,7 +437,11 @@ class ChannelRepoCog(commands.Cog):
                 pass  # 他のエラーは無視してbindを続行
 
         # --- Bind thread to repo ---
-        repo = normalize_repo_url(repo)  # shrink derived URLs (PR/issue/blob/...) to repo (#88)
+        try:
+            repo = normalize_repo_url(validate_repo_url(repo))  # PR/issue/blob → repo root (#88)
+        except ValueError as exc:
+            await respond(f"⚠️ リポジトリ URL が不正です: {exc}", ephemeral=True)
+            return
         await self._thread_repo.save(thread_id=thread_id, source_repo=repo, channel_id=channel_id)
         self.evict_thread_cache(thread_id)
         await respond(f"Bound thread <#{thread_id}> → `{repo}`", ephemeral=True)
