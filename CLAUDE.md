@@ -42,7 +42,7 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
 7. **REST API as the control plane**: Claude Code subprocesses communicate back to c-lord via REST API (`CLORD_API_URL` env var), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
 8. **SQLite-backed dynamic scheduler**: Scheduled tasks are stored in `scheduled_tasks` DB table and executed by a single `discord.ext.tasks` master loop (every 30s). Tasks are registered at runtime via REST API — no code changes needed to add new tasks. `discord.ext.tasks` decorators are only used for the master loop, not per-task (they're static/compile-time constructs).
 9. **Claude handles "what", c-lord handles "when"**: For scheduled tasks, c-lord only manages the schedule. All domain logic (what to check, how to deduplicate, what to post) lives in the Claude prompt. No GitHub/AzureDevOps-specific code in c-lord itself.
-10. **Per-channel tmux sessions** (auto-derived from `/clord-init` binding): When a channel is bound to a repo via `/clord-init`, the tmux session name is auto-derived from the repo URL (`derive_session_name()` → e.g. `https://github.com/yousan/c-lord` → `c-lord`). All threads in that channel share that session, with one window per thread (`work1`, `work2`, ...). Channels without a binding fall back to the global default `clord` session. Implemented in `c_lord/cogs/channel_repo.py::resolve_tmux_manager()` (cached per channel) and consumed by `claude_chat`, `webhook_trigger`, `scheduler` cogs. **Do not assume a single global session — always go through `resolve_tmux_manager(channel_id)`.**
+10. **tmux session name follows the *repo*, not the channel** (auto-derived from the binding): the session name comes from the repo URL (`derive_session_name()` → e.g. `https://github.com/yousan/c-lord` → `c-lord`), with one window per thread (`w1`, `w2`, ...). In the common case a channel is bound via `/clord-init` and all its threads share that one session. A thread bound to a *different* repo (`/clord-thread-init`) gets the session of **its own** repo — session_dir and tmux session then still agree, which is the point (#427). Channels without a binding fall back to the global default `clord` session. Implemented in `c_lord/cogs/channel_repo.py::resolve_tmux_manager()` (cached per channel and per thread) and consumed by `claude_chat`, `skill_command`, `session_manage`, `webhook_trigger`, `scheduler` cogs. **Do not assume a single global session, and always pass `thread_id` when a thread is in scope — `resolve_tmux_manager(channel_id, thread_id=...)`.** Omitting it silently resolves the parent channel's session, which is exactly the bug #427 fixed. When a thread's binding changes after its window already exists, `TmuxSessionManager.create_session()` **moves** that window into the newly-resolved session rather than creating a second one (a duplicate window would mean two Claude processes on one checkout).
 
 ### Why REST API over stdout markers for Claude→c-lord communication
 
@@ -186,7 +186,7 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 
 1. **作成** — ユーザーがチャンネルにメッセージ → `ClaudeChatCog` がスレッドを作成
 2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)
-3. **tmux window 作成** — `tmux.py::resolve_tmux_manager(channel_id)` で per-channel session を取得し、新規 window (`work1`, `work2`, ...) を立てる
+3. **tmux window 作成** — `channel_repo.py::resolve_tmux_manager(channel_id, thread_id=...)` で session を取得し (thread binding があればそちらの repo 由来、無ければ channel binding 由来)、新規 window (`w1`, `w2`, ...) を立てる
 4. **Claude CLI 起動 + Skill 注入** — `claude/tmux_runner.py` が tmux window 内で `claude` を起動 (`send-keys`)。同時に `session_dir.py` が `<session_dir>/.claude/skills/discord-reply/SKILL.md` を注入 — Claude はこれを読み取り、応答末尾で `curl POST /api/reply` で **自身が** Discord へ最終回答を投稿する (#53)。
 5. **ツール embed / 状態 emoji** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events を yield。 `EventProcessor` がそれぞれの embed/reaction を Discord に post する。**最終回答テキストはここを通らない** — Skill 経由のみ。
 6. **応答完了** — `RESULT` event で `EventProcessor.finalize()` を呼び、reaction 更新 + registry から unregister
@@ -202,7 +202,7 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 | 同一セッションのはずが別セッション扱い | `_run_helper` で `session_id=` ログを確認、DB の `sessions` テーブル | repository から session_id が読めていない |
 | Webhook trigger が無視される | `Webhook trigger matched` ログの有無 | webhook_id allowlist / channel_ids 不一致、prefix mismatch |
 | Scheduler が動かない | `SchedulerCog: N task(s) due` の有無 (30 秒間隔) | `next_run_at` が未来、`scheduled_tasks` が空 |
-| tmux session が見つからない | `tmux ls` で session 名を確認 | channel に `/clord-init` 未実行 → fallback `clord` を期待してしまう。常に `resolve_tmux_manager(channel_id)` 経由で取得 |
+| tmux session が見つからない | `tmux ls` で session 名を確認 | channel に `/clord-init` 未実行 → fallback `clord` を期待してしまう。常に `resolve_tmux_manager(channel_id, thread_id=...)` 経由で取得する (`thread_id` を渡し忘れると、thread binding があるスレッドで親チャンネルのセッションを引いてしまう — #427) |
 
 これでも切り分かないときは Discord 側の状態 (リアクション・スレッド存在・最終メッセージの author) を上の curl で確認するのが速い。
 

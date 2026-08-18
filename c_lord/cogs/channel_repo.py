@@ -61,6 +61,7 @@ class ChannelRepoCog(commands.Cog):
         self._manager_cache: dict[int, SessionDirManager] = {}
         self._thread_manager_cache: dict[int, SessionDirManager] = {}
         self._tmux_cache: dict[int, TmuxSessionManager] = {}
+        self._thread_tmux_cache: dict[int, TmuxSessionManager] = {}
 
     # ------------------------------------------------------------------
     # Public API (used by ClaudeChatCog)
@@ -111,14 +112,37 @@ class ChannelRepoCog(commands.Cog):
         self._manager_cache[channel_id] = manager
         return manager
 
-    async def resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
-        """Resolve a TmuxSessionManager for the given channel.
+    async def resolve_tmux_manager(
+        self, channel_id: int, thread_id: int | None = None
+    ) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel (and optional thread).
 
-        Lookup order:
-          1. In-memory cache
-          2. DB binding → create manager with auto-derived session name
+        Lookup order mirrors :meth:`resolve_manager`:
+          1. Thread-level: in-memory thread cache → DB thread binding
+          2. Channel-level: in-memory channel cache → DB channel binding
           3. None (caller should fall back to global bot.tmux_manager)
+
+        #427: this used to resolve the channel binding only, so a thread bound
+        to another repo via ``/clord-thread-init`` got its session_dir from the
+        thread's repo but its tmux window in the *parent channel's* session —
+        ``tmux attach`` then showed a session name that did not match the
+        checkout inside it. Honouring the thread binding here keeps the two in
+        step, and gives a thread on an unbound channel a session at all.
         """
+        # --- Thread-level override ---
+        if thread_id is not None and self._thread_repo is not None:
+            if thread_id in self._thread_tmux_cache:
+                return self._thread_tmux_cache[thread_id]
+
+            thread_binding = await self._thread_repo.get(thread_id)
+            if thread_binding is not None:
+                manager = TmuxSessionManager(
+                    session_name=derive_session_name(thread_binding["source_repo"])
+                )
+                self._thread_tmux_cache[thread_id] = manager
+                return manager
+
+        # --- Channel-level fallback ---
         if channel_id in self._tmux_cache:
             return self._tmux_cache[channel_id]
 
@@ -142,7 +166,13 @@ class ChannelRepoCog(commands.Cog):
         from ..tmux import SESSION_NAME
 
         names: set[str] = {SESSION_NAME}
-        for binding in await self._repo.list_all():
+        bindings = list(await self._repo.list_all())
+        # #427: thread bindings now get their own tmux session, so those names
+        # are ours as well — otherwise the watchdog reads them as another bot's.
+        if self._thread_repo is not None:
+            with contextlib.suppress(Exception):
+                bindings += list(await self._thread_repo.list_all())
+        for binding in bindings:
             with contextlib.suppress(Exception):
                 names.add(derive_session_name(binding["source_repo"]))
         return names
@@ -155,6 +185,7 @@ class ChannelRepoCog(commands.Cog):
     def evict_thread_cache(self, thread_id: int) -> None:
         """Remove a cached thread manager (called on thread bind/unbind)."""
         self._thread_manager_cache.pop(thread_id, None)
+        self._thread_tmux_cache.pop(thread_id, None)
 
     # ------------------------------------------------------------------
     # Authorization

@@ -486,13 +486,19 @@ class SessionManageCog(commands.Cog):
             return await channel_cog.resolve_manager(channel_id)
         return None
 
-    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
-        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+    async def _resolve_tmux_manager(
+        self, channel_id: int, thread_id: int | None = None
+    ) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
+
+        #427: pass ``thread_id`` whenever a thread is in scope, so a thread
+        bound to its own repo is looked up in that repo's tmux session.
+        """
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_tmux_manager(channel_id)
+            return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
     async def _resolve_all_tmux_managers(self) -> list[TmuxSessionManager]:
@@ -875,7 +881,7 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is None:
             await respond(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
@@ -1001,7 +1007,8 @@ class SessionManageCog(commands.Cog):
         channels, mirroring the #420 watchdog fallback).
         """
         if parent_id is not None:
-            tmux_mgr = await self._resolve_tmux_manager(parent_id)
+            thread_id = channel.id if isinstance(channel, discord.Thread) else None
+            tmux_mgr = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
             if tmux_mgr is not None:
                 return tmux_mgr.session_name
         if isinstance(channel, discord.Thread):
@@ -1159,7 +1166,7 @@ class SessionManageCog(commands.Cog):
         results: list[str] = []
 
         # Kill tmux window
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is not None:
             killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
             if killed:
@@ -1243,7 +1250,7 @@ class SessionManageCog(commands.Cog):
         results: list[str] = []
 
         # Kill the tmux window to free the w<N> slot.
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is not None:
             killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
             if killed:

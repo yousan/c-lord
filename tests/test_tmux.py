@@ -39,6 +39,8 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),
                 # _find_window_by_working_dir → list-windows (no windows yet)
                 MagicMock(returncode=1, stdout=""),
+                # #427: _adopt_window_from_other_session → list-windows -a (nothing elsewhere)
+                MagicMock(returncode=1, stdout=""),
                 # new-window
                 MagicMock(returncode=0),
                 # set-option @thread_id
@@ -111,6 +113,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
                 MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
+                MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
             ]
@@ -123,6 +126,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout="111\n"),  # show-option w1
                 MagicMock(returncode=0),  # has-session (exists)
                 MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
             ]
@@ -1665,6 +1669,7 @@ class TestSortWindows:
                 MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
+                MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
             ]
