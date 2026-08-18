@@ -44,7 +44,7 @@ def _router(all_windows: str, own_windows: str = ""):
 class TestAdoptWindowFromOtherSession:
     def test_moves_existing_window_instead_of_creating_a_second(self) -> None:
         # The thread's window currently lives in the parent channel's session.
-        elsewhere = f"games\tw5\t\t{WORKDIR}\n"
+        elsewhere = f"games\t@42\tw5\t\t{WORKDIR}\n"
         run, calls = _router(all_windows=elsewhere)
         mgr = _manager()
 
@@ -57,12 +57,15 @@ class TestAdoptWindowFromOtherSession:
         assert mgr._thread_to_window[THREAD] == name
 
         move = next(c for c in calls if c[1] == "move-window")
-        assert "games:w5" in " ".join(move) or "games:" in " ".join(move)
-        assert f"{mgr.session_name}:" in " ".join(move)
+        # Addressed by window_id: "games:w5" is ambiguous the moment another
+        # window shares the name — that is how this failed on staging.
+        assert "@42" in move
+        assert f"{mgr.session_name}:" in move
+        assert "games:w5" not in move
 
     def test_tags_the_adopted_window_with_thread_id(self) -> None:
         """The games windows lost @thread_id to a tmux restart — repair it."""
-        run, calls = _router(all_windows=f"games\tw5\t\t{WORKDIR}\n")
+        run, calls = _router(all_windows=f"games\t@42\tw5\t\t{WORKDIR}\n")
         mgr = _manager()
 
         with patch("c_lord.tmux._run", side_effect=run):
@@ -71,12 +74,11 @@ class TestAdoptWindowFromOtherSession:
         assert "new-window" not in [c[1] for c in calls if len(c) > 1]
         tagged = [c for c in calls if c[1] == "set-option" and "@thread_id" in c]
         assert tagged, "adopted window must carry @thread_id so later lookups find it"
-        # Tagged in the *source* session — the move only works once it is tagged.
-        assert any("games:w5" in c and str(THREAD) in c for c in tagged)
+        assert any("@42" in c and str(THREAD) in c for c in tagged)
 
     def test_ignores_windows_in_a_different_working_dir(self) -> None:
         """Path equality is the safety anchor — never steal another bot's window."""
-        run, calls = _router(all_windows=f"c-lord-staging-2\tw1\t{THREAD}\t/other/dir\n")
+        run, calls = _router(all_windows=f"c-lord-staging-2\t@7\tw1\t{THREAD}\t/other/dir\n")
         mgr = _manager()
 
         with patch("c_lord.tmux._run", side_effect=run):
@@ -88,7 +90,7 @@ class TestAdoptWindowFromOtherSession:
 
     def test_does_not_move_a_window_already_in_this_session(self) -> None:
         own = f"w5\t{WORKDIR}\n"
-        run, calls = _router(all_windows=f"monitoring\tw5\t{THREAD}\t{WORKDIR}\n", own_windows=own)
+        run, calls = _router(all_windows=f"monitoring\t@9\tw5\t{THREAD}\t{WORKDIR}\n", own_windows=own)
         mgr = _manager()
 
         with patch("c_lord.tmux._run", side_effect=run):
@@ -100,14 +102,38 @@ class TestAdoptWindowFromOtherSession:
 
 
 class TestAdoptionSafety:
-    def test_skips_windows_whose_name_breaks_tmux_target_syntax(self) -> None:
-        """``session:window.pane`` — a dotted window name cannot be addressed."""
-        run, calls = _router(all_windows=f"games\tw5.old\t{THREAD}\t{WORKDIR}\n")
+    def test_adopts_a_window_whose_name_breaks_tmux_target_syntax(self) -> None:
+        """``session:window.pane`` — a dotted name is unaddressable by name, but
+        the window_id is not, and the post-move rename gives it a safe ``w{N}``."""
+        run, calls = _router(all_windows=f"games\t@42\tw5.old\t{THREAD}\t{WORKDIR}\n")
         mgr = _manager()
 
         with patch("c_lord.tmux._run", side_effect=run):
-            mgr.create_session(THREAD, WORKDIR)
+            name = mgr.create_session(THREAD, WORKDIR)
 
         subs = [c[1] for c in calls if len(c) > 1]
-        assert "move-window" not in subs
-        assert "new-window" in subs
+        assert "move-window" in subs
+        assert "new-window" not in subs
+        rename = next(c for c in calls if c[1] == "rename-window")
+        assert "@42" in rename and name in rename
+        assert "." not in name
+
+    def test_renames_only_after_a_successful_move(self) -> None:
+        """A failed move must leave the source window's name untouched."""
+        calls: list[list[str]] = []
+
+        def run(args, **_kwargs):
+            calls.append(args)
+            if args[1] == "list-windows":
+                out = f"games\t@42\tw5\t{THREAD}\t{WORKDIR}\n" if "-a" in args else ""
+                return MagicMock(returncode=0, stdout=out)
+            if args[1] == "move-window":
+                return MagicMock(returncode=1, stdout="", stderr="can't find window")
+            return MagicMock(returncode=0, stdout="")
+
+        mgr = _manager()
+        with patch("c_lord.tmux._run", side_effect=run):
+            mgr.create_session(THREAD, WORKDIR)
+
+        assert "rename-window" not in [c[1] for c in calls if len(c) > 1]
+        assert "new-window" in [c[1] for c in calls if len(c) > 1]

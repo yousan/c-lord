@@ -813,10 +813,14 @@ class TmuxSessionManager:
 
     def _find_window_in_other_sessions(
         self, thread_id: int, working_dir: str
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """Find this thread's window living in a *different* tmux session (#427).
 
-        Returns ``(session_name, window_name)`` or None.
+        Returns ``(session_name, window_id, window_name)`` or None. The
+        ``window_id`` (``@123``) is what callers must address: it is unique
+        server-wide and survives renames and moves, whereas ``session:name`` is
+        ambiguous the moment two windows share a name — which is exactly what
+        happened on staging, where the move failed with ``can't find window``.
 
         Path equality is the safety anchor, not ``@thread_id``: a parallel
         c-lord instance (staging) can legitimately hold a window for the same
@@ -831,36 +835,29 @@ class TmuxSessionManager:
                 "list-windows",
                 "-a",
                 "-F",
-                "#{session_name}\t#{window_name}\t#{@thread_id}\t#{pane_current_path}",
+                "#{session_name}\t#{window_id}\t#{window_name}\t"
+                "#{@thread_id}\t#{pane_current_path}",
             ]
         )
         if result.returncode != 0:
             return None
 
         target = working_dir.rstrip("/")
-        fallback: tuple[str, str] | None = None
+        fallback: tuple[str, str, str] | None = None
         for line in result.stdout.strip().splitlines():
             parts = line.split("\t")
-            if len(parts) != 4:
+            if len(parts) != 5:
                 continue
-            session, window, tid, pane_path = parts
-            if session == self.session_name:
-                continue
-            # tmux target syntax is ``session:window.pane``, so a foreign window
-            # whose name carries ``:`` or ``.`` cannot be addressed unambiguously
-            # — moving it would leave us holding an unusable handle. c-lord's own
-            # windows are ``w{N}``; see derive_session_name() for the same guard
-            # applied to session names (#474).
-            if ":" in session or ":" in window or "." in window:
-                logger.debug("Skipping unaddressable window %s:%s", session, window)
+            session, window_id, window, tid, pane_path = parts
+            if session == self.session_name or not window_id:
                 continue
             pane_path = pane_path.rstrip("/")
             if pane_path != target and not pane_path.startswith(target + "/"):
                 continue
             if tid == str(thread_id):
-                return session, window
+                return session, window_id, window
             if fallback is None:
-                fallback = (session, window)
+                fallback = (session, window_id, window)
         return fallback
 
     def _adopt_window_from_other_session(self, thread_id: int, working_dir: str) -> str | None:
@@ -873,32 +870,21 @@ class TmuxSessionManager:
         them invisible to Discord. Move the window instead — the conversation,
         the pane and its scrollback all come along.
 
-        Returns the (renamed) window name, or None when there is nothing to
-        adopt or the move failed.
+        Every tmux op targets the immutable ``window_id``; the rename to this
+        session's ``w{N}`` scheme happens *after* the move, so the new name only
+        has to be free in the destination.
+
+        Returns the window's new name, or None when there is nothing to adopt or
+        the move failed.
         """
         found = self._find_window_in_other_sessions(thread_id, working_dir)
         if found is None:
             return None
-        src_session, src_window = found
+        src_session, window_id, src_name = found
 
         # Tag before moving: windows that lost @thread_id to a tmux restart were
-        # matched by path, and the mapping below needs the option to stick.
-        _run(
-            [
-                "tmux",
-                "set-option",
-                "-w",
-                "-t",
-                f"{src_session}:{src_window}",
-                "@thread_id",
-                str(thread_id),
-            ]
-        )
-
-        # Rename while still in the source session: this bot addresses windows
-        # by ``session:name``, so the name has to be free in the destination.
-        new_name = self._next_window_name()
-        _run(["tmux", "rename-window", "-t", f"{src_session}:{src_window}", new_name])
+        # matched by path, and later lookups need the option to be there.
+        _run(["tmux", "set-option", "-w", "-t", window_id, "@thread_id", str(thread_id)])
 
         result = _run(
             [
@@ -908,29 +894,32 @@ class TmuxSessionManager:
                 # the -d on new-window, #374).
                 "-d",
                 "-s",
-                f"{src_session}:{new_name}",
+                window_id,
                 "-t",
                 f"{self.session_name}:",
             ]
         )
         if result.returncode != 0:
             logger.warning(
-                "Failed to move window %s:%s -> %s: %s",
+                "Failed to move window %s (%s:%s) -> %s: %s",
+                window_id,
                 src_session,
-                new_name,
+                src_name,
                 self.session_name,
                 result.stderr.strip(),
             )
-            # Leave it addressable where it is rather than half-migrated.
-            _run(["tmux", "rename-window", "-t", f"{src_session}:{new_name}", src_window])
             return None
+
+        new_name = self._next_window_name()
+        _run(["tmux", "rename-window", "-t", window_id, new_name])
 
         self._thread_to_window[thread_id] = new_name
         self._save_mapping()
         logger.info(
-            "Adopted tmux window %s:%s -> %s:%s (thread=%d, dir=%s)",
+            "Adopted tmux window %s (%s:%s) -> %s:%s (thread=%d, dir=%s)",
+            window_id,
             src_session,
-            src_window,
+            src_name,
             self.session_name,
             new_name,
             thread_id,
