@@ -13,6 +13,7 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 - **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
 - **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
 - **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding returns an error directing the user to configure the binding first — *unless* `repo:` names one explicitly (#514), which works with no binding at all.
+- **Channels another instance owns** (#522): the `!text` twins reach **every** c-lord instance that can read the channel, so an instance that is neither bound to the channel nor watching it as its `DISCORD_CHANNEL_ID` **says nothing at all** — no warning, no thread. Without this, every bystander bot in a shared server answers the same `!clord` with its own "not bound" warning. Slash commands are unaffected: their replies are ephemeral, so only the invoker sees them.
 - **Execution mode**: Claude Code runs exclusively in tmux TUI mode. The legacy subprocess mode was removed in v1.x.
 
 ## Slash Commands
