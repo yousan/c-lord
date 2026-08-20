@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
-from c_lord.cogs.claude_chat import ClaudeChatCog, _requester_of_turn
+from c_lord.cogs.claude_chat import ClaudeChatCog, _notify_target, _requester_of_turn
 
 OWNER_ID = 7777
 
@@ -37,6 +37,14 @@ def _bot_user(user_id: int = 1111, name: str = "C-lord") -> MagicMock:
     return u
 
 
+def _bot_host(self_id: int = 1111) -> MagicMock:
+    """A bot object whose own user id is *self_id* (c-lord itself)."""
+    bot = MagicMock()
+    bot.user = MagicMock(id=self_id)
+    bot.owner_id = OWNER_ID
+    return bot
+
+
 def _message(author: MagicMock, message_id: int = 77) -> MagicMock:
     m = MagicMock(spec=discord.Message)
     m.id = message_id
@@ -48,29 +56,46 @@ def _message(author: MagicMock, message_id: int = 77) -> MagicMock:
 
 
 class TestRequesterOfTurn:
-    """The pure resolution rule."""
+    """Who asked for the turn — used for the ``Co-authored-by`` credit."""
 
     def test_trigger_author_is_the_requester_for_a_normal_message(self) -> None:
         author = _human()
-        assert _requester_of_turn(_message(author), None, MagicMock()) is author
+        assert _requester_of_turn(_message(author), None, _bot_host()) is author
 
-    def test_explicit_requester_wins_over_a_bot_seed_author(self) -> None:
+    def test_explicit_requester_wins_over_our_own_seed_message(self) -> None:
         """/clord: the seed message is ours, the invoker is the requester."""
         invoker = _human()
-        assert _requester_of_turn(_message(_bot_user()), invoker, MagicMock()) is invoker
+        assert _requester_of_turn(_message(_bot_user()), invoker, _bot_host()) is invoker
 
-    def test_bot_authored_seed_without_an_invoker_has_no_requester(self) -> None:
+    def test_our_own_seed_without_an_invoker_has_no_requester(self) -> None:
         """/api/spawn: nobody in Discord asked for this turn."""
-        assert _requester_of_turn(_message(_bot_user()), None, MagicMock()) is None
+        assert _requester_of_turn(_message(_bot_user()), None, _bot_host()) is None
 
-    def test_our_own_user_id_counts_as_a_bot_seed(self) -> None:
-        """Even when ``.bot`` is missing, a message we posted is not a person."""
+    def test_a_foreign_webhook_or_bot_is_still_the_requester(self) -> None:
+        """#519 records CI/companion-bot provenance — only *our* seed is nobody."""
+        webhook = _bot_user(user_id=9999, name="CI")
+        assert _requester_of_turn(_message(webhook), None, _bot_host()) is webhook
+
+    def test_our_own_user_id_is_recognised_without_a_bot_flag(self) -> None:
+        """Identity is by user id, so a missing ``.bot`` attribute is harmless."""
         me = MagicMock()
         me.id = 1111
         del me.bot
-        bot = MagicMock()
-        bot.user = MagicMock(id=1111)
-        assert _requester_of_turn(_message(me), None, bot) is None
+        assert _requester_of_turn(_message(me), None, _bot_host()) is None
+
+
+class TestNotifyTarget:
+    """Who gets @-mentioned — only a human reads a ping."""
+
+    def test_a_human_requester_is_mentioned(self) -> None:
+        human = _human()
+        assert _notify_target(human, _bot_host()) == human.id
+
+    def test_a_webhook_or_bot_requester_falls_back_to_the_owner(self) -> None:
+        assert _notify_target(_bot_user(user_id=9999), _bot_host()) == OWNER_ID
+
+    def test_no_requester_falls_back_to_the_owner(self) -> None:
+        assert _notify_target(None, _bot_host()) == OWNER_ID
 
 
 class _Stop(BaseException):
@@ -149,7 +174,7 @@ class TestRunClaudeUsesTheRequester:
         assert waiting.kwargs["notify_user_id"] == invoker.id
         assert seen["coauthor"] is invoker
 
-    async def test_bot_seeded_turn_without_an_invoker_falls_back_to_the_owner(self) -> None:
+    async def test_our_own_seed_without_an_invoker_falls_back_to_the_owner(self) -> None:
         """AC4: /api/spawn — ping the owner, credit no Discord user."""
         cog = _make_cog()
 
@@ -159,6 +184,16 @@ class TestRunClaudeUsesTheRequester:
         waiting = seen["dashboard"].set_state.await_args_list[-1]
         assert waiting.kwargs["notify_user_id"] == OWNER_ID
         assert seen["coauthor"] is None
+
+    async def test_a_webhook_turn_pings_the_owner_but_still_credits_the_webhook(self) -> None:
+        """#519 keeps CI provenance in the commit; the ping goes to a human."""
+        cog = _make_cog()
+        webhook = _bot_user(user_id=9999, name="CI")
+
+        seen = await _run_turn(cog, _message(webhook))
+
+        assert seen["config"].notify_user_id == OWNER_ID
+        assert seen["coauthor"] is webhook
 
     async def test_plain_thread_message_still_names_its_author(self) -> None:
         """AC5: the ordinary path is untouched."""

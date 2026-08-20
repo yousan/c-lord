@@ -88,7 +88,7 @@ def _requester_of_turn(
     explicit: discord.Member | discord.User | None,
     bot: object,
 ) -> discord.Member | discord.User | None:
-    """Return the person who asked for this turn, or ``None`` (#520).
+    """Return who asked for this turn, or ``None`` when nobody did (#520).
 
     The trigger message's author is *not* always the requester: ``/clord`` and
     ``POST /api/spawn`` seed the thread with a message **c-lord itself** posts,
@@ -97,22 +97,33 @@ def _requester_of_turn(
     ``Co-authored-by`` trailer (#519) then pointed at.
 
     An ``explicit`` requester (the slash command's invoker) wins; otherwise the
-    trigger author is used unless it is a bot — a bot-seeded turn has no person
-    behind it, and callers fall back to the bot owner rather than ping us.
+    trigger message's author is used — unless it is c-lord's own seed message,
+    which nobody is behind. A webhook or companion bot *is* a requester here:
+    #519 deliberately records it as the provenance of the turn.
     """
     for candidate in (explicit, getattr(user_message, "author", None)):
-        if candidate is None or _is_bot_actor(candidate, bot):
+        if candidate is None or _is_self(candidate, bot):
             continue
         return candidate
     return None
 
 
-def _is_bot_actor(user: object, bot: object) -> bool:
-    """True when *user* is a bot — c-lord itself included — not a person."""
+def _is_self(user: object, bot: object) -> bool:
+    """True when *user* is c-lord itself (i.e. our own seed message)."""
     self_id = getattr(getattr(bot, "user", None), "id", None)
-    if self_id is not None and getattr(user, "id", None) == self_id:
-        return True
-    return bool(getattr(user, "bot", False))
+    return self_id is not None and getattr(user, "id", None) == self_id
+
+
+def _notify_target(requester: object, bot: object) -> int | None:
+    """Discord user to @-mention for this turn, or ``None`` (#520).
+
+    Only a human reads a ping, so a webhook- or bot-driven turn falls back to
+    the configured owner — the same convention the scheduler and webhook cogs
+    already use — instead of mentioning an account nobody watches.
+    """
+    if requester is not None and not bool(getattr(requester, "bot", False)):
+        return getattr(requester, "id", None)
+    return getattr(bot, "owner_id", None)
 
 
 class ClaudeChatCog(commands.Cog):
@@ -1719,14 +1730,12 @@ class ClaudeChatCog(commands.Cog):
         message c-lord itself posts, so ``user_message.author`` is the bot.
         Defaults to the trigger message's author, as before.
         """
-        # #520: resolve who to ping (#480/#481) and credit (#519) for this turn.
-        # A bot-seeded turn has nobody behind it, so it falls back to the bot
-        # owner for the ping — the same convention as scheduler/webhook turns —
-        # and records no Discord co-author.
+        # #520: resolve who asked for this turn — the invoker for /clord, the
+        # trigger message's author otherwise, and nobody when the trigger is
+        # c-lord's own seed message. That answers both "who to credit" (#519)
+        # and, once bots are filtered out, "who to ping" (#480/#481).
         requester = _requester_of_turn(user_message, requester, self.bot)
-        notify_user_id = (
-            requester.id if requester is not None else getattr(self.bot, "owner_id", None)
-        )
+        notify_user_id = _notify_target(requester, self.bot)
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
