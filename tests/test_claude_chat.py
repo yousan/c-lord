@@ -1614,7 +1614,9 @@ class TestClordTextCommand:
         cc = _make_channel_cog_mock()  # both managers None
         cog = _make_cog(channel_cog=cc)
         ctx = _make_channel_ctx()
-        ctx.channel.id = 4242
+        # This instance's own channel (== bot.channel_id): #522 keeps the
+        # guidance here and only silences channels belonging to other instances.
+        ctx.channel.id = 999
         cog.spawn_session = AsyncMock()
 
         await cog.clord_text.callback(cog, ctx, prompt="hello")

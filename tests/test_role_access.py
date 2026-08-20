@@ -259,7 +259,9 @@ def _make_text_ctx(
     ctx = MagicMock()
     ctx.author = author
     ctx.channel = MagicMock(spec=channel_spec)
-    ctx.channel.id = 555
+    # 999 == bot.channel_id: this instance's own channel, so an unbound channel
+    # still answers with guidance (#522 only silences other instances' channels).
+    ctx.channel.id = 999
     ctx.channel.parent_id = None
     ctx.message = MagicMock(spec=discord.Message)
     ctx.message.webhook_id = webhook_id
