@@ -173,6 +173,13 @@ def _is_inside(path: Path, parent: Path) -> bool:
     return resolved == root or root in resolved.parents
 
 
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _remove(path: Path) -> None:
     try:
         path.unlink()
@@ -252,10 +259,3 @@ def install_coauthor_hook(
 
     logger.debug("coauthor: hook installed at %s", hook_path)
     return str(hook_path)
-
-
-def _read(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
