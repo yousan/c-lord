@@ -151,9 +151,10 @@ class TestHookOnRealRepo:
         assert CLAUDE_COAUTHOR in body
 
     def test_applies_even_with_no_verify(self, repo: Path) -> None:
-        install_coauthor_hook(repo, user=_user())
+        user = _user()
+        install_coauthor_hook(repo, user=user)
         body = _commit(repo, "feat: bypass hooks", extra=["--no-verify"])
-        assert "users.noreply.discord.com" in body
+        assert discord_trailer(user) in body
 
     def test_claude_trailer_not_duplicated_when_claude_already_signed(self, repo: Path) -> None:
         install_coauthor_hook(repo, user=_user())
@@ -182,10 +183,12 @@ class TestHookOnRealRepo:
 
     def test_shell_metacharacters_in_name_are_not_executed(self, repo: Path) -> None:
         marker = repo / "pwned"
-        install_coauthor_hook(repo, user=_user(7, "a$(touch pwned)`touch pwned`b"))
+        user = _user(7, "a$(touch pwned)`touch pwned`b")
+        install_coauthor_hook(repo, user=user)
         body = _commit(repo, "feat: injection attempt")
         assert not marker.exists(), "display name was executed by the hook"
-        assert "users.noreply.discord.com" in body
+        # The name survives verbatim as *text* — it is data, never shell.
+        assert discord_trailer(user) in body
 
     def test_merge_commits_are_left_alone(self, repo: Path) -> None:
         install_coauthor_hook(repo, user=_user())
@@ -197,7 +200,7 @@ class TestHookOnRealRepo:
         result = _git(repo, "merge", "--no-ff", "-m", "merge side", "side")
         assert result.returncode == 0, result.stderr
         body = _git(repo, "log", "-1", "--format=%B").stdout
-        assert "users.noreply.discord.com" not in body
+        assert "Co-authored-by:" not in body
 
     def test_commit_succeeds_when_data_file_is_deleted(self, repo: Path) -> None:
         install_coauthor_hook(repo, user=_user())
@@ -225,11 +228,12 @@ class TestHookInstallation:
         custom = repo / ".git" / "alt-hooks"
         custom.mkdir()
         _git(repo, "config", "core.hooksPath", str(custom))
-        path = install_coauthor_hook(repo, user=_user())
+        user = _user()
+        path = install_coauthor_hook(repo, user=user)
         assert path is not None
         assert Path(path).parent == custom
         body = _commit(repo, "feat: custom hooks dir")
-        assert "users.noreply.discord.com" in body
+        assert discord_trailer(user) in body
 
     def test_hooks_path_in_the_working_tree_is_refused(self, repo: Path) -> None:
         """husky-style `core.hooksPath=.husky`: writing there would leave an
@@ -270,7 +274,7 @@ class TestHookInstallation:
         assert install_coauthor_hook(repo, user=_user()) is None
         assert not Path(path).exists()
         body = _commit(repo, "feat: disabled")
-        assert "users.noreply.discord.com" not in body
+        assert "Co-authored-by:" not in body
 
     def test_non_git_directory_is_a_noop(self, tmp_path: Path) -> None:
         assert install_coauthor_hook(tmp_path, user=_user()) is None
