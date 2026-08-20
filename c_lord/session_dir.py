@@ -24,6 +24,9 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from .coauthor import install_coauthor_hook
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +112,7 @@ class SessionDirManager:
     def source_repo(self) -> str:
         return self._source_repo
 
-    def create_session_dir(self, thread_id: int) -> str:
+    def create_session_dir(self, thread_id: int, coauthor: Any | None = None) -> str:
         """Create (or return existing) session directory for a thread.
 
         Idempotent: if the directory already exists, returns its path
@@ -117,6 +120,13 @@ class SessionDirManager:
         call when the flag is enabled — this keeps SKILL.md in sync with the
         current ``CLORD_API_URL`` / ``CLORD_API_SECRET`` even if the operator
         changes them between sessions.
+
+        Args:
+            thread_id: Discord thread the session belongs to.
+            coauthor: Discord user who triggered this turn (#518). Recorded
+                as a ``Co-authored-by`` trailer on commits Claude makes in
+                this checkout. None for runs with no human behind them
+                (scheduler), which then get Claude's trailer only.
 
         Returns:
             Absolute path to the session directory.
@@ -186,6 +196,12 @@ class SessionDirManager:
             inject_read_skill(target)
         except OSError as exc:
             logger.warning("Failed to inject discord-read for thread %d: %s", thread_id, exc)
+
+        # Issue #518: (re)install the prepare-commit-msg hook so commits made
+        # in this checkout record who asked for them. Refreshed every turn —
+        # the trailer must name the user who triggered *this* turn, not the
+        # one who happened to create the thread.
+        install_coauthor_hook(target, user=coauthor)
 
         return target
 

@@ -1731,8 +1731,12 @@ class ClaudeChatCog(commands.Cog):
             # session_dir_manager and tmux_manager already resolved above
             working_dir = self.runner.working_dir  # default
             if session_dir_manager is not None:
+                # #518: hand the turn's Discord author down so the session
+                # dir's commit hook can credit them as a Co-authored-by.
                 session_dir = await _asyncio.to_thread(
-                    session_dir_manager.create_session_dir, thread.id
+                    session_dir_manager.create_session_dir,
+                    thread.id,
+                    getattr(user_message, "author", None),
                 )
                 working_dir = session_dir
                 logger.info("Session dir for thread %d: %s", thread.id, session_dir)
