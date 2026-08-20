@@ -32,6 +32,9 @@ def _user(user_id: int = 4242, name: str = "yousan") -> MagicMock:
     u.id = user_id
     u.display_name = name
     u.name = name
+    # A real discord.User exposes a bool here; #520 keys off it to tell a
+    # person from a bot-authored seed message, so the stand-in must too.
+    u.bot = False
     return u
 
 
