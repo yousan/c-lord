@@ -83,6 +83,49 @@ _SEND_PERMISSION_HELP = (
 )
 
 
+def _requester_of_turn(
+    user_message: discord.Message | None,
+    explicit: discord.Member | discord.User | None,
+    bot: object,
+) -> discord.Member | discord.User | None:
+    """Return who asked for this turn, or ``None`` when nobody did (#520).
+
+    The trigger message's author is *not* always the requester: ``/clord`` and
+    ``POST /api/spawn`` seed the thread with a message **c-lord itself** posts,
+    so reading the author there names the bot — which is who the completion
+    mention (#481), the interactive-prompt mention (#480) and the
+    ``Co-authored-by`` trailer (#519) then pointed at.
+
+    An ``explicit`` requester (the slash command's invoker) wins; otherwise the
+    trigger message's author is used — unless it is c-lord's own seed message,
+    which nobody is behind. A webhook or companion bot *is* a requester here:
+    #519 deliberately records it as the provenance of the turn.
+    """
+    for candidate in (explicit, getattr(user_message, "author", None)):
+        if candidate is None or _is_self(candidate, bot):
+            continue
+        return candidate
+    return None
+
+
+def _is_self(user: object, bot: object) -> bool:
+    """True when *user* is c-lord itself (i.e. our own seed message)."""
+    self_id = getattr(getattr(bot, "user", None), "id", None)
+    return self_id is not None and getattr(user, "id", None) == self_id
+
+
+def _notify_target(requester: object, bot: object) -> int | None:
+    """Discord user to @-mention for this turn, or ``None`` (#520).
+
+    Only a human reads a ping, so a webhook- or bot-driven turn falls back to
+    the configured owner — the same convention the scheduler and webhook cogs
+    already use — instead of mentioning an account nobody watches.
+    """
+    if requester is not None and not bool(getattr(requester, "bot", False)):
+        return getattr(requester, "id", None)
+    return getattr(bot, "owner_id", None)
+
+
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
 
@@ -684,7 +727,11 @@ class ClaudeChatCog(commands.Cog):
                 )
                 await respond(_SEND_PERMISSION_HELP, ephemeral=True)
                 return
-            await self._run_claude(seed_message, channel, prompt=prompt, session_id=session_id)
+            # #520: the seed message above is ours, so hand the invoker down
+            # explicitly — otherwise the turn would ping and credit the bot.
+            await self._run_claude(
+                seed_message, channel, prompt=prompt, session_id=session_id, requester=user
+            )
             await respond("Session completed.", silent=True)
         else:
             # Create a new thread via spawn_session (text channels only)
@@ -692,7 +739,7 @@ class ClaudeChatCog(commands.Cog):
                 await respond("This command must be used in a text channel.", ephemeral=True)
                 return
             try:
-                thread = await self.spawn_session(channel, prompt, repo=repo)
+                thread = await self.spawn_session(channel, prompt, repo=repo, requester=user)
             except ThreadCreateForbiddenError:
                 # #443: bot lacks View Channel / Create Public Threads here.
                 # Reply via the interaction (ephemeral) — the channel itself is
@@ -1196,6 +1243,7 @@ class ClaudeChatCog(commands.Cog):
         thread_name: str | None = None,
         session_id: str | None = None,
         repo: str | None = None,
+        requester: discord.Member | discord.User | None = None,
     ) -> discord.Thread:
         """Create a new thread and start a Claude Code session without a user message.
 
@@ -1217,6 +1265,12 @@ class ClaudeChatCog(commands.Cog):
             repo: Optional repository for this thread (#514). Bound to the new
                   thread before Claude starts, so the session dir is cloned
                   from it instead of from the channel's binding.
+            requester: Discord user who asked for this session (#520). The seed
+                  message below is authored by the bot, so without this the turn
+                  would ping and credit c-lord itself. ``None`` (e.g.
+                  ``POST /api/spawn``) ⇒ no person behind the turn: the ping
+                  falls back to the bot owner and no Discord co-author is
+                  recorded.
 
         Returns:
             The newly created :class:`discord.Thread`.
@@ -1273,7 +1327,11 @@ class ClaudeChatCog(commands.Cog):
             raise
         # Run Claude in the background so /api/spawn returns immediately.
         # The caller gets the thread reference without waiting for Claude to finish.
-        asyncio.create_task(self._run_claude(seed_message, thread, prompt, session_id=session_id))
+        asyncio.create_task(
+            self._run_claude(
+                seed_message, thread, prompt, session_id=session_id, requester=requester
+            )
+        )
         return thread
 
     async def cog_unload(self) -> None:
@@ -1663,8 +1721,22 @@ class ClaudeChatCog(commands.Cog):
         session_id: str | None,
         image_paths: list[str] | None = None,
         try_continue: bool = False,
+        requester: discord.Member | discord.User | None = None,
     ) -> None:
-        """Execute Claude Code CLI and stream results to the thread."""
+        """Execute Claude Code CLI and stream results to the thread.
+
+        ``requester`` (#520) names the person who asked for this turn when the
+        trigger message is not theirs — ``/clord`` seeds the thread with a
+        message c-lord itself posts, so ``user_message.author`` is the bot.
+        Defaults to the trigger message's author, as before.
+        """
+        # #520: resolve who asked for this turn — the invoker for /clord, the
+        # trigger message's author otherwise, and nobody when the trigger is
+        # c-lord's own seed message. That answers both "who to credit" (#519)
+        # and, once bots are filtered out, "who to ping" (#480/#481).
+        requester = _requester_of_turn(user_message, requester, self.bot)
+        notify_user_id = _notify_target(requester, self.bot)
+
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
         session_dir_manager = await self._resolve_session_dir_manager(
@@ -1731,12 +1803,14 @@ class ClaudeChatCog(commands.Cog):
             # session_dir_manager and tmux_manager already resolved above
             working_dir = self.runner.working_dir  # default
             if session_dir_manager is not None:
-                # #518: hand the turn's Discord author down so the session
-                # dir's commit hook can credit them as a Co-authored-by.
+                # #518: hand the turn's requester down so the session dir's
+                # commit hook can credit them as a Co-authored-by. #520: that is
+                # the requester, not the trigger message's author — a /clord
+                # seed message is authored by the bot itself.
                 session_dir = await _asyncio.to_thread(
                     session_dir_manager.create_session_dir,
                     thread.id,
-                    getattr(user_message, "author", None),
+                    requester,
                 )
                 working_dir = session_dir
                 logger.info("Session dir for thread %d: %s", thread.id, session_dir)
@@ -1841,10 +1915,11 @@ class ClaudeChatCog(commands.Cog):
                         image_paths=image_paths,
                         working_dir=working_dir or None,
                         authorizer=self._authorizer,
-                        # #480: ping the poster of THIS turn when an interactive
-                        # prompt (permission/plan/elicitation/ask) blocks it —
-                        # a mid-turn pause never reaches the turn-end mention.
-                        notify_user_id=user_message.author.id,
+                        # #480: ping the requester of THIS turn when an
+                        # interactive prompt (permission/plan/elicitation/ask)
+                        # blocks it — a mid-turn pause never reaches the
+                        # turn-end mention.
+                        notify_user_id=notify_user_id,
                     )
                 )
             finally:
@@ -1877,8 +1952,9 @@ class ClaudeChatCog(commands.Cog):
                             ThreadState.WAITING_INPUT,
                             description,
                             thread=thread,
-                            # #481: ping the poster of THIS turn, not a fixed
-                            # owner — so completion reaches whoever is waiting
-                            # (any guild / any authorized user, owner or not).
-                            notify_user_id=user_message.author.id,
+                            # #481: ping the requester of THIS turn, not a
+                            # fixed owner — so completion reaches whoever is
+                            # waiting (any guild / any authorized user, owner or
+                            # not). #520: bot-seeded turns fall back to owner.
+                            notify_user_id=notify_user_id,
                         )
