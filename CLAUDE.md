@@ -43,6 +43,7 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
 8. **SQLite-backed dynamic scheduler**: Scheduled tasks are stored in `scheduled_tasks` DB table and executed by a single `discord.ext.tasks` master loop (every 30s). Tasks are registered at runtime via REST API — no code changes needed to add new tasks. `discord.ext.tasks` decorators are only used for the master loop, not per-task (they're static/compile-time constructs).
 9. **Claude handles "what", c-lord handles "when"**: For scheduled tasks, c-lord only manages the schedule. All domain logic (what to check, how to deduplicate, what to post) lives in the Claude prompt. No GitHub/AzureDevOps-specific code in c-lord itself.
 10. **tmux session name follows the *repo*, not the channel** (auto-derived from the binding): the session name comes from the repo URL (`derive_session_name()` → e.g. `https://github.com/yousan/c-lord` → `c-lord`), with one window per thread (`w1`, `w2`, ...). In the common case a channel is bound via `/clord-init` and all its threads share that one session. A thread bound to a *different* repo (`/clord-thread-init`) gets the session of **its own** repo — session_dir and tmux session then still agree, which is the point (#427). Channels without a binding fall back to the global default `clord` session. Implemented in `c_lord/cogs/channel_repo.py::resolve_tmux_manager()` (cached per channel and per thread) and consumed by `claude_chat`, `skill_command`, `session_manage`, `webhook_trigger`, `scheduler` cogs. **Do not assume a single global session, and always pass `thread_id` when a thread is in scope — `resolve_tmux_manager(channel_id, thread_id=...)`.** Omitting it silently resolves the parent channel's session, which is exactly the bug #427 fixed. When a thread's binding changes after its window already exists, `TmuxSessionManager.create_session()` **moves** that window into the newly-resolved session rather than creating a second one (a duplicate window would mean two Claude processes on one checkout).
+11. **Commits record who asked for them** (#518): every session dir gets a `prepare-commit-msg` hook (`c_lord/coauthor.py`) that appends `Co-authored-by: <Discord 表示名> <<user_id>@users.noreply.discord.com>` plus Claude's own trailer to any commit Claude makes there. The hook is refreshed on every turn by `create_session_dir(thread_id, coauthor=...)`, so the trailer names **the user who triggered that turn** — not whoever created the thread. A hook, not a prompt instruction: an instruction depends on Claude remembering, which is the #491 failure mode. The display name never enters the hook script (it is written to `<git_dir>/clord-coauthors` and read as data), so a hostile display name cannot become shell. Every failure path in the hook exits 0 — trailers must never be able to fail a commit. Foreign `prepare-commit-msg` hooks are never overwritten. Opt out with `CLORD_COAUTHOR=0`. あるべき動きは `docs/specs/commit-coauthors.md`。
 
 ### Why REST API over stdout markers for Claude→c-lord communication
 
@@ -185,7 +186,7 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
 c-lord で 1 つの「セッション」が辿る状態遷移:
 
 1. **作成** — ユーザーがチャンネルにメッセージ → `ClaudeChatCog` がスレッドを作成
-2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)
+2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)。同時に `coauthor.py` が `prepare-commit-msg` フックを (再)注入し、このターンの依頼者を `Co-authored-by` として記録する (#518)
 3. **tmux window 作成** — `channel_repo.py::resolve_tmux_manager(channel_id, thread_id=...)` で session を取得し (thread binding があればそちらの repo 由来、無ければ channel binding 由来)、新規 window (`w1`, `w2`, ...) を立てる
 4. **Claude CLI 起動 + Skill 注入** — `claude/tmux_runner.py` が tmux window 内で `claude` を起動 (`send-keys`)。同時に `session_dir.py` が `<session_dir>/.claude/skills/discord-reply/SKILL.md` を注入 — Claude はこれを読み取り、応答末尾で `curl POST /api/reply` で **自身が** Discord へ最終回答を投稿する (#53)。
 5. **ツール embed / 状態 emoji** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events を yield。 `EventProcessor` がそれぞれの embed/reaction を Discord に post する。**最終回答テキストはここを通らない** — Skill 経由のみ。
@@ -271,6 +272,7 @@ c_lord/          # Installable Python package
   main.py                # Standalone entry point
   bot.py                 # Discord Bot class
   session_dir.py         # Git clone based session directory management
+  coauthor.py            # prepare-commit-msg hook: Co-authored-by trailers (#518)
   tmux.py                # Tmux session management wrapper
   cogs/
     claude_chat.py       # Main chat Cog (thread creation, message handling)
