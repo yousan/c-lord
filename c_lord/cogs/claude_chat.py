@@ -221,6 +221,24 @@ class ClaudeChatCog(commands.Cog):
         """
         return self._authorizer.is_allowed(member)
 
+    def _is_someone_elses_channel(
+        self, channel_id: int | None, message: discord.Message | None
+    ) -> bool:
+        """True when this instance should stay quiet here (#522).
+
+        Several c-lord instances can share a guild, and a text command reaches
+        **every** one that can read the channel — so answering an unbound
+        channel means each bystander bot posts the same public warning. A
+        channel is ours when it is the configured ``DISCORD_CHANNEL_ID``; a
+        bound channel never reaches this check (it resolves a manager).
+
+        Only message-backed invocations are silenced: a slash command's reply
+        is ephemeral, so it reaches its invoker and nobody else.
+        """
+        if message is None:
+            return False
+        return channel_id != getattr(self.bot, "channel_id", None)
+
     def _is_message_authorized(self, message: discord.Message) -> bool:
         """Whether *message* is allowed to drive Claude.
 
@@ -682,6 +700,8 @@ class ClaudeChatCog(commands.Cog):
             sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
             tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=channel.id)
             if sdm is None and tmux is None:
+                if self._is_someone_elses_channel(parent_channel_id, message):
+                    return
                 await respond(
                     "⚠️ このスレッドにはリポジトリが紐づけられていません。\n"
                     "先に `/clord-thread-init repo:<URL>` または"
@@ -701,6 +721,8 @@ class ClaudeChatCog(commands.Cog):
                 sdm = await self._resolve_session_dir_manager(channel_id)
                 tmux = await self._resolve_tmux_manager(channel_id)
                 if sdm is None and tmux is None:
+                    if self._is_someone_elses_channel(channel_id, message):
+                        return
                     await respond(
                         "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
                         "`/clord repo:<URL> prompt:<やること>` でこの1回だけ指定するか、"
