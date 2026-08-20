@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands, tasks
 
+from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -161,8 +162,9 @@ class SchedulerCog(commands.Cog):
                     session_id=None,
                     registry=registry,
                     # #480: scheduled turns have no human poster — fall back to
-                    # the bot owner so a question-mode pause still pings someone.
-                    notify_user_id=getattr(self.bot, "owner_id", None),
+                    # the bot owner so a question-mode pause still pings someone
+                    # (#525: unless this deployment turned that fallback off).
+                    notify_user_id=owner_notify_id(self.bot, kind="blocked"),
                 )
             )
 

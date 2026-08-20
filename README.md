@@ -382,6 +382,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `MAX_CONCURRENT_SESSIONS` | Max parallel sessions | `3` |
 | `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout | `300` |
 | `DISCORD_OWNER_ID` | User ID to @-mention when Claude needs input | (optional) |
+| `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end + pauses), `blocked` (pauses only), `off` (never) | `blocked` |
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |

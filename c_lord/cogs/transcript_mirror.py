@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from ..notify_policy import owner_notify_id
 from ..transcript.mirror import (
     TranscriptMirror,
     bridge_mode_jsonl,
@@ -226,7 +227,7 @@ class TranscriptMirrorCog(commands.Cog):
                 question,
                 runner,
                 ask_repo=getattr(bot, "ask_repo", None),
-                notify_user_id=getattr(bot, "owner_id", None),
+                notify_user_id=owner_notify_id(bot, kind="blocked"),
             )
 
         return ask_bridge
