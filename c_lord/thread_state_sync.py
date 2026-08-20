@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from .notify_policy import owner_notify_id
 from .session_close import is_closed
 from .thread_name import build_name
 from .tmux import parse_work_number
@@ -724,8 +725,9 @@ class MenuWatchdogLoop:
                 runner,
                 ask_repo=getattr(self._bot, "ask_repo", None),
                 # #480: watchdog bridges a menu no Discord turn is watching
-                # (terminal-driven), so ping the bot owner as the fallback.
-                notify_user_id=getattr(self._bot, "owner_id", None),
+                # (terminal-driven), so ping the bot owner as the fallback
+                # (#525: unless this deployment turned that fallback off).
+                notify_user_id=owner_notify_id(self._bot, kind="blocked"),
             ),
             name=f"menu-watchdog-{thread_id}",
         )

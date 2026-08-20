@@ -23,6 +23,7 @@ from discord.ext import commands
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
+from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 
@@ -189,8 +190,9 @@ class WebhookTriggerCog(commands.Cog):
                     status=None,
                     registry=self._registry,
                     # #480: no human poster on a webhook (CI/CD) turn — fall back
-                    # to the bot owner so a question-mode pause still pings someone.
-                    notify_user_id=getattr(self.bot, "owner_id", None),
+                    # to the bot owner so a question-mode pause still pings someone
+                    # (#525: unless this deployment turned that fallback off).
+                    notify_user_id=owner_notify_id(self.bot, kind="blocked"),
                 )
             )
 

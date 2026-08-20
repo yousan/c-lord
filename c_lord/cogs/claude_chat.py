@@ -39,6 +39,7 @@ from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thre
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import ReopenSessionView, StopView
+from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_settings import resolve_auto_archive_duration
@@ -114,16 +115,18 @@ def _is_self(user: object, bot: object) -> bool:
     return self_id is not None and getattr(user, "id", None) == self_id
 
 
-def _notify_target(requester: object, bot: object) -> int | None:
+def _notify_target(requester: object, bot: object, *, kind: Kind) -> int | None:
     """Discord user to @-mention for this turn, or ``None`` (#520).
 
     Only a human reads a ping, so a webhook- or bot-driven turn falls back to
     the configured owner — the same convention the scheduler and webhook cogs
-    already use — instead of mentioning an account nobody watches.
+    already use — instead of mentioning an account nobody watches. How far that
+    fallback goes is deployment policy (#525): see :mod:`c_lord.notify_policy`.
+    A turn a person actually asked for always mentions that person.
     """
     if requester is not None and not bool(getattr(requester, "bot", False)):
         return getattr(requester, "id", None)
-    return getattr(bot, "owner_id", None)
+    return owner_notify_id(bot, kind=kind)
 
 
 class ClaudeChatCog(commands.Cog):
@@ -1757,7 +1760,11 @@ class ClaudeChatCog(commands.Cog):
         # c-lord's own seed message. That answers both "who to credit" (#519)
         # and, once bots are filtered out, "who to ping" (#480/#481).
         requester = _requester_of_turn(user_message, requester, self.bot)
-        notify_user_id = _notify_target(requester, self.bot)
+        # #525: the two mentions answer different questions — "your turn is
+        # parked, come and decide" vs "your turn is done" — so a deployment can
+        # keep the first and drop the second for turns nobody human asked for.
+        notify_user_id = _notify_target(requester, self.bot, kind="blocked")
+        completion_notify_id = _notify_target(requester, self.bot, kind="completion")
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
@@ -1977,6 +1984,7 @@ class ClaudeChatCog(commands.Cog):
                             # #481: ping the requester of THIS turn, not a
                             # fixed owner — so completion reaches whoever is
                             # waiting (any guild / any authorized user, owner or
-                            # not). #520: bot-seeded turns fall back to owner.
-                            notify_user_id=notify_user_id,
+                            # not). #520: bot-seeded turns fall back to owner,
+                            # #525: and only when the deployment asked for it.
+                            notify_user_id=completion_notify_id,
                         )

@@ -13,6 +13,7 @@ import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import pytest
 
 from c_lord.cogs.claude_chat import ClaudeChatCog, _notify_target, _requester_of_turn
 
@@ -85,17 +86,26 @@ class TestRequesterOfTurn:
 
 
 class TestNotifyTarget:
-    """Who gets @-mentioned — only a human reads a ping."""
+    """Who gets @-mentioned — only a human reads a ping.
 
-    def test_a_human_requester_is_mentioned(self) -> None:
+    The owner *fallback* is deployment policy (#525), so these ask for the
+    mode that exercises it; ``tests/test_notify_policy.py`` owns the matrix.
+    """
+
+    def test_a_human_requester_is_mentioned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "off")  # never masks a real poster
         human = _human()
-        assert _notify_target(human, _bot_host()) == human.id
+        assert _notify_target(human, _bot_host(), kind="completion") == human.id
 
-    def test_a_webhook_or_bot_requester_falls_back_to_the_owner(self) -> None:
-        assert _notify_target(_bot_user(user_id=9999), _bot_host()) == OWNER_ID
+    def test_a_webhook_or_bot_requester_falls_back_to_the_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
+        assert _notify_target(_bot_user(user_id=9999), _bot_host(), kind="completion") == OWNER_ID
 
-    def test_no_requester_falls_back_to_the_owner(self) -> None:
-        assert _notify_target(None, _bot_host()) == OWNER_ID
+    def test_no_requester_falls_back_to_the_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
+        assert _notify_target(None, _bot_host(), kind="completion") == OWNER_ID
 
 
 class _Stop(BaseException):
@@ -174,8 +184,15 @@ class TestRunClaudeUsesTheRequester:
         assert waiting.kwargs["notify_user_id"] == invoker.id
         assert seen["coauthor"] is invoker
 
-    async def test_our_own_seed_without_an_invoker_falls_back_to_the_owner(self) -> None:
-        """AC4: /api/spawn — ping the owner, credit no Discord user."""
+    async def test_our_own_seed_without_an_invoker_falls_back_to_the_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC4: /api/spawn — ping the owner, credit no Discord user.
+
+        #525 made the turn-end half of that fallback configurable; this asserts
+        the resolution itself, so it asks for the mode that keeps both halves.
+        """
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
         cog = _make_cog()
 
         seen = await _run_turn(cog, _message(_bot_user()))

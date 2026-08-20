@@ -143,6 +143,15 @@ class TestSetState:
 
 
 class TestOwnerMention:
+    @pytest.fixture(autouse=True)
+    def _owner_fallback_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#525: these cover the owner *fallback* itself, so ask for it.
+
+        The shipped default is ``blocked`` (turn-end pings only the human who
+        asked), and TestOwnerFallbackPolicy below covers that side.
+        """
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
+
     @pytest.mark.asyncio
     async def test_mention_sent_on_waiting_input_transition(self) -> None:
         dashboard, channel = _make_dashboard(owner_id=42)
@@ -374,3 +383,55 @@ def _thread_info(
     description: str,
 ) -> _ThreadInfo:
     return _ThreadInfo(thread_id=thread_id, description=description, state=state)
+
+
+class TestOwnerFallbackPolicy:
+    """#525: CLORD_OWNER_FALLBACK decides whether a turn nobody asked for pings."""
+
+    @pytest.mark.asyncio
+    async def test_default_does_not_ping_the_owner_on_turn_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default ``blocked``: a turn no human asked for finishes silently."""
+        monkeypatch.delenv("CLORD_OWNER_FALLBACK", raising=False)
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_off_does_not_ping_the_owner_either(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "off")
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_real_poster_is_mentioned_in_every_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The policy governs the fallback only — never a human requester."""
+        for mode in ("all", "blocked", "off"):
+            monkeypatch.setenv("CLORD_OWNER_FALLBACK", mode)
+            dashboard, _ = _make_dashboard(owner_id=42)
+            await dashboard.initialize()
+            thread = _make_thread(10)
+
+            await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+            await dashboard.set_state(
+                10, ThreadState.WAITING_INPUT, "w", thread=thread, notify_user_id=999
+            )
+
+            sent_text = thread.send.call_args.args[0]
+            assert "<@999>" in sent_text, f"mode={mode} must still mention the poster"

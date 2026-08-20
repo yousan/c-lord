@@ -36,6 +36,8 @@ from enum import Enum
 
 import discord
 
+from ..notify_policy import owner_fallback_allowed
+
 logger = logging.getLogger(__name__)
 
 # Embed colours
@@ -169,7 +171,11 @@ class ThreadStatusDashboard:
 
             # #481: mention the turn's poster (notify_user_id); fall back to the
             # configured owner. Mention on the first WAITING_INPUT transition.
-            mention_id = notify_user_id if notify_user_id is not None else self._owner_id
+            # #525: the owner fallback for a turn nobody human asked for is
+            # deployment policy — a server running many automated threads reads
+            # "Claude has finished" pings for threads it never opened as noise.
+            owner_fallback = self._owner_id if owner_fallback_allowed("completion") else None
+            mention_id = notify_user_id if notify_user_id is not None else owner_fallback
             should_mention = (
                 state == ThreadState.WAITING_INPUT
                 and prev_state != ThreadState.WAITING_INPUT
