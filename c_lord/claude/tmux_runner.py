@@ -73,6 +73,24 @@ _POST_STARTUP_DELAY = 1.0
 # back to a plain fresh start.
 _CONTINUE_CHECK_DELAY = 3.0
 
+
+def _delivery_failure(action: str, prompt: str) -> str:
+    """User-facing text for "the message never reached Claude" (#527).
+
+    The old wording was ``Failed to send input to Claude in tmux`` — true, but
+    it left the user with no idea what broke or what to do, which is how a
+    19,852-byte attachment silently going nowhere looked from Discord.  Name
+    the input size (the usual culprit) and the one command that fixes a dead
+    pane.
+    """
+    size = len(prompt.encode("utf-8"))
+    return (
+        f"{action}に失敗しました — tmux のペインが入力を受け付けませんでした "
+        f"(入力 {size:,} bytes)。ペインが落ちているか応答しない状態です。"
+        "`/restart-claude` でセッションを立て直してから、もう一度送ってください。"
+    )
+
+
 # Patterns that indicate a trust/safety prompt that needs Enter to dismiss.
 _TRUST_PROMPT_MARKERS = (
     "Yes, I trust this folder",
@@ -789,7 +807,7 @@ class TmuxClaudeRunner:
                     raw={},
                     message_type=MessageType.RESULT,
                     is_complete=True,
-                    error="Failed to send input to Claude in tmux",
+                    error=_delivery_failure("メッセージの送信", prompt),
                 )
                 return
         else:
@@ -812,7 +830,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error="Failed to start Claude in tmux",
+                        error=_delivery_failure("Claude の起動", prompt),
                     )
                     return
 
@@ -842,7 +860,7 @@ class TmuxClaudeRunner:
                             raw={},
                             message_type=MessageType.RESULT,
                             is_complete=True,
-                            error="Failed to start Claude in tmux",
+                            error=_delivery_failure("Claude の起動", prompt),
                         )
                         return
             else:
@@ -863,7 +881,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error="Failed to start Claude in tmux",
+                        error=_delivery_failure("Claude の起動", prompt),
                     )
                     return
 

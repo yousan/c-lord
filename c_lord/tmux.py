@@ -188,6 +188,41 @@ def _screenshot_rows_from_env() -> int:
     return rows
 
 
+# #527: tmux hands each command to its server over an imsg capped at
+# ``MAX_IMSGSIZE`` (16384 bytes), so a single ``send-keys`` carrying a whole
+# prompt is refused with ``command too long`` once it passes ~16KB — measured
+# ceiling on tmux 3.4 is 16,335 bytes for a short target name, and the target
+# name eats into it.  A 19,852-byte markdown attachment hit exactly this and the
+# message never reached Claude.  Chunk far enough below the cap that argv
+# overhead (flags, ``session:window``) can never close the gap.
+_SEND_KEYS_CHUNK_BYTES = 3000
+
+
+def _chunk_for_send_keys(text: str, limit: int = _SEND_KEYS_CHUNK_BYTES) -> list[str]:
+    """Split *text* into pieces of at most *limit* UTF-8 bytes each.
+
+    Splits only on character boundaries: ``send-keys -l`` writes the bytes
+    straight to the pane, so a multi-byte character cut in half would arrive as
+    mojibake.  Lossless — ``"".join(_chunk_for_send_keys(t)) == t``.
+    """
+    if not text:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for char in text:
+        width = len(char.encode("utf-8"))
+        if size + width > limit and current:
+            chunks.append("".join(current))
+            current = []
+            size = 0
+        current.append(char)
+        size += width
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
     return subprocess.run(
@@ -1432,12 +1467,51 @@ class TmuxSessionManager:
         # Prefix with unalias to bypass any shell alias (e.g. --continue).
         cmd = f"unalias claude 2>/dev/null; {' '.join(cmd_parts)}"
 
-        result = _run(["tmux", "send-keys", "-t", target, cmd, "Enter"])
+        # Typed literally and in pieces: the prompt rides on this command line,
+        # so a long attachment/paste would otherwise blow past tmux's imsg cap
+        # and the whole turn would be lost (#527).
+        if not self._type_literal(target, cmd, what="start_claude"):
+            return False
+        result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         if result.returncode != 0:
-            logger.warning("start_claude: send-keys failed: %s", result.stderr.strip())
+            logger.warning("start_claude: send-keys Enter failed: %s", result.stderr.strip())
             return False
 
         logger.info("start_claude: sent command to %s", target)
+        return True
+
+    def _type_literal(self, target: str, text: str, *, what: str) -> bool:
+        """Type *text* into *target* with ``send-keys -l``, split for tmux's cap.
+
+        One ``send-keys`` carrying more than ~16KB is refused outright by the
+        tmux server (``command too long``) — see :func:`_chunk_for_send_keys`.
+        Before #527 that meant a long paste or a large text attachment vanished
+        on the way to Claude, with only a bare "Failed to send input" in
+        Discord.  Splitting is transparent to the pane: the chunks arrive as one
+        continuous stream of characters.
+
+        Returns True only if **every** chunk was accepted; the caller must not
+        press Enter on a partially typed payload.
+        """
+        chunks = _chunk_for_send_keys(text)
+        for index, chunk in enumerate(chunks, start=1):
+            result = _run(["tmux", "send-keys", "-l", "-t", target, chunk])
+            if result.returncode != 0:
+                logger.warning(
+                    "%s: send-keys -l failed on chunk %d/%d (%d bytes): %s",
+                    what,
+                    index,
+                    len(chunks),
+                    len(chunk.encode("utf-8")),
+                    result.stderr.strip(),
+                )
+                if index > 1:
+                    # Best effort: wipe the half-typed payload. Left in the box
+                    # it would prepend itself to whatever the user sends next —
+                    # the same "input silently corrupted" class this fix exists
+                    # to remove. C-u is the input box's kill-line.
+                    _run(["tmux", "send-keys", "-t", target, "C-u"])
+                return False
         return True
 
     def send_input(self, thread_id: int, text: str) -> bool:
@@ -1500,9 +1574,7 @@ class TmuxSessionManager:
             time.sleep(_INSERT_SETTLE)
 
         payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
-        result = _run(["tmux", "send-keys", "-l", "-t", target, payload])
-        if result.returncode != 0:
-            logger.warning("send_input: send-keys -l failed: %s", result.stderr.strip())
+        if not self._type_literal(target, payload, what="send_input"):
             return False
 
         # Press Enter to submit
@@ -1534,11 +1606,7 @@ class TmuxSessionManager:
             return False
 
         target = f"{self.session_name}:{window}"
-        result = _run(["tmux", "send-keys", "-l", "-t", target, text])
-        if result.returncode != 0:
-            logger.warning("send_literal: send-keys -l failed: %s", result.stderr.strip())
-            return False
-        return True
+        return self._type_literal(target, text, what="send_literal")
 
     def send_keys(self, thread_id: int, *keys: str) -> bool:
         """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).

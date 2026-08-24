@@ -108,6 +108,8 @@ The bot **only responds in threads it knows about** — threads created via `/cl
 
 Type normally in the thread. Each message is sent to Claude as a new prompt. If Claude is already processing a previous message, the new message interrupts it (sends SIGINT) and starts fresh with your new instruction.
 
+There is **no length limit** on what you send — long pastes and large text attachments are delivered to Claude in full (they are split internally on the way into the tmux pane; you see no difference). If a message genuinely cannot be delivered, the bot says so with the input size and how to recover — it never silently finishes an empty turn. See [あるべき動き: 送ったメッセージが Claude に届くこと](specs/input-delivery.md).
+
 ### Attachments
 
 - **Text files** (`.txt`, `.md`, `.csv`, `.json`, `.xml`, etc.) — automatically appended to the prompt. Up to 5 files, 50 KB each, 100 KB total.
