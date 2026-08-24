@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
+import time
 import uuid
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -170,8 +173,9 @@ def test_real_tmux_rejects_a_single_oversized_send_but_accepts_chunks() -> None:
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", session, "-x", "200", "-y", "50"], check=True
     )
+    sink = Path(tempfile.gettempdir()) / f"{session}.txt"
     try:
-        payload = "あ" * 7000  # 21,000 bytes — just past what W126 hit
+        payload = _LONG_TEXT  # ~60KB, mixed-width, with newlines
         one_shot = subprocess.run(
             ["tmux", "send-keys", "-l", "-t", session, payload],
             capture_output=True,
@@ -180,6 +184,11 @@ def test_real_tmux_rejects_a_single_oversized_send_but_accepts_chunks() -> None:
         assert one_shot.returncode != 0, "expected tmux to refuse an oversized send-keys"
         assert "too long" in one_shot.stderr
 
+        # Chunked: every call is accepted *and* the pane receives the text
+        # byte-for-byte — ``cat`` in the pane writes back exactly what it was
+        # typed, so a split through a multi-byte character would show up here.
+        subprocess.run(["tmux", "send-keys", "-t", session, f"cat > {sink}", "Enter"], check=True)
+        time.sleep(0.5)
         for chunk in _chunk_for_send_keys(payload):
             r = subprocess.run(
                 ["tmux", "send-keys", "-l", "-t", session, chunk],
@@ -187,5 +196,13 @@ def test_real_tmux_rejects_a_single_oversized_send_but_accepts_chunks() -> None:
                 text=True,
             )
             assert r.returncode == 0, r.stderr
+        time.sleep(2.0)
+        subprocess.run(["tmux", "send-keys", "-t", session, "C-d"], check=True)
+        time.sleep(1.0)
+
+        assert sink.read_text(encoding="utf-8") == payload, (
+            "the pane must receive the payload byte-for-byte, not mojibake"
+        )
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+        sink.unlink(missing_ok=True)
