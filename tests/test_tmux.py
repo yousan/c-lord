@@ -12,6 +12,19 @@ from c_lord.tmux import (
 )
 
 
+def _typed_command(mock_run: MagicMock) -> str:
+    """Reassemble the shell command ``start_claude`` typed into the pane.
+
+    Since #527 it is typed in chunks (tmux refuses a single oversized
+    ``send-keys``), so the command is the concatenation of every
+    ``send-keys -l`` payload rather than one argv element.
+    """
+    return "".join(
+        call[0][0][-1]
+        for call in mock_run.call_args_list
+        if "send-keys" in call[0][0] and "-l" in call[0][0]
+    )
+
 class TestTmuxSessionManager:
     """Tests for the window-based TmuxSessionManager."""
 
@@ -159,10 +172,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # show-option verify
-                MagicMock(returncode=0),  # kill-window
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             assert mgr.kill_session(12345) is True
 
         # Cache should be cleared
@@ -434,24 +446,24 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: show-option verify
-                MagicMock(returncode=0),  # send-keys for claude command
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.start_claude(12345, "hello world", "sonnet")
 
         assert result is True
 
         # Verify the claude command was sent with prompt
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        assert "send-keys" in args
-        assert f"{SESSION_NAME}:work1" in args
+        send_keys = [c[0][0] for c in mock_run.call_args_list if "send-keys" in c[0][0]]
+        assert send_keys, "start_claude must send keys to the pane"
+        assert all(f"{SESSION_NAME}:work1" in args for args in send_keys)
         # The command string should contain the prompt
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "claude --model sonnet" in cmd_str
         assert "hello world" in cmd_str
-        assert "Enter" in args
+        # …and be submitted by a separate Enter (#527: the command itself is
+        # typed literally, so Enter can no longer ride along with it).
+        assert send_keys[-1][-1] == "Enter"
 
     def test_start_claude_no_window_returns_false(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -476,15 +488,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys for claude command
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello", dangerously_skip_permissions=True)
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])  # everything after -t
+        cmd_str = _typed_command(mock_run)
         assert "--dangerously-skip-permissions" in cmd_str
 
     def test_start_claude_escapes_single_quotes(self) -> None:
@@ -494,15 +503,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),
-                MagicMock(returncode=0),
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "it's a test")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         # Single quote should be escaped
         assert "'" in cmd_str
 
@@ -513,16 +519,13 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.start_claude(12345, "hello", try_continue=True)
 
         assert result is True
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--continue" in cmd_str
 
     def test_start_claude_default_no_try_continue(self) -> None:
@@ -532,15 +535,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--continue" not in cmd_str
 
     def test_start_claude_includes_effort_flag(self) -> None:
@@ -550,15 +550,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello", effort="max")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--effort max" in cmd_str
 
     def test_start_claude_no_effort_flag_when_none(self) -> None:
@@ -568,15 +565,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--effort" not in cmd_str
 
     def test_start_claude_invalid_effort_is_skipped(self) -> None:
@@ -588,16 +582,13 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.start_claude(12345, "hello", effort="ultracode")
 
         assert result is True
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--effort" not in cmd_str
 
     def test_send_input_sends_text_and_enter(self, monkeypatch) -> None:
@@ -788,10 +779,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys -l (text)
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             assert mgr.send_literal(12345, "メロン") is True
 
         calls = mock_run.call_args_list
@@ -913,10 +903,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys C-c
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.send_interrupt(12345)
 
         assert result is True
@@ -995,10 +984,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: show-option verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello", "sonnet")
 
         # Verify the custom session name is used in the target

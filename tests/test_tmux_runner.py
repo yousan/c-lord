@@ -1116,7 +1116,12 @@ class TestTmuxClaudeRunnerRun:
         assert events[0].message_type == MessageType.SYSTEM
         assert events[0].session_id == "tmux-12345"
         assert events[-1].is_complete
-        assert events[-1].error == "Failed to start Claude in tmux"
+        # #527: the bare "Failed to start Claude in tmux" told the user nothing
+        # they could act on. Name the size and the way out.
+        err = events[-1].error or ""
+        assert "tmux" in err
+        assert "restart-claude" in err, "the error must say how to recover"
+        assert "bytes" in err, "the error must name the input size"
 
     @pytest.mark.asyncio
     async def test_send_input_failure_yields_error(self, runner, tmux_manager) -> None:
@@ -1131,7 +1136,10 @@ class TestTmuxClaudeRunnerRun:
         assert events[0].message_type == MessageType.SYSTEM
         assert events[0].session_id == "tmux-12345"
         assert events[-1].is_complete
-        assert events[-1].error == "Failed to send input to Claude in tmux"
+        err = events[-1].error or ""
+        assert "tmux" in err
+        assert "restart-claude" in err, "the error must say how to recover"
+        assert "bytes" in err, "the error must name the input size"
 
     @pytest.mark.asyncio
     async def test_idle_timeout_completes(self, runner, tmux_manager) -> None:
