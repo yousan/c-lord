@@ -1461,8 +1461,18 @@ class TmuxSessionManager:
                     ", ".join(sorted(_VALID_EFFORT_LEVELS)),
                 )
 
+        # #530: mark the prompt as c-lord-originated, exactly as send_input
+        # does. Without it the jsonl mirror reads the ``user`` event Claude
+        # writes for this prompt as "a human typed into the pane" and posts the
+        # whole thing back to the thread — one duplicated line for a short
+        # message, a dozen messages burying the answer for a big one.
+        from .transcript.formatter import ZWSP_MARKER
+        from .transcript.mirror import bridge_mode_jsonl
+
+        marked_prompt = f"{ZWSP_MARKER}{prompt}" if bridge_mode_jsonl() else prompt
+
         # Escape single quotes in the prompt for shell safety.
-        safe_prompt = prompt.replace("'", "'\\''")
+        safe_prompt = marked_prompt.replace("'", "'\\''")
         cmd_parts.append(f"'{safe_prompt}'")
         # Prefix with unalias to bypass any shell alias (e.g. --continue).
         cmd = f"unalias claude 2>/dev/null; {' '.join(cmd_parts)}"
