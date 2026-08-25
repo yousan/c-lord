@@ -17,8 +17,10 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -221,6 +223,61 @@ def _chunk_for_send_keys(text: str, limit: int = _SEND_KEYS_CHUNK_BYTES) -> list
     if current:
         chunks.append("".join(current))
     return chunks
+
+
+# #529: the cold-start prompt used to be typed at the pane's shell prompt as
+# part of the command line. oh-my-zsh binds ``url-quote-magic`` to
+# ``self-insert``, so zsh backslash-escaped ``?``/``=``/``&`` inside any URL as
+# it was typed and Claude received a URL that 404s. Handing the prompt over in a
+# file keeps it out of the line editor entirely — and keeps the command short
+# no matter how long the prompt is.
+_PROMPT_FILE_PREFIX = "clord-prompt-"
+_PROMPT_FILE_MAX_AGE = 3600.0  # seconds; a file older than this was abandoned
+
+
+def _prompt_file_dir() -> Path:
+    """Directory holding hand-off prompt files (created 0700 on first use)."""
+    directory = Path(tempfile.gettempdir()) / "clord-prompts"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory
+
+
+def _sweep_stale_prompt_files(directory: Path) -> None:
+    """Delete abandoned prompt files — they hold whatever the user typed.
+
+    A file is only abandoned if its turn never reached the ``rm`` in the
+    command (pane died between write and run). Best effort; never raises.
+    """
+    cutoff = time.time() - _PROMPT_FILE_MAX_AGE
+    try:
+        for path in directory.glob(f"{_PROMPT_FILE_PREFIX}*"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+def _write_prompt_file(prompt: str) -> Path:
+    """Write *prompt* to an owner-only file and return its path.
+
+    Raises OSError; the caller falls back to the inline command line, because
+    a mangled URL beats losing the turn.
+    """
+    directory = _prompt_file_dir()
+    _sweep_stale_prompt_files(directory)
+    fd, name = tempfile.mkstemp(prefix=_PROMPT_FILE_PREFIX, suffix=".txt", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(prompt)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+    path = Path(name)
+    path.chmod(0o600)
+    return path
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1471,11 +1528,30 @@ class TmuxSessionManager:
 
         marked_prompt = f"{ZWSP_MARKER}{prompt}" if bridge_mode_jsonl() else prompt
 
-        # Escape single quotes in the prompt for shell safety.
-        safe_prompt = marked_prompt.replace("'", "'\\''")
-        cmd_parts.append(f"'{safe_prompt}'")
+        # #529: hand the prompt over in a file rather than typing it. Anything
+        # typed at the pane's prompt goes through zsh's line editor, and
+        # oh-my-zsh's url-quote-magic rewrites URLs on the way in.
+        prelude = ""
+        try:
+            prompt_path = _write_prompt_file(marked_prompt)
+        except OSError as exc:
+            # A mangled URL is bad; losing the turn is worse — fall back to the
+            # inline command line.
+            logger.warning(
+                "start_claude: could not stage the prompt in a file (%s); falling back "
+                "to an inline command line — URLs may be mangled by the shell (#529)",
+                exc,
+            )
+            safe_prompt = marked_prompt.replace("'", "'\\''")
+            cmd_parts.append(f"'{safe_prompt}'")
+        else:
+            # Read it into a variable and delete the file *before* claude runs,
+            # so no prompt text sits on disk for the life of the session.
+            prelude = f'CLORD_PROMPT="$(cat {prompt_path})"; rm -f {prompt_path}; '
+            cmd_parts.append('"$CLORD_PROMPT"')
+
         # Prefix with unalias to bypass any shell alias (e.g. --continue).
-        cmd = f"unalias claude 2>/dev/null; {' '.join(cmd_parts)}"
+        cmd = f"unalias claude 2>/dev/null; {prelude}{' '.join(cmd_parts)}"
 
         # Typed literally and in pieces: the prompt rides on this command line,
         # so a long attachment/paste would otherwise blow past tmux's imsg cap

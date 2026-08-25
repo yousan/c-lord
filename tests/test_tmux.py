@@ -25,6 +25,27 @@ def _typed_command(mock_run: MagicMock) -> str:
         if "send-keys" in call[0][0] and "-l" in call[0][0]
     )
 
+
+def _staged_prompt(mock_run: MagicMock) -> str:
+    """Read back the prompt ``start_claude`` staged in a file (#529).
+
+    The prompt is no longer typed at the pane's shell prompt — zsh's
+    ``url-quote-magic`` rewrote URLs on the way in — so it is read from the
+    file the command points at.
+    """
+    import re
+    from pathlib import Path
+
+    cmd = _typed_command(mock_run)
+    match = re.search(r'"\$\(cat (\S+)\)"', cmd)
+    assert match, f"expected a staged prompt file in: {cmd!r}"
+    path = Path(match.group(1))
+    try:
+        return path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+
+
 class TestTmuxSessionManager:
     """Tests for the window-based TmuxSessionManager."""
 
@@ -453,16 +474,17 @@ class TestTmuxSessionManager:
 
         assert result is True
 
-        # Verify the claude command was sent with prompt
+        # Verify the claude command was sent, and the prompt handed over
         send_keys = [c[0][0] for c in mock_run.call_args_list if "send-keys" in c[0][0]]
         assert send_keys, "start_claude must send keys to the pane"
         assert all(f"{SESSION_NAME}:work1" in args for args in send_keys)
-        # The command string should contain the prompt
         cmd_str = _typed_command(mock_run)
         assert "claude --model sonnet" in cmd_str
-        assert "hello world" in cmd_str
-        # …and be submitted by a separate Enter (#527: the command itself is
-        # typed literally, so Enter can no longer ride along with it).
+        # #529: the prompt rides in a file, never on the typed command line.
+        assert "hello world" not in cmd_str
+        assert "hello world" in _staged_prompt(mock_run)
+        # …and the command is submitted by a separate Enter (#527: the command
+        # itself is typed literally, so Enter can no longer ride along).
         assert send_keys[-1][-1] == "Enter"
 
     def test_start_claude_no_window_returns_false(self) -> None:
@@ -496,21 +518,24 @@ class TestTmuxSessionManager:
         cmd_str = _typed_command(mock_run)
         assert "--dangerously-skip-permissions" in cmd_str
 
-    def test_start_claude_escapes_single_quotes(self) -> None:
-        """Prompt with single quotes is properly escaped."""
+    def test_start_claude_survives_shell_metacharacters_in_the_prompt(self) -> None:
+        """Quotes, backticks and $ reach Claude untouched.
+
+        They used to need shell escaping because the prompt was part of the
+        typed command line; since #529 it is read from a file, so nothing in it
+        is shell syntax in the first place.
+        """
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
+        hostile = 'it\'s a `test` with $HOME and "quotes"'
 
         with patch("c_lord.tmux._run") as mock_run:
-            # #527: start_claude now types the command in chunks + a separate
-            # Enter, so the call count is no longer fixed at two.
             mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
-            mgr.start_claude(12345, "it's a test")
+            mgr.start_claude(12345, hostile)
 
-        cmd_str = _typed_command(mock_run)
-        # Single quote should be escaped
-        assert "'" in cmd_str
+        assert _staged_prompt(mock_run).endswith(hostile)
+        assert hostile not in _typed_command(mock_run)
 
     def test_start_claude_with_try_continue_flag(self) -> None:
         """start_claude with try_continue=True includes --continue in the command."""
@@ -622,9 +647,7 @@ class TestTmuxSessionManager:
         args = enter_call[0][0]
         assert "Enter" in args
 
-    def test_send_input_prefixes_zwsp_marker_under_jsonl_mode(
-        self, monkeypatch=None
-    ) -> None:
+    def test_send_input_prefixes_zwsp_marker_under_jsonl_mode(self, monkeypatch=None) -> None:
         # In CLORD_BRIDGE_MODE=jsonl the input must be prefixed with a
         # zero-width-space so the resulting JSONL ``user`` event is recognised
         # as c-lord-originated and not double-posted back to Discord (#71).
@@ -1249,6 +1272,7 @@ class TestTmuxSessionManager:
         assert any("22222" in c for c in set_calls), "@thread_id not restored from file"
 
         import os
+
         os.unlink(mapping_path)
 
     def test_create_session_adopts_window_via_mapping_file(self) -> None:
@@ -1293,6 +1317,7 @@ class TestTmuxSessionManager:
         assert new_window_calls == [], f"new-window was called despite mapping file entry"
 
         import os
+
         os.unlink(mapping_path)
 
     # ── Issue #111: duplicate window prevention after tmux restart ───
@@ -1354,9 +1379,7 @@ class TestWindowSizePolicy:
             mock_run.return_value = MagicMock(returncode=0, stdout="")
             mgr._ensure_window_size_manual()
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert any(
-            "set-option" in a and "window-size" in a and "manual" in a for a in calls
-        ), calls
+        assert any("set-option" in a and "window-size" in a and "manual" in a for a in calls), calls
 
     def test_ensure_window_size_manual_noop_when_unavailable(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -1415,9 +1438,7 @@ class TestWindowSizePolicy:
             mock_run.return_value = MagicMock(returncode=0, stdout="")
             mgr._ensure_session()
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert any(
-            "set-option" in a and "window-size" in a and "manual" in a for a in calls
-        ), calls
+        assert any("set-option" in a and "window-size" in a and "manual" in a for a in calls), calls
 
 
 class TestPaneInsertModeDetection:
@@ -1553,9 +1574,7 @@ class TestSortWindows:
             mgr._sort_windows_unlocked()
         # sources must be ascending by number: w5(@6), w12(@7), w30(@5)
         assert self._move_sources(mock_run) == ["@6", "@7", "@5"]
-        assert any(
-            "move-window" in c[0][0] and "-r" in c[0][0] for c in mock_run.call_args_list
-        )
+        assert any("move-window" in c[0][0] and "-r" in c[0][0] for c in mock_run.call_args_list)
 
     def test_non_numbered_windows_go_to_end(self) -> None:
         mgr = self._avail_mgr()
