@@ -72,3 +72,15 @@ def simple_events(session_id: str = "sess-1") -> list[StreamEvent]:
             duration_ms=500,
         ),
     ]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_prompt_dir(tmp_path_factory, monkeypatch):
+    """Keep staged prompt files (#529) out of the shared temp directory.
+
+    ``start_claude`` writes the prompt to a file that the *pane* is meant to
+    delete once it has read it. Under test there is no pane, so without this
+    every call would leave one behind in the system temp dir.
+    """
+    directory = tmp_path_factory.mktemp("clord-prompts")
+    monkeypatch.setattr("c_lord.tmux._prompt_file_dir", lambda: directory)
