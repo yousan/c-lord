@@ -53,9 +53,23 @@ def _user_event(text: str) -> dict:
 # ── the marker reaches the cold-start prompt ────────────────────────
 
 
+def _staged(cmd: str) -> str:
+    """The prompt ``start_claude`` handed over in a file (#529)."""
+    import re
+    from pathlib import Path
+
+    match = re.search(r'"\$\(cat (\S+)\)"', cmd)
+    assert match, f"expected a staged prompt file in: {cmd!r}"
+    path = Path(match.group(1))
+    try:
+        return path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_cold_start_prompt_is_marked_as_clord_originated() -> None:
     cmd = _start("最初のメッセージ", jsonl=True)
-    assert f"{ZWSP_MARKER}最初のメッセージ" in cmd, (
+    assert _staged(cmd) == f"{ZWSP_MARKER}最初のメッセージ", (
         "start_claude must mark its prompt the way send_input does (#530)"
     )
 
@@ -63,15 +77,15 @@ def test_cold_start_prompt_is_marked_as_clord_originated() -> None:
 def test_cold_start_prompt_is_unmarked_when_the_jsonl_bridge_is_off() -> None:
     """Under skill mode there is no mirror to fool — do not touch the prompt."""
     cmd = _start("最初のメッセージ", jsonl=False)
-    assert ZWSP_MARKER not in cmd
+    assert ZWSP_MARKER not in _staged(cmd)
 
 
-def test_the_marker_sits_inside_the_quoted_prompt_not_on_the_command() -> None:
-    """It must ride on the prompt argument, never on the `claude` command."""
+def test_the_marker_never_lands_on_the_command_line() -> None:
+    """It rides with the prompt, never on the `claude` command itself."""
     cmd = _start("hello", jsonl=True)
-    assert not cmd.startswith(ZWSP_MARKER)
     assert cmd.startswith("unalias claude")
-    assert f"'{ZWSP_MARKER}hello'" in cmd
+    assert ZWSP_MARKER not in cmd
+    assert _staged(cmd) == f"{ZWSP_MARKER}hello"
 
 
 # ── and the mirror then keeps quiet about it ────────────────────────

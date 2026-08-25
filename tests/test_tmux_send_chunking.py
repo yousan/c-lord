@@ -144,19 +144,36 @@ def test_send_literal_splits_long_text() -> None:
     assert not any(c[-1] == "Enter" for c in calls if "send-keys" in c)
 
 
-def test_start_claude_splits_long_command() -> None:
+def _cleanup_staged_prompt(cmd: str) -> None:
+    import re
+    from pathlib import Path
+
+    match = re.search(r'"\$\(cat (\S+)\)"', cmd)
+    if match:
+        Path(match.group(1)).unlink(missing_ok=True)
+
+
+def test_start_claude_never_types_a_command_near_the_cap() -> None:
+    """The cold-start command line no longer grows with the prompt.
+
+    #527 chunked it because the prompt was part of it; #529 then moved the
+    prompt into a file, removing the failure mode at the source. Both still
+    hold: whatever is typed goes through the chunker, and it is now small
+    enough to need a single piece however long the prompt is.
+    """
     calls: list[list[str]] = []
     with patch("c_lord.tmux._run", side_effect=_run_recorder(calls)):
         assert _mgr().start_claude(12345, _LONG_TEXT, "sonnet") is True
 
     payloads = _literal_payloads(calls)
-    assert len(payloads) > 1, "the cold-start command line must be chunked too (#527)"
-    for p in payloads:
-        assert len(p.encode("utf-8")) <= _SEND_KEYS_CHUNK_BYTES
+    for piece in payloads:
+        assert len(piece.encode("utf-8")) <= _SEND_KEYS_CHUNK_BYTES
     cmd = "".join(payloads)
     assert cmd.startswith("unalias claude")
-    assert _LONG_TEXT in cmd
+    assert _LONG_TEXT not in cmd, "the prompt must not ride on the command line (#529)"
+    assert len(cmd.encode("utf-8")) < 1000
     assert [c for c in calls if "send-keys" in c][-1][-1] == "Enter"
+    _cleanup_staged_prompt(cmd)
 
 
 # ── the real thing: prove the cap exists and that chunking clears it ──
