@@ -22,6 +22,7 @@
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
 | [input-delivery.md](./input-delivery.md) | 送ったメッセージが Claude に届くこと | 本文・貼り付け・テキスト添付は長さに関係なく全文が届く。届かないときは理由と次の一手が出る |
+| [attachments.md](./attachments.md) | 添付ファイル | 添付は Claude が開ける実ファイルとして渡る。渡せないときは名前と理由がスレッドに出る（黙って捨てない） |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
 

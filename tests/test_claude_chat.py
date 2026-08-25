@@ -8,12 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from c_lord.cogs.claude_chat import (
-    _MAX_ATTACHMENT_BYTES,
-    _MAX_ATTACHMENTS,
-    _MAX_TOTAL_BYTES,
-    ClaudeChatCog,
-)
+from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.concurrency import SessionRegistry
 from c_lord.coordination.service import CoordinationService
 
@@ -394,7 +389,13 @@ class TestActiveCountAlias:
 
 
 class TestBuildPrompt:
-    """Tests for the _build_prompt method (attachment handling)."""
+    """_build_prompt now carries the message text only (#528).
+
+    Attachments used to be pasted in here (small ones) or dropped (large ones).
+    They are written to disk by ``_stage_attachments`` instead — covered in
+    tests/test_attachment_staging.py — so the only thing left to pin down is
+    that the prompt no longer grows with the file.
+    """
 
     @staticmethod
     def _make_attachment(
@@ -415,6 +416,7 @@ class TestBuildPrompt:
     @staticmethod
     def _make_message(content: str = "my message", attachments: list | None = None) -> MagicMock:
         msg = MagicMock(spec=discord.Message)
+        msg.id = 4242
         msg.content = content
         msg.attachments = attachments or []
         return msg
@@ -422,206 +424,32 @@ class TestBuildPrompt:
     @pytest.mark.asyncio
     async def test_no_attachments_returns_content(self) -> None:
         cog = _make_cog()
-        msg = self._make_message(content="hello")
-        result = await cog._build_prompt(msg)
-        assert result == "hello"
+        assert await cog._build_prompt(self._make_message(content="hello")) == "hello"
 
     @pytest.mark.asyncio
-    async def test_text_attachment_appended(self) -> None:
+    async def test_attachment_contents_are_not_inlined(self) -> None:
+        """Inlining is what pushed a 20KB .md past tmux's input cap (#527)."""
         cog = _make_cog()
         att = self._make_attachment(filename="notes.txt", content=b"file content here")
         msg = self._make_message(content="check this", attachments=[att])
 
         result = await cog._build_prompt(msg)
 
-        assert "check this" in result
-        assert "notes.txt" in result
-        assert "file content here" in result
+        assert result == "check this"
+        assert "file content here" not in result
+        att.read.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_image_attachment_url_embedded_in_prompt(self) -> None:
-        """Images are NOT downloaded; their CDN URL is embedded in the prompt."""
-        image_url = "https://cdn.discordapp.com/attachments/1/2/image.png?ex=abc&is=def&hm=xyz"
+    async def test_image_url_is_not_embedded(self) -> None:
+        """Images are saved as files too — no signed CDN URL to expire (#529)."""
         cog = _make_cog()
-        att = self._make_attachment(
-            filename="image.png",
-            content_type="image/png",
-            size=100,
-            content=b"\x89PNG...",
-            url=image_url,
-        )
+        att = self._make_attachment(filename="image.png", content_type="image/png")
         msg = self._make_message(content="see image", attachments=[att])
 
         prompt, image_paths = await cog._build_prompt_and_images(msg)
 
-        # URL is embedded in the prompt text.
-        assert image_url in prompt
-        assert "image.png" in prompt
-        # No tempfiles — images are not downloaded.
+        assert "cdn.discordapp.com" not in prompt
         assert image_paths == []
-        att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_binary_non_image_url_embedded(self) -> None:
-        """Non-image binary files (e.g. zip, PDF) have their URL embedded."""
-        file_url = "https://cdn.discordapp.com/attachments/1/2/archive.zip?ex=abc&is=def&hm=xyz"
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="archive.zip",
-            content_type="application/zip",
-            content=b"PK...",
-            url=file_url,
-        )
-        msg = self._make_message(content="see zip", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert file_url in result
-        assert "archive.zip" in result
-        att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_multiple_images_all_urls_embedded(self) -> None:
-        """Multiple image attachments all get their URLs embedded."""
-        cog = _make_cog()
-        images = [
-            self._make_attachment(
-                filename=f"img{i}.png",
-                content_type="image/png",
-                url=f"https://cdn.discordapp.com/attachments/1/2/img{i}.png?ex=abc",
-            )
-            for i in range(3)
-        ]
-        msg = self._make_message(content="three images", attachments=images)
-
-        prompt, image_paths = await cog._build_prompt_and_images(msg)
-
-        for i in range(3):
-            assert f"img{i}.png" in prompt
-            assert f"img{i}.png?ex=abc" in prompt
-        assert image_paths == []
-        for att in images:
-            att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_image_and_text_attachment_combined(self) -> None:
-        """Image URL + text file content both appear in the prompt."""
-        image_url = "https://cdn.discordapp.com/attachments/1/2/photo.jpg?ex=abc"
-        cog = _make_cog()
-        img_att = self._make_attachment(
-            filename="photo.jpg",
-            content_type="image/jpeg",
-            url=image_url,
-        )
-        txt_att = self._make_attachment(filename="notes.txt", content=b"my notes")
-        msg = self._make_message(content="check these", attachments=[img_att, txt_att])
-
-        prompt, image_paths = await cog._build_prompt_and_images(msg)
-
-        assert image_url in prompt
-        assert "my notes" in prompt
-        assert image_paths == []
-
-    @pytest.mark.asyncio
-    async def test_oversized_attachment_skipped(self) -> None:
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="huge.txt",
-            content_type="text/plain",
-            size=_MAX_ATTACHMENT_BYTES + 1,
-        )
-        msg = self._make_message(content="big file", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert result == "big file"
-        att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_empty_content_with_attachment(self) -> None:
-        """Message with only an attachment (no text) should still work."""
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="code.py", content_type="text/x-python", content=b"print('hi')"
-        )
-        msg = self._make_message(content="", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert "code.py" in result
-        assert "print('hi')" in result
-
-    @pytest.mark.asyncio
-    async def test_max_attachments_limit(self) -> None:
-        """Only the first _MAX_ATTACHMENTS files should be processed."""
-        cog = _make_cog()
-        attachments = [
-            self._make_attachment(filename=f"file{i}.txt", content=f"content{i}".encode())
-            for i in range(_MAX_ATTACHMENTS + 2)
-        ]
-        msg = self._make_message(attachments=attachments)
-
-        await cog._build_prompt(msg)
-
-        # Extra attachments beyond the limit should not be read
-        for att in attachments[_MAX_ATTACHMENTS:]:
-            att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_total_size_limit_stops_processing(self) -> None:
-        """Processing stops when cumulative size exceeds _MAX_TOTAL_BYTES."""
-        cog = _make_cog()
-        # Each file is just under the per-file limit but together they exceed total
-        chunk = _MAX_ATTACHMENT_BYTES - 100  # 49.9 KB
-        attachments = [
-            self._make_attachment(
-                filename=f"file{i}.txt",
-                size=chunk,
-                content=b"x" * chunk,
-            )
-            for i in range(10)
-        ]
-        msg = self._make_message(attachments=attachments)
-
-        await cog._build_prompt(msg)
-
-        # Should stop after total exceeds _MAX_TOTAL_BYTES (~2 files)
-        read_count = sum(1 for att in attachments if att.read.called)
-        expected_max = (_MAX_TOTAL_BYTES // chunk) + 1
-        assert read_count <= expected_max
-
-    @pytest.mark.asyncio
-    async def test_json_attachment_included(self) -> None:
-        """application/json is in the allowed types."""
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="config.json",
-            content_type="application/json",
-            content=b'{"key": "value"}',
-        )
-        msg = self._make_message(content="here is config", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert "config.json" in result
-        assert '{"key": "value"}' in result
-
-    @pytest.mark.asyncio
-    async def test_multiple_text_attachments(self) -> None:
-        """Multiple allowed attachments should all be included."""
-        cog = _make_cog()
-        attachments = [
-            self._make_attachment(filename="a.txt", content=b"alpha"),
-            self._make_attachment(filename="b.md", content_type="text/markdown", content=b"beta"),
-        ]
-        msg = self._make_message(content="two files", attachments=attachments)
-
-        result = await cog._build_prompt(msg)
-
-        assert "a.txt" in result
-        assert "alpha" in result
-        assert "b.md" in result
-        assert "beta" in result
 
 
 class TestRegistryAutoDiscovery:

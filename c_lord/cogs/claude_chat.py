@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
@@ -23,6 +24,7 @@ from discord.ext import commands
 
 from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
+from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..concurrency import SessionRegistry
@@ -58,21 +60,31 @@ logger = logging.getLogger(__name__)
 # letting /stop, /clear and their !text twins share one implementation (#209).
 _Responder = Callable[..., Awaitable[None]]
 
-# Attachment filtering constants
-_ALLOWED_MIME_PREFIXES = (
-    "text/",
-    "application/json",
-    "application/xml",
-)
-_IMAGE_MIME_PREFIXES = ("image/",)
-_MAX_ATTACHMENT_BYTES = 50_000  # 50 KB per file
-_MAX_TOTAL_BYTES = 100_000  # 100 KB across all text attachments
-_MAX_ATTACHMENTS = 5
+# Attachment limits (#528). Attachments are written to disk and referenced by
+# path, so the prompt no longer grows with the file — the old 50KB/100KB caps
+# existed only because the bytes were pasted into it, and they silently ate
+# every larger file. What is left is a disk-abuse guard sized above Discord's
+# own upload ceiling, so in practice nothing a user can upload hits it.
+_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100 MB — Discord's largest tier
+_MAX_ATTACHMENTS = 10
 
-# Discord CDN URLs are signed and valid for ~24 hours.
-_ATTACHMENT_URL_NOTE = (
-    "(This is a signed CDN URL valid for ~24 hours. Use the WebFetch tool or curl to retrieve it.)"
+# Tells Claude the file is on disk — without it a bare path in the prompt reads
+# like a mention rather than an instruction, and it answers from the filename.
+_ATTACHMENT_PATH_NOTE = (
+    "(The user attached this file; it is saved at the path above. "
+    "Read it with the Read tool — it is not inlined in this message.)"
 )
+
+
+def _human_size(num_bytes: int) -> str:
+    """Byte count as something a person can read in a Discord notice."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
 
 # Issue #75: shown when the bot lacks send permission (discord.Forbidden / 50001
 # Missing Access) on a channel or thread.  Names the exact permissions to grant
@@ -1679,64 +1691,113 @@ class ClaudeChatCog(commands.Cog):
         return prompt
 
     async def _build_prompt_and_images(self, message: discord.Message) -> tuple[str, list[str]]:
-        """Build the prompt string from message content and attachments.
+        """Build the prompt string from the message text.
 
-        Text attachments (text/*, application/json, application/xml) are appended
-        inline to the prompt.
-
-        Image and other binary attachments are embedded as CDN URLs with a note
-        explaining that Claude can fetch them via WebFetch or curl.  Discord CDN
-        URLs are signed and valid for ~24 hours — no download or tempfile needed.
+        Attachments are **not** part of this any more (#528): they are written
+        to disk next to the checkout by :meth:`_stage_attachments`, which runs
+        later — once the session directory is known — and appends their paths.
+        Pasting file contents in here is what made a 20KB ``.md`` exceed tmux's
+        input cap (#527) and what forced the 50KB drop that ate files silently.
 
         Returns:
-            (prompt_text, []) — image_paths is always empty (URL embedding, not
-            local download).  The second element is kept for API compatibility.
+            (prompt_text, []) — the second element is kept for API compatibility.
         """
-        prompt = message.content or ""
-        if not message.attachments:
-            return prompt, []
+        return message.content or "", []
 
-        total_bytes = 0
+    async def _stage_attachments(
+        self,
+        message: discord.Message,
+        work_dir: str | None,
+        thread: discord.abc.Messageable,
+    ) -> str:
+        """Save the message's attachments to disk; return the prompt sections.
+
+        Every attachment becomes a real file under ``work_dir`` and the prompt
+        gets its **path**, so "I attached a file" means Claude can open a file
+        — the thing the user assumed was happening all along.
+
+        Anything that cannot be handed over is named in the thread with the
+        reason. The old code dropped over-cap files with a ``logger.debug`` and
+        nothing else, which is how "添付したのに見つからないと言われる" happened:
+        Claude was never told a file existed, and neither was the user.
+        """
+        attachments = list(message.attachments)
+        if not attachments:
+            return ""
+
+        skipped: list[str] = []
         sections: list[str] = []
 
-        for attachment in message.attachments[:_MAX_ATTACHMENTS]:
-            content_type = attachment.content_type or ""
+        if not work_dir or not Path(work_dir).is_dir():
+            # No checkout to write into (unbound channel). Say so rather than
+            # letting the files evaporate.
+            skipped = [f"`{a.filename}` — 保存先のワークスペースがありません" for a in attachments]
+            await self._report_skipped_attachments(thread, skipped)
+            return ""
 
-            # ---- Image and binary attachments → embed CDN URL in prompt ----
-            if content_type.startswith(_IMAGE_MIME_PREFIXES) or not content_type.startswith(
-                _ALLOWED_MIME_PREFIXES
-            ):
-                sections.append(
-                    f"\n\n--- Attached file: {attachment.filename} ---\n"
-                    f"URL: {attachment.url}\n"
-                    f"{_ATTACHMENT_URL_NOTE}"
-                )
-                logger.debug(
-                    "Embedded attachment URL for %s (%s)", attachment.filename, content_type
-                )
-                continue
+        ensure_git_excluded(work_dir)
 
-            # ---- Text attachments → inline content in prompt ----
+        for attachment in attachments[:_MAX_ATTACHMENTS]:
             if attachment.size > _MAX_ATTACHMENT_BYTES:
-                logger.debug(
-                    "Skipping attachment %s: too large (%d bytes)",
-                    attachment.filename,
-                    attachment.size,
+                skipped.append(
+                    f"`{attachment.filename}` — {_human_size(attachment.size)} は上限 "
+                    f"{_human_size(_MAX_ATTACHMENT_BYTES)} を超えています"
                 )
                 continue
-            total_bytes += attachment.size
-            if total_bytes > _MAX_TOTAL_BYTES:
-                logger.debug("Stopping attachment processing: total size exceeded")
-                break
             try:
                 data = await attachment.read()
-                text = data.decode("utf-8", errors="replace")
-                sections.append(f"\n\n--- Attached file: {attachment.filename} ---\n{text}")
-            except Exception:
-                logger.debug("Failed to read attachment %s", attachment.filename, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 — any download failure is reportable
+                logger.warning(
+                    "%s failed to download attachment %s: %s",
+                    log_ctx(thread_id=getattr(thread, "id", None)),
+                    attachment.filename,
+                    exc,
+                )
+                skipped.append(f"`{attachment.filename}` — ダウンロードに失敗しました")
+                continue
+            try:
+                path = await asyncio.to_thread(
+                    save_attachment, work_dir, message.id, attachment.filename, data
+                )
+            except OSError as exc:
+                logger.warning(
+                    "%s failed to save attachment %s: %s",
+                    log_ctx(thread_id=getattr(thread, "id", None)),
+                    attachment.filename,
+                    exc,
+                )
+                skipped.append(f"`{attachment.filename}` — 保存に失敗しました ({exc.strerror})")
                 continue
 
-        return prompt + "".join(sections), []
+            sections.append(
+                f"\n\n--- Attached file: {attachment.filename} "
+                f"({_human_size(len(data))}) ---\n"
+                f"Saved to: {path}\n"
+                f"{_ATTACHMENT_PATH_NOTE}"
+            )
+            logger.info(
+                "%s saved attachment %s -> %s",
+                log_ctx(thread_id=getattr(thread, "id", None)),
+                attachment.filename,
+                path,
+            )
+
+        for extra in attachments[_MAX_ATTACHMENTS:]:
+            skipped.append(f"`{extra.filename}` — 1メッセージあたり {_MAX_ATTACHMENTS} 個までです")
+
+        await self._report_skipped_attachments(thread, skipped)
+        return "".join(sections)
+
+    @staticmethod
+    async def _report_skipped_attachments(
+        thread: discord.abc.Messageable, skipped: list[str]
+    ) -> None:
+        """Tell the user, in the thread, which attachments never reached Claude."""
+        if not skipped:
+            return
+        body = "\n".join(f"- {line}" for line in skipped)
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(f"⚠️ 次の添付は Claude に渡せませんでした:\n{body}")
 
     async def _run_claude(
         self,
@@ -1843,6 +1904,11 @@ class ClaudeChatCog(commands.Cog):
                 )
                 working_dir = session_dir
                 logger.info("Session dir for thread %d: %s", thread.id, session_dir)
+
+            # #528: attachments become real files in the checkout, and the
+            # prompt gets their paths. Done here rather than while building the
+            # prompt because only now do we know where the checkout is.
+            prompt += await self._stage_attachments(user_message, working_dir, thread)
 
             window_name: str | None = None
             if tmux_manager is not None:
