@@ -112,8 +112,13 @@ There is **no length limit** on what you send — long pastes and large text att
 
 ### Attachments
 
-- **Text files** (`.txt`, `.md`, `.csv`, `.json`, `.xml`, etc.) — automatically appended to the prompt. Up to 5 files, 50 KB each, 100 KB total.
-- **Images** (`.png`, `.jpg`, etc.) — downloaded and passed to Claude via `--image`. Up to 4 images, 5 MB each.
+Attach any file — text, image, PDF, archive. Each one is **saved into the session's checkout** and Claude is given its path, so "read the file I attached" works the way you'd expect. Nothing is inlined into the prompt, so file size does not affect whether your message gets through.
+
+- Up to **10 files per message**, each up to Discord's own upload limit (100 MB).
+- Saved under `.clord/attachments/<message-id>/` inside the session directory, and git-excluded so Claude's commits never pick them up.
+- If a file **cannot** be handed over (too large, too many, download failed, or the channel has no repository bound), the bot says so in the thread, naming the file and the reason — it is never dropped silently.
+
+See [あるべき動き: 添付ファイル](specs/attachments.md).
 
 ### Status Indicators (Emoji Reactions)
 
