@@ -38,9 +38,13 @@ class SessionRecord:
     # Issue #414: the Issue/PR number this thread is working on, shown in the
     # thread name as "#<n>". Auto-detected from the git branch / first message.
     issue_ref: str | None = None
-    # Issue #512: timestamp of an intentional /close-workspace, or None when the
-    # session is open. Distinct from a merely dead tmux pane (#270).
+    # Issue #512: timestamp of an intentional stop, or None when the workspace
+    # is open. Distinct from a merely dead tmux pane (#270).
     closed_at: str | None = None
+    # Issue #574: who stopped it — "manual" or "idle". Read **only** to word the
+    # notice. The state itself is still decided by closed_at alone, so a second
+    # column can never contradict the first (the #538 failure mode).
+    closed_reason: str | None = None
 
 
 class SessionRepository:
@@ -188,27 +192,33 @@ class SessionRepository:
             )
             await db.commit()
 
-    async def set_closed(self, thread_id: int, closed: bool) -> None:
-        """Mark the session closed (終了) or reopen it (Issue #512).
+    async def set_closed(self, thread_id: int, closed: bool, *, reason: str = "manual") -> None:
+        """Mark the workspace stopped (停止) or reopen it (#512, #574).
 
         ``closed=True`` stamps ``closed_at`` with the local wall clock;
         ``closed=False`` clears it back to ``NULL``.
 
-        This is what distinguishes a deliberate ``/close-workspace`` from a tmux
+        This is what distinguishes a deliberate ``/workspace-stop`` from a tmux
         pane that merely died: a dead pane still auto-resumes on the next message
-        via ``--continue`` (#270), whereas a closed session holds the message and
-        shows the reopen notice instead.
+        via ``--continue`` (#270), whereas a stopped workspace holds the message
+        and shows the reopen notice instead.
+
+        *reason* (``"manual"`` / ``"idle"``) is stored alongside so the notice can
+        say **why** it happened. It is never consulted to decide *whether* the
+        workspace is stopped — ``closed_at`` alone answers that, so the two
+        cannot drift apart.
         """
         async with aiosqlite.connect(self.db_path) as db:
             if closed:
                 await db.execute(
-                    "UPDATE sessions SET closed_at = datetime('now', 'localtime') "
-                    "WHERE thread_id = ?",
-                    (thread_id,),
+                    "UPDATE sessions SET closed_at = datetime('now', 'localtime'), "
+                    "closed_reason = ? WHERE thread_id = ?",
+                    (reason, thread_id),
                 )
             else:
                 await db.execute(
-                    "UPDATE sessions SET closed_at = NULL WHERE thread_id = ?",
+                    "UPDATE sessions SET closed_at = NULL, closed_reason = NULL "
+                    "WHERE thread_id = ?",
                     (thread_id,),
                 )
             await db.commit()

@@ -297,6 +297,22 @@ async def setup_bridge(
             "(set CLORD_THREAD_LAMP=1 to enable 🟢🟡 thread-name lamps)"
         )
 
+    # --- Idle stop (#574) ---
+    # Always-on (zero-config): stops workspaces nobody has touched for
+    # CLORD_IDLE_STOP_DAYS (default 7). The threshold is a constant rather than
+    # something derived from the host because it describes how people use
+    # Discord, not how much RAM the machine has — see docs/specs/
+    # workspace-vocabulary.md. Set the env to 0 to disable.
+    from .idle_stop import IdleStopLoop, idle_stop_days
+
+    _idle_days = idle_stop_days()
+    if _idle_days > 0:
+        idle_loop = IdleStopLoop(bot, session_repo, threshold_days=_idle_days)
+        idle_loop.start()
+        bot.idle_stop_loop = idle_loop  # type: ignore[attr-defined]
+    else:
+        logger.info("Idle-stop disabled (CLORD_IDLE_STOP_DAYS=0)")
+
     # --- Menu watchdog (#359) ---
     # Always-on (zero-config): bridges TUI AskUserQuestion/plan menus that no
     # turn is watching (turn finalized early; mirror cannot read the tool_use

@@ -70,6 +70,26 @@ class ThreadState(str, Enum):  # noqa: UP042 — requires-python = ">=3.10", Str
     """Claude finished responding; awaiting the next user message."""
 
 
+def _completion_text(mention_id: int, no_response: bool) -> str:
+    """The turn-end ping. Says what actually happened (#562).
+
+    "終わりました" is a summons: the user drops what they are doing and comes to
+    look. When the turn produced nothing at all, that summons is a lie, and a
+    notification that lies stops being worth reading. So a turn that never
+    produced a response says so, and tells the reader what to do next instead of
+    implying an answer is waiting.
+
+    The mention trails the text either way so Discord's push preview leads with
+    the message rather than "@you" (#495).
+    """
+    if no_response:
+        return (
+            "⚠️ 応答がありませんでした — Claude がこのターンを開始しませんでした。"
+            f"もう一度送るか、tmux ペインを確認してください。 <@{mention_id}>"
+        )
+    return f"🟡 Claude has finished — your reply is needed here. <@{mention_id}>"
+
+
 @dataclass
 class _ThreadInfo:
     thread_id: int
@@ -129,6 +149,7 @@ class ThreadStatusDashboard:
         description: str,
         thread: discord.Thread | None = None,
         notify_user_id: int | None = None,
+        no_response: bool = False,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -186,15 +207,15 @@ class ThreadStatusDashboard:
             await self._refresh_dashboard()
 
         # Send mention outside the lock to avoid holding it during an HTTP call
-        if should_mention and thread is not None:
+        # ``mention_id`` is non-None whenever ``should_mention`` is set, but that
+        # is established inside the lock above and does not narrow out here.
+        if should_mention and thread is not None and mention_id is not None:
             try:
                 # #495: the mention trails the text so the Discord push preview
                 # leads with "Claude has finished…" instead of "@you". A user
                 # mention pings anywhere in the content, so trailing it does not
                 # weaken the notification.
-                await thread.send(
-                    f"🟡 Claude has finished — your reply is needed here. <@{mention_id}>"
-                )
+                await thread.send(_completion_text(mention_id, no_response))
             except discord.HTTPException:
                 logger.debug(
                     "Failed to send completion mention in thread %d", thread_id, exc_info=True

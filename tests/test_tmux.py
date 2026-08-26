@@ -146,7 +146,9 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
+                MagicMock(
+                    returncode=0, stdout=""
+                ),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -159,7 +161,9 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout="w1\n"),  # list-windows
                 MagicMock(returncode=0, stdout="111\n"),  # show-option w1
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(
+                    returncode=0, stdout="w1\t/a\n"
+                ),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -253,35 +257,47 @@ class TestTmuxSessionManager:
         assert windows == []
 
     def test_cleanup_orphaned(self) -> None:
+        """Windows whose thread is not active are killed; active ones survive.
+
+        Dispatches ``_run`` by subcommand rather than replaying a fixed call
+        sequence: since #570 the reaper also probes each window's pane before
+        killing it, and a positional ``side_effect`` list silently mis-aligns
+        whenever a probe is added. The reaper-specific cases (a live Claude
+        pane, a window with no ``@thread_id``) live in
+        ``tests/test_tmux_reaper.py``.
+        """
+        windows = {"work1": "111", "work2": "222", "work3": "333"}
+        killed_targets: list[str] = []
+
+        def fake_run(argv: list[str], **_: object) -> MagicMock:
+            if "list-windows" in argv:
+                sep = "\t" if "\t" in argv[-1] else ":"
+                body = "".join(f"{n}{sep}/work/{n}\n" for n in windows)
+                return MagicMock(returncode=0, stdout=body)
+            if "show-option" in argv:
+                name = argv[argv.index("-t") + 1].split(":", 1)[1]
+                tid = windows.get(name)
+                if tid is None:
+                    return MagicMock(returncode=1, stdout="")
+                return MagicMock(returncode=0, stdout=f"{tid}\n")
+            if "list-panes" in argv:
+                return MagicMock(returncode=0, stdout="zsh\n")
+            if "kill-window" in argv:
+                killed_targets.append(argv[argv.index("-t") + 1])
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
-        with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list_sessions: list-windows
-                MagicMock(
-                    returncode=0,
-                    stdout="work1:/a\nwork2:/b\nwork3:/c\n",
-                ),
-                # show-option for work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option for work2
-                MagicMock(returncode=0, stdout="222\n"),
-                # show-option for work3
-                MagicMock(returncode=0, stdout="333\n"),
-                # kill_session(111): _find → cache miss → rebuild list-windows
-                MagicMock(returncode=0, stdout="work1:/a\nwork2:/b\nwork3:/c\n"),
-                MagicMock(returncode=0, stdout="111\n"),  # show-option work1
-                MagicMock(returncode=0, stdout="222\n"),  # show-option work2
-                MagicMock(returncode=0, stdout="333\n"),  # show-option work3
-                MagicMock(returncode=0),  # kill-window work1
-                # kill_session(333): _find → cache hit → show-option verify
-                MagicMock(returncode=0, stdout="333\n"),
-                MagicMock(returncode=0),  # kill-window work3
-            ]
+        with patch("c_lord.tmux._run", side_effect=fake_run):
             killed = mgr.cleanup_orphaned(active_thread_ids={222})
 
         assert killed == 2
+        assert sorted(killed_targets) == [
+            f"{SESSION_NAME}:work1",
+            f"{SESSION_NAME}:work3",
+        ]
 
     def test_cleanup_orphaned_tmux_unavailable(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -630,6 +646,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             result = mgr.send_input(12345, "my prompt")
 
@@ -666,6 +683,9 @@ class TestTmuxSessionManager:
                     MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
+                    # #560: send_input now reads the box back to confirm the
+                    # message actually left it.
+                    MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
@@ -695,6 +715,9 @@ class TestTmuxSessionManager:
                     MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
+                    # #560: send_input now reads the box back to confirm the
+                    # message actually left it.
+                    MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
@@ -709,14 +732,30 @@ class TestTmuxSessionManager:
             else:
                 os.environ["CLORD_BRIDGE_MODE"] = prev
 
-    # -- #147: vim NORMAL-mode correction before literal input --------------
+    # -- #147/#544: vim NORMAL-mode correction before literal input ---------
     #
-    # Claude Code runs with ``editorMode: vim``. When the input box is in
+    # When Claude Code runs with ``editorMode: vim`` and the input box is in
     # NORMAL mode, ``send-keys -l`` characters are interpreted as vim commands
-    # and the message is corrupted. This Claude version (v2.1.150) shows
-    # ``-- INSERT`` in the status bar only in INSERT mode; NORMAL omits it
-    # entirely (no ``-- NORMAL`` marker). So send_input must capture the pane,
-    # and if not in INSERT, press ``i`` to enter INSERT before the literal text.
+    # and the message is corrupted, so send_input presses ``i`` first.
+    #
+    # #544: that correction must fire ONLY for panes that actually run vim
+    # mode.  A bare ``⏵⏵ bypass permissions on …`` bar is what a vim-*less*
+    # input box shows, so it is not evidence of NORMAL — the fixture below
+    # therefore carries an explicit ``-- NORMAL`` marker.  The vim-off pane and
+    # the marker-less vim NORMAL pane (which v2.1.246 renders identically) are
+    # covered in tests/test_send_input_vim_mode.py.
+
+    # #560: an input box that is empty — what the pane looks like once the
+    # message has actually been submitted. send_input reads this back to confirm
+    # delivery instead of trusting the Enter keypress's exit code.
+    _EMPTY_BOX_PANE = (
+        "● done\n"
+        "─────────────────────────────\n"
+        "❯ \n"
+        "─────────────────────────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
 
     _INSERT_PANE = (
         "❯ \n"
@@ -730,11 +769,11 @@ class TestTmuxSessionManager:
         "─────────────────────────────\n"
         "   Model: Opus 4.7  v2.1.150  Style: default\n"
         "   ⎇ no git  cwd: /tmp  Skill: none\n"
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+        "  -- NORMAL -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
 
     def test_send_input_enters_insert_when_normal_mode(self, monkeypatch) -> None:
-        """NORMAL mode → press ``i`` (key) before sending the literal text (#147)."""
+        """vim NORMAL → press ``i`` (key) before sending the literal text (#147)."""
         monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
@@ -747,6 +786,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),  # send-keys i
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             assert mgr.send_input(12345, "melon") is True
 
@@ -775,6 +815,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             assert mgr.send_input(12345, "melon") is True
 
@@ -1442,32 +1483,63 @@ class TestWindowSizePolicy:
 
 
 class TestPaneInsertModeDetection:
-    """#147: detect vim INSERT vs NORMAL from the pane status bar.
+    """#147/#544: decide vim INSERT vs NORMAL from the pane status bar.
 
-    Claude Code (v2.1.150) shows ``-- INSERT`` in the status bar only in
-    INSERT mode. NORMAL mode omits it — there is NO ``-- NORMAL`` marker —
-    so detection keys on the presence of ``-- INSERT`` plus a recognisable
-    status-bar anchor for the NORMAL case.
+    Claude Code (verified on v2.1.246) renders the vim mode marker like this:
+
+    ==========================  ==========================================
+    editor state                bottom status bar
+    ==========================  ==========================================
+    vim on, INSERT              ``-- INSERT -- ⏵⏵ bypass permissions on …``
+    vim on, NORMAL              ``⏵⏵ bypass permissions on …``
+    vim **off** (the default)   ``⏵⏵ bypass permissions on …``
+    ==========================  ==========================================
+
+    The last two rows are byte-identical, so ``⏵⏵`` alone proves only that the
+    pane is sitting at the input prompt — it is **not** evidence of vim NORMAL.
+    Treating it as such was #544: every message from a consumer who does not use
+    vim mode got an ``i`` typed in front of it.  ``_pane_in_insert_mode`` must
+    therefore report ``None`` ("cannot tell — do not touch the input") for that
+    frame, and only commit to NORMAL on a positive ``-- NORMAL`` marker.
     """
 
     _INSERT = (
         "❯ some text\n"
         "──────────\n"
-        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "   Model: Opus 5  v2.1.246  Style: default\n"
         "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
+    # vim enabled and dropped to NORMAL, on a build that renders the explicit
+    # marker.  This is the only frame that positively proves "vim, not INSERT".
     _NORMAL = (
         "❯ some text\n"
         "──────────\n"
-        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "   Model: Opus 5  v2.1.246  Style: default\n"
+        "  -- NORMAL -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+    # A consumer with the default editor mode (no vim).  Perfectly normal,
+    # ready-for-input pane — pressing ``i`` here types a literal ``i`` (#544).
+    _VIM_DISABLED = (
+        "❯ some text\n"
+        "──────────\n"
+        "   Model: Opus 5  v2.1.246  Style: default\n"
         "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
 
     def test_insert_marker_present(self) -> None:
         assert _pane_in_insert_mode(self._INSERT) is True
 
-    def test_normal_no_insert_marker(self) -> None:
+    def test_explicit_normal_marker_is_normal(self) -> None:
+        """``-- NORMAL`` is the only positive proof of vim-but-not-INSERT."""
         assert _pane_in_insert_mode(self._NORMAL) is False
+
+    def test_vim_disabled_status_bar_is_undecidable(self) -> None:
+        """#544: ``⏵⏵`` without any vim marker must NOT read as NORMAL.
+
+        It is indistinguishable from vim-on-NORMAL, so the only safe answer is
+        "unknown" — the caller must not press ``i`` on this evidence alone.
+        """
+        assert _pane_in_insert_mode(self._VIM_DISABLED) is None
 
     def test_old_insert_in_scrollback_ignored(self) -> None:
         """A stale ``-- INSERT`` far above the current status bar must not win.
@@ -1481,6 +1553,43 @@ class TestPaneInsertModeDetection:
     def test_empty_or_unknown_returns_none(self) -> None:
         assert _pane_in_insert_mode("") is None
         assert _pane_in_insert_mode("just some\nresponse text\n") is None
+
+
+class TestPaneInsertModeRealCaptures:
+    """#544 AC5: the same three states, as real ``capture-pane`` snapshots.
+
+    ``vim_disabled_staging_pane.txt`` is the #544 bug fixture: a real staging-1
+    pane (Claude Code v2.1.246) whose session dir set ``editorMode: "normal"``.
+    Before the fix, ``_pane_in_insert_mode`` answered ``False`` on it and
+    send_input typed an ``i`` in front of the message. The vim-enabled captures
+    come from the same Claude build with vim mode left on.
+    """
+
+    def _load(self, name: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "fixtures" / "panes" / name).read_text()
+
+    def test_real_vim_disabled_pane_is_undecidable(self) -> None:
+        """The bug fixture: a real vim-less pane must never read as NORMAL."""
+        assert _pane_in_insert_mode(self._load("vim_disabled_staging_pane.txt")) is None
+
+    def test_real_vim_enabled_insert_pane(self) -> None:
+        assert _pane_in_insert_mode(self._load("vim_enabled_insert.txt")) is True
+
+    def test_real_vim_enabled_normal_pane_is_undecidable(self) -> None:
+        """v2.1.246 renders NO marker in vim NORMAL — identical to vim-off.
+
+        This is why :meth:`TmuxSessionManager.send_input` cannot rely on the
+        status bar alone and has to probe (see test_send_input_vim_mode.py).
+        """
+        assert _pane_in_insert_mode(self._load("vim_enabled_normal.txt")) is None
+
+    def test_vim_off_and_vim_normal_status_bars_are_identical(self) -> None:
+        """Documents the root cause of #544 with the real captures."""
+        off = self._load("vim_disabled_staging_pane.txt").splitlines()[-1]
+        normal = self._load("vim_enabled_normal.txt").splitlines()[-1]
+        assert off == normal
 
 
 class TestParseWorkNumber:

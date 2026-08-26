@@ -113,7 +113,7 @@ _NEXT_STEPS = (
 #: Leads with the fact the sender needs first — their message did **not** run —
 #: because the failure they hit was waiting for a reply that was never coming.
 UNTRACKED_NOTICE = (
-    "⚠️ このスレッドには復元できるセッションがありません（c-lord の記録が見つかりません）。\n"
+    "⚠️ このスレッドには復元できるワークスペースがありません（c-lord の記録が見つかりません）。\n"
     "**いま送ったメッセージは Claude に届いていません。**\n\n" + _NEXT_STEPS
 )
 
@@ -148,7 +148,7 @@ NOT_A_CLORD_THREAD_BINDING = (
 
 _HINTS = {
     ThreadResume.RESUMES: (
-        "ℹ️ この作業セッションは現在停止しています（tmux ウィンドウがありません）。\n"
+        "ℹ️ このスレッドのワークスペースは現在停止しています（tmux ウィンドウがありません）。\n"
         "**このスレッドにメッセージを送れば自動で復元し、続きから再開します。**"
     ),
     ThreadResume.CLOSED: (
@@ -157,7 +157,7 @@ _HINTS = {
         "（`/reopen-workspace` でも再開できます）。"
     ),
     ThreadResume.UNTRACKED: (
-        "ℹ️ この作業セッションは停止していて、**メッセージを送っても復元できません**"
+        "ℹ️ このスレッドのワークスペースは停止していて、**メッセージを送っても復元できません**"
         "（c-lord の記録が見つかりません）。\n" + _NEXT_STEPS
     ),
 }

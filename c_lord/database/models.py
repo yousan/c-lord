@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     topic_source TEXT,
     rename_backoff_until TEXT,
     closed_at TEXT,
+    closed_reason TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -157,6 +158,10 @@ _MIGRATIONS = [
     # death) — the latter still auto-resumes via --continue (#270), the former
     # holds the message and asks the user to reopen.
     "ALTER TABLE sessions ADD COLUMN closed_at TEXT",
+    # #574: why it was stopped ("manual" / "idle"). Wording only — the
+    # state itself is still decided by closed_at alone, so the two can
+    # never disagree.
+    "ALTER TABLE sessions ADD COLUMN closed_reason TEXT",
 ]
 
 
