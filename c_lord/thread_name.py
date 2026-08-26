@@ -87,9 +87,7 @@ _LEADING_EMOJI_RE = re.compile(
 )
 # Matches the leading "[終了] " closed marker (#512).
 _CLOSED_PREFIX_RE = re.compile(
-    r"^(?:"
-    + "|".join(re.escape(m) for m in (CLOSED_MARK, *LEGACY_CLOSED_MARKS))
-    + r")\s*"
+    r"^(?:" + "|".join(re.escape(m) for m in (CLOSED_MARK, *LEGACY_CLOSED_MARKS)) + r")\s*"
 )
 # Matches a leading "W<digits> │ " prefix (new format).
 _WORK_PREFIX_RE = re.compile(r"^W\d+\s*[│]\s*")

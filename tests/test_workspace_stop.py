@@ -111,3 +111,62 @@ class TestStoppingTheDevEnvironment:
 
         assert await devenv.stop_containers([]) == []
         assert calls == []
+
+
+class TestReasonIsPersistedButNotLoadBearing:
+    """``closed_reason`` exists to word the notice, not to decide state.
+
+    #540: ``closed_at`` alone already answers "is this stopped?". Adding a second
+    column that also has to be consulted would be a new way for the two to
+    disagree — which is the #538 failure exactly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reason_round_trips(self, tmp_path) -> None:
+        from c_lord.database.models import init_db
+        from c_lord.database.repository import SessionRepository
+
+        db = str(tmp_path / "s.db")
+        await init_db(db)
+        repo = SessionRepository(db)
+        await repo.save(thread_id=1, session_id="a" * 32, working_dir="/w")
+
+        await repo.set_closed(1, True, reason="idle")
+
+        rec = await repo.get(1)
+        assert rec is not None
+        assert rec.closed_reason == "idle"
+
+    @pytest.mark.asyncio
+    async def test_reason_defaults_to_manual(self, tmp_path) -> None:
+        from c_lord.database.models import init_db
+        from c_lord.database.repository import SessionRepository
+
+        db = str(tmp_path / "s.db")
+        await init_db(db)
+        repo = SessionRepository(db)
+        await repo.save(thread_id=1, session_id="a" * 32, working_dir="/w")
+
+        await repo.set_closed(1, True)
+
+        rec = await repo.get(1)
+        assert rec is not None
+        assert rec.closed_reason == "manual"
+
+    @pytest.mark.asyncio
+    async def test_reopening_clears_the_reason(self, tmp_path) -> None:
+        from c_lord.database.models import init_db
+        from c_lord.database.repository import SessionRepository
+
+        db = str(tmp_path / "s.db")
+        await init_db(db)
+        repo = SessionRepository(db)
+        await repo.save(thread_id=1, session_id="a" * 32, working_dir="/w")
+        await repo.set_closed(1, True, reason="idle")
+
+        await repo.set_closed(1, False)
+
+        rec = await repo.get(1)
+        assert rec is not None
+        assert rec.closed_at is None
+        assert rec.closed_reason is None
