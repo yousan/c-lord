@@ -160,7 +160,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
 - **Compact detection** — Notifies in-thread when context compaction occurs (trigger type + token count before compact)
 - **Hard stall notification** — Thread message after 30 s of no activity (extended thinking or context compression); resets automatically when Claude resumes
-- **Timeout notifications** — Embed with elapsed time and resume guidance on timeout
+- **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541)
 
 #### 🔌 Input & Skills
 - **Attachment support** — Text files auto-appended to prompt (up to 5 × 50 KB); images downloaded and passed via `--image` (up to 4 × 5 MB)

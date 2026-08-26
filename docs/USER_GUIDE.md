@@ -167,6 +167,20 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 - 🔄 In progress
 - ⬜ Pending
 
+### Progress folding (`progress.txt`)
+
+The intermediate embeds a turn produces — session start, thinking, tool use and
+tool results, the todo list — are useful while the turn is in flight and noise
+once it is over. At the end of a turn they are folded into a single
+`progress.txt` transcript and the originals are deleted.
+
+- A turn that produced **nothing worth reading** (no tool use, no thinking — the
+  session-start banner alone does not count) posts **no `progress.txt` at all**.
+  The intermediate embeds are still cleaned up, so the thread simply ends with
+  the answer (#542).
+- When `progress.txt` is posted on its own rather than attached to a message
+  that already has text, it carries a one-line caption saying what the file is.
+
 ---
 
 ## Slash Commands
@@ -263,7 +277,15 @@ Message sent to thread
 
 ### Timeout
 
-Sessions time out after a configurable period of inactivity (default: 5 minutes). An embed with elapsed time and guidance is shown. Send a new message to start a fresh session in the same thread.
+A session times out only when Claude is genuinely wedged: the tmux pane has
+stopped changing for the whole inactivity window (default: 5 minutes) **and**
+Claude is not sitting idle at its input prompt. An embed with elapsed time and
+guidance is shown; send a new message to start a fresh session in the same thread.
+
+A turn that finished normally never produces this embed, even though its pane
+goes completely silent afterwards — in the default `jsonl` bridge mode the answer
+is delivered by the transcript mirror, so pane silence after an answer is the
+expected steady state, not a hang (#541).
 
 ### Interrupting
 
