@@ -1221,21 +1221,38 @@ class TmuxClaudeRunner:
         # Yield final complete event.  ``error`` is computed first so the single
         # yield below carries the right outcome (#366: a failed/empty run must
         # surface an error, not a silent "done").
+        timed_out = raw_static_seconds >= self.timeout_seconds
         if self._stopped:
             error = None if self._silent_stop else "Stopped by user"
-        elif raw_static_seconds >= self.timeout_seconds:
-            error = f"Timed out after {self.timeout_seconds} seconds"
-        elif not last_response:
-            # Reached completion (idle timeout or startup fast-fail) without ever
-            # extracting a response.  This is NOT a normal completion — decide
-            # whether to surface it (#366):
+        elif timed_out or not last_response:
+            # Reached completion without a usable response — either the hard
+            # inactivity backstop fired (``timed_out``) or we never extracted
+            # any response text.  Neither is automatically a failure, so run the
+            # #366 liveness ladder before blaming the session:
             #   1. A fatal startup error is on the pane → report it verbatim.
             #   2. No marker, but ``claude`` is no longer running → it exited
             #      without answering (crash / unrecognised fatal error).
-            #   3. ``claude`` is still alive at its prompt → most likely it
-            #      answered via the discord-reply skill and we simply didn't
-            #      scrape the text; stay silent to avoid a false error embed.
-            pane_error = startup_error or _extract_startup_error(current)
+            #   3. ``claude`` is alive but NOT idle at its prompt → it really is
+            #      wedged mid-turn; a frozen pane for the whole timeout window is
+            #      a genuine hang, so report the timeout.
+            #   4. ``claude`` is alive and idle at its prompt → the turn is over
+            #      and the answer went out through the jsonl mirror / reply skill
+            #      (#541).  Stay silent rather than posting a false error embed.
+            #
+            # #541: step 3/4 is what the backstop was missing.  In jsonl mode the
+            # pane freezes completely once a turn ends, and the idle pane yields
+            # no scrapable response, so EVERY normal turn hit the backstop ~312s
+            # after answering and posted "⏱️ Session timed out" (33 of 35 observed
+            # timeouts were this false alarm).  The ladder has to run first —
+            # which also means an ordinary timeout no longer masks a crashed
+            # ``claude`` (step 2 now reports the crash instead).
+            # The pane scrape stays gated on "no response was ever produced":
+            # a marker phrase like ``command not found: claude`` can legitimately
+            # appear inside Claude's own answer, and a timed-out turn that DID
+            # produce text must not be re-labelled a startup failure (#366).
+            pane_error = startup_error
+            if pane_error is None and not last_response:
+                pane_error = _extract_startup_error(current)
             if pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
@@ -1243,6 +1260,8 @@ class TmuxClaudeRunner:
                     "Claude exited without producing a response "
                     "(possible startup failure or crash) — check the tmux pane."
                 )
+            elif timed_out and not self._is_idle_at_prompt(current):
+                error = f"Timed out after {self.timeout_seconds} seconds"
             else:
                 error = None
         else:
@@ -1852,6 +1871,23 @@ class TmuxClaudeRunner:
             ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
                 return True
         return False
+
+    @classmethod
+    def _is_idle_at_prompt(cls, text: str) -> bool:
+        """Return True when the pane shows ``claude`` parked at an idle prompt.
+
+        Used by the inactivity backstop to tell "the turn is over" from "the
+        turn is wedged" (#541).  ``_has_input_prompt`` alone is not enough: the
+        TUI keeps the input box on screen *while generating too*, so a session
+        frozen mid-tool would look idle.  Requiring the generation indicator to
+        be absent as well makes the pair a real idle check —
+        no spinner **and** a ready input box means Claude finished and is
+        waiting for the next message.
+
+        The caller checks process liveness separately, which is what keeps a
+        dead pane's leftover ``❯`` in the scrollback from reading as idle.
+        """
+        return cls._has_input_prompt(text) and not cls._is_generating(text)
 
     # Keep for backward compatibility / testing.
     @staticmethod

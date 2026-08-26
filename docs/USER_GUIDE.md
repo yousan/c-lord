@@ -253,7 +253,15 @@ Message sent to thread
 
 ### Timeout
 
-Sessions time out after a configurable period of inactivity (default: 5 minutes). An embed with elapsed time and guidance is shown. Send a new message to start a fresh session in the same thread.
+A session times out only when Claude is genuinely wedged: the tmux pane has
+stopped changing for the whole inactivity window (default: 5 minutes) **and**
+Claude is not sitting idle at its input prompt. An embed with elapsed time and
+guidance is shown; send a new message to start a fresh session in the same thread.
+
+A turn that finished normally never produces this embed, even though its pane
+goes completely silent afterwards — in the default `jsonl` bridge mode the answer
+is delivered by the transcript mirror, so pane silence after an answer is the
+expected steady state, not a hang (#541).
 
 ### Interrupting
 
