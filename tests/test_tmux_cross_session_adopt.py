@@ -90,9 +90,7 @@ class TestAdoptWindowFromOtherSession:
 
     def test_does_not_move_a_window_already_in_this_session(self) -> None:
         own = f"w5\t{WORKDIR}\n"
-        run, calls = _router(
-            all_windows=f"monitoring\t@9\tw5\t{THREAD}\t{WORKDIR}\n", own_windows=own
-        )
+        run, calls = _router(all_windows=f"monitoring\t@9\tw5\t{THREAD}\t{WORKDIR}\n", own_windows=own)
         mgr = _manager()
 
         with patch("c_lord.tmux._run", side_effect=run):

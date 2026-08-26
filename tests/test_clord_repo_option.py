@@ -118,9 +118,7 @@ class TestSpawnSessionRepoOption:
         binding = await thread_repo.get(thread.id)
         assert binding["source_repo"] == "https://github.com/yousan/dotclaude.git"
 
-    async def test_without_repo_no_thread_binding_is_created(
-        self, channel_cog, thread_repo
-    ) -> None:
+    async def test_without_repo_no_thread_binding_is_created(self, channel_cog, thread_repo) -> None:
         cog = _make_cog(channel_cog)
         channel = _make_text_channel()
         cog._run_claude = AsyncMock()  # type: ignore[method-assign]

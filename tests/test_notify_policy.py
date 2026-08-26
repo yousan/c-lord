@@ -31,7 +31,9 @@ class TestMode:
         assert owner_fallback_mode() == "blocked"
 
     @pytest.mark.parametrize("raw", ["all", "ALL", " all ", "off", "blocked"])
-    def test_accepts_the_documented_values(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    def test_accepts_the_documented_values(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
         monkeypatch.setenv("CLORD_OWNER_FALLBACK", raw)
         assert owner_fallback_mode() == raw.strip().lower()
 
@@ -69,7 +71,9 @@ class TestOwnerNotifyId:
         bot.owner_id = OWNER_ID
         assert owner_notify_id(bot, kind="completion") == OWNER_ID
 
-    def test_returns_none_when_the_policy_forbids_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_returns_none_when_the_policy_forbids_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("CLORD_OWNER_FALLBACK", "off")
         bot = MagicMock()
         bot.owner_id = OWNER_ID
@@ -194,7 +198,9 @@ class TestPolicyReachesTheTurn:
         assert seen["blocked_mention"] == OWNER_ID
         assert seen["completion_mention"] is None
 
-    async def test_all_keeps_the_previous_behaviour(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_all_keeps_the_previous_behaviour(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """AC4."""
         monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
         seen = await _run_turn(_make_cog(), _message(_webhook_user()))

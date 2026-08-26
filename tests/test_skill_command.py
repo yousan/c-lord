@@ -320,7 +320,9 @@ class TestRunSkillValidation:
 class TestNewThreadMode:
     def _setup_bound_channel(self, cog: SkillCommandCog) -> None:
         """Set up ChannelRepoCog mock so the channel appears bound."""
-        cc = _make_channel_cog_mock(session_dir_manager=MagicMock(), tmux_manager=MagicMock())
+        cc = _make_channel_cog_mock(
+            session_dir_manager=MagicMock(), tmux_manager=MagicMock()
+        )
         cog.bot.get_cog = MagicMock(return_value=cc)
 
     @pytest.mark.asyncio
@@ -451,7 +453,9 @@ class TestInThreadMode:
         """A thread not under the claude channel creates a new thread."""
         cog = _make_cog(skills=[{"name": "test", "description": ""}])
         # Set up ChannelRepoCog so channel appears bound
-        cc = _make_channel_cog_mock(session_dir_manager=MagicMock(), tmux_manager=MagicMock())
+        cc = _make_channel_cog_mock(
+            session_dir_manager=MagicMock(), tmux_manager=MagicMock()
+        )
         cog.bot.get_cog = MagicMock(return_value=cc)
         # Thread with different parent_id
         thread = _make_thread(thread_id=5555, parent_id=888)

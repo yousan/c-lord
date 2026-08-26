@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from c_lord.tmux import (
@@ -147,9 +146,7 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(
-                    returncode=0, stdout=""
-                ),  # _find_window_by_working_dir: no match for "/a"
+                MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -162,9 +159,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout="w1\n"),  # list-windows
                 MagicMock(returncode=0, stdout="111\n"),  # show-option w1
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(
-                    returncode=0, stdout="w1\t/a\n"
-                ),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -734,8 +729,6 @@ class TestTmuxSessionManager:
         "   ⎇ no git  cwd: /tmp  Skill: none\n"
         "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
-    # vim enabled AND dropped to NORMAL — the explicit marker is what makes
-    # this frame unambiguous (#544).
     _NORMAL_PANE = (
         "❯ \n"
         "─────────────────────────────\n"
@@ -1325,7 +1318,7 @@ class TestTmuxSessionManager:
 
         assert name == "work1", f"Expected work1 (found via mapping file), got {name}"
         new_window_calls = [c for c in recorded_calls if "new-window" in c]
-        assert new_window_calls == [], "new-window was called despite mapping file entry"
+        assert new_window_calls == [], f"new-window was called despite mapping file entry"
 
         import os
 
@@ -1536,6 +1529,8 @@ class TestPaneInsertModeRealCaptures:
     """
 
     def _load(self, name: str) -> str:
+        from pathlib import Path
+
         return (Path(__file__).parent / "fixtures" / "panes" / name).read_text()
 
     def test_real_vim_disabled_pane_is_undecidable(self) -> None:
