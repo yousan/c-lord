@@ -137,7 +137,13 @@ resumable.
 
 It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
 
-If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` and `/tmux-screenshot` no longer dead-end with a bare "No tmux window found." Instead they tell you the session is stopped and that **sending a message auto-restores it** (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
+If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` and `/tmux-screenshot` no longer dead-end with a bare "No tmux window found." They tell you what sending a message will *actually* do, which depends on the thread (#538):
+
+- **The thread has a session record** → sending a message auto-restores it (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
+- **The session was closed** (`[終了]` / `/close-workspace`) → the message is held and a **▶️ 再開する** button is offered instead (#512).
+- **c-lord has no record of the thread** (record deleted, DB rebuilt, thread from another host) → a message cannot restore anything, so the hint says so and names the way forward (`/clord <task>`, or `/clord-thread-init repo:<URL>` first) rather than promising a resume that never comes. Messages sent to such a thread are answered — a ⚠️ reaction plus a one-time notice that the message did **not** reach Claude — never dropped in silence, which is what #538 fixed.
+
+The hint's wording and the rule that decides whether a message is accepted come from the same place, so they cannot drift apart again. See [specs/session-resume.md](specs/session-resume.md).
 
 **Screenshot height (#471)**: `/tmux-screenshot` (and the `/resync` PNG snapshot) show **more history than the live ~40-row window**. Claude's TUI keeps no scrollback, so before capturing, c-lord transiently grows the window so Claude redraws more of the conversation, captures the taller screen, then restores the exact original size (the human's attached view is unchanged). The default height is **100 rows**; override it with `CLORD_TMUX_SCREENSHOT_ROWS` (rows), or set it to `0` to capture the current window as-is.
 
