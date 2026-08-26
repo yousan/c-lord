@@ -18,6 +18,7 @@ from c_lord.discord_ui.conversation_renderer import (
     ConvMessage,
     ConvReaction,
     conversation_from_spec,
+    emoji_support_available,
     load_spec_file,
     render_conversation_png,
 )
@@ -25,6 +26,14 @@ from c_lord.discord_ui.fonts import load_text_font
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _HAS_FONT = load_text_font(20) is not None
+
+# #588: the renderer now refuses to draw a spec containing emoji when the
+# optional ``emoji`` library is absent — the old behaviour was to draw them with
+# the body font (i.e. tofu) and report success. The specs below do carry emoji,
+# so they need the whole ``[table]`` extra, not just a usable font.
+_HAS_EMOJI = emoji_support_available()
+_RENDERABLE = _HAS_FONT and _HAS_EMOJI
+_RENDER_SKIP = "needs the optional [table] extra (font + emoji): uv sync --extra table"
 
 
 def _sample_messages() -> list[ConvMessage]:
@@ -151,7 +160,7 @@ class TestSpecLoader:
 # ── Pillow mockup renderer ───────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not _HAS_FONT, reason="no usable font (optional [table] extra)")
+@pytest.mark.skipif(not _RENDERABLE, reason=_RENDER_SKIP)
 class TestRenderPillow:
     def test_returns_png_bytes(self) -> None:
         png = render_conversation_png(_sample_messages())
@@ -200,7 +209,7 @@ def _load_cli():
     return mod
 
 
-@pytest.mark.skipif(not _HAS_FONT, reason="no usable font (optional [table] extra)")
+@pytest.mark.skipif(not _RENDERABLE, reason=_RENDER_SKIP)
 class TestCli:
     def test_writes_png_from_spec(self, tmp_path) -> None:
         cli = _load_cli()

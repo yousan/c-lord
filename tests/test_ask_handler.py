@@ -9,6 +9,7 @@ for up to 24h and the whole thread freezes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -409,3 +410,321 @@ async def test_collect_ask_answers_pings_notify_user(monkeypatch):
     assert any("<@999>" in (s.kwargs.get("content") or "") for s in embed_sends), (
         f"collect menu must ping notify user 999; sends={thread.send.await_args_list}"
     )
+
+
+@pytest.mark.asyncio
+async def test_bridge_declines_when_another_bridge_owns_the_menu():
+    """#535 AC6: a second bridge for the same thread returns at once.
+
+    Two independent paths can spot the same TUI menu (poll-loop / transcript
+    mirror / watchdog). Only the first may post buttons; the second must not
+    post a duplicate menu, must not re-post the pre-menu context, and above all
+    must not park on a 24h await — before #535 it did all three, and its
+    ``register()`` stole the queue from the bridge that was already waiting.
+    """
+    thread, _ = _thread(535_0001)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+    runner.answer_menu = AsyncMock()
+
+    owner_queue = ask_bus.register(thread.id)  # the bridge that got there first
+    assert owner_queue is not None
+    try:
+        q = _question()
+        q.context = "この判断の経緯を説明します。" * 8
+        await asyncio.wait_for(bridge_pane_ask(thread, q, runner), timeout=3.0)
+    finally:
+        ask_bus.unregister(thread.id)
+
+    thread.send.assert_not_called()  # no second menu, no second context message
+    runner.cancel_menu.assert_not_called()
+    runner.answer_menu.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_declining_bridge_leaves_the_owner_registered():
+    """#535 AC2: the loser must not unregister the winner on its way out."""
+    thread, _ = _thread(535_0002)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+
+    owner_queue = ask_bus.register(thread.id)
+    assert owner_queue is not None
+    try:
+        await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+        assert ask_bus.is_active(thread.id), "the owner's waiter was dropped"
+        assert ask_bus.post_answer(thread.id, ["A1"]) is True
+        assert owner_queue.get_nowait() == ["A1"]
+    finally:
+        ask_bus.unregister(thread.id)
+
+
+@pytest.mark.asyncio
+async def test_ownership_is_released_when_posting_the_menu_fails():
+    """#535: a failed menu post must not leave the thread permanently claimed.
+
+    Ownership only helps if it is always given back.  ``register()`` happens
+    before the menu is posted, so a Discord outage between the two used to be
+    survivable (the next bridge simply overwrote the waiter) — with ownership
+    now refused, the same outage would wedge every future menu in the thread.
+    """
+    thread, _ = _thread(535_0003)
+    thread.send = AsyncMock(side_effect=RuntimeError("discord is down"))
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert not ask_bus.is_active(thread.id), "a failed post left the thread claimed forever"
+
+
+@pytest.mark.asyncio
+async def test_ownership_is_released_when_the_bridge_is_cancelled(monkeypatch):
+    """#535: pre-emption (#315) cancels the bridge — ownership must come back."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    thread, _ = _thread(535_0004)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    task = asyncio.create_task(bridge_pane_ask(thread, _question(), runner))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if ask_bus.is_active(thread.id):
+            break
+    assert ask_bus.is_active(thread.id), "bridge never claimed the menu"
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert not ask_bus.is_active(thread.id), "a cancelled bridge kept the claim"
+
+
+# ----------------------------------------------------------------------
+# #536: the bridge records WHY a menu closed, so a late click can be told
+# the truth instead of a blanket "the bot was restarted".
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_terminal_resolution(monkeypatch):
+    """Answered in the tmux pane → a later click must not blame a restart."""
+    from c_lord.discord_ui.ask_bus import CLOSE_TERMINAL
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(536_1001)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=None)
+    runner.cancel_menu = AsyncMock()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_click_answer(monkeypatch):
+    """Answered by a Discord click → a click on a stale copy says 'already answered'."""
+    from c_lord.discord_ui.ask_bus import CLOSE_ANSWERED
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    thread, _ = _thread(536_1002)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.answer_menu = AsyncMock()
+
+    async def _answer_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["A1"])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0),
+        _answer_soon(),
+    )
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_ANSWERED
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_interruption(monkeypatch):
+    """A pre-empting message (#315) posts an empty answer — that is not an answer."""
+    from c_lord.discord_ui.ask_bus import CLOSE_INTERRUPTED
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    thread, _ = _thread(536_1003)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    async def _preempt_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, [])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0),
+        _preempt_soon(),
+    )
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_timeout(monkeypatch):
+    """A menu nobody answered says so — it was not lost to a restart."""
+    from c_lord.discord_ui.ask_bus import CLOSE_TIMEOUT
+
+    monkeypatch.setattr(ask_handler, "ASK_ANSWER_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 5.0)
+    thread, _ = _thread(536_1004)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_bridge_registers_and_releases_its_menu_message(monkeypatch):
+    """#536 AC5: the posted menu is addressable while live, forgotten once resolved."""
+    from c_lord.discord_ui.ask_menus import ask_menus
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, msg = _thread(536_1005)
+    msg.id = 4242
+    seen: list[int] = []
+
+    async def _peek_state():
+        # Record what the registry holds WHILE the menu is still open, then
+        # report the menu as resolved so the bridge winds down.
+        seen.append(len(ask_menus.pop_others(thread.id, keep_message_id=None)))
+        ask_menus.register(thread.id, msg)
+        return (None, True)
+
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=None)
+    runner.peek_menu_state = AsyncMock(side_effect=_peek_state)
+    runner.cancel_menu = AsyncMock()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert seen and seen[0] == 1, "the live menu message was never registered"
+    assert ask_menus.pop_others(thread.id, keep_message_id=None) == [], (
+        "a resolved menu must not stay registered as answerable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_menu_stops_showing_live_buttons(monkeypatch):
+    """#536: a menu cancelled by a new instruction must not keep live buttons.
+
+    ``_preempt_prior_turn`` (#315) posts an empty answer so the parked bridge can
+    wind down; the bridge then sends Esc and returned **without touching the
+    message**. The buttons stayed clickable on a menu that no longer existed —
+    the "生きたままのメニュー" in #536 — and clicking one reached nobody.
+    """
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    thread, msg = _thread(536_1006)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    async def _preempt_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, [])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0),
+        _preempt_soon(),
+    )
+
+    msg.edit.assert_awaited()
+    kwargs = msg.edit.await_args.kwargs
+    assert kwargs.get("view") is None, "cancelled menu kept its buttons"
+    assert "取り消" in (kwargs.get("content") or ""), kwargs
+
+
+@pytest.mark.asyncio
+async def test_long_prose_menu_resolution_keeps_its_order_and_posts_once(monkeypatch):
+    """#549 AC4/AC5: 経緯 → 質問 → 解決 の順で、本文は一度だけ。
+
+    The prose Claude speaks above a menu reaches Discord by two paths — the pane
+    bridge (which can read it while the menu is open) and the transcript mirror
+    (which can only read it *after* the menu resolves, because the CLI buffers
+    the whole chunk until then; measured on staging: nothing of the turn appears
+    in the jsonl for 90s with the menu open, then all of it lands at once).
+
+    So the order the reader sees depends on the pane bridge posting first, and
+    the "posted once" depends on the mirror suppressing its late twin.
+    """
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(549_0001)
+    q = _question()
+    # A long report of the kind that scrolls off the pane (#549's failing case).
+    q.context = "## 原因\n\n" + ("調査と修正が終わりました。理由を説明します。" * 40)
+    runner = _resolved_runner()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, runner), timeout=3.0)
+
+    # 1) 経緯 が先、質問(embed) が後。
+    sends = thread.send.await_args_list
+    assert len(sends) >= 2, sends
+    assert sends[0].kwargs.get("embed") is None, "prose must not be part of the menu embed"
+    assert sends[0].kwargs.get("content"), "the prose was not posted before the menu"
+    assert sends[-1].kwargs.get("embed") is not None, "the menu embed must come last"
+
+    # 2) 解決後に CLI が同じ本文を flush しても、mirror 側で抑止される。
+    assert bridged_context.consume_match(thread.id, q.context, source="pane") is True
+    # 3) one-shot: a second flush of the same text is NOT suppressed a second
+    #    time, so a genuinely new message with the same wording still gets through.
+    assert bridged_context.consume_match(thread.id, q.context, source="pane") is False
+
+
+@pytest.mark.asyncio
+async def test_menu_says_when_the_background_could_not_be_read(monkeypatch):
+    """#549: when the prose is unreadable, say so ON the menu.
+
+    The pane is the only place the 経緯 exists while the menu is open (the CLI
+    buffers the jsonl chunk until resolution — measured), so when even the tall
+    re-capture comes up empty there is nothing to post first. Silence then reads
+    as "Claude asked with no reasoning"; the prose turns up after the answer and
+    looks like a new statement. A one-line note is what makes the late arrival
+    legible instead of confusing.
+    """
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(549_0002)
+    q = _question()
+    q.context = ""  # nothing recoverable from the pane
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    menu_send = thread.send.await_args_list[-1]
+    embed = menu_send.kwargs.get("embed")
+    assert embed is not None
+    text = f"{embed.description or ''}{getattr(embed.footer, 'text', '') or ''}"
+    assert "回答後" in text, f"the menu does not explain the missing background: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_menu_with_context_carries_no_such_note(monkeypatch):
+    """The note is for the degraded case only — it must not become chrome."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(549_0003)
+    q = _question()
+    q.context = "この判断の経緯を説明します。" * 6
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    embed = thread.send.await_args_list[-1].kwargs.get("embed")
+    text = f"{embed.description or ''}{getattr(embed.footer, 'text', '') or ''}"
+    assert "回答後" not in text, text

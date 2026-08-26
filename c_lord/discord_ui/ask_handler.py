@@ -23,7 +23,14 @@ import discord
 
 from ..claude.types import AskQuestion
 from ..database.ask_repo import PendingAskRepository
+from .ask_bus import (
+    CLOSE_ANSWERED,
+    CLOSE_INTERRUPTED,
+    CLOSE_TERMINAL,
+    CLOSE_TIMEOUT,
+)
 from .ask_bus import ask_bus as _ask_bus
+from .ask_menus import ask_menus as _ask_menus
 from .ask_view import AskView
 from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
@@ -71,6 +78,17 @@ def _context_chunks(text: str) -> tuple[list[str], bool]:
     return chunks, truncated
 
 
+def _close(thread_id: int, reason: str, message: object | None = None) -> None:
+    """Mark this thread's menu closed for *reason* and stop tracking *message* (#536).
+
+    Recording the reason is what lets a late click say something true; forgetting
+    the message keeps a resolved menu from being blanked a second time as if it
+    were a stale copy.
+    """
+    _ask_bus.note_closed(thread_id, reason)
+    _ask_menus.forget(thread_id, getattr(message, "id", None))
+
+
 def _mention(user_id: int | None) -> str | None:
     """Message content that pings *user_id*, or None (#480).
 
@@ -98,8 +116,57 @@ async def bridge_pane_ask(
       "Type something." affordance that follows the real options
     - timeout / no answer → ``runner.cancel_menu()`` (Esc)
     """
-    answer_queue = _ask_bus.register(thread.id)
+    # #535: registering IS claiming the menu. Several paths can spot the same
+    # TUI menu (this poll-loop bridge, the transcript mirror, the #359
+    # watchdog); the first one to register owns it and everyone else returns
+    # here — before posting anything, so no second set of buttons and no second
+    # copy of the pre-menu context reaches the thread. Returning immediately
+    # also keeps the loser out of the 24h await that used to wedge the thread.
+    # #536 AC7: a typed sentence may answer this menu only when the TUI has a
+    # free-text row — ``allow_other`` is exactly that flag (plan-approval menus
+    # set it False, and keystrokes typed into one would land nowhere useful).
+    answer_queue = _ask_bus.register(thread.id, allow_free_text=question.allow_other)
+    if answer_queue is None:
+        logger.info(
+            "bridge_pane_ask: thread %d already has an active menu bridge — declining",
+            thread.id,
+        )
+        return
 
+    # #535: from here on the thread is CLAIMED. Everything below therefore runs
+    # under a single release-on-exit guard: the claim is taken before the menu
+    # is posted, so a failure in between (a Discord outage on the send, a #315
+    # pre-emption cancel) must still give it back. A leaked claim used to be
+    # harmless — the next bridge simply overwrote the waiter — but now it would
+    # silently block every future menu in this thread.
+    try:
+        await _bridge_claimed_menu(
+            thread,
+            question,
+            runner,
+            answer_queue,
+            ask_repo=ask_repo,
+            authorizer=authorizer,
+            notify_user_id=notify_user_id,
+        )
+    finally:
+        _ask_bus.unregister(thread.id)
+
+
+async def _bridge_claimed_menu(
+    thread: discord.Thread,
+    question: AskQuestion,
+    runner: TmuxClaudeRunner,
+    answer_queue: asyncio.Queue[list[str]],
+    ask_repo: PendingAskRepository | None = None,
+    authorizer: Authorizer | None = None,
+    notify_user_id: int | None = None,
+) -> None:
+    """Body of :func:`bridge_pane_ask`, run with the thread's menu claim held.
+
+    Split out so the claim's lifetime is one ``try/finally`` in the caller
+    rather than something every early return has to remember (#535).
+    """
     # #399: deliver the prose Claude spoke right above the menu (経緯・推し) as
     # its own silent message BEFORE the menu embed. The CLI buffers the jsonl
     # chunk containing the menu until resolution, so the transcript mirror
@@ -132,13 +199,24 @@ async def bridge_pane_ask(
                 _bridged_context.register(thread.id, question.context, source="pane")
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)
+    embed = ask_embed(question.question, question.header, question.options, question.multi_select)
+    if not question.context:
+        # #549: with no readable 経緯 the menu looks like a question asked out of
+        # nowhere, and the prose then turns up AFTER the answer looking like a
+        # new statement. The pane is the only source while the menu is open (the
+        # CLI buffers the jsonl chunk until resolution — measured on staging:
+        # nothing of the turn is written for 90s, then all of it at once), so
+        # when the tall re-capture also comes up empty there is nothing to post
+        # first. Say that, rather than leaving the gap unexplained.
+        embed.set_footer(text="この質問の経緯は、回答後にまとめて届きます")
     msg = await thread.send(
         content=_mention(notify_user_id),
-        embed=ask_embed(
-            question.question, question.header, question.options, question.multi_select
-        ),
+        embed=embed,
         view=view,
     )
+    # #536: while this menu is answerable it must be reachable, so that
+    # resolving any OTHER copy can blank this one out (and vice versa).
+    _ask_menus.register(thread.id, msg)
 
     resolved_note = "-# ✅ 端末で回答済み（このボタンは無効です）"
 
@@ -181,10 +259,13 @@ async def bridge_pane_ask(
     finally:
         for t in (click_task, tui_task):
             t.cancel()
-        _ask_bus.unregister(thread.id)
 
+    # #536: every exit below records WHY the menu stopped accepting answers.
+    # A click that lands afterwards (a stale copy, a slow finger) is then told
+    # the truth instead of the blanket "the bot was restarted" it used to get.
     if not done:
         # 24h timeout with the menu still open → dismiss it.
+        _close(thread.id, CLOSE_TIMEOUT, msg)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(
                 content="-# ⏰ Question timed out — send a new message to continue.",
@@ -196,6 +277,7 @@ async def bridge_pane_ask(
 
     if click_task not in done:
         # Menu was answered/cancelled directly in the pane — buttons are stale.
+        _close(thread.id, CLOSE_TERMINAL, msg)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(content=resolved_note, embed=None, view=None)
         return
@@ -204,13 +286,27 @@ async def bridge_pane_ask(
     # The menu may have been resolved in the TUI in the same instant the click
     # arrived; sending keystrokes then would leak into the idle prompt (#359).
     if hasattr(runner, "peek_pending_ask") and await runner.peek_pending_ask() is None:
+        _close(thread.id, CLOSE_TERMINAL, msg)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(content=resolved_note, embed=None, view=None)
         return
 
     if not selected:
+        # An EMPTY answer is the #315 pre-emption signal, not a choice. The menu
+        # is about to be Esc'd away, so its buttons must go with it (#536) —
+        # leaving them live is what produced menus that stayed clickable long
+        # after the question was gone.
+        _close(thread.id, CLOSE_INTERRUPTED, msg)
+        with contextlib.suppress(discord.HTTPException):
+            await msg.edit(
+                content="-# ⚡ 新しい指示が届いたので、この質問は取り消しました。",
+                embed=None,
+                view=None,
+            )
         await runner.cancel_menu()
         return
+
+    _close(thread.id, CLOSE_ANSWERED, msg)
 
     labels = [opt.label for opt in question.options]
     indices = [labels.index(s) for s in selected if s in labels]
@@ -269,7 +365,19 @@ async def collect_ask_answers(
 
         # Register a waiter in the bus before showing the view so there is no
         # race between the user clicking and the queue being registered.
+        # #535: a None means another bridge already has this thread's menu on
+        # screen. Posting a second copy is the bug we are fixing, and its
+        # answers would go to the owner's queue anyway — so skip this question
+        # and let the owner's menu collect the answer.
         answer_queue = _ask_bus.register(thread.id)
+        if answer_queue is None:
+            logger.warning(
+                "collect_ask_answers: thread %d already has an active menu bridge — "
+                "skipping duplicate menu for q_idx=%d",
+                thread.id,
+                q_idx,
+            )
+            continue
 
         view = AskView(
             q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo, authorizer=authorizer
@@ -279,10 +387,12 @@ async def collect_ask_answers(
             embed=ask_embed(q.question, q.header, q.options, q.multi_select),
             view=view,
         )
+        _ask_menus.register(thread.id, msg)  # #536: keep stale copies addressable
 
         try:
             selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)
         except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
+            _close(thread.id, CLOSE_TIMEOUT, msg)
             _ask_bus.unregister(thread.id)
             if ask_repo is not None:
                 await ask_repo.delete(thread.id)
@@ -307,7 +417,10 @@ async def collect_ask_answers(
             await ask_repo.delete(thread.id)
 
         if not selected:
+            _close(thread.id, CLOSE_INTERRUPTED, msg)
             continue
+
+        _close(thread.id, CLOSE_ANSWERED, msg)
 
         answer_text = ", ".join(selected)
         parts.append(f"**{q.question}**\nAnswer: {answer_text}")
