@@ -74,6 +74,23 @@ def _make_pane(
     return "\n".join(lines)
 
 
+def _running_script(*values: bool):
+    """``is_claude_running`` side_effect that repeats its last value forever.
+
+    A bare list raises ``StopIteration`` once the script runs out; inside an
+    async generator that surfaces as a hang instead of a clean failure.  How
+    many times the runner probes liveness is an implementation detail (the #541
+    backstop added one more probe), so tests script only the prefix they care
+    about and let the tail repeat.
+    """
+    seq = list(values)
+
+    def _next(_thread_id=None):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    return _next
+
+
 class TestProbeContextWindow:
     """probe_context_window scrapes /context to learn the real window total."""
 
@@ -1277,12 +1294,27 @@ class TestInactivityTimeout:
 
     @pytest.mark.asyncio
     async def test_timeout_fires_when_pane_frozen(self, runner, tmux_manager) -> None:
-        """A genuinely hung (frozen-pane) session is still killed by the backstop."""
+        """A genuinely hung (frozen-pane) session is still killed by the backstop.
+
+        The turn generates first and *then* freezes. That ordering is what makes
+        this a hang rather than a turn that never started: #562 gave the two
+        different wordings, and without a generation phase the runner has no
+        evidence the turn ever began — it would (correctly) say "No response"
+        instead of "Timed out".
+        """
         tmux_manager.is_claude_running.return_value = True
-        # A response is on screen (so the empty-response idle break does not
-        # apply) but the pane never changes again — a real hang.
         frozen = _make_pane(["● Partial answer, then hung"], user_prompt="q")
-        tmux_manager.capture_pane.return_value = frozen
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Working (spinner ticking), then frozen forever mid-answer.
+            if call_idx <= 4:
+                return f"✻ Generating… ({call_idx}s · ↑ 2.1k tokens · esc to interrupt)"
+            return frozen
+
+        tmux_manager.capture_pane.side_effect = capture_fn
 
         runner.timeout_seconds = 0.2
         events = []
@@ -1301,6 +1333,292 @@ class TestInactivityTimeout:
         assert len(result_events) == 1
         assert result_events[0].error is not None
         assert "Timed out" in result_events[0].error
+
+
+class TestAnsweredTurnDoesNotFalseTimeout:
+    """#541: a turn answered via the jsonl mirror must not report a timeout.
+
+    In the default ``jsonl`` bridge mode Claude posts its own final answer via
+    the transcript mirror, and the TUI pane then goes *completely* static at an
+    idle input prompt.  The scraped response text extracted from that idle pane
+    is empty (the ``●`` blocks have scrolled out of the viewport), while
+    ``last_response`` still holds the mid-turn tool text — so the completion
+    break (needs a stable non-empty response) and the idle break (needs an
+    empty ``last_response``) are both unreachable and the loop runs all the way
+    into the ``timeout_seconds`` backstop.  That posted a red
+    "⏱️ Session timed out" ~312s after a perfectly normal answer — 33 of 35
+    observed timeouts were this false alarm.
+
+    The backstop must therefore run the #366 liveness check *first*: an idle
+    ``claude`` sitting at its input prompt has finished, not hung.
+    """
+
+    # Mid-turn: tool output on screen, live spinner timer ticking every poll.
+    _WORKING = (
+        "❯ 調べて\n"
+        "\n"
+        "● Bash(rg -n 'foo' src/)\n"
+        "  ⎿  src/a.py:12: foo()\n"
+        "\n"
+        "✻ Cogitating… ({t}s · ↑ 4.2k tokens · esc to interrupt)\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "-- INSERT -- ⏵⏵ bypass permissions on\n"
+    )
+
+    # Turn over: answer delivered by the mirror, pane frozen at an idle prompt.
+    # ``_extract_response`` yields "" here — the ``●`` block scrolled away.
+    _IDLE = (
+        "✻ Brewed for 1m 6s\n"
+        "\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "-- INSERT -- ⏵⏵ bypass permissions on\n"
+    )
+
+    # Real hang: the spinner timer is still on screen but frozen — claude is
+    # alive yet stuck mid-generation, which must keep reporting a timeout.
+    _FROZEN_WORKING = _WORKING.format(t=42)
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_after_answer_delivered(self, runner, tmux_manager) -> None:
+        """AC1/AC4: answered turn + 300s of pane silence → RESULT carries no error."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 6:
+                # Working: response text stable, raw pane changing (spinner tick).
+                return self._WORKING.format(t=call_idx)
+            return self._IDLE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        runner.timeout_seconds = 0.2  # 10 polls @ 0.02 of frozen pane
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("調べて"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None, (
+            f"an answered turn reported a false timeout: {result_events[0].error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_frozen_mid_generation_still_times_out(self, runner, tmux_manager) -> None:
+        """AC3: claude alive but stuck mid-generation is a real hang → still errors."""
+        tmux_manager.is_claude_running.return_value = True
+        # The spinner never advances: the pane is byte-identical every poll.
+        tmux_manager.capture_pane.return_value = self._FROZEN_WORKING
+
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("調べて"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "Timed out" in result_events[0].error
+
+    @pytest.mark.asyncio
+    async def test_dead_claude_after_timeout_reports_exit(self, runner, tmux_manager) -> None:
+        """AC2: the liveness check runs first — a dead claude reports the crash."""
+        tmux_manager.is_claude_running.return_value = False
+        tmux_manager.capture_pane.return_value = self._IDLE
+
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 100.0),
+        ):
+            async for event in runner.run("調べて"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "exited without producing a response" in result_events[0].error
+
+
+class TestTurnThatNeverStarted:
+    """#562: a turn with no response at all must not report "finished".
+
+    yousan: 「僕が発言した時にいきなりメンションが飛んできて呼ばれることがある。
+    でも全然実際の作業としては終わってない」. Observed with the context footer
+    byte-identical before and after — Claude had not spent a single token.
+
+    #365 added a gate so the completion detector cannot finalize off a residual
+    previous-turn response. The idle-timeout exit never consulted that gate, and
+    its startup grace only applied when ``claude`` was cold — so a warm session
+    that simply had not begun drawing yet was declared finished after 60s of
+    pane silence, and the RESULT carried ``error=None`` (a normal completion).
+    """
+
+    # A warm session that has not started this turn: claude is idle at its
+    # prompt, nothing is generating, and nothing is extractable — which is the
+    # shape the incident journal recorded ("Idle timeout (67.0s) — no response").
+    _RESIDUAL = (
+        "✻ Brewed for 12s\n"
+        "\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "-- INSERT -- ⏵⏵ bypass permissions on\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_no_response_is_not_reported_as_finished(self, runner, tmux_manager) -> None:
+        """AC2/AC6: prompt delivered, pane frozen, nothing produced → not a success."""
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.capture_pane.return_value = self._RESIDUAL
+
+        runner.timeout_seconds = 5.0
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.1),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 0.3),
+        ):
+            async for event in runner.run("新しい質問"):
+                events.append(event)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is not None, (
+            "a turn that produced nothing was reported as a normal completion"
+        )
+        assert "No response" in result[0].error
+
+    @pytest.mark.asyncio
+    async def test_warm_session_gets_the_startup_grace(self, runner, tmux_manager) -> None:
+        """AC4: the grace used to apply only to a cold start.
+
+        The pane sits frozen past the idle window, then the turn finally starts
+        and answers. The old code had already given up by then.
+        """
+        tmux_manager.is_claude_running.return_value = True
+        answered = _make_pane(["● 新しい回答です。"], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Frozen well past _IDLE_TIMEOUT, then the real answer appears.
+            return self._RESIDUAL if call_idx <= 12 else answered
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        runner.timeout_seconds = 5.0
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.1),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 1.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+        ):
+            async for event in runner.run("新しい質問"):
+                events.append(event)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is None, (
+            f"the turn answered but was killed before it started: {result[0].error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_real_answer_still_completes_normally(self, runner, tmux_manager) -> None:
+        """AC5: the regression guard — answered turns must stay silent successes.
+
+        The pane starts on the pre-answer state and the answer appears after, as
+        a real turn does. An earlier version of this test returned the answered
+        pane from the very first poll, which made the answer identical to the
+        baseline — a state a freshly-sent prompt cannot produce, and one that
+        pushed the fix into scoping itself too narrowly.
+        """
+        tmux_manager.is_claude_running.return_value = True
+        answered = _make_pane(["● ちゃんと答えました。"], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            return self._RESIDUAL if call_idx <= 2 else answered
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        runner.timeout_seconds = 5.0
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+        ):
+            async for event in runner.run("質問"):
+                events.append(event)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is None
+
+    @pytest.mark.asyncio
+    async def test_stale_scrollback_does_not_excuse_a_turn_that_never_started(
+        self, runner, tmux_manager
+    ) -> None:
+        """Found on staging: scrapable *old* output must not read as success.
+
+        The first fix scoped the "never started" verdict to ``not last_response``
+        — matching the journal line in the report (``Idle timeout … no
+        response``). Reproducing the bug on staging showed the other half: when
+        the frozen pane still has the PREVIOUS turn's output on it, the scrape
+        succeeds, the run falls through to the inactivity backstop, and c-lord
+        announced "Claude has finished" for a turn Claude never received.
+
+        ``new_turn_started`` is the sound discriminator on its own: a turn that
+        genuinely produced something changes the extracted text away from the
+        baseline captured right after the prompt was sent.
+        """
+        tmux_manager.is_claude_running.return_value = True
+        # Old output still on screen, unchanged for the whole run.
+        tmux_manager.capture_pane.return_value = _make_pane(
+            ["● 前のターンの回答がまだ画面に残っている。"], with_input_prompt=True
+        )
+
+        runner.timeout_seconds = 0.4
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 0.1),
+        ):
+            async for event in runner.run("新しい質問"):
+                events.append(event)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is not None, (
+            "a turn that never started was reported as finished because stale "
+            "output was still scrapable"
+        )
+        assert "No response" in result[0].error
 
 
 class TestTmuxClaudeRunnerInterrupt:
@@ -1751,10 +2069,10 @@ class TestContinueFallback:
             timeout_seconds=10,
             try_continue=True,
         )
-        tmux_manager.is_claude_running.side_effect = [
+        tmux_manager.is_claude_running.side_effect = _running_script(
             False,  # initial check
             True,  # after --continue delay — Claude started successfully
-        ]
+        )
         pane = _make_pane(["● Resumed."])
         tmux_manager.capture_pane.return_value = pane
 
@@ -1799,10 +2117,10 @@ class TestContinueFallback:
             return "Loading..." if call_idx <= 2 else pane
 
         tmux_manager.capture_pane.side_effect = capture_fn
-        tmux_manager.is_claude_running.side_effect = [
+        tmux_manager.is_claude_running.side_effect = _running_script(
             False,  # initial check
             False,  # after --continue delay — failed (no history)
-        ]
+        )
         tmux_manager._find_window_for_thread.return_value = "work1"
 
         events = []
@@ -1866,8 +2184,12 @@ class TestContinueFallback:
             try_continue=False,
             effort=None,
         )
-        # Only one is_claude_running call (no post-continue check)
-        assert tmux_manager.is_claude_running.call_count == 1
+        # The post-continue liveness check must not have happened.  The probe
+        # *count* stopped being a proxy for that once #541 added a final probe
+        # to the inactivity backstop, so assert the invariant that actually
+        # distinguishes the two paths: the --continue attempt would have started
+        # claude a second time, and it never did.
+        assert tmux_manager.start_claude.call_count == 1
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
 
@@ -2354,6 +2676,70 @@ class TestParseAskFromPane:
         assert q is not None
         descriptions = [o.description for o in q.options]
         assert descriptions == ["本番", "検証", "ローカル"]
+
+    def test_wrapped_option_never_yields_an_empty_label(self) -> None:
+        """#579: a real production pane whose option text wrapped to the next line.
+
+        Captured live from ``qiita-article:w1`` while the bug was firing. The TUI
+        drew the menu as a two-column table with a preview pane on the right, and
+        option 2's text did not fit beside it:
+
+            ❯ 1. 具体的な場面から入る（推     ┌──────────────
+                奨）                          │ …
+              2.                              │
+                欠けているものを先に並べる    │ …
+              3. チーム共有を主役にする       │ …
+
+        The parser read ``2.`` as an option with an EMPTY label, ``AskView`` made
+        a ``discord.ui.Button(label="")`` from it, and Discord rejected the whole
+        message with 400 ``In components.0.components.1.label: This field is
+        required``. The menu therefore never reached Discord, the watchdog saw it
+        still unbridged, and retried every 30–60s — 116 times in one day.
+        """
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        labels = [o.label for o in q.options]
+        assert all(labels), f"an empty label reaches Discord as a 400: {labels!r}"
+
+    def test_wrapped_option_recovers_the_text_from_the_next_line(self) -> None:
+        """#579 AC2: the wrapped text IS the label — read it, do not drop it.
+
+        Dropping the option instead would be worse than an empty label: the TUI
+        still has it, and the answer is delivered as ``Down × index``, so a
+        shorter list would select the wrong option.
+        """
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        labels = [o.label for o in q.options]
+        assert len(labels) == 4, labels  # the TUI has 4 real options
+        assert labels[1] == "欠けているものを先に並べる", labels
+        assert "│" not in "".join(labels), f"preview-pane box leaked into a label: {labels!r}"
+
+    def test_wrapped_option_label_keeps_its_tail(self) -> None:
+        """#579 AC2: a label wrapped mid-word must not be delivered cut in half."""
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.options[0].label == "具体的な場面から入る（推奨）", q.options[0]
+
+    def test_descriptions_are_not_swallowed_into_labels(self) -> None:
+        """#579: the wrap recovery must not eat ordinary indented descriptions."""
+        pane = _load_fixture("ask_rich_descriptions.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == [
+            "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+        ]
+        assert all(o.description for o in q.options), q.options
+
+    def test_meta_row_is_not_read_as_a_description(self) -> None:
+        """#579: 'Chat about this' is a TUI affordance, not the last option's text."""
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert all("Chat about this" not in o.description for o in q.options), q.options
 
     def test_plan_approval_is_not_ask(self) -> None:
         """A Plan-approval menu is NOT an AskUserQuestion → returns None."""
@@ -2934,10 +3320,28 @@ class TestRunStartupErrorSurfacing:
 
     @pytest.mark.asyncio
     async def test_no_response_claude_alive_stays_silent(self, runner, tmux_manager) -> None:
-        """No extractable response but claude is still alive at its prompt →
-        treat as a benign completion (likely a skill-only post we didn't scrape),
-        NOT an error.  Guards against false-positive error embeds."""
-        tmux_manager.capture_pane.return_value = "static text"
+        """A turn that RAN but left nothing scrapable stays silent.
+
+        #366 chose silence here because it could not tell "answered via the
+        skill, we just didn't scrape it" from "never produced anything". #365
+        later added the ``new_turn_started`` gate, which does tell them apart,
+        and #562 reported the cost of the blanket silence: a turn that never
+        started was reported as a normal completion and pinged the user with
+        "Claude has finished". So the silence now applies to turns that
+        demonstrably ran — which is what a skill-answered turn looks like: the
+        generation spinner was visible while it worked.
+        """
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 8:
+                # Working: the spinner ticks, so the turn demonstrably started.
+                return f"✻ Cogitating… ({call_idx}s · ↑ 1.2k tokens · esc to interrupt)"
+            return "static text"
+
+        tmux_manager.capture_pane.side_effect = capture_fn
         tmux_manager.is_claude_running.return_value = True
 
         runner.timeout_seconds = 60
@@ -2953,6 +3357,35 @@ class TestRunStartupErrorSurfacing:
         result_events = [e for e in events if e.is_complete]
         assert len(result_events) == 1
         assert result_events[0].error is None
+
+    @pytest.mark.asyncio
+    async def test_no_response_and_turn_never_started_is_reported(
+        self, runner, tmux_manager
+    ) -> None:
+        """#562: the other half of the case #366 used to silence blanketly.
+
+        Nothing ever generated and nothing was ever scraped — there is no
+        evidence the turn ran at all, so reporting it as a normal completion is
+        what produced the false "Claude has finished" ping.
+        """
+        tmux_manager.capture_pane.return_value = "static text"
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 0.3),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "No response" in result_events[0].error
 
 
 class TestParseAskNewLayouts:

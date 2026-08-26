@@ -231,6 +231,187 @@ it:
    made. Last line of defense: even if a menu is somehow stuck open, a message
    cancels it and is delivered as text, never as a selection.
 
+## One menu, one owner (#535)
+
+Four independent paths can spot the same open TUI menu:
+
+| Path | Trigger |
+|---|---|
+| `cogs/event_processor.py::_handle_pane_ask` | the live turn's poll loop yields `pane_ask` |
+| `cogs/_run_helper.py` (post-turn recovery, #219/#222) | the menu rendered just after the turn finalized |
+| `cogs/transcript_mirror.py::_make_ask_bridge` (#232) | the jsonl carries the `AskUserQuestion` tool call |
+| `thread_state_sync.py::_maybe_bridge_open_menu` (#359) | sweep finds a menu no turn is watching |
+
+They are all deliberate — each covers a case the others miss — so the question
+is never "which one runs" but "which one **owns** the menu". Ownership is the
+ask-bus registration, and `AskAnswerBus.register()` is the single atomic step
+that grants it: the first caller gets the answer Queue, every later caller gets
+`None` and returns before posting anything.
+
+**What this replaced.** `register()` used to overwrite the existing waiter, and
+only two of the four paths checked `is_active` first. So two bridges could both
+pass the check and both post — the user saw the *same question twice* (one copy
+mentioning them, one not), each copy live, with no way to tell which one
+counted. Worse, the second registration silently discarded the first bridge's
+Queue, so the bridge that was actually waiting could never be answered: it sat
+out the full 24 h `ASK_ANSWER_TIMEOUT` holding its turn, and Claude — never
+hearing back — eventually asked a *third* time.
+
+A pre-check cannot fix this. `is_active()` and `register()` are two steps, and
+both bridges can pass the check before either registers; the mirror widened that
+window further by spawning its bridge as a background task between the two. So
+`register()` itself refuses, and the `is_active` pre-checks that remain are only
+cheap early exits, not the guarantee.
+
+**What a losing bridge does: nothing, immediately.** It posts no buttons, no
+duplicate pre-menu prose, sends no keystrokes, and — the part that used to wedge
+threads — never enters the 24 h await. The owner answers the menu; the loser's
+work was already done for it.
+
+## After the click — what the thread shows (#536)
+
+Pressing a button is the moment the user hands a decision to Claude, so the
+thread has to say what happened to it. It used to say almost nothing:
+
+| | before | now |
+|---|---|---|
+| delivered | the embed was wiped and replaced by a grey `-# ✅ Selected: X` | an embed keeping **the question and the answer** |
+| not delivered | an **ephemeral** "⚠️ The bot was restarted…" — only the clicker saw it, gone on refresh | a normal message in the thread naming the **actual** cause |
+| buttons on failure | **stayed live** | removed |
+| other copies of the menu | stayed live | blanked out |
+| multiSelect, chosen but not submitted | grey `-# 🔲 選択中: …` | full-size **まだ送信されていません** |
+
+**Why the old failure notice was worse than nothing.** `post_answer` returning
+False only means "no waiter is registered right now". The view treated that as
+proof of a restart and said so — to a user who had, in most real cases, just
+answered the same menu in the tmux pane. So the message was both invisible to
+the thread and wrong, and the buttons stayed clickable, so the natural next move
+was to click again and get the same nothing. yousan's report of the whole class:
+「選んだあとに決定されていない気がして `y` とメッセージを送っていた」.
+
+**Naming the cause instead of guessing it.** The bridge now records *why* a menu
+stopped accepting answers as it closes — `AskAnswerBus.note_closed()` with one of
+`answered` / `terminal` / `timeout` / `interrupted` — and the view reads it back.
+Recorded knowledge always beats inference. Only when this process has no note at
+all does the view fall back to inference, and then it uses the one fact that
+actually implies a restart: a menu message **older than the process itself**
+cannot have been posted by the process now handling its click.
+
+**Other copies (`ask_menus`).** #535 makes a second copy impossible within one
+process, but copies still outlive processes: a restart leaves the previous
+process's message on screen with working-looking buttons. Every posted menu is
+registered while answerable, and resolving one blanks the rest. A copy from a
+*previous* process is out of reach of an in-memory registry by construction — it
+is handled where it is reachable: its click lands on the honest "already closed"
+path above, which disables it.
+
+## Answering by typing (#536 AC7)
+
+Buttons used to be the only way to answer. Typing — which is what people do when
+the buttons feel unresponsive — took the **interrupt** path: the open question
+was discarded without a word (`⚡ Interrupted. Starting with new instruction...`)
+and the sentence ran as a fresh instruction. So an attempt to answer looked, from
+the user's side, like nothing happening at all. yousan hit exactly this: 「選んだ
+あとに決定されていない気がして `y` とメッセージを送っていた」.
+
+**A sentence sent while a menu is open is now delivered as that menu's answer**
+(`claude_chat.py::_maybe_answer_open_menu`), through the same free-text path as
+the ✏️ Other modal. The menu's copies are blanked to `✏️ 文章で回答しました: …`,
+and the thread gets a **「これは新しい指示でした」** button
+(`views.py::TextAnsweredMenuView`) that re-dispatches the message as an
+instruction — the old behaviour, one click away.
+
+Guessing "answer" is the right default because the two mistakes are not
+symmetric: a mis-read instruction costs one button, while a dropped answer costs
+the whole exchange (and, before #535, the user had usually already tried the
+buttons).
+
+Three cases stay instructions, because as answers they are nonsense:
+
+| case | why |
+|---|---|
+| empty body | nothing to deliver |
+| message with attachments | a file is not a menu choice |
+| menu with no free-text row | plan-approval menus (`allow_other=False`) have no `Type something.` row (#251); typing there would mis-send keystrokes |
+
+The bridge is what knows which menus take free text, so it declares it when it
+claims the menu: `ask_bus.register(thread_id, allow_free_text=question.allow_other)`.
+The flag defaults to False, so a caller that has not thought about it cannot opt
+a menu in by accident.
+
+## The prose is only readable from the pane (#549)
+
+Measured on staging (CLI 2.1.246, 2026-08-26): **while a menu is open, nothing
+of that turn exists in the jsonl.** Not the prose, not the `AskUserQuestion`
+`tool_use` — for 90 seconds of polling the file ended at the user's own message,
+and the whole chunk landed at once the moment the menu was answered (the prose
+carried a 04:01:46 timestamp but only became readable at ~04:05).
+
+So "read the transcript ahead of the menu and post the 経緯 first" is not an
+option: there is nothing to read. **While a menu is open, the pane is the only
+source of the prose**, which is why the pane path exists at all (#399) and why
+its ceiling matters so much (#468).
+
+**The watchdog had no ceiling at all.** `_maybe_bridge_open_menu` captured 120
+lines and parsed; when the prose was taller than the window it simply got
+`context=""`. The poll loop had recovered that since #468 by transiently growing
+the window — the watchdog never did. A menu bridged by the watchdog after a long
+report therefore reached Discord with no context, and the report showed up only
+after the answer, reading as a new statement. That is the whole of #549's
+"順序が入れ替わる" report. The watchdog now does the same tall re-capture, on the
+same condition (only when the first read came up empty, so an ordinary menu
+never pays the resize round-trip).
+
+**When even that comes up empty**, the menu says so in its footer —
+`この質問の経緯は、回答後にまとめて届きます`. The gap cannot be closed (see the
+measurement), so the next best thing is to stop it from reading as an omission.
+
+## An option the pane cannot be read from (#579)
+
+Discord rejects a button with an empty label — and rejects the **whole message**
+with it. So a single option c-lord failed to read silenced the entire menu, and
+because a menu that never posted still looks unbridged, the watchdog retried it
+every sweep: **128 failed posts in one day** on one thread, each swallowed as
+asyncio's `Task exception was never retrieved`.
+
+The pane that caused it (captured live, now
+`tests/fixtures/panes/ask_wrapped_option_empty_label.txt`) drew the menu as a
+two-column table, and one option's text did not fit beside the preview box:
+
+```
+❯ 1. 具体的な場面から入る（推     ┌──────────────
+    奨）                          │ …
+  2.                              │
+    欠けているものを先に並べる    │ …
+  3. チーム共有を主役にする       │ …
+```
+
+Three parser rules come out of that pane:
+
+- **A wrapped tail belongs to the label above.** In a preview-table menu
+  (`pane_col` is set) the explanation lives in the box on the right, so a
+  non-numbered line in the narrow left column can only be the continuation of
+  the option above it. *Indentation cannot decide this*: descriptions sit at
+  column 5 in a plain menu but at column 2 in a multiSelect one (the `[ ] `
+  checkbox shifts them), which overlaps the wrapped-tail indent — the first
+  attempt at an indent rule swallowed multiSelect descriptions into labels.
+- **Strip the preview box per line, not by column.** `pane_col` is a *character*
+  index taken from the numbered lines, but the box is drawn at a fixed *display*
+  column; a line of double-width text reaches it in fewer characters, so the
+  slice alone leaves `│` (and the preview text) inside the label.
+- **The `Chat about this` row is not the last option's description.** The
+  description scan ended at `end_idx + 1`, which is that row.
+
+**Two backstops sit behind the parser**, because the next unseen rendering will
+break it again:
+
+- `ask_view.py::_button_label` substitutes the TUI's own number for an empty
+  label. It *substitutes* rather than dropping the option: answers are delivered
+  as `Down × index`, so a shorter list would select the wrong choice.
+- The watchdog stops after `_ASK_BRIDGE_MAX_FAILURES` (3) consecutive failures
+  for a thread, logs each one, and tells the thread it could not show the
+  choices (with the `tmux attach` target). Without a cap the pair is a closed
+  loop — the post fails, so the menu stays unbridged, so the sweep fires again.
 ## A menu only counts while claude is alive (#510)
 
 Pane text outlives the process that drew it. When claude exits — a crash, a
@@ -278,12 +459,19 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | Parse menu from pane | `c_lord/claude/tmux_runner.py::_parse_ask_from_pane` |
 | Extract pre-menu prose (#399) | `tmux_runner.py::_extract_pane_context` |
 | Recover long prose via transient tall capture (#468) | `c_lord/tmux.py::TmuxSessionManager.capture_pane_tall`, wired in `tmux_runner.py::run` (poll loop) |
+| Same recovery for the watchdog path (#549) | `thread_state_sync.py::_maybe_bridge_open_menu` |
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
 | Ignore menus in a pane whose claude has exited (#510) | `c_lord/tmux.py::pane_command_is_dead`, `TmuxSessionManager.pane_foreground_command`, `thread_state_sync.py::_maybe_bridge_open_menu`, `tmux_runner.py::peek_menu_state` |
 | Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
+| One-owner-per-thread menu arbitration (#535) | `c_lord/discord_ui/ask_bus.py::AskAnswerBus.register` |
+| Why a menu closed / what a late click is told (#536) | `ask_bus.py::note_closed`, `ask_view.py::_undeliverable_reason` |
+| Answered / undelivered embeds (#536) | `embeds.py::ask_answered_embed`, `ask_undelivered_embed` |
+| Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |
+| 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
+| Empty-label backstop / watchdog retry cap (#579) | `ask_view.py::_button_label`, `thread_state_sync.py::_ASK_BRIDGE_MAX_FAILURES` |
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |

@@ -219,6 +219,26 @@ def error_embed(error: str) -> discord.Embed:
     )
 
 
+def no_response_embed(detail: str) -> discord.Embed:
+    """Embed for a turn that never produced anything (#562).
+
+    Distinct from :func:`timeout_embed`: a timeout means Claude was working and
+    stopped responding, while this means the turn never began. Saying the wrong
+    one sends the reader looking for output that was never started.
+    """
+    return discord.Embed(
+        title="\u26a0\ufe0f 応答がありませんでした",
+        description=(
+            f"{detail}\n\n"
+            "**確認すること:**\n"
+            "\u2022 同じ内容をもう一度送る\n"
+            "\u2022 `/clord-attach` (または tmux) でペインを直接見る\n"
+            "\u2022 ホストが混んでいると Claude の起動が遅れることがあります"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def timeout_embed(seconds: int) -> discord.Embed:
     """Create an embed for session timeout with actionable guidance."""
     return discord.Embed(
@@ -258,6 +278,50 @@ def ask_embed(
         description=body[:4096],
         color=COLOR_ASK,
     )
+
+
+def ask_answered_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+) -> discord.Embed:
+    """Embed shown in place of a menu once the answer reached Claude (#536).
+
+    Keeps the question: the old replacement was a single grey
+    ``-# ✅ Selected: X`` line with the embed wiped, so scrolling back showed an
+    answer with nothing to attach it to. Reading the thread later has to work.
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"✅ {header}" if header else "✅ 回答しました"
+    return discord.Embed(
+        title=title[:256],
+        description=f"{question}\n\n**あなたの回答:** {answer}"[:4096],
+        color=COLOR_SUCCESS,
+    )
+
+
+def ask_undelivered_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+    reason: str = "",
+) -> discord.Embed:
+    """Embed shown when a click could NOT be delivered to Claude (#536).
+
+    Replaces an ephemeral notice that only the clicker saw, that vanished on
+    refresh, and that blamed a bot restart no matter the real cause. *reason*
+    is the cause in the user's words; the body also says what to do next.
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"⚠️ {header}" if header else "⚠️ 回答が届きませんでした"
+    body = (
+        f"{question}\n\n"
+        f"**選ばれた答え:** {answer}\n"
+        f"**届かなかった理由:** {reason}\n\n"
+        "この選択は Claude に伝わっていません。続けるにはスレッドに"
+        "メッセージを送ってください。"
+    )
+    return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ERROR)
 
 
 def stopped_embed() -> discord.Embed:

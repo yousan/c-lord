@@ -11,7 +11,7 @@ run_claude_with_config() pipeline.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
@@ -357,6 +357,51 @@ class TestAskUserQuestion:
         await p.process(event)
 
         runner.interrupt.assert_called_once()
+
+
+class TestPaneAskOwnership:
+    """#535 AC1: the poll-loop bridge must respect an existing menu owner."""
+
+    @pytest.mark.asyncio
+    async def test_pane_ask_skipped_when_another_bridge_owns_the_menu(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """A menu already bridged elsewhere must not be bridged a second time.
+
+        ``_handle_pane_ask`` used to call ``bridge_pane_ask`` unconditionally
+        while the transcript-mirror bridge had the same menu on screen — the two
+        copies of the buttons yousan saw in #535.
+        """
+        from c_lord.discord_ui.ask_bus import ask_bus
+
+        runner.answer_menu = AsyncMock()
+        config = _make_config(thread, runner)
+        p = EventProcessor(config)
+        ask = AskQuestion(question="Which?", options=[AskOption(label="A")])
+
+        owner_queue = ask_bus.register(thread.id)
+        assert owner_queue is not None
+        try:
+            with patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge:
+                await p.process(StreamEvent(message_type=MessageType.SYSTEM, pane_ask=ask))
+            bridge.assert_not_called()
+            assert ask_bus.is_active(thread.id)
+        finally:
+            ask_bus.unregister(thread.id)
+
+    @pytest.mark.asyncio
+    async def test_pane_ask_bridged_when_nobody_owns_the_menu(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """The common case is unchanged: no owner → this turn bridges the menu."""
+        runner.answer_menu = AsyncMock()
+        config = _make_config(thread, runner)
+        p = EventProcessor(config)
+        ask = AskQuestion(question="Which?", options=[AskOption(label="A")])
+
+        with patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await p.process(StreamEvent(message_type=MessageType.SYSTEM, pane_ask=ask))
+        bridge.assert_called_once()
 
 
 class TestOnComplete:
