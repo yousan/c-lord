@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1643,6 +1644,10 @@ class ClaudeChatCog(commands.Cog):
             had_active = prev_task is not None and not prev_task.done()
             if prev_task is not None and had_active:
                 await self._preempt_prior_turn(thread, prev_task, prev_runner)
+                # #565: the interrupt succeeded — say so, so a thread that
+                # goes quiet after this can be told apart from one that
+                # never got here.
+                logger.info("%s preempted prior turn", log_ctx(thread_id=thread.id))
 
             # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
             # death) but a prior session's transcript is still on disk, resume it via
@@ -1689,6 +1694,11 @@ class ClaudeChatCog(commands.Cog):
             # held-across-run lock was the #315 deadlock.  Registering the task
             # here, under the lock, preserves the no-duplicate-run invariant: a
             # second reply that gets the lock sees this task and pre-empts it.
+            # #565: this dispatch is the boundary the silent-drop bug hid behind
+            # — everything before it had logged, and ``run_claude: enter`` is the
+            # next line that does. Log both sides so the gap can never be dark
+            # again (`grep "thread=<id>"` shows dispatch → enter as a pair).
+            logger.info("%s dispatching run_claude", log_ctx(thread_id=thread.id))
             task = asyncio.create_task(
                 self._run_claude(
                     message,
@@ -1699,7 +1709,38 @@ class ClaudeChatCog(commands.Cog):
                     try_continue=try_continue,
                 )
             )
+            # #565: ``_active_tasks`` keeps a strong reference to this task, so a
+            # turn that dies before anyone awaits it is never garbage-collected —
+            # and Python only reports "Task exception was never retrieved" at GC
+            # time. The exception would therefore be swallowed *forever*. Attach
+            # a callback that reports it instead.
+            task.add_done_callback(partial(self._report_turn_task_outcome, thread.id))
             self._active_tasks[thread.id] = task
+
+    @staticmethod
+    def _report_turn_task_outcome(thread_id: int, task: asyncio.Task) -> None:
+        """Surface a turn task that died without anyone awaiting it (#565).
+
+        A turn is dispatched with ``create_task`` and parked in ``_active_tasks``,
+        which keeps it referenced for the life of the thread entry. Python only
+        emits its "Task exception was never retrieved" warning when an un-awaited
+        task is *collected*, so that strong reference means an early crash in
+        ``_run_claude`` produces no log line anywhere — exactly the "message
+        accepted, then total silence" shape #565 was reported as.
+
+        Cancellation is normal here (that is how :meth:`_preempt_prior_turn`
+        tears a turn down), so only a real exception is worth a line.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "%s turn task died before completing: %s",
+                log_ctx(thread_id=thread_id),
+                exc,
+                exc_info=exc,
+            )
 
     async def _maybe_answer_open_menu(
         self, message: discord.Message, thread: discord.Thread
@@ -1836,15 +1877,27 @@ class ClaudeChatCog(commands.Cog):
         (which unregisters from the ask-bus in its ``finally``) and unwinds
         ``_run_claude``'s ``finally`` (releasing the semaphore slot and clearing
         ``_active_runners``), so a parked turn can never hold the thread hostage.
+
+        #565: the prior turn's outcome must never escape into the caller.  This
+        used to reap the task with ``contextlib.suppress(Exception)``, but
+        ``asyncio.CancelledError`` derives from ``BaseException``, so awaiting
+        the task we had just cancelled raised straight through
+        ``_preempt_prior_turn`` into ``_handle_thread_reply`` — aborting it
+        *before* the ``create_task(self._run_claude(...))`` that starts the new
+        turn.  The user saw "⚡ Interrupted. Starting with new instruction…" and
+        then silence, with no ``run_claude: enter`` and no traceback (discord.py
+        treats a CancelledError leaving an event handler as plain cancellation).
+
+        ``asyncio.wait`` reports the outcome instead of raising it, and
+        ``gather(..., return_exceptions=True)`` reaps the task's exception —
+        including its ``CancelledError`` — as a value.  A genuine cancellation of
+        *this* coroutine still propagates from both, which is what keeps the
+        #315 teardown honest.
         """
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=grace)
-        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+        _done, pending = await asyncio.wait({task}, timeout=grace)
+        if pending:
             task.cancel()
-        except Exception:
-            pass
-        with contextlib.suppress(Exception):
-            await task
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _build_prompt(self, message: discord.Message) -> str:
         """Build the prompt string (text only). Use _build_prompt_and_images for full processing."""
@@ -1995,6 +2048,10 @@ class ClaudeChatCog(commands.Cog):
         )
         tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
 
+        # #565: both resolvers are awaits that sit between the dispatch and
+        # the first ``run_claude: enter``. If one of them ever hangs, this
+        # line is the last one logged.
+        logger.info("%s resolved managers for turn", log_ctx(thread_id=thread.id))
         if session_dir_manager is None and tmux_manager is None:
             await thread.send(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
@@ -2009,6 +2066,8 @@ class ClaudeChatCog(commands.Cog):
             )
 
         async with self._semaphore:
+            # #565: distinguishes "waiting for a slot" from "never got here".
+            logger.info("%s acquired session slot", log_ctx(thread_id=thread.id))
             dashboard = self._get_dashboard()
             coordination = self._get_coordination()
             description = prompt[:100].replace("\n", " ")
