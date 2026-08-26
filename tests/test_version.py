@@ -20,10 +20,7 @@ from c_lord.version import (
 
 class TestFormatVersionString:
     def test_full_article_format(self) -> None:
-        assert (
-            format_version_string("1.4.0", "599631", "20251203")
-            == "v1.4.0-b599631-20251203"
-        )
+        assert format_version_string("1.4.0", "599631", "20251203") == "v1.4.0-b599631-20251203"
 
     def test_base_only(self) -> None:
         assert format_version_string("1.4.0", None, None) == "v1.4.0"
