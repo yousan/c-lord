@@ -773,6 +773,71 @@ async def test_reply_cursor_sink_records_final_uuid_on_turn_end(tmp_path: Path) 
     assert cursor == ["u-final"]
 
 
+async def test_cursor_never_records_a_silently_flushed_intermediate(tmp_path: Path) -> None:
+    """#553: the cursor must mean "this was delivered AS THE FINAL ANSWER".
+
+    An assistant_text followed by a tool call is an *intermediate* message: the
+    mirror posts it silently and the turn keeps going. Its uuid used to stay in
+    ``_last_text_uuid``, so a shutdown mid-turn committed it to the cursor — a
+    cursor pointing past the last completed turn's final answer. On restart the
+    #215 rescue compared the two, found them different, and re-posted an answer
+    the user had already read (yousan: 「メッセージが二重で出てる？」).
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    cursor: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_cursor_sink(uuid: str) -> None:
+        cursor.append(uuid)
+
+    mirror = TranscriptMirror(
+        thread_id=553,
+        project_dir=project,
+        sink=sink,
+        reply_cursor_sink=reply_cursor_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,  # no idle flush — stop() is the only turn boundary
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        # A completed turn: this one really was the final answer.
+        _write_event(jsonl, {**_assistant_text("delivered final answer"), "uuid": "u-final"})
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.25)
+        # A new turn starts and is INTERRUPTED mid-flight: its text is followed
+        # by a tool call, so the mirror posts it silently as an intermediate.
+        _write_event(jsonl, {**_assistant_text("still working on it"), "uuid": "u-mid"})
+        _write_event(
+            jsonl,
+            {
+                "type": "assistant",
+                "uuid": "u-tool",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}
+                    ]
+                },
+            },
+        )
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()  # shutdown mid-turn
+
+    assert cursor == ["u-final"], (
+        f"cursor must hold only delivered final answers, got {cursor!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Issue #218: idle flush — final answer must ping even when turn_duration is
 # absent (current Claude Code builds no longer emit `result` and do not
