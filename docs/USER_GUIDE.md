@@ -246,6 +246,16 @@ tmux session gone (killed together with the bot / tmux-server death):
               context reads as a restore, not a broken bot (#464).
 ```
 
+### Threads c-lord has no record of
+
+A thread whose session record is gone (deleted workspace, rebuilt database, a thread
+created by another host) **cannot** be resumed. c-lord no longer swallows those
+messages: the message gets a ⚠️ reaction, the thread gets a one-time notice saying it
+did **not** reach Claude, and the notice names the way forward — `/clord <task>` starts
+a fresh session right there. The stopped-session hint from `/tmux-screenshot` and
+`/resync` says the same thing rather than promising a resume that cannot happen (#538).
+See [specs/session-resume.md](specs/session-resume.md).
+
 ### What Happens Under the Hood
 
 ```
@@ -267,7 +277,15 @@ Message sent to thread
 
 ### Timeout
 
-Sessions time out after a configurable period of inactivity (default: 5 minutes). An embed with elapsed time and guidance is shown. Send a new message to start a fresh session in the same thread.
+A session times out only when Claude is genuinely wedged: the tmux pane has
+stopped changing for the whole inactivity window (default: 5 minutes) **and**
+Claude is not sitting idle at its input prompt. An embed with elapsed time and
+guidance is shown; send a new message to start a fresh session in the same thread.
+
+A turn that finished normally never produces this embed, even though its pane
+goes completely silent afterwards — in the default `jsonl` bridge mode the answer
+is delivered by the transcript mirror, so pane silence after an answer is the
+expected steady state, not a hang (#541).
 
 ### Interrupting
 

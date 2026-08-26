@@ -19,6 +19,7 @@
 | [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | トピックは初回固定（自動付け替えは既定オフ）。作業中の `#<Issue/PR番号>` をブランチ/本文から自動表示 |
 | [thread-lamp.md](./thread-lamp.md) | スレッド名のランプ 🟢/🟡 | 既定オフ（rename レート制限のため）。`CLORD_THREAD_LAMP=1` で有効化すると受信で 🟢・完了で 🟡 |
 | [session-close.md](./session-close.md) | セッションの終了と再開 | `/close-workspace` はスレッド名を `[終了] …` にし、以後の投稿は実行せず再開ボタン付きの案内を出す（落ちただけのペインの自動復元とは別物） |
+| [session-resume.md](./session-resume.md) | 止まったセッションの復元案内 | 「送れば復元します」と言うのは本当に復元できるときだけ。復元できないスレッドの投稿も黙って捨てず、理由と次の一手を出す |
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
 | [input-delivery.md](./input-delivery.md) | 送ったメッセージが Claude に届くこと | 本文・貼り付け・テキスト添付は長さに関係なく全文が届く。届かないときは理由と次の一手が出る |

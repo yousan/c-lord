@@ -9,6 +9,7 @@ for up to 24h and the whole thread freezes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -409,3 +410,93 @@ async def test_collect_ask_answers_pings_notify_user(monkeypatch):
     assert any("<@999>" in (s.kwargs.get("content") or "") for s in embed_sends), (
         f"collect menu must ping notify user 999; sends={thread.send.await_args_list}"
     )
+
+
+@pytest.mark.asyncio
+async def test_bridge_declines_when_another_bridge_owns_the_menu():
+    """#535 AC6: a second bridge for the same thread returns at once.
+
+    Two independent paths can spot the same TUI menu (poll-loop / transcript
+    mirror / watchdog). Only the first may post buttons; the second must not
+    post a duplicate menu, must not re-post the pre-menu context, and above all
+    must not park on a 24h await — before #535 it did all three, and its
+    ``register()`` stole the queue from the bridge that was already waiting.
+    """
+    thread, _ = _thread(535_0001)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+    runner.answer_menu = AsyncMock()
+
+    owner_queue = ask_bus.register(thread.id)  # the bridge that got there first
+    assert owner_queue is not None
+    try:
+        q = _question()
+        q.context = "この判断の経緯を説明します。" * 8
+        await asyncio.wait_for(bridge_pane_ask(thread, q, runner), timeout=3.0)
+    finally:
+        ask_bus.unregister(thread.id)
+
+    thread.send.assert_not_called()  # no second menu, no second context message
+    runner.cancel_menu.assert_not_called()
+    runner.answer_menu.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_declining_bridge_leaves_the_owner_registered():
+    """#535 AC2: the loser must not unregister the winner on its way out."""
+    thread, _ = _thread(535_0002)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+
+    owner_queue = ask_bus.register(thread.id)
+    assert owner_queue is not None
+    try:
+        await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+        assert ask_bus.is_active(thread.id), "the owner's waiter was dropped"
+        assert ask_bus.post_answer(thread.id, ["A1"]) is True
+        assert owner_queue.get_nowait() == ["A1"]
+    finally:
+        ask_bus.unregister(thread.id)
+
+
+@pytest.mark.asyncio
+async def test_ownership_is_released_when_posting_the_menu_fails():
+    """#535: a failed menu post must not leave the thread permanently claimed.
+
+    Ownership only helps if it is always given back.  ``register()`` happens
+    before the menu is posted, so a Discord outage between the two used to be
+    survivable (the next bridge simply overwrote the waiter) — with ownership
+    now refused, the same outage would wedge every future menu in the thread.
+    """
+    thread, _ = _thread(535_0003)
+    thread.send = AsyncMock(side_effect=RuntimeError("discord is down"))
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert not ask_bus.is_active(thread.id), "a failed post left the thread claimed forever"
+
+
+@pytest.mark.asyncio
+async def test_ownership_is_released_when_the_bridge_is_cancelled(monkeypatch):
+    """#535: pre-emption (#315) cancels the bridge — ownership must come back."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    thread, _ = _thread(535_0004)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    task = asyncio.create_task(bridge_pane_ask(thread, _question(), runner))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if ask_bus.is_active(thread.id):
+            break
+    assert ask_bus.is_active(thread.id), "bridge never claimed the menu"
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert not ask_bus.is_active(thread.id), "a cancelled bridge kept the claim"
