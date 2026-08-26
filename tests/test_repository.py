@@ -110,6 +110,7 @@ class TestSessionRepository:
         # Create a session (it will be "now")
         await repo.save(thread_id=400, session_id="recent")
 
-        # Cleanup with 0 days should delete everything
+        # Cleanup with 0 days should delete everything. #554: the deleted rows
+        # come back, not a count — the caller has to notify each of those threads.
         deleted = await repo.cleanup_old(days=0)
-        assert deleted == 1
+        assert [r.thread_id for r in deleted] == [400]
