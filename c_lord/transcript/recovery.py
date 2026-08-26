@@ -10,9 +10,15 @@ deduplicated by the assistant event ``uuid``.
 Issue #537: this scan reads and parses a whole transcript (up to ~100 MB on the
 production host) and startup runs it once per session row.  It must therefore
 never touch the event loop — the cog awaits
-:func:`last_completed_final_answer_async`, which hands the work to a worker
+:func:`final_answer_needs_recovery_async`, which hands the work to a worker
 thread — and it must not materialise the transcript in memory: the scan keeps
 only the current candidate answer, not the parsed events.
+
+Issue #553: "is this answer the stored cursor" is the wrong question — the
+cursor can sit *past* the last completed turn's answer, and comparing the two
+for equality then reported a delivered answer as dropped and re-posted it.
+:func:`final_answer_needs_recovery` asks the ordering question instead, in the
+same single streaming pass.
 """
 
 from __future__ import annotations
@@ -111,3 +117,83 @@ async def last_completed_final_answer_async(project_dir: Path) -> FinalAnswer | 
     message sent during the resulting reconnect was lost.
     """
     return await asyncio.to_thread(last_completed_final_answer, project_dir)
+
+
+def final_answer_needs_recovery(project_dir: Path, cursor_uuid: str | None) -> FinalAnswer | None:
+    """Return the final answer that still has to be delivered, or ``None`` (#553).
+
+    ``cursor_uuid`` is the last uuid the mirror recorded as **delivered as a
+    final answer** (``sessions.mirror_replied_uuid``).
+
+    The question is not "is the cursor equal to this answer" but **"has the
+    cursor already passed it"**.  Equality was the #553 bug: a turn still running
+    when the bot went down left the cursor on a *later* line than the last
+    completed turn's final answer, so the two differed, and the #215 rescue
+    re-posted an answer the user had already read.
+
+    Rules, in order:
+
+    - cursor at or after the answer → already delivered, return ``None``.  This
+      is the #553 fix: the cursor being *later* is precisely the mid-turn
+      shutdown case that used to be misread as a drop;
+    - cursor before the answer → the answer was written after the last delivery,
+      so nothing posted it: return it (the #215 rescue);
+    - cursor is not in this transcript at all → return it too.  For the cursor to
+      be missing here, no delivery from *this* file was ever committed — which is
+      what a mirror that was down for the whole file looks like (a ``/clear``
+      starting a fresh transcript, say).  Had the mirror been up and posted, it
+      would have committed a cursor into this same file;
+    - no cursor at all → return the answer; the caller seeds the cursor instead
+      of posting (see the cog).
+
+    Same single streaming pass and O(1) memory as
+    :func:`last_completed_final_answer` (#537): positions are line counters, not
+    stored events.
+
+    Blocking: callers on the event loop must use
+    :func:`final_answer_needs_recovery_async`.
+    """
+    jsonl = latest_session_jsonl(project_dir)
+    if jsonl is None:
+        return None
+
+    candidate: FinalAnswer | None = None
+    candidate_idx = -1
+    answer: FinalAnswer | None = None
+    answer_idx = -1
+    cursor_idx = -1
+    try:
+        with jsonl.open("r", encoding="utf-8", errors="replace") as f:
+            for idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if cursor_uuid is not None and cursor_idx < 0 and event.get("uuid") == cursor_uuid:
+                    cursor_idx = idx
+                if _is_turn_end(event):
+                    answer, answer_idx = candidate, candidate_idx
+                    continue
+                found = _as_final_answer(event)
+                if found is not None:
+                    candidate, candidate_idx = found, idx
+    except OSError:
+        return None
+
+    if answer is None:
+        return None
+    if cursor_uuid is None:
+        return answer
+    if cursor_idx >= 0 and cursor_idx >= answer_idx:
+        return None  # the cursor has already passed this answer (#553)
+    return answer
+
+
+async def final_answer_needs_recovery_async(
+    project_dir: Path, cursor_uuid: str | None
+) -> FinalAnswer | None:
+    """Await :func:`final_answer_needs_recovery` off the event loop (#537)."""
+    return await asyncio.to_thread(final_answer_needs_recovery, project_dir, cursor_uuid)
