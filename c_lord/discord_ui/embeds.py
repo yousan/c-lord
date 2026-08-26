@@ -260,6 +260,50 @@ def ask_embed(
     )
 
 
+def ask_answered_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+) -> discord.Embed:
+    """Embed shown in place of a menu once the answer reached Claude (#536).
+
+    Keeps the question: the old replacement was a single grey
+    ``-# ✅ Selected: X`` line with the embed wiped, so scrolling back showed an
+    answer with nothing to attach it to. Reading the thread later has to work.
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"✅ {header}" if header else "✅ 回答しました"
+    return discord.Embed(
+        title=title[:256],
+        description=f"{question}\n\n**あなたの回答:** {answer}"[:4096],
+        color=COLOR_SUCCESS,
+    )
+
+
+def ask_undelivered_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+    reason: str = "",
+) -> discord.Embed:
+    """Embed shown when a click could NOT be delivered to Claude (#536).
+
+    Replaces an ephemeral notice that only the clicker saw, that vanished on
+    refresh, and that blamed a bot restart no matter the real cause. *reason*
+    is the cause in the user's words; the body also says what to do next.
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"⚠️ {header}" if header else "⚠️ 回答が届きませんでした"
+    body = (
+        f"{question}\n\n"
+        f"**選ばれた答え:** {answer}\n"
+        f"**届かなかった理由:** {reason}\n\n"
+        "この選択は Claude に伝わっていません。続けるにはスレッドに"
+        "メッセージを送ってください。"
+    )
+    return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ERROR)
+
+
 def stopped_embed() -> discord.Embed:
     """Create an embed for a manually stopped session."""
     return discord.Embed(

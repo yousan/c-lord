@@ -14,8 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 logger = logging.getLogger(__name__)
+
+# Why a thread's menu stopped accepting answers (#536).  A click that arrives
+# after the fact needs the real reason: "the bot restarted" was told to every
+# late clicker, including the one who had just answered in the terminal.
+CLOSE_ANSWERED = "answered"  # a Discord click was delivered
+CLOSE_TERMINAL = "terminal"  # answered/cancelled directly in the tmux pane
+CLOSE_TIMEOUT = "timeout"  # nobody answered within ASK_ANSWER_TIMEOUT
+CLOSE_INTERRUPTED = "interrupted"  # a new instruction pre-empted the turn (#315)
+
+# Closure notes are only useful while a stale copy of the menu can still be
+# clicked; the ask-menu answer timeout (24h) is that horizon.
+_CLOSE_NOTE_TTL = 86_400.0
+_MAX_CLOSE_NOTES = 512
 
 
 class AskAnswerBus:
@@ -28,6 +42,8 @@ class AskAnswerBus:
 
     def __init__(self) -> None:
         self._waiters: dict[int, asyncio.Queue[list[str]]] = {}
+        # thread_id -> (noted_at_monotonic, reason) — see note_closed (#536)
+        self._closed: dict[int, tuple[float, str]] = {}
 
     def register(self, thread_id: int) -> asyncio.Queue[list[str]] | None:
         """Claim the menu for *thread_id* and return its Queue, or None (#535).
@@ -84,6 +100,39 @@ class AskAnswerBus:
         """Remove the waiter for *thread_id* (called after answer or timeout)."""
         self._waiters.pop(thread_id, None)
         logger.debug("AskAnswerBus: unregistered waiter for thread %d", thread_id)
+
+    def note_closed(self, thread_id: int, reason: str) -> None:
+        """Record WHY *thread_id*'s menu stopped accepting answers (#536).
+
+        A button click that arrives after the menu closed finds no waiter, and
+        without this note the view could only guess — it used to guess "the bot
+        was restarted" every time, which is wrong for every menu that was
+        answered in the terminal, timed out, or was pre-empted. Use one of the
+        ``CLOSE_*`` constants.
+        """
+        now = time.monotonic()
+        self._closed[thread_id] = (now, reason)
+        if len(self._closed) > _MAX_CLOSE_NOTES:
+            for tid, (noted_at, _) in list(self._closed.items()):
+                if now - noted_at >= _CLOSE_NOTE_TTL:
+                    del self._closed[tid]
+        while len(self._closed) > _MAX_CLOSE_NOTES:
+            self._closed.pop(next(iter(self._closed)))  # oldest insertion first
+
+    def closed_reason(self, thread_id: int) -> str | None:
+        """Return the recorded ``CLOSE_*`` reason for *thread_id*, or None.
+
+        None means "this process has no idea" — which, for a menu posted before
+        the process started, is itself the evidence of a restart.
+        """
+        note = self._closed.get(thread_id)
+        if note is None:
+            return None
+        noted_at, reason = note
+        if time.monotonic() - noted_at >= _CLOSE_NOTE_TTL:
+            del self._closed[thread_id]
+            return None
+        return reason
 
 
 # Module-level singleton — import this everywhere.

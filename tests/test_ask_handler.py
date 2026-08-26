@@ -500,3 +500,120 @@ async def test_ownership_is_released_when_the_bridge_is_cancelled(monkeypatch):
         await task
 
     assert not ask_bus.is_active(thread.id), "a cancelled bridge kept the claim"
+
+
+# ----------------------------------------------------------------------
+# #536: the bridge records WHY a menu closed, so a late click can be told
+# the truth instead of a blanket "the bot was restarted".
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_terminal_resolution(monkeypatch):
+    """Answered in the tmux pane → a later click must not blame a restart."""
+    from c_lord.discord_ui.ask_bus import CLOSE_TERMINAL
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(536_1001)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=None)
+    runner.cancel_menu = AsyncMock()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_click_answer(monkeypatch):
+    """Answered by a Discord click → a click on a stale copy says 'already answered'."""
+    from c_lord.discord_ui.ask_bus import CLOSE_ANSWERED
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    thread, _ = _thread(536_1002)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.answer_menu = AsyncMock()
+
+    async def _answer_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["A1"])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0),
+        _answer_soon(),
+    )
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_ANSWERED
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_interruption(monkeypatch):
+    """A pre-empting message (#315) posts an empty answer — that is not an answer."""
+    from c_lord.discord_ui.ask_bus import CLOSE_INTERRUPTED
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    thread, _ = _thread(536_1003)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    async def _preempt_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, [])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0),
+        _preempt_soon(),
+    )
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_timeout(monkeypatch):
+    """A menu nobody answered says so — it was not lost to a restart."""
+    from c_lord.discord_ui.ask_bus import CLOSE_TIMEOUT
+
+    monkeypatch.setattr(ask_handler, "ASK_ANSWER_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 5.0)
+    thread, _ = _thread(536_1004)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert ask_bus.closed_reason(thread.id) == CLOSE_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_bridge_registers_and_releases_its_menu_message(monkeypatch):
+    """#536 AC5: the posted menu is addressable while live, forgotten once resolved."""
+    from c_lord.discord_ui.ask_menus import ask_menus
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, msg = _thread(536_1005)
+    msg.id = 4242
+    seen: list[int] = []
+
+    async def _peek_state():
+        # Record what the registry holds WHILE the menu is still open, then
+        # report the menu as resolved so the bridge winds down.
+        seen.append(len(ask_menus.pop_others(thread.id, keep_message_id=None)))
+        ask_menus.register(thread.id, msg)
+        return (None, True)
+
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=None)
+    runner.peek_menu_state = AsyncMock(side_effect=_peek_state)
+    runner.cancel_menu = AsyncMock()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0)
+
+    assert seen and seen[0] == 1, "the live menu message was never registered"
+    assert ask_menus.pop_others(thread.id, keep_message_id=None) == [], (
+        "a resolved menu must not stay registered as answerable"
+    )
