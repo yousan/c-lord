@@ -43,6 +43,12 @@ from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import ReopenSessionView, StopView
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
+from ..session_resume import (
+    UNTRACKED_NOTICE,
+    UNTRACKED_REACTION,
+    accepts_message,
+    classify,
+)
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
@@ -224,6 +230,10 @@ class ClaudeChatCog(commands.Cog):
         # hint, so it is posted at most once per process per thread (not per turn).
         self._rename_hint_sent: set[int] = set()
         self._pending_tmux_window_id: dict[int, str] = {}
+        # Issue #538: thread ids already told "this thread has no session to
+        # restore", so the notice is posted at most once per process per thread
+        # (the ⚠️ reaction still marks every dropped message).
+        self._untracked_notice_sent: set[int] = set()
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
         """Check if a member/user is authorized to use the bot.
@@ -644,11 +654,78 @@ class ClaudeChatCog(commands.Cog):
         if ctx.valid:
             return
 
-        # Handle threads: only respond if session exists in DB (opt-in)
-        if isinstance(message.channel, discord.Thread) and (
-            await self.repo.get(message.channel.id) is not None
-        ):
+        # Handle threads: only respond if session exists in DB (opt-in).
+        # The opt-in check goes through the shared verdict so that what we accept
+        # here and what /tmux-screenshot & /resync *promise* can never disagree —
+        # that disagreement is #538. A thread we do not accept is answered rather
+        # than dropped in silence.
+        if not isinstance(message.channel, discord.Thread):
+            return
+        verdict = classify(await self.repo.get(message.channel.id))
+        if accepts_message(verdict):
             await self._handle_thread_reply(message)
+        else:
+            await self._handle_untracked_thread(message, message.channel)
+
+    async def _handle_untracked_thread(
+        self, message: discord.Message, thread: discord.Thread
+    ) -> None:
+        """Answer a message that landed in a thread with no ``sessions`` row (#538).
+
+        Before #538 this path was ``return`` — no reply, no log — so a thread whose
+        row was missing swallowed every message, including the ones sent because
+        c-lord itself had promised the thread would resume on the next message
+        (:mod:`c_lord.session_resume`). Three things happen instead, in decreasing
+        order of how sure we are they are wanted:
+
+        1. **A log line.** Greppable by ``thread=<id>``, so "I sent it and nothing
+           happened" is diagnosable at all.
+        2. **A ⚠️ reaction on the message**, so the 2nd and later messages still
+           read as *seen but not run* rather than ignored.
+        3. **The notice, once per thread per process.** It names the next step; it
+           is also a wall of text, so it is not repeated on every message.
+
+        In a thread that is not ours (#522) none of that is posted and the log line
+        drops to DEBUG: several c-lord instances can share a guild and every one of
+        them sees this message, so answering would mean each bystander bot posting
+        the same notice. Nothing here may raise — this is already the path for a
+        message we are failing to run.
+        """
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        if not await self._is_our_thread(parent_channel_id, thread.id, message):
+            # Another instance's thread: DEBUG, so a shared guild's traffic does
+            # not drown the log — the INFO line below is for threads we own.
+            logger.debug("%s message ignored — not this instance's thread (#538)", ctx)
+            return
+        logger.info("%s message not run — no session row for this thread (#538)", ctx)
+
+        with contextlib.suppress(discord.HTTPException):
+            await message.add_reaction(UNTRACKED_REACTION)
+
+        if thread.id in self._untracked_notice_sent:
+            return
+        self._untracked_notice_sent.add(thread.id)
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(UNTRACKED_NOTICE)
+
+    async def _is_our_thread(
+        self, parent_channel_id: int, thread_id: int, message: discord.Message
+    ) -> bool:
+        """Whether this instance should speak up in this thread (#522).
+
+        Ours when the parent channel is the configured ``DISCORD_CHANNEL_ID``, or
+        when either resolver finds a ``/clord-init`` / ``/clord-thread-init``
+        binding for it. Everything else belongs to another bot in the same guild.
+        """
+        if not self._is_someone_elses_channel(parent_channel_id, message):
+            return True
+        if await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id) is not None:
+            return True
+        return (
+            await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread_id)
+            is not None
+        )
 
     async def _clord_impl(
         self,
