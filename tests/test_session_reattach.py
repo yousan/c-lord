@@ -380,3 +380,44 @@ class TestUntrackedNoticeOffersRecovery:
         await view.reattach_button.callback(_interaction())
 
         assert cog.repo.save.await_count == 1
+
+
+class TestReattachTextTwin:
+    async def test_bang_clord_reattach_reconnects(self, tmp_path) -> None:
+        """#209: every slash command has a text twin, which is also what makes
+        this path reachable from a webhook in E2E."""
+        _seed(tmp_path, checkout=True, transcript=True)
+        cog = _cog(tmp_path)
+        thread = _thread()
+        ctx = MagicMock()
+        ctx.channel = thread
+        ctx.author = MagicMock()
+        ctx.message = MagicMock(spec=discord.Message)
+        ctx.message.author = ctx.author
+        ctx.message.author.bot = False
+        ctx.message.author.id = 7
+        ctx.message.webhook_id = None
+        ctx.send = AsyncMock()
+
+        await cog.clord_reattach_text.callback(cog, ctx)
+
+        cog.repo.save.assert_awaited_once()
+        assert "再接続" in str(ctx.send.await_args.args[0])
+
+    async def test_it_refuses_a_thread_that_still_has_its_row(self, tmp_path) -> None:
+        """Reattaching a live thread would rewrite a row that is already right."""
+        _seed(tmp_path, checkout=True, transcript=True)
+        cog = _cog(tmp_path)
+        cog.repo.get = AsyncMock(return_value=MagicMock())
+        ctx = MagicMock()
+        ctx.channel = _thread()
+        ctx.message = MagicMock(spec=discord.Message)
+        ctx.message.author = MagicMock()
+        ctx.message.author.bot = False
+        ctx.message.author.id = 7
+        ctx.message.webhook_id = None
+        ctx.send = AsyncMock()
+
+        await cog.clord_reattach_text.callback(cog, ctx)
+
+        cog.repo.save.assert_not_awaited()

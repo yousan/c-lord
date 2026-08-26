@@ -1232,6 +1232,25 @@ class ClaudeChatCog(commands.Cog):
         plan = await self._reattach_thread(channel)
         await interaction.followup.send(reattach_notice(plan))
 
+    @commands.command(name="clord-reattach")
+    async def clord_reattach_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /clord-reattach — webhook-invokable for E2E (#209)."""
+        channel = ctx.channel
+        if not isinstance(channel, discord.Thread):
+            await ctx.send("このコマンドはスレッド内でのみ使えます。")
+            return
+        if not self._is_message_authorized(ctx.message):
+            await ctx.send("You are not authorized to use this command.")
+            return
+        if await self.repo.get(channel.id) is not None:
+            await ctx.send(
+                "ℹ️ このスレッドの記録は失われていません。"
+                "そのままメッセージを送れば続きから再開します。"
+            )
+            return
+        plan = await self._reattach_thread(channel)
+        await ctx.send(reattach_notice(plan))
+
     @app_commands.command(name="stop", description="Stop the active session (session is preserved)")
     async def stop_session(self, interaction: discord.Interaction) -> None:
         """Stop the active Claude run without clearing the session.
