@@ -315,6 +315,15 @@ class TranscriptMirror:
         )
         self._task: asyncio.Task[None] | None = None
 
+    def note_turn_started(self) -> None:
+        """Tell the progress line a turn just began (#539).
+
+        Called when c-lord *accepts* the prompt, which is earlier and more honest
+        than the first transcript event: Claude's startup happens in between, and
+        the reader has been waiting for all of it.
+        """
+        self._progress.begin_turn(restart=True)
+
     def start(self) -> None:
         """Spawn the tail task.  Idempotent."""
         if self._task is not None and not self._task.done():

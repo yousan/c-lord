@@ -61,6 +61,11 @@ class TranscriptMirrorCog(commands.Cog):
         thread the final answer back to the user's message.
         """
         self._trigger_messages[thread_id] = message_id
+        # #539: this is the earliest point c-lord knows a turn started, so it is
+        # where the "how long have I been waiting" clock should start.
+        mirror = self._mirrors.get(thread_id)
+        if mirror is not None:
+            mirror.note_turn_started()
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:

@@ -1546,3 +1546,38 @@ async def test_idle_thread_never_shows_a_progress_line(tmp_path: Path) -> None:
         await mirror.stop()
 
     assert spy.posts == []
+
+
+async def test_a_prompt_alone_arms_the_progress_line(tmp_path: Path) -> None:
+    """A turn that starts with a prompt and then thinks silently still gets a line.
+
+    Staging showed the elapsed time under-reporting: the ``user_input`` branch
+    armed the turn and then flushed the previous one, and that flush disarms.
+    The turn only got armed again by its first tool event, so the clock started
+    late. Here there are no tool events at all, so nothing can paper over it.
+    """
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=11,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _user_str("調べてください"))
+        await asyncio.sleep(0.25)
+        clock.advance(91.0)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert spy.posts, "a prompt-then-silence turn produced no progress line"

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Protocol
@@ -50,6 +51,17 @@ DEFAULT_STALLED_SECONDS = 60.0
 # Tool labels can be long (a full Bash command); keep the line to one row.
 _MAX_LABEL_CHARS = 60
 
+# Rendered tool bodies already start with this (see transcript.formatter), so the
+# line must not stack a second one — staging showed "🔧 🔧 Read: …".
+_TOOL_GLYPH = "🔧"
+
+# An absolute path inside a label. Session dirs are deep
+# (``/home/…/c-lord-sessions-staging-4/<channel>/<thread>/c_lord/cogs/x.py``), so
+# a plain left-to-right truncation keeps the useless prefix and cuts off the one
+# part a reader wants — which file. Collapse to the last two segments instead.
+_ABS_PATH_RE = re.compile(r"/[^\s`'\"]{2,}")
+_KEEP_PATH_SEGMENTS = 2
+
 
 class _Post(Protocol):
     def __call__(self, text: str) -> Awaitable[object | None]: ...
@@ -68,8 +80,29 @@ def _mmss(seconds: float) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
+def _abbreviate_paths(label: str) -> str:
+    """Collapse absolute paths to their last couple of segments."""
+
+    def _tail(m: re.Match[str]) -> str:
+        parts = [seg for seg in m.group(0).split("/") if seg]
+        if len(parts) <= _KEEP_PATH_SEGMENTS:
+            return m.group(0)
+        return "/".join(parts[-_KEEP_PATH_SEGMENTS:])
+
+    return _ABS_PATH_RE.sub(_tail, label)
+
+
 def _shorten(label: str) -> str:
-    label = " ".join(label.split())
+    """Make a rendered tool body fit on one quiet line.
+
+    Drops the backticks (subtext already reads as secondary, and code spans just
+    add visual noise at this size), abbreviates paths, and strips a leading tool
+    glyph so the caller can place exactly one.
+    """
+    label = " ".join(label.replace("`", "").split())
+    label = _abbreviate_paths(label)
+    if label.startswith(_TOOL_GLYPH):
+        label = label[len(_TOOL_GLYPH) :].lstrip()
     if len(label) <= _MAX_LABEL_CHARS:
         return label
     return label[: _MAX_LABEL_CHARS - 1] + "…"
@@ -122,16 +155,21 @@ class TurnProgress:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def begin_turn(self) -> None:
+    def begin_turn(self, *, restart: bool = False) -> None:
         """Arm for a new turn. Idempotent within the same turn.
 
         Arming matters: an idle thread produces no jsonl events at all, which
         from the transcript alone looks the same as Claude thinking silently.
         Only a turn we know started can put a line in the thread, so an idle
         thread can never sprout a stale "待機中".
+
+        ``restart=True`` also resets the elapsed clock, and is what c-lord calls
+        the moment it accepts a prompt. Without it the clock would start at the
+        first *transcript* event — after Claude has booted — and the line would
+        under-report how long the reader has actually been waiting.
         """
         now = self._clock()
-        if self._armed:
+        if self._armed and not restart:
             return
         self._armed = True
         self._turn_start = now

@@ -281,3 +281,89 @@ class TestNeverBreaksTheTurn:
         clock.advance(91.0)
         await p.tick()
         assert len(rec.posts) == 2
+
+
+class TestLabelReadability:
+    """Defects found by looking at the real staging output, not the mockup."""
+
+    @pytest.mark.asyncio
+    async def test_does_not_double_the_tool_emoji(self) -> None:
+        """Rendered tool bodies already start with 🔧 — don't add a second one."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+
+        clock.advance(91.0)
+        p.note_activity("🔧 Bash: `ls`")
+        await p.tick()
+
+        assert "🔧 🔧" not in rec.posts[0], rec.posts[0]
+        assert rec.posts[0].count("🔧") == 1
+
+    @pytest.mark.asyncio
+    async def test_long_paths_keep_the_filename(self) -> None:
+        """A session-dir path must not eat the line and hide which file it is."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+
+        clock.advance(91.0)
+        p.note_activity(
+            "🔧 Read: `/home/yousan/c-lord-sessions-staging-4/1514535896328700015/"
+            "1542002829714260048/c_lord/cogs/claude_chat.py`"
+        )
+        await p.tick()
+
+        body = rec.posts[0]
+        assert "claude_chat.py" in body, body
+        assert "c-lord-sessions-staging-4" not in body, body
+
+    @pytest.mark.asyncio
+    async def test_line_stays_short(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+
+        clock.advance(91.0)
+        p.note_activity("🔧 Bash: `" + "x" * 500 + "`")
+        await p.tick()
+
+        assert len(rec.posts[0]) < 140, rec.posts[0]
+
+
+class TestElapsedIsMeasuredFromTheRequest:
+    @pytest.mark.asyncio
+    async def test_restart_resets_the_clock(self) -> None:
+        """The number's whole job is "how long you have been waiting".
+
+        Staging showed it under-reporting (1:34 when the user had waited 1:52):
+        without an explicit start the clock begins at the first *transcript*
+        event, which is after Claude has finished booting. c-lord knows when it
+        accepted the prompt, so it says so.
+        """
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+
+        p.begin_turn()  # e.g. armed by a stale signal
+        clock.advance(300.0)
+        p.begin_turn(restart=True)  # c-lord accepts the prompt: clock starts here
+
+        clock.advance(91.0)
+        p.note_activity("Read(a.py)")
+        await p.tick()
+
+        assert "1:31" in rec.posts[0], rec.posts[0]
+
+    @pytest.mark.asyncio
+    async def test_plain_begin_turn_stays_idempotent(self) -> None:
+        """Repeated arming inside one turn must not keep resetting the clock."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+
+        p.begin_turn()
+        clock.advance(91.0)
+        p.begin_turn()  # a later tool event re-arms — must be a no-op
+        p.note_activity("Read(a.py)")
+        await p.tick()
+
+        assert "1:31" in rec.posts[0], rec.posts[0]
