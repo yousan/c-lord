@@ -146,7 +146,9 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
+                MagicMock(
+                    returncode=0, stdout=""
+                ),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -159,7 +161,9 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout="w1\n"),  # list-windows
                 MagicMock(returncode=0, stdout="111\n"),  # show-option w1
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(
+                    returncode=0, stdout="w1\t/a\n"
+                ),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -630,6 +634,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             result = mgr.send_input(12345, "my prompt")
 
@@ -666,6 +671,9 @@ class TestTmuxSessionManager:
                     MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
+                    # #560: send_input now reads the box back to confirm the
+                    # message actually left it.
+                    MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
@@ -695,6 +703,9 @@ class TestTmuxSessionManager:
                     MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
+                    # #560: send_input now reads the box back to confirm the
+                    # message actually left it.
+                    MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
@@ -721,6 +732,18 @@ class TestTmuxSessionManager:
     # therefore carries an explicit ``-- NORMAL`` marker.  The vim-off pane and
     # the marker-less vim NORMAL pane (which v2.1.246 renders identically) are
     # covered in tests/test_send_input_vim_mode.py.
+
+    # #560: an input box that is empty — what the pane looks like once the
+    # message has actually been submitted. send_input reads this back to confirm
+    # delivery instead of trusting the Enter keypress's exit code.
+    _EMPTY_BOX_PANE = (
+        "● done\n"
+        "─────────────────────────────\n"
+        "❯ \n"
+        "─────────────────────────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
 
     _INSERT_PANE = (
         "❯ \n"
@@ -751,6 +774,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),  # send-keys i
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             assert mgr.send_input(12345, "melon") is True
 
@@ -779,6 +803,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             assert mgr.send_input(12345, "melon") is True
 
