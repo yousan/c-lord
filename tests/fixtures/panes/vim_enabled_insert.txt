@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.246
+▝▜██████▀  Opus 5 (1M context) with xhigh effort · Claude Max
+  ▝▝ ▝▝    /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1541976101650440202/425598ef-89b7-4186-92d1-faf02599635a/scratchpad/vimon
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "refactor <filepath>"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5  v2.1.246  Style: default  Ctx: 0  Context: [░░░░░░░░░░░░░░░░] 0/1.0M (0%)  Ctx Used: 0.0%  Ctx(u) Used: 0.0% 
+   Cost: $0.00  Session: 26.0%  Weekly: 46.0%  Session: <1m  Reset: 4hr 14m  Weekly Reset: 3d 5hr 54m  Block: 45m  In: 0  Out: 0  Cached: 0  Total: 0  In...
+   ⎇ no git  (no git)  (no git)  (no git)  no git  𖠰 no git  cwd: /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1541976101650440202/4...
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
