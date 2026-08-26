@@ -219,6 +219,26 @@ def error_embed(error: str) -> discord.Embed:
     )
 
 
+def no_response_embed(detail: str) -> discord.Embed:
+    """Embed for a turn that never produced anything (#562).
+
+    Distinct from :func:`timeout_embed`: a timeout means Claude was working and
+    stopped responding, while this means the turn never began. Saying the wrong
+    one sends the reader looking for output that was never started.
+    """
+    return discord.Embed(
+        title="\u26a0\ufe0f 応答がありませんでした",
+        description=(
+            f"{detail}\n\n"
+            "**確認すること:**\n"
+            "\u2022 同じ内容をもう一度送る\n"
+            "\u2022 `/clord-attach` (または tmux) でペインを直接見る\n"
+            "\u2022 ホストが混んでいると Claude の起動が遅れることがあります"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def timeout_embed(seconds: int) -> discord.Embed:
     """Create an embed for session timeout with actionable guidance."""
     return discord.Embed(
