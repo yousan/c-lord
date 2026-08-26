@@ -116,6 +116,21 @@ class ChannelRepoCog(commands.Cog):
         self._manager_cache[channel_id] = manager
         return manager
 
+    async def has_thread_binding(self, thread_id: int) -> bool:
+        """Whether ``/clord-thread-init`` bound a repo to ``thread_id`` (#556).
+
+        One of the three traces that outlive a swept ``sessions`` row — see
+        :mod:`c_lord.thread_origin`. Never raises: the callers use it to decide
+        whether to speak, and a DB hiccup is not an answer to that question.
+        """
+        if self._thread_repo is None:
+            return False
+        try:
+            return await self._thread_repo.get(thread_id) is not None
+        except Exception:
+            logger.warning("has_thread_binding failed for thread=%s", thread_id, exc_info=True)
+            return False
+
     async def resolve_tmux_manager(
         self, channel_id: int, thread_id: int | None = None
     ) -> TmuxSessionManager | None:

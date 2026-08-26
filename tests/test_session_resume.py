@@ -147,6 +147,10 @@ def _make_cog():
     ctx.valid = False
     bot.get_context = AsyncMock(return_value=ctx)
     bot.get_cog = MagicMock(return_value=None)
+    # #556: the notice is only for threads that were c-lord's. Every case here
+    # is "a c-lord thread whose row went missing", so the bot owns the thread.
+    bot.user = MagicMock()
+    bot.user.id = BOT_USER_ID
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
@@ -155,10 +159,14 @@ def _make_cog():
     return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
 
 
+BOT_USER_ID = 777
+
+
 def _make_message(*, thread_id: int = 42, parent_id: int = 999):
     thread = MagicMock(spec=discord.Thread)
     thread.id = thread_id
     thread.parent_id = parent_id
+    thread.owner_id = BOT_USER_ID  # c-lord created it — #556
     thread.send = AsyncMock()
 
     message = MagicMock(spec=discord.Message)

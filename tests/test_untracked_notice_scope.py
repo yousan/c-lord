@@ -97,16 +97,94 @@ class TestWebhookMessagesAreLeftAlone:
 
         assert str(THREAD_ID) in " ".join(r.getMessage() for r in caplog.records)
 
-    async def test_a_human_in_the_same_thread_still_gets_answered(self) -> None:
-        """AC4 guard: this must not silently undo #538 for people.
+    async def test_a_human_in_a_clord_thread_still_gets_answered(self) -> None:
+        """AC4 guard: suppressing webhooks must not silently undo #538 for people.
 
-        A human who types into a thread with no row is the case #538 exists for —
-        they are waiting for a reply that will never come unless we say so.
+        A person who types into a *c-lord* thread with no row is the case #538
+        exists for — they are waiting for a reply that will never come unless we
+        say so. (A person typing into the Grafana thread is a different case, and
+        is covered under AC2 below: that thread was never c-lord's either.)
         """
         cog = _make_cog()
+        cog.bot.user = MagicMock()
+        cog.bot.user.id = 777
         message, thread = _message(webhook=False)
+        thread.owner_id = 777  # c-lord created this thread
 
         await cog._handle_untracked_thread(message, thread)
 
         thread.send.assert_awaited_once()
         message.add_reaction.assert_awaited_once()
+
+
+# ── AC2 / AC3: the notice is for threads that were c-lord's ──────────────────
+
+
+def _human_message():
+    """A person typing into a human-made thread under a bound channel."""
+    return _message(webhook=False)
+
+
+class TestOnlyClordThreadsGetTheNotice:
+    async def test_a_plain_conversation_thread_stays_quiet(self, tmp_path) -> None:
+        """AC2/AC3: a bound *channel* is not evidence about the *thread*.
+
+        This is the Grafana thread with a person typing in it instead of a
+        webhook — same thread, same absence of any c-lord trace.
+        """
+        cog = _make_cog()
+        message, thread = _human_message()
+        thread.owner_id = 42  # a person made it
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog._thread_binding_exists = AsyncMock(return_value=False)
+
+        await cog._handle_untracked_thread(message, thread)
+
+        thread.send.assert_not_awaited()
+        message.add_reaction.assert_not_awaited()
+
+    async def test_a_thread_the_bot_made_still_gets_the_notice(self, tmp_path) -> None:
+        """AC4: #538's whole point. A c-lord thread that lost its row to the
+        30-day sweep (#554) must still be told, or we are back to silence."""
+        cog = _make_cog()
+        cog.bot.user = MagicMock()
+        cog.bot.user.id = 777
+        message, thread = _human_message()
+        thread.owner_id = 777  # the bot created it
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog._thread_binding_exists = AsyncMock(return_value=False)
+
+        await cog._handle_untracked_thread(message, thread)
+
+        thread.send.assert_awaited_once()
+        message.add_reaction.assert_awaited_once()
+
+    async def test_a_surviving_checkout_still_gets_the_notice(self, tmp_path) -> None:
+        """The W3 │ Qiita case — the clone outlived the row."""
+        cog = _make_cog()
+        cog.bot.user = MagicMock()
+        cog.bot.user.id = 777
+        message, thread = _human_message()
+        thread.owner_id = 42
+        (tmp_path / str(thread.id)).mkdir()
+        sdm = MagicMock()
+        sdm.base_dir = str(tmp_path)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
+        cog._thread_binding_exists = AsyncMock(return_value=False)
+
+        await cog._handle_untracked_thread(message, thread)
+
+        thread.send.assert_awaited_once()
+
+    async def test_a_repo_binding_still_gets_the_notice(self, tmp_path) -> None:
+        cog = _make_cog()
+        cog.bot.user = MagicMock()
+        cog.bot.user.id = 777
+        message, thread = _human_message()
+        thread.owner_id = 42
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog._thread_binding_exists = AsyncMock(return_value=True)
+
+        await cog._handle_untracked_thread(message, thread)
+
+        thread.send.assert_awaited_once()

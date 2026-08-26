@@ -50,6 +50,7 @@ from ..session_resume import (
     classify,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
+from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -720,6 +721,14 @@ class ClaudeChatCog(commands.Cog):
             # not drown the log — the INFO line below is for threads we own.
             logger.debug("%s message ignored — not this instance's thread (#538)", ctx)
             return
+        if not await self._was_ever_our_thread(thread, parent_channel_id):
+            # #556: the check above says the *channel* is ours, which every
+            # thread under a /clord-init binding satisfies — so on its own it
+            # sent this notice into ordinary conversation threads. A thread that
+            # carries no trace of c-lord at all has nothing to restore and never
+            # did; there is nothing to tell its author.
+            logger.debug("%s message ignored — never a c-lord thread (#556)", ctx)
+            return
         logger.info("%s message not run — no session row for this thread (#538)", ctx)
 
         with contextlib.suppress(discord.HTTPException):
@@ -748,6 +757,45 @@ class ClaudeChatCog(commands.Cog):
             await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread_id)
             is not None
         )
+
+    async def _was_ever_our_thread(self, thread: discord.Thread, parent_channel_id: int) -> bool:
+        """Whether this thread carries any trace of having been c-lord's (#556).
+
+        Distinct from :meth:`_is_our_thread`, which asks about the *channel* and
+        stays as the #522 cross-instance guard. This asks about the thread, and
+        it has to, because the ``sessions`` row that would have answered it is
+        exactly what the 30-day sweep deletes (#554) — see
+        :mod:`c_lord.thread_origin` for why these three signals and not the row.
+
+        Best-effort: a resolver or DB hiccup must not decide the question, and it
+        errs toward **speaking** — the cost of a stray notice in a c-lord thread
+        is far below the cost of silently swallowing a message again, which is
+        the bug (#538) this whole path exists to fix.
+        """
+        try:
+            sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
+            has_binding = await self._thread_binding_exists(thread.id)
+        except Exception:
+            logger.warning("%s origin check failed — assuming ours", log_ctx(thread_id=thread.id))
+            return True
+        bot_user = getattr(self.bot, "user", None)
+        origin = inspect_origin(
+            thread_owner_id=getattr(thread, "owner_id", None),
+            bot_user_id=getattr(bot_user, "id", None),
+            session_dir_base=getattr(sdm, "base_dir", None),
+            thread_id=thread.id,
+            has_binding=has_binding,
+        )
+        return origin.is_clords
+
+    async def _thread_binding_exists(self, thread_id: int) -> bool:
+        """Whether ``/clord-thread-init`` bound a repo to this thread."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is None or not isinstance(channel_cog, ChannelRepoCog):
+            return False
+        return await channel_cog.has_thread_binding(thread_id)
 
     async def _clord_impl(
         self,
