@@ -98,8 +98,54 @@ async def bridge_pane_ask(
       "Type something." affordance that follows the real options
     - timeout / no answer → ``runner.cancel_menu()`` (Esc)
     """
+    # #535: registering IS claiming the menu. Several paths can spot the same
+    # TUI menu (this poll-loop bridge, the transcript mirror, the #359
+    # watchdog); the first one to register owns it and everyone else returns
+    # here — before posting anything, so no second set of buttons and no second
+    # copy of the pre-menu context reaches the thread. Returning immediately
+    # also keeps the loser out of the 24h await that used to wedge the thread.
     answer_queue = _ask_bus.register(thread.id)
+    if answer_queue is None:
+        logger.info(
+            "bridge_pane_ask: thread %d already has an active menu bridge — declining",
+            thread.id,
+        )
+        return
 
+    # #535: from here on the thread is CLAIMED. Everything below therefore runs
+    # under a single release-on-exit guard: the claim is taken before the menu
+    # is posted, so a failure in between (a Discord outage on the send, a #315
+    # pre-emption cancel) must still give it back. A leaked claim used to be
+    # harmless — the next bridge simply overwrote the waiter — but now it would
+    # silently block every future menu in this thread.
+    try:
+        await _bridge_claimed_menu(
+            thread,
+            question,
+            runner,
+            answer_queue,
+            ask_repo=ask_repo,
+            authorizer=authorizer,
+            notify_user_id=notify_user_id,
+        )
+    finally:
+        _ask_bus.unregister(thread.id)
+
+
+async def _bridge_claimed_menu(
+    thread: discord.Thread,
+    question: AskQuestion,
+    runner: TmuxClaudeRunner,
+    answer_queue: asyncio.Queue[list[str]],
+    ask_repo: PendingAskRepository | None = None,
+    authorizer: Authorizer | None = None,
+    notify_user_id: int | None = None,
+) -> None:
+    """Body of :func:`bridge_pane_ask`, run with the thread's menu claim held.
+
+    Split out so the claim's lifetime is one ``try/finally`` in the caller
+    rather than something every early return has to remember (#535).
+    """
     # #399: deliver the prose Claude spoke right above the menu (経緯・推し) as
     # its own silent message BEFORE the menu embed. The CLI buffers the jsonl
     # chunk containing the menu until resolution, so the transcript mirror
@@ -181,7 +227,6 @@ async def bridge_pane_ask(
     finally:
         for t in (click_task, tui_task):
             t.cancel()
-        _ask_bus.unregister(thread.id)
 
     if not done:
         # 24h timeout with the menu still open → dismiss it.
@@ -269,7 +314,19 @@ async def collect_ask_answers(
 
         # Register a waiter in the bus before showing the view so there is no
         # race between the user clicking and the queue being registered.
+        # #535: a None means another bridge already has this thread's menu on
+        # screen. Posting a second copy is the bug we are fixing, and its
+        # answers would go to the owner's queue anyway — so skip this question
+        # and let the owner's menu collect the answer.
         answer_queue = _ask_bus.register(thread.id)
+        if answer_queue is None:
+            logger.warning(
+                "collect_ask_answers: thread %d already has an active menu bridge — "
+                "skipping duplicate menu for q_idx=%d",
+                thread.id,
+                q_idx,
+            )
+            continue
 
         view = AskView(
             q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo, authorizer=authorizer
