@@ -685,15 +685,29 @@ class ClaudeChatCog(commands.Cog):
         3. **The notice, once per thread per process.** It names the next step; it
            is also a wall of text, so it is not repeated on every message.
 
-        Two cases get the log line only. In a thread that is not ours (#522) it
-        drops to DEBUG: several c-lord instances can share a guild and every one of
-        them sees this message, so answering would mean each bystander bot posting
-        the same notice. And while a turn is already in flight, the row is simply
-        not written yet — see below. Nothing here may raise: this is already the
-        path for a message we are failing to run.
+        Three cases get the log line only. **Webhook messages** (#556): nobody is
+        waiting on the other end, so all three responses above are noise — see the
+        guard below for what that cost in production. In a thread that is not ours
+        (#522) it drops to DEBUG: several c-lord instances can share a guild and
+        every one of them sees this message, so answering would mean each bystander
+        bot posting the same notice. And while a turn is already in flight, the row
+        is simply not written yet — see below. Nothing here may raise: this is
+        already the path for a message we are failing to run.
         """
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        if message.webhook_id is not None:
+            # #556: nothing that arrives from a webhook is waiting for an answer,
+            # so none of the three responses below are owed to it. #538's guard
+            # asked whether the *channel* was ours, which every thread under a
+            # /clord-init binding satisfies — including Grafana's server-alert
+            # thread, where from the #545 deploy on, each alert was given a ⚠️ and
+            # a wall of text about restoring a session, during incidents.
+            #
+            # DEBUG, not INFO: an alerting webhook can be chatty, and unlike the
+            # human case there is no one to tell.
+            logger.debug("%s webhook message in an untracked thread — quiet (#556)", ctx)
+            return
         if thread.id in self._active_runners or self.is_processing(thread.id):
             # A freshly spawned thread has no row until Claude emits its first
             # session_id, so a message sent in that window is not an untracked
