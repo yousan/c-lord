@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import sys
@@ -234,6 +235,12 @@ class ClaudeDiscordBot(commands.Bot):
         except Exception:
             logger.exception("Failed to sync slash commands")
 
+        # #570: reap tmux windows whose Claude has exited. Fire-and-forget so a
+        # slow tmux never delays the bot coming up; the reaper swallows its own
+        # errors. Kept as a task reference so it is not garbage collected
+        # mid-flight (asyncio only holds a weak reference to running tasks).
+        self._reaper_task = asyncio.create_task(self._cleanup_orphaned_tmux_sessions())
+
     async def on_thread_update(self, before: discord.Thread, after: discord.Thread) -> None:
         """Detect manual renames in the Discord UI (Issue #95).
 
@@ -309,23 +316,52 @@ class ClaudeDiscordBot(commands.Bot):
         except Exception:
             logger.exception("Error during startup session dir cleanup")
 
-    async def _cleanup_orphaned_tmux_sessions(self) -> None:
-        """Kill leftover tmux sessions from previous bot runs.
+    def _in_flight_thread_ids(self) -> set[int]:
+        """Threads with a turn running right now, as far as the bot knows.
 
-        Runs in a background task so it does not block on_ready().
+        A turn that is still starting up can briefly show a shell rather than
+        ``claude`` in its pane, so the reaper's pane check needs this second
+        belt. Best-effort: an unavailable cog yields an empty set, and the pane
+        check alone still protects live sessions.
+        """
+        with contextlib.suppress(Exception):
+            cog = self.get_cog("ClaudeChatCog")
+            active = getattr(cog, "_active_tasks", None)
+            if isinstance(active, dict):
+                return {int(tid) for tid in active}
+        return set()
+
+    async def _cleanup_orphaned_tmux_sessions(self) -> None:
+        """Reap leftover c-lord tmux windows. Returns nothing; never raises.
+
+        Issue #570: this method existed but had no call site, so empty windows
+        accumulated forever — 175 of them on the production host, against 14
+        live sessions. Two things were needed before it could safely be wired:
+
+        * it now sweeps **every** tmux session via
+          :func:`c_lord.tmux.cleanup_orphaned_all_sessions`, not just
+          ``self.tmux_manager``'s. Since #427 the session name follows the repo,
+          so the default ``clord`` session holds no windows on a real host and
+          the old single-session sweep would have covered nothing, and
+        * :meth:`TmuxSessionManager.cleanup_orphaned` now refuses to kill a
+          window whose pane is running Claude, which is what makes calling it
+          with an (almost) empty ``active_thread_ids`` safe.
+
+        Runs in a background task so it does not block ``on_ready``.
         """
         import asyncio
 
-        assert self.tmux_manager is not None  # caller ensures this
+        from .tmux import cleanup_orphaned_all_sessions
+
         try:
-            killed = await asyncio.to_thread(
-                self.tmux_manager.cleanup_orphaned,
-                set(),  # no active sessions at startup
-            )
+            active = self._in_flight_thread_ids()
+            killed = await asyncio.to_thread(cleanup_orphaned_all_sessions, active)
             if killed:
-                logger.info("Startup tmux cleanup: killed %d orphaned session(s)", killed)
+                logger.info("tmux reaper: killed %d orphaned window(s)", killed)
+            else:
+                logger.debug("tmux reaper: nothing to reap")
         except Exception:
-            logger.exception("Error during startup tmux session cleanup")
+            logger.exception("Error during tmux window cleanup")
 
     async def _restore_pending_ask_views(self) -> None:
         """Re-register persistent AskViews for questions pending before restart.
