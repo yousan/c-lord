@@ -74,6 +74,23 @@ def _make_pane(
     return "\n".join(lines)
 
 
+def _running_script(*values: bool):
+    """``is_claude_running`` side_effect that repeats its last value forever.
+
+    A bare list raises ``StopIteration`` once the script runs out; inside an
+    async generator that surfaces as a hang instead of a clean failure.  How
+    many times the runner probes liveness is an implementation detail (the #541
+    backstop added one more probe), so tests script only the prefix they care
+    about and let the tail repeat.
+    """
+    seq = list(values)
+
+    def _next(_thread_id=None):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    return _next
+
+
 class TestProbeContextWindow:
     """probe_context_window scrapes /context to learn the real window total."""
 
@@ -1303,6 +1320,128 @@ class TestInactivityTimeout:
         assert "Timed out" in result_events[0].error
 
 
+class TestAnsweredTurnDoesNotFalseTimeout:
+    """#541: a turn answered via the jsonl mirror must not report a timeout.
+
+    In the default ``jsonl`` bridge mode Claude posts its own final answer via
+    the transcript mirror, and the TUI pane then goes *completely* static at an
+    idle input prompt.  The scraped response text extracted from that idle pane
+    is empty (the ``●`` blocks have scrolled out of the viewport), while
+    ``last_response`` still holds the mid-turn tool text — so the completion
+    break (needs a stable non-empty response) and the idle break (needs an
+    empty ``last_response``) are both unreachable and the loop runs all the way
+    into the ``timeout_seconds`` backstop.  That posted a red
+    "⏱️ Session timed out" ~312s after a perfectly normal answer — 33 of 35
+    observed timeouts were this false alarm.
+
+    The backstop must therefore run the #366 liveness check *first*: an idle
+    ``claude`` sitting at its input prompt has finished, not hung.
+    """
+
+    # Mid-turn: tool output on screen, live spinner timer ticking every poll.
+    _WORKING = (
+        "❯ 調べて\n"
+        "\n"
+        "● Bash(rg -n 'foo' src/)\n"
+        "  ⎿  src/a.py:12: foo()\n"
+        "\n"
+        "✻ Cogitating… ({t}s · ↑ 4.2k tokens · esc to interrupt)\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "-- INSERT -- ⏵⏵ bypass permissions on\n"
+    )
+
+    # Turn over: answer delivered by the mirror, pane frozen at an idle prompt.
+    # ``_extract_response`` yields "" here — the ``●`` block scrolled away.
+    _IDLE = (
+        "✻ Brewed for 1m 6s\n"
+        "\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "-- INSERT -- ⏵⏵ bypass permissions on\n"
+    )
+
+    # Real hang: the spinner timer is still on screen but frozen — claude is
+    # alive yet stuck mid-generation, which must keep reporting a timeout.
+    _FROZEN_WORKING = _WORKING.format(t=42)
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_after_answer_delivered(self, runner, tmux_manager) -> None:
+        """AC1/AC4: answered turn + 300s of pane silence → RESULT carries no error."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx <= 6:
+                # Working: response text stable, raw pane changing (spinner tick).
+                return self._WORKING.format(t=call_idx)
+            return self._IDLE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        runner.timeout_seconds = 0.2  # 10 polls @ 0.02 of frozen pane
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("調べて"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is None, (
+            f"an answered turn reported a false timeout: {result_events[0].error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_frozen_mid_generation_still_times_out(self, runner, tmux_manager) -> None:
+        """AC3: claude alive but stuck mid-generation is a real hang → still errors."""
+        tmux_manager.is_claude_running.return_value = True
+        # The spinner never advances: the pane is byte-identical every poll.
+        tmux_manager.capture_pane.return_value = self._FROZEN_WORKING
+
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("調べて"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "Timed out" in result_events[0].error
+
+    @pytest.mark.asyncio
+    async def test_dead_claude_after_timeout_reports_exit(self, runner, tmux_manager) -> None:
+        """AC2: the liveness check runs first — a dead claude reports the crash."""
+        tmux_manager.is_claude_running.return_value = False
+        tmux_manager.capture_pane.return_value = self._IDLE
+
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 100.0),
+        ):
+            async for event in runner.run("調べて"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert result_events[0].error is not None
+        assert "exited without producing a response" in result_events[0].error
+
+
 class TestTmuxClaudeRunnerInterrupt:
     """Tests for interrupt() and kill()."""
 
@@ -1751,10 +1890,10 @@ class TestContinueFallback:
             timeout_seconds=10,
             try_continue=True,
         )
-        tmux_manager.is_claude_running.side_effect = [
+        tmux_manager.is_claude_running.side_effect = _running_script(
             False,  # initial check
             True,  # after --continue delay — Claude started successfully
-        ]
+        )
         pane = _make_pane(["● Resumed."])
         tmux_manager.capture_pane.return_value = pane
 
@@ -1799,10 +1938,10 @@ class TestContinueFallback:
             return "Loading..." if call_idx <= 2 else pane
 
         tmux_manager.capture_pane.side_effect = capture_fn
-        tmux_manager.is_claude_running.side_effect = [
+        tmux_manager.is_claude_running.side_effect = _running_script(
             False,  # initial check
             False,  # after --continue delay — failed (no history)
-        ]
+        )
         tmux_manager._find_window_for_thread.return_value = "work1"
 
         events = []
@@ -1866,8 +2005,12 @@ class TestContinueFallback:
             try_continue=False,
             effort=None,
         )
-        # Only one is_claude_running call (no post-continue check)
-        assert tmux_manager.is_claude_running.call_count == 1
+        # The post-continue liveness check must not have happened.  The probe
+        # *count* stopped being a proxy for that once #541 added a final probe
+        # to the inactivity backstop, so assert the invariant that actually
+        # distinguishes the two paths: the --continue attempt would have started
+        # claude a second time, and it never did.
+        assert tmux_manager.start_claude.call_count == 1
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
 
