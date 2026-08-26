@@ -44,6 +44,15 @@ from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import ReopenSessionView, StopView, TextAnsweredMenuView
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
+from ..session_reattach import (
+    HISTORY_FILENAME,
+    Plan,
+    Recovery,
+    plan_recovery,
+    reattach_notice,
+    recoverable_notice,
+    render_history,
+)
 from ..session_resume import (
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
@@ -242,6 +251,9 @@ class ClaudeChatCog(commands.Cog):
         # restore", so the notice is posted at most once per process per thread
         # (the ⚠️ reaction still marks every dropped message).
         self._untracked_notice_sent: set[int] = set()
+        # #538: where Claude Code keeps its transcripts. None = its real
+        # location (``~/.claude/projects``); tests point it at a tmp dir.
+        self._projects_root: Path | None = None
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
         """Check if a member/user is authorized to use the bot.
@@ -744,8 +756,35 @@ class ClaudeChatCog(commands.Cog):
         if thread.id in self._untracked_notice_sent:
             return
         self._untracked_notice_sent.add(thread.id)
+        await self._offer_recovery(thread, parent_channel_id)
+
+    async def _offer_recovery(self, thread: discord.Thread, parent_channel_id: int) -> None:
+        """Post the notice, with a 🔗 再接続する button when there is one — #538 AC6.
+
+        Before this the notice could only say the thread was beyond help and send
+        the reader off to start a new one. Usually that was wrong: #554 takes the
+        row and leaves the checkout, so the work is still there and the thread can
+        be reconnected to it. The button goes on this message because this is the
+        message the confused person is already reading (AC6: reachable from
+        Discord). When nothing survived, the wording is unchanged and names the
+        way forward instead (AC8).
+        """
+        from ..discord_ui.views import ReattachSessionView
+
+        sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
+        plan = plan_recovery(
+            session_dir_base=getattr(sdm, "base_dir", None),
+            thread_id=thread.id,
+            projects_root=self._projects_root,
+        )
+        if plan.kind is Recovery.NONE:
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(UNTRACKED_NOTICE)
+            return
+
+        view = ReattachSessionView(lambda _i: self._reattach_thread(thread))
         with contextlib.suppress(discord.HTTPException):
-            await thread.send(UNTRACKED_NOTICE)
+            await thread.send(recoverable_notice(plan), view=view)
 
     async def _is_our_thread(
         self, parent_channel_id: int, thread_id: int, message: discord.Message
@@ -794,6 +833,80 @@ class ClaudeChatCog(commands.Cog):
             has_binding=has_binding,
         )
         return origin.is_clords
+
+    async def _reattach_thread(self, thread: discord.Thread) -> Plan:
+        """Reconnect ``thread`` to the Claude session it already has — #538 AC6.
+
+        Writes back the ``sessions`` row that #554's 30-day sweep deleted, using
+        only what is already on disk. It reads; it never clones, never creates a
+        session dir, and returns :attr:`Recovery.NONE` without writing anything
+        when there is nothing to reattach to (AC7) — a recovery that could
+        manufacture a session would be #551's takeover under a nicer name.
+
+        For a WORKDIR recovery the Discord thread is written into the checkout as
+        the hand-off document, because the transcript that held the conversation
+        is gone and the thread is where it still exists. That export is a bonus,
+        not the recovery: the row is what reconnects the thread, so a failure to
+        collect or write the history is logged and the recovery still stands.
+        """
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
+        plan = plan_recovery(
+            session_dir_base=getattr(sdm, "base_dir", None),
+            thread_id=thread.id,
+            # None = Claude Code's real ~/.claude/projects; overridden in tests.
+            projects_root=self._projects_root,
+        )
+        if plan.kind is Recovery.NONE or plan.working_dir is None:
+            logger.info("%s reattach found nothing to reconnect to (#538)", ctx)
+            return plan
+
+        if plan.kind is Recovery.WORKDIR:
+            await self._export_thread_history(thread, plan.working_dir, ctx)
+
+        # ``session_id`` is what --resume needs; for a WORKDIR recovery there is
+        # no id left to resume, so the tmux-derived placeholder is used — the
+        # same shape a thread carries before Claude reports its first real id.
+        await self.repo.save(
+            thread_id=thread.id,
+            session_id=plan.session_id or f"tmux-{thread.id}",
+            working_dir=plan.working_dir,
+        )
+        logger.info("%s reattached (%s) dir=%s", ctx, plan.kind.value, plan.working_dir)
+        return plan
+
+    async def _export_thread_history(
+        self, thread: discord.Thread, working_dir: str, ctx: str
+    ) -> None:
+        """Write the Discord thread into the checkout for Claude to read."""
+        try:
+            messages = await self._collect_thread_history(thread)
+            target = Path(working_dir) / HISTORY_FILENAME
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(render_history(messages), encoding="utf-8")
+            logger.info("%s wrote %d message(s) to %s", ctx, len(messages), HISTORY_FILENAME)
+        except Exception:
+            # Never fatal — see _reattach_thread's docstring.
+            logger.warning("%s could not export thread history (#538)", ctx, exc_info=True)
+
+    async def _collect_thread_history(
+        self, thread: discord.Thread, limit: int = 500
+    ) -> list[tuple[str, str, str]]:
+        """Oldest-first ``(author, timestamp, text)`` for this thread.
+
+        c-lord reads its own threads with its own token, so no extra plumbing is
+        needed. Empty messages (embed-only tool cards, attachments) are skipped:
+        they carry nothing for a reader trying to reconstruct what was being done.
+        """
+        out: list[tuple[str, str, str]] = []
+        async for message in thread.history(limit=limit, oldest_first=True):
+            text = (message.content or "").strip()
+            if not text:
+                continue
+            stamp = message.created_at.strftime("%Y-%m-%d %H:%M") if message.created_at else ""
+            out.append((message.author.display_name, stamp, text))
+        return out
 
     async def _thread_binding_exists(self, thread_id: int) -> bool:
         """Whether ``/clord-thread-init`` bound a repo to this thread."""
@@ -1085,6 +1198,65 @@ class ClaudeChatCog(commands.Cog):
         # _active_runners cleanup is handled by _run_claude's finally block.
         # We intentionally do NOT delete from the session DB so the user can resume.
         await respond(embed=stopped_embed())
+
+    @app_commands.command(
+        name="clord-reattach",
+        description="このスレッドの作業セッションに再接続する（記録が消えたとき）",
+    )
+    async def clord_reattach(self, interaction: discord.Interaction) -> None:
+        """Reconnect this thread to the Claude session already on disk — #538 AC6.
+
+        The button on the notice covers the case where someone stumbled into it;
+        this is for someone who knows what happened and wants to fix it without
+        first sending a message that will not run.
+
+        It reattaches only — see :meth:`_reattach_thread`. In a thread with
+        nothing on disk it reports that and changes nothing (AC7/AC8), which is
+        what keeps it from being an "adopt this thread" command by another name.
+        """
+        channel = interaction.channel
+        if not isinstance(channel, discord.Thread):
+            await interaction.response.send_message(
+                "このコマンドはスレッド内でのみ使えます。", ephemeral=True
+            )
+            return
+        if not self._is_allowed(interaction.user):
+            await interaction.response.send_message(
+                "You are not authorized to use this command.", ephemeral=True
+            )
+            return
+
+        existing = await self.repo.get(channel.id)
+        if existing is not None:
+            await interaction.response.send_message(
+                "ℹ️ このスレッドの記録は失われていません。"
+                "そのままメッセージを送れば続きから再開します。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        plan = await self._reattach_thread(channel)
+        await interaction.followup.send(reattach_notice(plan))
+
+    @commands.command(name="clord-reattach")
+    async def clord_reattach_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /clord-reattach — webhook-invokable for E2E (#209)."""
+        channel = ctx.channel
+        if not isinstance(channel, discord.Thread):
+            await ctx.send("このコマンドはスレッド内でのみ使えます。")
+            return
+        if not self._is_message_authorized(ctx.message):
+            await ctx.send("You are not authorized to use this command.")
+            return
+        if await self.repo.get(channel.id) is not None:
+            await ctx.send(
+                "ℹ️ このスレッドの記録は失われていません。"
+                "そのままメッセージを送れば続きから再開します。"
+            )
+            return
+        plan = await self._reattach_thread(channel)
+        await ctx.send(reattach_notice(plan))
 
     @app_commands.command(name="stop", description="Stop the active session (session is preserved)")
     async def stop_session(self, interaction: discord.Interaction) -> None:
