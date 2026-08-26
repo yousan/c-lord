@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from ..discord_ui.turn_progress import TurnProgress
 from ..notify_policy import owner_notify_id
 from ..transcript.mirror import (
     TranscriptMirror,
@@ -31,6 +32,8 @@ from ..transcript.mirror import (
     reply_to_trigger_enabled,
     show_url_embeds_enabled,
     silent_posts_enabled,
+    turn_progress_enabled,
+    turn_progress_quiet_seconds,
     verbosity_mode,
 )
 from ..transcript.recovery import last_completed_final_answer_async
@@ -161,6 +164,7 @@ class TranscriptMirrorCog(commands.Cog):
             reply_cursor_sink=reply_cursor_sink,
             verbosity=verbosity_mode(),
             ask_bridge_cb=self._make_ask_bridge(thread_id),
+            progress=self._make_progress(thread_id),
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -179,6 +183,38 @@ class TranscriptMirrorCog(commands.Cog):
     async def cog_unload(self) -> None:
         await asyncio.gather(*(m.stop() for m in self._mirrors.values()), return_exceptions=True)
         self._mirrors.clear()
+
+    def _make_progress(self, thread_id: int) -> TurnProgress | None:
+        """Build the #539 silence filler for *thread_id*, or None when disabled.
+
+        Wired here rather than left to consumers: a c-lord upgrade alone has to
+        turn the feature on (Zero-Config Principle). ``CLORD_TURN_PROGRESS=0``
+        opts out.
+        """
+        if not turn_progress_enabled():
+            return None
+        bot = self.bot
+
+        async def post(text: str):
+            channel = await self._resolve_channel(bot, thread_id)
+            send = getattr(channel, "send", None) if channel is not None else None
+            if send is None:
+                return None
+            # Silent: the whole point is a low-noise hint, not a notification.
+            return await send(text, silent=True)
+
+        async def edit(handle, text: str) -> None:
+            await handle.edit(content=text)
+
+        async def delete(handle) -> None:
+            await handle.delete()
+
+        return TurnProgress(
+            post=post,
+            edit=edit,
+            delete=delete,
+            quiet_seconds=turn_progress_quiet_seconds(),
+        )
 
     def _make_cursor_sink(self, thread_id: int):
         """Return an awaitable that records the delivered final-answer uuid.
