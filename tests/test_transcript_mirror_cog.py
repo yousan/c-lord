@@ -974,3 +974,99 @@ async def test_on_ready_does_not_redeliver_when_uuid_matches(
     ]
     assert not any("already delivered" in b for b in sent_bodies), sent_bodies
     repo.set_mirror_replied_uuid.assert_not_awaited()
+
+
+# ----------------------------------------------------------------------
+# #553: the #215 rescue must fire ONLY for answers that were really dropped.
+# ----------------------------------------------------------------------
+
+
+def _write_transcript(project: Path, events: list[dict]) -> None:
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "s.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
+    )
+
+
+def _assistant_ev(uuid: str, text: str) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"content": [{"type": "text", "text": text}]},
+    }
+
+
+def _cog_with_recovery(monkeypatch: pytest.MonkeyPatch, project: Path, posted: list[str]):
+    """A cog whose recovery reads *project* and records reply-sink posts."""
+    monkeypatch.setattr(
+        "c_lord.cogs.transcript_mirror.derive_project_dir", lambda _wd: project
+    )
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=MagicMock())
+    cog._session_repo.set_mirror_replied_uuid = AsyncMock()
+
+    async def _reply(text: str) -> None:
+        posted.append(text)
+
+    monkeypatch.setattr(cog, "_make_reply_sink", lambda _tid: _reply)
+    return cog
+
+
+async def test_no_recovery_after_a_restart_mid_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC3: the #553 shape end-to-end — nothing is re-posted.
+
+    The cursor is on an intermediate message of the turn that was interrupted,
+    which sits AFTER the last completed turn's (already delivered) final answer.
+    """
+    project = tmp_path / "proj"
+    _write_transcript(
+        project,
+        [
+            _assistant_ev("u-final", "4点とも答えます。"),
+            {"type": "system", "subtype": "turn_duration"},
+            {"type": "user", "uuid": "u-task", "message": {"content": "task-notification"}},
+            _assistant_ev("u-mid", "#534 も CI 全 pass。"),
+        ],
+    )
+    posted: list[str] = []
+    cog = _cog_with_recovery(monkeypatch, project, posted)
+    row = _row(1, str(tmp_path))
+    row.mirror_replied_uuid = "u-mid"
+
+    recovered = await cog._recover_final_answer(1, str(tmp_path), row)
+
+    assert recovered is False
+    assert posted == [], f"re-posted an already-delivered answer: {posted!r}"
+
+
+async def test_still_recovers_a_genuinely_dropped_answer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC4: killing the false positive must not kill the rescue.
+
+    A whole turn completed while the mirror was down: its final answer is newer
+    than the cursor and was never posted.
+    """
+    project = tmp_path / "proj"
+    _write_transcript(
+        project,
+        [
+            _assistant_ev("u-old", "first turn answer"),
+            {"type": "system", "subtype": "turn_duration"},
+            {"type": "user", "uuid": "u-ask", "message": {"content": "next please"}},
+            _assistant_ev("u-new", "second turn answer — never delivered"),
+            {"type": "system", "subtype": "turn_duration"},
+        ],
+    )
+    posted: list[str] = []
+    cog = _cog_with_recovery(monkeypatch, project, posted)
+    row = _row(2, str(tmp_path))
+    row.mirror_replied_uuid = "u-old"
+
+    recovered = await cog._recover_final_answer(2, str(tmp_path), row)
+
+    assert recovered is True
+    assert posted == ["second turn answer — never delivered"]
+    cog._session_repo.set_mirror_replied_uuid.assert_awaited_with(2, "u-new")

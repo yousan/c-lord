@@ -355,16 +355,26 @@ class TranscriptMirror:
         # tool event → flush silently; result/user_input/stop → flush as reply.
         _pending_text: str | None = None
         _pending_progress: list[str] = []  # snapshot of progress_buf at capture time
-        # Issue #215: uuid of the most recent assistant_text event of the
-        # current turn. Committed at each turn boundary so a restart knows the
-        # final answer was delivered.
-        _last_text_uuid: str | None = None
+        # uuid of the text currently held in _pending_text — not yet known to be
+        # the turn's final answer.
+        _pending_uuid: str | None = None
+        # Issue #215: uuid of the last text actually DELIVERED as a final answer.
+        # Committed at each turn boundary so a restart knows it was delivered.
+        #
+        # #553: this used to be "the most recent assistant_text of the turn",
+        # which is a different thing. An intermediate message (text followed by a
+        # tool call) is posted silently and the turn continues, but its uuid
+        # stayed here — so a shutdown mid-turn committed a cursor pointing PAST
+        # the last completed turn's final answer, and the restart rescue then
+        # mistook that answer for a dropped one and re-posted it. The cursor must
+        # only ever advance on a real final-answer delivery.
+        _delivered_uuid: str | None = None
 
         async def _commit_cursor() -> None:
-            nonlocal _last_text_uuid
-            if self._reply_cursor_sink is not None and _last_text_uuid:
+            nonlocal _delivered_uuid
+            if self._reply_cursor_sink is not None and _delivered_uuid:
                 try:
-                    await self._reply_cursor_sink(_last_text_uuid)
+                    await self._reply_cursor_sink(_delivered_uuid)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -373,10 +383,10 @@ class TranscriptMirror:
                         self.thread_id,
                         exc_info=True,
                     )
-            _last_text_uuid = None
+            _delivered_uuid = None
 
         async def _flush_pending_silently() -> None:
-            nonlocal _pending_text, _pending_progress
+            nonlocal _pending_text, _pending_progress, _pending_uuid
             if _pending_text is None:
                 return
             await self._try_sink(_pending_text)
@@ -389,14 +399,22 @@ class TranscriptMirror:
             progress_buf[:0] = _pending_progress
             _pending_text = None
             _pending_progress = []
+            # #553: an intermediate message is NOT a final answer, so it must not
+            # move the delivery cursor.
+            _pending_uuid = None
 
         async def _flush_pending_as_reply() -> None:
-            nonlocal _pending_text, _pending_progress
+            nonlocal _pending_text, _pending_progress, _pending_uuid, _delivered_uuid
             if _pending_text is None:
                 return
             await self._flush_as_reply(_pending_text, _pending_progress)
+            # This IS the final answer for the turn — the one delivery that may
+            # advance the cursor (#553).
+            if _pending_uuid:
+                _delivered_uuid = _pending_uuid
             _pending_text = None
             _pending_progress = []
+            _pending_uuid = None
 
         # Drive the tail through a queue so the consumer can apply an idle
         # timeout (Issue #218) without cancelling the tail generator: a bare
@@ -471,7 +489,9 @@ class TranscriptMirror:
                         # a restart does not re-post it as a missed final.
                         if bridged_context.consume_match(self.thread_id, body, source="pane"):
                             await _flush_pending_silently()
-                            _last_text_uuid = event.get("uuid") or _last_text_uuid
+                            # The pane bridge already delivered this text, so it
+                            # counts as delivered for cursor purposes (#215).
+                            _delivered_uuid = event.get("uuid") or _delivered_uuid
                             logger.info(
                                 "TranscriptMirror: suppressed pane-bridged ask context thread=%d",
                                 self.thread_id,
@@ -486,7 +506,7 @@ class TranscriptMirror:
                             await _flush_pending_silently()
                         _pending_text = body
                         _pending_progress = list(progress_buf)
-                        _last_text_uuid = event.get("uuid") or _last_text_uuid
+                        _pending_uuid = event.get("uuid")
                         progress_buf.clear()
                     elif rendered.kind == "user_input":
                         # Human turn: previous assistant turn is over → flush as reply.
