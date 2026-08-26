@@ -246,6 +246,21 @@ _ASK_TAB_HEADER_RE = re.compile(r"☐\s+(.+?)\s{2,}")
 _ASK_PREVIEW_BOX_CHARS = ("┌", "│", "└", "╭", "╰", "┐", "┘")
 
 
+def _join_wrapped(label: str, tail: str) -> str:
+    """Re-join an option label the TUI wrapped onto the next line (#579).
+
+    The wrap happens wherever the column runs out, so it can land mid-word:
+    Japanese needs the halves glued (「…（推」+「奨）」), while a Latin wrap broke
+    at a space that the capture then stripped, and gluing there would read as
+    "somewordelse". Insert a space only between two word characters.
+    """
+    if not label:
+        return tail
+    if label[-1].isalnum() and label[-1].isascii() and tail[:1].isalnum() and tail[:1].isascii():
+        return f"{label} {tail}"
+    return f"{label}{tail}"
+
+
 def _is_ask_meta_label(label: str) -> bool:
     """True for TUI affordance rows that must not become Discord buttons.
 
@@ -341,7 +356,18 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
                 pane_col = c if pane_col is None else min(pane_col, c)
 
     def _menu_text(line: str) -> str:
-        return line[:pane_col] if pane_col is not None else line
+        """The menu-column part of *line*, with any preview-pane box cut off.
+
+        ``pane_col`` is a *character* index taken from the numbered option lines,
+        but the box is drawn at a fixed *display* column: a line whose text is
+        double-width (Japanese) reaches that column in fewer characters, so the
+        slice alone leaves the box character (and the preview text) behind. That
+        leftover is what put "…並べる    │" into an option label (#579), so cut
+        again at the first box character actually present in this line.
+        """
+        text = line[:pane_col] if pane_col is not None else line
+        cuts = [text.find(ch) for ch in _ASK_PREVIEW_BOX_CHARS if ch in text]
+        return text[: min(cuts)] if cuts else text
 
     # Indices of every numbered line (including meta-options) within the menu —
     # used to bound the region from which each real option's description is read.
@@ -365,13 +391,41 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         # Description (#169): the first non-empty, non-separator line between this
         # option and the next numbered line — Claude renders it indented below
         # the option.  Empty when the option has no description.
-        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx + 1
+        #
+        # #579: in a preview-table menu (``pane_col`` set) the left column is
+        # narrow and holds labels only — the explanation is in the box on the
+        # right — so a non-numbered line there is the continuation of an option
+        # whose text did not fit on one line. Two shapes, both real:
+        #   "❯ 1. 具体的な場面から入る（推" / "    奨）"   → a label cut mid-word
+        #   "  2." / "    欠けているものを先に並べる"      → the whole label wrapped
+        # The second used to produce ``label=""``, which Discord rejects with 400
+        # ("This field is required"), so the menu never posted at all. Dropping
+        # such an option instead would be worse than an empty label: the TUI
+        # still shows it and answers are delivered as ``Down × index``, so a
+        # shorter list would select the wrong option.
+        #
+        # Indentation cannot be the test here: descriptions sit at column 5 in
+        # a plain menu but at column 2 in a multiSelect one (the "[ ] " checkbox
+        # shifts them), which overlaps the wrapped-tail indent.
+        #
+        # ``end_idx`` (exclusive) rather than ``end_idx + 1``: that line is the
+        # "Chat about this" affordance, which was being read as the last
+        # option's description.
+        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx
         description = ""
         for j in range(i + 1, next_i):
-            s = _menu_text(lines[j]).strip()
-            if not s or _SEPARATOR_RE.match(_menu_text(lines[j])):
+            raw = _menu_text(lines[j])
+            text = raw.strip()
+            if not text or _SEPARATOR_RE.match(raw):
                 continue
-            description = s
+            if pane_col is not None and not description:
+                # Preview-table layout: the explanation lives in the box on the
+                # right, so the narrow left column carries labels and nothing
+                # else. A non-numbered line in it is therefore the tail of the
+                # label above, never a description (#579).
+                label = _join_wrapped(label, text)
+                continue
+            description = text
             break
         options.append(AskOption(label=label, description=description))
 
