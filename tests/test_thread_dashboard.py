@@ -208,7 +208,9 @@ class TestOwnerMention:
 
         sent_text = thread.send.call_args.args[0]
         assert "<@999>" in sent_text, f"should mention the poster (999); got: {sent_text!r}"
-        assert "<@42>" not in sent_text, f"should NOT mention the fixed owner (42); got: {sent_text!r}"
+        assert "<@42>" not in sent_text, (
+            f"should NOT mention the fixed owner (42); got: {sent_text!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_mentions_author_even_when_owner_unset(self) -> None:

@@ -270,7 +270,9 @@ async def test_sync_one_keeps_issue_ref_in_name():
     bot = MagicMock()
     bot.get_channel.return_value = fake_thread
     loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
-    rec = _Rec(thread_id=222, state="running", topic="やること", tmux_window_id="@9", issue_ref="404")
+    rec = _Rec(
+        thread_id=222, state="running", topic="やること", tmux_window_id="@9", issue_ref="404"
+    )
     by_tid = {
         222: {
             "window_id": "@9",
@@ -946,9 +948,7 @@ def _make_loop(is_processing=lambda _tid: False):
     bot.ask_repo = None
     thread = MagicMock(spec=thread_state_sync.discord.Thread)
     bot.get_channel.return_value = thread
-    loop = thread_state_sync.MenuWatchdogLoop(
-        bot, interval_seconds=60, is_processing=is_processing
-    )
+    loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60, is_processing=is_processing)
     return loop, bot, thread
 
 
@@ -970,7 +970,10 @@ async def test_watchdog_bridges_unwatched_menu():
     bridge.assert_awaited_once()
     q = bridge.await_args.args[1]
     assert [o.label for o in q.options] == [
-        "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+        "カナリアリリース",
+        "ブルーグリーン",
+        "ローリング更新",
+        "一斉切り替え",
     ]
 
 
@@ -1003,7 +1006,9 @@ async def test_watchdog_dedups_active_bridge_and_busy_bus():
 
     with (
         patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
-        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock(side_effect=_hang)) as bridge,
+        patch(
+            "c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock(side_effect=_hang)
+        ) as bridge,
     ):
         await loop._maybe_bridge_open_menu(113, "sess", "w1", pane)
         await asyncio.sleep(0)

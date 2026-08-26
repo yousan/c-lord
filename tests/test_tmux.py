@@ -146,7 +146,9 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
+                MagicMock(
+                    returncode=0, stdout=""
+                ),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option
@@ -159,7 +161,9 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout="w1\n"),  # list-windows
                 MagicMock(returncode=0, stdout="111\n"),  # show-option w1
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(
+                    returncode=0, stdout="w1\t/a\n"
+                ),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
                 MagicMock(returncode=0),  # new-window
                 MagicMock(returncode=0),  # set-option

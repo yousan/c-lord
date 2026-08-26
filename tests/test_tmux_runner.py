@@ -1294,12 +1294,27 @@ class TestInactivityTimeout:
 
     @pytest.mark.asyncio
     async def test_timeout_fires_when_pane_frozen(self, runner, tmux_manager) -> None:
-        """A genuinely hung (frozen-pane) session is still killed by the backstop."""
+        """A genuinely hung (frozen-pane) session is still killed by the backstop.
+
+        The turn generates first and *then* freezes. That ordering is what makes
+        this a hang rather than a turn that never started: #562 gave the two
+        different wordings, and without a generation phase the runner has no
+        evidence the turn ever began — it would (correctly) say "No response"
+        instead of "Timed out".
+        """
         tmux_manager.is_claude_running.return_value = True
-        # A response is on screen (so the empty-response idle break does not
-        # apply) but the pane never changes again — a real hang.
         frozen = _make_pane(["● Partial answer, then hung"], user_prompt="q")
-        tmux_manager.capture_pane.return_value = frozen
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            # Working (spinner ticking), then frozen forever mid-answer.
+            if call_idx <= 4:
+                return f"✻ Generating… ({call_idx}s · ↑ 2.1k tokens · esc to interrupt)"
+            return frozen
+
+        tmux_manager.capture_pane.side_effect = capture_fn
 
         runner.timeout_seconds = 0.2
         events = []
@@ -1531,11 +1546,24 @@ class TestTurnThatNeverStarted:
 
     @pytest.mark.asyncio
     async def test_a_real_answer_still_completes_normally(self, runner, tmux_manager) -> None:
-        """AC5: the regression guard — answered turns must stay silent successes."""
+        """AC5: the regression guard — answered turns must stay silent successes.
+
+        The pane starts on the pre-answer state and the answer appears after, as
+        a real turn does. An earlier version of this test returned the answered
+        pane from the very first poll, which made the answer identical to the
+        baseline — a state a freshly-sent prompt cannot produce, and one that
+        pushed the fix into scoping itself too narrowly.
+        """
         tmux_manager.is_claude_running.return_value = True
-        tmux_manager.capture_pane.return_value = _make_pane(
-            ["● ちゃんと答えました。"], with_input_prompt=True
-        )
+        answered = _make_pane(["● ちゃんと答えました。"], with_input_prompt=True)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            return self._RESIDUAL if call_idx <= 2 else answered
+
+        tmux_manager.capture_pane.side_effect = capture_fn
 
         runner.timeout_seconds = 5.0
         events = []
@@ -1550,6 +1578,47 @@ class TestTurnThatNeverStarted:
         result = [e for e in events if e.is_complete]
         assert len(result) == 1
         assert result[0].error is None
+
+    @pytest.mark.asyncio
+    async def test_stale_scrollback_does_not_excuse_a_turn_that_never_started(
+        self, runner, tmux_manager
+    ) -> None:
+        """Found on staging: scrapable *old* output must not read as success.
+
+        The first fix scoped the "never started" verdict to ``not last_response``
+        — matching the journal line in the report (``Idle timeout … no
+        response``). Reproducing the bug on staging showed the other half: when
+        the frozen pane still has the PREVIOUS turn's output on it, the scrape
+        succeeds, the run falls through to the inactivity backstop, and c-lord
+        announced "Claude has finished" for a turn Claude never received.
+
+        ``new_turn_started`` is the sound discriminator on its own: a turn that
+        genuinely produced something changes the extracted text away from the
+        baseline captured right after the prompt was sent.
+        """
+        tmux_manager.is_claude_running.return_value = True
+        # Old output still on screen, unchanged for the whole run.
+        tmux_manager.capture_pane.return_value = _make_pane(
+            ["● 前のターンの回答がまだ画面に残っている。"], with_input_prompt=True
+        )
+
+        runner.timeout_seconds = 0.4
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 0.1),
+        ):
+            async for event in runner.run("新しい質問"):
+                events.append(event)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is not None, (
+            "a turn that never started was reported as finished because stale "
+            "output was still scrapable"
+        )
+        assert "No response" in result[0].error
 
 
 class TestTmuxClaudeRunnerInterrupt:

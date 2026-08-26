@@ -1285,7 +1285,7 @@ class TmuxClaudeRunner:
                     "Claude exited without producing a response "
                     "(possible startup failure or crash) — check the tmux pane."
                 )
-            elif not last_response and not new_turn_started:
+            elif not new_turn_started:
                 # #562: claude is alive but this turn never produced anything —
                 # no generation was ever seen and the pane still shows only the
                 # previous turn's residue. Reporting "done" here is what made
@@ -1294,12 +1294,17 @@ class TmuxClaudeRunner:
                 # ``new_turn_started`` set, so an answered-then-silent pane
                 # (the #541 case) never lands here.
                 #
-                # ``not last_response`` scopes this to the shape actually
-                # reported — the journal read ``Idle timeout (67.0s) — no
-                # response``, i.e. nothing was ever extracted. Without it, a
-                # turn whose answer happens to be byte-identical to the previous
-                # one (no spinner ever captured) would be called a failure on
-                # ambiguous evidence; #541 deliberately keeps that case quiet.
+                # ``new_turn_started`` is the whole test, deliberately: an
+                # earlier revision also required ``not last_response`` (matching
+                # the journal line in the report, ``Idle timeout … no
+                # response``). Reproducing the bug on staging showed that scoping
+                # left the other half in place — when the frozen pane still had
+                # the PREVIOUS turn's output on it the scrape succeeded, the run
+                # fell through to the inactivity backstop, and c-lord announced
+                # "finished" for a turn Claude never received. A turn that really
+                # produced something always moves the extracted text away from
+                # the baseline captured right after the prompt was sent, so the
+                # gate alone is both sufficient and safe.
                 error = (
                     f"{NO_RESPONSE_ERROR_PREFIX} Claude never started this turn "
                     f"(pane unchanged for {raw_static_seconds:.0f}s). "

@@ -1000,9 +1000,7 @@ def _assistant_ev(uuid: str, text: str) -> dict:
 
 def _cog_with_recovery(monkeypatch: pytest.MonkeyPatch, project: Path, posted: list[str]):
     """A cog whose recovery reads *project* and records reply-sink posts."""
-    monkeypatch.setattr(
-        "c_lord.cogs.transcript_mirror.derive_project_dir", lambda _wd: project
-    )
+    monkeypatch.setattr("c_lord.cogs.transcript_mirror.derive_project_dir", lambda _wd: project)
     bot = MagicMock()
     cog = TranscriptMirrorCog(bot, session_repo=MagicMock())
     cog._session_repo.set_mirror_replied_uuid = AsyncMock()
