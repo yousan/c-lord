@@ -268,6 +268,77 @@ duplicate pre-menu prose, sends no keystrokes, and — the part that used to wed
 threads — never enters the 24 h await. The owner answers the menu; the loser's
 work was already done for it.
 
+## After the click — what the thread shows (#536)
+
+Pressing a button is the moment the user hands a decision to Claude, so the
+thread has to say what happened to it. It used to say almost nothing:
+
+| | before | now |
+|---|---|---|
+| delivered | the embed was wiped and replaced by a grey `-# ✅ Selected: X` | an embed keeping **the question and the answer** |
+| not delivered | an **ephemeral** "⚠️ The bot was restarted…" — only the clicker saw it, gone on refresh | a normal message in the thread naming the **actual** cause |
+| buttons on failure | **stayed live** | removed |
+| other copies of the menu | stayed live | blanked out |
+| multiSelect, chosen but not submitted | grey `-# 🔲 選択中: …` | full-size **まだ送信されていません** |
+
+**Why the old failure notice was worse than nothing.** `post_answer` returning
+False only means "no waiter is registered right now". The view treated that as
+proof of a restart and said so — to a user who had, in most real cases, just
+answered the same menu in the tmux pane. So the message was both invisible to
+the thread and wrong, and the buttons stayed clickable, so the natural next move
+was to click again and get the same nothing. yousan's report of the whole class:
+「選んだあとに決定されていない気がして `y` とメッセージを送っていた」.
+
+**Naming the cause instead of guessing it.** The bridge now records *why* a menu
+stopped accepting answers as it closes — `AskAnswerBus.note_closed()` with one of
+`answered` / `terminal` / `timeout` / `interrupted` — and the view reads it back.
+Recorded knowledge always beats inference. Only when this process has no note at
+all does the view fall back to inference, and then it uses the one fact that
+actually implies a restart: a menu message **older than the process itself**
+cannot have been posted by the process now handling its click.
+
+**Other copies (`ask_menus`).** #535 makes a second copy impossible within one
+process, but copies still outlive processes: a restart leaves the previous
+process's message on screen with working-looking buttons. Every posted menu is
+registered while answerable, and resolving one blanks the rest. A copy from a
+*previous* process is out of reach of an in-memory registry by construction — it
+is handled where it is reachable: its click lands on the honest "already closed"
+path above, which disables it.
+
+## Answering by typing (#536 AC7)
+
+Buttons used to be the only way to answer. Typing — which is what people do when
+the buttons feel unresponsive — took the **interrupt** path: the open question
+was discarded without a word (`⚡ Interrupted. Starting with new instruction...`)
+and the sentence ran as a fresh instruction. So an attempt to answer looked, from
+the user's side, like nothing happening at all. yousan hit exactly this: 「選んだ
+あとに決定されていない気がして `y` とメッセージを送っていた」.
+
+**A sentence sent while a menu is open is now delivered as that menu's answer**
+(`claude_chat.py::_maybe_answer_open_menu`), through the same free-text path as
+the ✏️ Other modal. The menu's copies are blanked to `✏️ 文章で回答しました: …`,
+and the thread gets a **「これは新しい指示でした」** button
+(`views.py::TextAnsweredMenuView`) that re-dispatches the message as an
+instruction — the old behaviour, one click away.
+
+Guessing "answer" is the right default because the two mistakes are not
+symmetric: a mis-read instruction costs one button, while a dropped answer costs
+the whole exchange (and, before #535, the user had usually already tried the
+buttons).
+
+Three cases stay instructions, because as answers they are nonsense:
+
+| case | why |
+|---|---|
+| empty body | nothing to deliver |
+| message with attachments | a file is not a menu choice |
+| menu with no free-text row | plan-approval menus (`allow_other=False`) have no `Type something.` row (#251); typing there would mis-send keystrokes |
+
+The bridge is what knows which menus take free text, so it declares it when it
+claims the menu: `ask_bus.register(thread_id, allow_free_text=question.allow_other)`.
+The flag defaults to False, so a caller that has not thought about it cannot opt
+a menu in by accident.
+
 ## A menu only counts while claude is alive (#510)
 
 Pane text outlives the process that drew it. When claude exits — a crash, a
@@ -319,6 +390,10 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | Ignore menus in a pane whose claude has exited (#510) | `c_lord/tmux.py::pane_command_is_dead`, `TmuxSessionManager.pane_foreground_command`, `thread_state_sync.py::_maybe_bridge_open_menu`, `tmux_runner.py::peek_menu_state` |
 | Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
 | One-owner-per-thread menu arbitration (#535) | `c_lord/discord_ui/ask_bus.py::AskAnswerBus.register` |
+| Why a menu closed / what a late click is told (#536) | `ask_bus.py::note_closed`, `ask_view.py::_undeliverable_reason` |
+| Answered / undelivered embeds (#536) | `embeds.py::ask_answered_embed`, `ask_undelivered_embed` |
+| Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |
+| 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |

@@ -40,7 +40,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
-from ..discord_ui.views import ReopenSessionView, StopView
+from ..discord_ui.views import ReopenSessionView, StopView, TextAnsweredMenuView
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..session_resume import (
@@ -61,6 +61,12 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Longest sentence still treated as an answer to an open menu (#536 AC7).
+# Matches AskModal's free-text limit: the two are the same affordance reached
+# two ways, and past this length the message reads as a new request rather than
+# a pick from a short menu.
+_MENU_TEXT_ANSWER_MAX = 500
 
 # Posts a reply the way the caller needs (interaction response vs ctx.send),
 # letting /stop, /clear and their !text twins share one implementation (#209).
@@ -1611,6 +1617,14 @@ class ClaudeChatCog(commands.Cog):
             await self._post_closed_notice(thread, message)
             return
 
+        # #536 AC7: if a menu is open, this sentence is almost certainly the
+        # ANSWER to it, not a new order — that is what a user types when the
+        # buttons feel unresponsive (yousan sent `y`). Route it into the menu
+        # instead of pre-empting the turn and throwing the question away.
+        # Checked before the lock: nothing below it is needed for an answer.
+        if await self._maybe_answer_open_menu(message, thread):
+            return
+
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             record = await self.repo.get(thread.id)
@@ -1686,6 +1700,68 @@ class ClaudeChatCog(commands.Cog):
                 )
             )
             self._active_tasks[thread.id] = task
+
+    async def _maybe_answer_open_menu(
+        self, message: discord.Message, thread: discord.Thread
+    ) -> bool:
+        """Deliver *message*'s text as the open menu's answer (#536 AC7).
+
+        Returns True when the message was consumed as an answer, so the caller
+        must NOT run it as a new instruction.
+
+        Decision (recorded in issue #536): the sentence IS the answer. Before
+        this, typing while a menu was open silently discarded the question and
+        ran the text as a fresh instruction (``⚡ Interrupted``) — so an attempt
+        to answer looked, from the user's side, like nothing happening at all.
+        A wrong guess costs one button (:class:`TextAnsweredMenuView`); dropping
+        the question costs the whole exchange.
+
+        Four cases stay instructions, because as answers they are nonsense:
+        an empty body, a message carrying attachments, prose longer than the
+        ✏️ Other modal accepts (past that length it is a request, not a pick
+        from a three-option menu), and a menu with no free-text row (plan
+        approval — typing there would mis-send keystrokes).
+        """
+        from ..discord_ui.ask_bus import ask_bus
+        from ..discord_ui.ask_menus import disable_stale_copies
+
+        text = (message.content or "").strip()
+        if not text or message.attachments or len(text) > _MENU_TEXT_ANSWER_MAX:
+            return False
+        if not ask_bus.accepts_free_text(thread.id):
+            return False
+        if not ask_bus.post_answer(thread.id, [text]):
+            return False
+
+        logger.info(
+            "%s message delivered as the open menu's answer (#536 AC7)",
+            log_ctx(thread_id=thread.id),
+        )
+        # The answer came from outside the view, so no interaction edits the
+        # menu — blank every live copy here instead.
+        with contextlib.suppress(Exception):
+            await disable_stale_copies(
+                thread.id,
+                keep_message_id=None,
+                note=f"-# ✏️ 文章で回答しました: {text[:150]}",
+            )
+
+        async def _rerun(_interaction: discord.Interaction) -> None:
+            # The menu is closed by now, so this takes the ordinary reply path:
+            # pre-empt the running turn and start fresh with the same text.
+            await self._handle_thread_reply(message)
+
+        view = TextAnsweredMenuView(_rerun, authorizer=self._authorizer)
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(
+                content=(
+                    f"✏️ **この文章を、開いていた質問への回答として送りました:** {text[:150]}\n"
+                    "-# 質問への回答ではなく新しい指示のつもりだった場合は、"
+                    "下のボタンを押してください。"
+                ),
+                view=view,
+            )
+        return True
 
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).
