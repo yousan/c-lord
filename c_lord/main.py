@@ -21,6 +21,11 @@ from .utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
+#: Days of disuse after which a ``sessions`` row is swept at startup. Named here
+#: rather than inlined because #554 made it user-visible: the notice posted into
+#: each swept thread quotes it, and README/docs/COMMANDS.md now state it.
+SESSION_CLEANUP_DAYS = 30
+
 
 def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
     """Acquire an exclusive non-blocking flock on ``data_dir/.bot.lock``.
@@ -308,10 +313,24 @@ async def main(env_path: Path | None = None) -> None:
                 api_server.port,
             )
 
-        # Cleanup old sessions on startup
-        deleted = await components.session_repo.cleanup_old(days=30)
-        if deleted:
-            logger.info("Cleaned up %d old sessions", deleted)
+        # Cleanup old sessions on startup.
+        # #554: this used to be silent — a count in the log, nothing in Discord —
+        # so a user returning to a month-old thread was told there was no session
+        # with no way to learn that one had been deleted. The sweep still runs
+        # here, before the connection, so it cannot race TranscriptMirrorCog's
+        # on_ready walk of the same table; the cog posts the notices once the bot
+        # is connected. It logs the thread ids, so the count line is gone.
+        deleted = await components.session_repo.cleanup_old(days=SESSION_CLEANUP_DAYS)
+        cleanup_cog = bot.get_cog("SessionCleanupCog")
+        if cleanup_cog is not None:
+            cleanup_cog.announce(deleted)  # type: ignore[attr-defined]
+        elif deleted:
+            logger.info(
+                "Cleaned up %d session(s) unused for %d+ days: threads=%s (no notice cog)",
+                len(deleted),
+                SESSION_CLEANUP_DAYS,
+                [r.thread_id for r in deleted],
+            )
 
         # Handle signals
         loop = asyncio.get_running_loop()
