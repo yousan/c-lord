@@ -75,21 +75,36 @@ _SCREENSHOT_ROWS_ENV = "CLORD_TMUX_SCREENSHOT_ROWS"
 # not this flag — so they are intentionally excluded here.
 _VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
-# #147: Claude Code runs with ``editorMode: vim``.  Its input box therefore has
-# a vim NORMAL mode in which literal characters (``send-keys -l``) are
-# interpreted as editor commands, corrupting the message.  The TUI status bar
-# shows ``-- INSERT`` only while in INSERT mode; NORMAL mode simply omits the
-# prefix (current Claude Code, v2.1.150, renders NO ``-- NORMAL`` marker).  So
-# we detect mode by the presence of ``-- INSERT`` and anchor the NORMAL case on
-# the always-present permission/plan status indicators.
+# #147: when Claude Code runs with ``editorMode: vim`` its input box has a vim
+# NORMAL mode in which literal characters (``send-keys -l``) are interpreted as
+# editor commands, corrupting the message.  Pressing ``i`` first fixes that.
+#
+# #544: but vim mode is *not* the default, and c-lord must not assume it.  The
+# status bar on Claude Code v2.1.246 looks like this:
+#
+#     vim on,  INSERT      ``-- INSERT -- ⏵⏵ bypass permissions on …``
+#     vim on,  NORMAL      ``⏵⏵ bypass permissions on …``
+#     vim off (default)    ``⏵⏵ bypass permissions on …``      <- identical
+#
+# ``⏵⏵``/``⏸⏸`` are the permission/plan indicators; they are present regardless
+# of the editor mode, so they prove only that the pane is sitting at the input
+# prompt.  c-lord used to treat that bare status bar as "vim NORMAL" and press
+# ``i``, which for every consumer who does not use vim mode typed a literal
+# ``i`` in front of each Discord message.  Only an explicit ``-- INSERT`` /
+# ``-- NORMAL`` marker is evidence about vim; everything else is undecidable
+# from one frame, and :meth:`TmuxSessionManager._ensure_insert_mode` resolves it
+# by probing the pane instead of guessing.
 _INSERT_MARKER = "-- INSERT"
-# Status-bar anchors that prove the pane is sitting at the input prompt (and so
-# its vim mode is meaningful).  ``⏵⏵``/``⏸⏸`` are the bypass/plan indicators;
-# ``-- NORMAL`` is included for forward-compat in case a future build restores
-# the explicit NORMAL marker.
-_STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸", "-- NORMAL")
-# Pause after pressing ``i`` so the TUI commits the INSERT-mode switch before the
-# literal text arrives (verified on staging: the switch is near-instant).
+# Not rendered by v2.1.246 (NORMAL shows no marker at all), but older/newer
+# builds do show it and it is unambiguous when present.
+_NORMAL_MARKER = "-- NORMAL"
+# Status-bar anchors that prove the pane is sitting at the input prompt — i.e.
+# that a keypress would land in the input box.  Deliberately NOT evidence of
+# the editor mode (that was the #544 bug).
+_STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸")
+# Pause after pressing ``i`` so the TUI commits the INSERT-mode switch (or
+# renders the literal character) before we look at the pane / type the message.
+# Verified on staging: the switch is near-instant.
 _INSERT_SETTLE = 0.15
 # #485: pause after Esc-dismissing a stuck menu so the TUI closes it before the
 # message is typed (otherwise the text could still land on the closing menu).
@@ -289,26 +304,45 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _pane_in_insert_mode(pane_text: str) -> bool | None:
-    """Return True if the input box is in vim INSERT mode, False for NORMAL.
+def _status_zone(pane_text: str) -> str:
+    """The bottom few non-blank lines — where Claude Code draws its status bar.
 
-    Returns ``None`` when the mode cannot be determined (no status bar in the
-    captured frame — e.g. mid-redraw or while Claude is generating).  Callers
-    should treat ``None`` as "leave input untouched" to avoid the double-``i``
-    regression (#147 AC2).
-
-    Only the bottom status zone is inspected, so a stale ``-- INSERT`` lingering
-    in scrollback above a current NORMAL status bar does not win.
+    Restricting every status check to this zone keeps a stale marker lingering
+    in scrollback from outvoting the current frame.
     """
     lines = [ln for ln in pane_text.splitlines() if ln.strip()]
-    if not lines:
+    return "\n".join(lines[-8:])
+
+
+def _pane_in_insert_mode(pane_text: str) -> bool | None:
+    """Return True if the input box is in vim INSERT mode, False for vim NORMAL.
+
+    Returns ``None`` when the frame does not say — which covers both "no status
+    bar at all" (mid-redraw, Claude generating) *and* the common case of a pane
+    whose editor simply is not in vim mode (#544).  A bare ``⏵⏵`` status bar is
+    emitted identically by vim-NORMAL and by a vim-less input box, so it is not
+    evidence either way and must never be answered with ``False``.
+
+    Callers must treat ``None`` as "the status bar cannot decide" — press no
+    keys on this alone, or resolve it by probing.
+    """
+    if not pane_text.strip():
         return None
-    zone = "\n".join(lines[-8:])
+    zone = _status_zone(pane_text)
     if _INSERT_MARKER in zone:
         return True
-    if any(anchor in zone for anchor in _STATUS_BAR_ANCHORS):
+    if _NORMAL_MARKER in zone:
         return False
     return None
+
+
+def _pane_at_input_prompt(pane_text: str) -> bool:
+    """True if the pane is showing Claude Code's input prompt status bar.
+
+    Says nothing about the editor mode — only that a keypress would land in the
+    input box, so it is safe to probe/correct there.
+    """
+    return any(anchor in _status_zone(pane_text) for anchor in _STATUS_BAR_ANCHORS)
 
 
 def _pane_has_open_menu(pane_text: str) -> bool:
@@ -376,6 +410,11 @@ class TmuxSessionManager:
         self._available: bool | None = None
         self._next_work_id: int = 1
         self._thread_to_window: dict[int, str] = {}
+        # #544: window name -> "is this pane's Claude running in vim editor
+        # mode?".  Learned from the pane (an observed ``-- INSERT``/``-- NORMAL``
+        # marker, or a probe), never assumed.  In-memory only: a restart just
+        # means the next send re-learns it, which is cheap and self-correcting.
+        self._vim_mode: dict[str, bool] = {}
         # Serializes window creation + the post-create sort (#374) so concurrent
         # create_session() calls (one per Discord thread, run in the asyncio
         # thread pool) don't interleave their move-window operations.
@@ -1494,6 +1533,14 @@ class TmuxSessionManager:
             logger.warning("start_claude: no window for thread %d", thread_id)
             return False
 
+        # #544: the Claude we are about to start may not have the editor mode
+        # the previous one in this window had (a recycled window, or changed
+        # settings), so forget what was learned about it.  Observed on staging:
+        # a window probed as vim-less was reused by a vim-mode Claude, and the
+        # stale verdict meant no ``i`` was pressed — the message ran as vim
+        # commands and left the pane in ``-- VISUAL LINE --``.
+        self._vim_mode.pop(window, None)
+
         target = f"{self.session_name}:{window}"
         cmd_parts = ["env", "-u", "CLAUDECODE", "claude"]
         if try_continue:
@@ -1600,6 +1647,96 @@ class TmuxSessionManager:
                 return False
         return True
 
+    def _ensure_insert_mode(self, target: str, window: str, pane_text: str, thread_id: int) -> None:
+        """Put a vim-mode input box into INSERT before literal text is typed.
+
+        The hard part is that Claude Code v2.1.246 renders *nothing* in vim
+        NORMAL, so its status bar is byte-identical to that of an input box with
+        vim mode switched off entirely.  c-lord used to read that frame as
+        NORMAL and press ``i`` unconditionally, which prefixed every message
+        from a non-vim consumer with a literal ``i`` (#544).
+
+        So the mode is established from evidence, never assumed:
+
+        * ``-- INSERT`` — vim, already in INSERT.  Nothing to do.
+        * ``-- NORMAL`` — vim, in NORMAL.  Press ``i``.
+        * neither, and no input prompt — indeterminate frame (mid-redraw, or
+          Claude is generating).  Touch nothing.
+        * neither, but at the input prompt — undecidable from the frame, so
+          *probe*: press ``i`` and look at what it did.  A pane that flips to
+          ``-- INSERT`` was vim in NORMAL and the keypress did its job; a pane
+          that does not has vim off, so the ``i`` was a literal character and is
+          erased with a BSpace.  Either way the answer is remembered per window,
+          so the probe costs one extra capture the first time only.
+
+        The remembered answer is also refreshed from every marker we see, so a
+        probe that raced a redraw self-corrects on the next send rather than
+        sticking.
+        """
+        mode = _pane_in_insert_mode(pane_text)
+        if mode is not None:
+            # An explicit marker: this pane definitely runs vim mode.
+            self._vim_mode[window] = True
+            if mode is False:
+                logger.debug(
+                    "send_input: pane in vim NORMAL, entering INSERT (thread=%d)", thread_id
+                )
+                _run(["tmux", "send-keys", "-t", target, "i"])
+                time.sleep(_INSERT_SETTLE)
+            return
+
+        if not _pane_at_input_prompt(pane_text):
+            return  # no input prompt in this frame — never type blind
+
+        known = self._vim_mode.get(window)
+        if known is False:
+            return  # vim is off on this pane: the box takes text as-is
+        if known is True:
+            logger.debug("send_input: pane in vim NORMAL, entering INSERT (thread=%d)", thread_id)
+            _run(["tmux", "send-keys", "-t", target, "i"])
+            time.sleep(_INSERT_SETTLE)
+            return
+
+        # Undecidable and unknown — probe (#544).
+        _run(["tmux", "send-keys", "-t", target, "i"])
+        time.sleep(_INSERT_SETTLE)
+        after = _run(["tmux", "capture-pane", "-p", "-t", target])
+        if after.returncode == 0 and _pane_in_insert_mode(after.stdout) is True:
+            self._vim_mode[window] = True
+            logger.info(
+                "send_input: probe says vim editor mode is ON (window=%s thread=%d); "
+                "the 'i' switched the box to INSERT",
+                window,
+                thread_id,
+            )
+            return
+        # No INSERT marker appeared, so ``i`` was typed as a literal character.
+        # Erase it — the message must reach Claude exactly as the user wrote it.
+        # The BSpace is sent even when the verification capture itself failed:
+        # the input box is empty at this point in a normal send, so deleting the
+        # character we just typed is harmless, whereas leaving it behind would
+        # reproduce the very bug this method exists to prevent.
+        if after.returncode == 0:
+            self._vim_mode[window] = False
+            logger.info(
+                "send_input: probe says vim editor mode is OFF (window=%s thread=%d); "
+                "erasing the probe character so the message is sent unprefixed (#544)",
+                window,
+                thread_id,
+            )
+        else:
+            # Nothing was actually observed, so don't remember a verdict —
+            # re-probe next time instead of caching a guess.
+            logger.warning(
+                "send_input: could not read the pane back after the vim probe "
+                "(window=%s thread=%d); erasing the probe character and retrying "
+                "the detection on the next message",
+                window,
+                thread_id,
+            )
+        _run(["tmux", "send-keys", "-t", target, "BSpace"])
+        time.sleep(_INSERT_SETTLE)
+
     def send_input(self, thread_id: int, text: str) -> bool:
         """Send text to the Claude process in the tmux window via ``send-keys -l``.
 
@@ -1647,17 +1784,12 @@ class TmuxSessionManager:
             time.sleep(_MENU_DISMISS_SETTLE)
             visible = _run(["tmux", "capture-pane", "-p", "-t", target])
 
-        # #147: Claude's vim-mode input box drops to NORMAL after some
-        # operations (e.g. an Escape sent by cancel_menu()).  Sending literal
-        # text in NORMAL makes each character a vim command, corrupting the
-        # message.  If not positively in INSERT, press ``i`` first.  We only
-        # correct when the pane is positively NOT in INSERT (a recognised status
-        # bar without ``-- INSERT``); an indeterminate frame is left untouched so
-        # we never inject a stray ``i`` into an already-INSERT box (AC2).
-        if visible.returncode == 0 and _pane_in_insert_mode(visible.stdout) is False:
-            logger.debug("send_input: pane in NORMAL mode, entering INSERT (thread=%d)", thread_id)
-            _run(["tmux", "send-keys", "-t", target, "i"])
-            time.sleep(_INSERT_SETTLE)
+        # #147/#544: a vim-mode input box drops to NORMAL after some operations
+        # (e.g. an Escape sent by cancel_menu() or the menu guard above), and
+        # literal text typed in NORMAL becomes vim commands.  Pressing ``i``
+        # fixes that — but only for panes that actually run vim mode.
+        if visible.returncode == 0:
+            self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
         payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
         if not self._type_literal(target, payload, what="send_input"):
