@@ -366,6 +366,52 @@ never pays the resize round-trip).
 `この質問の経緯は、回答後にまとめて届きます`. The gap cannot be closed (see the
 measurement), so the next best thing is to stop it from reading as an omission.
 
+## An option the pane cannot be read from (#579)
+
+Discord rejects a button with an empty label — and rejects the **whole message**
+with it. So a single option c-lord failed to read silenced the entire menu, and
+because a menu that never posted still looks unbridged, the watchdog retried it
+every sweep: **128 failed posts in one day** on one thread, each swallowed as
+asyncio's `Task exception was never retrieved`.
+
+The pane that caused it (captured live, now
+`tests/fixtures/panes/ask_wrapped_option_empty_label.txt`) drew the menu as a
+two-column table, and one option's text did not fit beside the preview box:
+
+```
+❯ 1. 具体的な場面から入る（推     ┌──────────────
+    奨）                          │ …
+  2.                              │
+    欠けているものを先に並べる    │ …
+  3. チーム共有を主役にする       │ …
+```
+
+Three parser rules come out of that pane:
+
+- **A wrapped tail belongs to the label above.** In a preview-table menu
+  (`pane_col` is set) the explanation lives in the box on the right, so a
+  non-numbered line in the narrow left column can only be the continuation of
+  the option above it. *Indentation cannot decide this*: descriptions sit at
+  column 5 in a plain menu but at column 2 in a multiSelect one (the `[ ] `
+  checkbox shifts them), which overlaps the wrapped-tail indent — the first
+  attempt at an indent rule swallowed multiSelect descriptions into labels.
+- **Strip the preview box per line, not by column.** `pane_col` is a *character*
+  index taken from the numbered lines, but the box is drawn at a fixed *display*
+  column; a line of double-width text reaches it in fewer characters, so the
+  slice alone leaves `│` (and the preview text) inside the label.
+- **The `Chat about this` row is not the last option's description.** The
+  description scan ended at `end_idx + 1`, which is that row.
+
+**Two backstops sit behind the parser**, because the next unseen rendering will
+break it again:
+
+- `ask_view.py::_button_label` substitutes the TUI's own number for an empty
+  label. It *substitutes* rather than dropping the option: answers are delivered
+  as `Down × index`, so a shorter list would select the wrong choice.
+- The watchdog stops after `_ASK_BRIDGE_MAX_FAILURES` (3) consecutive failures
+  for a thread, logs each one, and tells the thread it could not show the
+  choices (with the `tmux attach` target). Without a cap the pair is a closed
+  loop — the post fails, so the menu stays unbridged, so the sweep fires again.
 ## A menu only counts while claude is alive (#510)
 
 Pane text outlives the process that drew it. When claude exits — a crash, a
@@ -425,6 +471,7 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
+| Empty-label backstop / watchdog retry cap (#579) | `ask_view.py::_button_label`, `thread_state_sync.py::_ASK_BRIDGE_MAX_FAILURES` |
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |

@@ -70,6 +70,23 @@ _CLOSED_RESTARTED = "この質問のあとに bot が再起動したため、セ
 _STALE_COPY_NOTE = "-# 🔁 この質問は別のメッセージで解決済みです（このボタンは無効です）"
 
 
+def _button_label(label: str, index: int) -> str:
+    """A label Discord will accept, for the option at *index* (#579).
+
+    Discord rejects an empty button label — and rejects the **whole message**
+    with it, so one option the pane parser could not read silenced the entire
+    menu (400 ``In components.0.components.1.label: This field is required``),
+    which the watchdog then retried every 30–60s forever.
+
+    Substituting a placeholder rather than dropping the option is deliberate:
+    the option still exists in the TUI, and answers are delivered as
+    ``Down × index``, so a shorter list would select the wrong one. The number
+    shown is the TUI's own, which is what the user sees in the pane.
+    """
+    text = (label or "").strip()
+    return text[:80] if text else f"{index + 1}."
+
+
 class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """Renders buttons or a select menu for a single AskUserQuestion prompt.
 
@@ -122,11 +139,11 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
                 max_values=min(max_vals, 25),
                 options=[
                     discord.SelectOption(
-                        label=opt.label[:100],
+                        label=_button_label(opt.label, i)[:100],
                         description=opt.description[:100] if opt.description else None,
-                        value=opt.label[:100],
+                        value=_button_label(opt.label, i)[:100],
                     )
-                    for opt in options[:25]
+                    for i, opt in enumerate(options[:25])
                 ],
                 custom_id=f"ask_{thread_id}_{q_idx}_select",
             )
@@ -137,7 +154,7 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         elif options:
             for i, opt in enumerate(options[:4]):
                 btn = discord.ui.Button(
-                    label=opt.label[:80],
+                    label=_button_label(opt.label, i),
                     style=discord.ButtonStyle.primary,
                     custom_id=f"ask_{thread_id}_{q_idx}_{i}",
                     row=0,

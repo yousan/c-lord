@@ -1000,9 +1000,7 @@ def _assistant_ev(uuid: str, text: str) -> dict:
 
 def _cog_with_recovery(monkeypatch: pytest.MonkeyPatch, project: Path, posted: list[str]):
     """A cog whose recovery reads *project* and records reply-sink posts."""
-    monkeypatch.setattr(
-        "c_lord.cogs.transcript_mirror.derive_project_dir", lambda _wd: project
-    )
+    monkeypatch.setattr("c_lord.cogs.transcript_mirror.derive_project_dir", lambda _wd: project)
     bot = MagicMock()
     cog = TranscriptMirrorCog(bot, session_repo=MagicMock())
     cog._session_repo.set_mirror_replied_uuid = AsyncMock()
@@ -1130,3 +1128,59 @@ async def test_on_ready_skips_closed_sessions(
     startup_lines = [r.getMessage() for r in caplog.records if "session row(s)" in r.getMessage()]
     assert startup_lines, caplog.text
     assert "1 closed" in startup_lines[-1], startup_lines[-1]
+
+
+# -- #539: the silence filler is on by default and opt-out ------------------
+
+
+async def test_progress_line_is_wired_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Zero-Config: upgrading the package alone must turn #539 on."""
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+
+    assert cog._make_progress(123) is not None
+
+
+async def test_progress_line_can_be_opted_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLORD_TURN_PROGRESS", "0")
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+
+    assert cog._make_progress(123) is None
+
+
+async def test_progress_line_posts_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It is a hint, not a notification — it must never ping the thread."""
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    channel = MagicMock()
+    channel.send = AsyncMock(return_value=MagicMock())
+    bot = MagicMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    progress = cog._make_progress(123)
+    assert progress is not None
+    progress.begin_turn()
+    progress._last_output -= 10_000  # pretend the thread has been quiet
+    await progress.tick()
+
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs.get("silent") is True
+
+
+async def test_progress_quiet_threshold_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    monkeypatch.setenv("CLORD_TURN_PROGRESS_QUIET_SECONDS", "45")
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+
+    progress = cog._make_progress(123)
+    assert progress is not None
+    assert progress._quiet_seconds == 45.0
