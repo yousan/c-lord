@@ -617,3 +617,33 @@ async def test_bridge_registers_and_releases_its_menu_message(monkeypatch):
     assert ask_menus.pop_others(thread.id, keep_message_id=None) == [], (
         "a resolved menu must not stay registered as answerable"
     )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_menu_stops_showing_live_buttons(monkeypatch):
+    """#536: a menu cancelled by a new instruction must not keep live buttons.
+
+    ``_preempt_prior_turn`` (#315) posts an empty answer so the parked bridge can
+    wind down; the bridge then sends Esc and returned **without touching the
+    message**. The buttons stayed clickable on a menu that no longer existed —
+    the "生きたままのメニュー" in #536 — and clicking one reached nobody.
+    """
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    thread, msg = _thread(536_1006)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_question())
+    runner.cancel_menu = AsyncMock()
+
+    async def _preempt_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, [])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=3.0),
+        _preempt_soon(),
+    )
+
+    msg.edit.assert_awaited()
+    kwargs = msg.edit.await_args.kwargs
+    assert kwargs.get("view") is None, "cancelled menu kept its buttons"
+    assert "取り消" in (kwargs.get("content") or ""), kwargs

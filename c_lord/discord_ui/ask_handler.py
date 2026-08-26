@@ -122,7 +122,10 @@ async def bridge_pane_ask(
     # here — before posting anything, so no second set of buttons and no second
     # copy of the pre-menu context reaches the thread. Returning immediately
     # also keeps the loser out of the 24h await that used to wedge the thread.
-    answer_queue = _ask_bus.register(thread.id)
+    # #536 AC7: a typed sentence may answer this menu only when the TUI has a
+    # free-text row — ``allow_other`` is exactly that flag (plan-approval menus
+    # set it False, and keystrokes typed into one would land nowhere useful).
+    answer_queue = _ask_bus.register(thread.id, allow_free_text=question.allow_other)
     if answer_queue is None:
         logger.info(
             "bridge_pane_ask: thread %d already has an active menu bridge — declining",
@@ -281,8 +284,17 @@ async def _bridge_claimed_menu(
         return
 
     if not selected:
-        # An EMPTY answer is the #315 pre-emption signal, not a choice.
+        # An EMPTY answer is the #315 pre-emption signal, not a choice. The menu
+        # is about to be Esc'd away, so its buttons must go with it (#536) —
+        # leaving them live is what produced menus that stayed clickable long
+        # after the question was gone.
         _close(thread.id, CLOSE_INTERRUPTED, msg)
+        with contextlib.suppress(discord.HTTPException):
+            await msg.edit(
+                content="-# ⚡ 新しい指示が届いたので、この質問は取り消しました。",
+                embed=None,
+                view=None,
+            )
         await runner.cancel_menu()
         return
 

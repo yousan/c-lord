@@ -44,9 +44,21 @@ class AskAnswerBus:
         self._waiters: dict[int, asyncio.Queue[list[str]]] = {}
         # thread_id -> (noted_at_monotonic, reason) — see note_closed (#536)
         self._closed: dict[int, tuple[float, str]] = {}
+        # thread_id -> may a typed sentence be delivered as this menu's answer?
+        # (#536 AC7) False for plan-approval menus, which have no free-text row.
+        self._free_text: dict[int, bool] = {}
 
-    def register(self, thread_id: int) -> asyncio.Queue[list[str]] | None:
+    def register(
+        self, thread_id: int, *, allow_free_text: bool = False
+    ) -> asyncio.Queue[list[str]] | None:
         """Claim the menu for *thread_id* and return its Queue, or None (#535).
+
+        *allow_free_text* says whether the claimed menu can accept a typed
+        sentence as its answer (#536 AC7).  Only the bridge knows: an
+        AskUserQuestion has a ``Type something.`` row, a plan-approval menu does
+        not, and typing into the latter mis-sends keystrokes.  It defaults to
+        False so a caller that has not thought about it cannot opt a menu in by
+        accident.
 
         Registration **is** the ownership acquisition: the first caller gets a
         Queue, every later caller gets ``None`` ("already owned") until the
@@ -70,6 +82,7 @@ class AskAnswerBus:
             return None
         q: asyncio.Queue[list[str]] = asyncio.Queue()
         self._waiters[thread_id] = q
+        self._free_text[thread_id] = allow_free_text
         logger.debug("AskAnswerBus: registered waiter for thread %d", thread_id)
         return q
 
@@ -96,9 +109,19 @@ class AskAnswerBus:
         logger.debug("AskAnswerBus: no waiter for thread %d (bot restarted?)", thread_id)
         return False
 
+    def accepts_free_text(self, thread_id: int) -> bool:
+        """True if a typed sentence may be delivered as this menu's answer (#536).
+
+        False when no menu is open, and False for a menu whose TUI has no
+        free-text row (plan approval) — there the sentence must stay a new
+        instruction rather than becoming stray keystrokes.
+        """
+        return bool(self._free_text.get(thread_id, False)) and thread_id in self._waiters
+
     def unregister(self, thread_id: int) -> None:
         """Remove the waiter for *thread_id* (called after answer or timeout)."""
         self._waiters.pop(thread_id, None)
+        self._free_text.pop(thread_id, None)
         logger.debug("AskAnswerBus: unregistered waiter for thread %d", thread_id)
 
     def note_closed(self, thread_id: int, reason: str) -> None:
