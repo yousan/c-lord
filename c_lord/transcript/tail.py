@@ -25,6 +25,25 @@ from typing import Any
 
 from .resolver import latest_session_jsonl
 
+# Read the seeding baseline in bounded slices instead of one ``read(offset)``:
+# a production transcript reaches ~100 MB and the seeding of every session now
+# runs concurrently in worker threads (Issue #537), so slurping whole files
+# would spike memory by the sum of every active transcript.
+_SEED_CHUNK_BYTES = 1 << 20
+
+
+def _record_uuid(line: bytes, seen: set[str]) -> None:
+    """Add the ``uuid`` of one raw JSONL line to ``seen``, if it has one."""
+    if not line.strip():
+        return
+    try:
+        event = json.loads(line.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return
+    uid = event.get("uuid")
+    if isinstance(uid, str) and uid:
+        seen.add(uid)
+
 
 def _seed_seen_uuids(path: Path, upto_offset: int, seen: set[str]) -> None:
     """Record the uuids of events in ``path[:upto_offset]`` into ``seen``.
@@ -34,22 +53,26 @@ def _seed_seen_uuids(path: Path, upto_offset: int, seen: set[str]) -> None:
     and are never re-emitted on a later offset-0 reset.  A partial trailing line
     (offset cutting mid-line) fails to parse and is ignored — it is read afresh
     by the follow loop from ``upto_offset``.
+
+    Blocking: parses every pre-existing line.  Callers on the event loop must
+    hand it to a worker thread (Issue #537) — :func:`tail_events` does.
     """
+    remaining = upto_offset
+    buffer = b""
     try:
         with path.open("rb") as f:
-            data = f.read(upto_offset)
+            while remaining > 0:
+                chunk = f.read(min(_SEED_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                lines = (buffer + chunk).split(b"\n")
+                buffer = lines[-1]  # last piece may be a partial line
+                for line in lines[:-1]:
+                    _record_uuid(line, seen)
     except OSError:
         return
-    for line in data.decode("utf-8", errors="replace").split("\n"):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        uid = event.get("uuid")
-        if isinstance(uid, str) and uid:
-            seen.add(uid)
+    _record_uuid(buffer, seen)
 
 
 async def tail_events(
@@ -90,7 +113,11 @@ async def tail_events(
     # uuid-less records that happen to serialise identically).
     seen_uuids: set[str] = set()
     if initial_path is not None and not from_start:
-        _seed_seen_uuids(initial_path, initial_offset, seen_uuids)
+        # Issue #537: a transcript can be ~100 MB, and every mirror seeds one at
+        # bot startup. Parsing that on the event loop stalled the Discord
+        # gateway heartbeat long enough to force a reconnect, during which every
+        # message the user sent was dropped by Discord and never redelivered.
+        await asyncio.to_thread(_seed_seen_uuids, initial_path, initial_offset, seen_uuids)
 
     current_path: Path | None = None
     offset = 0
