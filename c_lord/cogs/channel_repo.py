@@ -27,6 +27,7 @@ from discord.ext import commands
 
 if TYPE_CHECKING:
     from ..database.channel_repo import ChannelRepository
+    from ..database.repository import SessionRepository
     from ..database.thread_repo import ThreadRepository
 
 from ..database.channel_repo import (
@@ -35,6 +36,8 @@ from ..database.channel_repo import (
     validate_repo_url,
 )
 from ..session_dir import SessionDirManager
+from ..session_resume import NOT_A_CLORD_THREAD_BINDING, classify, is_clord_thread
+from ..thread_origin import inspect_origin
 from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
@@ -55,10 +58,16 @@ class ChannelRepoCog(commands.Cog):
         allowed_user_ids: set[int] | None = None,
         session_dir_base: str | None = None,
         allowed_role_name: str | None = None,
+        session_repo: SessionRepository | None = None,
     ) -> None:
         self.bot = bot
         self._repo = repo
         self._thread_repo = thread_repo
+        # #551: ``/clord-thread-init repo:`` binds only threads that are already
+        # c-lord's, which is a question about the ``sessions`` table. Defaulting
+        # to ``bot.session_repo`` keeps that true for consumers that never pass
+        # it — a gate nobody wires up is a gate nobody has.
+        self._session_repo = session_repo
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         self._session_dir_base = session_dir_base
@@ -130,6 +139,44 @@ class ChannelRepoCog(commands.Cog):
         except Exception:
             logger.warning("has_thread_binding failed for thread=%s", thread_id, exc_info=True)
             return False
+
+    async def is_clord_thread(self, thread_id: int, thread: object = None) -> bool:
+        """Whether ``thread_id`` is one of c-lord's own threads — #551 AC2.
+
+        Deliberately the *wide* test, not "does it have a session row": #554
+        deletes that row after 30 days, and a c-lord thread that merely went
+        quiet for a month is still c-lord's. Gating on the row alone would refuse
+        to rebind exactly the threads most likely to need it. So a live row
+        counts, and so does any trace :mod:`c_lord.thread_origin` finds — the same
+        evidence #556 uses, one spelling shared rather than two that drift.
+
+        With no session repository reachable at all the answer is **False**: an
+        instance that cannot tell whose thread this is must not hand it over.
+        """
+        repo = self._session_repo or getattr(self.bot, "session_repo", None)
+        if repo is None:
+            logger.warning("/clord-thread-init: no session repository — refusing (#551)")
+            return False
+        if is_clord_thread(classify(await repo.get(thread_id))):
+            return True
+        base = None
+        with contextlib.suppress(Exception):
+            channel_id = getattr(thread, "parent_id", None)
+            if channel_id is not None:
+                manager = await self.resolve_manager(channel_id, thread_id=thread_id)
+                base = getattr(manager, "base_dir", None)
+        bot_user = getattr(self.bot, "user", None)
+        binding = False
+        if self._thread_repo is not None:
+            with contextlib.suppress(Exception):
+                binding = await self._thread_repo.get(thread_id) is not None
+        return inspect_origin(
+            thread_owner_id=getattr(thread, "owner_id", None),
+            bot_user_id=getattr(bot_user, "id", None),
+            session_dir_base=base,
+            thread_id=thread_id,
+            has_binding=binding,
+        ).is_clords
 
     async def resolve_tmux_manager(
         self, channel_id: int, thread_id: int | None = None
@@ -414,6 +461,20 @@ class ChannelRepoCog(commands.Cog):
 
         assert thread_id is not None
         channel_id = channel.parent_id if isinstance(channel, discord.Thread) else thread_id
+
+        # --- #551 AC2: only c-lord's own threads can be bound to a repo ---
+        # Binding a human conversation thread was step one of the takeover this
+        # closes: bind the thread, then /clord in it, and every message in what
+        # had been a human conversation went to Claude. Only the *bind* path is
+        # gated — ``remove`` and the no-arg display can never turn a thread into
+        # a session, and blocking them would strand a stale binding on a thread
+        # that lost its row with no way to clear it.
+        if repo is not None and not remove and not await self.is_clord_thread(thread_id, channel):
+            logger.info(
+                "/clord-thread-init refused — thread=%s is not a c-lord thread (#551)", thread_id
+            )
+            await respond(NOT_A_CLORD_THREAD_BINDING, ephemeral=True)
+            return
 
         # --- Remove binding ---
         if remove:

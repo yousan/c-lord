@@ -232,6 +232,11 @@ class TestClordPassesTheInvoker:
         cog._resolve_tmux_manager = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
         cog._run_claude = AsyncMock()  # type: ignore[method-assign]
         cog._is_allowed = MagicMock(return_value=True)  # type: ignore[method-assign]
+        # #551: only c-lord's own threads continue, so give this one a row.
+        record = MagicMock()
+        record.closed_at = None
+        record.session_id = "sess-abc"
+        cog.repo.get = AsyncMock(return_value=record)
         thread = MagicMock(spec=discord.Thread)
         thread.id = 601
         thread.parent_id = 500

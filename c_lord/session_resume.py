@@ -35,12 +35,15 @@ if TYPE_CHECKING:
     from .database.repository import SessionRecord, SessionRepository
 
 __all__ = [
+    "NOT_A_CLORD_THREAD",
+    "NOT_A_CLORD_THREAD_BINDING",
     "UNTRACKED_NOTICE",
     "UNTRACKED_REACTION",
     "ThreadResume",
     "accepts_message",
     "classify",
     "hint_for_thread",
+    "is_clord_thread",
     "stopped_hint",
 ]
 
@@ -65,6 +68,21 @@ def classify(record: SessionRecord | None) -> ThreadResume:
     return ThreadResume.CLOSED if is_closed(record) else ThreadResume.RESUMES
 
 
+def is_clord_thread(verdict: ThreadResume) -> bool:
+    """True when this thread currently *has* a session — #551 branch 1.
+
+    Note this is the same rule as :func:`accepts_message`, deliberately: what
+    ``/clord`` will continue and what a plain message will continue have to be the
+    same set of threads, or one is a way around the other.
+
+    It is **not** the whole of "is this ours" — a thread whose row the 30-day
+    sweep took is still c-lord's, and :mod:`c_lord.thread_origin` is what answers
+    that. Keeping the two separate is the point: one asks "is there a session to
+    continue", the other "was there ever one".
+    """
+    return verdict is not ThreadResume.UNTRACKED
+
+
 def accepts_message(verdict: ThreadResume) -> bool:
     """True when ``on_message`` acts on a plain message with this verdict.
 
@@ -72,16 +90,23 @@ def accepts_message(verdict: ThreadResume) -> bool:
     (held, with a reopen button) rather than dropped — which is the distinction
     that matters to the person who sent it.
     """
-    return verdict is not ThreadResume.UNTRACKED
+    return is_clord_thread(verdict)
 
 
 #: What to do when a thread has no session record. Shared by the notice posted to
 #: the thread and by the hint the slash commands show, so both name the same way out.
+#:
+#: #551 AC9 rewrote this. #545 said 「このスレッドで新しく始める → `/clord`」, which
+#: was true when written and is a refusal now — #551 stops ``/clord`` from turning a
+#: thread into a session. Leaving it would have c-lord instructing people to run the
+#: command it rejects, which is #538's failure (a promise and a check that disagree)
+#: reappearing one layer up. c-lord threads are only ever born in a channel, so that
+#: is where it points.
 _NEXT_STEPS = (
     "続けるには:\n"
-    "・このスレッドで新しく始める → `/clord <やること>`（前の会話は引き継ぎません）\n"
-    "・「リポジトリが紐づけられていません」と言われたら → "
-    "`/clord-thread-init repo:<URL>` の後にもう一度 `/clord`"
+    "・新しく始める → **チャンネルで** `/clord prompt:<やること>`"
+    "（新しいスレッドが立ちます。前の会話は引き継ぎません）\n"
+    "・別のリポジトリで始める → **チャンネルで** `/clord repo:<URL> prompt:<やること>`"
 )
 
 #: Posted to the thread when a message arrives with no session record (#538).
@@ -96,6 +121,30 @@ UNTRACKED_NOTICE = (
 #: per process (it is a wall of text); the reaction is what keeps the 2nd, 3rd, …
 #: message from looking silently ignored again.
 UNTRACKED_REACTION = "⚠️"
+
+#: ``/clord`` (and ``!clord``) refusing a thread that was never c-lord's — #551.
+#: Before this the command took the thread over instead: it cloned a session dir,
+#: opened a tmux window and wrote the ``sessions`` row, after which every message
+#: in what had been a human conversation went to Claude.
+#:
+#: Reached only when :mod:`c_lord.thread_origin` finds no trace of c-lord at all.
+#: A thread that merely lost its row to the 30-day sweep is offered a reconnect
+#: (#538) instead — refusing those would strand them, which is what the first cut
+#: of #551 got wrong.
+NOT_A_CLORD_THREAD = (
+    "⚠️ このスレッドは c-lord のスレッドではないため、ここでセッションを開始できません。\n"
+    + _NEXT_STEPS
+)
+
+#: ``/clord-thread-init`` refusing the same thread — #551 AC2. Binding a repo to a
+#: human thread was step one of the same takeover, so it is refused on the same
+#: test; the middle line says what the command *is* for, so the reader is not left
+#: thinking it is broken.
+NOT_A_CLORD_THREAD_BINDING = (
+    "⚠️ このスレッドは c-lord のスレッドではないため、リポジトリを紐づけられません。\n"
+    "`/clord-thread-init` は、**すでにある c-lord スレッド**のリポジトリを変えるための"
+    "コマンドです。\n" + _NEXT_STEPS
+)
 
 _HINTS = {
     ThreadResume.RESUMES: (

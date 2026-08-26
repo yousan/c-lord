@@ -1328,8 +1328,15 @@ class TestStartSessionCommand:
         assert kwargs["prompt"] == "continue this"
 
     @pytest.mark.asyncio
-    async def test_thread_execution_no_existing_session(self) -> None:
-        """Running /claude in a thread with no DB record passes session_id=None."""
+    async def test_thread_with_no_trace_of_clord_is_refused(self) -> None:
+        """#551: a thread with no session row *and* no sign it was ever c-lord's
+        is not ours, so /clord refuses instead of taking it over.
+
+        This used to run with ``session_id=None`` — which is how an ordinary
+        human conversation thread became a Claude session, after which every
+        message in it went to Claude. (A thread that merely lost its row to the
+        30-day sweep takes the other branch and is offered a reconnect.)
+        """
         cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
         cog = _make_cog(channel_cog=cc)
         interaction = MagicMock(spec=discord.Interaction)
@@ -1345,13 +1352,19 @@ class TestStartSessionCommand:
         interaction.followup = MagicMock()
         interaction.followup.send = AsyncMock()
 
+        # The refusal lands before the defer, so it comes back through
+        # ``interaction.response`` rather than a followup.
+        interaction.response.send_message = AsyncMock()
         cog.repo.get = AsyncMock(return_value=None)
         cog._run_claude = AsyncMock()
+        cog._was_ever_our_thread = AsyncMock(return_value=False)
 
         await cog.start_session.callback(cog, interaction, prompt="start fresh")
 
-        _, kwargs = cog._run_claude.call_args
-        assert kwargs["session_id"] is None
+        cog._run_claude.assert_not_called()
+        thread.send.assert_not_called()
+        said = str(interaction.response.send_message.call_args.args[0])
+        assert "c-lord のスレッドではない" in said, said
 
     @pytest.mark.asyncio
     async def test_any_channel_allowed(self) -> None:
