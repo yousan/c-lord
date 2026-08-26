@@ -1533,6 +1533,14 @@ class TmuxSessionManager:
             logger.warning("start_claude: no window for thread %d", thread_id)
             return False
 
+        # #544: the Claude we are about to start may not have the editor mode
+        # the previous one in this window had (a recycled window, or changed
+        # settings), so forget what was learned about it.  Observed on staging:
+        # a window probed as vim-less was reused by a vim-mode Claude, and the
+        # stale verdict meant no ``i`` was pressed — the message ran as vim
+        # commands and left the pane in ``-- VISUAL LINE --``.
+        self._vim_mode.pop(window, None)
+
         target = f"{self.session_name}:{window}"
         cmd_parts = ["env", "-u", "CLAUDECODE", "claude"]
         if try_continue:

@@ -31,7 +31,7 @@ from c_lord.tmux import TmuxSessionManager
 
 _FIX = Path(__file__).parent / "fixtures" / "panes"
 
-VIM_OFF = (_FIX / "vim_disabled_input_idle.txt").read_text()
+VIM_OFF = (_FIX / "vim_disabled_staging_pane.txt").read_text()
 VIM_ON_INSERT = (_FIX / "vim_enabled_insert.txt").read_text()
 VIM_ON_NORMAL = (_FIX / "vim_enabled_normal.txt").read_text()
 # A build that renders the explicit marker: unambiguous vim-but-not-INSERT.
@@ -195,3 +195,34 @@ def test_pane_without_status_bar_is_untouched() -> None:
 
     assert not pane.i_presses and not pane.backspaces
     assert pane.text_index is not None
+
+
+# --------------------------------------------------------------------------
+# A restarted Claude may have a different editor mode than the last one
+# --------------------------------------------------------------------------
+
+
+def test_starting_claude_forgets_the_windows_vim_verdict() -> None:
+    """A fresh Claude in the same window must be re-detected, not assumed.
+
+    Caught on staging: window ``w1`` was probed as vim-less, then the window was
+    recycled and Claude restarted with ``editorMode: vim``.  The stale "vim off"
+    verdict meant no ``i`` was pressed, so the message ran as vim commands and
+    put the pane into ``-- VISUAL LINE --`` instead of being typed (#544/#147).
+
+    Starting Claude is the moment a pane's editor mode can change, so the
+    remembered verdict has to be dropped there.
+    """
+    mgr = _mgr()
+    _send(_Pane(VIM_OFF), mgr)
+    assert mgr._vim_mode.get("w1") is False, "precondition: the window was learned as vim-less"
+
+    with patch("c_lord.tmux._run", return_value=MagicMock(returncode=0, stdout="")):
+        mgr.start_claude(12345, "hello")
+    assert "w1" not in mgr._vim_mode, "start_claude must forget the old editor-mode verdict"
+
+    # …and the next send re-detects, so a now-vim pane in NORMAL is corrected.
+    pane = _Pane(VIM_ON_NORMAL, VIM_ON_INSERT)
+    _send(pane, mgr)
+    assert len(pane.i_presses) == 1, "the restarted vim pane must be corrected again"
+    assert not pane.backspaces

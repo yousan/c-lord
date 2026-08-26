@@ -1528,8 +1528,11 @@ class TestPaneInsertModeDetection:
 class TestPaneInsertModeRealCaptures:
     """#544 AC5: the same three states, as real ``capture-pane`` snapshots.
 
-    Captured from Claude Code v2.1.246 running under tmux — vim disabled via
-    ``editorMode: "normal"``, vim enabled from the user's own settings.
+    ``vim_disabled_staging_pane.txt`` is the #544 bug fixture: a real staging-1
+    pane (Claude Code v2.1.246) whose session dir set ``editorMode: "normal"``.
+    Before the fix, ``_pane_in_insert_mode`` answered ``False`` on it and
+    send_input typed an ``i`` in front of the message. The vim-enabled captures
+    come from the same Claude build with vim mode left on.
     """
 
     def _load(self, name: str) -> str:
@@ -1537,7 +1540,7 @@ class TestPaneInsertModeRealCaptures:
 
     def test_real_vim_disabled_pane_is_undecidable(self) -> None:
         """The bug fixture: a real vim-less pane must never read as NORMAL."""
-        assert _pane_in_insert_mode(self._load("vim_disabled_input_idle.txt")) is None
+        assert _pane_in_insert_mode(self._load("vim_disabled_staging_pane.txt")) is None
 
     def test_real_vim_enabled_insert_pane(self) -> None:
         assert _pane_in_insert_mode(self._load("vim_enabled_insert.txt")) is True
@@ -1552,7 +1555,7 @@ class TestPaneInsertModeRealCaptures:
 
     def test_vim_off_and_vim_normal_status_bars_are_identical(self) -> None:
         """Documents the root cause of #544 with the real captures."""
-        off = self._load("vim_disabled_input_idle.txt").splitlines()[-1]
+        off = self._load("vim_disabled_staging_pane.txt").splitlines()[-1]
         normal = self._load("vim_enabled_normal.txt").splitlines()[-1]
         assert off == normal
 
