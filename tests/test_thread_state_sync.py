@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1321,3 +1322,88 @@ async def test_watchdog_bridges_when_foreground_command_is_unknown():
         assert task is not None
         await task
     bridge.assert_awaited_once()
+
+
+# ----------------------------------------------------------------------
+# #579: a menu the bridge cannot post must not become an infinite retry.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_logs_a_failed_bridge_instead_of_swallowing_it(caplog):
+    """AC4: the failure has to be readable.
+
+    The bridge runs as a bare ``create_task`` nobody awaits, so a raise surfaced
+    only as asyncio's ``Task exception was never retrieved`` — which is why 116
+    failed posts in one day went unnoticed.
+    """
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    boom = AsyncMock(side_effect=RuntimeError("400 Bad Request: label required"))
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=boom),
+        caplog.at_level(logging.WARNING, logger="c_lord.thread_state_sync"),
+    ):
+        await loop._maybe_bridge_open_menu(579_101, "sess", "w1", pane)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(579_101)
+        assert task is not None
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert any("400 Bad Request" in r.getMessage() or "bridge failed" in r.getMessage()
+               for r in caplog.records), caplog.text
+
+
+@pytest.mark.asyncio
+async def test_watchdog_gives_up_after_repeated_failures_and_says_so():
+    """AC5: stop retrying a menu that cannot be posted, and say so in the thread.
+
+    Without a cap the watchdog retried the same unpostable menu every sweep
+    forever: the post failed, so the menu stayed unbridged, so the condition
+    that triggers the sweep never cleared.
+    """
+    loop, bot, thread = _make_loop()
+    thread.send = AsyncMock()
+    pane = _fixture("ask_rich_descriptions.txt")
+    boom = AsyncMock(side_effect=RuntimeError("400 Bad Request: label required"))
+
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=boom),
+    ):
+        for _ in range(thread_state_sync._ASK_BRIDGE_MAX_FAILURES + 3):
+            await loop._maybe_bridge_open_menu(579_102, "sess", "w1", pane)
+            await asyncio.sleep(0)
+            task = loop._ask_bridges.get(579_102)
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+                loop._ask_bridges.pop(579_102, None)
+
+    assert boom.await_count == thread_state_sync._ASK_BRIDGE_MAX_FAILURES, (
+        f"retried {boom.await_count} times — the cap did not hold"
+    )
+    sent = " ".join(str(c.args) + str(c.kwargs) for c in thread.send.await_args_list)
+    assert "選択肢" in sent, f"gave up silently: {thread.send.await_args_list}"
+
+
+@pytest.mark.asyncio
+async def test_a_successful_bridge_clears_the_failure_count():
+    """A menu that posts fine must not inherit an earlier menu's failures."""
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_rich_descriptions.txt")
+    boom = AsyncMock(side_effect=RuntimeError("nope"))
+    ok = AsyncMock()
+
+    with patch.object(thread_state_sync, "_capture_pane_text", return_value=pane):
+        with patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=boom):
+            await loop._maybe_bridge_open_menu(579_103, "sess", "w1", pane)
+            await asyncio.sleep(0)
+            await asyncio.gather(loop._ask_bridges.pop(579_103), return_exceptions=True)
+        with patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=ok):
+            await loop._maybe_bridge_open_menu(579_103, "sess", "w1", pane)
+            await asyncio.sleep(0)
+            await asyncio.gather(loop._ask_bridges.pop(579_103), return_exceptions=True)
+
+    assert loop._ask_bridge_failures.get(579_103, 0) == 0

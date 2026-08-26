@@ -2677,6 +2677,70 @@ class TestParseAskFromPane:
         descriptions = [o.description for o in q.options]
         assert descriptions == ["本番", "検証", "ローカル"]
 
+    def test_wrapped_option_never_yields_an_empty_label(self) -> None:
+        """#579: a real production pane whose option text wrapped to the next line.
+
+        Captured live from ``qiita-article:w1`` while the bug was firing. The TUI
+        drew the menu as a two-column table with a preview pane on the right, and
+        option 2's text did not fit beside it:
+
+            ❯ 1. 具体的な場面から入る（推     ┌──────────────
+                奨）                          │ …
+              2.                              │
+                欠けているものを先に並べる    │ …
+              3. チーム共有を主役にする       │ …
+
+        The parser read ``2.`` as an option with an EMPTY label, ``AskView`` made
+        a ``discord.ui.Button(label="")`` from it, and Discord rejected the whole
+        message with 400 ``In components.0.components.1.label: This field is
+        required``. The menu therefore never reached Discord, the watchdog saw it
+        still unbridged, and retried every 30–60s — 116 times in one day.
+        """
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        labels = [o.label for o in q.options]
+        assert all(labels), f"an empty label reaches Discord as a 400: {labels!r}"
+
+    def test_wrapped_option_recovers_the_text_from_the_next_line(self) -> None:
+        """#579 AC2: the wrapped text IS the label — read it, do not drop it.
+
+        Dropping the option instead would be worse than an empty label: the TUI
+        still has it, and the answer is delivered as ``Down × index``, so a
+        shorter list would select the wrong option.
+        """
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        labels = [o.label for o in q.options]
+        assert len(labels) == 4, labels  # the TUI has 4 real options
+        assert labels[1] == "欠けているものを先に並べる", labels
+        assert "│" not in "".join(labels), f"preview-pane box leaked into a label: {labels!r}"
+
+    def test_wrapped_option_label_keeps_its_tail(self) -> None:
+        """#579 AC2: a label wrapped mid-word must not be delivered cut in half."""
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.options[0].label == "具体的な場面から入る（推奨）", q.options[0]
+
+    def test_descriptions_are_not_swallowed_into_labels(self) -> None:
+        """#579: the wrap recovery must not eat ordinary indented descriptions."""
+        pane = _load_fixture("ask_rich_descriptions.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert [o.label for o in q.options] == [
+            "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+        ]
+        assert all(o.description for o in q.options), q.options
+
+    def test_meta_row_is_not_read_as_a_description(self) -> None:
+        """#579: 'Chat about this' is a TUI affordance, not the last option's text."""
+        pane = _load_fixture("ask_wrapped_option_empty_label.txt")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert all("Chat about this" not in o.description for o in q.options), q.options
+
     def test_plan_approval_is_not_ask(self) -> None:
         """A Plan-approval menu is NOT an AskUserQuestion → returns None."""
         pane = _load_fixture("plan_approval_menu.txt")

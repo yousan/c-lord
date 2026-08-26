@@ -26,6 +26,11 @@ from c_lord.discord_ui.ask_bus import AskAnswerBus
 from c_lord.discord_ui.ask_view import AskView
 
 
+def _utcnow() -> dt.datetime:
+    """Now, timezone-aware. ``dt.UTC`` is 3.11+ and this project supports 3.10."""
+    return dt.datetime.now(dt.timezone.utc)  # noqa: UP017
+
+
 def _question(header: str = "方針") -> AskQuestion:
     return AskQuestion(
         question="どの案にしますか?",
@@ -41,7 +46,7 @@ def _interaction(created_at: dt.datetime | None = None) -> MagicMock:
     interaction.response.send_message = AsyncMock()
     interaction.message = MagicMock()
     interaction.message.id = 777
-    interaction.message.created_at = created_at or dt.datetime.now(dt.timezone.utc)
+    interaction.message.created_at = created_at or _utcnow()
     return interaction
 
 
@@ -128,13 +133,11 @@ class TestUndeliveredAnswer:
         monkeypatch.setattr(
             ask_view_mod,
             "_PROCESS_STARTED_AT",
-            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5),
+            _utcnow() - dt.timedelta(minutes=5),
         )
         bus = AskAnswerBus()  # a fresh process knows nothing about this thread
         view = AskView(_question(), thread_id=536_0005, q_idx=0, bus=bus)
-        interaction = _interaction(
-            created_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
-        )
+        interaction = _interaction(created_at=_utcnow() - dt.timedelta(hours=2))
 
         await view._deliver(interaction, ["A案"])
 
@@ -237,3 +240,61 @@ class TestMultiSelectPending:
         assert not content.startswith("-#"), f"pending state still whispers: {content!r}"
         assert "確定" in content
         assert "A" in content and "C" in content
+
+
+class TestEmptyLabelGuard:
+    """#579 AC3: a label the parser could not read must never reach Discord.
+
+    Discord rejects a button with an empty label — 400 ``In
+    components.0.components.1.label: This field is required`` — and rejects the
+    WHOLE message, so one unreadable option silences the entire menu. The parser
+    fix removes the known cause; this is the backstop for the next rendering
+    nobody has seen yet.
+    """
+
+    def _labels(self, question: AskQuestion) -> list[str]:
+        view = AskView(question, thread_id=579_001, q_idx=0, bus=AskAnswerBus())
+        out = []
+        for child in view.children:
+            label = getattr(child, "label", None)
+            if label is not None:
+                out.append(label)
+            for opt in getattr(child, "options", []) or []:
+                out.append(opt.label)
+        return out
+
+    @pytest.mark.asyncio
+    async def test_no_button_is_built_with_an_empty_label(self) -> None:
+        q = AskQuestion(
+            question="どれ?",
+            header="h",
+            options=[AskOption("A案", "one"), AskOption("", "wrapped away"), AskOption("C案", "")],
+        )
+        assert all(self._labels(q)), self._labels(q)
+
+    @pytest.mark.asyncio
+    async def test_the_unreadable_option_still_occupies_its_slot(self) -> None:
+        """Answers are delivered as ``Down × index`` — dropping an option would
+        shift every option after it and select the wrong one."""
+        q = AskQuestion(
+            question="どれ?",
+            header="h",
+            options=[AskOption("A案", ""), AskOption("", ""), AskOption("C案", "")],
+        )
+        labels = [
+            child.label
+            for child in AskView(q, thread_id=579_002, q_idx=0, bus=AskAnswerBus()).children
+            if getattr(child, "custom_id", "").rsplit("_", 1)[-1].isdigit()
+        ]
+        assert len(labels) == 3, labels
+        assert labels[0] == "A案" and labels[2] == "C案", labels
+
+    @pytest.mark.asyncio
+    async def test_select_menu_options_are_never_empty(self) -> None:
+        """≥5 options render as a Select, whose option labels have the same rule."""
+        q = AskQuestion(
+            question="どれ?",
+            header="h",
+            options=[AskOption(f"opt{i}", "") for i in range(4)] + [AskOption("", "")],
+        )
+        assert all(self._labels(q)), self._labels(q)
