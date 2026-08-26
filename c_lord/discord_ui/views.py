@@ -164,3 +164,61 @@ class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui
 
         await self._on_reopen(interaction)
         self.stop()
+
+
+class TextAnsweredMenuView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+    """The undo for "your sentence was used as the menu's answer" (#536 AC7).
+
+    A sentence typed while a menu is open is delivered as that menu's answer
+    rather than interrupting the turn — because typing is what users do when the
+    buttons feel unresponsive, and dropping the question they were answering is
+    the worse failure.  When the guess is wrong, this button turns the sentence
+    back into a new instruction: exactly the old behaviour, one click away.
+
+    ``on_rerun`` re-dispatches the original message as an instruction (it
+    pre-empts the running turn, as an ordinary reply does).  Injecting it keeps
+    this class free of cog imports.
+
+    ``timeout=None``: the notice can sit for a while before someone notices the
+    answer went to the wrong place, and a button that silently stopped working
+    would strand the only way back.
+    """
+
+    def __init__(
+        self,
+        on_rerun: Callable[[discord.Interaction], Awaitable[None]],
+        authorizer: Authorizer | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self._on_rerun = on_rerun
+        self._authorizer = authorizer
+        self._rerun = False
+
+    @discord.ui.button(
+        label="これは新しい指示でした",
+        emoji="⚡",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def rerun_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Re-run the message as a new instruction instead of a menu answer."""
+        # A double click would dispatch the instruction twice.
+        if self._rerun:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "⚡ すでに新しい指示として実行しています。", ephemeral=True
+                )
+            return
+        self._rerun = True
+
+        button.disabled = True
+        button.label = "新しい指示として実行しました"
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        if interaction.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+
+        await self._on_rerun(interaction)
+        self.stop()
