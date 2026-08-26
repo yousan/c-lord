@@ -61,10 +61,23 @@ STATUS_EMOJI: dict[str, str] = {
 
 _MAX_NAME_LEN = 30
 
-# #512: prefix marking a session the user closed on purpose (/close-workspace).
+# #512: prefix marking a workspace that was stopped on purpose.
 # Deliberately plain text rather than an emoji: it must stay legible where emoji
 # don't render, and it reads as a state word rather than as one more lamp colour.
-CLOSED_MARK = "[終了]"
+#
+# #574 renamed it from 「終了」. The operation is about to fire automatically
+# after 7 days, and 「終了」 says *it is over* while nothing is — the working
+# directory, the conversation and the DB volume all survive, and
+# ``/workspace-start`` brings it straight back. Telling someone their work
+# "ended" when they did not ask for anything is a false alarm; 「停止」 is simply
+# true.
+CLOSED_MARK = "[停止]"
+
+#: Marks written by earlier versions. Threads still carry them, so they must keep
+#: parsing — otherwise every one of them silently gains the old marker as part of
+#: its topic the next time it is renamed.
+LEGACY_CLOSED_MARKS = ("[終了]",)
+
 _CLOSED_PREFIX = f"{CLOSED_MARK} "
 
 # Matches an optional leading status emoji + space.
@@ -73,7 +86,11 @@ _LEADING_EMOJI_RE = re.compile(
     r"^(?:" + "|".join(re.escape(e) for e in dict.fromkeys(STATUS_EMOJI.values())) + r")\s*"
 )
 # Matches the leading "[終了] " closed marker (#512).
-_CLOSED_PREFIX_RE = re.compile(r"^" + re.escape(CLOSED_MARK) + r"\s*")
+_CLOSED_PREFIX_RE = re.compile(
+    r"^(?:"
+    + "|".join(re.escape(m) for m in (CLOSED_MARK, *LEGACY_CLOSED_MARKS))
+    + r")\s*"
+)
 # Matches a leading "W<digits> │ " prefix (new format).
 _WORK_PREFIX_RE = re.compile(r"^W\d+\s*[│]\s*")
 # Matches a trailing " #<digits>" suffix (legacy backward-compat).
