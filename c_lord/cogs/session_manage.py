@@ -1251,7 +1251,9 @@ class SessionManageCog(commands.Cog):
                 results.append("✅ Tmux window closed")
             else:
                 results.append("ℹ️ No tmux window found")
-            results.append("📂 セッションは保持しています（履歴・作業ディレクトリはそのまま）。")
+            results.append(
+                "📂 ワークスペースは保持しています（履歴・作業ディレクトリはそのまま）。"
+            )
         else:
             results.append(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
@@ -1325,7 +1327,7 @@ class SessionManageCog(commands.Cog):
 
         record = await self.repo.get(channel.id)
         if record is None:
-            await respond("ℹ️ このスレッドには c-lord のセッションがありません。")
+            await respond("ℹ️ このスレッドには c-lord のワークスペースがありません。")
             return
         if not is_closed(record):
             await respond("ℹ️ このスレッドは終了していません（そのままメッセージを送れます）。")
@@ -1343,7 +1345,7 @@ class SessionManageCog(commands.Cog):
         new_name = await apply_open_name(self.repo, channel)
 
         embed = discord.Embed(
-            title="▶️ セッションを再開しました",
+            title="▶️ このスレッドのワークスペースを再開しました",
             description=(
                 f"🏷️ スレッド名: `{new_name}`\n"
                 "💬 このスレッドにメッセージを送ると、これまでの会話の続きから再開します。"
