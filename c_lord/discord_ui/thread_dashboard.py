@@ -207,7 +207,9 @@ class ThreadStatusDashboard:
             await self._refresh_dashboard()
 
         # Send mention outside the lock to avoid holding it during an HTTP call
-        if should_mention and thread is not None:
+        # ``mention_id`` is non-None whenever ``should_mention`` is set, but that
+        # is established inside the lock above and does not narrow out here.
+        if should_mention and thread is not None and mention_id is not None:
             try:
                 # #495: the mention trails the text so the Discord push preview
                 # leads with "Claude has finished…" instead of "@you". A user
