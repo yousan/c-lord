@@ -222,6 +222,7 @@ async def setup_bridge(
         allowed_user_ids=allowed_user_ids,
         allowed_role_name=allowed_role_name,
         session_dir_base=session_dir_base,
+        session_repo=session_repo,
     )
     await bot.add_cog(channel_repo_cog)
     logger.info("Registered ChannelRepoCog")

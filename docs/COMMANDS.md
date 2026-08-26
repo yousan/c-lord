@@ -24,7 +24,7 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/clord <prompt>` | Start a new Claude Code session | Channel or thread |
+| `/clord <prompt>` | Start a new Claude Code session | Channel; in a thread, **c-lord's own only** |
 | `/clord repo:<url> <prompt>` | Start a session on a **specific** repository | Channel only |
 | `/stop` | Stop the active session (session is preserved for resume) | Thread only |
 | `/clear` | Reset the session — next message starts fresh | Thread only |
@@ -32,7 +32,23 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 | `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
 | `/clord-reattach` | Reconnect this thread to the Claude session still on disk (when its record was swept) | Thread only |
 
-**`/clord`** creates a new thread and sends your prompt to Claude Code. If used inside an existing thread, it continues the same session.
+**`/clord`** creates a new thread and sends your prompt to Claude Code. Inside a thread, what it does depends on whether that thread is c-lord's (#551):
+
+| The thread | `/clord` does |
+|---|---|
+| has a session | continues it, as before |
+| **was** c-lord's but lost its record (the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep)) | offers **🔗 再接続する** — reconnects to what is on disk, rather than starting over |
+| was never c-lord's | **refuses, and changes nothing** |
+
+```
+⚠️ このスレッドは c-lord のスレッドではないため、ここでセッションを開始できません。
+続けるには:
+・新しく始める → チャンネルで /clord prompt:<やること>
+```
+
+Before this, `/clord` checked only whether *a repository* was reachable from the thread — true of every thread under a bound channel, human conversations included — and then cloned a session dir, opened a tmux window and wrote the session record. From that point every message in that thread went to Claude, and only someone who knew `/close-workspace` could undo it.
+
+**There is deliberately no command that adopts an existing thread.** A c-lord thread is one c-lord created from a channel. To start work from an existing discussion, run `/clord` in the channel — it opens a fresh thread. Reconnecting (middle row) is not an exception to this: it only ever reattaches to a session dir that is already on disk, so a thread c-lord never touched has nothing for it to find.
 
 **`repo:` is optional** (#514). Leave it out and the thread uses the channel's `/clord-init` repository, as before. Give it and the new thread is cloned from *that* repository instead — no `/clord-init` needed, and no separate `/clord-thread-init` step:
 
@@ -66,10 +82,12 @@ Skills are predefined prompts stored in `~/.claude/skills/`. The `name` paramete
 | `/clord-init repo:<url>` | Bind this channel to a git repository | Any channel |
 | `/clord-init remove:True` | Remove the binding for this channel | Any channel |
 | `/clord-thread-init` | Show thread-level binding for this thread | Thread only |
-| `/clord-thread-init repo:<url>` | Bind this thread to a git repository (overrides channel binding) | Thread only |
+| `/clord-thread-init repo:<url>` | Change this thread's repository (overrides channel binding) | **c-lord threads only** |
 | `/clord-thread-init remove:True` | Remove the thread-level binding | Thread only |
 
 Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory. A thread-level binding set via `/clord-thread-init` takes precedence over the channel binding.
+
+`/clord-thread-init repo:<url>` **changes the repository of a thread that is already c-lord's** — it does not turn a thread into one (#551). Binding an ordinary conversation thread used to be step one of the takeover described under `/clord` above, so it is refused on the same test. To start on a different repository, use `/clord repo:<url> prompt:<...>` in the channel, which opens a new thread already bound to it. Showing the binding (no arguments) and `remove:True` still work anywhere — neither can turn a thread into a session.
 
 ### Model Management
 

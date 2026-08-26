@@ -12,6 +12,7 @@ from c_lord.database.channel_repo import (
     derive_session_name,
     normalize_repo_url,
 )
+from c_lord.database.repository import SessionRecord
 from c_lord.database.thread_repo import ThreadRepository
 
 # ---------------------------------------------------------------------------
@@ -33,10 +34,32 @@ async def thread_repo(tmp_path) -> ThreadRepository:
     return r
 
 
-def _make_bot() -> MagicMock:
+def _session_record() -> SessionRecord:
+    """A minimal open ``sessions`` row — enough to read as a c-lord thread."""
+    return SessionRecord(
+        thread_id=0,
+        session_id="sess-existing",
+        working_dir="/tmp/x",
+        model=None,
+        origin="discord",
+        summary=None,
+        created_at="2026-08-20 10:00:00",
+        last_used_at="2026-08-20 11:00:00",
+        closed_at=None,
+    )
+
+
+def _make_bot(*, clord_thread: bool = True) -> MagicMock:
     bot = MagicMock()
     bot.loop = MagicMock()
     bot.get_cog = MagicMock(return_value=None)
+    # #551 gates ``/clord-thread-init repo:`` on the thread being c-lord's.
+    # These tests are about URL handling and channel access, so the thread is
+    # one of c-lord's own unless a test says otherwise.
+    bot.session_repo = MagicMock()
+    bot.session_repo.get = AsyncMock(
+        return_value=_session_record() if clord_thread else None
+    )
     return bot
 
 

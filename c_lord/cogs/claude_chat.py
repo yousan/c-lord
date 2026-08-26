@@ -54,10 +54,12 @@ from ..session_reattach import (
     render_history,
 )
 from ..session_resume import (
+    NOT_A_CLORD_THREAD,
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
     accepts_message,
     classify,
+    is_clord_thread,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_origin import inspect_origin
@@ -834,6 +836,36 @@ class ClaudeChatCog(commands.Cog):
         )
         return origin.is_clords
 
+    async def _handle_clord_without_session(
+        self, thread: discord.Thread, parent_channel_id: int, respond: _Responder
+    ) -> None:
+        """``/clord`` in a thread with no ``sessions`` row — #551 branches 2 and 3.
+
+        No row means one of two very different things, and the first cut of #551
+        conflated them. #554 deletes the row after 30 days, so a month-quiet
+        c-lord thread looks exactly like a thread c-lord never touched — and
+        refusing both would have made ``W3 │ Qiita``, checkout and half-written
+        article intact, permanently unreachable.
+
+        :mod:`c_lord.thread_origin` tells them apart (the same test #556 uses, so
+        the two cannot drift):
+
+        * **was ours** → offer the reconnect (#538). Not a takeover: it reattaches
+          to what is already on disk, and starts no new session.
+        * **never ours** → refuse and change nothing, which is what #551 is for.
+        """
+        ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        if await self._was_ever_our_thread(thread, parent_channel_id):
+            logger.info("%s /clord: no session row, offering reconnect (#551/#538)", ctx)
+            await self._offer_recovery(thread, parent_channel_id)
+            await respond(
+                "ℹ️ このスレッドの記録が見つかりませんでした。スレッドに再接続の案内を出しました。",
+                ephemeral=True,
+            )
+            return
+        logger.info("%s /clord refused — never a c-lord thread (#551)", ctx)
+        await respond(NOT_A_CLORD_THREAD, ephemeral=True)
+
     async def _reattach_thread(self, thread: discord.Thread) -> Plan:
         """Reconnect ``thread`` to the Claude session it already has — #538 AC6.
 
@@ -991,6 +1023,21 @@ class ClaudeChatCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
+            # #551: everything above only established that *a repo* is reachable
+            # from here, which is true of every thread under a bound channel —
+            # human conversations included. Running on for one of those wrote the
+            # ``sessions`` row, and from that moment ``on_message`` sent every
+            # message in the thread to Claude. Nothing below this line is
+            # reversible from the thread, so the branch goes here: before the seed
+            # message, before ``_run_claude``'s clone.
+            #
+            # Ordering note: after the resolver check on purpose. A thread in
+            # another instance's unbound channel returns silently above, so a
+            # shared guild does not get one refusal per bystander bot (#522).
+            thread_record = await self.repo.get(channel.id)
+            if not is_clord_thread(classify(thread_record)):
+                await self._handle_clord_without_session(channel, parent_channel_id, respond)
+                return
         else:
             channel_id = (
                 channel.id
@@ -1016,9 +1063,9 @@ class ClaudeChatCog(commands.Cog):
         await ack()
 
         if isinstance(channel, discord.Thread):
-            # Continue in existing thread
-            record = await self.repo.get(channel.id)
-            session_id = (record.session_id or None) if record else None
+            # Continue in existing thread. The row was read by the #551 branch
+            # above, which only lets a thread through when it has one.
+            session_id = (thread_record.session_id or None) if thread_record else None
             try:
                 seed_message = await channel.send(prompt)
             except discord.Forbidden:
