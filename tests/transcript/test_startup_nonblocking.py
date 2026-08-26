@@ -159,29 +159,36 @@ async def test_seed_seen_uuids_runs_in_a_worker_thread(
 async def test_on_ready_does_not_block_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC4: with a large transcript to scan, ``on_ready`` must leave the loop
-    responsive.
+    """AC4: startup must leave the event loop responsive.
 
-    The bar the Issue states is "no continuous block of 1 s or more".  A
-    unit test cannot afford a fixture big enough to cost a full second of
-    parsing, so the assertion is calibrated against a *measured* baseline:
-    the same scan done synchronously.  If startup still does the work inline
-    the observed stall is ≈ that baseline; once it is off-loop the stall is
-    sub-tick.  Both the absolute 1 s bar and the relative one are asserted.
+    Both per-session scans are replaced by a blocking stub of *known* cost, so
+    the assertion measures **where** the work runs rather than how fast the
+    machine is: run inline, the stub stalls the loop for its full cost; handed
+    to a worker thread, it costs the loop nothing.  (A threshold calibrated
+    against real JSON parsing does hold on a dev box but is not reproducible on
+    a shared CI runner, where the loop and the worker contend for a core.)
+    The real functions are covered by the two tests above; the real cost is
+    covered by the staging run in the PR.
     """
     from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
 
     monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
-    _write_big_transcript(project)
+    _write_big_transcript(project, lines=10)
 
-    # Baseline: what the blocking scan actually costs on this machine.
-    started = time.perf_counter()
-    assert recovery_mod.last_completed_final_answer(project) is not None
-    sync_cost = time.perf_counter() - started
-    if sync_cost < 0.05:
-        pytest.skip(f"fixture too cheap to detect a stall (sync scan {sync_cost:.3f}s)")
+    # Costly enough to dwarf scheduler jitter, cheap enough for a unit test.
+    blocking_cost = 0.4
+
+    def blocking_scan(project_dir: Path):
+        time.sleep(blocking_cost)  # stands in for reading + parsing a transcript
+        return None
+
+    def blocking_seed(path: Path, upto_offset: int, seen: set[str]) -> None:
+        time.sleep(blocking_cost)
+
+    monkeypatch.setattr(recovery_mod, "last_completed_final_answer", blocking_scan)
+    monkeypatch.setattr(tail_mod, "_seed_seen_uuids", blocking_seed)
 
     row = MagicMock()
     row.thread_id = 11
@@ -206,14 +213,14 @@ async def test_on_ready_does_not_block_the_event_loop(
     try:
         await cog.on_ready()
         # Let the mirror's tail task reach its seeding step too — that is the
-        # second full-file parse and the one the journal caught red-handed.
-        await asyncio.sleep(0.4)
+        # second blocking scan, and the one the prod journal caught red-handed.
+        await asyncio.sleep(blocking_cost * 2)
     finally:
         await watchdog.stop()
         await cog.cog_unload()
 
     assert watchdog.max_gap < 1.0, f"loop blocked {watchdog.max_gap:.3f}s during startup"
-    assert watchdog.max_gap < sync_cost / 2, (
-        f"loop blocked {watchdog.max_gap:.3f}s during startup — "
-        f"comparable to the {sync_cost:.3f}s synchronous scan, so the scan is still inline"
+    assert watchdog.max_gap < blocking_cost / 4, (
+        f"loop blocked {watchdog.max_gap:.3f}s during startup — comparable to the "
+        f"{blocking_cost:.3f}s each scan costs, so a scan is still running inline"
     )
