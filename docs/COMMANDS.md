@@ -28,6 +28,7 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 | `/clear` | Reset the session — next message starts fresh | Thread only |
 | `/compact [instructions]` | Compact (summarize) the session context to free the window | Thread only |
 | `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
+| `/clord-reattach` | Reconnect this thread to the Claude session still on disk (when its record was swept) | Thread only |
 
 **`/clord`** creates a new thread and sends your prompt to Claude Code. If used inside an existing thread, it continues the same session.
 
@@ -141,7 +142,17 @@ If the thread's work session is **stopped** (no tmux window — e.g. after a bot
 
 - **The thread has a session record** → sending a message auto-restores it (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
 - **The session was closed** (`[終了]` / `/close-workspace`) → the message is held and a **▶️ 再開する** button is offered instead (#512).
-- **c-lord has no record of the thread** (record deleted, DB rebuilt, thread from another host) → a message cannot restore anything, so the hint says so and names the way forward (`/clord <task>`, or `/clord-thread-init repo:<URL>` first) rather than promising a resume that never comes. Messages sent to such a thread are answered — a ⚠️ reaction plus a one-time notice that the message did **not** reach Claude — never dropped in silence, which is what #538 fixed.
+- **c-lord has no record of the thread** (usually the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep); also a rebuilt DB, or a thread from another host) → the message did not run, and it is answered rather than dropped in silence: a ⚠️ reaction plus a one-time notice saying so. What the notice offers depends on **what is still on disk** (#538):
+
+| Still on disk | The notice offers |
+|---|---|
+| checkout + transcript | **🔗 再接続する** — reconnects, and the next message continues the real conversation |
+| checkout only (the common case) | **🔗 再接続する** — reconnects to the work; the thread's own history is written into the checkout so Claude can pick up where it left off |
+| neither | no button: says nothing is left to reconnect to, and points at `/clord` in the channel |
+
+  `/clord-reattach` does the same thing from a command, for when you already know what happened and would rather not send a message that will not run.
+
+  **Reattaching only ever reconnects.** It never clones, never creates a session dir, and refuses a thread with nothing on disk — so it cannot be used to turn an ordinary thread into a Claude session (the door #551 closes).
 
 The hint's wording and the rule that decides whether a message is accepted come from the same place, so they cannot drift apart again. See [specs/session-resume.md](specs/session-resume.md).
 
