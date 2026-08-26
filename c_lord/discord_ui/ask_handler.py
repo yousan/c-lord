@@ -199,11 +199,19 @@ async def _bridge_claimed_menu(
                 _bridged_context.register(thread.id, question.context, source="pane")
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)
+    embed = ask_embed(question.question, question.header, question.options, question.multi_select)
+    if not question.context:
+        # #549: with no readable 経緯 the menu looks like a question asked out of
+        # nowhere, and the prose then turns up AFTER the answer looking like a
+        # new statement. The pane is the only source while the menu is open (the
+        # CLI buffers the jsonl chunk until resolution — measured on staging:
+        # nothing of the turn is written for 90s, then all of it at once), so
+        # when the tall re-capture also comes up empty there is nothing to post
+        # first. Say that, rather than leaving the gap unexplained.
+        embed.set_footer(text="この質問の経緯は、回答後にまとめて届きます")
     msg = await thread.send(
         content=_mention(notify_user_id),
-        embed=ask_embed(
-            question.question, question.header, question.options, question.multi_select
-        ),
+        embed=embed,
         view=view,
     )
     # #536: while this menu is answerable it must be reachable, so that

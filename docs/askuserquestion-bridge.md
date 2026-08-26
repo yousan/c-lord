@@ -339,6 +339,33 @@ claims the menu: `ask_bus.register(thread_id, allow_free_text=question.allow_oth
 The flag defaults to False, so a caller that has not thought about it cannot opt
 a menu in by accident.
 
+## The prose is only readable from the pane (#549)
+
+Measured on staging (CLI 2.1.246, 2026-08-26): **while a menu is open, nothing
+of that turn exists in the jsonl.** Not the prose, not the `AskUserQuestion`
+`tool_use` — for 90 seconds of polling the file ended at the user's own message,
+and the whole chunk landed at once the moment the menu was answered (the prose
+carried a 04:01:46 timestamp but only became readable at ~04:05).
+
+So "read the transcript ahead of the menu and post the 経緯 first" is not an
+option: there is nothing to read. **While a menu is open, the pane is the only
+source of the prose**, which is why the pane path exists at all (#399) and why
+its ceiling matters so much (#468).
+
+**The watchdog had no ceiling at all.** `_maybe_bridge_open_menu` captured 120
+lines and parsed; when the prose was taller than the window it simply got
+`context=""`. The poll loop had recovered that since #468 by transiently growing
+the window — the watchdog never did. A menu bridged by the watchdog after a long
+report therefore reached Discord with no context, and the report showed up only
+after the answer, reading as a new statement. That is the whole of #549's
+"順序が入れ替わる" report. The watchdog now does the same tall re-capture, on the
+same condition (only when the first read came up empty, so an ordinary menu
+never pays the resize round-trip).
+
+**When even that comes up empty**, the menu says so in its footer —
+`この質問の経緯は、回答後にまとめて届きます`. The gap cannot be closed (see the
+measurement), so the next best thing is to stop it from reading as an omission.
+
 ## A menu only counts while claude is alive (#510)
 
 Pane text outlives the process that drew it. When claude exits — a crash, a
@@ -386,6 +413,7 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | Parse menu from pane | `c_lord/claude/tmux_runner.py::_parse_ask_from_pane` |
 | Extract pre-menu prose (#399) | `tmux_runner.py::_extract_pane_context` |
 | Recover long prose via transient tall capture (#468) | `c_lord/tmux.py::TmuxSessionManager.capture_pane_tall`, wired in `tmux_runner.py::run` (poll loop) |
+| Same recovery for the watchdog path (#549) | `thread_state_sync.py::_maybe_bridge_open_menu` |
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
 | Ignore menus in a pane whose claude has exited (#510) | `c_lord/tmux.py::pane_command_is_dead`, `TmuxSessionManager.pane_foreground_command`, `thread_state_sync.py::_maybe_bridge_open_menu`, `tmux_runner.py::peek_menu_state` |
 | Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |

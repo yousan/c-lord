@@ -975,6 +975,61 @@ async def test_watchdog_bridges_unwatched_menu():
 
 
 @pytest.mark.asyncio
+async def test_watchdog_recovers_long_prose_with_a_tall_recapture():
+    """#549: the watchdog must recover pre-menu prose that scrolled off.
+
+    Claude Code's alternate screen keeps no scrollback, so a normal capture only
+    returns the visible rows: when the 経緯 above the menu is long, it is simply
+    not there and the menu reaches Discord with ``context_chars=0``.  The poll
+    loop has recovered that since #468 by transiently growing the window
+    (Claude redraws on SIGWINCH) — the watchdog never did, so a menu bridged by
+    the watchdog lost its context, and the prose only showed up after the answer
+    (out of order). That is the reported #549 case.
+    """
+    loop, bot, thread = _make_loop()
+    short = _fixture("ask_rich_descriptions.txt")  # menu, no prose above it
+    tall = _fixture("ask_context_prose_above_menu.txt")  # same shape, with prose
+    bot.tmux_manager.capture_pane_tall = MagicMock(return_value=tall)
+
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=short),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(549_001, "sess", "w1", short)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(549_001)
+        assert task is not None
+        await task
+
+    bridge.assert_awaited_once()
+    question = bridge.await_args.args[1]
+    assert question.context, "the watchdog bridged a menu with no decision context"
+    bot.tmux_manager.capture_pane_tall.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_recapture_when_context_is_already_there():
+    """The resize round-trip is only paid when the first read came up empty."""
+    loop, bot, thread = _make_loop()
+    pane = _fixture("ask_context_prose_above_menu.txt")
+    bot.tmux_manager.capture_pane_tall = MagicMock(return_value=pane)
+
+    with (
+        patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+        patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge,
+    ):
+        await loop._maybe_bridge_open_menu(549_002, "sess", "w1", pane)
+        await asyncio.sleep(0)
+        task = loop._ask_bridges.get(549_002)
+        assert task is not None
+        await task
+
+    bridge.assert_awaited_once()
+    assert bridge.await_args.args[1].context
+    bot.tmux_manager.capture_pane_tall.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_watchdog_skips_while_turn_active():
     """While a run_claude turn is processing, its poll loop owns menus."""
     loop, bot, thread = _make_loop(is_processing=lambda _tid: True)
