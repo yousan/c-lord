@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,7 +41,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
-from ..discord_ui.views import ReopenSessionView, StopView
+from ..discord_ui.views import ReopenSessionView, StopView, TextAnsweredMenuView
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..session_resume import (
@@ -61,6 +62,12 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# Longest sentence still treated as an answer to an open menu (#536 AC7).
+# Matches AskModal's free-text limit: the two are the same affordance reached
+# two ways, and past this length the message reads as a new request rather than
+# a pick from a short menu.
+_MENU_TEXT_ANSWER_MAX = 500
 
 # Posts a reply the way the caller needs (interaction response vs ctx.send),
 # letting /stop, /clear and their !text twins share one implementation (#209).
@@ -1611,6 +1618,14 @@ class ClaudeChatCog(commands.Cog):
             await self._post_closed_notice(thread, message)
             return
 
+        # #536 AC7: if a menu is open, this sentence is almost certainly the
+        # ANSWER to it, not a new order — that is what a user types when the
+        # buttons feel unresponsive (yousan sent `y`). Route it into the menu
+        # instead of pre-empting the turn and throwing the question away.
+        # Checked before the lock: nothing below it is needed for an answer.
+        if await self._maybe_answer_open_menu(message, thread):
+            return
+
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             record = await self.repo.get(thread.id)
@@ -1629,6 +1644,10 @@ class ClaudeChatCog(commands.Cog):
             had_active = prev_task is not None and not prev_task.done()
             if prev_task is not None and had_active:
                 await self._preempt_prior_turn(thread, prev_task, prev_runner)
+                # #565: the interrupt succeeded — say so, so a thread that
+                # goes quiet after this can be told apart from one that
+                # never got here.
+                logger.info("%s preempted prior turn", log_ctx(thread_id=thread.id))
 
             # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
             # death) but a prior session's transcript is still on disk, resume it via
@@ -1675,6 +1694,11 @@ class ClaudeChatCog(commands.Cog):
             # held-across-run lock was the #315 deadlock.  Registering the task
             # here, under the lock, preserves the no-duplicate-run invariant: a
             # second reply that gets the lock sees this task and pre-empts it.
+            # #565: this dispatch is the boundary the silent-drop bug hid behind
+            # — everything before it had logged, and ``run_claude: enter`` is the
+            # next line that does. Log both sides so the gap can never be dark
+            # again (`grep "thread=<id>"` shows dispatch → enter as a pair).
+            logger.info("%s dispatching run_claude", log_ctx(thread_id=thread.id))
             task = asyncio.create_task(
                 self._run_claude(
                     message,
@@ -1685,7 +1709,100 @@ class ClaudeChatCog(commands.Cog):
                     try_continue=try_continue,
                 )
             )
+            # #565: ``_active_tasks`` keeps a strong reference to this task, so a
+            # turn that dies before anyone awaits it is never garbage-collected —
+            # and Python only reports "Task exception was never retrieved" at GC
+            # time. The exception would therefore be swallowed *forever*. Attach
+            # a callback that reports it instead.
+            task.add_done_callback(partial(self._report_turn_task_outcome, thread.id))
             self._active_tasks[thread.id] = task
+
+    @staticmethod
+    def _report_turn_task_outcome(thread_id: int, task: asyncio.Task) -> None:
+        """Surface a turn task that died without anyone awaiting it (#565).
+
+        A turn is dispatched with ``create_task`` and parked in ``_active_tasks``,
+        which keeps it referenced for the life of the thread entry. Python only
+        emits its "Task exception was never retrieved" warning when an un-awaited
+        task is *collected*, so that strong reference means an early crash in
+        ``_run_claude`` produces no log line anywhere — exactly the "message
+        accepted, then total silence" shape #565 was reported as.
+
+        Cancellation is normal here (that is how :meth:`_preempt_prior_turn`
+        tears a turn down), so only a real exception is worth a line.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "%s turn task died before completing: %s",
+                log_ctx(thread_id=thread_id),
+                exc,
+                exc_info=exc,
+            )
+
+    async def _maybe_answer_open_menu(
+        self, message: discord.Message, thread: discord.Thread
+    ) -> bool:
+        """Deliver *message*'s text as the open menu's answer (#536 AC7).
+
+        Returns True when the message was consumed as an answer, so the caller
+        must NOT run it as a new instruction.
+
+        Decision (recorded in issue #536): the sentence IS the answer. Before
+        this, typing while a menu was open silently discarded the question and
+        ran the text as a fresh instruction (``⚡ Interrupted``) — so an attempt
+        to answer looked, from the user's side, like nothing happening at all.
+        A wrong guess costs one button (:class:`TextAnsweredMenuView`); dropping
+        the question costs the whole exchange.
+
+        Four cases stay instructions, because as answers they are nonsense:
+        an empty body, a message carrying attachments, prose longer than the
+        ✏️ Other modal accepts (past that length it is a request, not a pick
+        from a three-option menu), and a menu with no free-text row (plan
+        approval — typing there would mis-send keystrokes).
+        """
+        from ..discord_ui.ask_bus import ask_bus
+        from ..discord_ui.ask_menus import disable_stale_copies
+
+        text = (message.content or "").strip()
+        if not text or message.attachments or len(text) > _MENU_TEXT_ANSWER_MAX:
+            return False
+        if not ask_bus.accepts_free_text(thread.id):
+            return False
+        if not ask_bus.post_answer(thread.id, [text]):
+            return False
+
+        logger.info(
+            "%s message delivered as the open menu's answer (#536 AC7)",
+            log_ctx(thread_id=thread.id),
+        )
+        # The answer came from outside the view, so no interaction edits the
+        # menu — blank every live copy here instead.
+        with contextlib.suppress(Exception):
+            await disable_stale_copies(
+                thread.id,
+                keep_message_id=None,
+                note=f"-# ✏️ 文章で回答しました: {text[:150]}",
+            )
+
+        async def _rerun(_interaction: discord.Interaction) -> None:
+            # The menu is closed by now, so this takes the ordinary reply path:
+            # pre-empt the running turn and start fresh with the same text.
+            await self._handle_thread_reply(message)
+
+        view = TextAnsweredMenuView(_rerun, authorizer=self._authorizer)
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(
+                content=(
+                    f"✏️ **この文章を、開いていた質問への回答として送りました:** {text[:150]}\n"
+                    "-# 質問への回答ではなく新しい指示のつもりだった場合は、"
+                    "下のボタンを押してください。"
+                ),
+                view=view,
+            )
+        return True
 
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).
@@ -1760,15 +1877,27 @@ class ClaudeChatCog(commands.Cog):
         (which unregisters from the ask-bus in its ``finally``) and unwinds
         ``_run_claude``'s ``finally`` (releasing the semaphore slot and clearing
         ``_active_runners``), so a parked turn can never hold the thread hostage.
+
+        #565: the prior turn's outcome must never escape into the caller.  This
+        used to reap the task with ``contextlib.suppress(Exception)``, but
+        ``asyncio.CancelledError`` derives from ``BaseException``, so awaiting
+        the task we had just cancelled raised straight through
+        ``_preempt_prior_turn`` into ``_handle_thread_reply`` — aborting it
+        *before* the ``create_task(self._run_claude(...))`` that starts the new
+        turn.  The user saw "⚡ Interrupted. Starting with new instruction…" and
+        then silence, with no ``run_claude: enter`` and no traceback (discord.py
+        treats a CancelledError leaving an event handler as plain cancellation).
+
+        ``asyncio.wait`` reports the outcome instead of raising it, and
+        ``gather(..., return_exceptions=True)`` reaps the task's exception —
+        including its ``CancelledError`` — as a value.  A genuine cancellation of
+        *this* coroutine still propagates from both, which is what keeps the
+        #315 teardown honest.
         """
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=grace)
-        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+        _done, pending = await asyncio.wait({task}, timeout=grace)
+        if pending:
             task.cancel()
-        except Exception:
-            pass
-        with contextlib.suppress(Exception):
-            await task
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _build_prompt(self, message: discord.Message) -> str:
         """Build the prompt string (text only). Use _build_prompt_and_images for full processing."""
@@ -1919,6 +2048,10 @@ class ClaudeChatCog(commands.Cog):
         )
         tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
 
+        # #565: both resolvers are awaits that sit between the dispatch and
+        # the first ``run_claude: enter``. If one of them ever hangs, this
+        # line is the last one logged.
+        logger.info("%s resolved managers for turn", log_ctx(thread_id=thread.id))
         if session_dir_manager is None and tmux_manager is None:
             await thread.send(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
@@ -1933,6 +2066,8 @@ class ClaudeChatCog(commands.Cog):
             )
 
         async with self._semaphore:
+            # #565: distinguishes "waiting for a slot" from "never got here".
+            logger.info("%s acquired session slot", log_ctx(thread_id=thread.id))
             dashboard = self._get_dashboard()
             coordination = self._get_coordination()
             description = prompt[:100].replace("\n", " ")

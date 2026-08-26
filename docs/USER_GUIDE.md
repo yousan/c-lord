@@ -160,12 +160,44 @@ All of the prompts above (**AskUserQuestion / plan approval / tool permission / 
 - The mention targets **whoever posted the turn** (the thread creator for the first prompt, or the replier for a follow-up).
 - For turns with no human poster (webhook / scheduled runs) or turns driven directly in the tmux pane, the mention falls back to `DISCORD_OWNER_ID` when set (no mention when it is unset).
 
+### Turn progress line
+
+When a turn goes **90 seconds** without anything reaching the thread, a single
+subtext line appears:
+
+```
+-# ⚙️ 作業中 5:56 · 🔧 Bash(rg -n 'timeout' c_lord/) · ツール 61 件
+```
+
+It refreshes **in place** every 15 seconds and disappears the moment real output
+returns, so the thread never grows by more than one message at a time and ends
+the turn back at zero. When even tool activity has stopped it says
+`⏳ 待機中 …` instead, so a stall is distinguishable from progress.
+
+It is never posted outside a turn: an idle thread stays silent no matter how
+long it idles. Opt out with `CLORD_TURN_PROGRESS=0`; change the threshold with
+`CLORD_TURN_PROGRESS_QUIET_SECONDS`. Full behaviour: `docs/specs/turn-progress.md`.
+
 ### TodoWrite Progress
 
 When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated in-place:
 - ✅ Completed
 - 🔄 In progress
 - ⬜ Pending
+
+### Progress folding (`progress.txt`)
+
+The intermediate embeds a turn produces — session start, thinking, tool use and
+tool results, the todo list — are useful while the turn is in flight and noise
+once it is over. At the end of a turn they are folded into a single
+`progress.txt` transcript and the originals are deleted.
+
+- A turn that produced **nothing worth reading** (no tool use, no thinking — the
+  session-start banner alone does not count) posts **no `progress.txt` at all**.
+  The intermediate embeds are still cleaned up, so the thread simply ends with
+  the answer (#542).
+- When `progress.txt` is posted on its own rather than attached to a message
+  that already has text, it carries a one-line caption saying what the file is.
 
 ---
 

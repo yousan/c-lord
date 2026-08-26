@@ -1455,3 +1455,190 @@ async def test_mirror_registers_flushed_intermediate_text_as_mirror_source(tmp_p
     finally:
         await mirror.stop()
         bridged_context.clear()
+
+
+# -- #539: the silence filler is driven by the mirror loop -------------------
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class _ProgressSpy:
+    def __init__(self) -> None:
+        self.posts: list[str] = []
+        self.deletes: list[object] = []
+
+    async def post(self, text: str):
+        self.posts.append(text)
+        return f"m{len(self.posts)}"
+
+    async def edit(self, handle, text: str) -> None:  # pragma: no cover - not asserted
+        pass
+
+    async def delete(self, handle) -> None:
+        self.deletes.append(handle)
+
+
+def _progress(spy: _ProgressSpy, clock: _FakeClock):
+    from c_lord.discord_ui.turn_progress import TurnProgress
+
+    return TurnProgress(
+        post=spy.post,
+        edit=spy.edit,
+        delete=spy.delete,
+        quiet_seconds=90.0,
+        update_seconds=15.0,
+        clock=clock,
+    )
+
+
+def _fresh_jsonl(tmp_path: Path):
+    import os
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    jsonl.write_text("")
+    os.utime(jsonl, (1, 1))
+    return project, jsonl
+
+
+async def test_progress_line_appears_after_a_long_tool_only_silence(tmp_path: Path) -> None:
+    """Tool events keep arriving but nothing is posted — that is the #539 gap."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=7,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        # Long enough that the idle heartbeat cannot fire between the clock jump
+        # and the tool event below. With a fake clock, "time passed" and "an
+        # event arrived" are separate steps, so a fast heartbeat would tick on
+        # the jump alone and render the pre-event state.
+        idle_flush_seconds=5.0,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_tool_use("Bash", "ls"))
+        await asyncio.sleep(0.2)
+        # 91s pass with nothing posted to Discord — but Claude is still working,
+        # which reaches the mirror as more tool traffic. That combination (quiet
+        # thread, busy transcript) is the gap #539 is about.
+        clock.advance(91.0)
+        _write_event(jsonl, _assistant_tool_use("Bash", "rg -n 'timeout' c_lord/"))
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    assert spy.posts, "no progress line appeared during a 91s tool-only silence"
+    assert "作業中" in spy.posts[0]
+    assert "Bash" in spy.posts[0]
+
+
+async def test_progress_line_disappears_when_claude_speaks(tmp_path: Path) -> None:
+    """Real output makes the filler get out of the way."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=8,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_tool_use("Bash", "ls"))
+        await asyncio.sleep(0.2)
+        clock.advance(91.0)
+        await asyncio.sleep(0.25)
+        assert spy.posts, "precondition: the line should be showing"
+        _write_event(jsonl, _assistant_text("途中経過です"))
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+
+    assert spy.deletes, "the progress line was left behind after real output"
+
+
+async def test_idle_thread_never_shows_a_progress_line(tmp_path: Path) -> None:
+    """No turn, no events — an idle thread must not sprout a stale 待機中."""
+    project, _ = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=9,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        clock.advance(6000.0)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert spy.posts == []
+
+
+async def test_a_prompt_alone_arms_the_progress_line(tmp_path: Path) -> None:
+    """A turn that starts with a prompt and then thinks silently still gets a line.
+
+    Staging showed the elapsed time under-reporting: the ``user_input`` branch
+    armed the turn and then flushed the previous one, and that flush disarms.
+    The turn only got armed again by its first tool event, so the clock started
+    late. Here there are no tool events at all, so nothing can paper over it.
+    """
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=11,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _user_str("調べてください"))
+        await asyncio.sleep(0.25)
+        clock.advance(91.0)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert spy.posts, "a prompt-then-silence turn produced no progress line"

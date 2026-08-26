@@ -86,6 +86,12 @@ _POST_STARTUP_DELAY = 1.0
 _CONTINUE_CHECK_DELAY = 3.0
 
 
+# #560: how many Enter presses send_input tries before giving up. Mirrors
+# c_lord.tmux._SUBMIT_ATTEMPTS; kept as a literal here so the user-facing
+# wording does not drag a tmux import into this module.
+_SUBMIT_ATTEMPTS_HINT = 3
+
+
 def _delivery_failure(action: str, prompt: str) -> str:
     """User-facing text for "the message never reached Claude" (#527).
 
@@ -100,6 +106,22 @@ def _delivery_failure(action: str, prompt: str) -> str:
         f"{action}に失敗しました — tmux のペインが入力を受け付けませんでした "
         f"(入力 {size:,} bytes)。ペインが落ちているか応答しない状態です。"
         "`/restart-claude` でセッションを立て直してから、もう一度送ってください。"
+    )
+
+
+def _stuck_in_input_box(prompt: str) -> str:
+    """User-facing text for "typed into the pane, but it would not submit" (#560).
+
+    Deliberately does **not** suggest ``/restart-claude``: the message is sitting
+    in the input box right now, and restarting the session would throw it away.
+    """
+    size = len(prompt.encode("utf-8"))
+    return (
+        f"メッセージの送信に失敗しました — 本文はペインの入力欄に入りましたが、"
+        f"Enter を {_SUBMIT_ATTEMPTS_HINT} 回試しても送信されませんでした "
+        f"(入力 {size:,} bytes)。本文はまだ入力欄に残っています。"
+        "もう一度送り直すか、`/tmux-screenshot` で状態を確認してください "
+        "(`/restart-claude` は入力欄の本文ごと破棄されるので、まず送り直しを試してください)。"
     )
 
 
@@ -815,11 +837,21 @@ class TmuxClaudeRunner:
                 await asyncio.sleep(_MENU_NAV_DELAY)
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
+                # #560: two very different failures reach this branch. Either the
+                # pane never took the input (#527), or the text is typed in and
+                # simply will not submit. Telling the second case to
+                # ``/restart-claude`` would discard the message the user just
+                # wrote, so ask the pane which one it is before advising.
+                stuck = await asyncio.to_thread(self._tmux.input_box_holds, self._thread_id, prompt)
                 yield StreamEvent(
                     raw={},
                     message_type=MessageType.RESULT,
                     is_complete=True,
-                    error=_delivery_failure("メッセージの送信", prompt),
+                    error=(
+                        _stuck_in_input_box(prompt)
+                        if stuck
+                        else _delivery_failure("メッセージの送信", prompt)
+                    ),
                 )
                 return
         else:
