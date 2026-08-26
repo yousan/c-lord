@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 # The embed description limit is 4096, so this leaves room for code block markers.
 _TOOL_RESULT_MAX_CHARS = 3000
 
+# Caption for a standalone ``progress.txt`` post (#542).  Sent as Discord
+# subtext (``-# ``) so it identifies the attachment without adding a full-size
+# message to the thread — an attachment on an otherwise empty message tells the
+# reader nothing about what the file is.
+PROGRESS_ATTACHMENT_NOTE = "-# 📄 progress.txt — このターンのツール実行ログ"
+
 
 def _truncate_result(content: str) -> str:
     """Truncate tool result content for display."""
@@ -217,7 +223,7 @@ class EventProcessor:
         # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
         if not self._config.session_id and not self._session_start_sent:
             msg = await self._config.thread.send(embed=session_start_embed(self._state.session_id))
-            self._folder.track(msg, f"[session start] {self._state.session_id}")
+            self._folder.track(msg, f"[session start] {self._state.session_id}", meaningful=False)
             self._session_start_sent = True
 
     async def _on_assistant(self, event: StreamEvent) -> None:
@@ -473,10 +479,16 @@ class EventProcessor:
         completed run.
         """
         if self._folder.is_empty:
+            # Nothing worth reading was collected — do NOT ship a progress.txt
+            # whose only line is the session-start banner (#542).  The tracked
+            # embeds are still cleaned up, so the thread ends in the same state
+            # as a folded turn, just without the empty bubble.
+            await self._folder.cleanup_messages()
             return
 
         file = self._folder.build_file()
         if file is None:
+            await self._folder.cleanup_messages()
             return
 
         attached = False
@@ -489,10 +501,12 @@ class EventProcessor:
 
         if not attached:
             # No final response message (or edit failed): rebuild and send standalone.
+            # #542: always carry a one-line caption — a bare attachment on an
+            # empty message gives the reader no idea what the file is.
             file = self._folder.build_file()
             if file is not None:
                 with contextlib.suppress(Exception):
-                    await self._config.thread.send(file=file)
+                    await self._config.thread.send(content=PROGRESS_ATTACHMENT_NOTE, file=file)
 
         await self._folder.cleanup_messages()
 
