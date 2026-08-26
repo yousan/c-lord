@@ -169,3 +169,110 @@ class TestEventProcessorFolding:
             edits = [c for c in m.edit.await_args_list if "attachments" in c.kwargs]
             assert edits == []
             m.delete.assert_not_called()
+
+class TestEmptyProgressNotSent:
+    """#542: a progress.txt whose only line is the session banner must not ship.
+
+    Every turn tracks one bookkeeping line — ``[session start] <id>``.  In the
+    default jsonl bridge mode Claude's answer is posted by the transcript
+    mirror, so ``_last_response_msg`` stays None and folding always fell through
+    to the standalone branch: an **empty message** carrying a 40-byte
+    ``progress.txt``.  It appeared on 11 of 11 sampled threads and told the
+    reader nothing.
+    """
+
+    def test_bookkeeping_line_alone_counts_as_empty(self) -> None:
+        """AC2: is_empty asks whether a reader would get anything out of it."""
+        f = ProgressFolder()
+        f.track(_new_msg(), "[session start] abc-123", meaningful=False)
+        assert f.is_empty is True
+
+    def test_bookkeeping_plus_real_line_is_not_empty(self) -> None:
+        """A banner next to real content must still fold normally."""
+        f = ProgressFolder()
+        f.track(_new_msg(), "[session start] abc-123", meaningful=False)
+        f.track_tool("t1", _new_msg(), "[tool] Bash echo")
+        assert f.is_empty is False
+        file = f.build_file()
+        assert file is not None
+        # The banner is still *in* the file — it just doesn't make it non-empty.
+        assert "[session start] abc-123" in file.fp.read().decode()
+
+    @pytest.mark.asyncio
+    async def test_session_start_only_sends_no_file(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """AC1: a turn with only a session banner posts no progress.txt at all."""
+        sent_messages: list[MagicMock] = []
+
+        async def fake_send(*args, **kwargs):
+            m = _new_msg()
+            sent_messages.append(m)
+            return m
+
+        thread.send = AsyncMock(side_effect=fake_send)
+
+        p = EventProcessor(_config(thread, runner))
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                text="Final answer.",
+                session_id="s1",
+                cost_usd=0.0,
+                duration_ms=1,
+            )
+        )
+
+        file_sends = [c for c in thread.send.await_args_list if "file" in c.kwargs]
+        assert file_sends == [], (
+            f"an empty progress.txt was posted: {file_sends!r}"
+        )
+        # The session-start embed is still cleaned up, so the thread ends in the
+        # same state as a folded turn — just without the empty bubble.
+        sent_messages[0].delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_standalone_progress_has_caption(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """AC3: when progress.txt IS sent standalone, it carries a caption."""
+        sent_messages: list[MagicMock] = []
+
+        async def fake_send(*args, **kwargs):
+            m = _new_msg()
+            sent_messages.append(m)
+            return m
+
+        thread.send = AsyncMock(side_effect=fake_send)
+
+        p = EventProcessor(_config(thread, runner))
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.ASSISTANT,
+                tool_use=ToolUseEvent(
+                    tool_id="t1",
+                    tool_name="Bash",
+                    tool_input={"command": "echo hi"},
+                    category=ToolCategory.COMMAND,
+                ),
+            )
+        )
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                text="Final answer.",
+                session_id="s1",
+                cost_usd=0.0,
+                duration_ms=1,
+            )
+        )
+
+        file_sends = [c for c in thread.send.await_args_list if "file" in c.kwargs]
+        assert len(file_sends) == 1
+        content = file_sends[0].kwargs.get("content")
+        assert content, "progress.txt was sent on an empty message"
+        assert "progress.txt" in content
