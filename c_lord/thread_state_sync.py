@@ -66,6 +66,13 @@ _LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_i
 
 _DEFAULT_INTERVAL_SECONDS = 60.0
 
+# How many times the menu watchdog may fail to post the same thread's menu
+# before it stops trying (#579). A failed post leaves the menu unbridged, which
+# is exactly the condition that triggers the sweep — so without a cap the pair
+# is a closed loop: production retried one unpostable menu 116 times in a day,
+# every failure swallowed as "Task exception was never retrieved".
+_ASK_BRIDGE_MAX_FAILURES = 3
+
 # Timeout for a single rename HTTP call.  Long enough for normal API response;
 # short enough not to block the tick when discord.py's rate-limit sleep fires.
 _RENAME_TIMEOUT_SECONDS = 30.0
@@ -531,6 +538,8 @@ class MenuWatchdogLoop:
         self._task: asyncio.Task[None] | None = None
         # Per-thread background bridge task — one at a time per thread.
         self._ask_bridges: dict[int, asyncio.Task[None]] = {}
+        # thread_id -> consecutive failed bridge attempts (#579)
+        self._ask_bridge_failures: dict[int, int] = {}
 
     def start(self) -> None:
         """Spawn the loop task. Idempotent."""
@@ -661,6 +670,11 @@ class MenuWatchdogLoop:
         existing = self._ask_bridges.get(thread_id)
         if existing is not None and not existing.done():
             return
+        # #579: this menu has failed to post repeatedly — stop. Retrying cannot
+        # help (the pane is unchanged, so the post will fail the same way) and
+        # the loop is what buried the logs.
+        if self._ask_bridge_failures.get(thread_id, 0) >= _ASK_BRIDGE_MAX_FAILURES:
+            return
         from .discord_ui.ask_bus import ask_bus
 
         if ask_bus.is_active(thread_id):
@@ -711,23 +725,88 @@ class MenuWatchdogLoop:
             return
         runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
 
+        # #549: long pre-menu prose (経緯・推し) scrolls off the alternate screen,
+        # which keeps no scrollback, so the capture above returns the menu with
+        # ``context=""`` — the question then reaches Discord with no decision
+        # context, and the prose only appears after the answer, out of order.
+        # The poll loop has recovered this since #468 by transiently growing the
+        # window (Claude redraws its conversation on SIGWINCH); the watchdog
+        # never did, which is exactly the reported #549 case. Same conditions as
+        # the poll loop: only when the first read came up empty, so an ordinary
+        # menu never pays the resize round-trip.
+        if not question.context and hasattr(tmux_manager, "capture_pane_tall"):
+            tall = await asyncio.to_thread(tmux_manager.capture_pane_tall, thread_id)
+            if isinstance(tall, str) and tall:
+                recovered = _parse_ask_from_pane(_normalize_capture(tall)) or _parse_plan_from_pane(
+                    _normalize_capture(tall)
+                )
+                if recovered is not None and recovered.context:
+                    question = recovered
+                    logger.info(
+                        "menu watchdog: recovered pre-menu context via tall capture "
+                        "(thread=%d, context_chars=%d)",
+                        thread_id,
+                        len(recovered.context),
+                    )
+
         from .discord_ui.ask_handler import bridge_pane_ask
 
         logger.info(
-            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r)",
+            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r context_chars=%d)",
             thread_id,
             question.header,
+            len(question.context),
         )
+
+        async def _bridge_and_report() -> None:
+            """Bridge, and make a failure visible instead of swallowing it (#579).
+
+            The task is spawned and never awaited, so a raise used to surface
+            only as asyncio's ``Task exception was never retrieved`` — which is
+            why a menu failing to post 116 times in one day went unnoticed.
+            """
+            try:
+                await bridge_pane_ask(
+                    channel,
+                    question,
+                    runner,
+                    ask_repo=getattr(self._bot, "ask_repo", None),
+                    # #480: watchdog bridges a menu no Discord turn is watching
+                    # (terminal-driven), so ping the bot owner as the fallback
+                    # (#525: unless this deployment turned that fallback off).
+                    notify_user_id=owner_notify_id(self._bot, kind="blocked"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failures = self._ask_bridge_failures.get(thread_id, 0) + 1
+                self._ask_bridge_failures[thread_id] = failures
+                logger.warning(
+                    "menu watchdog: bridge failed for thread=%d (attempt %d/%d)",
+                    thread_id,
+                    failures,
+                    _ASK_BRIDGE_MAX_FAILURES,
+                    exc_info=True,
+                )
+                if failures >= _ASK_BRIDGE_MAX_FAILURES:
+                    # Giving up quietly would leave the user waiting on choices
+                    # that are never coming, with the question still blocking
+                    # Claude in the pane.
+                    with contextlib.suppress(Exception):
+                        await channel.send(
+                            "-# ⚠️ この質問の選択肢を Discord に表示できませんでした"
+                            f"（{failures} 回失敗）。tmux ペインで直接回答してください: "
+                            f"`tmux attach -t {session_name}` → `{window_name}`"
+                        )
+                    logger.error(
+                        "menu watchdog: giving up on thread=%d after %d failures (#579)",
+                        thread_id,
+                        failures,
+                    )
+            else:
+                self._ask_bridge_failures.pop(thread_id, None)
+
         self._ask_bridges[thread_id] = asyncio.create_task(
-            bridge_pane_ask(
-                channel,
-                question,
-                runner,
-                ask_repo=getattr(self._bot, "ask_repo", None),
-                # #480: watchdog bridges a menu no Discord turn is watching
-                # (terminal-driven), so ping the bot owner as the fallback
-                # (#525: unless this deployment turned that fallback off).
-                notify_user_id=owner_notify_id(self._bot, kind="blocked"),
-            ),
+            _bridge_and_report(),
             name=f"menu-watchdog-{thread_id}",
         )

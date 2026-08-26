@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from c_lord.thread_name import (
+    CLOSED_MARK,
+    LEGACY_CLOSED_MARKS,
     STATUS_EMOJI,
     build_name,
     parse_topic_from_name,
@@ -255,21 +257,26 @@ def test_thread_retitle_enabled_explicit_overrides_env(monkeypatch):
     assert thread_retitle_enabled(True) is True
 
 
-# ── #512: 終了 (closed) marker ────────────────────────────────────────────────
+# ── #512/#574: 停止 (stopped) marker ─────────────────────────────────────────
 
 
 def test_build_name_closed_prefixes_marker():
-    """#512: a closed (/close-workspace'd) thread is marked ``[終了]`` up front."""
+    """#512: a stopped workspace is marked with :data:`CLOSED_MARK` up front.
+
+    Asserted through the constant, not its literal text: #574 renamed it from
+    「終了」 to 「停止」 and these tests should track the marker, not re-encode the
+    wording. The wording itself is pinned once, in ``test_workspace_stop.py``.
+    """
     assert (
         build_name("認証リファクタ", "dead", None, lamp=False, issue_ref="404", closed=True)
-        == "[終了] #404 認証リファクタ"
+        == f"{CLOSED_MARK} #404 認証リファクタ"
     )
 
 
 def test_build_name_closed_drops_work_prefix_and_lamp():
     """#512: the W<N> window no longer exists and the lamp is meaningless once closed."""
     out = build_name("topic", "alive", 3, lamp=True, closed=True)
-    assert out == "[終了] topic"
+    assert out == f"{CLOSED_MARK} topic"
     assert "W3" not in out
     assert not any(e in out for e in STATUS_EMOJI.values())
 
@@ -277,7 +284,7 @@ def test_build_name_closed_drops_work_prefix_and_lamp():
 def test_build_name_closed_keeps_issue_ref_and_truncates_topic():
     """#512: under the 30-char cap the marker + number survive; the topic is trimmed."""
     out = build_name("あ" * 40, "dead", None, lamp=False, issue_ref="404", closed=True)
-    assert out.startswith("[終了] #404 ")
+    assert out.startswith(f"{CLOSED_MARK} #404 ")
     assert len(out) <= 30
 
 
@@ -288,6 +295,7 @@ def test_build_name_not_closed_is_unchanged():
 
 def test_parse_topic_strips_closed_marker():
     """#512: the marker must not be absorbed into the stored topic on manual rename."""
-    assert parse_topic_from_name("[終了] #404 認証リファクタ") == "認証リファクタ"
-    assert parse_topic_from_name("[終了] W3 │ 認証リファクタ") == "認証リファクタ"
-    assert parse_topic_from_name("[終了] 認証リファクタ") == "認証リファクタ"
+    for mark in (CLOSED_MARK, *LEGACY_CLOSED_MARKS):
+        assert parse_topic_from_name(f"{mark} #404 認証リファクタ") == "認証リファクタ"
+        assert parse_topic_from_name(f"{mark} W3 │ 認証リファクタ") == "認証リファクタ"
+        assert parse_topic_from_name(f"{mark} 認証リファクタ") == "認証リファクタ"

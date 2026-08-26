@@ -44,6 +44,18 @@ _IDLE_TIMEOUT = 60.0
 # How long to wait for Claude to become ready (show input prompt).
 _STARTUP_TIMEOUT = 30.0
 
+# How long a turn is allowed to not-start-yet before the idle exit gives up on
+# it (#562).  Distinct from ``_STARTUP_TIMEOUT``, which only covers a *cold*
+# claude: a warm session used to get no grace at all, so 60s of pane silence on
+# a busy host ended the turn and reported it finished.  Generous on purpose —
+# a late "no response" notice is far cheaper than a false "finished", and the
+# ``timeout_seconds`` backstop still bounds the wait.
+_TURN_START_GRACE = 120.0
+
+# Prefix of the RESULT error for "this turn never produced anything" (#562).
+# Exported so callers can recognise the outcome without string-sniffing.
+NO_RESPONSE_ERROR_PREFIX = "No response —"
+
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
 _UNKNOWN_ALERT_DELAY = 5.0
@@ -74,6 +86,12 @@ _POST_STARTUP_DELAY = 1.0
 _CONTINUE_CHECK_DELAY = 3.0
 
 
+# #560: how many Enter presses send_input tries before giving up. Mirrors
+# c_lord.tmux._SUBMIT_ATTEMPTS; kept as a literal here so the user-facing
+# wording does not drag a tmux import into this module.
+_SUBMIT_ATTEMPTS_HINT = 3
+
+
 def _delivery_failure(action: str, prompt: str) -> str:
     """User-facing text for "the message never reached Claude" (#527).
 
@@ -88,6 +106,22 @@ def _delivery_failure(action: str, prompt: str) -> str:
         f"{action}に失敗しました — tmux のペインが入力を受け付けませんでした "
         f"(入力 {size:,} bytes)。ペインが落ちているか応答しない状態です。"
         "`/restart-claude` でセッションを立て直してから、もう一度送ってください。"
+    )
+
+
+def _stuck_in_input_box(prompt: str) -> str:
+    """User-facing text for "typed into the pane, but it would not submit" (#560).
+
+    Deliberately does **not** suggest ``/restart-claude``: the message is sitting
+    in the input box right now, and restarting the session would throw it away.
+    """
+    size = len(prompt.encode("utf-8"))
+    return (
+        f"メッセージの送信に失敗しました — 本文はペインの入力欄に入りましたが、"
+        f"Enter を {_SUBMIT_ATTEMPTS_HINT} 回試しても送信されませんでした "
+        f"(入力 {size:,} bytes)。本文はまだ入力欄に残っています。"
+        "もう一度送り直すか、`/tmux-screenshot` で状態を確認してください "
+        "(`/restart-claude` は入力欄の本文ごと破棄されるので、まず送り直しを試してください)。"
     )
 
 
@@ -246,6 +280,21 @@ _ASK_TAB_HEADER_RE = re.compile(r"☐\s+(.+?)\s{2,}")
 _ASK_PREVIEW_BOX_CHARS = ("┌", "│", "└", "╭", "╰", "┐", "┘")
 
 
+def _join_wrapped(label: str, tail: str) -> str:
+    """Re-join an option label the TUI wrapped onto the next line (#579).
+
+    The wrap happens wherever the column runs out, so it can land mid-word:
+    Japanese needs the halves glued (「…（推」+「奨）」), while a Latin wrap broke
+    at a space that the capture then stripped, and gluing there would read as
+    "somewordelse". Insert a space only between two word characters.
+    """
+    if not label:
+        return tail
+    if label[-1].isalnum() and label[-1].isascii() and tail[:1].isalnum() and tail[:1].isascii():
+        return f"{label} {tail}"
+    return f"{label}{tail}"
+
+
 def _is_ask_meta_label(label: str) -> bool:
     """True for TUI affordance rows that must not become Discord buttons.
 
@@ -341,7 +390,18 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
                 pane_col = c if pane_col is None else min(pane_col, c)
 
     def _menu_text(line: str) -> str:
-        return line[:pane_col] if pane_col is not None else line
+        """The menu-column part of *line*, with any preview-pane box cut off.
+
+        ``pane_col`` is a *character* index taken from the numbered option lines,
+        but the box is drawn at a fixed *display* column: a line whose text is
+        double-width (Japanese) reaches that column in fewer characters, so the
+        slice alone leaves the box character (and the preview text) behind. That
+        leftover is what put "…並べる    │" into an option label (#579), so cut
+        again at the first box character actually present in this line.
+        """
+        text = line[:pane_col] if pane_col is not None else line
+        cuts = [text.find(ch) for ch in _ASK_PREVIEW_BOX_CHARS if ch in text]
+        return text[: min(cuts)] if cuts else text
 
     # Indices of every numbered line (including meta-options) within the menu —
     # used to bound the region from which each real option's description is read.
@@ -365,13 +425,41 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         # Description (#169): the first non-empty, non-separator line between this
         # option and the next numbered line — Claude renders it indented below
         # the option.  Empty when the option has no description.
-        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx + 1
+        #
+        # #579: in a preview-table menu (``pane_col`` set) the left column is
+        # narrow and holds labels only — the explanation is in the box on the
+        # right — so a non-numbered line there is the continuation of an option
+        # whose text did not fit on one line. Two shapes, both real:
+        #   "❯ 1. 具体的な場面から入る（推" / "    奨）"   → a label cut mid-word
+        #   "  2." / "    欠けているものを先に並べる"      → the whole label wrapped
+        # The second used to produce ``label=""``, which Discord rejects with 400
+        # ("This field is required"), so the menu never posted at all. Dropping
+        # such an option instead would be worse than an empty label: the TUI
+        # still shows it and answers are delivered as ``Down × index``, so a
+        # shorter list would select the wrong option.
+        #
+        # Indentation cannot be the test here: descriptions sit at column 5 in
+        # a plain menu but at column 2 in a multiSelect one (the "[ ] " checkbox
+        # shifts them), which overlaps the wrapped-tail indent.
+        #
+        # ``end_idx`` (exclusive) rather than ``end_idx + 1``: that line is the
+        # "Chat about this" affordance, which was being read as the last
+        # option's description.
+        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx
         description = ""
         for j in range(i + 1, next_i):
-            s = _menu_text(lines[j]).strip()
-            if not s or _SEPARATOR_RE.match(_menu_text(lines[j])):
+            raw = _menu_text(lines[j])
+            text = raw.strip()
+            if not text or _SEPARATOR_RE.match(raw):
                 continue
-            description = s
+            if pane_col is not None and not description:
+                # Preview-table layout: the explanation lives in the box on the
+                # right, so the narrow left column carries labels and nothing
+                # else. A non-numbered line in it is therefore the tail of the
+                # label above, never a description (#579).
+                label = _join_wrapped(label, text)
+                continue
+            description = text
             break
         options.append(AskOption(label=label, description=description))
 
@@ -803,11 +891,21 @@ class TmuxClaudeRunner:
                 await asyncio.sleep(_MENU_NAV_DELAY)
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
+                # #560: two very different failures reach this branch. Either the
+                # pane never took the input (#527), or the text is typed in and
+                # simply will not submit. Telling the second case to
+                # ``/restart-claude`` would discard the message the user just
+                # wrote, so ask the pane which one it is before advising.
+                stuck = await asyncio.to_thread(self._tmux.input_box_holds, self._thread_id, prompt)
                 yield StreamEvent(
                     raw={},
                     message_type=MessageType.RESULT,
                     is_complete=True,
-                    error=_delivery_failure("メッセージの送信", prompt),
+                    error=(
+                        _stuck_in_input_box(prompt)
+                        if stuck
+                        else _delivery_failure("メッセージの送信", prompt)
+                    ),
                 )
                 return
         else:
@@ -953,6 +1051,10 @@ class TmuxClaudeRunner:
         # response trivially differs and cold starts are unaffected.
         saw_generation = False
         baseline_response: str | None = None
+        # #562: the #365 gate, hoisted out of the loop body. The idle exit and
+        # the final verdict both need it, and it must be defined even if the
+        # loop body never runs.
+        new_turn_started = False
 
         # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
         # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
@@ -1188,6 +1290,7 @@ class TmuxClaudeRunner:
             new_turn_started = saw_generation or (
                 bool(last_response) and last_response != baseline_response
             )
+
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
@@ -1208,8 +1311,16 @@ class TmuxClaudeRunner:
                 and stable_seconds >= _IDLE_TIMEOUT
                 and raw_static_seconds >= _IDLE_TIMEOUT
             ):
-                # During a fresh start, allow extra time for Claude to load.
-                if not claude_running and elapsed < _STARTUP_TIMEOUT:
+                # #562: a turn that never started is not a turn that finished.
+                # #365 gates the *completion* detector on the new turn actually
+                # having begun; this exit ignored that gate, so a warm session
+                # that simply had not started drawing yet was declared done —
+                # and the verdict below then read it as a normal completion,
+                # firing "🟡 Claude has finished" at a user with no answer.
+                # The old grace was `not claude_running and elapsed <
+                # _STARTUP_TIMEOUT`, i.e. cold starts only; a warm session got
+                # none. Wait out `_TURN_START_GRACE` either way.
+                if not new_turn_started and elapsed < _TURN_START_GRACE:
                     continue
                 logger.info(
                     "Idle timeout (%.1fs) — no response (thread=%d)",
@@ -1221,21 +1332,38 @@ class TmuxClaudeRunner:
         # Yield final complete event.  ``error`` is computed first so the single
         # yield below carries the right outcome (#366: a failed/empty run must
         # surface an error, not a silent "done").
+        timed_out = raw_static_seconds >= self.timeout_seconds
         if self._stopped:
             error = None if self._silent_stop else "Stopped by user"
-        elif raw_static_seconds >= self.timeout_seconds:
-            error = f"Timed out after {self.timeout_seconds} seconds"
-        elif not last_response:
-            # Reached completion (idle timeout or startup fast-fail) without ever
-            # extracting a response.  This is NOT a normal completion — decide
-            # whether to surface it (#366):
+        elif timed_out or not last_response:
+            # Reached completion without a usable response — either the hard
+            # inactivity backstop fired (``timed_out``) or we never extracted
+            # any response text.  Neither is automatically a failure, so run the
+            # #366 liveness ladder before blaming the session:
             #   1. A fatal startup error is on the pane → report it verbatim.
             #   2. No marker, but ``claude`` is no longer running → it exited
             #      without answering (crash / unrecognised fatal error).
-            #   3. ``claude`` is still alive at its prompt → most likely it
-            #      answered via the discord-reply skill and we simply didn't
-            #      scrape the text; stay silent to avoid a false error embed.
-            pane_error = startup_error or _extract_startup_error(current)
+            #   3. ``claude`` is alive but NOT idle at its prompt → it really is
+            #      wedged mid-turn; a frozen pane for the whole timeout window is
+            #      a genuine hang, so report the timeout.
+            #   4. ``claude`` is alive and idle at its prompt → the turn is over
+            #      and the answer went out through the jsonl mirror / reply skill
+            #      (#541).  Stay silent rather than posting a false error embed.
+            #
+            # #541: step 3/4 is what the backstop was missing.  In jsonl mode the
+            # pane freezes completely once a turn ends, and the idle pane yields
+            # no scrapable response, so EVERY normal turn hit the backstop ~312s
+            # after answering and posted "⏱️ Session timed out" (33 of 35 observed
+            # timeouts were this false alarm).  The ladder has to run first —
+            # which also means an ordinary timeout no longer masks a crashed
+            # ``claude`` (step 2 now reports the crash instead).
+            # The pane scrape stays gated on "no response was ever produced":
+            # a marker phrase like ``command not found: claude`` can legitimately
+            # appear inside Claude's own answer, and a timed-out turn that DID
+            # produce text must not be re-labelled a startup failure (#366).
+            pane_error = startup_error
+            if pane_error is None and not last_response:
+                pane_error = _extract_startup_error(current)
             if pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
@@ -1243,6 +1371,33 @@ class TmuxClaudeRunner:
                     "Claude exited without producing a response "
                     "(possible startup failure or crash) — check the tmux pane."
                 )
+            elif not new_turn_started:
+                # #562: claude is alive but this turn never produced anything —
+                # no generation was ever seen and the pane still shows only the
+                # previous turn's residue. Reporting "done" here is what made
+                # c-lord ping people about work that had not started. Note this
+                # is checked AFTER the #541 rungs: a turn that DID generate has
+                # ``new_turn_started`` set, so an answered-then-silent pane
+                # (the #541 case) never lands here.
+                #
+                # ``new_turn_started`` is the whole test, deliberately: an
+                # earlier revision also required ``not last_response`` (matching
+                # the journal line in the report, ``Idle timeout … no
+                # response``). Reproducing the bug on staging showed that scoping
+                # left the other half in place — when the frozen pane still had
+                # the PREVIOUS turn's output on it the scrape succeeded, the run
+                # fell through to the inactivity backstop, and c-lord announced
+                # "finished" for a turn Claude never received. A turn that really
+                # produced something always moves the extracted text away from
+                # the baseline captured right after the prompt was sent, so the
+                # gate alone is both sufficient and safe.
+                error = (
+                    f"{NO_RESPONSE_ERROR_PREFIX} Claude never started this turn "
+                    f"(pane unchanged for {raw_static_seconds:.0f}s). "
+                    "Send the message again, or check the tmux pane."
+                )
+            elif timed_out and not self._is_idle_at_prompt(current):
+                error = f"Timed out after {self.timeout_seconds} seconds"
             else:
                 error = None
         else:
@@ -1852,6 +2007,23 @@ class TmuxClaudeRunner:
             ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
                 return True
         return False
+
+    @classmethod
+    def _is_idle_at_prompt(cls, text: str) -> bool:
+        """Return True when the pane shows ``claude`` parked at an idle prompt.
+
+        Used by the inactivity backstop to tell "the turn is over" from "the
+        turn is wedged" (#541).  ``_has_input_prompt`` alone is not enough: the
+        TUI keeps the input box on screen *while generating too*, so a session
+        frozen mid-tool would look idle.  Requiring the generation indicator to
+        be absent as well makes the pair a real idle check —
+        no spinner **and** a ready input box means Claude finished and is
+        waiting for the next message.
+
+        The caller checks process liveness separately, which is what keeps a
+        dead pane's leftover ``❯`` in the scrollback from reading as idle.
+        """
+        return cls._has_input_prompt(text) and not cls._is_generating(text)
 
     # Keep for backward compatibility / testing.
     @staticmethod

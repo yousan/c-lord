@@ -75,25 +75,69 @@ _SCREENSHOT_ROWS_ENV = "CLORD_TMUX_SCREENSHOT_ROWS"
 # not this flag — so they are intentionally excluded here.
 _VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
-# #147: Claude Code runs with ``editorMode: vim``.  Its input box therefore has
-# a vim NORMAL mode in which literal characters (``send-keys -l``) are
-# interpreted as editor commands, corrupting the message.  The TUI status bar
-# shows ``-- INSERT`` only while in INSERT mode; NORMAL mode simply omits the
-# prefix (current Claude Code, v2.1.150, renders NO ``-- NORMAL`` marker).  So
-# we detect mode by the presence of ``-- INSERT`` and anchor the NORMAL case on
-# the always-present permission/plan status indicators.
+# #147: when Claude Code runs with ``editorMode: vim`` its input box has a vim
+# NORMAL mode in which literal characters (``send-keys -l``) are interpreted as
+# editor commands, corrupting the message.  Pressing ``i`` first fixes that.
+#
+# #544: but vim mode is *not* the default, and c-lord must not assume it.  The
+# status bar on Claude Code v2.1.246 looks like this:
+#
+#     vim on,  INSERT      ``-- INSERT -- ⏵⏵ bypass permissions on …``
+#     vim on,  NORMAL      ``⏵⏵ bypass permissions on …``
+#     vim off (default)    ``⏵⏵ bypass permissions on …``      <- identical
+#
+# ``⏵⏵``/``⏸⏸`` are the permission/plan indicators; they are present regardless
+# of the editor mode, so they prove only that the pane is sitting at the input
+# prompt.  c-lord used to treat that bare status bar as "vim NORMAL" and press
+# ``i``, which for every consumer who does not use vim mode typed a literal
+# ``i`` in front of each Discord message.  Only an explicit ``-- INSERT`` /
+# ``-- NORMAL`` marker is evidence about vim; everything else is undecidable
+# from one frame, and :meth:`TmuxSessionManager._ensure_insert_mode` resolves it
+# by probing the pane instead of guessing.
 _INSERT_MARKER = "-- INSERT"
-# Status-bar anchors that prove the pane is sitting at the input prompt (and so
-# its vim mode is meaningful).  ``⏵⏵``/``⏸⏸`` are the bypass/plan indicators;
-# ``-- NORMAL`` is included for forward-compat in case a future build restores
-# the explicit NORMAL marker.
-_STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸", "-- NORMAL")
-# Pause after pressing ``i`` so the TUI commits the INSERT-mode switch before the
-# literal text arrives (verified on staging: the switch is near-instant).
+# Not rendered by v2.1.246 (NORMAL shows no marker at all), but older/newer
+# builds do show it and it is unambiguous when present.
+_NORMAL_MARKER = "-- NORMAL"
+# Status-bar anchors that prove the pane is sitting at the input prompt — i.e.
+# that a keypress would land in the input box.  Deliberately NOT evidence of
+# the editor mode (that was the #544 bug).
+_STATUS_BAR_ANCHORS = ("⏵⏵", "⏸⏸")
+# Pause after pressing ``i`` so the TUI commits the INSERT-mode switch (or
+# renders the literal character) before we look at the pane / type the message.
+# Verified on staging: the switch is near-instant.
 _INSERT_SETTLE = 0.15
 # #485: pause after Esc-dismissing a stuck menu so the TUI closes it before the
 # message is typed (otherwise the text could still land on the closing menu).
 _MENU_DISMISS_SETTLE = 0.3
+
+# #560: ``send-keys -l`` delivers a long message as one fast burst, which the
+# Claude Code TUI treats as a *paste* and folds into a ``[Pasted text #N +M
+# lines]`` placeholder.  Folding is debounced, and an Enter that lands inside
+# that window is absorbed as part of the paste instead of submitting — the
+# message then sits in the input box until a human presses Enter (observed in
+# production: 20+ minutes).  Measured on v2.1.246: ~335 characters still typed
+# through as plain text, ~1029 folded.  The threshold is set below the observed
+# fold point so anything that *might* fold gets the settle; shorter messages keep
+# the old zero-latency path.
+_PASTE_FOLD_MIN_CHARS = 300
+# Pause between the last chunk of text and Enter, so the fold completes first.
+_PASTE_SETTLE = 0.4
+# #560: waits around reading the input box back after Enter. The first check is
+# delayed so the TUI has redrawn; later ones pace the retries.
+_SUBMIT_SETTLE = 0.35
+_SUBMIT_RETRY_DELAY = 0.5
+# How many times to look for the message leaving the box (each failed look after
+# the first re-presses Enter). Three looks ≈ 1.35s worst case before giving up.
+_SUBMIT_ATTEMPTS = 3
+# A horizontal rule drawn by the TUI. The input box sits between the last two.
+_BOX_RULE_RE = re.compile(r"^\s*[─━]{10,}\s*$")
+# The placeholder a folded paste leaves in the input box. Compared against
+# whitespace-stripped text because ``capture-pane`` hard-wraps the pane and can
+# split the marker across two lines.
+_PASTED_PLACEHOLDER = "[Pastedtext"
+# How much of the payload to look for when deciding whether it is still in the
+# box. Long enough to be distinctive, short enough to survive the TUI's wrapping.
+_PAYLOAD_FINGERPRINT = 24
 
 # #503: c-lord is usually the first process on the host to touch tmux, so the
 # server it starts inherits c-lord's *own* cgroup. systemd kills a unit's whole
@@ -289,26 +333,116 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _pane_in_insert_mode(pane_text: str) -> bool | None:
-    """Return True if the input box is in vim INSERT mode, False for NORMAL.
+def _status_zone(pane_text: str) -> str:
+    """The bottom few non-blank lines — where Claude Code draws its status bar.
 
-    Returns ``None`` when the mode cannot be determined (no status bar in the
-    captured frame — e.g. mid-redraw or while Claude is generating).  Callers
-    should treat ``None`` as "leave input untouched" to avoid the double-``i``
-    regression (#147 AC2).
-
-    Only the bottom status zone is inspected, so a stale ``-- INSERT`` lingering
-    in scrollback above a current NORMAL status bar does not win.
+    Restricting every status check to this zone keeps a stale marker lingering
+    in scrollback from outvoting the current frame.
     """
     lines = [ln for ln in pane_text.splitlines() if ln.strip()]
-    if not lines:
+    return "\n".join(lines[-8:])
+
+
+def _pane_in_insert_mode(pane_text: str) -> bool | None:
+    """Return True if the input box is in vim INSERT mode, False for vim NORMAL.
+
+    Returns ``None`` when the frame does not say — which covers both "no status
+    bar at all" (mid-redraw, Claude generating) *and* the common case of a pane
+    whose editor simply is not in vim mode (#544).  A bare ``⏵⏵`` status bar is
+    emitted identically by vim-NORMAL and by a vim-less input box, so it is not
+    evidence either way and must never be answered with ``False``.
+
+    Callers must treat ``None`` as "the status bar cannot decide" — press no
+    keys on this alone, or resolve it by probing.
+    """
+    if not pane_text.strip():
         return None
-    zone = "\n".join(lines[-8:])
+    zone = _status_zone(pane_text)
     if _INSERT_MARKER in zone:
         return True
-    if any(anchor in zone for anchor in _STATUS_BAR_ANCHORS):
+    if _NORMAL_MARKER in zone:
         return False
     return None
+
+
+def _pane_at_input_prompt(pane_text: str) -> bool:
+    """True if the pane is showing Claude Code's input prompt status bar.
+
+    Says nothing about the editor mode — only that a keypress would land in the
+    input box, so it is safe to probe/correct there.
+    """
+    return any(anchor in _status_zone(pane_text) for anchor in _STATUS_BAR_ANCHORS)
+
+
+def _squash(text: str) -> str:
+    """Drop all whitespace (and the bridge ZWSP) so wrapped text can be matched.
+
+    ``capture-pane`` hard-wraps the pane at its width, so a marker like
+    ``[Pasted text #2 +5 lines]`` can arrive split across two lines. Comparing
+    whitespace-free forms makes the match independent of where it wrapped.
+    """
+    from .transcript.formatter import ZWSP_MARKER
+
+    return "".join(text.split()).replace(ZWSP_MARKER, "")
+
+
+def _input_box_text(pane_text: str) -> str | None:
+    """Whitespace-free contents of the TUI input box, or ``None`` if not found.
+
+    Claude Code draws the input box between two horizontal rules just above the
+    status bar::
+
+        ────────────────────────────
+        ❯ what the user is typing
+        ────────────────────────────
+           Model: …
+
+    So the box is what lies between the last two rules. When the typed text is
+    tall enough to push its own top rule off the top of the pane there is only
+    one rule left, and everything above it *is* the box — handled by treating a
+    missing top rule as "starts at the top of the capture".
+
+    Returns ``""`` for an empty box.
+    """
+    lines = pane_text.splitlines()
+    rules = [i for i, line in enumerate(lines) if _BOX_RULE_RE.match(line)]
+    if not rules:
+        return None
+    bottom = rules[-1]
+    above = [i for i in rules if i < bottom]
+    top = above[-1] if above else -1
+    content = _squash("\n".join(lines[top + 1 : bottom]))
+    return content[1:] if content.startswith("❯") else content
+
+
+def _input_box_retains(pane_text: str, payload: str) -> bool | None:
+    """Is *payload* still sitting unsent in the input box? ``None`` if unknowable.
+
+    Positive evidence only (#544's rule, applied again): a frame that cannot be
+    parsed, or a box holding something we do not recognise, is **not** treated as
+    a failed send.  A wrong "it failed" would tell the user their message was
+    dropped when it actually went through, and the empty box also legitimately
+    carries a greyed placeholder hint (``Try "refactor <filepath>"``).
+
+    Two things count as evidence:
+
+    * ``[Pasted text …]`` — the fold placeholder.  A submitted paste leaves the
+      box empty, so a placeholder still there means our Enter never landed.
+    * a fingerprint of the payload itself, for messages too short to be folded.
+    """
+    box = _input_box_text(pane_text)
+    if box is None:
+        return None
+    if not box:
+        return False
+    if _PASTED_PLACEHOLDER in box:
+        return True
+    squashed = _squash(payload)
+    if not squashed:
+        return False
+    head = squashed[:_PAYLOAD_FINGERPRINT]
+    tail = squashed[-_PAYLOAD_FINGERPRINT:]
+    return head in box or tail in box
 
 
 def _pane_has_open_menu(pane_text: str) -> bool:
@@ -376,6 +510,11 @@ class TmuxSessionManager:
         self._available: bool | None = None
         self._next_work_id: int = 1
         self._thread_to_window: dict[int, str] = {}
+        # #544: window name -> "is this pane's Claude running in vim editor
+        # mode?".  Learned from the pane (an observed ``-- INSERT``/``-- NORMAL``
+        # marker, or a probe), never assumed.  In-memory only: a restart just
+        # means the next send re-learns it, which is cheap and self-correcting.
+        self._vim_mode: dict[str, bool] = {}
         # Serializes window creation + the post-create sort (#374) so concurrent
         # create_session() calls (one per Discord thread, run in the asyncio
         # thread pool) don't interleave their move-window operations.
@@ -1494,6 +1633,14 @@ class TmuxSessionManager:
             logger.warning("start_claude: no window for thread %d", thread_id)
             return False
 
+        # #544: the Claude we are about to start may not have the editor mode
+        # the previous one in this window had (a recycled window, or changed
+        # settings), so forget what was learned about it.  Observed on staging:
+        # a window probed as vim-less was reused by a vim-mode Claude, and the
+        # stale verdict meant no ``i`` was pressed — the message ran as vim
+        # commands and left the pane in ``-- VISUAL LINE --``.
+        self._vim_mode.pop(window, None)
+
         target = f"{self.session_name}:{window}"
         cmd_parts = ["env", "-u", "CLAUDECODE", "claude"]
         if try_continue:
@@ -1600,6 +1747,96 @@ class TmuxSessionManager:
                 return False
         return True
 
+    def _ensure_insert_mode(self, target: str, window: str, pane_text: str, thread_id: int) -> None:
+        """Put a vim-mode input box into INSERT before literal text is typed.
+
+        The hard part is that Claude Code v2.1.246 renders *nothing* in vim
+        NORMAL, so its status bar is byte-identical to that of an input box with
+        vim mode switched off entirely.  c-lord used to read that frame as
+        NORMAL and press ``i`` unconditionally, which prefixed every message
+        from a non-vim consumer with a literal ``i`` (#544).
+
+        So the mode is established from evidence, never assumed:
+
+        * ``-- INSERT`` — vim, already in INSERT.  Nothing to do.
+        * ``-- NORMAL`` — vim, in NORMAL.  Press ``i``.
+        * neither, and no input prompt — indeterminate frame (mid-redraw, or
+          Claude is generating).  Touch nothing.
+        * neither, but at the input prompt — undecidable from the frame, so
+          *probe*: press ``i`` and look at what it did.  A pane that flips to
+          ``-- INSERT`` was vim in NORMAL and the keypress did its job; a pane
+          that does not has vim off, so the ``i`` was a literal character and is
+          erased with a BSpace.  Either way the answer is remembered per window,
+          so the probe costs one extra capture the first time only.
+
+        The remembered answer is also refreshed from every marker we see, so a
+        probe that raced a redraw self-corrects on the next send rather than
+        sticking.
+        """
+        mode = _pane_in_insert_mode(pane_text)
+        if mode is not None:
+            # An explicit marker: this pane definitely runs vim mode.
+            self._vim_mode[window] = True
+            if mode is False:
+                logger.debug(
+                    "send_input: pane in vim NORMAL, entering INSERT (thread=%d)", thread_id
+                )
+                _run(["tmux", "send-keys", "-t", target, "i"])
+                time.sleep(_INSERT_SETTLE)
+            return
+
+        if not _pane_at_input_prompt(pane_text):
+            return  # no input prompt in this frame — never type blind
+
+        known = self._vim_mode.get(window)
+        if known is False:
+            return  # vim is off on this pane: the box takes text as-is
+        if known is True:
+            logger.debug("send_input: pane in vim NORMAL, entering INSERT (thread=%d)", thread_id)
+            _run(["tmux", "send-keys", "-t", target, "i"])
+            time.sleep(_INSERT_SETTLE)
+            return
+
+        # Undecidable and unknown — probe (#544).
+        _run(["tmux", "send-keys", "-t", target, "i"])
+        time.sleep(_INSERT_SETTLE)
+        after = _run(["tmux", "capture-pane", "-p", "-t", target])
+        if after.returncode == 0 and _pane_in_insert_mode(after.stdout) is True:
+            self._vim_mode[window] = True
+            logger.info(
+                "send_input: probe says vim editor mode is ON (window=%s thread=%d); "
+                "the 'i' switched the box to INSERT",
+                window,
+                thread_id,
+            )
+            return
+        # No INSERT marker appeared, so ``i`` was typed as a literal character.
+        # Erase it — the message must reach Claude exactly as the user wrote it.
+        # The BSpace is sent even when the verification capture itself failed:
+        # the input box is empty at this point in a normal send, so deleting the
+        # character we just typed is harmless, whereas leaving it behind would
+        # reproduce the very bug this method exists to prevent.
+        if after.returncode == 0:
+            self._vim_mode[window] = False
+            logger.info(
+                "send_input: probe says vim editor mode is OFF (window=%s thread=%d); "
+                "erasing the probe character so the message is sent unprefixed (#544)",
+                window,
+                thread_id,
+            )
+        else:
+            # Nothing was actually observed, so don't remember a verdict —
+            # re-probe next time instead of caching a guess.
+            logger.warning(
+                "send_input: could not read the pane back after the vim probe "
+                "(window=%s thread=%d); erasing the probe character and retrying "
+                "the detection on the next message",
+                window,
+                thread_id,
+            )
+        _run(["tmux", "send-keys", "-t", target, "BSpace"])
+        time.sleep(_INSERT_SETTLE)
+
     def send_input(self, thread_id: int, text: str) -> bool:
         """Send text to the Claude process in the tmux window via ``send-keys -l``.
 
@@ -1647,25 +1884,129 @@ class TmuxSessionManager:
             time.sleep(_MENU_DISMISS_SETTLE)
             visible = _run(["tmux", "capture-pane", "-p", "-t", target])
 
-        # #147: Claude's vim-mode input box drops to NORMAL after some
-        # operations (e.g. an Escape sent by cancel_menu()).  Sending literal
-        # text in NORMAL makes each character a vim command, corrupting the
-        # message.  If not positively in INSERT, press ``i`` first.  We only
-        # correct when the pane is positively NOT in INSERT (a recognised status
-        # bar without ``-- INSERT``); an indeterminate frame is left untouched so
-        # we never inject a stray ``i`` into an already-INSERT box (AC2).
-        if visible.returncode == 0 and _pane_in_insert_mode(visible.stdout) is False:
-            logger.debug("send_input: pane in NORMAL mode, entering INSERT (thread=%d)", thread_id)
-            _run(["tmux", "send-keys", "-t", target, "i"])
-            time.sleep(_INSERT_SETTLE)
+        # #147/#544: a vim-mode input box drops to NORMAL after some operations
+        # (e.g. an Escape sent by cancel_menu() or the menu guard above), and
+        # literal text typed in NORMAL becomes vim commands.  Pressing ``i``
+        # fixes that — but only for panes that actually run vim mode.
+        if visible.returncode == 0:
+            self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
         payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
         if not self._type_literal(target, payload, what="send_input"):
             return False
 
+        # #560: a payload big enough to be treated as a paste is folded into a
+        # ``[Pasted text …]`` placeholder, and an Enter arriving inside that
+        # debounce is swallowed by the fold instead of submitting. Give the TUI
+        # time to finish folding first. Short messages never fold, so they keep
+        # the old zero-latency path.
+        if len(payload) >= _PASTE_FOLD_MIN_CHARS:
+            time.sleep(_PASTE_SETTLE)
+
         # Press Enter to submit
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
-        return result.returncode == 0
+        if result.returncode != 0:
+            logger.warning(
+                "send_input: Enter keypress failed (thread=%d): %s",
+                thread_id,
+                result.stderr.strip(),
+            )
+            return False
+        return self._confirm_submitted(target, payload, thread_id)
+
+    def input_box_holds(self, thread_id: int, text: str) -> bool | None:
+        """Is *text* still sitting unsent in this thread's input box? (#560)
+
+        Used on the delivery-failure path to tell the two failure modes apart:
+        a pane that never took the input at all (#527 — the advice there is
+        ``/restart-claude``) versus a message that is typed in and just will not
+        submit, where restarting would **throw the user's message away**.
+
+        ``None`` when it cannot be determined.
+        """
+        if not self._check_available():
+            return None
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return None
+        capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", f"{self.session_name}:{window}"])
+        if capture.returncode != 0:
+            return None
+        from .transcript.formatter import ZWSP_MARKER
+        from .transcript.mirror import bridge_mode_jsonl
+
+        payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
+        return _input_box_retains(capture.stdout, payload)
+
+    def _confirm_submitted(self, target: str, payload: str, thread_id: int) -> bool:
+        """Read the input box back and make sure the message actually left it (#560).
+
+        The Enter ``send-keys`` exits 0 whether or not the TUI acted on it, so
+        its return code proves nothing.  Before this check c-lord reported
+        success for messages that were still sitting in the box — the turn then
+        died on an idle timeout and neither the user nor the log said why.
+
+        A message still in the box gets another Enter, up to
+        :data:`_SUBMIT_ATTEMPTS` looks.  If it still will not go, return
+        ``False`` so the caller surfaces a delivery failure rather than a silent
+        drop.  Anything we cannot read is reported as success — see
+        :func:`_input_box_retains` for why this only ever acts on positive
+        evidence.
+        """
+        for attempt in range(1, _SUBMIT_ATTEMPTS + 1):
+            time.sleep(_SUBMIT_SETTLE if attempt == 1 else _SUBMIT_RETRY_DELAY)
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            if capture.returncode != 0:
+                logger.warning(
+                    "send_input: could not read the pane back to confirm delivery (thread=%d): %s",
+                    thread_id,
+                    capture.stderr.strip(),
+                )
+                return True
+            retained = _input_box_retains(capture.stdout, payload)
+            if retained is None:
+                logger.warning(
+                    "send_input: could not locate the input box to confirm delivery "
+                    "(thread=%d); assuming the message was submitted",
+                    thread_id,
+                )
+                return True
+            if not retained:
+                if attempt > 1:
+                    logger.info(
+                        "send_input: message submitted after %d Enter press(es) (thread=%d)",
+                        attempt,
+                        thread_id,
+                    )
+                return True
+            if _pane_has_open_menu(capture.stdout):
+                # Pressing Enter again would answer the menu rather than submit
+                # (#485's failure mode). Whatever is in the box, it is not worth
+                # fabricating a menu answer over.
+                logger.warning(
+                    "send_input: input box still holds the message but a menu is open "
+                    "(thread=%d); not pressing Enter again",
+                    thread_id,
+                )
+                return True
+            if attempt < _SUBMIT_ATTEMPTS:
+                logger.warning(
+                    "send_input: message is still in the input box after Enter "
+                    "(attempt %d/%d, thread=%d); pressing Enter again (#560)",
+                    attempt,
+                    _SUBMIT_ATTEMPTS,
+                    thread_id,
+                )
+                _run(["tmux", "send-keys", "-t", target, "Enter"])
+        logger.error(
+            "send_input: message never left the input box after %d Enter presses "
+            "(thread=%d, %d chars); reporting a delivery failure instead of a "
+            "silent drop (#560)",
+            _SUBMIT_ATTEMPTS,
+            thread_id,
+            len(payload),
+        )
+        return False
 
     def send_literal(self, thread_id: int, text: str) -> bool:
         """Send literal text to the pane WITHOUT submitting (no Enter) (#172).
@@ -2043,9 +2384,22 @@ class TmuxSessionManager:
     # ── Cleanup ──────────────────────────────────────────────────────
 
     def cleanup_orphaned(self, active_thread_ids: set[int]) -> int:
-        """Kill tmux windows whose threads are no longer active.
+        """Kill leftover tmux windows in this session. Returns the count killed.
 
-        Returns the number of windows killed.
+        A window is reaped only when **all three** hold:
+
+        1. it carries an ``@thread_id`` — windows without one were created by
+           hand (``factorio-server-1``, ``work3``, …) and are none of our
+           business,
+        2. its thread is not in *active_thread_ids*, and
+        3. **its pane is not running Claude.**
+
+        Condition 3 is the one that makes this callable at all (#570). Callers
+        pass ``active_thread_ids=set()`` at startup — the bot has no in-flight
+        threads yet — so membership alone would mark *every* window orphaned and
+        kill live sessions. The pane's foreground command is the only signal
+        that separates a leftover shell from a running Claude, and it is read
+        fresh from tmux rather than inferred from our own bookkeeping.
         """
         if not self._check_available():
             return 0
@@ -2056,7 +2410,68 @@ class TmuxSessionManager:
             if not tid_str.isdigit():
                 continue
             thread_id = int(tid_str)
-            if thread_id not in active_thread_ids and self.kill_session(thread_id):
+            if thread_id in active_thread_ids:
+                continue
+            window_name = window.get("window_name", "")
+            if window_name and self._window_has_claude(window_name):
+                logger.debug(
+                    "cleanup_orphaned: %s:%s still runs Claude — keeping (thread=%d)",
+                    self.session_name,
+                    window_name,
+                    thread_id,
+                )
+                continue
+            if self.kill_session(thread_id):
                 killed += 1
 
         return killed
+
+
+def list_tmux_sessions() -> list[str]:
+    """Every tmux session name on this host, or ``[]`` when tmux is unusable."""
+    if not _tmux_available():
+        return []
+    result = _run(["tmux", "list-sessions", "-F", "#{session_name}"])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def cleanup_orphaned_all_sessions(active_thread_ids: set[int]) -> int:
+    """Reap leftover c-lord windows across **every** tmux session.
+
+    :meth:`TmuxSessionManager.cleanup_orphaned` only ever looks at its own
+    ``session_name``. Since #427 the session name follows the *repo*, so real
+    windows live in ``c-lord`` / ``project_30_ehon-ya`` / ``pt-jp`` / … while
+    ``bot.tmux_manager`` points at the default ``clord`` — which on a busy host
+    holds no windows at all. A reaper bound to that one session covers nothing.
+
+    Scanning every session is safe because the per-window guards do the
+    filtering: a window is only touched when it carries an ``@thread_id`` and
+    is not running Claude. Sessions a human created by hand are full of windows
+    with neither, so they are skipped without needing an allowlist of names —
+    which matters because c-lord's repo-derived names (``games``, ``pt-jp``)
+    collide with hand-made sessions of the same name.
+
+    Returns the total number of windows killed.
+    """
+    total = 0
+    for session_name in list_tmux_sessions():
+        # mapping_path="" keeps this off the on-disk window map: the reaper is a
+        # read-mostly sweep and must not rewrite another manager's cache file.
+        mgr = TmuxSessionManager(session_name=session_name, mapping_path="")
+        try:
+            killed = mgr.cleanup_orphaned(active_thread_ids)
+        except Exception:
+            logger.warning(
+                "cleanup_orphaned_all_sessions: session %s failed", session_name, exc_info=True
+            )
+            continue
+        if killed:
+            logger.info(
+                "cleanup_orphaned_all_sessions: killed %d orphaned window(s) in session %s",
+                killed,
+                session_name,
+            )
+        total += killed
+    return total

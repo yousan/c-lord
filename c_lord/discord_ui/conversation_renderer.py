@@ -21,6 +21,7 @@ client's actual rendering, a human screenshot remains authoritative.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILImageDraw
     from PIL import ImageFont
+
+logger = logging.getLogger(__name__)
 
 
 # ── Data model (decoupled from live discord.py objects, for testability) ──────
@@ -358,6 +361,86 @@ def _split_code_blocks(content: str) -> list[tuple[str, str]]:
     return [(k, v) for k, v in blocks if v.strip() or k == "text"]
 
 
+#: Discord packs at most three ``inline`` fields onto one row.
+INLINE_PER_ROW = 3
+
+#: Horizontal gap between inline columns, in pixels.
+_INLINE_GAP = 10
+
+
+def _messages_contain_emoji(messages: list[ConvMessage]) -> bool:
+    """True when any text in *messages* holds a character outside the BMP-text
+    range that the body font can be expected to cover.
+
+    Deliberately a cheap codepoint test rather than the ``emoji`` library: this
+    runs precisely when that library is unavailable.
+    """
+
+    def _has(text: str | None) -> bool:
+        if not text:
+            return False
+        return any(ord(ch) >= 0x2190 for ch in text)
+
+    for m in messages:
+        if _has(m.content) or _has(m.author):
+            return True
+        for a in m.attachments:
+            if _has(a.filename):
+                return True
+        for r in m.reactions:
+            if _has(r.emoji):
+                return True
+        for e in m.embeds:
+            if _has(e.title) or _has(e.description):
+                return True
+            for f in e.fields:
+                if _has(f.name) or _has(f.value):
+                    return True
+    return False
+
+
+def emoji_support_available() -> bool:
+    """Whether the optional ``emoji`` library is importable.
+
+    Without it :func:`c_lord.discord_ui.table_renderer._segment_runs` classifies
+    every cluster as *not* an emoji, so emoji get drawn with the body font — i.e.
+    as tofu. Callers use this to refuse rather than emit a broken picture (#588).
+    """
+    try:
+        import emoji  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def group_fields_into_rows(
+    fields: list[ConvField] | tuple[ConvField, ...],
+) -> list[list[ConvField]]:
+    """Group *fields* the way Discord lays them out.
+
+    Consecutive ``inline`` fields share a row, at most :data:`INLINE_PER_ROW` of
+    them. A non-inline field takes a whole row **and breaks the run**, so
+    ``a b | wide | c`` renders as three rows rather than folding ``c`` back up
+    next to ``a b``.
+    """
+    rows: list[list[ConvField]] = []
+    run: list[ConvField] = []
+    for f in fields:
+        if not f.inline:
+            if run:
+                rows.append(run)
+                run = []
+            rows.append([f])
+            continue
+        run.append(f)
+        if len(run) == INLINE_PER_ROW:
+            rows.append(run)
+            run = []
+    if run:
+        rows.append(run)
+    return rows
+
+
 def _layout_embed(
     e: ConvEmbed,
     y: int,
@@ -374,20 +457,55 @@ def _layout_embed(
     pad = 12
     emoji_h = int(BODY_SIZE * 1.15)
 
-    items: list[tuple[object, str, tuple[int, int, int], bool, int]] = []
-    if e.title:
-        for ln in _wrap_rich(draw, e.title, fonts.name, inner_w, emoji_h):
-            items.append((fonts.name, ln, _rgb(e.color) or NAME_DEFAULT, True, _line_h(fonts.name)))
-    if e.description:
-        for ln in _wrap_rich(draw, e.description, fonts.body, inner_w, emoji_h):
-            items.append((fonts.body, ln, EMBED_TEXT, False, body_h))
-    for f in e.fields:
-        for ln in _wrap_rich(draw, f.name, fonts.name, inner_w, emoji_h):
-            items.append((fonts.name, ln, NAME_DEFAULT, True, _line_h(fonts.name, 2)))
-        for ln in _wrap_rich(draw, f.value, fonts.body, inner_w, emoji_h):
-            items.append((fonts.body, ln, EMBED_TEXT, False, body_h))
+    # An embed is laid out as rows of columns. Title and description are
+    # single-column rows; a group of inline fields is one row with up to
+    # INLINE_PER_ROW columns. Every column in a row starts at the same y, and the
+    # row is as tall as its tallest column — which is what stops inline fields
+    # from stacking vertically (#588).
+    # (font, line, color, bold, height)
+    line_t = tuple[object, str, tuple[int, int, int], bool, int]
+    # (dx from inner_x, lines)
+    column_t = tuple[int, list[line_t]]
+    rows: list[list[column_t]] = []
 
-    inner_h = sum(it[4] for it in items)
+    def _lines(
+        text: str, font: object, color: tuple[int, int, int], bold: bool, h: int, width: int
+    ) -> list[line_t]:
+        return [(font, ln, color, bold, h) for ln in _wrap_rich(draw, text, font, width, emoji_h)]
+
+    if e.title:
+        rows.append(
+            [
+                (
+                    0,
+                    _lines(
+                        e.title,
+                        fonts.name,
+                        _rgb(e.color) or NAME_DEFAULT,
+                        True,
+                        _line_h(fonts.name),
+                        inner_w,
+                    ),
+                )
+            ]
+        )
+    if e.description:
+        rows.append([(0, _lines(e.description, fonts.body, EMBED_TEXT, False, body_h, inner_w))])
+
+    for group in group_fields_into_rows(e.fields):
+        n = len(group)
+        col_w = (inner_w - _INLINE_GAP * (n - 1)) // n
+        columns: list[column_t] = []
+        for i, f in enumerate(group):
+            lines = _lines(f.name, fonts.name, NAME_DEFAULT, True, _line_h(fonts.name, 2), col_w)
+            lines += _lines(f.value, fonts.body, EMBED_TEXT, False, body_h, col_w)
+            columns.append((i * (col_w + _INLINE_GAP), lines))
+        rows.append(columns)
+
+    def _row_h(row: list[column_t]) -> int:
+        return max((sum(ln[4] for ln in lines) for _, lines in row), default=0)
+
+    inner_h = sum(_row_h(r) for r in rows)
     box_h = inner_h + 2 * pad
     if not dry:
         draw.rounded_rectangle((GUTTER, y, WIDTH - MARGIN, y + box_h), radius=6, fill=EMBED_BG)
@@ -395,11 +513,26 @@ def _layout_embed(
             (GUTTER, y, GUTTER + 4, y + box_h), radius=2, fill=_rgb(e.color) or EMBED_BAR_DEFAULT
         )
         yy = y + pad
-        for font, ln, color, bold, h in items:
-            _draw_rich(
-                img, draw, inner_x, yy, ln, font, fonts, color, emoji_h, cache, bold=bold, dry=dry
-            )
-            yy += h
+        for row in rows:
+            for dx, lines in row:
+                ly = yy
+                for font, ln, color, bold, h in lines:
+                    _draw_rich(
+                        img,
+                        draw,
+                        inner_x + dx,
+                        ly,
+                        ln,
+                        font,
+                        fonts,
+                        color,
+                        emoji_h,
+                        cache,
+                        bold=bold,
+                        dry=dry,
+                    )
+                    ly += h
+            yy += _row_h(row)
     return y + box_h + 6
 
 
@@ -557,6 +690,18 @@ def render_conversation_png(
     try:
         from PIL import Image, ImageDraw
     except ImportError:
+        return None
+
+    # #588: without the ``emoji`` library every emoji is drawn with the body font
+    # — as tofu — and the old code reported success anyway. A mockup is evidence
+    # someone adjudicates a design from, so a silently broken picture is worse
+    # than none. Only refuse when the spec actually contains emoji: an ASCII-only
+    # spec renders correctly without the extra.
+    if not emoji_support_available() and _messages_contain_emoji(messages):
+        logger.warning(
+            "conversation mockup: spec contains emoji but the 'emoji' library is "
+            "missing — refusing to render tofu. Install it with: uv sync --extra table"
+        )
         return None
 
     text_font = load_text_font(BODY_SIZE)
