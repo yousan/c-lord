@@ -752,8 +752,7 @@ class MenuWatchdogLoop:
         from .discord_ui.ask_handler import bridge_pane_ask
 
         logger.info(
-            "menu watchdog: bridging unwatched TUI menu "
-            "(thread=%d header=%r context_chars=%d)",
+            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r context_chars=%d)",
             thread_id,
             question.header,
             len(question.context),
