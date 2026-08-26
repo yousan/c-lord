@@ -155,3 +155,56 @@ class TestVocabulary:
         with two different nouns in adjacent messages."""
         e = workspace_notice_embed(action, reason=reason, idle_label="7日間")
         assert "作業セッション" not in _text(e)
+
+
+class TestDockerRowReportsWhatActuallyHappened:
+    """The row must never claim something the caller did not do.
+
+    #571 wires the notice into ``/close-workspace`` *before* #574 teaches it to
+    stop containers. If the row were derived from the action alone it would
+    announce "⏹ 停止（ポート解放）" while the containers kept running and kept
+    their ports — a notice that lies is worse than no notice.
+    """
+
+    def test_left_running_is_reported_as_running(self) -> None:
+        from c_lord.workspace_notice import DockerOutcome
+
+        e = workspace_notice_embed(
+            WorkspaceAction.STOP,
+            reason=WorkspaceReason.MANUAL,
+            containers=[_c("db", (5432,))],
+            docker=DockerOutcome.LEFT_RUNNING,
+        )
+        fields = {f.name: f.value for f in e.fields}
+        assert "動いたまま" in fields["開発環境 (docker)"]
+        assert "停止" not in fields["開発環境 (docker)"]
+
+    def test_left_running_on_stop_still_warns_about_ports(self) -> None:
+        """Ports the user must know about are not a sleep-only concern."""
+        from c_lord.workspace_notice import DockerOutcome
+
+        e = workspace_notice_embed(
+            WorkspaceAction.STOP,
+            reason=WorkspaceReason.MANUAL,
+            containers=[_c("db", (5432,))],
+            docker=DockerOutcome.LEFT_RUNNING,
+        )
+        assert "5432" in _text(e)
+
+    def test_stopped_is_reported_with_released_ports(self) -> None:
+        from c_lord.workspace_notice import DockerOutcome
+
+        e = workspace_notice_embed(
+            WorkspaceAction.STOP,
+            reason=WorkspaceReason.MANUAL,
+            containers=[_c("db", (5432,))],
+            docker=DockerOutcome.STOPPED,
+        )
+        fields = {f.name: f.value for f in e.fields}
+        assert "停止" in fields["開発環境 (docker)"]
+        assert "5432" in fields["開発環境 (docker)"]
+
+    def test_no_containers_is_reported_explicitly(self) -> None:
+        """The inventory never silently drops a row."""
+        e = workspace_notice_embed(WorkspaceAction.STOP, reason=WorkspaceReason.MANUAL)
+        assert "開発環境 (docker)" in {f.name for f in e.fields}

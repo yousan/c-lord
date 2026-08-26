@@ -13,6 +13,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
@@ -21,6 +22,7 @@ from discord.ext import commands
 
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
+from ..devenv import DevContainer, containers_for_session_dir
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..session_close import apply_closed_name, apply_open_name, is_closed
@@ -35,6 +37,12 @@ from ..thread_settings import (
 from ..tmux import parse_work_number
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
+from ..workspace_notice import (
+    DockerOutcome,
+    WorkspaceAction,
+    WorkspaceReason,
+    workspace_notice_embed,
+)
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
@@ -1246,14 +1254,7 @@ class SessionManageCog(commands.Cog):
         # Kill the tmux window to free the w<N> slot.
         tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is not None:
-            killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
-            if killed:
-                results.append("✅ Tmux window closed")
-            else:
-                results.append("ℹ️ No tmux window found")
-            results.append(
-                "📂 ワークスペースは保持しています（履歴・作業ディレクトリはそのまま）。"
-            )
+            await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
         else:
             results.append(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
@@ -1276,16 +1277,32 @@ class SessionManageCog(commands.Cog):
         new_name = await apply_closed_name(self.repo, channel)
         if new_name:
             results.append(f"🏷️ スレッド名: `{new_name}`")
-        results.append(
-            "▶️ 再開するには `/reopen-workspace`。"
-            "終了後にこのスレッドへ投稿すると、再開ボタン付きの案内が出ます。"
-        )
 
-        embed = discord.Embed(
-            title="🧹 Workspace Closed",
-            description="\n".join(results),
-            color=COLOR_SUCCESS,
+        # #571: the notice is an inventory, not a label — it says what stopped
+        # *and* what survived, because that is the question the reader has.
+        # Built by the one shared function so the manual and automatic notices
+        # cannot drift (the #538 failure mode).
+        #
+        # docker is reported as LEFT_RUNNING because that is the truth today:
+        # this command does not stop containers yet (#574 adds that). Deriving
+        # the row from the action instead would announce released ports that are
+        # in fact still held — and a notice that lies is worse than none.
+        containers: list[DevContainer] = []
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(parent_channel_id)
+            if sdm is not None:
+                containers = await containers_for_session_dir(
+                    str(Path(sdm.base_dir) / str(thread_id))
+                )
+
+        embed = workspace_notice_embed(
+            WorkspaceAction.STOP,
+            reason=WorkspaceReason.MANUAL,
+            containers=containers,
+            docker=DockerOutcome.LEFT_RUNNING if containers else DockerOutcome.NONE,
         )
+        if results:
+            embed.add_field(name="メモ", value="\n".join(results), inline=False)
         await respond(embed=embed)
 
     @app_commands.command(

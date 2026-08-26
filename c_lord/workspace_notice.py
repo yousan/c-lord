@@ -52,6 +52,29 @@ class WorkspaceAction(Enum):
     DELETE = "delete"
 
 
+class DockerOutcome(Enum):
+    """What the caller actually did to the dev environment.
+
+    Deliberately not derived from the action. #571 wires this notice into
+    ``/close-workspace`` before #574 teaches that command to stop containers, so
+    an action-derived row would announce "停止（ポート解放）" while the containers
+    kept running and kept their ports. A notice that lies is worse than none, and
+    an enum the caller must pass cannot drift into prose.
+    """
+
+    NONE = "none"
+    """No dev environment found."""
+
+    LEFT_RUNNING = "left_running"
+    """Containers were found and deliberately not touched."""
+
+    STOPPED = "stopped"
+    """Containers were stopped; their host ports are free again."""
+
+    REMOVED = "removed"
+    """Containers were removed entirely."""
+
+
 class WorkspaceReason(Enum):
     """Who triggered it. Changes the wording, never the effect."""
 
@@ -98,18 +121,21 @@ def _running_ports(containers: list[DevContainer]) -> list[int]:
     return sorted(ports)
 
 
-def _docker_value(action: WorkspaceAction, containers: list[DevContainer]) -> str:
-    if action is WorkspaceAction.SLEEP:
-        if not containers:
-            return "— （なし）"
-        return "▶️ 動いたまま"
-    if not containers:
+def _all_ports(containers: list[DevContainer]) -> list[int]:
+    """Every host port these containers bind, running or not."""
+    return sorted({p for c in containers for p in c.ports})
+
+
+def _docker_value(outcome: DockerOutcome, containers: list[DevContainer]) -> str:
+    if outcome is DockerOutcome.NONE or not containers:
         return "— （なし）"
-    ports = _running_ports(containers)
-    if action is WorkspaceAction.DELETE:
-        return "🗑️ 削除" + (f"（:{' :'.join(str(p) for p in ports)} を解放）" if ports else "")
-    released = f"（:{' :'.join(str(p) for p in ports)} を解放）" if ports else ""
-    return f"⏹ 停止{released}"
+    if outcome is DockerOutcome.LEFT_RUNNING:
+        return "▶️ 動いたまま"
+    ports = _all_ports(containers)
+    freed = f"（:{' :'.join(str(p) for p in ports)} を解放）" if ports else ""
+    if outcome is DockerOutcome.REMOVED:
+        return f"🗑️ 削除{freed}"
+    return f"⏹ 停止{freed}"
 
 
 def _workdir_value(action: WorkspaceAction, freed_mb: int | None) -> str:
@@ -124,6 +150,7 @@ def workspace_notice_embed(
     reason: WorkspaceReason,
     idle_label: str | None = None,
     containers: list[DevContainer] | None = None,
+    docker: DockerOutcome | None = None,
     freed_mb: int | None = None,
 ) -> discord.Embed:
     """Build the notice for *action*.
@@ -136,6 +163,19 @@ def workspace_notice_embed(
     is never silently short a row.
     """
     containers = containers or []
+    if docker is None:
+        # Default to what each action is *specified* to do, so callers that have
+        # nothing surprising to report stay terse. Callers that deviate — like
+        # /close-workspace before #574 — must say so explicitly.
+        docker = (
+            DockerOutcome.NONE
+            if not containers
+            else DockerOutcome.LEFT_RUNNING
+            if action is WorkspaceAction.SLEEP
+            else DockerOutcome.REMOVED
+            if action is WorkspaceAction.DELETE
+            else DockerOutcome.STOPPED
+        )
 
     lines: list[str] = []
     if reason is WorkspaceReason.IDLE:
@@ -152,15 +192,17 @@ def workspace_notice_embed(
     # The inventory. Order is deliberate: what stopped first, what survived
     # after, so the reassuring half is what the eye lands on last.
     embed.add_field(name="Claude", value="⏹ 停止", inline=True)
-    embed.add_field(name="開発環境 (docker)", value=_docker_value(action, containers), inline=True)
+    embed.add_field(name="開発環境 (docker)", value=_docker_value(docker, containers), inline=True)
     embed.add_field(name="作業フォルダ", value=_workdir_value(action, freed_mb), inline=True)
     embed.add_field(name="会話履歴", value=_KEPT, inline=True)
     embed.add_field(name="DBのデータ (volume)", value=_KEPT, inline=True)
 
-    # Sleep deliberately leaves docker up, so the ports stay taken. That is the
-    # one thing the reader cannot work out for themselves, and the one thing
-    # that will bite them (a port collision) next time they start something.
-    if action is WorkspaceAction.SLEEP:
+    # Leaving docker up means the host ports stay taken. That is the one thing
+    # the reader cannot work out for themselves, and the one thing that will
+    # bite them (a port collision) next time they start an environment. Keyed on
+    # the outcome, not the action: /close-workspace also leaves them running
+    # until #574, and the warning matters just as much there.
+    if docker is DockerOutcome.LEFT_RUNNING:
         ports = _running_ports(containers)
         if ports:
             detail = " / ".join(
