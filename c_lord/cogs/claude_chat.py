@@ -685,14 +685,22 @@ class ClaudeChatCog(commands.Cog):
         3. **The notice, once per thread per process.** It names the next step; it
            is also a wall of text, so it is not repeated on every message.
 
-        In a thread that is not ours (#522) none of that is posted and the log line
+        Two cases get the log line only. In a thread that is not ours (#522) it
         drops to DEBUG: several c-lord instances can share a guild and every one of
         them sees this message, so answering would mean each bystander bot posting
-        the same notice. Nothing here may raise — this is already the path for a
-        message we are failing to run.
+        the same notice. And while a turn is already in flight, the row is simply
+        not written yet — see below. Nothing here may raise: this is already the
+        path for a message we are failing to run.
         """
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        if thread.id in self._active_runners or self.is_processing(thread.id):
+            # A freshly spawned thread has no row until Claude emits its first
+            # session_id, so a message sent in that window is not an untracked
+            # thread — it is a session being born. Saying "no session to restore"
+            # here would be wrong, and would be the first thing a new user sees.
+            logger.info("%s message not run — the first turn is still starting (#538)", ctx)
+            return
         if not await self._is_our_thread(parent_channel_id, thread.id, message):
             # Another instance's thread: DEBUG, so a shared guild's traffic does
             # not drown the log — the INFO line below is for threads we own.

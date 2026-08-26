@@ -254,6 +254,26 @@ class TestUntrackedThreadIsAnswered:
         thread.send.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_quiet_while_the_first_turn_is_still_starting(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A brand-new thread has no row until Claude emits its first session_id.
+
+        Telling the user "this thread has no session" in that window would be
+        wrong — the session is being created right now.
+        """
+        cog = _make_cog()
+        message, thread = _make_message()
+        cog._active_runners[thread.id] = MagicMock()
+
+        with caplog.at_level(logging.INFO, logger="c_lord.cogs.claude_chat"):
+            await cog.on_message(message)
+
+        thread.send.assert_not_awaited()
+        message.add_reaction.assert_not_awaited()
+        assert any("thread=42" in r.getMessage() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
     async def test_tracked_thread_is_untouched(self) -> None:
         """A thread with a row keeps running Claude and gets no notice."""
         cog = _make_cog()
