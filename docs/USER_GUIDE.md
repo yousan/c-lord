@@ -167,6 +167,20 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 - 🔄 In progress
 - ⬜ Pending
 
+### Progress folding (`progress.txt`)
+
+The intermediate embeds a turn produces — session start, thinking, tool use and
+tool results, the todo list — are useful while the turn is in flight and noise
+once it is over. At the end of a turn they are folded into a single
+`progress.txt` transcript and the originals are deleted.
+
+- A turn that produced **nothing worth reading** (no tool use, no thinking — the
+  session-start banner alone does not count) posts **no `progress.txt` at all**.
+  The intermediate embeds are still cleaned up, so the thread simply ends with
+  the answer (#542).
+- When `progress.txt` is posted on its own rather than attached to a message
+  that already has text, it carries a one-line caption saying what the file is.
+
 ---
 
 ## Slash Commands
