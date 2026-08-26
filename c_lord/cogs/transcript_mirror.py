@@ -33,7 +33,7 @@ from ..transcript.mirror import (
     silent_posts_enabled,
     verbosity_mode,
 )
-from ..transcript.recovery import final_answer_needs_recovery
+from ..transcript.recovery import final_answer_needs_recovery_async
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -68,8 +68,16 @@ class TranscriptMirrorCog(commands.Cog):
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
         recovered = 0
+        closed = 0
         for row in rows:
             if not row.working_dir:
+                continue
+            # Issue #537: a closed workspace (``!close-workspace``) keeps its
+            # row and its transcript — often the biggest ones on disk. Nobody is
+            # waiting on it, so neither the recovery scan nor a mirror is worth
+            # the startup cost.
+            if getattr(row, "closed_at", None):
+                closed += 1
                 continue
             # Issue #215: re-deliver a final answer that was written to the
             # jsonl while the bot was down (mirror not tailing). The resumed
@@ -86,10 +94,11 @@ class TranscriptMirrorCog(commands.Cog):
             if self.start_for(row.thread_id, row.working_dir):
                 started += 1
         logger.info(
-            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s), "
-            "recovered %d dropped final answer(s)",
+            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s) "
+            "(%d closed row(s) skipped), recovered %d dropped final answer(s)",
             started,
             len(rows),
+            closed,
             recovered,
         )
 
@@ -107,7 +116,8 @@ class TranscriptMirrorCog(commands.Cog):
         # the last completed turn's final answer, and the equality test then read
         # that as a drop and re-posted an answer the user had already read. Ask
         # the ordering question instead: has the cursor already passed it?
-        fa = final_answer_needs_recovery(derive_project_dir(working_dir), stored)
+        # Awaited off the loop (#537): the scan reads a whole transcript.
+        fa = await final_answer_needs_recovery_async(derive_project_dir(working_dir), stored)
         if fa is None:
             return False
         if stored is None:

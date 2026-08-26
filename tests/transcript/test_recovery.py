@@ -163,18 +163,20 @@ def test_recovers_an_answer_written_while_the_mirror_was_down(tmp_path: Path) ->
     assert fa.text == "second turn answer — never delivered"
 
 
-def test_unknown_cursor_is_treated_as_delivered(tmp_path: Path) -> None:
-    """A cursor from another session file says nothing about THIS file.
+def test_cursor_from_another_transcript_still_recovers(tmp_path: Path) -> None:
+    """A cursor that is missing here means nothing was ever delivered from here.
 
-    Guessing "dropped" there is what spams; guessing "delivered" at worst skips
-    a rescue in a corner case (a /clear between the delivery and the restart).
-    Duplicates are the harm being fixed, so the tie goes to silence.
+    The mirror commits the cursor as it delivers, so a delivery out of *this*
+    file would have left its uuid in *this* file. A cursor pointing elsewhere
+    (a ``/clear`` started a fresh transcript) therefore describes a mirror that
+    was down for the whole file — the #215 rescue case, not the #553 one.
     """
     from c_lord.transcript.recovery import final_answer_needs_recovery
 
     _write_jsonl(tmp_path / "s.jsonl", [_assistant("u-final", "done"), _turn_end()])
 
-    assert final_answer_needs_recovery(tmp_path, "u-from-another-session") is None
+    fa = final_answer_needs_recovery(tmp_path, "u-from-another-session")
+    assert fa is not None and fa.uuid == "u-final"
 
 
 def test_no_cursor_yields_the_answer_for_seeding(tmp_path: Path) -> None:
