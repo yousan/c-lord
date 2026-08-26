@@ -231,6 +231,43 @@ it:
    made. Last line of defense: even if a menu is somehow stuck open, a message
    cancels it and is delivered as text, never as a selection.
 
+## One menu, one owner (#535)
+
+Four independent paths can spot the same open TUI menu:
+
+| Path | Trigger |
+|---|---|
+| `cogs/event_processor.py::_handle_pane_ask` | the live turn's poll loop yields `pane_ask` |
+| `cogs/_run_helper.py` (post-turn recovery, #219/#222) | the menu rendered just after the turn finalized |
+| `cogs/transcript_mirror.py::_make_ask_bridge` (#232) | the jsonl carries the `AskUserQuestion` tool call |
+| `thread_state_sync.py::_maybe_bridge_open_menu` (#359) | sweep finds a menu no turn is watching |
+
+They are all deliberate — each covers a case the others miss — so the question
+is never "which one runs" but "which one **owns** the menu". Ownership is the
+ask-bus registration, and `AskAnswerBus.register()` is the single atomic step
+that grants it: the first caller gets the answer Queue, every later caller gets
+`None` and returns before posting anything.
+
+**What this replaced.** `register()` used to overwrite the existing waiter, and
+only two of the four paths checked `is_active` first. So two bridges could both
+pass the check and both post — the user saw the *same question twice* (one copy
+mentioning them, one not), each copy live, with no way to tell which one
+counted. Worse, the second registration silently discarded the first bridge's
+Queue, so the bridge that was actually waiting could never be answered: it sat
+out the full 24 h `ASK_ANSWER_TIMEOUT` holding its turn, and Claude — never
+hearing back — eventually asked a *third* time.
+
+A pre-check cannot fix this. `is_active()` and `register()` are two steps, and
+both bridges can pass the check before either registers; the mirror widened that
+window further by spawning its bridge as a background task between the two. So
+`register()` itself refuses, and the `is_active` pre-checks that remain are only
+cheap early exits, not the guarantee.
+
+**What a losing bridge does: nothing, immediately.** It posts no buttons, no
+duplicate pre-menu prose, sends no keystrokes, and — the part that used to wedge
+threads — never enters the 24 h await. The owner answers the menu; the loser's
+work was already done for it.
+
 ## A menu only counts while claude is alive (#510)
 
 Pane text outlives the process that drew it. When claude exits — a crash, a
@@ -281,6 +318,7 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | Detect & yield `pane_ask` event | `tmux_runner.py::run` (poll loop) |
 | Ignore menus in a pane whose claude has exited (#510) | `c_lord/tmux.py::pane_command_is_dead`, `TmuxSessionManager.pane_foreground_command`, `thread_state_sync.py::_maybe_bridge_open_menu`, `tmux_runner.py::peek_menu_state` |
 | Show buttons / route answer / post context | `c_lord/discord_ui/ask_handler.py::bridge_pane_ask` |
+| One-owner-per-thread menu arbitration (#535) | `c_lord/discord_ui/ask_bus.py::AskAnswerBus.register` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |

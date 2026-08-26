@@ -232,6 +232,16 @@ tmux session gone (killed together with the bot / tmux-server death):
               context reads as a restore, not a broken bot (#464).
 ```
 
+### Threads c-lord has no record of
+
+A thread whose session record is gone (deleted workspace, rebuilt database, a thread
+created by another host) **cannot** be resumed. c-lord no longer swallows those
+messages: the message gets a ⚠️ reaction, the thread gets a one-time notice saying it
+did **not** reach Claude, and the notice names the way forward — `/clord <task>` starts
+a fresh session right there. The stopped-session hint from `/tmux-screenshot` and
+`/resync` says the same thing rather than promising a resume that cannot happen (#538).
+See [specs/session-resume.md](specs/session-resume.md).
+
 ### What Happens Under the Hood
 
 ```

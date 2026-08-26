@@ -31,6 +31,7 @@ from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
 from ..discord_ui.progress_folder import ProgressFolder
 from ..discord_ui.tool_timer import LiveToolTimer
+from ..utils.logger import log_ctx
 from .run_config import RunConfig
 
 logger = logging.getLogger(__name__)
@@ -388,6 +389,20 @@ class EventProcessor:
         if not hasattr(runner, "answer_menu"):
             # Non-tmux runner — nothing to answer in a pane.  Skip gracefully.
             logger.warning("pane_ask received but runner cannot answer menus; skipping")
+            return
+        # #535: this menu may already be on screen — the transcript mirror and
+        # the #359 watchdog bridge the same TUI menu from their own triggers.
+        # Bridging it again posted a second, identical set of buttons and stole
+        # the first bridge's answer queue.  ``bridge_pane_ask`` refuses the
+        # duplicate on its own (register is the atomic claim); checking here as
+        # well keeps the "bridged and answered" log honest and skips the work.
+        from ..discord_ui.ask_bus import ask_bus
+
+        if ask_bus.is_active(self._config.thread.id):
+            logger.info(
+                "%s pane_ask ignored — another bridge already owns this menu (#535)",
+                log_ctx(thread_id=self._config.thread.id),
+            )
             return
         from ..discord_ui.ask_handler import bridge_pane_ask
 
