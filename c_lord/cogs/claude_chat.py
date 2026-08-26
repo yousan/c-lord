@@ -1682,9 +1682,9 @@ class ClaudeChatCog(commands.Cog):
                 reopened = thread.id in self._reopened_threads
                 self._reopened_threads.discard(thread.id)
                 notice = (
-                    "🔄 終了していたセッションを復元して、続きから再開します。"
+                    "🔄 停止していたワークスペースを復元して、続きから再開します。"
                     if reopened
-                    else "🔄 前回のセッションが落ちていたので、これまでの会話を復元して続けます。"
+                    else "🔄 前回のワークスペースが落ちていたので、会話を復元して続けます。"
                 )
                 with contextlib.suppress(discord.HTTPException):
                     await thread.send(notice)
