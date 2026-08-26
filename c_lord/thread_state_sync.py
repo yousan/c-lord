@@ -725,12 +725,37 @@ class MenuWatchdogLoop:
             return
         runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
 
+        # #549: long pre-menu prose (経緯・推し) scrolls off the alternate screen,
+        # which keeps no scrollback, so the capture above returns the menu with
+        # ``context=""`` — the question then reaches Discord with no decision
+        # context, and the prose only appears after the answer, out of order.
+        # The poll loop has recovered this since #468 by transiently growing the
+        # window (Claude redraws its conversation on SIGWINCH); the watchdog
+        # never did, which is exactly the reported #549 case. Same conditions as
+        # the poll loop: only when the first read came up empty, so an ordinary
+        # menu never pays the resize round-trip.
+        if not question.context and hasattr(tmux_manager, "capture_pane_tall"):
+            tall = await asyncio.to_thread(tmux_manager.capture_pane_tall, thread_id)
+            if isinstance(tall, str) and tall:
+                recovered = _parse_ask_from_pane(_normalize_capture(tall)) or _parse_plan_from_pane(
+                    _normalize_capture(tall)
+                )
+                if recovered is not None and recovered.context:
+                    question = recovered
+                    logger.info(
+                        "menu watchdog: recovered pre-menu context via tall capture "
+                        "(thread=%d, context_chars=%d)",
+                        thread_id,
+                        len(recovered.context),
+                    )
+
         from .discord_ui.ask_handler import bridge_pane_ask
 
         logger.info(
-            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r)",
+            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r context_chars=%d)",
             thread_id,
             question.header,
+            len(question.context),
         )
 
         async def _bridge_and_report() -> None:

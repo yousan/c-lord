@@ -647,3 +647,84 @@ async def test_interrupted_menu_stops_showing_live_buttons(monkeypatch):
     kwargs = msg.edit.await_args.kwargs
     assert kwargs.get("view") is None, "cancelled menu kept its buttons"
     assert "取り消" in (kwargs.get("content") or ""), kwargs
+
+
+@pytest.mark.asyncio
+async def test_long_prose_menu_resolution_keeps_its_order_and_posts_once(monkeypatch):
+    """#549 AC4/AC5: 経緯 → 質問 → 解決 の順で、本文は一度だけ。
+
+    The prose Claude speaks above a menu reaches Discord by two paths — the pane
+    bridge (which can read it while the menu is open) and the transcript mirror
+    (which can only read it *after* the menu resolves, because the CLI buffers
+    the whole chunk until then; measured on staging: nothing of the turn appears
+    in the jsonl for 90s with the menu open, then all of it lands at once).
+
+    So the order the reader sees depends on the pane bridge posting first, and
+    the "posted once" depends on the mirror suppressing its late twin.
+    """
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(549_0001)
+    q = _question()
+    # A long report of the kind that scrolls off the pane (#549's failing case).
+    q.context = "## 原因\n\n" + ("調査と修正が終わりました。理由を説明します。" * 40)
+    runner = _resolved_runner()
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, runner), timeout=3.0)
+
+    # 1) 経緯 が先、質問(embed) が後。
+    sends = thread.send.await_args_list
+    assert len(sends) >= 2, sends
+    assert sends[0].kwargs.get("embed") is None, "prose must not be part of the menu embed"
+    assert sends[0].kwargs.get("content"), "the prose was not posted before the menu"
+    assert sends[-1].kwargs.get("embed") is not None, "the menu embed must come last"
+
+    # 2) 解決後に CLI が同じ本文を flush しても、mirror 側で抑止される。
+    assert bridged_context.consume_match(thread.id, q.context, source="pane") is True
+    # 3) one-shot: a second flush of the same text is NOT suppressed a second
+    #    time, so a genuinely new message with the same wording still gets through.
+    assert bridged_context.consume_match(thread.id, q.context, source="pane") is False
+
+
+@pytest.mark.asyncio
+async def test_menu_says_when_the_background_could_not_be_read(monkeypatch):
+    """#549: when the prose is unreadable, say so ON the menu.
+
+    The pane is the only place the 経緯 exists while the menu is open (the CLI
+    buffers the jsonl chunk until resolution — measured), so when even the tall
+    re-capture comes up empty there is nothing to post first. Silence then reads
+    as "Claude asked with no reasoning"; the prose turns up after the answer and
+    looks like a new statement. A one-line note is what makes the late arrival
+    legible instead of confusing.
+    """
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(549_0002)
+    q = _question()
+    q.context = ""  # nothing recoverable from the pane
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    menu_send = thread.send.await_args_list[-1]
+    embed = menu_send.kwargs.get("embed")
+    assert embed is not None
+    text = f"{embed.description or ''}{getattr(embed.footer, 'text', '') or ''}"
+    assert "回答後" in text, f"the menu does not explain the missing background: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_menu_with_context_carries_no_such_note(monkeypatch):
+    """The note is for the degraded case only — it must not become chrome."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 1)
+    thread, _ = _thread(549_0003)
+    q = _question()
+    q.context = "この判断の経緯を説明します。" * 6
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    embed = thread.send.await_args_list[-1].kwargs.get("embed")
+    text = f"{embed.description or ''}{getattr(embed.footer, 'text', '') or ''}"
+    assert "回答後" not in text, text
