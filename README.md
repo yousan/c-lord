@@ -197,6 +197,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
 - **Worktree management** — `/worktree-list` shows all active session worktrees with clean/dirty status; `/worktree-cleanup` removes orphaned clean worktrees (supports `dry_run` preview)
 - **Runtime model switching** — `/model-show` displays the current global model and per-thread session model; `/model-set` changes the model for all new sessions without restart
+- **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; the thread each one belonged to gets a 🧹 notice saying so and what survived on disk (#554). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
 
 ### Security
 - **No shell injection** — `asyncio.create_subprocess_exec` only, never `shell=True`
