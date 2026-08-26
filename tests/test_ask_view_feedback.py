@@ -26,6 +26,11 @@ from c_lord.discord_ui.ask_bus import AskAnswerBus
 from c_lord.discord_ui.ask_view import AskView
 
 
+def _utcnow() -> dt.datetime:
+    """Now, timezone-aware. ``dt.UTC`` is 3.11+ and this project supports 3.10."""
+    return dt.datetime.now(dt.timezone.utc)  # noqa: UP017
+
+
 def _question(header: str = "方針") -> AskQuestion:
     return AskQuestion(
         question="どの案にしますか?",
@@ -41,7 +46,7 @@ def _interaction(created_at: dt.datetime | None = None) -> MagicMock:
     interaction.response.send_message = AsyncMock()
     interaction.message = MagicMock()
     interaction.message.id = 777
-    interaction.message.created_at = created_at or dt.datetime.now(dt.UTC)
+    interaction.message.created_at = created_at or _utcnow()
     return interaction
 
 
@@ -128,11 +133,11 @@ class TestUndeliveredAnswer:
         monkeypatch.setattr(
             ask_view_mod,
             "_PROCESS_STARTED_AT",
-            dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5),
+            _utcnow() - dt.timedelta(minutes=5),
         )
         bus = AskAnswerBus()  # a fresh process knows nothing about this thread
         view = AskView(_question(), thread_id=536_0005, q_idx=0, bus=bus)
-        interaction = _interaction(created_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=2))
+        interaction = _interaction(created_at=_utcnow() - dt.timedelta(hours=2))
 
         await view._deliver(interaction, ["A案"])
 
