@@ -22,7 +22,7 @@ from discord.ext import commands
 
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
-from ..devenv import DevContainer, containers_for_session_dir
+from ..devenv import DevContainer, containers_for_session_dir, stop_containers
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..session_close import apply_closed_name, apply_open_name, is_closed
@@ -1214,7 +1214,13 @@ class SessionManageCog(commands.Cog):
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     async def _close_workspace_impl(
-        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+        self,
+        *,
+        channel: object,
+        respond: _Responder,
+        ack: _Acknowledger,
+        reason: WorkspaceReason = WorkspaceReason.MANUAL,
+        idle_label: str | None = None,
     ) -> None:
         """Shared core for /close-workspace and !close-workspace (#271).
 
@@ -1265,7 +1271,7 @@ class SessionManageCog(commands.Cog):
         # pane that merely died — the latter still auto-resumes via --continue
         # (#270), this one holds the message and offers the reopen button.
         with contextlib.suppress(Exception):
-            await self.repo.set_closed(thread_id, True)
+            await self.repo.set_closed(thread_id, True, reason=reason.value)
 
         # Rename to "[終了] …" **and** archive (#271) in a single PATCH. They must
         # not be two calls: Discord refuses to rename an archived thread (code
@@ -1278,15 +1284,11 @@ class SessionManageCog(commands.Cog):
         if new_name:
             results.append(f"🏷️ スレッド名: `{new_name}`")
 
-        # #571: the notice is an inventory, not a label — it says what stopped
-        # *and* what survived, because that is the question the reader has.
-        # Built by the one shared function so the manual and automatic notices
-        # cannot drift (the #538 failure mode).
-        #
-        # docker is reported as LEFT_RUNNING because that is the truth today:
-        # this command does not stop containers yet (#574 adds that). Deriving
-        # the row from the action instead would announce released ports that are
-        # in fact still held — and a notice that lies is worse than none.
+        # #574: stop the dev environment too. Leaving it running is how 12
+        # supabase containers ended up on the production host holding ports
+        # 55321-55327 with no owner: the workspace was gone, so nothing was left
+        # that knew they existed. Stopping frees the ports; the volumes (the
+        # actual data) are untouched — see docs/specs/workspace-vocabulary.md.
         containers: list[DevContainer] = []
         with contextlib.suppress(Exception):
             sdm = await self._resolve_session_dir_manager(parent_channel_id)
@@ -1295,28 +1297,69 @@ class SessionManageCog(commands.Cog):
                     str(Path(sdm.base_dir) / str(thread_id))
                 )
 
+        docker_outcome = DockerOutcome.NONE
+        if containers:
+            stopped = await stop_containers(containers)
+            # Report what actually happened, not what was attempted: a docker
+            # that refused leaves the ports held, and the notice must say so
+            # rather than announcing a release that did not occur (#571).
+            docker_outcome = DockerOutcome.STOPPED if stopped else DockerOutcome.LEFT_RUNNING
+
+        # #571: the notice is an inventory, not a label — it says what stopped
+        # *and* what survived, because that is the question the reader has.
+        # Built by the one shared function so the manual and automatic notices
+        # cannot drift (the #538 failure mode).
         embed = workspace_notice_embed(
             WorkspaceAction.STOP,
-            reason=WorkspaceReason.MANUAL,
+            reason=reason,
+            idle_label=idle_label,
             containers=containers,
-            docker=DockerOutcome.LEFT_RUNNING if containers else DockerOutcome.NONE,
+            docker=docker_outcome,
         )
         if results:
             embed.add_field(name="メモ", value="\n".join(results), inline=False)
         await respond(embed=embed)
 
     @app_commands.command(
+        name="workspace-stop",
+        description="停止: stop Claude and the dev environment, keep everything else",
+    )
+    async def workspace_stop(self, interaction: discord.Interaction) -> None:
+        """停止 — kill the tmux window and the dev environment (#574).
+
+        Named object-first (``workspace-stop``) because that is already the
+        majority convention in this command set (9 of 13 that take an object) and
+        because Discord's autocomplete groups by prefix: typing ``/workspace``
+        surfaces the whole lifecycle together, which ``close-workspace`` never
+        did.
+        """
+        respond, ack = self._slash_io(interaction)
+        await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-stop")
+    async def workspace_stop_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /workspace-stop — webhook-invokable for E2E (#271)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    @app_commands.command(
         name="close-workspace",
-        description="終了: close the tmux window, keep the session (reopen to continue)",
+        description="(旧名) /workspace-stop と同じです",
     )
     async def close_workspace(self, interaction: discord.Interaction) -> None:
-        """Close the tmux window + archive the thread, keeping the session dir (#271)."""
+        """Old name for :meth:`workspace_stop`, kept working (#574).
+
+        Renaming a command people have in their fingers is not free. The alias
+        calls the same implementation, so there is nothing to keep in sync — and
+        consumers get the new name by updating the package alone, which is the
+        Zero-Config Principle.
+        """
         respond, ack = self._slash_io(interaction)
         await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="close-workspace")
     async def close_workspace_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /close-workspace — webhook-invokable for E2E (#271)."""
+        """Text/mention twin of the /close-workspace alias (#271)."""
         respond, ack = self._ctx_io(ctx)
         await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
 
@@ -1347,7 +1390,9 @@ class SessionManageCog(commands.Cog):
             await respond("ℹ️ このスレッドには c-lord のワークスペースがありません。")
             return
         if not is_closed(record):
-            await respond("ℹ️ このスレッドは終了していません（そのままメッセージを送れます）。")
+            await respond(
+                "ℹ️ このワークスペースは停止していません（そのままメッセージを送れます）。"
+            )
             return
 
         await self.repo.set_closed(channel.id, False)
@@ -1372,16 +1417,36 @@ class SessionManageCog(commands.Cog):
         await respond(embed=embed)
 
     @app_commands.command(
+        name="workspace-start",
+        description="再開: start a stopped (停止) workspace so messages run again",
+    )
+    async def workspace_start(self, interaction: discord.Interaction) -> None:
+        """再開 — clear the 停止 state (#512, renamed in #574).
+
+        ``start`` rather than ``reopen`` because it is the inverse of ``stop``:
+        open/close is about visibility, start/stop is about running state, and
+        running state is what this actually changes.
+        """
+        respond, ack = self._slash_io(interaction)
+        await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-start")
+    async def workspace_start_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /workspace-start — webhook-invokable for E2E (#512)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    @app_commands.command(
         name="reopen-workspace",
-        description="Reopen a closed (終了) thread so messages run again",
+        description="(旧名) /workspace-start と同じです",
     )
     async def reopen_workspace(self, interaction: discord.Interaction) -> None:
-        """Clear the 終了 state set by /close-workspace (#512)."""
+        """Old name for :meth:`workspace_start`, kept working (#574)."""
         respond, ack = self._slash_io(interaction)
         await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="reopen-workspace")
     async def reopen_workspace_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /reopen-workspace — webhook-invokable for E2E (#512)."""
+        """Text/mention twin of the /reopen-workspace alias (#512)."""
         respond, ack = self._ctx_io(ctx)
         await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)

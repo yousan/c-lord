@@ -201,3 +201,28 @@ async def orphaned_containers(known_session_dirs: Iterable[str]) -> list[DevCont
             orphans.append(_to_container(doc, source))
             break
     return orphans
+
+
+async def stop_containers(containers: list[DevContainer]) -> list[str]:
+    """Stop the running containers among *containers*. Returns the names stopped.
+
+    Only *running* ones are touched: a stop on an already-exited container is a
+    no-op that can only produce noise, and an exited container holds no host
+    port, which is the resource this is really about.
+
+    A docker failure is reported by omission, never raised. By the time this
+    runs the tmux window is already gone and the user is owed a notice either
+    way — a container that refused to stop must not turn into a traceback in
+    place of the message telling them what happened.
+    """
+    running = [c for c in containers if c.running]
+    if not running:
+        return []
+
+    names = [c.name for c in running]
+    rc, _ = await _docker(["docker", "stop", *names])
+    if rc != 0:
+        logger.warning("devenv: `docker stop` failed for %s (rc=%d)", ", ".join(names), rc)
+        return []
+    logger.info("devenv: stopped %d container(s): %s", len(names), ", ".join(names))
+    return names

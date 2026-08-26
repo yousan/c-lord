@@ -5,7 +5,7 @@ now-meaningless ``W<N> │`` prefix and a later message silently woke Claude bac
 up via the ``--continue`` crash-recovery path (#270).  #512 makes "終了" a real,
 persisted state:
 
-* the thread is renamed ``[終了] …``
+* the thread is renamed ``[停止] …`` (#574 renamed it from ``[終了]``)
 * a message in a closed thread is **not** forwarded to Claude; a notice with a
   「▶️ 再開する」button is posted instead
 * reopening clears the flag, restores the name, and runs the held message
@@ -19,6 +19,7 @@ import discord
 import pytest
 
 from c_lord.database.repository import SessionRecord
+from c_lord.thread_name import CLOSED_MARK
 
 
 def _record(thread_id: int = 555, *, closed_at: str | None = None) -> SessionRecord:
@@ -79,17 +80,23 @@ class TestCloseMarksThread:
         cog = self._cog(_record())
         thread = _thread()
         await cog.close_workspace_text.callback(cog, self._ctx(thread))
-        cog.repo.set_closed.assert_awaited_once_with(555, True)
+        # #574: reason rides along for the notice wording; the state itself is
+        # still decided by closed_at alone.
+        cog.repo.set_closed.assert_awaited_once_with(555, True, reason="manual")
 
     @pytest.mark.asyncio
     async def test_close_renames_thread_with_marker(self) -> None:
-        """#512 AC4: the thread name gains the ``[終了]`` marker on close."""
+        """#512 AC4: the thread name gains the :data:`CLOSED_MARK` marker on stop.
+
+        Asserted through the constant: #574 renamed it and these tests should
+        track the marker, not re-encode its wording.
+        """
         cog = self._cog(_record())
         thread = _thread()
         await cog.close_workspace_text.callback(cog, self._ctx(thread))
 
         names = [c.kwargs.get("name") for c in thread.edit.call_args_list]
-        assert "[終了] #404 認証リファクタ" in names
+        assert f"{CLOSED_MARK} #404 認証リファクタ" in names
 
     @pytest.mark.asyncio
     async def test_close_still_archives_thread(self) -> None:
@@ -108,7 +115,7 @@ class TestCloseMarksThread:
         archived thread at all (code 50083). Splitting this into
         ``edit(name=…)`` + ``edit(archived=True)`` spends the allowance twice and
         orders badly — observed live on staging as a 429 that silently dropped
-        the ``[終了]`` marker while the archive went through.
+        the marker while the archive went through.
         """
         cog = self._cog(_record())
         thread = _thread()
@@ -116,7 +123,7 @@ class TestCloseMarksThread:
 
         assert thread.edit.await_count == 1
         kwargs = thread.edit.await_args.kwargs
-        assert kwargs.get("name") == "[終了] #404 認証リファクタ"
+        assert kwargs.get("name") == f"{CLOSED_MARK} #404 認証リファクタ"
         assert kwargs.get("archived") is True
 
     @pytest.mark.asyncio
@@ -164,13 +171,13 @@ class TestReopenCommand:
         """#512 AC8: /reopen-workspace un-closes the session and drops the marker."""
         cog = self._cog(_record(closed_at="2026-08-18 12:00:00"))
         thread = _thread()
-        thread.name = "[終了] #404 認証リファクタ"
+        thread.name = f"{CLOSED_MARK} #404 認証リファクタ"
 
         await cog.reopen_workspace_text.callback(cog, self._ctx(thread))
 
         cog.repo.set_closed.assert_awaited_once_with(555, False)
         names = [c.kwargs.get("name") for c in thread.edit.call_args_list if "name" in c.kwargs]
-        assert names and not names[-1].startswith("[終了]")
+        assert names and not names[-1].startswith(CLOSED_MARK)
 
     @pytest.mark.asyncio
     async def test_reopen_unarchives_in_the_same_patch(self) -> None:
@@ -179,7 +186,7 @@ class TestReopenCommand:
         same PATCH is refused outright."""
         cog = self._cog(_record(closed_at="2026-08-18 12:00:00"))
         thread = _thread()
-        thread.name = "[終了] #404 認証リファクタ"
+        thread.name = f"{CLOSED_MARK} #404 認証リファクタ"
 
         await cog.reopen_workspace_text.callback(cog, self._ctx(thread))
 

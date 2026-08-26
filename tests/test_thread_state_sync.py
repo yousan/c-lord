@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from c_lord.thread_name import CLOSED_MARK
 from c_lord import thread_state_sync
 from c_lord.thread_state_sync import (
     ThreadStateSyncLoop,
@@ -301,7 +302,7 @@ async def test_sync_one_keeps_issue_ref_in_name():
 
 
 async def test_sync_one_keeps_closed_marker_in_name():
-    """#512 AC5: the 60s sidebar repaint must not strip ``[終了]`` off a closed thread.
+    """#512 AC5: the 60s sidebar repaint must not strip the stopped marker.
 
     The lamp-sync loop rebuilds the name from the DB row every tick.  Without the
     ``closed`` flag it would rebuild ``#404 やること`` and quietly undo the marker
@@ -312,7 +313,7 @@ async def test_sync_one_keeps_closed_marker_in_name():
     repo.set_tmux_window_id = AsyncMock()
 
     fake_thread = MagicMock()
-    fake_thread.name = "[終了] #404 やること"
+    fake_thread.name = f"{CLOSED_MARK} #404 やること"
     fake_thread.edit = AsyncMock()
 
     bot = MagicMock()
@@ -1407,8 +1408,10 @@ async def test_watchdog_logs_a_failed_bridge_instead_of_swallowing_it(caplog):
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0)
 
-    assert any("400 Bad Request" in r.getMessage() or "bridge failed" in r.getMessage()
-               for r in caplog.records), caplog.text
+    assert any(
+        "400 Bad Request" in r.getMessage() or "bridge failed" in r.getMessage()
+        for r in caplog.records
+    ), caplog.text
 
 
 @pytest.mark.asyncio
