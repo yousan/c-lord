@@ -44,6 +44,18 @@ _IDLE_TIMEOUT = 60.0
 # How long to wait for Claude to become ready (show input prompt).
 _STARTUP_TIMEOUT = 30.0
 
+# How long a turn is allowed to not-start-yet before the idle exit gives up on
+# it (#562).  Distinct from ``_STARTUP_TIMEOUT``, which only covers a *cold*
+# claude: a warm session used to get no grace at all, so 60s of pane silence on
+# a busy host ended the turn and reported it finished.  Generous on purpose —
+# a late "no response" notice is far cheaper than a false "finished", and the
+# ``timeout_seconds`` backstop still bounds the wait.
+_TURN_START_GRACE = 120.0
+
+# Prefix of the RESULT error for "this turn never produced anything" (#562).
+# Exported so callers can recognise the outcome without string-sniffing.
+NO_RESPONSE_ERROR_PREFIX = "No response —"
+
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
 _UNKNOWN_ALERT_DELAY = 5.0
@@ -953,6 +965,10 @@ class TmuxClaudeRunner:
         # response trivially differs and cold starts are unaffected.
         saw_generation = False
         baseline_response: str | None = None
+        # #562: the #365 gate, hoisted out of the loop body. The idle exit and
+        # the final verdict both need it, and it must be defined even if the
+        # loop body never runs.
+        new_turn_started = False
 
         # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
         # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
@@ -1188,6 +1204,7 @@ class TmuxClaudeRunner:
             new_turn_started = saw_generation or (
                 bool(last_response) and last_response != baseline_response
             )
+
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
@@ -1208,8 +1225,16 @@ class TmuxClaudeRunner:
                 and stable_seconds >= _IDLE_TIMEOUT
                 and raw_static_seconds >= _IDLE_TIMEOUT
             ):
-                # During a fresh start, allow extra time for Claude to load.
-                if not claude_running and elapsed < _STARTUP_TIMEOUT:
+                # #562: a turn that never started is not a turn that finished.
+                # #365 gates the *completion* detector on the new turn actually
+                # having begun; this exit ignored that gate, so a warm session
+                # that simply had not started drawing yet was declared done —
+                # and the verdict below then read it as a normal completion,
+                # firing "🟡 Claude has finished" at a user with no answer.
+                # The old grace was `not claude_running and elapsed <
+                # _STARTUP_TIMEOUT`, i.e. cold starts only; a warm session got
+                # none. Wait out `_TURN_START_GRACE` either way.
+                if not new_turn_started and elapsed < _TURN_START_GRACE:
                     continue
                 logger.info(
                     "Idle timeout (%.1fs) — no response (thread=%d)",
@@ -1259,6 +1284,26 @@ class TmuxClaudeRunner:
                 error = (
                     "Claude exited without producing a response "
                     "(possible startup failure or crash) — check the tmux pane."
+                )
+            elif not last_response and not new_turn_started:
+                # #562: claude is alive but this turn never produced anything —
+                # no generation was ever seen and the pane still shows only the
+                # previous turn's residue. Reporting "done" here is what made
+                # c-lord ping people about work that had not started. Note this
+                # is checked AFTER the #541 rungs: a turn that DID generate has
+                # ``new_turn_started`` set, so an answered-then-silent pane
+                # (the #541 case) never lands here.
+                #
+                # ``not last_response`` scopes this to the shape actually
+                # reported — the journal read ``Idle timeout (67.0s) — no
+                # response``, i.e. nothing was ever extracted. Without it, a
+                # turn whose answer happens to be byte-identical to the previous
+                # one (no spinner ever captured) would be called a failure on
+                # ambiguous evidence; #541 deliberately keeps that case quiet.
+                error = (
+                    f"{NO_RESPONSE_ERROR_PREFIX} Claude never started this turn "
+                    f"(pane unchanged for {raw_static_seconds:.0f}s). "
+                    "Send the message again, or check the tmux pane."
                 )
             elif timed_out and not self._is_idle_at_prompt(current):
                 error = f"Timed out after {self.timeout_seconds} seconds"

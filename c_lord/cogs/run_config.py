@@ -8,7 +8,7 @@ added without changing every caller).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import discord
@@ -26,6 +26,18 @@ if TYPE_CHECKING:
     from ..discord_ui.views import StopView
     from ..session_dir import SessionDirManager
     from ..tmux import TmuxSessionManager
+
+
+@dataclass
+class RunOutcome:
+    """What a completed run needs to tell its caller (#562).
+
+    Only ``no_response`` for now: whether the turn ended without Claude ever
+    producing anything. The caller needs it because the turn-end ping would
+    otherwise announce "Claude has finished" for work that never started.
+    """
+
+    no_response: bool = False
 
 
 @dataclass
@@ -95,6 +107,12 @@ class RunConfig:
     # poster (its author); automated/terminal-driven turns fall back to the
     # bot owner. None ⇒ no one to ping ⇒ posted without a mention (silent-safe).
     notify_user_id: int | None = None
+
+    # #562: how the run turned out, written by the runner side and read by the
+    # caller after it returns. RunConfig's *inputs* stay a value object; this is
+    # a separate, explicitly mutable output channel rather than a field the
+    # caller is expected to mutate.
+    outcome: RunOutcome = field(default_factory=lambda: RunOutcome())
 
     # Prevent accidental field mutation — RunConfig is a value object.
     # Use dataclasses.replace() to create modified copies.

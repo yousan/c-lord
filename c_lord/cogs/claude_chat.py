@@ -2076,32 +2076,34 @@ class ClaudeChatCog(commands.Cog):
                 stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
             stop_view.set_message(stop_msg)
 
+            # #562: kept in a variable so the turn-end ping below can read the
+            # run's outcome — a turn that produced nothing must not be announced
+            # as finished.
+            run_config = RunConfig(
+                thread=thread,
+                runner=runner,
+                repo=self.repo,
+                prompt=prompt,
+                session_id=session_id,
+                status=status,
+                registry=self._registry,
+                ask_repo=self._ask_repo,
+                lounge_repo=self._lounge_repo,
+                settings_repo=self._settings_repo,
+                stop_view=stop_view,
+                session_dir_manager=session_dir_manager,
+                tmux_manager=tmux_manager,
+                image_paths=image_paths,
+                working_dir=working_dir or None,
+                authorizer=self._authorizer,
+                # #480: ping the requester of THIS turn when an
+                # interactive prompt (permission/plan/elicitation/ask)
+                # blocks it — a mid-turn pause never reaches the
+                # turn-end mention.
+                notify_user_id=notify_user_id,
+            )
             try:
-                await run_claude_with_config(
-                    RunConfig(
-                        thread=thread,
-                        runner=runner,
-                        repo=self.repo,
-                        prompt=prompt,
-                        session_id=session_id,
-                        status=status,
-                        registry=self._registry,
-                        ask_repo=self._ask_repo,
-                        lounge_repo=self._lounge_repo,
-                        settings_repo=self._settings_repo,
-                        stop_view=stop_view,
-                        session_dir_manager=session_dir_manager,
-                        tmux_manager=tmux_manager,
-                        image_paths=image_paths,
-                        working_dir=working_dir or None,
-                        authorizer=self._authorizer,
-                        # #480: ping the requester of THIS turn when an
-                        # interactive prompt (permission/plan/elicitation/ask)
-                        # blocks it — a mid-turn pause never reaches the
-                        # turn-end mention.
-                        notify_user_id=notify_user_id,
-                    )
-                )
+                await run_claude_with_config(run_config)
             finally:
                 # Issue #91: wrap every Discord call so that RuntimeError("Session is
                 # closed") during bot shutdown doesn't propagate and turn the bot into
@@ -2138,4 +2140,8 @@ class ClaudeChatCog(commands.Cog):
                             # not). #520: bot-seeded turns fall back to owner,
                             # #525: and only when the deployment asked for it.
                             notify_user_id=completion_notify_id,
+                            # #562: say what happened. "終わりました" is a summons;
+                            # when nothing was produced it is a lie, and a
+                            # notification that lies stops being worth reading.
+                            no_response=run_config.outcome.no_response,
                         )
