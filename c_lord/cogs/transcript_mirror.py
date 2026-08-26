@@ -33,7 +33,7 @@ from ..transcript.mirror import (
     silent_posts_enabled,
     verbosity_mode,
 )
-from ..transcript.recovery import last_completed_final_answer
+from ..transcript.recovery import last_completed_final_answer_async
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -68,8 +68,16 @@ class TranscriptMirrorCog(commands.Cog):
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
         recovered = 0
+        closed = 0
         for row in rows:
             if not row.working_dir:
+                continue
+            # Issue #537: a closed workspace (``!close-workspace``) keeps its
+            # row and its transcript — often the biggest ones on disk. Nobody is
+            # waiting on it, so neither the recovery scan nor a mirror is worth
+            # the startup cost.
+            if getattr(row, "closed_at", None):
+                closed += 1
                 continue
             # Issue #215: re-deliver a final answer that was written to the
             # jsonl while the bot was down (mirror not tailing). The resumed
@@ -86,10 +94,11 @@ class TranscriptMirrorCog(commands.Cog):
             if self.start_for(row.thread_id, row.working_dir):
                 started += 1
         logger.info(
-            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s), "
-            "recovered %d dropped final answer(s)",
+            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s) "
+            "(%d closed row(s) skipped), recovered %d dropped final answer(s)",
             started,
             len(rows),
+            closed,
             recovered,
         )
 
@@ -100,7 +109,7 @@ class TranscriptMirrorCog(commands.Cog):
         event uuid: a final answer whose uuid already matches the stored
         ``mirror_replied_uuid`` was delivered live and is left alone.
         """
-        fa = last_completed_final_answer(derive_project_dir(working_dir))
+        fa = await last_completed_final_answer_async(derive_project_dir(working_dir))
         if fa is None:
             return False
         stored = getattr(row, "mirror_replied_uuid", None)
