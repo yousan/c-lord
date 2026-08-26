@@ -51,6 +51,7 @@ from ..session_resume import (
     classify,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
+from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
@@ -692,15 +693,29 @@ class ClaudeChatCog(commands.Cog):
         3. **The notice, once per thread per process.** It names the next step; it
            is also a wall of text, so it is not repeated on every message.
 
-        Two cases get the log line only. In a thread that is not ours (#522) it
-        drops to DEBUG: several c-lord instances can share a guild and every one of
-        them sees this message, so answering would mean each bystander bot posting
-        the same notice. And while a turn is already in flight, the row is simply
-        not written yet — see below. Nothing here may raise: this is already the
-        path for a message we are failing to run.
+        Three cases get the log line only. **Webhook messages** (#556): nobody is
+        waiting on the other end, so all three responses above are noise — see the
+        guard below for what that cost in production. In a thread that is not ours
+        (#522) it drops to DEBUG: several c-lord instances can share a guild and
+        every one of them sees this message, so answering would mean each bystander
+        bot posting the same notice. And while a turn is already in flight, the row
+        is simply not written yet — see below. Nothing here may raise: this is
+        already the path for a message we are failing to run.
         """
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        if message.webhook_id is not None:
+            # #556: nothing that arrives from a webhook is waiting for an answer,
+            # so none of the three responses below are owed to it. #538's guard
+            # asked whether the *channel* was ours, which every thread under a
+            # /clord-init binding satisfies — including Grafana's server-alert
+            # thread, where from the #545 deploy on, each alert was given a ⚠️ and
+            # a wall of text about restoring a session, during incidents.
+            #
+            # DEBUG, not INFO: an alerting webhook can be chatty, and unlike the
+            # human case there is no one to tell.
+            logger.debug("%s webhook message in an untracked thread — quiet (#556)", ctx)
+            return
         if thread.id in self._active_runners or self.is_processing(thread.id):
             # A freshly spawned thread has no row until Claude emits its first
             # session_id, so a message sent in that window is not an untracked
@@ -712,6 +727,14 @@ class ClaudeChatCog(commands.Cog):
             # Another instance's thread: DEBUG, so a shared guild's traffic does
             # not drown the log — the INFO line below is for threads we own.
             logger.debug("%s message ignored — not this instance's thread (#538)", ctx)
+            return
+        if not await self._was_ever_our_thread(thread, parent_channel_id):
+            # #556: the check above says the *channel* is ours, which every
+            # thread under a /clord-init binding satisfies — so on its own it
+            # sent this notice into ordinary conversation threads. A thread that
+            # carries no trace of c-lord at all has nothing to restore and never
+            # did; there is nothing to tell its author.
+            logger.debug("%s message ignored — never a c-lord thread (#556)", ctx)
             return
         logger.info("%s message not run — no session row for this thread (#538)", ctx)
 
@@ -741,6 +764,45 @@ class ClaudeChatCog(commands.Cog):
             await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread_id)
             is not None
         )
+
+    async def _was_ever_our_thread(self, thread: discord.Thread, parent_channel_id: int) -> bool:
+        """Whether this thread carries any trace of having been c-lord's (#556).
+
+        Distinct from :meth:`_is_our_thread`, which asks about the *channel* and
+        stays as the #522 cross-instance guard. This asks about the thread, and
+        it has to, because the ``sessions`` row that would have answered it is
+        exactly what the 30-day sweep deletes (#554) — see
+        :mod:`c_lord.thread_origin` for why these three signals and not the row.
+
+        Best-effort: a resolver or DB hiccup must not decide the question, and it
+        errs toward **speaking** — the cost of a stray notice in a c-lord thread
+        is far below the cost of silently swallowing a message again, which is
+        the bug (#538) this whole path exists to fix.
+        """
+        try:
+            sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
+            has_binding = await self._thread_binding_exists(thread.id)
+        except Exception:
+            logger.warning("%s origin check failed — assuming ours", log_ctx(thread_id=thread.id))
+            return True
+        bot_user = getattr(self.bot, "user", None)
+        origin = inspect_origin(
+            thread_owner_id=getattr(thread, "owner_id", None),
+            bot_user_id=getattr(bot_user, "id", None),
+            session_dir_base=getattr(sdm, "base_dir", None),
+            thread_id=thread.id,
+            has_binding=has_binding,
+        )
+        return origin.is_clords
+
+    async def _thread_binding_exists(self, thread_id: int) -> bool:
+        """Whether ``/clord-thread-init`` bound a repo to this thread."""
+        from .channel_repo import ChannelRepoCog
+
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is None or not isinstance(channel_cog, ChannelRepoCog):
+            return False
+        return await channel_cog.has_thread_binding(thread_id)
 
     async def _clord_impl(
         self,
