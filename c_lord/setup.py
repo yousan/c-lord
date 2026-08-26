@@ -127,6 +127,7 @@ async def setup_bridge(
     from .cogs.channel_repo import ChannelRepoCog
     from .cogs.claude_chat import ClaudeChatCog
     from .cogs.scheduler import SchedulerCog
+    from .cogs.session_cleanup import SessionCleanupCog
     from .cogs.session_manage import SessionManageCog
     from .cogs.skill_command import SkillCommandCog
     from .cogs.transcript_mirror import TranscriptMirrorCog
@@ -238,6 +239,16 @@ async def setup_bridge(
         )
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")
+
+    # --- SessionCleanupCog (#554) ---
+    # Announce-only: it posts the 「記録を整理しました」 notice for rows the 30-day
+    # sweep deleted, and never deletes anything itself. Registering it
+    # unconditionally is therefore safe for consumers who do not run the sweep —
+    # with no rows handed to it, it does nothing.
+    session_cleanup_cog = SessionCleanupCog(bot)
+    await bot.add_cog(session_cleanup_cog)
+    bot.session_cleanup_cog = session_cleanup_cog  # type: ignore[attr-defined]
+    logger.info("Registered SessionCleanupCog")
 
     # --- TranscriptMirrorCog (Issue #71, gated by CLORD_BRIDGE_MODE=jsonl) ---
     transcript_cog = TranscriptMirrorCog(bot, session_repo=session_repo)

@@ -176,6 +176,30 @@ If the thread's work session is **stopped** (no tmux window — e.g. after a bot
 
 The hint's wording and the rule that decides whether a message is accepted come from the same place, so they cannot drift apart again. See [specs/session-resume.md](specs/session-resume.md).
 
+### Why a thread loses its record (the 30-day sweep)
+
+The most common reason c-lord "has no record of the thread" is not a bug: **every startup deletes session records that have gone 30 days unused.** Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
+
+> 古い C-lord セッションを続けようとしたところセッションが無い、って言われちゃった。消した覚えは無いはず。Discord 上にそういう事も書いてないし
+
+The sweep still runs. What changed is that **each swept thread now gets a notice in the thread itself**, so the reason is where the question gets asked:
+
+```
+🧹 このスレッドは 30 日以上使われていなかったため、作業セッションの記録を整理しました。
+・作業ディレクトリ（clone した内容）は残っています — 書きかけの成果物はディスク上にそのままあります
+・会話の履歴は失われています（Claude Code 自身も既定 30 日で transcript を整理するため）
+```
+
+**What is deleted is the record, not the work.** The row ties a Discord thread to its Claude session; the git clone under `c-lord-sessions/<channel>/<thread>/` is left alone. So a swept thread usually still has its checkout, half-finished edits included — which is why the notice inspects the disk instead of printing one fixed sentence. It reports three different situations:
+
+| On disk | Notice says |
+|---|---|
+| clone + transcript | both survived |
+| clone only (the common case) | the work is there, the conversation is not |
+| neither | nothing left to reconnect to |
+
+**Two cleaners run on the same schedule.** Claude Code expires its own transcripts under `~/.claude/projects/` via `cleanupPeriodDays` (default 30), independently of c-lord. That is why the middle row is the common one, and why c-lord cannot restore a conversation it never deleted — raise `cleanupPeriodDays` in your Claude Code settings if you want longer history.
+
 **Screenshot height (#471)**: `/tmux-screenshot` (and the `/resync` PNG snapshot) show **more history than the live ~40-row window**. Claude's TUI keeps no scrollback, so before capturing, c-lord transiently grows the window so Claude redraws more of the conversation, captures the taller screen, then restores the exact original size (the human's attached view is unchanged). The default height is **100 rows**; override it with `CLORD_TMUX_SCREENSHOT_ROWS` (rows), or set it to `0` to capture the current window as-is.
 
 **`/restart-claude`** restarts the Claude *process* for this thread **while keeping the conversation**. Use it when the process is wedged (e.g. a stuck turn silently blocks further input). It kills the active runner and the tmux window so the old/stuck process is gone, but — unlike `/clear` — it does **not** reset the session. Your next message then resumes the same conversation via `--continue`, so the context survives. (The fresh process spawns on that next message through the normal reply path, which is what keeps session setup correct.)

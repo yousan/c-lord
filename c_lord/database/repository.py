@@ -274,13 +274,27 @@ class SessionRepository:
             rows = await cursor.fetchall()
             return [SessionRecord(**dict(row)) for row in rows]
 
-    async def cleanup_old(self, days: int = 30) -> int:
-        """Delete sessions older than N days. Returns count deleted."""
+    async def cleanup_old(self, days: int = 30) -> list[SessionRecord]:
+        """Delete sessions unused for N days. Returns the rows that were deleted.
+
+        Returns the rows rather than a count (#554) because the caller has to
+        tell each of those threads what happened, and a count names no thread.
+        They are read inside the same transaction as the DELETE and with the
+        same predicate, so the list is exactly what went — no row can be deleted
+        without being reported, and none reported without being deleted.
+
+        The row carries ``working_dir``, which is the only handle left on the
+        session dir and the transcript once the row is gone. Reading it after the
+        delete would be too late; :func:`c_lord.session_cleanup.inspect_survivors`
+        needs it to say what survived.
+        """
+        where = " WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ?"
         async with aiosqlite.connect(self.db_path) as db:
-            query = (
-                "DELETE FROM sessions"
-                " WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ?"
-            )
-            cursor = await db.execute(query, (days,))
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
+            doomed = [SessionRecord(**dict(row)) for row in await cursor.fetchall()]
+            if not doomed:
+                return []
+            await db.execute("DELETE FROM sessions" + where, (days,))
             await db.commit()
-            return cursor.rowcount
+            return doomed

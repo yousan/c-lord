@@ -6,6 +6,7 @@ from .claude_chat import ClaudeChatCog
 from .event_processor import EventProcessor
 from .run_config import RunConfig
 from .scheduler import SchedulerCog
+from .session_cleanup import SessionCleanupCog
 from .session_manage import SessionManageCog
 from .skill_command import SkillCommandCog
 from .webhook_trigger import WebhookTriggerCog
@@ -17,6 +18,7 @@ __all__ = [
     "EventProcessor",
     "RunConfig",
     "SchedulerCog",
+    "SessionCleanupCog",
     "SessionManageCog",
     "SkillCommandCog",
     "WebhookTriggerCog",
