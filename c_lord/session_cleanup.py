@@ -94,6 +94,16 @@ def _headline(days: int) -> str:
 #: loss leaves the reader exactly as stuck as the silence did.
 _START_AGAIN = "・新しく始める → **チャンネルで** `/clord prompt:<やること>`"
 
+#: Offered only when the checkout survived. #538 can reconnect the thread to a
+#: session dir that is still on disk, so for those threads 「新しく始める」 alone
+#: understates what is possible — and understating it is how work that is sitting
+#: right there gets abandoned. Never offered when nothing survived: a reconnect
+#: that cannot succeed is the false promise #538 exists to remove.
+_RECONNECT = (
+    "・**この作業の続きから再開する** → `/clord-reattach`"
+    "（ディスクに残っている作業ディレクトリに繋ぎ直します）"
+)
+
 
 def notice_for(record: SessionRecord, survivors: Survivors, *, days: int = 30) -> str:
     """The message to post into ``record``'s thread, given what survived.
@@ -107,15 +117,16 @@ def notice_for(record: SessionRecord, survivors: Survivors, *, days: int = 30) -
     * **neither** — nothing to reconnect to; do not describe leftovers that are
       not there.
 
-    The recovery step is named by :mod:`c_lord.session_resume` once #538 lands;
-    until then each branch points at what exists today.
+    The two checkout-surviving branches name ``/clord-reattach`` (#538 AC6): the
+    row is gone but the work is not, and reconnecting keeps it. The third does not
+    — with nothing on disk there is nothing to reattach to.
     """
     head = _headline(days)
     if survivors.session_dir and survivors.transcript:
         return (
             head + "・作業ディレクトリ（clone した内容）は**残っています**\n"
             "・会話の履歴も**残っています**\n\n"
-            "続けるには:\n" + _START_AGAIN
+            "続けるには:\n" + _RECONNECT + "\n" + _START_AGAIN
         )
     if survivors.session_dir:
         return (
@@ -123,7 +134,7 @@ def notice_for(record: SessionRecord, survivors: Survivors, *, days: int = 30) -
             " — 書きかけの成果物はディスク上にそのままあります\n"
             "・会話の履歴は**失われています**"
             "（Claude Code 自身も既定 30 日で transcript を整理するため）\n\n"
-            "続けるには:\n" + _START_AGAIN
+            "続けるには:\n" + _RECONNECT + "\n" + _START_AGAIN
         )
     return (
         head + "・この作業セッションに紐づくファイルは見つかりませんでした\n\n"

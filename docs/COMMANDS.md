@@ -190,6 +190,8 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 ・会話の履歴は失われています（Claude Code 自身も既定 30 日で transcript を整理するため）
 ```
 
+**The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
+
 **What is deleted is the record, not the work.** The row ties a Discord thread to its Claude session; the git clone under `c-lord-sessions/<channel>/<thread>/` is left alone. So a swept thread usually still has its checkout, half-finished edits included — which is why the notice inspects the disk instead of printing one fixed sentence. It reports three different situations:
 
 | On disk | Notice says |

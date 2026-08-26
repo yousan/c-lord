@@ -267,3 +267,23 @@ class TestAnnounce:
 
         assert elapsed >= 0.05 * 4, elapsed
         assert bot.fetch_channel.await_count == 5
+
+
+# ── AC4: the notice names the recovery that #538 built ───────────────────────
+
+
+class TestRecoveryPointer:
+    def test_a_surviving_checkout_points_at_the_reconnect(self) -> None:
+        """AC4: when the clone is still there the thread can be reconnected
+        (#538), so 「新しく始める」 alone understates what is possible — and
+        understating it is how the work on disk gets abandoned."""
+        for survivors in (Survivors(True, True), Survivors(True, False)):
+            text = notice_for(_record(), survivors, days=30)
+            assert "/clord-reattach" in text, survivors
+
+    def test_nothing_left_does_not_offer_a_reconnect(self) -> None:
+        """With no checkout there is nothing to reattach to — offering it would
+        be the same false promise #538 exists to remove."""
+        text = notice_for(_record(), Survivors(False, False), days=30)
+        assert "/clord-reattach" not in text
+        assert "/clord" in text  # …but still names a way forward
