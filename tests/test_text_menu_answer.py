@@ -156,3 +156,35 @@ class TestUndo:
 
         rerun.assert_awaited_once()
         assert view.rerun_button.disabled is True
+
+
+@pytest.mark.asyncio
+async def test_a_long_message_is_an_instruction_not_a_menu_answer() -> None:
+    """Long prose is a new request, not a pick from a 3-option menu.
+
+    The ✏️ Other modal caps free text at 500 characters, and a menu answer that
+    exceeds it would also be typed character-by-character onto a TUI row. Both
+    say the same thing: past that length this is an instruction.
+    """
+    tid = 536_7007
+    queue = ask_bus.register(tid, allow_free_text=True)
+    assert queue is not None
+    try:
+        message, thread = _message(tid, "あ" * 501)
+        assert await _cog()._maybe_answer_open_menu(message, thread) is False
+        assert queue.empty()
+    finally:
+        ask_bus.unregister(tid)
+
+
+@pytest.mark.asyncio
+async def test_a_message_at_the_limit_is_still_an_answer() -> None:
+    tid = 536_7008
+    queue = ask_bus.register(tid, allow_free_text=True)
+    assert queue is not None
+    try:
+        message, thread = _message(tid, "あ" * 500)
+        assert await _cog()._maybe_answer_open_menu(message, thread) is True
+        assert queue.get_nowait() == ["あ" * 500]
+    finally:
+        ask_bus.unregister(tid)
