@@ -2384,9 +2384,22 @@ class TmuxSessionManager:
     # ── Cleanup ──────────────────────────────────────────────────────
 
     def cleanup_orphaned(self, active_thread_ids: set[int]) -> int:
-        """Kill tmux windows whose threads are no longer active.
+        """Kill leftover tmux windows in this session. Returns the count killed.
 
-        Returns the number of windows killed.
+        A window is reaped only when **all three** hold:
+
+        1. it carries an ``@thread_id`` — windows without one were created by
+           hand (``factorio-server-1``, ``work3``, …) and are none of our
+           business,
+        2. its thread is not in *active_thread_ids*, and
+        3. **its pane is not running Claude.**
+
+        Condition 3 is the one that makes this callable at all (#570). Callers
+        pass ``active_thread_ids=set()`` at startup — the bot has no in-flight
+        threads yet — so membership alone would mark *every* window orphaned and
+        kill live sessions. The pane's foreground command is the only signal
+        that separates a leftover shell from a running Claude, and it is read
+        fresh from tmux rather than inferred from our own bookkeeping.
         """
         if not self._check_available():
             return 0
@@ -2397,7 +2410,68 @@ class TmuxSessionManager:
             if not tid_str.isdigit():
                 continue
             thread_id = int(tid_str)
-            if thread_id not in active_thread_ids and self.kill_session(thread_id):
+            if thread_id in active_thread_ids:
+                continue
+            window_name = window.get("window_name", "")
+            if window_name and self._window_has_claude(window_name):
+                logger.debug(
+                    "cleanup_orphaned: %s:%s still runs Claude — keeping (thread=%d)",
+                    self.session_name,
+                    window_name,
+                    thread_id,
+                )
+                continue
+            if self.kill_session(thread_id):
                 killed += 1
 
         return killed
+
+
+def list_tmux_sessions() -> list[str]:
+    """Every tmux session name on this host, or ``[]`` when tmux is unusable."""
+    if not _tmux_available():
+        return []
+    result = _run(["tmux", "list-sessions", "-F", "#{session_name}"])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def cleanup_orphaned_all_sessions(active_thread_ids: set[int]) -> int:
+    """Reap leftover c-lord windows across **every** tmux session.
+
+    :meth:`TmuxSessionManager.cleanup_orphaned` only ever looks at its own
+    ``session_name``. Since #427 the session name follows the *repo*, so real
+    windows live in ``c-lord`` / ``project_30_ehon-ya`` / ``pt-jp`` / … while
+    ``bot.tmux_manager`` points at the default ``clord`` — which on a busy host
+    holds no windows at all. A reaper bound to that one session covers nothing.
+
+    Scanning every session is safe because the per-window guards do the
+    filtering: a window is only touched when it carries an ``@thread_id`` and
+    is not running Claude. Sessions a human created by hand are full of windows
+    with neither, so they are skipped without needing an allowlist of names —
+    which matters because c-lord's repo-derived names (``games``, ``pt-jp``)
+    collide with hand-made sessions of the same name.
+
+    Returns the total number of windows killed.
+    """
+    total = 0
+    for session_name in list_tmux_sessions():
+        # mapping_path="" keeps this off the on-disk window map: the reaper is a
+        # read-mostly sweep and must not rewrite another manager's cache file.
+        mgr = TmuxSessionManager(session_name=session_name, mapping_path="")
+        try:
+            killed = mgr.cleanup_orphaned(active_thread_ids)
+        except Exception:
+            logger.warning(
+                "cleanup_orphaned_all_sessions: session %s failed", session_name, exc_info=True
+            )
+            continue
+        if killed:
+            logger.info(
+                "cleanup_orphaned_all_sessions: killed %d orphaned window(s) in session %s",
+                killed,
+                session_name,
+            )
+        total += killed
+    return total

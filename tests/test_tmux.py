@@ -257,35 +257,47 @@ class TestTmuxSessionManager:
         assert windows == []
 
     def test_cleanup_orphaned(self) -> None:
+        """Windows whose thread is not active are killed; active ones survive.
+
+        Dispatches ``_run`` by subcommand rather than replaying a fixed call
+        sequence: since #570 the reaper also probes each window's pane before
+        killing it, and a positional ``side_effect`` list silently mis-aligns
+        whenever a probe is added. The reaper-specific cases (a live Claude
+        pane, a window with no ``@thread_id``) live in
+        ``tests/test_tmux_reaper.py``.
+        """
+        windows = {"work1": "111", "work2": "222", "work3": "333"}
+        killed_targets: list[str] = []
+
+        def fake_run(argv: list[str], **_: object) -> MagicMock:
+            if "list-windows" in argv:
+                sep = "\t" if "\t" in argv[-1] else ":"
+                body = "".join(f"{n}{sep}/work/{n}\n" for n in windows)
+                return MagicMock(returncode=0, stdout=body)
+            if "show-option" in argv:
+                name = argv[argv.index("-t") + 1].split(":", 1)[1]
+                tid = windows.get(name)
+                if tid is None:
+                    return MagicMock(returncode=1, stdout="")
+                return MagicMock(returncode=0, stdout=f"{tid}\n")
+            if "list-panes" in argv:
+                return MagicMock(returncode=0, stdout="zsh\n")
+            if "kill-window" in argv:
+                killed_targets.append(argv[argv.index("-t") + 1])
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
-        with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list_sessions: list-windows
-                MagicMock(
-                    returncode=0,
-                    stdout="work1:/a\nwork2:/b\nwork3:/c\n",
-                ),
-                # show-option for work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option for work2
-                MagicMock(returncode=0, stdout="222\n"),
-                # show-option for work3
-                MagicMock(returncode=0, stdout="333\n"),
-                # kill_session(111): _find → cache miss → rebuild list-windows
-                MagicMock(returncode=0, stdout="work1:/a\nwork2:/b\nwork3:/c\n"),
-                MagicMock(returncode=0, stdout="111\n"),  # show-option work1
-                MagicMock(returncode=0, stdout="222\n"),  # show-option work2
-                MagicMock(returncode=0, stdout="333\n"),  # show-option work3
-                MagicMock(returncode=0),  # kill-window work1
-                # kill_session(333): _find → cache hit → show-option verify
-                MagicMock(returncode=0, stdout="333\n"),
-                MagicMock(returncode=0),  # kill-window work3
-            ]
+        with patch("c_lord.tmux._run", side_effect=fake_run):
             killed = mgr.cleanup_orphaned(active_thread_ids={222})
 
         assert killed == 2
+        assert sorted(killed_targets) == [
+            f"{SESSION_NAME}:work1",
+            f"{SESSION_NAME}:work3",
+        ]
 
     def test_cleanup_orphaned_tmux_unavailable(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
