@@ -823,9 +823,7 @@ async def test_cursor_never_records_a_silently_flushed_intermediate(tmp_path: Pa
                 "type": "assistant",
                 "uuid": "u-tool",
                 "message": {
-                    "content": [
-                        {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}
-                    ]
+                    "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]
                 },
             },
         )
@@ -833,9 +831,7 @@ async def test_cursor_never_records_a_silently_flushed_intermediate(tmp_path: Pa
     finally:
         await mirror.stop()  # shutdown mid-turn
 
-    assert cursor == ["u-final"], (
-        f"cursor must hold only delivered final answers, got {cursor!r}"
-    )
+    assert cursor == ["u-final"], f"cursor must hold only delivered final answers, got {cursor!r}"
 
 
 # ---------------------------------------------------------------------------

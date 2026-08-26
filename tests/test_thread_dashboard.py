@@ -437,3 +437,55 @@ class TestOwnerFallbackPolicy:
 
             sent_text = thread.send.call_args.args[0]
             assert "<@999>" in sent_text, f"mode={mode} must still mention the poster"
+
+
+class TestNoResponseMention:
+    """#562 AC2/AC3: the turn-end ping must say what actually happened."""
+
+    @staticmethod
+    def _dash(thread):
+        from c_lord.discord_ui.thread_dashboard import ThreadStatusDashboard
+
+        d = ThreadStatusDashboard(MagicMock(), owner_id=999)
+        d._refresh_dashboard = AsyncMock()  # type: ignore[method-assign]
+        return d
+
+    @pytest.mark.asyncio
+    async def test_answered_turn_still_says_finished(self) -> None:
+        """AC5: the normal wording is untouched."""
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        thread = MagicMock()
+        thread.send = AsyncMock()
+        d = self._dash(thread)
+
+        await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=7)
+        await d.set_state(1, ThreadState.WAITING_INPUT, "x", thread=thread, notify_user_id=7)
+
+        thread.send.assert_awaited_once()
+        assert "Claude has finished" in thread.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_turn_with_no_response_says_so_instead(self) -> None:
+        """AC2/AC3: no answer → do not claim the work finished."""
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        thread = MagicMock()
+        thread.send = AsyncMock()
+        d = self._dash(thread)
+
+        await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=7)
+        await d.set_state(
+            1,
+            ThreadState.WAITING_INPUT,
+            "x",
+            thread=thread,
+            notify_user_id=7,
+            no_response=True,
+        )
+
+        thread.send.assert_awaited_once()
+        body = thread.send.await_args.args[0]
+        assert "Claude has finished" not in body, body
+        assert "応答がありません" in body, body
+        assert "<@7>" in body, "the waiting user must still be told"
