@@ -2,18 +2,22 @@
 
 Format::
 
+    <status_emoji> W<work_number> │ #<origin> <topic> →#<current>
     <status_emoji> W<work_number> │ #<issue> <topic>   (with window + Issue/PR number)
     <status_emoji> W<work_number> │ <topic>            (with window, no number)
     <status_emoji> <topic>                             (dead, or no window number)
     [終了] #<issue> <topic>                             (closed — /close-workspace'd)
 
-The ``#<issue>`` token (#414) is the Issue/PR number the thread is working on,
-auto-detected from the session's git branch or its first message; it is omitted
-when no number is known.
+The leading ``#<issue>`` token (#414) is the Issue/PR number that **identifies**
+the thread — the one it was opened for. It is written once and never moves, so a
+thread stays findable in the sidebar. When the thread has since moved on to a
+different number (a spun-off Issue, a PR), that one is appended as ``→#<current>``
+(#593). Both are omitted when no number is known.
 
 Examples::
 
     🟢 W3 │ #404 認証リファクタ      (running, working on #404)
+    W131 │ #540 メモリ →#588          (opened for #540, now working on #588)
     🟡 W2 │ 絵本-イラスト発注        (waiting for user input, no number)
     🔴 W1 │ エラーが発生             (error)
     ⚪ 終わったプロジェクト           (dead)
@@ -34,7 +38,7 @@ Lamp states (#120):
 * ``pending``  → 🟠 — reserved for external setters
 
 Rules:
-* total length ≤ 30 chars (topic is truncated if needed to fit)
+* total length ≤ 45 chars (topic is truncated if needed to fit)
 * ``closed`` replaces the lamp emoji and the ``W<N> │`` prefix with ``[終了] ``
   (the window it named no longer exists), and wins over ``state``
 * state ``dead`` drops the ``W<N> │`` prefix entirely
@@ -59,7 +63,14 @@ STATUS_EMOJI: dict[str, str] = {
     "dead": "⚪",  # no tmux window
 }
 
-_MAX_NAME_LEN = 30
+#: Hard cap on the rendered thread name.
+#:
+#: Discord itself allows 100; c-lord self-limits so the sidebar stays scannable.
+#: #593 raised it from 30 after measuring the live server: 46 of 195 ``W…``
+#: threads were **already** truncated at 30 (median 26). Appending the
+#: ``→#<current>`` token there would have eaten the topic rather than slack —
+#: "keep the original number" must not cost "what is this thread about".
+MAX_NAME_LEN = 45
 
 # #512: prefix marking a workspace that was stopped on purpose.
 # Deliberately plain text rather than an emoji: it must stay legible where emoji
@@ -96,6 +107,10 @@ _TRAILING_INDEX_RE = re.compile(r"\s*#\d+\s*$")
 # Matches a leading "#<digits> " issue/PR token (new format, #414). Sits between
 # the work prefix and the topic body, so it is stripped after the work prefix.
 _LEADING_REF_RE = re.compile(r"^#\d+\s*")
+# Matches the trailing " →#<digits>" current-work token (#593). Stripped so a
+# manual rename of a name carrying it does not fold it into the stored topic —
+# which would double it (``… →#588 →#588``) on the next rebuild.
+_TRAILING_CUR_REF_RE = re.compile(r"\s*→\s*#\d+\s*$")
 
 # States that suppress the W<N> prefix (no window info shown).
 _NO_PREFIX_STATES = frozenset({"dead"})
@@ -108,9 +123,10 @@ def build_name(
     *,
     lamp: bool = True,
     issue_ref: str | None = None,
+    origin_issue_ref: str | None = None,
     closed: bool = False,
 ) -> str:
-    """Build a thread name from its parts, capped at 30 characters.
+    """Build a thread name from its parts, capped at :data:`MAX_NAME_LEN` characters.
 
     ``window_number`` is the ``N`` from the tmux ``w{N}`` window name (a
     stable identifier), not tmux's volatile ``#{window_index}``.
@@ -120,11 +136,18 @@ def build_name(
     Issue/PR number the thread is working on; it is dropped when ``issue_ref`` is
     ``None``. Drops the ``W<N> │`` work prefix for dead state or when the window
     number is unknown. Unknown ``state`` falls back to the ``alive``/🟢 emoji.
-    When the combination is too long, only the topic is truncated (the number is
-    kept); under extreme length pressure the work prefix, then the number, are
-    dropped before the topic disappears.
+    When the combination is too long, the ``→#<current>`` token is dropped first
+    (#593 — the identity must outlive the running commentary), then only the
+    topic is truncated (the number is kept); under extreme length pressure the
+    work prefix, then the number, are dropped before the topic disappears.
 
-    ``issue_ref`` may be passed with or without a leading ``#`` — it is
+    ``origin_issue_ref`` (#593) is the number the thread was **opened for** — its
+    identity. It leads the name; ``issue_ref`` (what the thread is working on
+    *now*) is appended as ``→#<current>`` only when the two differ. When no
+    origin is recorded (rows predating the column) the current number leads
+    instead, so those threads render exactly as they did before.
+
+    Both refs may be passed with or without a leading ``#`` — they are
     normalised to a single ``#``.
 
     ``lamp=False`` (the thread-lamp opt-out, #329) drops the leading status
@@ -143,8 +166,12 @@ def build_name(
     emoji = STATUS_EMOJI.get(state, STATUS_EMOJI["alive"])
     prefix_emoji = "" if closed else (f"{emoji} " if lamp else "")
 
-    ref = (issue_ref or "").lstrip("#").strip()
-    ref_token = f"#{ref} " if ref else ""
+    current = (issue_ref or "").lstrip("#").strip()
+    # No origin recorded (a row written before #593) → the current number *is*
+    # the thread's identity, which is exactly the pre-#593 rendering.
+    origin = (origin_issue_ref or "").lstrip("#").strip() or current
+    ref_token = f"#{origin} " if origin else ""
+    cur_token = f" →#{current}" if current and current != origin else ""
 
     if not closed and state not in _NO_PREFIX_STATES and window_number is not None:
         work = f"W{window_number} │ "
@@ -161,17 +188,25 @@ def build_name(
         f"{mark}{prefix_emoji}{ref_token}",
         f"{mark}{prefix_emoji}",
     ):
-        budget = _MAX_NAME_LEN - len(fixed)
+        budget = MAX_NAME_LEN - len(fixed)
         if budget >= 1:
             break
     else:
         fixed = f"{mark}{prefix_emoji}"
-        budget = _MAX_NAME_LEN - len(fixed)
+        budget = MAX_NAME_LEN - len(fixed)
 
     if len(topic_clean) > budget:
         topic_clean = topic_clean[: max(budget, 0)]
 
-    return f"{fixed}{topic_clean}"[:_MAX_NAME_LEN]
+    name = f"{fixed}{topic_clean}"[:MAX_NAME_LEN]
+    # The ``→#<current>`` token is strictly additive: it is appended only when it
+    # fits in the slack the topic left over, never by shortening the topic. The
+    # thread's identity (``#<origin>``) and what it is about must both survive
+    # first — this is the shed order AC4 asks for. It is also pointless without
+    # the origin token, which extreme length pressure may already have dropped.
+    if cur_token and ref_token in fixed and len(name) + len(cur_token) <= MAX_NAME_LEN:
+        name += cur_token
+    return name
 
 
 _LAMP_TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -219,7 +254,8 @@ def parse_topic_from_name(name: str) -> str:
 
     Strips the leading status emoji (if present), the ``[終了]`` closed marker
     (#512, if present), the ``W<N> │`` work prefix (if present), the leading
-    ``#<digits>`` issue/PR token (#414, if present), and the legacy trailing
+    ``#<digits>`` issue/PR token (#414, if present), the trailing ``→#<digits>``
+    current-work token (#593, if present), and the legacy trailing
     `` #<digits>`` suffix (if present, for backward-compat with the old format).
     Whitespace around the result is trimmed.
     Returns an empty string only when the input has no body at all.
@@ -233,5 +269,6 @@ def parse_topic_from_name(name: str) -> str:
     body = _CLOSED_PREFIX_RE.sub("", body)
     body = _WORK_PREFIX_RE.sub("", body)
     body = _LEADING_REF_RE.sub("", body)
+    body = _TRAILING_CUR_REF_RE.sub("", body)
     body = _TRAILING_INDEX_RE.sub("", body)
     return body.strip()

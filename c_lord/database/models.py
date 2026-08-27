@@ -152,6 +152,18 @@ _MIGRATIONS = [
     # from the session's git branch or first message and shown in the thread
     # name as "#<n>". Persisted so it is stable across restarts.
     "ALTER TABLE sessions ADD COLUMN issue_ref TEXT",
+    # Issue #593: the Issue/PR number the thread was *opened for* — its identity
+    # in the sidebar. Written once (the first time any number is known) and never
+    # moved again, unlike issue_ref which follows the git branch every turn. The
+    # two were one column, so switching to a spun-off Issue's branch erased the
+    # number the thread was findable by.
+    "ALTER TABLE sessions ADD COLUMN origin_issue_ref TEXT",
+    # Backfill for rows written before the column existed: adopt the number they
+    # currently carry. Their display does not change (origin == current renders
+    # as one number) and the *next* branch switch is tracked. Idempotent — it
+    # only ever fills NULLs, so re-running it on every startup is a no-op.
+    "UPDATE sessions SET origin_issue_ref = issue_ref "
+    "WHERE origin_issue_ref IS NULL AND issue_ref IS NOT NULL",
     # Issue #512: when the user closed this session on purpose
     # (/close-workspace). NULL = open. Persisting it is what lets c-lord tell an
     # intentional 終了 apart from a pane that merely died (bot restart, tmux-server

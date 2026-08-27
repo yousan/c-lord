@@ -444,8 +444,11 @@ class ClaudeChatCog(commands.Cog):
           git branch (``working_dir``) or, as a fallback, the first message.
         - Persists the tmux ``window_id`` (immutable) on the row.
         - Renames the Discord thread to
-          ``<status_emoji> W<work_number> │ #<issue> <topic>`` capped at 30
-          chars, but only if the current name differs (minimises API calls).
+          ``<status_emoji> W<work_number> │ #<origin> <topic> →#<current>``
+          capped at ``thread_name.MAX_NAME_LEN`` chars, but only if the current
+          name differs (minimises API calls). The ``→#<current>`` half appears
+          only while the work has moved off the Issue the thread was opened for
+          (#593).
 
         Mid-conversation topic re-titling (#121) is gated on ``self._thread_retitle``
         (off by default, #414).
@@ -460,6 +463,11 @@ class ClaudeChatCog(commands.Cog):
         locked = bool(record.auto_topic_locked) if record else False
         state = (record.state if record else None) or "alive"
         issue_ref = record.issue_ref if record else None
+        # #593: the number the thread was *opened for*. Unlike issue_ref it never
+        # follows the branch, so the sidebar keeps a stable handle on the thread
+        # after the work moves to a spun-off Issue. set_issue_ref seeds it the
+        # first time any number is known, so nothing else has to write it here.
+        origin_issue_ref = record.origin_issue_ref if record else None
         # #428: text-based issue-ref detection runs ONLY on the thread's first
         # message (the branch is still read every turn). Captured before topic
         # generation: no topic persisted yet and none pending = first naming.
@@ -477,6 +485,7 @@ class ClaudeChatCog(commands.Cog):
             if pending_ref and not record.issue_ref:
                 await self.repo.set_issue_ref(thread.id, pending_ref)
                 issue_ref = pending_ref
+                origin_issue_ref = origin_issue_ref or pending_ref
             pending_win = self._pending_tmux_window_id.pop(thread.id, None)
             if pending_win and record.tmux_window_id != pending_win:
                 await self.repo.set_tmux_window_id(thread.id, pending_win)
@@ -537,6 +546,8 @@ class ClaudeChatCog(commands.Cog):
         )
         if detected_ref and detected_ref != issue_ref:
             issue_ref = detected_ref
+            # #593: the very first number a thread learns is also its origin.
+            origin_issue_ref = origin_issue_ref or detected_ref
             if record is not None:
                 await self.repo.set_issue_ref(thread.id, detected_ref)
             else:
@@ -554,6 +565,7 @@ class ClaudeChatCog(commands.Cog):
             window_number,
             lamp=self._thread_lamp,
             issue_ref=issue_ref,
+            origin_issue_ref=origin_issue_ref,
             closed=is_closed(record),
         )
         if (thread.name or "") == new_name:

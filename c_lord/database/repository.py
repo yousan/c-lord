@@ -38,6 +38,11 @@ class SessionRecord:
     # Issue #414: the Issue/PR number this thread is working on, shown in the
     # thread name as "#<n>". Auto-detected from the git branch / first message.
     issue_ref: str | None = None
+    # Issue #593: the Issue/PR number this thread was *opened for*. Written once
+    # and never moved, so the sidebar keeps a stable handle on the thread even
+    # after the work moves to a spun-off Issue. ``None`` on rows that never had a
+    # number — nothing is invented for them.
+    origin_issue_ref: str | None = None
     # Issue #512: timestamp of an intentional stop, or None when the workspace
     # is open. Distinct from a merely dead tmux pane (#270).
     closed_at: str | None = None
@@ -181,14 +186,24 @@ class SessionRepository:
             await db.commit()
 
     async def set_issue_ref(self, thread_id: int, issue_ref: str | None) -> None:
-        """Persist the Issue/PR number shown in the thread name (Issue #414).
+        """Persist the Issue/PR number the thread is working on (Issue #414).
 
         ``issue_ref`` is a bare digit string (e.g. ``"404"``) or ``None`` to clear.
+
+        The **first** number a thread is ever given also becomes its
+        ``origin_issue_ref`` (#593) — the identity shown in the sidebar. The
+        ``COALESCE`` is what makes that write-once: later branch switches move
+        ``issue_ref`` alone, and clearing ``issue_ref`` never clears the origin.
+        Keeping it here rather than at the call sites means every path that
+        records a number (naming pass, pending drain, API) seeds the origin.
         """
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "UPDATE sessions SET issue_ref = ? WHERE thread_id = ?",
-                (issue_ref, thread_id),
+                "UPDATE sessions "
+                "   SET issue_ref = ?, "
+                "       origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+                " WHERE thread_id = ?",
+                (issue_ref, issue_ref, thread_id),
             )
             await db.commit()
 

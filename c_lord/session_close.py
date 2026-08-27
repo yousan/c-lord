@@ -94,19 +94,27 @@ def closed_notice_embed() -> discord.Embed:
     )
 
 
-def _name_parts(record: SessionRecord | None, thread: discord.Thread) -> tuple[str, str | None]:
-    """Resolve ``(topic, issue_ref)`` for rebuilding ``thread``'s name.
+def _name_parts(
+    record: SessionRecord | None, thread: discord.Thread
+) -> tuple[str, str | None, str | None]:
+    """Resolve ``(topic, issue_ref, origin_issue_ref)`` for rebuilding ``thread``'s name.
 
     Falls back to parsing the current Discord name when the row has no topic yet
     (e.g. a session closed before its first naming pass), so the rename never
     invents a placeholder over a name the user can already read.
+
+    The origin (#593) rides along because stopping a workspace rebuilds the whole
+    name: without it the ``[停止]`` rename would erase the number the thread was
+    opened for, which is precisely when a stopped thread most needs to stay
+    findable in the archived list.
     """
     topic = record.topic if record else None
     if not topic:
         name = thread.name if isinstance(thread.name, str) else ""
         topic = parse_topic_from_name(name)
     issue_ref = record.issue_ref if record else None
-    return topic or _FALLBACK_TOPIC, issue_ref
+    origin_issue_ref = record.origin_issue_ref if record else None
+    return topic or _FALLBACK_TOPIC, issue_ref, origin_issue_ref
 
 
 async def _edit(thread: discord.Thread, *, archived: bool, name: str | None = None) -> bool:
@@ -159,7 +167,7 @@ async def _build_and_apply(
     """
     try:
         record = await _safe_get(repo, thread.id)
-        topic, issue_ref = _name_parts(record, thread)
+        topic, issue_ref, origin_issue_ref = _name_parts(record, thread)
         new_name = build_name(
             topic,
             # A closed session has no live pane, and a reopened one has no window
@@ -168,6 +176,7 @@ async def _build_and_apply(
             None,
             lamp=thread_lamp_enabled(),
             issue_ref=issue_ref,
+            origin_issue_ref=origin_issue_ref,
             closed=closed,
         )
     except Exception:  # pragma: no cover - defensive
