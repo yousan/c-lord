@@ -31,10 +31,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
@@ -43,6 +46,7 @@ from .notify_policy import owner_notify_id
 from .session_close import is_closed
 from .thread_name import build_name
 from .tmux import parse_work_number
+from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
@@ -65,6 +69,16 @@ def _now() -> datetime.datetime:
 _LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_id}|#{window_name}"
 
 _DEFAULT_INTERVAL_SECONDS = 60.0
+
+# #359: where a pane that looks like a menu but will not parse gets kept, so the
+# population that has never been explainable finally leaves evidence. These are
+# diagnostic captures, not state — losing them costs nothing.
+_UNPARSABLE_DIR_ENV = "CLORD_UNPARSABLE_MENU_DIR"
+_DEFAULT_UNPARSABLE_DIR = "~/.cache/c-lord/unparsable-menus"
+# The sweep revisits the same stuck menu every tick; a bounded, deduplicated
+# store keeps one stuck menu from writing 1,440 files a day (the "loop buries
+# the signal" failure #579 had to undo).
+_MAX_UNPARSABLE_CAPTURES = 40
 
 # How many times the menu watchdog may fail to post the same thread's menu
 # before it stops trying (#579). A failed post leaves the menu unbridged, which
@@ -256,6 +270,61 @@ def _index_by_thread_id(
         if tid.isdigit():
             by_tid[int(tid)] = w
     return by_tid
+
+
+def _unparsable_dir() -> Path:
+    """Directory for #359 diagnostic captures (override with the env var)."""
+    return Path(os.path.expanduser(os.getenv(_UNPARSABLE_DIR_ENV) or _DEFAULT_UNPARSABLE_DIR))
+
+
+def record_unparsable_menu(
+    *,
+    thread_id: int,
+    session_name: str,
+    window_name: str,
+    pane_text: str,
+    directory: Path | None = None,
+) -> Path | None:
+    """Keep a pane that shows a menu the parser could not read (#359).
+
+    The watchdog's cheap signature gate said "there is a menu here" and the full
+    parse then produced nothing. Before this, that combination returned silently
+    on every 60-second tick — no log, no capture — so the "buttons never
+    appeared" reports could never be traced to a cause. Now each distinct frame
+    is written once, which is also exactly the material the DoD's detection-bug
+    fixture rule requires before any parser change.
+
+    Returns the file written, or ``None`` when nothing was written (a duplicate
+    frame, the store is full, or the write failed). Never raises: a diagnostic
+    must not be able to take the sweep down.
+    """
+    logger.warning(
+        "%s pane shows a menu signature but the parser produced nothing — "
+        "the choices cannot reach Discord (session=%s window=%s) (#359)",
+        log_ctx(thread_id=thread_id),
+        session_name,
+        window_name,
+    )
+    try:
+        target = directory if directory is not None else _unparsable_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        existing = sorted(target.glob("*.txt"))
+        if len(existing) >= _MAX_UNPARSABLE_CAPTURES:
+            return None
+        digest = hashlib.sha1(pane_text.encode("utf-8", "replace")).hexdigest()[:12]
+        if any(f.name.endswith(f"-{digest}.txt") for f in existing):
+            return None  # same frame as a previous tick
+        path = target / f"thread{thread_id}-{digest}.txt"
+        path.write_text(pane_text, encoding="utf-8", errors="replace")
+        logger.warning(
+            "%s captured the unparsable pane for diagnosis: %s (#359)",
+            log_ctx(thread_id=thread_id),
+            path,
+        )
+        return path
+    except Exception:
+        logger.debug("record_unparsable_menu: could not store the pane", exc_info=True)
+        return None
 
 
 class ThreadStateSyncLoop:
@@ -691,6 +760,15 @@ class MenuWatchdogLoop:
         norm = _normalize_capture(full)
         question = _parse_ask_from_pane(norm) or _parse_plan_from_pane(norm)
         if question is None:
+            # #359: the signature gate above said this pane is showing a menu, so
+            # a parse that yields nothing means the user is looking at choices we
+            # cannot bridge. Keep the frame instead of returning in silence.
+            record_unparsable_menu(
+                thread_id=thread_id,
+                session_name=session_name,
+                window_name=window_name,
+                pane_text=full,
+            )
             return
 
         channel = self._bot.get_channel(thread_id)
