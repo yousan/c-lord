@@ -40,6 +40,8 @@ class _Rec:
     rename_backoff_until: str | None = None
     # #414: Issue/PR number shown in the thread name
     issue_ref: str | None = None
+    # #593: the number the thread was opened for (its identity in the sidebar)
+    origin_issue_ref: str | None = None
     # #512: set when the session was intentionally closed (/close-workspace)
     closed_at: str | None = None
 

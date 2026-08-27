@@ -5,6 +5,7 @@ from __future__ import annotations
 from c_lord.thread_name import (
     CLOSED_MARK,
     LEGACY_CLOSED_MARKS,
+    MAX_NAME_LEN,
     STATUS_EMOJI,
     build_name,
     parse_topic_from_name,
@@ -66,7 +67,7 @@ def test_build_name_running_no_index():
 def test_build_name_truncates_long_topic():
     long = "あ" * 100
     out = build_name(long, "alive", 12)
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
     assert out.startswith("🟢 W12 │ ")
 
 
@@ -143,7 +144,7 @@ def test_build_name_lamp_false_no_status_emoji_for_any_state():
 
 def test_build_name_lamp_false_truncates_long_topic():
     out = build_name("あ" * 100, "running", 12, lamp=False)
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
     assert out.startswith("W12 │ ")
 
 
@@ -221,7 +222,7 @@ def test_build_name_issue_ref_no_window():
 
 def test_build_name_issue_ref_truncates_topic_to_fit():
     out = build_name("あ" * 100, "running", 12, issue_ref="404")
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
     assert out.startswith("🟢 W12 │ #404 ")
 
 
@@ -282,10 +283,10 @@ def test_build_name_closed_drops_work_prefix_and_lamp():
 
 
 def test_build_name_closed_keeps_issue_ref_and_truncates_topic():
-    """#512: under the 30-char cap the marker + number survive; the topic is trimmed."""
+    """#512: under the name cap the marker + number survive; the topic is trimmed."""
     out = build_name("あ" * 40, "dead", None, lamp=False, issue_ref="404", closed=True)
     assert out.startswith(f"{CLOSED_MARK} #404 ")
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
 
 
 def test_build_name_not_closed_is_unchanged():

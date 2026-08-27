@@ -389,6 +389,9 @@ class ThreadStateSyncLoop:
 
         # #414: keep the Issue/PR number in the lamp-sync rename too, otherwise
         # the slow sidebar repaint would drop it from the name.
+        # #593: likewise the *origin* number. This loop repaints every thread on a
+        # 60s tick, so omitting it here would quietly undo the identity half of
+        # the name a minute after the naming pass wrote it.
         # #512: likewise the ``[終了]`` marker. A closed session has no tmux window,
         # so this loop computes state="dead" for it every tick — without the flag
         # it would rebuild the plain name and quietly undo the marker that
@@ -398,6 +401,7 @@ class ThreadStateSyncLoop:
             new_state,
             window_number,
             issue_ref=record.issue_ref,
+            origin_issue_ref=record.origin_issue_ref,
             closed=is_closed(record),
         )
 

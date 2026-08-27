@@ -2157,13 +2157,16 @@ class TestApplyThreadNamingRetitle:
 
         return cog, thread, tmux_manager
 
-    def _make_record(self, *, topic, locked=0, state="running", issue_ref=None):
+    def _make_record(
+        self, *, topic, locked=0, state="running", issue_ref=None, origin_issue_ref=None
+    ):
         record = MagicMock()
         record.topic = topic
         record.auto_topic_locked = locked
         record.state = state
         record.tmux_window_id = "@1"
         record.issue_ref = issue_ref
+        record.origin_issue_ref = origin_issue_ref
         return record
 
     @pytest.mark.asyncio
@@ -2402,13 +2405,14 @@ class TestApplyThreadNamingIssueRef:
         tmux_manager.get_window_info = MagicMock(return_value=("@1", 1))
         return cog, thread, tmux_manager
 
-    def _make_record(self, *, topic="認証リファクタ", issue_ref=None):
+    def _make_record(self, *, topic="認証リファクタ", issue_ref=None, origin_issue_ref=None):
         record = MagicMock()
         record.topic = topic
         record.auto_topic_locked = 0
         record.state = "running"
         record.tmux_window_id = "@1"
         record.issue_ref = issue_ref
+        record.origin_issue_ref = origin_issue_ref
         return record
 
     @pytest.mark.asyncio
