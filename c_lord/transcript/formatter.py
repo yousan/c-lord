@@ -114,6 +114,57 @@ _BASH_NO_OUTPUT = "(Bash completed with no output)"
 _BASH_TAG_RE = re.compile(r"</?bash-(?:input|stdout|stderr)>")
 
 
+# Claude Code harness task notifications (#380).  When a background task
+# finishes or is killed the harness injects a ``user``-role *string* event
+# wrapped in these tags.  Nobody typed it, so mirroring it as a 👤 bubble shows
+# the reader a message they never sent — raw XML, and with it the internal
+# ``<output-file>`` path (measured 2026-08-27: every leaked message exposed
+# one).  Same shape and same reasoning as the ``<bash-*>`` markers above:
+# harness bookkeeping, not human input.
+#
+# Only ``<summary>`` is worth keeping — it is the one field written for a person
+# to read ("Background command ... completed (exit code 0)").  The task id, the
+# tool-use id and the output path are internal, and the path is the leak itself.
+_TASK_NOTIFICATION_OPEN = "<task-notification>"
+_TASK_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
+_TASK_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.DOTALL)
+_TASK_TAG_RE = re.compile(r"</?task-notification>|<[^>]+>")
+
+
+def _is_task_notification(text: str) -> bool:
+    """True when *text* (already stripped) is a harness task notification."""
+    return text.startswith(_TASK_NOTIFICATION_OPEN)
+
+
+def _render_task_notification(text: str, session_id: str | None) -> RenderedEvent | None:
+    """Render a task notification as tool activity, or ``None`` to drop it (#380).
+
+    Folded into ``progress.txt`` in minimal mode like any other tool result, so
+    the record survives without a 👤 bubble per background task.  It also counts
+    as tool activity for the in-turn progress line (#539), which is what makes
+    "a background task is running" visible during the turn without spending a
+    message on it.
+
+    Falls back to ``<status>`` when there is no summary, and to tag-stripping for
+    a malformed marker — the raw storage form must never reach Discord (#487).
+    """
+    m = _TASK_SUMMARY_RE.search(text)
+    detail = m.group(1).strip() if m is not None else ""
+    if not detail:
+        m = _TASK_STATUS_RE.search(text)
+        detail = m.group(1).strip() if m is not None else ""
+    if not detail:
+        # Malformed or empty: strip every tag rather than leak the storage form.
+        detail = _TASK_TAG_RE.sub("", text).strip()
+    if not detail:
+        return None
+    return RenderedEvent(
+        kind="tool_result",
+        body=f"⏹ バックグラウンド: {detail}",
+        session_id=session_id,
+    )
+
+
 def _is_bash_mode_marker(text: str) -> bool:
     """True when *text* (already stripped) is a Claude Code bash-mode marker."""
     return text.startswith("<bash-input>") or text.startswith("<bash-stdout>")
@@ -183,6 +234,9 @@ def _render_user(event: dict[str, Any]) -> RenderedEvent | None:
         # the drop (empty output) cases.
         if _is_bash_mode_marker(stripped):
             return _render_bash_mode(stripped, event.get("sessionId"))
+        # #380: harness bookkeeping, not human input — same treatment as above.
+        if _is_task_notification(stripped):
+            return _render_task_notification(stripped, event.get("sessionId"))
         if content.startswith(ZWSP_MARKER):
             # Echo of c-lord-driven send-keys; Discord already has the original.
             return None

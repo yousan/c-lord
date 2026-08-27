@@ -221,3 +221,119 @@ def test_render_carries_session_id_when_present() -> None:
 
 def test_render_returns_none_for_unknown_top_level_type() -> None:
     assert render_event({"type": "mystery"}) is None
+
+
+# --- Claude Code harness task notifications (#380) ---
+# When a background task finishes (or is killed), the harness injects a
+# ``user``-role *string* event wrapped in ``<task-notification>``. Nobody typed
+# it, so mirroring it as a 👤 bubble shows the reader a message they never sent —
+# raw XML, including the internal ``<output-file>`` path. Same shape and same
+# reasoning as the ``<bash-*>`` markers handled in #487: harness bookkeeping, not
+# human input, so it belongs in progress.txt as tool activity.
+
+_REAL_TASK_NOTIFICATION = (
+    "<task-notification>\n"
+    "<task-id>bdnbr8ftm</task-id>\n"
+    "<tool-use-id>toolu_01RC55pzXpo4stAsQhv38oht</tool-use-id>\n"
+    "<output-file>/tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-"
+    "1541974007887175760/3baa0184-ca9d-49c2-86e2-4c5298e02403/tasks/bdnbr8ftm.output</output-file>\n"
+    "<status>completed</status>\n"
+    '<summary>Background command "Final merge attempt for 539" completed (exit code 0)</summary>\n'
+    "</task-notification>"
+)
+
+
+def test_task_notification_is_not_mirrored_as_user_input() -> None:
+    """The whole complaint: it shows up as something the reader never typed."""
+    out = render_event(_user(_REAL_TASK_NOTIFICATION))
+    assert out is not None
+    assert out.kind != "user_input", "harness bookkeeping was mirrored as a 👤 message"
+    assert out.kind == "tool_result"
+
+
+def test_task_notification_keeps_the_readable_summary() -> None:
+    out = render_event(_user(_REAL_TASK_NOTIFICATION))
+    assert out is not None
+    assert 'Background command "Final merge attempt for 539" completed' in out.body
+
+
+def test_task_notification_drops_internal_ids_and_paths() -> None:
+    """Measured 2026-08-27: every leaked message exposed a filesystem path."""
+    out = render_event(_user(_REAL_TASK_NOTIFICATION))
+    assert out is not None
+    assert "/tmp/claude-" not in out.body, out.body
+    assert "bdnbr8ftm" not in out.body, out.body
+    assert "toolu_01RC55pzXpo4stAsQhv38oht" not in out.body, out.body
+
+
+def test_task_notification_never_leaks_raw_tags() -> None:
+    out = render_event(_user(_REAL_TASK_NOTIFICATION))
+    assert out is not None
+    assert "<task-notification>" not in out.body
+    assert "<summary>" not in out.body
+    assert "<output-file>" not in out.body
+
+
+def test_killed_task_notification_says_so() -> None:
+    ev = _user(
+        "<task-notification>\n"
+        "<task-id>x1</task-id>\n"
+        "<status>killed</status>\n"
+        '<summary>Background command "watch logs" was stopped</summary>\n'
+        "</task-notification>"
+    )
+    out = render_event(ev)
+    assert out is not None
+    assert out.kind == "tool_result"
+    assert "was stopped" in out.body
+
+
+def test_task_notification_without_summary_falls_back_to_status() -> None:
+    ev = _user(
+        "<task-notification>\n<task-id>x1</task-id>\n<status>failed</status>\n</task-notification>"
+    )
+    out = render_event(ev)
+    assert out is not None
+    assert "failed" in out.body
+    assert "x1" not in out.body
+
+
+def test_empty_task_notification_is_dropped() -> None:
+    """Nothing readable in it → do not put an empty bubble in the thread."""
+    assert render_event(_user("<task-notification>\n</task-notification>")) is None
+
+
+def test_malformed_task_notification_still_does_not_leak_tags() -> None:
+    """#487's fallback rule: strip rather than leak the raw storage form."""
+    out = render_event(_user("<task-notification>oops no closing tag"))
+    assert out is None or ("<task-notification>" not in out.body and out.kind != "user_input")
+
+
+def test_real_user_input_is_still_mirrored() -> None:
+    """Regression guard: a human message must still read as one."""
+    out = render_event(_user("これは人間が打ったメッセージです"))
+    assert out is not None
+    assert out.kind == "user_input"
+    assert out.body == "これは人間が打ったメッセージです"
+
+
+def test_zwsp_echo_of_a_pasted_task_notification_is_still_dropped() -> None:
+    """A human pasting one must not be re-rendered as harness activity.
+
+    c-lord marks its own send-keys echo with ZWSP so it is not mirrored back.
+    The #380 check sits before that guard in ``_render_user``, so pin the
+    ordering: a ZWSP-marked echo stays an echo even when its text happens to be
+    a task notification.
+    """
+    ev = _user(
+        ZWSP_MARKER
+        + "<task-notification>\n<summary>pasted by a human</summary>\n</task-notification>"
+    )
+    assert render_event(ev) is None
+
+
+def test_message_merely_mentioning_the_tag_is_still_user_input() -> None:
+    """Talking *about* the tag is a human message, not harness bookkeeping."""
+    out = render_event(_user("`<task-notification>` が 👤 で流れる件、直しました"))
+    assert out is not None
+    assert out.kind == "user_input"
