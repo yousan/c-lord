@@ -962,6 +962,56 @@ class TestTmuxClaudeRunnerTrustPrompt:
         text = "Hello! How can I help?\n❯"
         assert TmuxClaudeRunner._has_trust_prompt(text) is False
 
+    # Claude Code >= 2.1.248 drops the numbers and puts "No, exit" first, with
+    # the cursor on it.  Captured from a real pane on 2.1.250.
+    UNNUMBERED = (
+        " Quick safety check: Is this a project you created or one you trust?\n"
+        "\n"
+        " Security guide\n"
+        "\n"
+        " ❯ No, exit\n"
+        "   Yes, I trust this folder\n"
+        "\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+
+    def test_detects_unnumbered_trust_prompt(self) -> None:
+        assert TmuxClaudeRunner._has_trust_prompt(self.UNNUMBERED) is True
+
+    def test_detects_unnumbered_prompt_with_permission_warning(self) -> None:
+        """A folder that pre-approves permissions gets an extra warning block."""
+        text = (
+            " ⚠ This folder pre-approves 6 tool permissions in .claude/settings.local.json:\n"
+            "   mcp__serena__find_symbol, Bash(npx tsc:*), Bash(git add:*)\n"
+        ) + self.UNNUMBERED
+        assert TmuxClaudeRunner._has_trust_prompt(text) is True
+
+    def test_prose_without_confirm_footer_is_not_a_prompt(self) -> None:
+        """Talking about the dialog must not trip a keystroke into the input."""
+        text = "we discussed how it prints\nYes, I trust this folder\nand then stops\n❯ "
+        assert TmuxClaudeRunner._has_trust_prompt(text) is False
+
+    def test_offset_is_zero_for_numbered_dialog(self) -> None:
+        text = (
+            "❯ 1. Yes, I trust this folder\n"
+            "  2. No, exit\n"
+            "Enter to confirm"
+        )
+        assert TmuxClaudeRunner._trust_option_offset(text) == 0
+
+    def test_offset_is_one_for_unnumbered_dialog(self) -> None:
+        """Bare Enter here would select "No, exit" and Claude would quit."""
+        assert TmuxClaudeRunner._trust_option_offset(self.UNNUMBERED) == 1
+
+    def test_offset_uses_the_live_dialog_not_scrollback(self) -> None:
+        text = (
+            "❯ 1. Yes, I trust this folder\n"
+            "  2. No, exit\n"
+            "Enter to confirm\n"
+            "\n...earlier work...\n\n"
+        ) + self.UNNUMBERED
+        assert TmuxClaudeRunner._trust_option_offset(text) == 1
+
 
 class TestTmuxClaudeRunnerHandleStartupPrompts:
     """Tests for _handle_startup_prompts."""
@@ -998,7 +1048,8 @@ class TestTmuxClaudeRunnerHandleStartupPrompts:
             mock_run.return_value = MagicMock(returncode=0)
             await runner._handle_startup_prompts()
 
-        mock_run.assert_called_once()
+        # The numbered dialog starts on "Yes", so accepting it is a bare Enter.
+        tmux_manager.send_keys.assert_called_once_with(runner._thread_id, "Enter")
 
 
 # -- Tests for run() --------------------------------------------------------

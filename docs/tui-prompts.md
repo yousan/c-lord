@@ -25,12 +25,12 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | 項目 | 内容 |
 |------|------|
 | **トリガ** | 初回起動 or 未信頼ディレクトリで `claude` を起動 |
-| **画面シグネチャ** | `Quick safety check: Is this a project you created?` / `❯ 1. Yes, I trust this folder` / `  2. No, exit` / `Enter to confirm` |
-| **操作** | Enter（選択肢 1 を選択）または `2` + Enter で終了 |
+| **画面シグネチャ** | `Quick safety check: Is this a project you created or one you trust?` / `Enter to confirm`。**選択肢は CLI のバージョンで2形ある**: **≤ 2.1.247** = `❯ 1. Yes, I trust this folder` / `  2. No, exit`（番号付き・**Yes が既定**）、**≥ 2.1.248** = `❯ No, exit` / `  Yes, I trust this folder`（番号なし・**No が既定**） |
+| **操作** | カーソルを `Yes, I trust this folder` の行まで Down で運んでから Enter。旧形は Down 0 回（＝素の Enter）、現行は Down 1 回。🔴 **現行形で素の Enter を送ると `No, exit` を選び、Claude は起動せずに終了する**（#602。2026-08-28 の 2.1.250 導入後、新規セッションが1本も起動しなくなった） |
 | **JSONL** | ❌ TUI-only（ハーネス起動前） |
-| **現在の c-lord 対応** | ✅ 自動処理（`_handle_startup_prompts` が Enter を送信） |
-| **検出パターン（現行）** | `_TRUST_PROMPT_MARKERS = ("Yes, I trust this folder", "Enter to confirm")` |
-| **課題** | 画面シグネチャが変わると検出漏れ。より安定なパターンは `❯ 1.` + 選択肢が並ぶ構造のみ |
+| **現在の c-lord 対応** | ✅ 自動処理。`_handle_startup_prompts` / `run()` → `_accept_trust_prompt(pane)` が `_trust_option_offset(pane)` で**カーソル位置をペインから読み取り**、`_navigate_menu(offset)` で Down×offset + Enter を送る |
+| **検出パターン（現行）** | 番号付き行は単独で成立（`_TRUST_PROMPT_NUMBERED_RE`）。番号なし行は prose が再現しうるので、`Enter to confirm` フッターの同時存在を要求する（`_TRUST_PROMPT_RE`） |
+| **課題** | 並び順や既定が変わっても効くよう、**固定の Enter／番号を前提にせずカーソル位置を読む**方式にした。ただし文言（`Yes, I trust this folder` 等）自体が変われば検出漏れは残る |
 
 ### 1-2. Resume Session Picker
 
