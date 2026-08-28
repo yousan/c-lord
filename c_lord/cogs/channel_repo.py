@@ -179,7 +179,7 @@ class ChannelRepoCog(commands.Cog):
         ).is_clords
 
     async def resolve_tmux_manager(
-        self, channel_id: int, thread_id: int | None = None
+        self, channel_id: int, *, thread_id: int | None
     ) -> TmuxSessionManager | None:
         """Resolve a TmuxSessionManager for the given channel (and optional thread).
 
@@ -187,6 +187,13 @@ class ChannelRepoCog(commands.Cog):
           1. Thread-level: in-memory thread cache → DB thread binding
           2. Channel-level: in-memory channel cache → DB channel binding
           3. None (caller should fall back to global bot.tmux_manager)
+
+        ``thread_id`` is **required** (#600). It used to default to ``None``, and
+        that default caused the same accident twice: #427, then #600, where two
+        paths that send a menu answer back to the TUI resolved by parent channel
+        and dropped every keystroke into the wrong tmux session. A caller that
+        genuinely is not thread-scoped now has to write ``thread_id=None`` on
+        purpose, which is reviewable; silence no longer compiles.
 
         #427: this used to resolve the channel binding only, so a thread bound
         to another repo via ``/clord-thread-init`` got its session_dir from the

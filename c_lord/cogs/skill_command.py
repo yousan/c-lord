@@ -130,7 +130,7 @@ class SkillCommandCog(commands.Cog):
         return None
 
     async def _resolve_tmux_manager(
-        self, channel_id: int, thread_id: int | None = None
+        self, channel_id: int, *, thread_id: int | None
     ) -> TmuxSessionManager | None:
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
 
@@ -300,7 +300,8 @@ class SkillCommandCog(commands.Cog):
 
         # Resolve per-channel managers
         sdm = await self._resolve_session_dir_manager(claude_channel.id)
-        tmux = await self._resolve_tmux_manager(claude_channel.id)
+        # New-thread mode: no thread exists yet (#600 audit).
+        tmux = await self._resolve_tmux_manager(claude_channel.id, thread_id=None)
 
         # Unbound channel check
         if tmux is None:

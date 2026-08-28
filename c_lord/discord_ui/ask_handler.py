@@ -98,6 +98,41 @@ def _mention(user_id: int | None) -> str | None:
     return f"<@{user_id}>" if user_id is not None else None
 
 
+def _answer_undeliverable_notice(selected: list[str]) -> str:
+    """Told to the thread when the chosen answer never reached Claude (#600).
+
+    Echo the choice back: the menu is gone from Discord's side, so without this
+    the person's decision is simply lost and they have to guess what they picked.
+    """
+    choice = " / ".join(s for s in selected if s) or "(選択なし)"
+    return (
+        "-# ⚠️ 選んだ回答を Claude に届けられませんでした"
+        f"（選択: {choice}）。"
+        "スレッドの tmux ウィンドウが見つかりませんでした。"
+        "もう一度送るか、`/tmux-screenshot` でセッションの状態を確認してください。"
+    )
+
+
+async def _report_answer_delivery(
+    thread: discord.Thread, *, delivered: bool, selected: list[str]
+) -> None:
+    """Say something only when the answer did not land (#600).
+
+    A delivered answer needs no message — the menu closing is the feedback. A
+    lost one previously produced nothing at all, which is why a stalled thread
+    went unnoticed for two days.
+    """
+    if delivered:
+        return
+    logger.warning(
+        "ask answer could not be delivered to the TUI (thread=%d selected=%r) (#600)",
+        thread.id,
+        selected,
+    )
+    with contextlib.suppress(Exception):
+        await thread.send(_answer_undeliverable_notice(selected))
+
+
 async def bridge_pane_ask(
     thread: discord.Thread,
     question: AskQuestion,
@@ -313,13 +348,16 @@ async def _bridge_claimed_menu(
     if question.multi_select and indices:
         # multiSelect: toggle every chosen option and Submit (#418).  Using
         # answer_menu (single-select) here dropped all but selected[0].
-        await runner.answer_menu_multi(indices, len(question.options))
+        delivered = await runner.answer_menu_multi(indices, len(question.options))
     elif selected[0] in labels:
-        await runner.answer_menu(labels.index(selected[0]))
+        delivered = await runner.answer_menu(labels.index(selected[0]))
     else:
         # Free text from the "Other" modal → use the "Type something." option,
         # which the TUI numbers immediately after the real options.
-        await runner.answer_menu_text(len(question.options), selected[0])
+        delivered = await runner.answer_menu_text(len(question.options), selected[0])
+    # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
+    # is what keeps the menu from silently staying open and being re-posted.
+    await _report_answer_delivery(thread, delivered=delivered is not False, selected=selected)
 
 
 async def collect_ask_answers(

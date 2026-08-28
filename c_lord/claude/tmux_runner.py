@@ -1643,7 +1643,7 @@ class TmuxClaudeRunner:
         )
         await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
-    async def _navigate_menu(self, index: int) -> None:
+    async def _navigate_menu(self, index: int) -> bool:
         """Move the menu cursor down *index* times then confirm with Enter.
 
         Each key is sent as a SEPARATE ``send-keys`` call with a delay between
@@ -1651,12 +1651,24 @@ class TmuxClaudeRunner:
         fast — the TUI drops the Down navigations and Enter selects the wrong
         (first) option.
         """
+        delivered = True
         for _ in range(max(0, index)):
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            if not await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"):
+                delivered = False
             await asyncio.sleep(_MENU_NAV_DELAY)
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        if not await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"):
+            delivered = False
+        if not delivered:
+            # #600: send_keys returns False when the thread has no tmux window —
+            # the answer went nowhere. Reporting it is what stops the menu from
+            # sitting open and being re-posted on every restart.
+            logger.warning(
+                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+                self._thread_id,
+            )
+        return delivered
 
-    async def answer_menu(self, index: int) -> None:
+    async def answer_menu(self, index: int) -> bool:
         """Select option *index* (0-based) of an open AskUserQuestion menu (#166).
 
         The cursor always starts on the first option, so landing on option
@@ -1669,9 +1681,9 @@ class TmuxClaudeRunner:
             index,
             self._thread_id,
         )
-        await self._navigate_menu(index)
+        return await self._navigate_menu(index)
 
-    async def answer_menu_multi(self, indices: list[int], option_count: int) -> None:
+    async def answer_menu_multi(self, indices: list[int], option_count: int) -> bool:
         """Answer a multiSelect AskUserQuestion: toggle each option then Submit (#418).
 
         ``answer_menu`` (Down×index + Enter) is single-select only, so the bridge
@@ -1690,6 +1702,15 @@ class TmuxClaudeRunner:
         Keys are sent one-per-call with ``_MENU_NAV_DELAY`` spacing — batching is
         dropped by the TUI (#171).
         """
+        # #600: every keystroke reports whether it reached a window; an
+        # undelivered answer must not read as an answered menu.
+        _delivered = True
+
+        def _ok(sent: object) -> None:
+            nonlocal _delivered
+            if not sent:
+                _delivered = False
+
         logger.info(
             "Answering multiSelect AskUserQuestion menu: indices=%s (thread=%d)",
             indices,
@@ -1698,22 +1719,28 @@ class TmuxClaudeRunner:
         cursor = 0
         for idx in sorted({i for i in indices if i >= 0}):
             for _ in range(idx - cursor):
-                await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+                _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
                 await asyncio.sleep(_MENU_NAV_DELAY)
             cursor = idx
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Space")
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Space"))
             await asyncio.sleep(_MENU_NAV_DELAY)
         # Navigate to the "Submit" row (one past "Type something") and open the
         # "Submit answers" review screen.
         for _ in range(max(0, (option_count + 1) - cursor)):
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
             await asyncio.sleep(_MENU_NAV_DELAY)
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
         await asyncio.sleep(_MENU_NAV_DELAY)
         # Confirm the review screen (cursor defaults to "Submit answers").
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        if not _delivered:
+            logger.warning(
+                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+                self._thread_id,
+            )
+        return _delivered
 
-    async def answer_menu_text(self, text_option_index: int, text: str) -> None:
+    async def answer_menu_text(self, text_option_index: int, text: str) -> bool:
         """Answer via the free-text ("Type something.") affordance (#172).
 
         Verified on a live Claude Code v2.1.150 TUI, the correct interaction is:
@@ -1731,22 +1758,37 @@ class TmuxClaudeRunner:
         Keystrokes are spaced by ``_MENU_NAV_DELAY`` for the same reason as
         :meth:`answer_menu` (#171): the TUI drops keys sent too fast.
         """
+        # #600: every keystroke reports whether it reached a window; an
+        # undelivered answer must not read as an answered menu.
+        _delivered = True
+
+        def _ok(sent: object) -> None:
+            nonlocal _delivered
+            if not sent:
+                _delivered = False
+
         logger.info(
             "Answering AskUserQuestion with free text (thread=%d)",
             self._thread_id,
         )
         for _ in range(max(0, text_option_index)):
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
             await asyncio.sleep(_MENU_NAV_DELAY)
         # Type the free text directly onto the highlighted "Type something." row.
-        await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text)
+        _ok(await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text))
         await asyncio.sleep(_MENU_NAV_DELAY)
         # Confirm — records the typed text as the AskUserQuestion answer.
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        if not _delivered:
+            logger.warning(
+                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+                self._thread_id,
+            )
+        return _delivered
 
-    async def cancel_menu(self) -> None:
+    async def cancel_menu(self) -> bool:
         """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape")
+        return bool(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape"))
 
     async def peek_pending_ask(self) -> AskQuestion | None:
         """Re-capture the pane and return an open AskUserQuestion/plan menu (#219).

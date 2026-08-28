@@ -374,7 +374,7 @@ class ClaudeChatCog(commands.Cog):
         return await channel_cog.bind_thread(thread_id, repo, channel_id)
 
     async def _resolve_tmux_manager(
-        self, channel_id: int | None, thread_id: int | None = None
+        self, channel_id: int | None, *, thread_id: int | None
     ) -> TmuxSessionManager | None:
         """Resolve a TmuxSessionManager for the given channel (and optional thread).
 
@@ -1060,7 +1060,9 @@ class ClaudeChatCog(commands.Cog):
             # is the whole point of the option, so do not demand /clord-init.
             if repo is None:
                 sdm = await self._resolve_session_dir_manager(channel_id)
-                tmux = await self._resolve_tmux_manager(channel_id)
+                # No thread exists yet — /clord is creating one, so this is a
+                # channel-binding existence check (#600 audit).
+                tmux = await self._resolve_tmux_manager(channel_id, thread_id=None)
                 if sdm is None and tmux is None:
                     if self._is_someone_elses_channel(channel_id, message):
                         return
