@@ -131,12 +131,36 @@ _TRUST_PROMPT_MARKERS = (
     "Enter to confirm",
 )
 
-# The trust dialog's distinctive *menu option line*: "❯ 1. Yes, I trust this
-# folder".  Detection keys on this anchored line rather than a loose substring
-# of the marker phrases anywhere in the pane: the runner captures ~500 lines of
+# The trust dialog's distinctive *menu option line*.  Claude Code has shipped it
+# in two shapes, and BOTH must be handled:
+#
+#   <= 2.1.247   "❯ 1. Yes, I trust this folder" / "  2. No, exit"  (numbered, Yes first)
+#   >= 2.1.248   "❯ No, exit" / "  Yes, I trust this folder"        (unnumbered, No first)
+#
+# Detection keys on the anchored option line rather than a loose substring of the
+# marker phrases anywhere in the pane: the runner captures ~500 lines of
 # scrollback, so a session that merely *mentions* the dialog's wording (e.g. a
 # chat about this very feature) must not trip a spurious Enter into the input.
-_TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*1\.\s+Yes, I trust this folder\s*$", re.MULTILINE)
+# The unnumbered line is plainer prose than the numbered one, so detection also
+# requires the dialog's confirm footer to be present.
+# The numbered line is a structure prose does not reproduce, so it stands alone.
+_TRUST_PROMPT_NUMBERED_RE = re.compile(
+    r"^\s*❯?\s*\d+\.\s+Yes, I trust this folder\s*$", re.MULTILINE
+)
+# The unnumbered line is plain enough that quoted prose could reproduce it, so it
+# is only trusted alongside the dialog's confirm footer.
+_TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*Yes, I trust this folder\s*$", re.MULTILINE)
+
+# One option line of the trust dialog, in either shape.  Used to work out how
+# many Downs land the cursor on "Yes" — on the newer dialog the cursor starts on
+# "No, exit", so a bare Enter DECLINES trust and Claude exits without ever
+# starting the turn.
+_TRUST_OPTION_RE = re.compile(
+    r"^(?P<cursor>\s*❯)?\s*(?:\d+\.\s+)?(?P<label>Yes, I trust this folder|No, exit)\s*$"
+)
+
+# Footer the trust dialog always prints under its options.
+_TRUST_CONFIRM_FOOTER = "Enter to confirm"
 
 # Patterns from legacy AskUserQuestion TUI menus that must NOT be flagged as
 # "unknown" interactive prompts (#153).
@@ -1112,7 +1136,7 @@ class TmuxClaudeRunner:
             # c-lord already runs these dirs with --dangerously-skip-permissions, so
             # trusting the dir it just cloned is consistent with that threat model.
             if self._has_trust_prompt(current):
-                await self._accept_trust_prompt()
+                await self._accept_trust_prompt(current)
                 continue
 
             # Auto-accept permission prompts so the bot doesn't stall.
@@ -1508,16 +1532,7 @@ class TmuxClaudeRunner:
             pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
 
             if not trust_handled and self._has_trust_prompt(pane):
-                logger.info(
-                    "Trust prompt detected, sending Enter to accept (thread=%d)",
-                    self._thread_id,
-                )
-                from ..tmux import _run
-
-                window = self._tmux._find_window_for_thread(self._thread_id)
-                if window:
-                    target = f"{self._tmux.session_name}:{window}"
-                    _run(["tmux", "send-keys", "-t", target, "Enter"])
+                await self._accept_trust_prompt(pane)
                 trust_handled = True
                 await asyncio.sleep(1.0)
                 elapsed += 1.0
@@ -1539,11 +1554,54 @@ class TmuxClaudeRunner:
         The dialog is top-anchored (its content is near the top of the pane,
         bottom rows blank), so this scans the WHOLE pane rather than the bottom
         permission zone.  To stay robust against the ~500 lines of scrollback the
-        runner captures, it keys on the *menu option line* "❯ 1. Yes, I trust
-        this folder" — a structure prose does not reproduce — instead of a loose
-        substring of the marker phrases.
+        runner captures, it keys on the *menu option line* "Yes, I trust this
+        folder" — anchored to its own line — instead of a loose substring of the
+        marker phrases.  The pre-2.1.248 line carries a "1." that prose does not
+        reproduce; the current unnumbered line is plainer, so it additionally
+        requires the dialog's "Enter to confirm" footer.
         """
+        if _TRUST_PROMPT_NUMBERED_RE.search(text):
+            return True
+        if _TRUST_CONFIRM_FOOTER not in text:
+            return False
         return bool(_TRUST_PROMPT_RE.search(text))
+
+    @staticmethod
+    def _trust_option_offset(text: str) -> int:
+        """Downs needed to move the cursor onto "Yes, I trust this folder".
+
+        Returns 0 for the pre-2.1.248 dialog (the cursor already starts on
+        "1. Yes, I trust this folder") and 1 for the current one, whose options
+        are unnumbered with "❯ No, exit" selected by default.
+
+        Only the LAST contiguous run of option lines counts: the runner captures
+        ~500 lines of scrollback, which may hold an older copy of the dialog
+        above the live one.
+        """
+        block: list[tuple[bool, str]] = []
+        run: list[tuple[bool, str]] = []
+        for line in text.splitlines():
+            match = _TRUST_OPTION_RE.match(line)
+            if match:
+                run.append((bool(match.group("cursor")), match.group("label")))
+            elif line.strip():
+                # A non-blank, non-option line ends the run (blank lines do not,
+                # so a spacer between options does not split the menu).  The
+                # footer under the options ends it too, which is why a finished
+                # run is banked here and not only after the loop.
+                if run:
+                    block = run
+                run = []
+        if run:
+            block = run
+        if not block:
+            return 0
+        cursor_idx = next((i for i, (sel, _) in enumerate(block) if sel), 0)
+        yes_idx = next(
+            (i for i, (_, label) in enumerate(block) if label.startswith("Yes")),
+            cursor_idx,
+        )
+        return max(0, yes_idx - cursor_idx)
 
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
@@ -1603,14 +1661,20 @@ class TmuxClaudeRunner:
         # confuse users with a duplicate warning alongside the real Discord UI.
         return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
 
-    async def _accept_trust_prompt(self) -> None:
-        """Accept the folder-trust dialog by confirming option 1 with Enter.
+    async def _accept_trust_prompt(self, pane_text: str = "") -> None:
+        """Accept the folder-trust dialog by selecting "Yes, I trust this folder".
 
-        The dialog's cursor starts on "1. Yes, I trust this folder", so a bare
-        Enter confirms trust and lets Claude proceed with the original prompt.
+        Which keys do that depends on the Claude Code version: the older dialog
+        starts on "1. Yes, I trust this folder" (bare Enter), the current one
+        starts on "No, exit" (Down, then Enter).  Passing the pane text lets the
+        offset be read off the live dialog instead of assumed — confirming the
+        wrong default makes Claude exit without ever starting the turn.
         """
-        logger.info("Trust prompt detected, accepting (thread=%d)", self._thread_id)
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        offset = self._trust_option_offset(pane_text)
+        logger.info(
+            "Trust prompt detected, accepting (down=%d, thread=%d)", offset, self._thread_id
+        )
+        await self._navigate_menu(offset)
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.
