@@ -265,7 +265,9 @@ class TranscriptMirrorCog(commands.Cog):
             channel_cog = bot.get_cog("ChannelRepoCog")
             tmux_manager = None
             if isinstance(channel_cog, ChannelRepoCog):
-                tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
+                tmux_manager = await channel_cog.resolve_tmux_manager(
+                    parent_id, thread_id=thread_id
+                )
             if tmux_manager is None:
                 tmux_manager = getattr(bot, "tmux_manager", None)
             if tmux_manager is None:

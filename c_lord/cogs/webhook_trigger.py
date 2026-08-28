@@ -134,7 +134,7 @@ class WebhookTriggerCog(commands.Cog):
         async with lock:
             await self._execute_trigger(message, matched_prefix, matched_trigger)
 
-    async def _resolve_tmux_manager(self, channel_id: int, thread_id: int | None = None):
+    async def _resolve_tmux_manager(self, channel_id: int, *, thread_id: int | None):
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
 
         #427: pass ``thread_id`` whenever a thread is in scope so a thread bound

@@ -485,7 +485,7 @@ class SessionManageCog(commands.Cog):
         return None
 
     async def _resolve_tmux_manager(
-        self, channel_id: int, thread_id: int | None = None
+        self, channel_id: int, *, thread_id: int | None
     ) -> TmuxSessionManager | None:
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
 
@@ -504,7 +504,8 @@ class SessionManageCog(commands.Cog):
         bindings = await self._get_all_bindings()
         managers: list[TmuxSessionManager] = []
         for binding in bindings:
-            mgr = await self._resolve_tmux_manager(binding["channel_id"])
+            # Walks channel bindings, not threads (#600 audit).
+            mgr = await self._resolve_tmux_manager(binding["channel_id"], thread_id=None)
             if mgr is not None:
                 managers.append(mgr)
         return managers
@@ -555,7 +556,8 @@ class SessionManageCog(commands.Cog):
             return
 
         sdm = await self._resolve_session_dir_manager(parent_id)
-        tmux_mgr = await self._resolve_tmux_manager(parent_id)
+        # /clord-status lists the *channel's* sessions by design (#600 audit).
+        tmux_mgr = await self._resolve_tmux_manager(parent_id, thread_id=None)
         if sdm is None or tmux_mgr is None:
             await respond(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
@@ -811,7 +813,8 @@ class SessionManageCog(commands.Cog):
 
         all_windows: list[dict] = []
         for binding in bindings:
-            tmux_mgr = await self._resolve_tmux_manager(binding["channel_id"])
+            # Walks channel bindings, not threads (#600 audit).
+            tmux_mgr = await self._resolve_tmux_manager(binding["channel_id"], thread_id=None)
             if tmux_mgr is not None:
                 windows = await asyncio.to_thread(tmux_mgr.list_sessions)
                 all_windows.extend(windows)

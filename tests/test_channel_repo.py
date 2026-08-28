@@ -57,9 +57,7 @@ def _make_bot(*, clord_thread: bool = True) -> MagicMock:
     # These tests are about URL handling and channel access, so the thread is
     # one of c-lord's own unless a test says otherwise.
     bot.session_repo = MagicMock()
-    bot.session_repo.get = AsyncMock(
-        return_value=_session_record() if clord_thread else None
-    )
+    bot.session_repo.get = AsyncMock(return_value=_session_record() if clord_thread else None)
     return bot
 
 
@@ -325,7 +323,7 @@ class TestBindNormalizesUrl:
 
 class TestChannelRepoCogResolveTmuxManager:
     async def test_resolve_returns_none_without_binding(self, cog: ChannelRepoCog) -> None:
-        manager = await cog.resolve_tmux_manager(999)
+        manager = await cog.resolve_tmux_manager(999, thread_id=None)
         assert manager is None
 
     async def test_resolve_auto_derives_from_repo(
@@ -335,7 +333,7 @@ class TestChannelRepoCogResolveTmuxManager:
             channel_id=200,
             source_repo="https://github.com/org/my-project.git",
         )
-        manager = await cog.resolve_tmux_manager(200)
+        manager = await cog.resolve_tmux_manager(200, thread_id=None)
         assert manager is not None
         assert manager.session_name == "my-project"
 
@@ -344,8 +342,8 @@ class TestChannelRepoCogResolveTmuxManager:
             channel_id=300,
             source_repo="https://github.com/org/repo.git",
         )
-        m1 = await cog.resolve_tmux_manager(300)
-        m2 = await cog.resolve_tmux_manager(300)
+        m1 = await cog.resolve_tmux_manager(300, thread_id=None)
+        m2 = await cog.resolve_tmux_manager(300, thread_id=None)
         assert m1 is m2  # same object from cache
 
 
@@ -363,7 +361,7 @@ class TestChannelRepoCogEvictCache:
         self, cog: ChannelRepoCog, repo: ChannelRepository
     ) -> None:
         await repo.save(channel_id=100, source_repo="https://github.com/org/repo.git")
-        await cog.resolve_tmux_manager(100)
+        await cog.resolve_tmux_manager(100, thread_id=None)
         assert 100 in cog._tmux_cache
         cog.evict_cache(100)
         assert 100 not in cog._tmux_cache

@@ -97,13 +97,14 @@ class SchedulerCog(commands.Cog):
     async def _before_master_loop(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _resolve_tmux_manager(self, channel_id: int):
+    async def _resolve_tmux_manager(self, channel_id: int, *, thread_id: int | None):
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_tmux_manager(channel_id)
+            # Scheduled tasks are bound to a channel, never a thread (#600 audit).
+            return await channel_cog.resolve_tmux_manager(channel_id, thread_id=None)
         return None
 
     async def _run_task(self, task: dict) -> None:
@@ -123,7 +124,8 @@ class SchedulerCog(commands.Cog):
                 logger.warning("%s channel is not a TextChannel", ctx)
                 return
 
-            tmux = await self._resolve_tmux_manager(channel.id)
+            # A scheduled task targets a channel, never a thread (#600 audit).
+            tmux = await self._resolve_tmux_manager(channel.id, thread_id=None)
             if tmux is None:
                 logger.warning("%s no tmux manager (name=%s)", ctx, task["name"])
                 return

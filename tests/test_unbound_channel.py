@@ -66,7 +66,7 @@ class TestResolveWithoutBinding:
     @pytest.mark.asyncio
     async def test_resolve_tmux_returns_none_without_binding(self) -> None:
         cog = _make_cog()
-        result = await cog._resolve_tmux_manager(channel_id=12345)
+        result = await cog._resolve_tmux_manager(channel_id=12345, thread_id=None)
         assert result is None
 
 
