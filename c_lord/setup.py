@@ -351,6 +351,30 @@ async def setup_bridge(
     else:
         logger.info("Idle-sleep disabled (CLORD_IDLE_SLEEP_HOURS=0)")
 
+    # --- Resident workspace cap (#576) ---
+    # Backstop, not the main control: TTL (sleep 4h / stop 7d) is. This only
+    # exists so a runaway cannot take the host down before a TTL fires. Unlike
+    # the TTLs, the value **is** host-dependent, so the default is computed from
+    # MemTotal (cgroup limit first) rather than shipped as a constant — a fixed
+    # default would break every host smaller than the one it was measured on
+    # (#540). Override with CLORD_MAX_RESIDENT_WORKSPACES; 0 disables.
+    #
+    # It never blocks a new workspace. The loop only removes residents; there is
+    # nothing on the turn path that consults it. See docs/specs/resident-cap.md.
+    from .resident_cap import ResidentCapLoop, max_resident_workspaces, memory_total
+
+    _total = memory_total()
+    _cap = max_resident_workspaces(total_bytes=_total)
+    logger.info(
+        "Resident cap: %s (memory budget source: %.1f GiB total)",
+        f"{_cap} workspace(s)" if _cap > 0 else "disabled (CLORD_MAX_RESIDENT_WORKSPACES=0)",
+        _total / (1024**3) if _total else 0.0,
+    )
+    if _cap > 0:
+        cap_loop = ResidentCapLoop(bot, session_repo, limit=_cap)
+        cap_loop.start()
+        bot.resident_cap_loop = cap_loop  # type: ignore[attr-defined]
+
     # --- Orphan working-directory sweep (#613) ---
     # Always-on (zero-config): reclaims workspace directories no ``sessions``
     # row points at any more. #575 deletes a directory as it deletes its row, so

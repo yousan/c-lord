@@ -2437,6 +2437,36 @@ def list_tmux_sessions() -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def resident_thread_ids() -> set[int]:
+    """Thread ids whose tmux pane is running Claude right now, host-wide (#576).
+
+    **One** ``tmux list-panes -a`` call regardless of how many sessions exist —
+    the resident-cap loop asks every 30 seconds, and the per-session walk
+    :func:`cleanup_orphaned_all_sessions` does (one ``list-windows`` plus one
+    ``list-panes`` each) costs ~40 subprocesses on a busy host.
+
+    Counts only panes that are *positively* running claude. A pane whose
+    foreground process is a shell holds a window, not the ~400 MB the cap is
+    about, so counting it would evict a live workspace to make room for a
+    corpse. Windows without an ``@thread_id`` were made by hand and are none of
+    our business.
+    """
+    if not _tmux_available():
+        return set()
+
+    result = _run(["tmux", "list-panes", "-a", "-F", "#{@thread_id}\t#{pane_current_command}"])
+    if result.returncode != 0:
+        return set()
+
+    resident: set[int] = set()
+    for line in result.stdout.splitlines():
+        tid, _, command = line.partition("\t")
+        tid = tid.strip()
+        if tid.isdigit() and "claude" in command.strip().lower():
+            resident.add(int(tid))
+    return resident
+
+
 def cleanup_orphaned_all_sessions(active_thread_ids: set[int]) -> int:
     """Reap leftover c-lord windows across **every** tmux session.
 
