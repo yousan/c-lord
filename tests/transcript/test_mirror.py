@@ -16,10 +16,15 @@ from c_lord.transcript.mirror import (
     verbosity_mode,
 )
 
+from .helpers import clord_marker_event, clord_transcript
+
 
 def _write_event(path: Path, payload: dict) -> None:
+    # ensure_ascii=False: Claude Code serialises with JS ``JSON.stringify``, which
+    # writes non-ASCII raw. Escaping would hide c-lord's zero-width-space marker
+    # (#627) behind a ``\\u200b`` and no transcript on disk looks like that.
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _assistant_text(text: str) -> dict:
@@ -58,7 +63,7 @@ async def test_mirror_posts_rendered_events_to_sink(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -84,7 +89,7 @@ async def test_mirror_skips_thinking_and_framing(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -135,7 +140,7 @@ async def test_mirror_sink_errors_do_not_kill_task(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -201,7 +206,7 @@ async def test_mirror_minimal_suppresses_tool_use(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -230,7 +235,7 @@ async def test_mirror_minimal_suppresses_tool_result(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -259,7 +264,7 @@ async def test_mirror_minimal_posts_assistant_text(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -291,7 +296,7 @@ async def test_mirror_minimal_attaches_progress_file_when_tools_buffered(
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -338,7 +343,7 @@ async def test_mirror_minimal_bash_mode_buffered_not_leaked_as_bubble(tmp_path: 
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -390,7 +395,7 @@ async def test_mirror_minimal_no_file_sink_fallback_to_sink(tmp_path: Path) -> N
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -425,7 +430,7 @@ async def test_mirror_full_mode_posts_tool_events_directly(tmp_path: Path) -> No
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -458,7 +463,7 @@ async def test_mirror_minimal_clears_buffer_after_assistant_text(tmp_path: Path)
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -516,7 +521,7 @@ async def test_mirror_multiple_assistant_texts_intermediate_silent(tmp_path: Pat
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -561,7 +566,7 @@ async def test_mirror_result_event_flushes_pending_as_reply(tmp_path: Path) -> N
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -603,7 +608,7 @@ async def test_mirror_multiple_turns_each_final_text_as_reply(tmp_path: Path) ->
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -658,7 +663,7 @@ async def test_mirror_minimal_markdown_table_with_tools_reaches_file_sink(
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -741,7 +746,7 @@ async def test_reply_cursor_sink_records_final_uuid_on_turn_end(tmp_path: Path) 
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -786,7 +791,7 @@ async def test_cursor_never_records_a_silently_flushed_intermediate(tmp_path: Pa
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -857,7 +862,7 @@ async def test_minimal_idle_flush_pings_without_turn_duration(tmp_path: Path) ->
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -899,7 +904,7 @@ async def test_minimal_idle_does_not_prematurely_flush_intermediate_text(
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -996,7 +1001,7 @@ async def test_mirror_bridges_ask_to_cb(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     os.utime(jsonl, (1, 1))
 
     called = asyncio.Event()
@@ -1038,7 +1043,7 @@ async def test_mirror_skips_already_answered_ask(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     os.utime(jsonl, (1, 1))
 
     tid = 2320003
@@ -1088,7 +1093,7 @@ async def test_mirror_skips_ask_when_bus_active(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     os.utime(jsonl, (1, 1))
 
     tid = 2320002
@@ -1139,6 +1144,9 @@ async def test_mirror_does_not_repost_history_on_resume_rewrite(tmp_path: Path) 
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
+    # #627: the mirror only follows a transcript c-lord itself drove, so the
+    # history starts with one of c-lord's marked prompts — as a real one does.
+    _write_event(jsonl, clord_marker_event())
     # Two completed turns of HISTORY, delivered by a previous mirror lifetime.
     # Padded so the later resume-rewrite shrinks the file (trips offset reset).
     _write_event(jsonl, _assistant_text_uuid("old answer 1", "u1", pad=400))
@@ -1170,6 +1178,8 @@ async def test_mirror_does_not_repost_history_on_resume_rewrite(tmp_path: Path) 
         await asyncio.sleep(0.2)
         # Resume rewrite: history preserved verbatim + a NEW turn, no padding.
         lines = [
+            # A resume rewrite preserves the history verbatim, marker included.
+            clord_marker_event(),
             _assistant_text_uuid("old answer 1", "u1"),
             _turn_end("t1"),
             _assistant_text_uuid("old answer 2", "u2"),
@@ -1177,7 +1187,7 @@ async def test_mirror_does_not_repost_history_on_resume_rewrite(tmp_path: Path) 
             _assistant_text_uuid("brand new answer", "u3"),
             _turn_end("t3"),
         ]
-        jsonl.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        jsonl.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
         os.utime(jsonl, (50, 50))
         await asyncio.sleep(0.4)
     finally:
@@ -1214,7 +1224,7 @@ async def test_mirror_suppresses_pane_bridged_context(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -1267,7 +1277,7 @@ async def test_mirror_commits_uuid_of_suppressed_text_when_turn_ends(tmp_path: P
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -1322,7 +1332,7 @@ async def test_mirror_commits_suppressed_uuid_without_turn_end_marker(tmp_path: 
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -1372,7 +1382,7 @@ async def test_stale_registry_entry_cleared_at_turn_boundary(tmp_path: Path) -> 
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -1424,7 +1434,7 @@ async def test_mirror_registers_flushed_intermediate_text_as_mirror_source(tmp_p
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     import os
 
     os.utime(jsonl, (1, 1))
@@ -1506,7 +1516,7 @@ def _fresh_jsonl(tmp_path: Path):
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    clord_transcript(jsonl)
     os.utime(jsonl, (1, 1))
     return project, jsonl
 

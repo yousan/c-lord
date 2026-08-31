@@ -39,10 +39,29 @@ from c_lord.transcript import resolver as resolver_mod
 from c_lord.transcript import tail as tail_mod
 from c_lord.transcript.tail import tail_events
 
+from .helpers import clord_transcript
+
 
 def _write_event(path: Path, payload: dict) -> None:
+    # ensure_ascii=False: Claude Code writes non-ASCII raw, and escaping would
+    # hide c-lord's zero-width-space marker behind a ``\\u200b`` (#627).
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _clord_jsonl(path: Path) -> Path:
+    """A transcript the mirror is allowed to read (#627)."""
+    return clord_transcript(path, uuid=f"marker-{path.stem}")
+
+
+def _other_session_jsonl(path: Path) -> Path:
+    """A transcript some *other* Claude in the same working copy wrote.
+
+    Not eligible (#627), but still a directory entry the resolution has to walk
+    — which is the cost this file is about.
+    """
+    _write_event(path, {"type": "assistant", "uuid": f"other-{path.stem}"})
+    return path
 
 
 class _LoopWatchdog:
@@ -89,25 +108,25 @@ async def _drain(agen, n: int, timeout: float = 3.0) -> list:
 async def test_follow_loop_resolves_the_active_jsonl_off_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC-a: ``latest_session_jsonl`` (glob + stat of every jsonl) must not run
-    on the event loop.  ``tail.py:128`` called it inline, 2x/second, per mirror
-    — 14 of the 23 production heartbeat-block tracebacks were caught inside it.
+    """AC-a: resolving the active jsonl (glob + stat of every jsonl) must not
+    run on the event loop.  ``tail.py:128`` called it inline, 2x/second, per
+    mirror — 14 of the 23 production heartbeat-block tracebacks were caught
+    inside it.
     """
     project = tmp_path / "proj"
     project.mkdir()
-    jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    jsonl = _clord_jsonl(project / "s.jsonl")
     os.utime(jsonl, (1, 1))
 
     loop_thread = threading.get_ident()
     ran_on: list[int] = []
-    real = tail_mod.latest_session_jsonl
+    real = resolver_mod.ThreadSessionResolver.resolve
 
-    def spy(project_dir: Path):
+    def spy(self):
         ran_on.append(threading.get_ident())
-        return real(project_dir)
+        return real(self)
 
-    monkeypatch.setattr(tail_mod, "latest_session_jsonl", spy)
+    monkeypatch.setattr(resolver_mod.ThreadSessionResolver, "resolve", spy)
 
     agen = tail_events(project, poll_interval=0.05).__aiter__()
 
@@ -125,8 +144,8 @@ async def test_follow_loop_resolves_the_active_jsonl_off_the_event_loop(
 
     assert ran_on, "the active-file resolution never ran"
     assert loop_thread not in ran_on, (
-        "latest_session_jsonl ran on the event loop thread — this is the glob+stat "
-        "that the production heartbeat-block tracebacks were caught inside"
+        "the active-file resolution ran on the event loop thread — this is the "
+        "glob+stat that the production heartbeat-block tracebacks were caught inside"
     )
 
 
@@ -139,8 +158,7 @@ async def test_follow_loop_reads_and_parses_off_the_event_loop(
     """
     project = tmp_path / "proj"
     project.mkdir()
-    jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    jsonl = _clord_jsonl(project / "s.jsonl")
     os.utime(jsonl, (1, 1))
 
     loop_thread = threading.get_ident()
@@ -186,18 +204,18 @@ async def test_a_slow_poll_cycle_does_not_stall_the_event_loop(
     """
     project = tmp_path / "proj"
     project.mkdir()
-    jsonl = project / "s.jsonl"
+    jsonl = _clord_jsonl(project / "s.jsonl")
     _write_event(jsonl, {"type": "assistant", "uuid": "seed"})
     os.utime(jsonl, (1, 1))
 
     poll_cost = 0.3  # stands in for glob+stat of a 2481-file project dir
-    real = tail_mod.latest_session_jsonl
+    real = resolver_mod.ThreadSessionResolver.resolve
 
-    def slow(project_dir: Path):
+    def slow(self):
         time.sleep(poll_cost)
-        return real(project_dir)
+        return real(self)
 
-    monkeypatch.setattr(tail_mod, "latest_session_jsonl", slow)
+    monkeypatch.setattr(resolver_mod.ThreadSessionResolver, "resolve", slow)
 
     agen = tail_events(project, poll_interval=0.01).__aiter__()
     watchdog = _LoopWatchdog()
@@ -243,11 +261,9 @@ async def test_many_concurrent_tails_keep_the_event_loop_responsive(
         project = tmp_path / f"p{i}"
         project.mkdir()
         for j in range(files_per_dir):
-            decoy = project / f"other-{j}.jsonl"
-            decoy.write_text("")
+            decoy = _other_session_jsonl(project / f"other-{j}.jsonl")
             os.utime(decoy, (1 + j, 1 + j))
-        active = project / "active.jsonl"
-        active.write_text("")
+        active = _clord_jsonl(project / "active.jsonl")
         os.utime(active, (1000, 1000))
         projects.append(project)
 
@@ -296,8 +312,7 @@ async def test_tail_polling_does_not_starve_unrelated_to_thread_calls(
     for i in range(mirrors):
         project = tmp_path / f"p{i}"
         project.mkdir()
-        active = project / "active.jsonl"
-        active.write_text("")
+        active = _clord_jsonl(project / "active.jsonl")
         os.utime(active, (1000, 1000))
         projects.append(project)
 
@@ -355,7 +370,7 @@ def test_tail_worker_count_is_configurable(monkeypatch: pytest.MonkeyPatch) -> N
 def test_resolver_is_still_the_single_active_file_rule() -> None:
     """The follow loop must keep using the shared resolver, not its own copy.
 
-    #627 changes how the active jsonl is chosen; that change has to land in one
-    place, so the loop is not allowed to inline its own glob.
+    Which jsonl a thread may read is one rule (#627), so the loop is not allowed
+    to inline its own glob next to it.
     """
-    assert tail_mod.latest_session_jsonl is resolver_mod.latest_session_jsonl
+    assert tail_mod.ThreadSessionResolver is resolver_mod.ThreadSessionResolver

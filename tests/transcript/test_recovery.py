@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from c_lord.transcript.recovery import FinalAnswer, last_completed_final_answer
 
+from .helpers import clord_marker_event
+
 
 def _write_jsonl(path: Path, events: list[dict]) -> None:
-    path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    # #627: the rescue scans the transcript **c-lord itself drove**, so every
+    # fixture opens with one of c-lord's marked prompts, as a real one does.
+    # ensure_ascii=False because Claude Code writes non-ASCII raw — escaping
+    # would hide the marker behind a ``\\u200b``.
+    events = [clord_marker_event(), *events]
+    path.write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _assistant(uuid: str, text: str) -> dict:
@@ -187,3 +198,46 @@ def test_no_cursor_yields_the_answer_for_seeding(tmp_path: Path) -> None:
 
     fa = final_answer_needs_recovery(tmp_path, None)
     assert fa is not None and fa.uuid == "u-final"
+
+
+def test_does_not_recover_a_sub_invocations_answer(tmp_path: Path) -> None:
+    """#627: the rescue must not post another Claude's last answer to the thread.
+
+    The #215 rescue re-delivers "the final answer written while the mirror was
+    down".  Picking the mtime-latest jsonl made that "whatever ran last in this
+    working copy" — so a ``claude -p`` sub-invocation finishing during a bot
+    restart would have its answer posted into the user's thread as if it were
+    Claude replying to them.
+    """
+    _write_jsonl(
+        tmp_path / "ours.jsonl",
+        [_assistant("u1", "私への返事"), _turn_end()],
+    )
+    os.utime(tmp_path / "ours.jsonl", (100, 100))
+
+    # A sub-invocation that finished later, with no c-lord marker in it.
+    (tmp_path / "sub.jsonl").write_text(
+        "\n".join(
+            json.dumps(e, ensure_ascii=False)
+            for e in [_assistant("s1", '{"is_flyer":false}'), _turn_end()]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(tmp_path / "sub.jsonl", (900, 900))
+
+    fa = last_completed_final_answer(tmp_path)
+    assert fa == FinalAnswer(uuid="u1", text="私への返事")
+
+
+def test_returns_none_when_no_transcript_is_ours(tmp_path: Path) -> None:
+    """#627 AC4: silence beats recovering somebody else's answer."""
+    (tmp_path / "sub.jsonl").write_text(
+        "\n".join(
+            json.dumps(e, ensure_ascii=False)
+            for e in [_assistant("s1", "not for this thread"), _turn_end()]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert last_completed_final_answer(tmp_path) is None
