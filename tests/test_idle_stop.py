@@ -290,3 +290,137 @@ class TestFirstSweepDoesNotBurst:
         del picked
         ids = [call.kwargs["channel"].id for call in cog._close_workspace_impl.await_args_list]
         assert ids == [20, 19, 18]
+
+
+class TestArchivedThreadsAreReachable:
+    """本番で4日間 1件も止まらなかったバグ — #593。
+
+    ログはこう言い続けていた::
+
+        idle-stop: 93 workspace(s) past the threshold; stopping 5 this tick
+        （10分おきに、同じ 93 のまま4日間）
+
+    毎tick選ばれる最古5件を Discord に問い合わせると **5件とも archived=True**
+    だった。``get_channel`` はキャッシュしか見ないので、Discord が自動アーカイブ
+    したスレッドは ``None`` になり、黙って飛ばされていた。
+
+    しかも「対象を古い順に並べて先頭5件だけ処理する」設計だったため、**先頭が
+    解決できないと後ろの88件に永久に到達しない**。
+
+    7日放置したスレッドは Discord 側が自動アーカイブしているのが普通なので、
+    閾値7日という設計そのものが「ほぼ必ず引けない」条件になっていた。
+    """
+
+    def _loop(self, bot, repo, **kw):
+        from c_lord.idle_stop import IdleStopLoop
+
+        return IdleStopLoop(bot, repo, threshold_days=7, now_fn=lambda: NOW, **kw)
+
+    def _bot_with_uncached_threads(self, cog, *, fetchable: set[int]):
+        import discord
+        from unittest.mock import AsyncMock, MagicMock
+
+        bot = MagicMock()
+        bot.get_cog = MagicMock(return_value=cog)
+        bot.get_channel = MagicMock(return_value=None)  # nothing is cached
+
+        async def _fetch(tid):
+            if tid in fetchable:
+                return MagicMock(id=tid)
+            raise discord.NotFound(MagicMock(status=404), "Unknown Channel")
+
+        bot.fetch_channel = AsyncMock(side_effect=_fetch)
+        return bot
+
+    def test_an_archived_thread_is_fetched_and_stopped(self) -> None:
+        """The cache miss is not the end of the story — ask the API."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        cog = MagicMock()
+        cog._close_workspace_impl = AsyncMock()
+        repo = MagicMock()
+        repo.list_all = AsyncMock(return_value=[_rec(1, days_ago=30)])
+        bot = self._bot_with_uncached_threads(cog, fetchable={1})
+
+        asyncio.run(self._loop(bot, repo).tick())
+
+        cog._close_workspace_impl.assert_awaited_once()
+
+    def test_a_deleted_thread_does_not_block_the_ones_behind_it(self) -> None:
+        """The head-of-line bug: 5 unresolvable threads froze the other 88."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        cog = MagicMock()
+        cog._close_workspace_impl = AsyncMock()
+        repo = MagicMock()
+        # 1 is the oldest and is gone; 2 and 3 are reachable and must still run.
+        repo.list_all = AsyncMock(
+            return_value=[_rec(1, days_ago=40), _rec(2, days_ago=30), _rec(3, days_ago=20)]
+        )
+        bot = self._bot_with_uncached_threads(cog, fetchable={2, 3})
+
+        asyncio.run(self._loop(bot, repo, max_per_tick=2).tick())
+
+        ids = [c.kwargs["channel"].id for c in cog._close_workspace_impl.await_args_list]
+        assert ids == [2, 3]
+
+    def test_a_deleted_thread_is_not_retried_forever(self) -> None:
+        """Retrying a thread Discord says does not exist is pure noise, and it
+        is what kept the backlog count frozen."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        cog = MagicMock()
+        cog._close_workspace_impl = AsyncMock()
+        repo = MagicMock()
+        repo.list_all = AsyncMock(return_value=[_rec(1, days_ago=40), _rec(2, days_ago=30)])
+        bot = self._bot_with_uncached_threads(cog, fetchable={2})
+
+        loop = self._loop(bot, repo, max_per_tick=2)
+        asyncio.run(loop.tick())
+        bot.fetch_channel.reset_mock()
+        asyncio.run(loop.tick())
+
+        assert 1 not in [c.args[0] for c in bot.fetch_channel.await_args_list]
+
+    def test_a_transient_failure_is_retried_next_tick(self) -> None:
+        """Only "this does not exist" is permanent. A network blip must not
+        write a workspace off for the life of the process."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        cog = MagicMock()
+        cog._close_workspace_impl = AsyncMock()
+        repo = MagicMock()
+        repo.list_all = AsyncMock(return_value=[_rec(1, days_ago=40)])
+
+        bot = MagicMock()
+        bot.get_cog = MagicMock(return_value=cog)
+        bot.get_channel = MagicMock(return_value=None)
+        bot.fetch_channel = AsyncMock(side_effect=OSError("connection reset"))
+
+        loop = self._loop(bot, repo)
+        asyncio.run(loop.tick())
+        asyncio.run(loop.tick())
+
+        assert bot.fetch_channel.await_count == 2
+
+    def test_skips_are_visible_in_the_log(self, caplog) -> None:
+        """The real cost of this bug was four days of not noticing. A skip that
+        only logs at DEBUG reads, from outside, as "nothing happened"."""
+        import asyncio
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        cog = MagicMock()
+        cog._close_workspace_impl = AsyncMock()
+        repo = MagicMock()
+        repo.list_all = AsyncMock(return_value=[_rec(1, days_ago=40)])
+        bot = self._bot_with_uncached_threads(cog, fetchable=set())
+
+        with caplog.at_level(logging.INFO):
+            asyncio.run(self._loop(bot, repo).tick())
+
+        assert any(r.levelno >= logging.INFO and "1" in r.getMessage() for r in caplog.records)

@@ -205,6 +205,10 @@ class IdleStopLoop:
         self._now = now_fn or datetime.datetime.now
         self._in_flight = in_flight_fn
         self._max_per_tick = max_per_tick
+        # Threads Discord says do not exist. Retrying them is pure noise, and
+        # leaving them at the head of an oldest-first list is what froze the
+        # backlog at 93 for four days (#593).
+        self._unresolvable: set[int] = set()
         self._task: object | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
@@ -266,6 +270,43 @@ class IdleStopLoop:
                 return {int(t) for t in active}
         return set()
 
+    async def _resolve_thread(self, thread_id: int) -> object | None:
+        """The thread for *thread_id*, or None when it cannot be reached.
+
+        ``get_channel`` only reads the cache, and Discord auto-archives a thread
+        after its inactivity window — which for anything this loop selects has
+        by definition already elapsed. So the cache misses **almost every**
+        candidate, and the original code treated that as "deleted" and moved on
+        silently (#593). Ask the API before believing it.
+
+        A thread the API reports as gone is remembered, so it is never tried
+        again this process. Anything else (a network blip, a rate limit) is left
+        alone: writing a workspace off for the life of the process because one
+        request failed is the wrong trade.
+        """
+        import discord
+
+        channel = self._bot.get_channel(thread_id)  # type: ignore[attr-defined]
+        if channel is not None:
+            return channel
+        try:
+            return await self._bot.fetch_channel(thread_id)  # type: ignore[attr-defined]
+        except discord.NotFound:
+            logger.info(
+                "idle-stop: thread=%d no longer exists in Discord — not retrying", thread_id
+            )
+            self._unresolvable.add(thread_id)
+            return None
+        except discord.Forbidden:
+            logger.info("idle-stop: thread=%d is not visible to the bot — not retrying", thread_id)
+            self._unresolvable.add(thread_id)
+            return None
+        except Exception as exc:
+            logger.info(
+                "idle-stop: thread=%d could not be fetched (%s) — will retry", thread_id, exc
+            )
+            return None
+
     async def tick(self) -> None:
         """One sweep. Public so tests can drive it without a real clock."""
 
@@ -282,16 +323,19 @@ class IdleStopLoop:
         if not due:
             return
 
+        due = [tid for tid in due if tid not in self._unresolvable]
+        if not due:
+            return
+
         backlog = len(due)
-        due = due[: self._max_per_tick]
-        if backlog > len(due):
+        if backlog > self._max_per_tick:
             # Never truncate silently: a log line that only counts what was done
             # reads as "everything is handled".
             logger.info(
-                "idle-stop: %d workspace(s) past the threshold; stopping %d this tick, "
-                "the rest follow on later ticks",
+                "idle-stop: %d workspace(s) past the threshold; stopping up to %d this "
+                "tick, the rest follow on later ticks",
                 backlog,
-                len(due),
+                self._max_per_tick,
             )
 
         cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
@@ -305,12 +349,14 @@ class IdleStopLoop:
         label = idle_label_for(self._threshold)
         stopped = 0
         for thread_id in due:
-            channel = self._bot.get_channel(thread_id)  # type: ignore[attr-defined]
+            if stopped >= self._max_per_tick:
+                break
+            # Count against the cap only once a thread is actually stopped, and
+            # keep walking past the ones that cannot be reached. Slicing the
+            # oldest-first list *before* resolving meant five unreachable
+            # threads at the head starved the other 88 forever (#593).
+            channel = await self._resolve_thread(thread_id)
             if channel is None:
-                # The thread was deleted in Discord. Nothing to notify, and the
-                # DB row is somebody else's cleanup problem — one missing thread
-                # must not take the whole sweep down with it.
-                logger.debug("idle-stop: thread=%d not visible to the bot — skipping", thread_id)
                 continue
 
             try:
