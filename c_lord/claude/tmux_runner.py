@@ -253,8 +253,22 @@ def _permission_zone(text: str) -> str:
     Only this zone is scanned for permission / y/N / unknown-interactive markers.
     Conversation text in the scrollback above is excluded, preventing false
     positives when Claude's own output contains marker phrases (#156).
+
+    The window is anchored to the last line carrying *content*, not to the last
+    line of the capture (#611).  A prompt that draws no input box under itself —
+    an AskUserQuestion menu, or its "Review your answers" confirmation — leaves
+    the rest of the pane as blank rows, and a flat ``lines[-N:]`` then returned
+    nothing but that padding.  Every zone-based check went blind at the same
+    moment: ``_is_ask_submit_screen`` stopped pressing Enter on an answered
+    flow, *and* ``_has_unknown_interactive`` — the fail-safe whose whole job is
+    to shout about a stuck menu — could not see it either, so the session
+    stalled without emitting a single log line.  Skipping the padding only moves
+    the window across rows that carry no signal, so the #156 guarantee is intact:
+    conversation text above a pane that really does end in chrome stays excluded.
     """
     lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
     return "\n".join(lines[-_PERMISSION_SCAN_LINES:])
 
 
