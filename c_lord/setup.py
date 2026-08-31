@@ -134,6 +134,7 @@ async def setup_bridge(
     from .cogs.version_cmd import VersionCog
     from .database.ask_repo import PendingAskRepository
     from .database.channel_repo import ChannelRepository
+    from .database.devenv_repo import DevEnvRepository
     from .database.lounge_repo import LoungeRepository
     from .database.models import init_db
     from .database.repository import SessionRepository
@@ -201,11 +202,19 @@ async def setup_bridge(
     await bot.add_cog(chat_cog)
     logger.info("Registered ClaudeChatCog (max_concurrent=%d)", max_concurrent)
 
+    # --- Dev environment ownership (#573, wired in #612) ---
+    # init_db() here is what creates the `dev_environments` table. #573 shipped
+    # the repository without a single call site, so the table never existed on
+    # the production host and the docker↔workspace link was never written.
+    devenv_repo = DevEnvRepository(session_db_path)
+    await devenv_repo.init_db()
+
     # --- SessionManageCog ---
     session_manage_cog = SessionManageCog(
         bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
         repo=session_repo,
         settings_repo=settings_repo,
+        devenv_repo=devenv_repo,
     )
     await bot.add_cog(session_manage_cog)
     logger.info("Registered SessionManageCog")
@@ -323,6 +332,26 @@ async def setup_bridge(
         bot.idle_stop_loop = idle_loop  # type: ignore[attr-defined]
     else:
         logger.info("Idle-stop disabled (CLORD_IDLE_STOP_DAYS=0)")
+
+    # --- Orphan working-directory sweep (#613) ---
+    # Always-on (zero-config): reclaims workspace directories no ``sessions``
+    # row points at any more. #575 deletes a directory as it deletes its row, so
+    # a directory whose row is already gone is unreachable by that path — 313 of
+    # them (17.3 GB) had piled up on the production host. Needs the base path to
+    # know where to look, so it stays off when session dirs are not configured.
+    # Set CLORD_ORPHAN_SWEEP_DAYS=0 to disable.
+    if session_dir_base:
+        from .orphan_dirs import OrphanSweepLoop, orphan_sweep_days
+
+        _orphan_days = orphan_sweep_days()
+        if _orphan_days > 0:
+            orphan_loop = OrphanSweepLoop(
+                session_repo, session_dir_base, min_idle_days=_orphan_days
+            )
+            orphan_loop.start()
+            bot.orphan_sweep_loop = orphan_loop  # type: ignore[attr-defined]
+        else:
+            logger.info("Orphan-dir sweep disabled (CLORD_ORPHAN_SWEEP_DAYS=0)")
 
     # --- Menu watchdog (#359) ---
     # Always-on (zero-config): bridges TUI AskUserQuestion/plan menus that no

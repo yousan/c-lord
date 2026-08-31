@@ -161,10 +161,16 @@ class SessionManageCog(commands.Cog):
         repo: SessionRepository,
         settings_repo: SettingsRepository | None = None,
         runner: object | None = None,
+        devenv_repo: object | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.settings_repo = settings_repo
+        # #612: where the docker↔workspace link is written down. Optional so
+        # consumers constructing the cog themselves keep working, but the
+        # standard setup always passes it — without a call site, #573's
+        # persistence layer was dead code and its table was never created.
+        self._devenv_repo = devenv_repo
         # Optional ClaudeConfig reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
@@ -1295,11 +1301,25 @@ class SessionManageCog(commands.Cog):
         # that knew they existed. Stopping frees the ports; the volumes (the
         # actual data) are untouched — see docs/specs/workspace-vocabulary.md.
         containers: list[DevContainer] = []
+        # Only a discovery that actually completed may be written down. An empty
+        # list from a *failed* docker call is indistinguishable from "nothing is
+        # running" at the call site, and recording it would mark live containers
+        # as gone — losing the very ownership record #612 exists to keep.
+        discovered_dir: str | None = None
         with contextlib.suppress(Exception):
             sdm = await self._resolve_session_dir_manager(parent_channel_id)
             if sdm is not None:
-                containers = await containers_for_session_dir(
-                    str(Path(sdm.base_dir) / str(thread_id))
+                session_dir = str(Path(sdm.base_dir) / str(thread_id))
+                containers = await containers_for_session_dir(session_dir)
+                discovered_dir = session_dir
+
+        # #612: write the link down *before* stopping. This is the last moment
+        # anything knows these containers belong to this thread — after the
+        # workspace goes, only this row can answer "who is holding port 55322?".
+        if self._devenv_repo is not None and discovered_dir is not None:
+            with contextlib.suppress(Exception):
+                await self._devenv_repo.record(  # type: ignore[attr-defined]
+                    thread_id, discovered_dir, containers
                 )
 
         docker_outcome = DockerOutcome.NONE
