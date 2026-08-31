@@ -164,6 +164,36 @@ Enter-ed twice) — mirroring the auto-accept used for trust/permission prompts.
 The answers are already locked in via the bridge, so no further user input is
 needed.
 
+### The review screen has no input box under it (#611)
+
+Prompt detection only scans the bottom of the pane (`_permission_zone`, 15 lines)
+so that conversation text in the scrollback can't trigger an auto-accept (#156).
+The review screen breaks the assumption that "the bottom of the pane" is where a
+prompt sits: it draws **no input box beneath itself**, so a 40-row pane is left
+with a tall run of blank rows under the options. The shorter the rendered block,
+the taller that run — and with two questions it reached 23 rows, so a flat
+`lines[-15:]` returned nothing but padding.
+
+That window is shared, so the detector *and* its fail-safe went blind together:
+
+| | expected | before #611 |
+|---|---|---|
+| `_is_ask_submit_screen` | True → press `Enter` | **False** → the answered flow never submits |
+| `_has_unknown_interactive` | True → post "Unknown TUI prompt" to Discord | **False** → nothing is posted |
+
+Neither one logs anything when it returns False, so the session stalled with **no
+Discord message and no log line to grep for** — the user saw their answers vanish
+(2026-08-31 11:28 JST; recovering by typing `1` was read as an interrupt).
+
+`_permission_zone` now anchors the window to the last line that carries
+**content** instead of the last line of the capture. Blank padding carries no
+signal, so skipping it cannot widen the window into conversation text: a pane
+that really does end in chrome (input box, status rows) keeps the exact #156
+behaviour. Locked by `TestBlankTailPaneZone` in `tests/test_tmux_runner.py`,
+which drives both functions over real captures
+(`tests/fixtures/panes/ask_submit_screen_blank_tail.txt`,
+`unknown_menu_blank_tail.txt`) at blank tails of 0/5/10/15/23/30 rows.
+
 ## Pre-menu prose (経緯・推し) (#399)
 
 Claude usually *talks* right before opening a menu — explaining the options and
