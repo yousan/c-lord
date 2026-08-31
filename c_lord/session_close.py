@@ -227,3 +227,27 @@ async def _safe_get(repo: SessionRepository, thread_id: int) -> SessionRecord | 
     except Exception:  # pragma: no cover - defensive
         logger.debug("session_close: session lookup failed for %d", thread_id, exc_info=True)
         return None
+
+
+def reopen_rename_notice(old_name: str, new_name: str) -> str:
+    """One line recording what the thread was called before it was reopened.
+
+    A stopped thread keeps its window number (``[停止] W28 │ …``, #607), but the
+    number is **not** restored on reopen: while it was stopped another workspace
+    may well have taken 28, and pointing two threads at one window is the #427
+    class of bug. So the reopen is exactly the moment the ``W28`` handle
+    disappears from the name.
+
+    Writing the old name into the thread keeps it findable afterwards — the whole
+    reason the number was worth keeping in the first place.
+
+    Returns ``""`` when there is nothing worth saying: the name did not change,
+    or the rename did not go through.
+    """
+    if not old_name or not new_name or old_name == new_name:
+        return ""
+    return (
+        f"🏷️ スレッド名: `{old_name}`\n"
+        f"　　　　　　→ `{new_name}`\n"
+        "（次に投稿すると、新しいウィンドウ番号が付きます）"
+    )
