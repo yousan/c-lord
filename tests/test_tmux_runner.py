@@ -16,6 +16,7 @@ from c_lord.claude.tmux_runner import (
     _normalize_capture,
     _parse_ask_from_pane,
     _parse_plan_from_pane,
+    _unknown_prompt_signature,
 )
 from c_lord.claude.types import MessageType
 
@@ -2539,6 +2540,90 @@ class TestAskUserQuestionSubmitScreen:
         assert not any(e.unknown_tui_prompt for e in events), (
             "Submit screen must not surface an unknown-prompt warning"
         )
+
+
+class TestBlankTailPaneZone:
+    """#611: the bottom-of-pane scan window must be anchored to the last line
+    that has *content*, not to the last line of the capture.
+
+    Claude Code renders AskUserQuestion menus (and their "Review your answers"
+    confirmation) as top-anchored screens with **no input box underneath** — the
+    rest of the 40-row pane is blank.  ``_permission_zone`` used to slice a flat
+    ``lines[-15:]``, so once the blank tail reached 15 rows the whole window was
+    empty and *every* zone-based detector went blind at once:
+
+      * ``_is_ask_submit_screen`` → False → Enter is never pressed → the answered
+        flow stalls with no Discord message at all,
+      * ``_has_unknown_interactive`` → False → the fail-safe that exists to shout
+        about exactly this could not see it either.
+
+    Detector and safety net shared the blind spot, so the failure produced no log
+    line to grep for.  The blank tail grows as the rendered block shrinks, so the
+    fewer questions were asked, the more reliably it broke.
+    """
+
+    @staticmethod
+    def _with_blank_tail(text: str, blanks: int) -> str:
+        """Re-pad *text* so exactly *blanks* empty rows follow its last content."""
+        lines = text.splitlines()
+        last = max(i for i, line in enumerate(lines) if line.strip())
+        return "\n".join(lines[: last + 1] + [""] * blanks)
+
+    # The blank tail lengths from the Issue's repro table.  15 is where the old
+    # flat ``lines[-15:]`` window first went fully blank; 23 is what the real
+    # 2026-08-31 incident produced (two questions in a 40-row pane).
+    BLANK_TAILS = (0, 5, 10, 15, 23, 30)
+
+    def test_real_capture_with_blank_tail_is_submit_screen(self) -> None:
+        """RED: real 80x40 capture of the review screen (16 blank rows below the
+        options) was not recognised, so Enter was never sent."""
+        pane = _normalize_capture(_load_fixture("ask_submit_screen_blank_tail.txt"))
+        assert _is_ask_submit_screen(pane) is True
+
+    @pytest.mark.parametrize("blanks", BLANK_TAILS)
+    def test_submit_screen_detected_at_any_blank_tail(self, blanks: int) -> None:
+        pane = self._with_blank_tail(
+            _normalize_capture(_load_fixture("ask_submit_screen_blank_tail.txt")), blanks
+        )
+        assert _is_ask_submit_screen(pane) is True
+
+    def test_real_capture_with_blank_tail_is_not_flagged_unknown(self) -> None:
+        """Recognising it must not also make it shout: the review screen is a
+        known, auto-submitted prompt, so the unknown-prompt alert stays quiet."""
+        pane = _normalize_capture(_load_fixture("ask_submit_screen_blank_tail.txt"))
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_unknown_menu_with_blank_tail_still_alerts(self) -> None:
+        """RED: the fail-safe shared the blind spot — an unrecognised menu sitting
+        above a blank tail produced no alert, so the stall was silent."""
+        pane = _normalize_capture(_load_fixture("unknown_menu_blank_tail.txt"))
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+    @pytest.mark.parametrize("blanks", BLANK_TAILS)
+    def test_unknown_menu_alerts_at_any_blank_tail(self, blanks: int) -> None:
+        pane = self._with_blank_tail(
+            _normalize_capture(_load_fixture("unknown_menu_blank_tail.txt")), blanks
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+    @pytest.mark.parametrize("blanks", BLANK_TAILS)
+    def test_unknown_prompt_signature_survives_blank_tail(self, blanks: int) -> None:
+        """The dedup signature is built from the same zone; if it came back empty
+        every distinct menu would collapse to one signature and alerts would be
+        suppressed as duplicates."""
+        pane = self._with_blank_tail(
+            _normalize_capture(_load_fixture("unknown_menu_blank_tail.txt")), blanks
+        )
+        assert "1. Production" in _unknown_prompt_signature(pane)
+
+    def test_scrollback_above_a_drawn_input_box_stays_excluded(self) -> None:
+        """#156 must not regress: trimming the blank tail may only move the window
+        up over *padding*.  When the pane really does end in chrome, conversation
+        text far above it stays outside the zone."""
+        pane = "\n".join(
+            ["❯ 1. Production", "  2. Staging"] + ["  some conversation line"] * 30 + ["❯ ", ""]
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
 
 
 class TestParsePlanFromPane:
