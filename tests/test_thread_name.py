@@ -274,12 +274,18 @@ def test_build_name_closed_prefixes_marker():
     )
 
 
-def test_build_name_closed_drops_work_prefix_and_lamp():
-    """#512: the W<N> window no longer exists and the lamp is meaningless once closed."""
-    out = build_name("topic", "alive", 3, lamp=True, closed=True)
-    assert out == f"{CLOSED_MARK} topic"
-    assert "W3" not in out
-    assert not any(e in out for e in STATUS_EMOJI.values())
+def test_build_name_closed_keeps_work_prefix_but_drops_the_lamp():
+    """#607: 停止しても ``W<N>`` は残す（#512 では落としていた）。
+
+    #512 は「その番号が指す tmux ウィンドウはもう無い」を理由に落としていた。
+    「いまどこを見ればいいか」としては正しいが、名前の用途はそれだけではない —
+    あとから「W28 で作業していた」を辿る手掛かりでもある。``[停止]`` が付くので
+    生きているスレッドと取り違えることはない。ランプ絵文字は止まっているものに
+    付けても意味がないので、引き続き落とす。
+    """
+    out = build_name("topic", "alive", 3, closed=True)
+    assert out == f"{CLOSED_MARK} W3 │ topic"
+    assert not out.startswith(("🟢", "🟡", "🔴", "⚪"))
 
 
 def test_build_name_closed_keeps_issue_ref_and_truncates_topic():

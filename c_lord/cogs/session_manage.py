@@ -25,7 +25,12 @@ from ..database.settings_repo import SettingsRepository
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
-from ..session_close import apply_closed_name, apply_open_name, is_closed
+from ..session_close import (
+    apply_closed_name,
+    apply_open_name,
+    is_closed,
+    reopen_rename_notice,
+)
 from ..session_dir import SessionDirManager
 from ..session_resume import hint_for_thread
 from ..status_view import StatusRow, classify_status, render_status
@@ -1283,9 +1288,6 @@ class SessionManageCog(commands.Cog):
         # likely. apply_closed_name falls back to archive-only if the rename half
         # fails, so a missing Manage Threads permission still leaves the thread
         # archived (#512).
-        new_name = await apply_closed_name(self.repo, channel)
-        if new_name:
-            results.append(f"🏷️ スレッド名: `{new_name}`")
 
         # #574: stop the dev environment too. Leaving it running is how 12
         # supabase containers ended up on the production host holding ports
@@ -1321,7 +1323,22 @@ class SessionManageCog(commands.Cog):
         )
         if results:
             embed.add_field(name="メモ", value="\n".join(results), inline=False)
+
+        # #607: post *before* archiving. Discord un-archives a thread the moment
+        # anything is posted to it, so archiving first meant every automatically
+        # stopped thread bounced straight back open — measured in production,
+        # 6 out of 6 ended up ``archived=False`` and kept cluttering the sidebar.
+        # The rename lost too: Discord refuses to rename an archived thread
+        # (code 50083), so the ``[停止]`` marker never landed either.
         await respond(embed=embed)
+
+        new_name = await apply_closed_name(self.repo, channel)
+        if new_name:
+            logger.info(
+                "%s stopped workspace renamed to %r",
+                log_ctx(thread_id=thread_id),
+                new_name,
+            )
 
     @app_commands.command(
         name="workspace-stop",
@@ -1407,14 +1424,17 @@ class SessionManageCog(commands.Cog):
         if mark_reopened is not None:
             with contextlib.suppress(Exception):
                 mark_reopened(channel.id)
+        # #607: capture the stopped name before the rename wipes it. It carries
+        # the window number, and reopening is exactly when that handle is lost.
+        old_name = channel.name if isinstance(channel.name, str) else ""
         new_name = await apply_open_name(self.repo, channel)
+
+        lines = [reopen_rename_notice(old_name, new_name) or f"🏷️ スレッド名: `{new_name}`"]
+        lines.append("💬 このスレッドにメッセージを送ると、これまでの会話の続きから再開します。")
 
         embed = discord.Embed(
             title="▶️ このスレッドのワークスペースを再開しました",
-            description=(
-                f"🏷️ スレッド名: `{new_name}`\n"
-                "💬 このスレッドにメッセージを送ると、これまでの会話の続きから再開します。"
-            ),
+            description="\n".join(lines),
             color=COLOR_SUCCESS,
         )
         await respond(embed=embed)
