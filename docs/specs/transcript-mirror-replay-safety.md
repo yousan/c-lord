@@ -1,10 +1,51 @@
-# Transcript mirror — replay safety across restarts/rewrites (#433)
+# Transcript mirror — どれを読み、何を二度流さないか (#627 / #433)
 
 このドキュメントは、`CLORD_BRIDGE_MODE=jsonl` のときに動く JSONL transcript ミラー
 (`c_lord/transcript/`、`c_lord/cogs/transcript_mirror.py`) の **「あるべき動き」**
-のうち「過去ログを二度 Discord に流さない」保証を定める。
+のうち「**どの transcript を読むか**」と「過去ログを二度 Discord に流さない」保証を定める。
 
-## あるべき動き (利用者から見た期待)
+応答性(ミラーが Discord のメッセージ処理を邪魔しないこと)は
+[transcript-mirror-liveness.md](./transcript-mirror-liveness.md)、
+何を 👤 として出してよいかは [mirrored-events.md](./mirrored-events.md)。
+
+## どの transcript を読むか (#627)
+
+**1 つの作業ディレクトリには、たくさんのセッションがある。** `claude -p` の呼び出しも
+サブエージェントも、同じ `~/.claude/projects/<slug>/` に**自分の
+`<session-id>.jsonl` を書く**。#627 の実例のディレクトリには **182 個**あった。
+
+### あるべき動き (利用者から見た期待)
+
+- スレッドに流れるのは、**そのスレッドの Claude が言ったこと**だけ。
+  同じ作業コピーで別のプロセスが動いていても、その会話は流れてこない。
+- **👤 は自分が言ったことだけ。** 言っていないことを言ったことにされない。
+
+### 実装上の不変条件
+
+**読んでよいのは「c-lord 自身が動かしたセッションの transcript」だけ**
+(`c_lord/transcript/resolver.py::ThreadSessionResolver`)。
+
+| ルール | 中身 |
+|---|---|
+| 1. 資格 | c-lord がペインに送るプロンプトには必ず ZWSP (U+200B) が付く (`tmux.send_input` / `start_claude` #530)。それが `"content":"` の直後に生の UTF-8 で入っている transcript だけが対象。`claude -p` の transcript には決して入らない |
+| 2. 前進のみ | いったん決めたら、乗り換えてよいのは**それを決めた後に現れたファイル**だけ (= `/clear` の後継)。既にあったファイルは mtime がどれだけ新しく見えても乗っ取れない。`touch` で読了済み transcript に戻って再投稿する事故を塞ぐ |
+| 3. 該当なし | 資格を満たすファイルが無ければ**何も出さない**。ログに 1 度だけ警告する。他人の会話を流すくらいなら黙る。次に c-lord がターンを回した時点で自動的に解消する |
+
+**同じ判定を #215 の救出スキャンにも使う** (`recovery.py`)。mtime 最新を読むと、
+bot 再起動中に終わった `claude -p` の最終回答が「落ちた回答」として
+スレッドに投稿されてしまう。
+
+**実測 (2026-08-31, 本番ホスト)**: #627 該当ディレクトリの 182 個中、印が付いていたのは
+**1 個**(そのスレッド自身のもの)。生きているセッション行 313 件全部で、
+「印つきの最新」と旧ルールの選択が食い違うケースは **0 件** — つまりこの規則は
+正常に動いていたスレッドの挙動を変えずに、事故だけを塞ぐ。
+
+テスト: `tests/transcript/test_session_pinning.py`、
+`tests/transcript/test_recovery.py::test_does_not_recover_a_sub_invocations_answer`。
+
+## 二度流さない (#433)
+
+### あるべき動き (利用者から見た期待)
 
 - bot / ホストが再起動しても、**古いスレッドに過去の会話履歴が再投稿されない**。
 - 再起動後に古いスレッドへ話しかけると、**届くのはその新しいターンの応答だけ**。
@@ -13,7 +54,7 @@
   `--resume`（Claude Code がアクティブ jsonl を**履歴を保ったまま書き換える**）を
   またいでも成り立つ。
 
-## なぜこの保証が要るか (#433 の実害)
+### なぜこの保証が要るか (#433 の実害)
 
 ミラーは Claude Code のセッション jsonl を tail し、`assistant` の最終応答などを
 Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** 追従するので
@@ -30,7 +71,7 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
 上記リセットを誘発し、ミラーが**全 `assistant` 履歴を Discord に再投稿**してしまう
 （2026-06-18: 約44秒で1スレッドの98発話が再送される実害）。
 
-## 実装上の不変条件 (regression を防ぐ)
+### 実装上の不変条件 (regression を防ぐ)
 
 `tail_events` は **1 回の追従セッション中、同じイベントを二度 yield しない**。
 
@@ -44,6 +85,12 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
   ても、**起動前から在った履歴は「配信済み」として二度と流れない**。
 - `from_start=True`（明示的な全リプレイ）では baseline seeding を行わず、各イベントは
   一度だけ流れる（リセットが起きても重複しない）。
+- **読み位置はファイルごとに覚える**（#627）。乗り換えて戻ってきても、読了済みの
+  ところから再開する＝二度流さない。
+- **tail の開始時に既にあったファイル**を後から読み始めるとき（そのスレッドの
+  transcript が、c-lord が次のターンを回して初めて資格を得る場合）は、
+  **開始時点のサイズから**読む。開始前からディスクにあった履歴は、そもそも
+  こちらが配信すべきものではなかった。
 
 テスト: `tests/transcript/test_tail.py`
 (`test_tail_does_not_replay_history_on_resume_rewrite`,

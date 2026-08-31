@@ -1,10 +1,12 @@
 """Async follower for a project's active Claude Code transcript jsonl.
 
-Yields each parsed JSON event in the order it was appended.  The active jsonl
-is re-selected on every poll as the mtime-latest ``*.jsonl`` under the project
-directory, so ``/clear`` (which causes Claude Code to start a new
-``<session-id>.jsonl``) is followed without restarting the tail.  Truncation
-or rewrite of the current file is handled by resetting the read offset to 0.
+Yields each parsed JSON event in the order it was appended.  Which jsonl is
+followed is decided by :class:`~c_lord.transcript.resolver.ThreadSessionResolver`
+— the newest transcript **this thread's own Claude session** wrote, so ``/clear``
+(which starts a new ``<session-id>.jsonl``) is followed without restarting the
+tail, while a ``claude -p`` sub-invocation sharing the working copy is not
+(Issue #627).  Truncation or rewrite of the current file is handled by resetting
+the read offset to 0.
 
 Re-reading from byte 0 (truncation / in-place rewrite / new active file) must
 never re-emit an event that was already yielded — otherwise a ``--resume`` that
@@ -35,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .resolver import latest_session_jsonl
+from .resolver import ThreadSessionResolver
 
 logger = logging.getLogger(__name__)
 
@@ -151,33 +153,79 @@ class _FollowState:
     """
 
     project_dir: Path
-    initial_path: Path | None = None
-    initial_offset: int = 0
+    resolver: ThreadSessionResolver
+    from_start: bool = False
+    # Size of each file that already existed when the tail started.  Everything
+    # below that mark predates our watch, so if one of these is adopted later
+    # (#627: a transcript becomes eligible the moment c-lord drives a turn into
+    # it) reading starts at the mark — the history that was on disk before we
+    # were looking is never replayed, and the turn that made it eligible is.
+    pre_existing: dict[Path, int] = field(default_factory=dict)
     current_path: Path | None = None
     offset: int = 0
     buffer: str = ""
     last_mtime: float = -1.0
+    # Read position per file, so switching back and forth never re-reads (and
+    # the consumer never re-receives) a transcript already consumed (#627 AC3).
+    offsets: dict[Path, int] = field(default_factory=dict)
     # Set when a poll stopped at the read cap: the caller repeats immediately
     # rather than sleeping, so falling behind is not also made slow.
     more_to_read: bool = False
     seen_uuids: set[str] = field(default_factory=set)
 
 
-def _open_initial_state(project_dir: Path, from_start: bool) -> tuple[Path | None, int]:
+def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
     """Snapshot the project dir as it was when the tail started.
 
-    Blocking (``glob`` + ``stat``): runs in the tail pool.  ``from_start=False``
-    only skips bytes that *already existed* at that moment — any file that
-    appears later (including a ``/clear``-induced new session) is read from byte
-    0 so events that landed before we noticed are not missed.
+    Blocking (``glob`` + ``stat`` + the eligibility probe): runs in the tail
+    pool.  ``from_start=False`` only skips bytes that *already existed* at that
+    moment — a file that appears later (a ``/clear``-induced new session) is
+    read from byte 0 so events that landed before we noticed are not missed.
     """
-    initial_path = latest_session_jsonl(project_dir)
-    if initial_path is None or from_start:
-        return initial_path, 0
+    resolver = ThreadSessionResolver(project_dir)
+    state = _FollowState(project_dir=project_dir, resolver=resolver, from_start=from_start)
     try:
-        return initial_path, initial_path.stat().st_size
+        state.pre_existing = {p: _size_of(p) for p in project_dir.glob("*.jsonl") if p.is_file()}
     except OSError:
-        return initial_path, 0
+        state.pre_existing = {}
+
+    initial_path = resolver.resolve()
+    if initial_path is not None and not from_start:
+        # Issue #537: a transcript can be ~100 MB, and every mirror seeds one at
+        # bot startup. Parsing that on the event loop stalled the Discord
+        # gateway heartbeat long enough to force a reconnect, during which every
+        # message the user sent was dropped by Discord and never redelivered.
+        state.offsets[initial_path] = _size_of(initial_path)
+        _seed_seen_uuids(initial_path, state.offsets[initial_path], state.seen_uuids)
+    return state
+
+
+def _size_of(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _start_offset(state: _FollowState, path: Path) -> int:
+    """Where to (re)start reading ``path``, and seed uuids when adopting it late.
+
+    - already read in this follow session → resume exactly where we stopped;
+    - existed before the tail started → resume at **the size it had then**, not
+      its size now: the history on disk before we were watching was never ours
+      to deliver, but the turn that just made it eligible is (#627 AC3).  This
+      is the "a transcript becomes eligible only once c-lord drives a turn into
+      it" case;
+    - created while we were watching → genuinely new content, read from 0.
+    """
+    known = state.offsets.get(path)
+    if known is not None:
+        return known
+    baseline = state.pre_existing.get(path)
+    if baseline is not None and not state.from_start:
+        _seed_seen_uuids(path, baseline, state.seen_uuids)
+        return baseline
+    return 0
 
 
 def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
@@ -190,16 +238,14 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     """
     state.more_to_read = False
 
-    active = latest_session_jsonl(state.project_dir)
+    active = state.resolver.resolve()
     if active is None:
         return []
 
     if active != state.current_path:
-        state.offset = (
-            state.initial_offset
-            if state.initial_path is not None and active == state.initial_path
-            else 0
-        )
+        if state.current_path is not None:
+            state.offsets[state.current_path] = state.offset
+        state.offset = _start_offset(state, active)
         state.current_path = active
         state.buffer = ""
         state.last_mtime = -1.0
@@ -279,8 +325,6 @@ async def tail_events(
         Useful for catching up to an existing session.  Default ``False`` —
         only newly appended lines are yielded.
     """
-    initial_path, initial_offset = await _run_off_loop(_open_initial_state, project_dir, from_start)
-
     # Issue #433: events already yielded (or present at start) must not be
     # re-emitted when the read offset is reset to 0 (truncation / in-place
     # rewrite / new active file).  Dedup by stable ``uuid``; events without a
@@ -288,17 +332,7 @@ async def tail_events(
     # …) that the consumer drops, so re-emitting them on a reset is harmless and
     # they are intentionally not deduplicated (avoids collapsing two distinct
     # uuid-less records that happen to serialise identically).
-    state = _FollowState(
-        project_dir=project_dir,
-        initial_path=initial_path,
-        initial_offset=initial_offset,
-    )
-    if initial_path is not None and not from_start:
-        # Issue #537: a transcript can be ~100 MB, and every mirror seeds one at
-        # bot startup. Parsing that on the event loop stalled the Discord
-        # gateway heartbeat long enough to force a reconnect, during which every
-        # message the user sent was dropped by Discord and never redelivered.
-        await _run_off_loop(_seed_seen_uuids, initial_path, initial_offset, state.seen_uuids)
+    state = await _run_off_loop(_open_initial_state, project_dir, from_start)
 
     while True:
         # The whole cycle — glob, stat, read, parse — in one worker-thread hop.
