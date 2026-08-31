@@ -29,6 +29,7 @@
 | [turn-progress.md](./turn-progress.md) | ターン中の進捗表示 | スレッドが90秒黙ったときだけ1行出て、15秒ごとに書き換わり、実出力が戻ると消える（常時は出さない） |
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
 | [mirrored-events.md](./mirrored-events.md) | スレッドに流れるイベントの選別 | 👤 はその人が実際に打ったものだけ。ハーネス内部の通知は progress.txt に畳み、内部パスは出さない |
+| [scheduled-tasks.md](./scheduled-tasks.md) | スケジュール実行（定期タスク） | 時間になるとスレッドが立ち、Claude が実際に起動して応答が投稿される。失敗したら本当の理由が出てログにも残る |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
 

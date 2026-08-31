@@ -32,12 +32,19 @@ if TYPE_CHECKING:
 class RunOutcome:
     """What a completed run needs to tell its caller (#562).
 
-    Only ``no_response`` for now: whether the turn ended without Claude ever
-    producing anything. The caller needs it because the turn-end ping would
-    otherwise announce "Claude has finished" for work that never started.
+    ``no_response``: the turn ended without Claude ever producing anything. The
+    caller needs it because the turn-end ping would otherwise announce "Claude
+    has finished" for work that never started.
+
+    ``error``: the failure text that was posted to the thread, or None if the
+    run finished cleanly (#621). A caller with no human watching the thread —
+    the scheduler, a webhook — otherwise cannot tell a successful run from one
+    that posted a red embed and returned, and logs a clean-looking exit either
+    way.
     """
 
     no_response: bool = False
+    error: str | None = None
 
 
 @dataclass
