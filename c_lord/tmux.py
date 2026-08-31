@@ -12,10 +12,12 @@ When tmux is not installed, operations degrade gracefully (log warning, skip).
 
 from __future__ import annotations
 
+import getpass
 import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -330,6 +332,57 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
         args,
         capture_output=True,
         text=True,
+    )
+
+
+# OTEL_RESOURCE_ATTRIBUTES is comma/equals separated and gets typed into a
+# shell inside single quotes, so any of these in a value would either split the
+# attribute list or break the command line.
+_OTEL_UNSAFE = re.compile(r"""[,='"$`\\\s]""")
+
+
+def _repo_name(workdir: str) -> str | None:
+    """Repository name for *workdir*, taken from its ``origin`` remote.
+
+    c-lord runs each session in a directory named after the Discord thread, so
+    the directory name is a snowflake ID and useless as a cost-attribution key.
+    The remote URL is the only place the human-readable repository name lives.
+    Returns None when *workdir* is not a git repo (or has no origin).
+    """
+    result = _run(["git", "-C", workdir, "remote", "get-url", "origin"])
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip().rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    return name or None
+
+
+def _otel_resource_attributes(workdir: str | None) -> str:
+    """Build ``OTEL_RESOURCE_ATTRIBUTES`` for a Claude Code launch.
+
+    Claude Code exports its own OpenTelemetry metrics (cost, tokens, session
+    counts). Those carry only the attributes present in the environment, and
+    c-lord never set any — so every session it started landed in a single
+    unlabelled bucket and "which repository is the spend going to?" could not
+    be answered at all. Only launches through the user's shell wrapper were
+    ever labelled.
+
+    Attributes whose value would break the encoding are dropped rather than
+    escaped: a mangled command line would stop Claude from starting, which is
+    far worse than one missing label.
+    """
+    attrs: dict[str, str] = {
+        "host.user": getpass.getuser(),
+        "host.name": socket.gethostname(),
+    }
+    if workdir:
+        attrs["cwd"] = workdir
+        repo = _repo_name(workdir)
+        if repo:
+            attrs["project"] = repo
+    return ",".join(
+        f"{key}={value}" for key, value in attrs.items() if value and not _OTEL_UNSAFE.search(value)
     )
 
 
@@ -1642,7 +1695,14 @@ class TmuxSessionManager:
         self._vim_mode.pop(window, None)
 
         target = f"{self.session_name}:{window}"
-        cmd_parts = ["env", "-u", "CLAUDECODE", "claude"]
+        cmd_parts = ["env", "-u", "CLAUDECODE"]
+        # Label the telemetry with the working directory and its repository so
+        # cost/token metrics can be attributed per project instead of piling up
+        # in one unlabelled bucket.
+        otel_attributes = _otel_resource_attributes(self._pane_path(target))
+        if otel_attributes:
+            cmd_parts.append(f"OTEL_RESOURCE_ATTRIBUTES='{otel_attributes}'")
+        cmd_parts.append("claude")
         if try_continue:
             cmd_parts.append("--continue")
         cmd_parts.extend(["--model", model])
@@ -1712,6 +1772,13 @@ class TmuxSessionManager:
 
         logger.info("start_claude: sent command to %s", target)
         return True
+
+    def _pane_path(self, target: str) -> str | None:
+        """Current working directory of *target*'s pane, or None if unknown."""
+        result = _run(["tmux", "display-message", "-p", "-t", target, "#{pane_current_path}"])
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
 
     def _type_literal(self, target: str, text: str, *, what: str) -> bool:
         """Type *text* into *target* with ``send-keys -l``, split for tmux's cap.
