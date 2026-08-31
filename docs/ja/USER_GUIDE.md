@@ -16,41 +16,37 @@ Bot (c-lord プロセス)                                    ← 1つ
 ├── アクセス制御: @claude-operator ロール
 │   └── このロールを持つユーザーのみ Bot と対話可能
 │
-├── #project-a (channel)
+├── #project-a (channel) ── /clord-init で github.com/user/project-a.git に紐づけ
 │   │
-│   ├── リポジトリ: github.com/user/project-a.git
-│   │   └── /clord-init で紐づけ (DB に保存)
-│   │
-│   ├── tmux session: "project-a"
-│   │   ├── w1 ── Thread 101 の Claude Code CLI
-│   │   └── w2 ── Thread 102 の Claude Code CLI
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-a/
-│       ├── 101/ ── git clone of project-a (Thread 101 用)
-│       └── 102/ ── git clone of project-a (Thread 102 用)
+│   ├── Thread 101 ── tmux session "project-a" の window w1
+│   ├── Thread 102 ── tmux session "project-a" の window w2
+│   └── Thread 103 ── /clord-thread-init で project-c.git に紐づけ
+│                     → tmux session "project-c" の window w1   ← "project-a" では**ない**
 │
-├── #project-b (channel)
-│   │
-│   ├── リポジトリ: github.com/user/project-b.git
-│   │
-│   ├── tmux session: "project-b"
-│   │   └── w1 ── Thread 201 の Claude Code CLI
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-b/
-│       └── 201/ ── git clone of project-b (Thread 201 用)
+├── #project-b (channel) ── github.com/user/project-b.git に紐づけ
+│   └── Thread 201 ── tmux session "project-b" の window w1
 │
 └── #general (リポジトリ未設定)
     └── /clord → エラー「リポジトリが設定されていません」
+
+session_dir (各スレッドが作業する git clone):
+    ~/c-lord-sessions/<channel_id>/<thread_id>/
 ```
+
+**tmux セッションはチャンネルではなくリポジトリに従います。** 上の Thread 103 は
+#project-a のスレッドですが `project-c` セッションにいます。同じリポジトリに紐づいた
+チャンネルが2つあれば1つのセッションを共有します。詳しくは
+[specs/tmux-layout.md](../specs/tmux-layout.md)。
 
 ### 各要素の関係
 
 | 関係 | 対応 | 紐づけキー |
 |------|------|-----------|
 | Channel : リポジトリ | 1:1 | `/clord-init` で DB に保存 |
-| Channel : tmux session | 1:1 | リポジトリ名から自動生成 |
-| Thread : tmux window | 1:1 | `@thread_id` (tmux window option) |
-| Thread : session_dir | 1:1 | `~/c-lord-sessions/{project}/{thread_id}/` |
+| Thread : リポジトリ | 1:1 | チャンネルのもの、またはスレッド固有（`/clord-thread-init`） |
+| リポジトリ : tmux session | 1:1 | リポジトリ名から自動生成 — 1チャンネルが**複数**セッションに散ることも、2チャンネルが1セッションを**共有**することもある |
+| Thread : tmux window | 1:1 | `@thread_id` (tmux window option)。番号が一意なのはセッション内であってチャンネル内ではない |
+| Thread : session_dir | 1:1 | `~/c-lord-sessions/{channel_id}/{thread_id}/` |
 | Thread : Claude session | 1:1 | DB (`sessions` テーブル) |
 
 ### 紐づけの流れ

@@ -692,16 +692,16 @@ curl -X POST http://localhost:8080/api/tasks \
 
 ### How Discord maps to tmux
 
-The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Knowing this 1:1 mapping makes debugging and integration much easier (you can `tmux attach` to watch a session live):
+The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Knowing where a thread actually lives makes debugging and integration much easier (you can `tmux attach` to watch a session live):
 
-| Discord | tmux         | Mapping |
-|---------|--------------|---------|
-| Channel | tmux session | 1:1     |
-| Thread  | tmux window  | 1:1     |
+| Unit | tmux | Mapping |
+|------|--------------|---------|
+| Repository a thread is bound to | tmux session | 1:1 |
+| Thread | tmux window | 1:1 |
 
 - **Sessions are only ever born in a channel.** `/clord` opens a *new* thread; inside a thread it continues that thread's session, offers to reconnect one whose record was swept, or refuses if the thread was never c-lord's (#551). An ordinary conversation thread cannot be turned into a Claude session — there is no command that adopts one, by design. See [docs/COMMANDS.md](docs/COMMANDS.md#chat--sessions).
-- **1 Discord channel = 1 tmux session.** All threads in a channel share that one session. The session name is derived from the bound repo — the channel's (via `/clord-init`), or the thread's own when it has one (`/clord-thread-init`, or `/clord repo:<url>`); unbound channels fall back to the default `clord` session.
-- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`w1`, `w2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
+- **1 repository = 1 tmux session — not 1 channel.** The session name comes from the repo a thread is bound to: its own when it has one (`/clord-thread-init`, or `/clord repo:<url>`), otherwise the channel's (`/clord-init`); unbound channels fall back to the default `clord` session. So a channel whose threads are bound to different repos is spread over several sessions, and two channels bound to the same repo share one. Where a given thread lives — and why it is decided this way — is spelled out in [docs/specs/tmux-layout.md](docs/specs/tmux-layout.md).
+- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`w1`, `w2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`. Window numbers are unique **within a session**, not within a channel.
 
 For the "why" behind this design, see [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
