@@ -34,6 +34,14 @@ MUST_BE_WIRED = [
     ("cleanup_orphaned_all_sessions", "tmux.py"),
     # #574: 7日アイドルの自動停止
     ("IdleStopLoop", "idle_stop.py"),
+    # #572: 4時間アイドルの自動スリープ
+    #
+    # ループが呼ぶ ``_sleep_workspace_impl`` はここでは見られない — ``get_cog`` +
+    # ``getattr(cog, "...")`` の名前解決は AST 上ただの文字列で、参照には見えない
+    # から。その繋がりは tests/test_idle_sleep.py の
+    # ``test_the_cog_really_has_the_method_the_loop_looks_up`` が実物の
+    # SessionManageCog に対して確かめる。
+    ("IdleSleepLoop", "idle_sleep.py"),
     # #613: 行を失った作業ディレクトリの回収
     ("OrphanSweepLoop", "orphan_dirs.py"),
     # #612: #573 で配線を忘れた2つ

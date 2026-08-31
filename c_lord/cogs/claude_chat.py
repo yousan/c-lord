@@ -60,6 +60,7 @@ from ..session_resume import (
     accepts_message,
     classify,
     is_clord_thread,
+    resume_notice,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_origin import inspect_origin
@@ -1971,18 +1972,33 @@ class ClaudeChatCog(commands.Cog):
             # (exactly what the 2026-06-25 tmux-server-death incident looked like
             # to the user). A visible notice makes the recovery legible.
             if try_continue:
-                # #512: same mechanism, different story. A user who just pressed
-                # 「再開する」 did not suffer a crash, so telling them the session
-                # "fell over" is simply false and reads as a new failure.
+                # #512 / #572: same mechanism, three different stories. A user
+                # who just pressed 「再開する」 did not suffer a crash, and a
+                # workspace c-lord itself put to sleep after 4 idle hours never
+                # had a problem to report at all. The wording lives in one
+                # function so the three cannot drift apart.
                 reopened = thread.id in self._reopened_threads
                 self._reopened_threads.discard(thread.id)
-                notice = (
-                    "🔄 停止していたワークスペースを復元して、続きから再開します。"
-                    if reopened
-                    else "🔄 前回のワークスペースが落ちていたので、会話を復元して続けます。"
-                )
-                with contextlib.suppress(discord.HTTPException):
-                    await thread.send(notice)
+                slept = bool(record is not None and record.slept_at)
+                notice = resume_notice(slept=slept, reopened=reopened)
+                if notice is not None:
+                    with contextlib.suppress(discord.HTTPException):
+                        await thread.send(notice)
+                elif slept:
+                    # Invisible to the user, but not to whoever reads the log:
+                    # a silent restore must still be greppable, or a sleep that
+                    # failed to come back would look identical to one that never
+                    # happened (#565).
+                    logger.info(
+                        "%s silently restoring a slept workspace (#572)",
+                        log_ctx(thread_id=thread.id),
+                    )
+
+            # A turn is starting, so this workspace is awake — clear the mark
+            # where it is consumed rather than trusting a later write to do it.
+            if record is not None and record.slept_at:
+                with contextlib.suppress(Exception):
+                    await self.repo.set_slept(thread.id, False)
 
             # Run as its own task so the per-thread lock is NOT held for the
             # (possibly long, possibly menu-parked) duration of the turn — that

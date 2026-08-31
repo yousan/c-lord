@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     rename_backoff_until TEXT,
     closed_at TEXT,
     closed_reason TEXT,
+    slept_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -174,6 +175,12 @@ _MIGRATIONS = [
     # state itself is still decided by closed_at alone, so the two can
     # never disagree.
     "ALTER TABLE sessions ADD COLUMN closed_reason TEXT",
+    # #572: when the 4-hour sleep stopped this workspace's Claude. NULL once any
+    # turn has run since. Read **only** to word the resume — a slept workspace
+    # comes back without a word, a crashed one says so (#464). Whether to resume
+    # at all is still decided by "is the pane alive?" alone, so this column can
+    # never contradict the thing it describes (the closed_reason rule).
+    "ALTER TABLE sessions ADD COLUMN slept_at TEXT",
 ]
 
 

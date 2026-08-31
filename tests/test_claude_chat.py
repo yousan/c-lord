@@ -740,6 +740,20 @@ class TestResumeAfterPaneDeath:
         msg.author.bot = False
         return msg
 
+    @staticmethod
+    def _record(session_id: str) -> MagicMock:
+        """A session row for this thread.
+
+        ``slept_at`` is spelled out because a bare ``MagicMock`` attribute is
+        truthy, and the reply path reads that field to decide whether to
+        announce the recovery (#572): an unset mock would silently claim every
+        one of these threads had been put to sleep.
+        """
+        record = MagicMock()
+        record.session_id = session_id
+        record.slept_at = None
+        return record
+
     def _cog_with_pane(self, *, running: bool) -> ClaudeChatCog:
         """Cog whose tmux pane for the thread is alive (running) or dead."""
         cog = _make_cog()
@@ -753,8 +767,7 @@ class TestResumeAfterPaneDeath:
     async def test_resumes_with_continue_when_pane_dead_and_prior_session(self) -> None:
         """RED (#270): pane died but a prior session exists → must pass try_continue=True."""
         cog = self._cog_with_pane(running=False)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
 
         await cog._handle_thread_reply(self._make_thread_message())
@@ -773,8 +786,7 @@ class TestResumeAfterPaneDeath:
         notice makes the recovery legible instead of confusing.
         """
         cog = self._cog_with_pane(running=False)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
         msg = self._make_thread_message()
 
@@ -787,8 +799,7 @@ class TestResumeAfterPaneDeath:
     async def test_no_recovery_notice_when_pane_alive(self) -> None:
         """Pane alive → normal live continuation; must NOT post a recovery notice."""
         cog = self._cog_with_pane(running=True)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
         msg = self._make_thread_message()
 
@@ -801,8 +812,7 @@ class TestResumeAfterPaneDeath:
     async def test_no_continue_when_session_cleared(self) -> None:
         """/clear invariant (#123 Part 1): session was reset → stay fresh, never --continue."""
         cog = self._cog_with_pane(running=False)
-        record = MagicMock()
-        record.session_id = ""  # /clear resets session_id to empty
+        record = self._record("")  # /clear resets session_id to empty
         cog.repo.get = AsyncMock(return_value=record)
 
         await cog._handle_thread_reply(self._make_thread_message())
@@ -815,8 +825,7 @@ class TestResumeAfterPaneDeath:
     async def test_no_continue_when_pane_alive(self) -> None:
         """Pane still alive → live send_input continues context; must not force --continue."""
         cog = self._cog_with_pane(running=True)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
 
         await cog._handle_thread_reply(self._make_thread_message())

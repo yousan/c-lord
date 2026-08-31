@@ -333,6 +333,24 @@ async def setup_bridge(
     else:
         logger.info("Idle-stop disabled (CLORD_IDLE_STOP_DAYS=0)")
 
+    # --- Idle sleep (#572) ---
+    # Always-on (zero-config): stops just the *claude process* of workspaces
+    # nobody has touched for CLORD_IDLE_SLEEP_HOURS (default 4). docker keeps
+    # running, the checkout / transcript / volumes / DB row all stay, and the
+    # next message resumes without a word — so the user never sees it. The
+    # threshold is a constant for the same reason the 7-day one is: it describes
+    # how people use Discord, not how much RAM the host has. Set the env to 0 to
+    # disable. See docs/specs/workspace-sleep.md.
+    from .idle_sleep import IdleSleepLoop, idle_sleep_hours
+
+    _sleep_hours = idle_sleep_hours()
+    if _sleep_hours > 0:
+        sleep_loop = IdleSleepLoop(bot, session_repo, threshold_hours=_sleep_hours)
+        sleep_loop.start()
+        bot.idle_sleep_loop = sleep_loop  # type: ignore[attr-defined]
+    else:
+        logger.info("Idle-sleep disabled (CLORD_IDLE_SLEEP_HOURS=0)")
+
     # --- Orphan working-directory sweep (#613) ---
     # Always-on (zero-config): reclaims workspace directories no ``sessions``
     # row points at any more. #575 deletes a directory as it deletes its row, so
