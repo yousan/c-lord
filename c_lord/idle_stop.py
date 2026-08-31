@@ -137,13 +137,13 @@ def select_idle_workspaces(
 
 #: Most workspaces stopped in a single sweep.
 #:
-#: Switching this on for the first time finds a backlog — 20 on the production
-#: host — and stopping all of them at once means that many embeds and thread
-#: archives back to back. That is the burst #277 had to fix for the rename loop,
-#: and it would be the reader's first experience of the feature. Everything
-#: selected has already been idle for a week, so spreading the backlog over
-#: consecutive ticks costs nothing.
-MAX_STOPS_PER_TICK = 5
+#: Effectively unlimited. It started at 5 to avoid a burst of notices, but that
+#: traded a real cost for an imagined one: everything selected has been idle for
+#: at least a week, and drip-feeding five per ten minutes stretched a 93-item
+#: backlog across three hours while the sidebar stayed cluttered the whole time.
+#: yousan asked for them to go at once (2026-08-31). The ceiling stays as a guard
+#: against a pathological table, not as a pacing mechanism.
+MAX_STOPS_PER_TICK = 1000
 
 #: How often to look for idle workspaces. Generous on purpose: the threshold is
 #: measured in days, so checking every 10 minutes is already 1000× finer than it

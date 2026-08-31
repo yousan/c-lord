@@ -44,6 +44,21 @@ _SUBJECT = "このスレッドのワークスペース"
 _KEPT = "✅ そのまま"
 
 
+def _transcript_value() -> str:
+    """The 会話履歴 row, including how long it actually lasts (#607).
+
+    A bare 「そのまま」 is true the moment it is written — the workspace is
+    stopped at day 7 and the transcript is still there — but it promises
+    something about the future that c-lord does not control: Claude Code deletes
+    transcripts itself after ``cleanupPeriodDays`` (30 by default, measured).
+    Saying the period turns an over-promise into a fact the reader can act on,
+    and points at the setting that changes it.
+    """
+    from .retention import claude_transcript_retention_days
+
+    return f"✅ そのまま（Claude Code の保持期間 {claude_transcript_retention_days()} 日まで）"
+
+
 class WorkspaceAction(Enum):
     """The three lifecycle operations. Each one contains the one above it."""
 
@@ -194,7 +209,7 @@ def workspace_notice_embed(
     embed.add_field(name="Claude", value="⏹ 停止", inline=True)
     embed.add_field(name="開発環境 (docker)", value=_docker_value(docker, containers), inline=True)
     embed.add_field(name="作業フォルダ", value=_workdir_value(action, freed_mb), inline=True)
-    embed.add_field(name="会話履歴", value=_KEPT, inline=True)
+    embed.add_field(name="会話履歴", value=_transcript_value(), inline=True)
     embed.add_field(name="DBのデータ (volume)", value=_KEPT, inline=True)
 
     # Leaving docker up means the host ports stay taken. That is the one thing

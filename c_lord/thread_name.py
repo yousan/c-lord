@@ -173,7 +173,18 @@ def build_name(
     ref_token = f"#{origin} " if origin else ""
     cur_token = f" →#{current}" if current and current != origin else ""
 
-    if not closed and state not in _NO_PREFIX_STATES and window_number is not None:
+    # #607: the number survives the stop. #512 dropped it because the tmux window
+    # it names is exactly what was just killed — correct for "where do I look
+    # now", but that is not the only thing the name is used for. yousan reads it
+    # months later to find which workspace a piece of work lived in, and the
+    # issue number alone is not enough. ``[停止]`` already says the window is
+    # gone, so a stopped thread cannot be mistaken for a live one.
+    #
+    # A live thread elsewhere may hold the same number — numbers restart per
+    # repository, and the production server already shows w1 four times over. The
+    # collision is pre-existing and visual only: window lookup goes through the
+    # pane's own ``@thread_id``, never through this name.
+    if window_number is not None and (closed or state not in _NO_PREFIX_STATES):
         work = f"W{window_number} │ "
     else:
         work = ""
