@@ -599,6 +599,8 @@ curl -X POST http://localhost:8080/api/tasks \
 
 The 30-second master loop picks up due tasks and spawns Claude Code sessions automatically.
 
+Each run posts a `🔄 **[Scheduled]** <task name>` message, opens a thread on it, creates a tmux window in the task's `working_dir`, and runs Claude there — the answer lands in the thread like any other turn. What a scheduled run should look like (and what counts as a bug) is written up in [docs/specs/scheduled-tasks.md](docs/specs/scheduled-tasks.md).
+
 ---
 
 ## Auto-Upgrade

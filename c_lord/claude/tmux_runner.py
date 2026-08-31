@@ -109,6 +109,26 @@ def _delivery_failure(action: str, prompt: str) -> str:
     )
 
 
+def _missing_window(action: str, thread_id: int) -> str:
+    """User-facing text for "there is no window to start Claude in" (#621).
+
+    ``start_claude`` returns False for two unrelated reasons, and #527's wording
+    only fits one of them.  When the window was never created there is no pane
+    to be unresponsive, and ``/restart-claude`` — which restarts the process
+    *inside* an existing pane — cannot conjure one.  Sending the reader there
+    (as every scheduled run did) costs them the one attempt they had at fixing
+    it themselves.  So name what is actually absent, and point at the two things
+    that can actually be absent: the channel's repo binding, and tmux itself.
+    """
+    return (
+        f"{action}に失敗しました — このスレッド用の tmux ウィンドウが作られていません "
+        f"(thread={thread_id})。ペインが落ちているのではなく、Claude を動かす先の"
+        "ウィンドウがそもそも存在しない状態です。"
+        "チャンネルが `/clord-init` で repo に紐づいているか、"
+        "ホストで tmux が使えるかを確認してください。"
+    )
+
+
 def _stuck_in_input_box(prompt: str) -> str:
     """User-facing text for "typed into the pane, but it would not submit" (#560).
 
@@ -881,6 +901,31 @@ class TmuxClaudeRunner:
         self._silent_stop = False
         self._last_capture: str = ""
 
+    async def _start_failure_reason(self, prompt: str) -> str:
+        """Explain a failed ``start_claude`` by asking tmux, not by guessing (#621).
+
+        The call returns a bare ``False`` for two failures that need opposite
+        advice: a pane that will not take the keystrokes, and a window that was
+        never created (which is what every scheduled run hit — see #621).  Same
+        shape as the #560 probe on the send path: read the actual state before
+        telling the user what to do about it.
+        """
+        try:
+            has_window = bool(await asyncio.to_thread(self._tmux.session_exists, self._thread_id))
+        except Exception:
+            # Undecidable — keep the broader #527 wording rather than assert a
+            # cause we did not verify.
+            logger.warning("Could not check whether thread %d has a tmux window", self._thread_id)
+            has_window = True
+        if has_window:
+            return _delivery_failure("Claude の起動", prompt)
+        logger.error(
+            "start_claude failed with no tmux window for thread %d — "
+            "the window was never created (#621)",
+            self._thread_id,
+        )
+        return _missing_window("Claude の起動", self._thread_id)
+
     async def run(
         self,
         prompt: str,
@@ -966,7 +1011,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error=_delivery_failure("Claude の起動", prompt),
+                        error=await self._start_failure_reason(prompt),
                     )
                     return
 
@@ -996,7 +1041,7 @@ class TmuxClaudeRunner:
                             raw={},
                             message_type=MessageType.RESULT,
                             is_complete=True,
-                            error=_delivery_failure("Claude の起動", prompt),
+                            error=await self._start_failure_reason(prompt),
                         )
                         return
             else:
@@ -1017,7 +1062,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error=_delivery_failure("Claude の起動", prompt),
+                        error=await self._start_failure_reason(prompt),
                     )
                     return
 

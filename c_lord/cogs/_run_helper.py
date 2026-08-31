@@ -395,9 +395,14 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             await processor.process(event)
             if event.is_complete and event.error:
                 run_errored = True
+                # #621: hand the reason back to the caller. A scheduled/webhook
+                # turn has nobody reading the thread, so an error that only ever
+                # became an embed is an error nobody ever sees.
+                config.outcome.error = event.error
     except Exception:
         logger.exception("%s Error running Claude CLI", ctx)
         run_errored = True
+        config.outcome.error = "An unexpected error occurred."
         # Wrap Discord sends in suppress — the connection may already be closed
         # (e.g. ServerDisconnectedError on bot shutdown), and sending would fail too.
         with contextlib.suppress(Exception):
