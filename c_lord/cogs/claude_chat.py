@@ -1262,7 +1262,7 @@ class ClaudeChatCog(commands.Cog):
 
     @app_commands.command(
         name="clord-reattach",
-        description="このスレッドの作業セッションに再接続する（記録が消えたとき）",
+        description="このスレッドのワークスペースに再接続する（記録が消えたとき）",
     )
     async def clord_reattach(self, interaction: discord.Interaction) -> None:
         """Reconnect this thread to the Claude session already on disk — #538 AC6.

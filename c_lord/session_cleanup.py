@@ -33,10 +33,14 @@ promising a recovery this side cannot deliver.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .retention import claude_transcript_retention_days
+from .session_dir import _is_clean
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
 if TYPE_CHECKING:
@@ -84,9 +88,20 @@ def inspect_survivors(record: SessionRecord, *, projects_root: Path | None = Non
 #: Opening line. Leads with the fact, because the reader arrived here confused
 #: about why their session vanished — not looking for advice yet.
 def _headline(days: int) -> str:
+    """Opening line, including where the period came from (#575).
+
+    The reader is being told their thread was cleaned up without asking. They
+    are owed the reason the number is what it is — and that c-lord did not pick
+    it: the period follows Claude Code's own transcript retention
+    (``cleanupPeriodDays``), so the folder goes at the same moment the
+    conversation Claude was keeping for it does. Saying so is also the only way
+    someone can find the knob that changes it.
+    """
     return (
         f"🧹 このスレッドは {days} 日以上使われていなかったため、"
-        "**作業セッションの記録を整理しました。**\n"
+        "**ワークスペースを整理しました。**\n"
+        f"（{days} 日は Claude Code の会話ログ保持期間 `cleanupPeriodDays` に"
+        "合わせています。c-lord 独自の期間ではありません）\n"
     )
 
 
@@ -137,6 +152,84 @@ def notice_for(record: SessionRecord, survivors: Survivors, *, days: int = 30) -
             "続けるには:\n" + _RECONNECT + "\n" + _START_AGAIN
         )
     return (
-        head + "・この作業セッションに紐づくファイルは見つかりませんでした\n\n"
+        head + "・このワークスペースに紐づくファイルは見つかりませんでした\n\n"
         "続けるには:\n" + _START_AGAIN
     )
+
+
+# ── #575: the folder, not just the row ───────────────────────────────────────
+
+
+class DirOutcome(Enum):
+    """What the sweep did with a session directory."""
+
+    REMOVED = "removed"
+    KEPT_DIRTY = "kept_dirty"
+    """Uncommitted work present, or cleanliness could not be established."""
+    KEPT_UNSAFE = "kept_unsafe"
+    """The path did not look like a session directory at all."""
+    ABSENT = "absent"
+
+
+#: A session dir is always ``<base>/<channel_id>/<thread_id>`` — at least three
+#: path components deep. A ``working_dir`` shallower than this is a corrupt row,
+#: not a workspace, and deleting it could take out a home directory.
+_MIN_PATH_DEPTH = 3
+
+
+def sweep_days() -> int:
+    """How long a workspace survives unused, in days.
+
+    Mirrors Claude Code's transcript retention rather than being a number c-lord
+    picked: once Claude has forgotten the conversation, the checkout that existed
+    to serve it has nothing left to serve. Keeping the two in step also removes
+    the window that produced the 118 GB — rows expiring while directories did
+    not. See :mod:`c_lord.retention` for why c-lord reads that setting and never
+    writes it.
+    """
+    return claude_transcript_retention_days()
+
+
+def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
+    """Delete *record*'s working directory when it is safe to. Never raises.
+
+    Safe means: the path looks like a session directory, it exists, and ``git``
+    reports no uncommitted or untracked changes. Anything else is kept.
+
+    Losing a half-finished change to a background sweep nobody asked for is
+    unrecoverable, so every uncertainty resolves to *keep* — including "this is
+    not a git repository at all", where cleanliness cannot be established.
+    """
+    working_dir = (record.working_dir or "").strip()
+    if not working_dir:
+        return DirOutcome.ABSENT
+
+    try:
+        path = Path(working_dir)
+        if len([p for p in path.parts if p not in ("/", "")]) < _MIN_PATH_DEPTH:
+            logger.warning(
+                "session cleanup: refusing to remove suspiciously shallow path %r (thread=%s)",
+                working_dir,
+                record.thread_id,
+            )
+            return DirOutcome.KEPT_UNSAFE
+        if not path.is_dir():
+            return DirOutcome.ABSENT
+    except (OSError, ValueError):
+        return DirOutcome.ABSENT
+
+    if not _is_clean(str(path)):
+        logger.info(
+            "session cleanup: keeping %s — uncommitted work or not a git repo (thread=%s)",
+            path,
+            record.thread_id,
+        )
+        return DirOutcome.KEPT_DIRTY
+
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        logger.warning("session cleanup: failed to remove %s: %s", path, exc)
+        return DirOutcome.KEPT_DIRTY
+    logger.info("session cleanup: removed %s (thread=%s)", path, record.thread_id)
+    return DirOutcome.REMOVED
