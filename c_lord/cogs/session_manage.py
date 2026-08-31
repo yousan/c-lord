@@ -1227,6 +1227,107 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
 
+    async def _sleep_workspace_impl(
+        self,
+        *,
+        channel: object,
+        reason: WorkspaceReason = WorkspaceReason.IDLE,
+        idle_label: str | None = None,
+    ) -> bool:
+        """スリープ — stop this workspace's Claude and nothing else (#572).
+
+        The innermost of the three lifecycle operations (スリープ ⊂ 停止 ⊂ 削除).
+        It kills the tmux window, which is the whole 400 MB, and stops there:
+
+        * **docker keeps running.** A build in progress or a database must not
+          die because nobody typed for four hours, and the memory this reclaims
+          is Claude's, not docker's — so stopping containers would cost real work
+          to buy nothing. Their host ports stay held, which is the one thing the
+          user is told about (below).
+        * the working copy, the transcript, the volumes and the ``sessions`` row
+          are untouched,
+        * no ``closed_at``, no rename, no marker. 停止 is a state the user can
+          see and undo; sleep is not a state they should ever have to know about.
+
+        Returns ``True`` only when a window was actually killed. The callers —
+        :class:`c_lord.idle_sleep.IdleSleepLoop`, and #576's resident cap — count
+        that, not the number of calls: a sweep that counts attempts reports
+        progress it never made (#604).
+
+        There is no slash command on purpose. Being invisible is the feature; a
+        手動 twin would add a concept ("how is this different from 停止?") that
+        buys the user nothing.
+        """
+        if not isinstance(channel, discord.Thread):
+            return False
+
+        import asyncio
+
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
+        if tmux_mgr is None:
+            return False
+
+        # Already asleep (or never resident): there is nothing to reclaim, and
+        # going further would re-post the docker line on every tick — which is
+        # how an invisible feature turns into a nuisance.
+        if not await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
+            return False
+
+        # Stop the mirror BEFORE the kill (#379): killing the pane can make the
+        # harness write a final ``<task-notification>`` row into the transcript,
+        # and a mirror still tailing would echo it into the thread as 👤. Sleep
+        # must leave no trace.
+        await self._stop_transcript_mirror(thread_id)
+
+        if not await asyncio.to_thread(tmux_mgr.kill_session, thread_id):
+            logger.info("%s sleep: no tmux window to kill", log_ctx(thread_id=thread_id))
+            return False
+
+        # Remember it, so the next message resumes without a word even across a
+        # bot restart. Wording only — see ``SessionRepository.set_slept``.
+        with contextlib.suppress(Exception):
+            await self.repo.set_slept(thread_id, True)
+
+        logger.info(
+            "%s workspace slept (reason=%s, idle=%s)",
+            log_ctx(thread_id=thread_id),
+            reason.value,
+            idle_label or "-",
+        )
+
+        # ── the one exception to silence ──────────────────────────────────
+        # docker was left running on purpose, so this workspace still holds its
+        # host ports. The user cannot work that out for themselves and it comes
+        # back as a port collision the next time they start an environment
+        # (measured: one supabase workspace holds five ports). Everything else
+        # about a sleep is deliberately unremarkable, so nothing else is said.
+        containers: list[DevContainer] = []
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(parent_channel_id)
+            if sdm is not None:
+                session_dir = str(Path(sdm.base_dir) / str(thread_id))
+                containers = await containers_for_session_dir(session_dir)
+
+        if any(c.running for c in containers):
+            # Built by the shared inventory builder, not a bespoke line: a notice
+            # says what stopped *and what survived*, because "did I just lose
+            # something?" is the reader's actual question (#571). Two functions
+            # producing "the same" message always drift — that was #538.
+            embed = workspace_notice_embed(
+                WorkspaceAction.SLEEP,
+                reason=reason,
+                idle_label=idle_label,
+                containers=containers,
+                docker=DockerOutcome.LEFT_RUNNING,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(embed=embed)
+
+        return True
+
     async def _close_workspace_impl(
         self,
         *,

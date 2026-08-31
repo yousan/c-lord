@@ -44,6 +44,7 @@ __all__ = [
     "classify",
     "hint_for_thread",
     "is_clord_thread",
+    "resume_notice",
     "stopped_hint",
 ]
 
@@ -192,3 +193,38 @@ async def hint_for_thread(repo: SessionRepository, thread_id: int) -> str:
     except Exception:
         return _HINTS[ThreadResume.RESUMES]
     return stopped_hint(classify(record))
+
+
+# ── what the user is told when a dead pane is revived (#464, #512, #572) ──────
+#
+# All three arrive at exactly the same place — ``session_id`` on disk, no live
+# pane, ``--continue`` about to run — and want three different sentences. Deciding
+# that at the call site is how the wordings drift, so it is decided here.
+
+_RESUME_CRASHED = "🔄 前回のワークスペースが落ちていたので、会話を復元して続けます。"
+_RESUME_REOPENED = "🔄 停止していたワークスペースを復元して、続きから再開します。"
+
+
+def resume_notice(*, slept: bool, reopened: bool) -> str | None:
+    """What to post before a ``--continue`` resume, or ``None`` to say nothing.
+
+    * **reopened** — the user just pressed 「▶️ 再開する」. Nothing fell over, so
+      calling it a crash is simply false and reads as a fresh failure (#512).
+    * **slept** — c-lord stopped Claude itself after 4 idle hours (#572). The
+      user did not ask for it and was never told it happened, so announcing the
+      recovery would be announcing a problem they never had. Silence here is the
+      feature, not an omission.
+    * otherwise — the pane really did die (bot restart, ``kill -9``, tmux-server
+      death). Say so: a silent resume re-emits the prior turn's output and reads
+      as the bot replaying garbage, which is exactly what the 2026-06-25 incident
+      looked like to the user (#464).
+
+    A deliberate reopen wins over a stale sleep mark: a workspace can be slept at
+    4 hours, stopped at 7 days and then reopened by hand, and the last of those is
+    the one the user actually did.
+    """
+    if reopened:
+        return _RESUME_REOPENED
+    if slept:
+        return None
+    return _RESUME_CRASHED

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import aiosqlite
 
@@ -50,6 +50,30 @@ class SessionRecord:
     # notice. The state itself is still decided by closed_at alone, so a second
     # column can never contradict the first (the #538 failure mode).
     closed_reason: str | None = None
+    # Issue #572: when the 4-hour sleep stopped this workspace's Claude, or None
+    # once any turn has run since. Read **only** to word the resume: a slept
+    # workspace comes back silently, a crashed one announces itself (#464).
+    # Whether to resume is still decided by "is the pane alive?" alone.
+    slept_at: str | None = None
+
+
+def _record(row) -> SessionRecord:
+    """Build a :class:`SessionRecord` from a ``SELECT *`` row.
+
+    Columns the dataclass does not know about are **dropped** rather than passed
+    through. Migrations here only ever add columns, so a database is always at or
+    ahead of the code that opens it — and a bot running yesterday's code against
+    a database today's code migrated used to die on every single read with
+    ``TypeError: unexpected keyword argument``. That is not a hypothetical: it is
+    what a staging clone does the moment it is switched back to ``main`` after
+    verifying a branch that added a column (#576, observed 2026-08-31 with
+    ``slept_at``), and it is what a rollback of a release would do in production.
+
+    Dropping unknown columns makes the older code simply not see the new field,
+    which is exactly what it did before the column existed.
+    """
+    known = {f.name for f in fields(SessionRecord)}
+    return SessionRecord(**{k: v for k, v in dict(row).items() if k in known})
 
 
 class SessionRepository:
@@ -69,7 +93,7 @@ class SessionRepository:
             row = await cursor.fetchone()
             if row is None:
                 return None
-            return SessionRecord(**dict(row))
+            return _record(row)
 
     async def save(
         self,
@@ -92,6 +116,12 @@ class SessionRepository:
                      model = COALESCE(excluded.model, sessions.model),
                      origin = COALESCE(excluded.origin, sessions.origin),
                      summary = COALESCE(excluded.summary, sessions.summary),
+                     -- A turn is starting, so this workspace is awake by
+                     -- definition. Clearing it here rather than at each call
+                     -- site means no turn path (scheduler, skill, webhook) can
+                     -- forget to, and it can only ever be cleared — never set —
+                     -- so it cannot contradict `set_slept` (#572).
+                     slept_at = NULL,
                      last_used_at = datetime('now', 'localtime')""",
                 (thread_id, session_id, working_dir, model, origin, summary),
             )
@@ -115,7 +145,7 @@ class SessionRepository:
                 (limit,),
             )
             rows = await cursor.fetchall()
-            return [SessionRecord(**dict(row)) for row in rows]
+            return [_record(row) for row in rows]
 
     async def delete(self, thread_id: int) -> bool:
         """Delete a session mapping. Returns True if a row was deleted."""
@@ -238,6 +268,35 @@ class SessionRepository:
                 )
             await db.commit()
 
+    async def set_slept(self, thread_id: int, slept: bool) -> None:
+        """Record (or clear) the 4-hour sleep for this workspace (#572).
+
+        Sleep stops the workspace's Claude and nothing else — no ``closed_at``,
+        no rename, no notice — because the whole point is that the user does not
+        notice. That leaves the next message facing a dead pane, which is
+        indistinguishable from a crash; and a crash *must* be announced,
+        otherwise the resumed turn re-emits the prior output and reads as the bot
+        replaying garbage (#464). This column is what tells the two apart.
+
+        It words the resume and nothing else. Whether to resume at all is still
+        decided by "is the pane alive?", exactly as before, so a stale value here
+        can never resume (or refuse to resume) anything — the same discipline as
+        ``closed_reason``.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if slept:
+                await db.execute(
+                    "UPDATE sessions SET slept_at = datetime('now', 'localtime') "
+                    "WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sessions SET slept_at = NULL WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            await db.commit()
+
     async def update_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Persist the Discord message ID that triggered the current Claude turn.
 
@@ -287,7 +346,7 @@ class SessionRepository:
                 "SELECT * FROM sessions WHERE state = 'alive' ORDER BY last_used_at DESC"
             )
             rows = await cursor.fetchall()
-            return [SessionRecord(**dict(row)) for row in rows]
+            return [_record(row) for row in rows]
 
     async def all_working_dirs(self) -> set[str]:
         """Every ``working_dir`` any row still claims — closed rows included.
@@ -322,7 +381,7 @@ class SessionRepository:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
-            doomed = [SessionRecord(**dict(row)) for row in await cursor.fetchall()]
+            doomed = [_record(row) for row in await cursor.fetchall()]
             if not doomed:
                 return []
             await db.execute("DELETE FROM sessions" + where, (days,))
