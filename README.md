@@ -400,7 +400,9 @@ When Claude's reply contains a URL (e.g. a GitHub Issues link), Discord would no
 
 When enabled, Markdown pipe tables in Claude's responses are rendered as PNG images using [Pillow](https://python-pillow.github.io/) and attached to the Discord message alongside the text. Each cell is split into text and emoji runs: **text is drawn with a CJK-capable font and emoji are drawn in full color** from a color emoji font, so 🟢/🔴 status lamps keep their color.
 
-**Inline markdown inside cells is collapsed to plain text** before drawing — the image cannot be made interactive, so leaving the raw syntax in would just leak noise. `[label](url)` / `![alt](url)` become `label` (the URL is unclickable in an image and only adds clutter), `**bold**` / `*italic*` / `~~strike~~` / `` `code` `` keep only their inner text. Underscore emphasis (`_x_`, `__x__`) is intentionally left untouched so identifiers such as `_is_allowed` / `__init__` are not mangled.
+**Inline markdown inside cells is collapsed to plain text** before drawing — the image cannot be made interactive, so leaving the raw syntax in would just leak noise. `[label](url)` / `![alt](url)` become `label` (the URL is unclickable in an image and only adds clutter), and `**bold**` / `*italic*` / `` `code` `` keep only their inner text. Underscore emphasis (`_x_`, `__x__`) is intentionally left untouched so identifiers such as `_is_allowed` / `__init__` are not mangled.
+
+**`~~strike~~` is the exception: it is drawn as a real strikethrough rule.** A picture *can* show a line through the text, and Claude uses strikethrough in tables to mean "this row is the one being dropped" — Discord strikes it in the message body, so collapsing it to plain text in the image would make the two disagree and invert the meaning of the table. The rule follows the text across wrapped lines and applies to part of a cell (`~~a~~ b`) as well as the whole of it.
 
 **Installation:**
 
