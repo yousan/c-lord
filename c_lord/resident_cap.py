@@ -228,9 +228,9 @@ def select_lru_victims(
     what the cap is for: the point is to survive a runaway, not to interrupt the
     person using the tool.
 
-    A resident window with no ``sessions`` row still **counts** (it occupies the
-    same memory) but is never chosen: there is no timestamp to order it by, and
-    guessing would evict by accident. Those are the tmux reaper's and #613's job.
+    *resident* must already be scoped to workspaces **this bot owns** — see
+    :meth:`ResidentCapLoop._enforce_cap`. A window this instance cannot manage
+    must not push its own users out.
     """
     if target < 0:
         target = 0
@@ -427,7 +427,7 @@ class ResidentCapLoop:
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
         victims = select_lru_victims(
             records,
-            resident=self._resident(),
+            resident=self._resident() & {rec.thread_id for rec in records},
             target=0,  # ordering only — the loop below stops as soon as it recovers
             in_flight=self._in_flight(),
         )
@@ -463,10 +463,24 @@ class ResidentCapLoop:
 
     async def _enforce_cap(self) -> int:
         resident = self._resident()
+        # Cheap upper bound first: the ownership filter below can only shrink
+        # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
             return 0
 
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
+
+        # Count only what **this** instance owns. One tmux server is shared by
+        # every c-lord on the host (and by the operator's own hand-made
+        # sessions), so a host-wide count would let another bot's workspaces —
+        # ones we could never sleep, since victims are drawn from our own
+        # ``sessions`` rows — push our users out. Host-wide pressure is the
+        # emergency brake's job; it reads ``MemAvailable``, which is host-wide
+        # by nature. The cap governs what it is responsible for.
+        resident &= {rec.thread_id for rec in records}
+        if len(resident) <= self._limit:
+            return 0
+
         victims = select_lru_victims(
             records,
             resident=resident,

@@ -179,10 +179,9 @@ class TestLruSelection:
         records = [_rec(1, hours_ago=9), _rec(2, hours_ago=8)]
         assert select_lru_victims(records, resident={2}, target=0, in_flight=set()) == [2]
 
-    def test_a_resident_without_a_row_counts_but_is_never_chosen(self) -> None:
-        """行が無いウィンドウも RAM は食っているので数には入れる。
+    def test_a_resident_without_a_row_is_never_chosen(self) -> None:
+        """行の無いウィンドウは選べない（アイドル時間が測れない）。
 
-        ただしアイドル時間が測れないので順番を付けられない — 選ばない。そういう
         残骸は #613 の掃除と startup の tmux リーパーの担当。
         """
         records = [_rec(1, hours_ago=9)]
@@ -192,6 +191,33 @@ class TestLruSelection:
     def test_an_unparsable_timestamp_is_skipped(self) -> None:
         records = [replace(_rec(1, hours_ago=9), last_used_at="nope"), _rec(2, hours_ago=8)]
         assert select_lru_victims(records, resident={1, 2}, target=1, in_flight=set()) == [2]
+
+
+class TestOnlyOurOwnWorkspacesAreCounted:
+    """1台の tmux サーバを、そのホストの c-lord 全部と人間の手作業が共有している。
+
+    ホスト全体で数えると、**このボットが決して眠らせられない他人のワークスペース**
+    （victim は自分の ``sessions`` 行からしか選ばれない）が、自分の利用者を
+    押し出すことになる。ホスト全体の逼迫は緊急ブレーキ（``MemAvailable`` を見る）の
+    担当で、上限は自分が責任を持てる範囲だけを見る。
+    """
+
+    @pytest.mark.asyncio
+    async def test_another_bots_residents_do_not_push_ours_out(self) -> None:
+        ours = [_rec(i, hours_ago=i) for i in range(1, 4)]
+        # 自分は3本。同じ tmux サーバに他所の 20 本が居る。
+        foreign = set(range(100, 120))
+        loop = _loop(ours, resident={1, 2, 3} | foreign, limit=5)
+
+        assert await loop.tick() == 0
+        loop._cog_for_test._sleep_workspace_impl.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_our_own_excess_is_still_enforced(self) -> None:
+        ours = [_rec(i, hours_ago=i) for i in range(1, 8)]
+        loop = _loop(ours, resident=set(range(1, 8)) | {100, 101}, limit=5)
+
+        assert await loop.tick() == 2
 
 
 class TestNewWorkspacesAreNeverBlocked:
@@ -487,3 +513,37 @@ class TestTheNoticeTellsTheTruthAboutWhy:
             for r in WorkspaceReason
         ]
         assert len(set(fields)) == 1
+
+
+class TestAnOlderBotSurvivesANewerDatabase:
+    """マイグレーションは前にしか進まないので、**DB はコードと同じか、先を行く**。
+
+    ``SessionRecord(**dict(row))`` は知らない列で ``TypeError`` になるため、列を
+    足したブランチを検証した staging clone を ``main`` に戻した瞬間、**すべての
+    読み取りが落ちる**（2026-08-31 に ``slept_at`` で実際に踏んだ）。本番の
+    ロールバックでも同じことが起きる。
+
+    知らない列は落として読む = 「その列が存在しなかった頃」と同じ挙動に戻る。
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_column_the_dataclass_does_not_know_is_ignored(self, tmp_path) -> None:
+        import aiosqlite
+
+        from c_lord.database.models import init_db
+        from c_lord.database.repository import SessionRepository
+
+        db_path = str(tmp_path / "sessions.db")
+        await init_db(db_path)
+        repo = SessionRepository(db_path)
+        await repo.save(555, "sess-abc", working_dir="/w")
+
+        # 未来のリリースが足した列。いまのコードは知らない。
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("ALTER TABLE sessions ADD COLUMN a_column_from_the_future TEXT")
+            await db.execute("UPDATE sessions SET a_column_from_the_future = 'x'")
+            await db.commit()
+
+        record = await repo.get(555)
+        assert record is not None and record.thread_id == 555
+        assert (await repo.list_all())[0].thread_id == 555
