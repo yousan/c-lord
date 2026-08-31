@@ -50,6 +50,11 @@ class SessionRecord:
     # notice. The state itself is still decided by closed_at alone, so a second
     # column can never contradict the first (the #538 failure mode).
     closed_reason: str | None = None
+    # Issue #572: when the 4-hour sleep stopped this workspace's Claude, or None
+    # once any turn has run since. Read **only** to word the resume: a slept
+    # workspace comes back silently, a crashed one announces itself (#464).
+    # Whether to resume is still decided by "is the pane alive?" alone.
+    slept_at: str | None = None
 
 
 class SessionRepository:
@@ -92,6 +97,12 @@ class SessionRepository:
                      model = COALESCE(excluded.model, sessions.model),
                      origin = COALESCE(excluded.origin, sessions.origin),
                      summary = COALESCE(excluded.summary, sessions.summary),
+                     -- A turn is starting, so this workspace is awake by
+                     -- definition. Clearing it here rather than at each call
+                     -- site means no turn path (scheduler, skill, webhook) can
+                     -- forget to, and it can only ever be cleared — never set —
+                     -- so it cannot contradict `set_slept` (#572).
+                     slept_at = NULL,
                      last_used_at = datetime('now', 'localtime')""",
                 (thread_id, session_id, working_dir, model, origin, summary),
             )
@@ -234,6 +245,35 @@ class SessionRepository:
                 await db.execute(
                     "UPDATE sessions SET closed_at = NULL, closed_reason = NULL "
                     "WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            await db.commit()
+
+    async def set_slept(self, thread_id: int, slept: bool) -> None:
+        """Record (or clear) the 4-hour sleep for this workspace (#572).
+
+        Sleep stops the workspace's Claude and nothing else — no ``closed_at``,
+        no rename, no notice — because the whole point is that the user does not
+        notice. That leaves the next message facing a dead pane, which is
+        indistinguishable from a crash; and a crash *must* be announced,
+        otherwise the resumed turn re-emits the prior output and reads as the bot
+        replaying garbage (#464). This column is what tells the two apart.
+
+        It words the resume and nothing else. Whether to resume at all is still
+        decided by "is the pane alive?", exactly as before, so a stale value here
+        can never resume (or refuse to resume) anything — the same discipline as
+        ``closed_reason``.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if slept:
+                await db.execute(
+                    "UPDATE sessions SET slept_at = datetime('now', 'localtime') "
+                    "WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sessions SET slept_at = NULL WHERE thread_id = ?",
                     (thread_id,),
                 )
             await db.commit()
