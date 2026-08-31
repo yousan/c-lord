@@ -96,6 +96,16 @@ class WorkspaceReason(Enum):
     MANUAL = "manual"
     IDLE = "idle"
 
+    #: #576: the resident-workspace cap evicted this one, longest-idle first.
+    #: A separate reason because a capped eviction is **not** an idle timeout —
+    #: it can take a workspace used ten minutes ago, and saying 「4時間 操作が
+    #: 無かったため」 about that is simply false.
+    CAP = "cap"
+
+    #: #576: the emergency brake fired because the host was nearly out of
+    #: memory. Neither "you were idle" nor "we hit the cap"; say what happened.
+    PRESSURE = "pressure"
+
 
 _TITLES = {
     WorkspaceAction.SLEEP: f"💤 {_SUBJECT}をスリープしました",
@@ -117,6 +127,18 @@ _NEXT_STEP = {
     ),
     WorkspaceAction.DELETE: ("▶️ このスレッドに投稿すれば、リポジトリを取り直して再開します。"),
 }
+
+#: The explanatory line for a cap eviction. ``idle_label`` carries the limit
+#: ("30本"), not a span of time.
+_CAP_LINE = (
+    "常駐ワークスペースが上限（{span}）に達したため、"
+    "いちばん長く使われていないものからスリープしました。"
+)
+
+#: The explanatory line for the emergency brake.
+_PRESSURE_LINE = (
+    "ホストのメモリが逼迫したため、いちばん長く使われていないものからスリープしました。"
+)
 
 _IDLE_PREFIX = {
     WorkspaceAction.SLEEP: "操作が無かったためスリープしました。",
@@ -170,8 +192,9 @@ def workspace_notice_embed(
 ) -> discord.Embed:
     """Build the notice for *action*.
 
-    ``idle_label`` is the human span that elapsed ("4時間" / "7日間" / "90日間");
-    it is only read when *reason* is :attr:`WorkspaceReason.IDLE`.
+    ``idle_label`` is the human span that elapsed ("4時間" / "7日間" / "90日間")
+    for :attr:`WorkspaceReason.IDLE`, and the configured limit ("30本") for
+    :attr:`WorkspaceReason.CAP`. It is unread for the other reasons.
 
     ``containers`` is what :mod:`c_lord.devenv` discovered. An empty list is not
     the same as "docker is irrelevant" — it is reported as なし so the inventory
@@ -196,6 +219,10 @@ def workspace_notice_embed(
     if reason is WorkspaceReason.IDLE:
         span = idle_label or "しばらく"
         lines.append(f"💤 **{span} {_IDLE_PREFIX[action]}**")
+    elif reason is WorkspaceReason.CAP:
+        lines.append("💤 **" + _CAP_LINE.format(span=idle_label or "設定値") + "**")
+    elif reason is WorkspaceReason.PRESSURE:
+        lines.append(f"💤 **{_PRESSURE_LINE}**")
     lines.append(_NEXT_STEP[action])
 
     embed = discord.Embed(

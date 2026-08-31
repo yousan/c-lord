@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import aiosqlite
 
@@ -57,6 +57,25 @@ class SessionRecord:
     slept_at: str | None = None
 
 
+def _record(row) -> SessionRecord:
+    """Build a :class:`SessionRecord` from a ``SELECT *`` row.
+
+    Columns the dataclass does not know about are **dropped** rather than passed
+    through. Migrations here only ever add columns, so a database is always at or
+    ahead of the code that opens it — and a bot running yesterday's code against
+    a database today's code migrated used to die on every single read with
+    ``TypeError: unexpected keyword argument``. That is not a hypothetical: it is
+    what a staging clone does the moment it is switched back to ``main`` after
+    verifying a branch that added a column (#576, observed 2026-08-31 with
+    ``slept_at``), and it is what a rollback of a release would do in production.
+
+    Dropping unknown columns makes the older code simply not see the new field,
+    which is exactly what it did before the column existed.
+    """
+    known = {f.name for f in fields(SessionRecord)}
+    return SessionRecord(**{k: v for k, v in dict(row).items() if k in known})
+
+
 class SessionRepository:
     """CRUD operations for session records."""
 
@@ -74,7 +93,7 @@ class SessionRepository:
             row = await cursor.fetchone()
             if row is None:
                 return None
-            return SessionRecord(**dict(row))
+            return _record(row)
 
     async def save(
         self,
@@ -126,7 +145,7 @@ class SessionRepository:
                 (limit,),
             )
             rows = await cursor.fetchall()
-            return [SessionRecord(**dict(row)) for row in rows]
+            return [_record(row) for row in rows]
 
     async def delete(self, thread_id: int) -> bool:
         """Delete a session mapping. Returns True if a row was deleted."""
@@ -327,7 +346,7 @@ class SessionRepository:
                 "SELECT * FROM sessions WHERE state = 'alive' ORDER BY last_used_at DESC"
             )
             rows = await cursor.fetchall()
-            return [SessionRecord(**dict(row)) for row in rows]
+            return [_record(row) for row in rows]
 
     async def all_working_dirs(self) -> set[str]:
         """Every ``working_dir`` any row still claims — closed rows included.
@@ -362,7 +381,7 @@ class SessionRepository:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
-            doomed = [SessionRecord(**dict(row)) for row in await cursor.fetchall()]
+            doomed = [_record(row) for row in await cursor.fetchall()]
             if not doomed:
                 return []
             await db.execute("DELETE FROM sessions" + where, (days,))

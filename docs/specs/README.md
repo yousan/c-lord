@@ -23,6 +23,7 @@
 | [session-close.md](./session-close.md) | セッションの終了と再開 | `/close-workspace` はスレッド名を `[終了] …` にし、以後の投稿は実行せず再開ボタン付きの案内を出す（落ちただけのペインの自動復元とは別物） |
 | [workspace-vocabulary.md](./workspace-vocabulary.md) | ワークスペースの用語と3操作 | スリープ ⊂ 停止 ⊂ 削除。通知は毎回「止まったもの」と「まだ残っているもの」を並べる棚卸し |
 | [workspace-sleep.md](./workspace-sleep.md) | スリープ（4時間） | 4時間 無操作で claude だけ止まる。docker は止めない。次の投稿で無言復元し、手動コマンドは無い |
+| [resident-cap.md](./resident-cap.md) | 常駐ワークスペース数の上限 | TTL のバックストップ。上限は MemTotal から自動算出し、超えたら LRU でスリープ。新規は待たせない／緊急ブレーキは上げる方向に動かない |
 | [session-resume.md](./session-resume.md) | 止まったセッションの復元案内 | 「送れば復元します」と言うのは本当に復元できるときだけ。復元できないスレッドの投稿も黙って捨てず、理由と次の一手を出す |
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |

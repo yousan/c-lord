@@ -42,6 +42,10 @@ MUST_BE_WIRED = [
     # ``test_the_cog_really_has_the_method_the_loop_looks_up`` が実物の
     # SessionManageCog に対して確かめる。
     ("IdleSleepLoop", "idle_sleep.py"),
+    # #576: 常駐ワークスペース数の上限（暴走時のバックストップ）
+    ("ResidentCapLoop", "resident_cap.py"),
+    # #576: 常駐数の数え方。これが呼ばれなければ上限は何も見ていない
+    ("resident_thread_ids", "tmux.py"),
     # #613: 行を失った作業ディレクトリの回収
     ("OrphanSweepLoop", "orphan_dirs.py"),
     # #612: #573 で配線を忘れた2つ
