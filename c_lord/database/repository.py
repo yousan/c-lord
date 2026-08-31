@@ -289,6 +289,21 @@ class SessionRepository:
             rows = await cursor.fetchall()
             return [SessionRecord(**dict(row)) for row in rows]
 
+    async def all_working_dirs(self) -> set[str]:
+        """Every ``working_dir`` any row still claims — closed rows included.
+
+        The orphan sweep (#613) decides what to delete by *absence* from this
+        set, so it must err towards listing too much. A stopped workspace is
+        still someone's checkout; filtering by state here would hand it to the
+        sweep as an orphan.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL"
+            )
+            rows = await cursor.fetchall()
+            return {row[0] for row in rows if row[0]}
+
     async def cleanup_old(self, days: int = 30) -> list[SessionRecord]:
         """Delete sessions unused for N days. Returns the rows that were deleted.
 

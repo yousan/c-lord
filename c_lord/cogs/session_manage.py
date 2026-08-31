@@ -161,10 +161,16 @@ class SessionManageCog(commands.Cog):
         repo: SessionRepository,
         settings_repo: SettingsRepository | None = None,
         runner: object | None = None,
+        devenv_repo: object | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.settings_repo = settings_repo
+        # #612: where the docker↔workspace link is written down. Optional so
+        # consumers constructing the cog themselves keep working, but the
+        # standard setup always passes it — without a call site, #573's
+        # persistence layer was dead code and its table was never created.
+        self._devenv_repo = devenv_repo
         # Optional ClaudeConfig reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
@@ -1301,6 +1307,17 @@ class SessionManageCog(commands.Cog):
                 containers = await containers_for_session_dir(
                     str(Path(sdm.base_dir) / str(thread_id))
                 )
+
+        # #612: write the link down *before* stopping. This is the last moment
+        # anything knows these containers belong to this thread — after the
+        # workspace goes, only this row can answer "who is holding port 55322?".
+        if self._devenv_repo is not None:
+            with contextlib.suppress(Exception):
+                sdm = await self._resolve_session_dir_manager(parent_channel_id)
+                if sdm is not None:
+                    await self._devenv_repo.record(  # type: ignore[attr-defined]
+                        thread_id, str(Path(sdm.base_dir) / str(thread_id)), containers
+                    )
 
         docker_outcome = DockerOutcome.NONE
         if containers:
