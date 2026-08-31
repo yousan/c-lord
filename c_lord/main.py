@@ -16,6 +16,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
+from .session_cleanup import DirOutcome, remove_clean_session_dir, sweep_days
 from .setup import setup_bridge
 from .utils.logger import setup_logging
 
@@ -320,7 +321,25 @@ async def main(env_path: Path | None = None) -> None:
         # here, before the connection, so it cannot race TranscriptMirrorCog's
         # on_ready walk of the same table; the cog posts the notices once the bot
         # is connected. It logs the thread ids, so the count line is gone.
-        deleted = await components.session_repo.cleanup_old(days=SESSION_CLEANUP_DAYS)
+        # #575: the period follows Claude Code's own transcript retention
+        # (cleanupPeriodDays) rather than a constant c-lord chose. Once Claude
+        # has forgotten the conversation, the checkout that existed to serve it
+        # has nothing left to serve — and keeping the two in step closes the
+        # window that produced 118 GB of stranded directories.
+        sweep_days_value = sweep_days()
+        deleted = await components.session_repo.cleanup_old(days=sweep_days_value)
+
+        # Deleting the row alone strands the directory: the row is the only
+        # handle tying a Discord thread to its working copy. Clean checkouts go
+        # with it; anything with uncommitted or untracked work is kept (#575).
+        for record in deleted:
+            outcome = await asyncio.to_thread(remove_clean_session_dir, record)
+            if outcome is DirOutcome.KEPT_DIRTY:
+                logger.info(
+                    "Session cleanup: kept %s (uncommitted work) thread=%s",
+                    record.working_dir,
+                    record.thread_id,
+                )
         cleanup_cog = bot.get_cog("SessionCleanupCog")
         if cleanup_cog is not None:
             cleanup_cog.announce(deleted)  # type: ignore[attr-defined]
@@ -328,7 +347,7 @@ async def main(env_path: Path | None = None) -> None:
             logger.info(
                 "Cleaned up %d session(s) unused for %d+ days: threads=%s (no notice cog)",
                 len(deleted),
-                SESSION_CLEANUP_DAYS,
+                sweep_days_value,
                 [r.thread_id for r in deleted],
             )
 
