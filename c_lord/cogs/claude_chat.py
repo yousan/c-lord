@@ -167,6 +167,33 @@ def _notify_target(requester: object, bot: object, *, kind: Kind) -> int | None:
     return owner_notify_id(bot, kind=kind)
 
 
+async def _safe_set_state(
+    dashboard: ThreadStatusDashboard,
+    thread_id: int,
+    state: ThreadState,
+    description: str,
+    **kwargs: object,
+) -> None:
+    """Update the dashboard, never letting its failure take the turn down (#632).
+
+    The dashboard embed is decoration: a closed aiohttp session, a revoked
+    permission or a Discord outage must not stop Claude from running or from
+    answering. Before #632 the PROCESSING update was the one un-guarded Discord
+    call on the turn path, so any of those killed the task before
+    ``run_claude_with_config`` was reached and the user's message vanished with
+    no reply, no ❌, nothing. Swallowed — but logged at WARNING, never silently.
+    """
+    try:
+        await dashboard.set_state(thread_id, state, description, **kwargs)  # type: ignore[arg-type]
+    except Exception:
+        logger.warning(
+            "%s dashboard set_state(%s) failed; continuing the turn",
+            log_ctx(thread_id=thread_id),
+            state.value,
+            exc_info=True,
+        )
+
+
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
 
@@ -2529,10 +2556,12 @@ class ClaudeChatCog(commands.Cog):
             return
 
         if self._semaphore.locked():
-            await thread.send(
-                f"\u23f3 Waiting for a free session slot... "
-                f"({self._max_concurrent} max sessions running)"
-            )
+            # #632: a courtesy notice — never a reason to drop the turn.
+            with contextlib.suppress(Exception):
+                await thread.send(
+                    f"\u23f3 Waiting for a free session slot... "
+                    f"({self._max_concurrent} max sessions running)"
+                )
 
         async with self._semaphore:
             # #565: distinguishes "waiting for a slot" from "never got here".
@@ -2556,9 +2585,12 @@ class ClaudeChatCog(commands.Cog):
             # view owned by the state-sync poll (its is_processing guard still
             # promotes waiting→running within ≤60s).
 
-            # Mark thread as PROCESSING when Claude starts
+            # Mark thread as PROCESSING when Claude starts. #632: through
+            # _safe_set_state — a failed embed refresh is decoration failing,
+            # and it must never be the reason a turn never happened.
             if dashboard is not None:
-                await dashboard.set_state(
+                await _safe_set_state(
+                    dashboard,
                     thread.id,
                     ThreadState.PROCESSING,
                     description,
@@ -2671,14 +2703,21 @@ class ClaudeChatCog(commands.Cog):
                 await self.repo.update_trigger_message(thread.id, user_message.id)
 
             stop_view = StopView(runner, authorizer=self._authorizer)
-            if window_name:
-                stop_msg = await thread.send(
-                    f"-# ⏺ Session running (`{window_name}`)",
-                    view=stop_view,
+            # #632: the Stop-button notice is decoration too. If Discord refuses
+            # it (rate limit, revoked permission, closed session) the turn must
+            # still run — StopView already treats a missing message as "nothing
+            # to delete", so the only thing lost is the button.
+            notice = (
+                f"-# ⏺ Session running (`{window_name}`)" if window_name else "-# ⏺ Session running"
+            )
+            try:
+                stop_view.set_message(await thread.send(notice, view=stop_view))
+            except Exception:
+                logger.warning(
+                    "%s could not post the Stop-button notice; continuing the turn",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
                 )
-            else:
-                stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
-            stop_view.set_message(stop_msg)
 
             # #562: kept in a variable so the turn-end ping below can read the
             # run's outcome — a turn that produced nothing must not be announced
@@ -2732,20 +2771,22 @@ class ClaudeChatCog(commands.Cog):
                 # poll (is_processing() is already False after the pop above).
 
                 if dashboard is not None:
-                    with contextlib.suppress(Exception):
-                        await dashboard.set_state(
-                            thread.id,
-                            ThreadState.WAITING_INPUT,
-                            description,
-                            thread=thread,
-                            # #481: ping the requester of THIS turn, not a
-                            # fixed owner — so completion reaches whoever is
-                            # waiting (any guild / any authorized user, owner or
-                            # not). #520: bot-seeded turns fall back to owner,
-                            # #525: and only when the deployment asked for it.
-                            notify_user_id=completion_notify_id,
-                            # #562: say what happened. "終わりました" is a summons;
-                            # when nothing was produced it is a lie, and a
-                            # notification that lies stops being worth reading.
-                            no_response=run_config.outcome.no_response,
-                        )
+                    # #632: same guard as the PROCESSING update above, but this
+                    # one logs instead of suppressing silently.
+                    await _safe_set_state(
+                        dashboard,
+                        thread.id,
+                        ThreadState.WAITING_INPUT,
+                        description,
+                        thread=thread,
+                        # #481: ping the requester of THIS turn, not a
+                        # fixed owner — so completion reaches whoever is
+                        # waiting (any guild / any authorized user, owner or
+                        # not). #520: bot-seeded turns fall back to owner,
+                        # #525: and only when the deployment asked for it.
+                        notify_user_id=completion_notify_id,
+                        # #562: say what happened. "終わりました" is a summons;
+                        # when nothing was produced it is a lie, and a
+                        # notification that lies stops being worth reading.
+                        no_response=run_config.outcome.no_response,
+                    )
