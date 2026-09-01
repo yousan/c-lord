@@ -38,6 +38,19 @@ class FakeTmux:
         self.thread_ids = thread_ids or {}
         self.pane_commands = pane_commands or {}
         self.killed: list[str] = []
+        # #649: tmux targets are ``window_id``s now. Test data stays keyed by the
+        # readable ``session:name``; this gives every window a stable id and
+        # resolves either form back to that key.
+        self._ids: dict[str, str] = {}
+        n = 0
+        for session, names in self.windows.items():
+            for name in names:
+                n += 1
+                self._ids[f"@{n}"] = f"{session}:{name}"
+
+    def _key(self, target: str) -> str:
+        """``@3`` or ``session:name`` → the ``session:name`` key of the test data."""
+        return self._ids.get(target, target)
 
     def __call__(self, argv: list[str], **kwargs: object) -> MagicMock:
         if "list-sessions" in argv:
@@ -45,31 +58,34 @@ class FakeTmux:
 
         if "list-windows" in argv:
             session = argv[argv.index("-t") + 1]
-            names = self.windows.get(session, [])
-            fmt = argv[-1]
-            # tmux.py uses three different -F formats here: colon-separated in
-            # list_sessions, tab-separated in _rebuild_mapping, bare name in
-            # remap_window. Emit whichever the caller asked for.
-            if "pane_current_path" not in fmt:
-                body = "".join(f"{n}\n" for n in names)
-            else:
-                sep = "\t" if "\t" in fmt else ":"
-                body = "".join(f"{n}{sep}/work/{n}\n" for n in names)
+            fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+            body = ""
+            for name in self.windows.get(session, []):
+                key = f"{session}:{name}"
+                wid = next((i for i, k in self._ids.items() if k == key), "")
+                row = fmt
+                for token, value in (
+                    ("#{window_id}", wid),
+                    ("#{window_name}", name),
+                    ("#{@thread_id}", self.thread_ids.get(key, "")),
+                    ("#{pane_current_path}", f"/work/{name}"),
+                ):
+                    row = row.replace(token, value)
+                body += row + "\n"
             return MagicMock(returncode=0, stdout=body)
 
         if "show-option" in argv:
-            target = argv[argv.index("-t") + 1]
-            tid = self.thread_ids.get(target)
+            tid = self.thread_ids.get(self._key(argv[argv.index("-t") + 1]))
             if tid is None:
                 return MagicMock(returncode=1, stdout="")
             return MagicMock(returncode=0, stdout=f"{tid}\n")
 
         if "list-panes" in argv:
-            target = argv[argv.index("-t") + 1]
-            return MagicMock(returncode=0, stdout=self.pane_commands.get(target, "zsh") + "\n")
+            key = self._key(argv[argv.index("-t") + 1])
+            return MagicMock(returncode=0, stdout=self.pane_commands.get(key, "zsh") + "\n")
 
         if "kill-window" in argv:
-            self.killed.append(argv[argv.index("-t") + 1])
+            self.killed.append(self._key(argv[argv.index("-t") + 1]))
             return MagicMock(returncode=0, stdout="")
 
         return MagicMock(returncode=0, stdout="")

@@ -470,7 +470,7 @@ class TestTmuxScreenshot:
 
         tmux_mgr = MagicMock()
         tmux_mgr.session_name = "c-lord"
-        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.window_name = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="\x1b[31mhi\x1b[0m")
         tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
@@ -503,7 +503,7 @@ class TestTmuxScreenshot:
         thread.parent_id = 456
 
         tmux_mgr = MagicMock()
-        tmux_mgr._find_window_for_thread = MagicMock(return_value=None)
+        tmux_mgr.window_name = MagicMock(return_value=None)
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
 
         respond, ack, sent = _capture_responder()
@@ -522,7 +522,7 @@ class TestTmuxScreenshot:
         thread.parent_id = 456
 
         tmux_mgr = MagicMock()
-        tmux_mgr._find_window_for_thread = MagicMock(return_value=None)
+        tmux_mgr.window_name = MagicMock(return_value=None)
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
 
         respond, ack, sent = _capture_responder()
@@ -542,7 +542,7 @@ class TestTmuxScreenshot:
 
         tmux_mgr = MagicMock()
         tmux_mgr.session_name = "c-lord"
-        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.window_name = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="hi")
         tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
@@ -577,7 +577,7 @@ class TestScreenshotWakesStoppedWorkspace:
         """A manager whose window is missing until the workspace is woken."""
         tmux_mgr = MagicMock()
         tmux_mgr.session_name = "c-lord"
-        tmux_mgr._find_window_for_thread = MagicMock(side_effect=[None, window_after_wake])
+        tmux_mgr.window_name = MagicMock(side_effect=[None, window_after_wake])
         tmux_mgr.capture_screen = MagicMock(return_value="restored pane")
         tmux_mgr.list_window_tabs = MagicMock(return_value=[(3, "work3", True)])
         return tmux_mgr
@@ -623,7 +623,7 @@ class TestScreenshotWakesStoppedWorkspace:
         thread = self._thread()
         tmux_mgr = MagicMock()
         tmux_mgr.session_name = "c-lord"
-        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.window_name = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="live pane")
         tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
