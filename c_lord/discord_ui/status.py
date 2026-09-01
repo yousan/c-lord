@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable
 
 import discord
 
@@ -54,18 +53,12 @@ class StatusManager:
     current reaction.
     """
 
-    def __init__(
-        self,
-        message: discord.Message,
-        on_hard_stall: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
+    def __init__(self, message: discord.Message) -> None:
         self._message = message
         self._current_emoji: str | None = None
         self._stall_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._last_activity = asyncio.get_running_loop().time()
-        self._on_hard_stall = on_hard_stall
-        self._hard_stall_notified = False
 
     async def set_running(self) -> None:
         """🟢 — Claude is actively working (turn start)."""
@@ -140,7 +133,6 @@ class StatusManager:
     def _reset_stall_timer(self) -> None:
         """Reset the stall timer (activity detected)."""
         self._last_activity = asyncio.get_running_loop().time()
-        self._hard_stall_notified = False
 
     def _cancel_stall_timer(self) -> None:
         """Cancel the stall timer."""
@@ -155,11 +147,11 @@ class StatusManager:
             elapsed = asyncio.get_running_loop().time() - self._last_activity
 
             if elapsed >= STALL_HARD_SECONDS and self._current_emoji != EMOJI_STALL_HARD:
+                # #473: the ⚠️ lamp is the *only* thing a hard stall shows.
+                # It used to also post a prose line into the thread saying the
+                # same thing — a warning for what is a normal long think, and
+                # repeatable several times in one turn.
                 await self._set_reaction(EMOJI_STALL_HARD)
-                if self._on_hard_stall and not self._hard_stall_notified:
-                    self._hard_stall_notified = True
-                    with contextlib.suppress(Exception):
-                        await self._on_hard_stall()
             elif (
                 elapsed >= STALL_SOFT_SECONDS
                 and not soft_warned
