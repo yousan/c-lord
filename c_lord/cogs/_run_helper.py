@@ -29,12 +29,18 @@ from ..claude.context_usage import (
     read_latest_usage,
 )
 from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX, TmuxClaudeRunner
+from ..claude.types import UsageLimit
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
     bridge_pane_ask,
     collect_ask_answers,
 )
-from ..discord_ui.embeds import error_embed, no_response_embed, timeout_embed
+from ..discord_ui.embeds import (
+    error_embed,
+    no_response_embed,
+    timeout_embed,
+    usage_limit_embed,
+)
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
@@ -72,8 +78,13 @@ _cli_version: str | None = None
 _cli_version_fetched: bool = False
 
 
-def _make_error_embed(error: str) -> discord.Embed:
+def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> discord.Embed:
     """Pick the embed that matches what actually went wrong."""
+    # #631: a rate limit is checked first — it is the one empty-turn outcome
+    # whose cause is known, and the embeds below would all tell the reader to
+    # retry something that cannot succeed until the limit resets.
+    if usage_limit is not None:
+        return usage_limit_embed(usage_limit)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))

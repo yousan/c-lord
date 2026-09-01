@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import discord
 
-from ..claude.types import AskOption, TodoItem, ToolCategory, ToolUseEvent
+from ..claude.types import AskOption, TodoItem, ToolCategory, ToolUseEvent, UsageLimit
 
 # Colors
 COLOR_INFO = 0x5865F2  # Discord blurple
@@ -234,6 +234,41 @@ def no_response_embed(detail: str) -> discord.Embed:
             "\u2022 同じ内容をもう一度送る\n"
             "\u2022 `/clord-attach` (または tmux) でペインを直接見る\n"
             "\u2022 ホストが混んでいると Claude の起動が遅れることがあります"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
+def usage_limit_embed(limit: UsageLimit) -> discord.Embed:
+    """Embed for a turn Claude refused because the account is rate limited (#631).
+
+    Deliberately different from :func:`no_response_embed`: that one's advice is
+    "send it again", which is exactly the advice that cannot work here. The
+    reporter of #631 sent the same request three times on that advice. So this
+    embed leads with the recovery time and offers only things that can actually
+    change the outcome.
+
+    ``resets_at`` is echoed verbatim as Claude Code printed it (already
+    localised, e.g. "Aug 29, 4pm (Asia/Tokyo)") rather than re-derived — being
+    confidently wrong about the one fact the reader came for is worse than
+    quoting.
+    """
+    when = (
+        f"**{limit.resets_at}** に回復します。"
+        if limit.resets_at
+        else "回復時刻は報告されませんでした。"
+    )
+    return discord.Embed(
+        title="\u23f3 Claude の利用上限に達しました",
+        description=(
+            f"Claude が **{limit.scope}** に達したため、このターンは実行されていません。\n"
+            f"{when}\n\n"
+            "**回復するまでは、同じ内容を送り直しても同じ結果になります。**\n\n"
+            "**できること:**\n"
+            "\u2022 回復時刻まで待つ\n"
+            "\u2022 `/model` で上限に余裕のあるモデルに切り替える"
+            "（Opus/Sonnet は上限枠が別）\n"
+            "\u2022 `/clord-attach` (または tmux) でペインの表示を直接確認する"
         ),
         color=COLOR_ERROR,
     )

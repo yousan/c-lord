@@ -2713,4 +2713,8 @@ class ClaudeChatCog(commands.Cog):
                             # when nothing was produced it is a lie, and a
                             # notification that lies stops being worth reading.
                             no_response=run_config.outcome.no_response,
+                            # #631: and when it was a plan limit, say so
+                            # with the reset time instead of asking for a
+                            # resend that cannot work yet.
+                            usage_limit=run_config.outcome.usage_limit,
                         )
