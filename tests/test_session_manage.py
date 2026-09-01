@@ -58,169 +58,6 @@ def _make_cog():
     return SessionManageCog(bot=bot, repo=repo)
 
 
-class TestResumeInfo:
-    async def test_outside_thread_sends_ephemeral(self):
-        cog = _make_cog()
-        interaction = _make_channel_interaction()
-        await cog.resume_info.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        assert call_args.kwargs.get("ephemeral") is True
-
-    async def test_no_session_sends_ephemeral(self):
-        cog = _make_cog()
-        cog.repo.get = AsyncMock(return_value=None)
-        interaction = _make_thread_interaction(thread_id=555)
-        await cog.resume_info.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        assert call_args.kwargs.get("ephemeral") is True
-
-    async def test_shows_resume_command(self):
-        cog = _make_cog()
-        record = _make_record(thread_id=555, session_id="def-456")
-        cog.repo.get = AsyncMock(return_value=record)
-        interaction = _make_thread_interaction(thread_id=555)
-        await cog.resume_info.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        # Should contain an embed with the resume command
-        embed = call_args.kwargs.get("embed")
-        assert embed is not None
-        assert "def-456" in embed.description
-
-
-class TestSessionsList:
-    async def test_empty_sessions(self):
-        cog = _make_cog()
-        cog.repo.list_all = AsyncMock(return_value=[])
-        interaction = _make_channel_interaction()
-        await cog.sessions_list.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        # Should send something indicating no sessions
-        embed = call_args.kwargs.get("embed")
-        assert embed is not None
-
-    async def test_shows_sessions(self):
-        cog = _make_cog()
-        records = [
-            _make_record(thread_id=100, session_id="aaa", origin="discord", summary="First task"),
-            _make_record(thread_id=101, session_id="bbb", origin="cli", summary="CLI task"),
-        ]
-        cog.repo.list_all = AsyncMock(return_value=records)
-        interaction = _make_channel_interaction()
-        await cog.sessions_list.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        embed = call_args.kwargs.get("embed")
-        assert embed is not None
-        assert len(embed.fields) == 2
-
-    async def test_session_origin_icons(self):
-        cog = _make_cog()
-        records = [
-            _make_record(session_id="d1", origin="discord", summary="Discord session"),
-            _make_record(session_id="c1", origin="cli", summary="CLI session", thread_id=101),
-        ]
-        cog.repo.list_all = AsyncMock(return_value=records)
-        interaction = _make_channel_interaction()
-        await cog.sessions_list.callback(cog, interaction)
-        embed = interaction.response.send_message.call_args.kwargs["embed"]
-        # Discord sessions show 💬, CLI sessions show 🖥️
-        assert "\U0001f4ac" in embed.fields[0].name  # 💬
-        assert "\U0001f5a5" in embed.fields[1].name  # 🖥️
-
-    async def test_tmux_session_shows_window_name(self):
-        """tmux sessions should display window name (e.g. work3) instead of tmux-147..."""
-        cog = _make_cog()
-        records = [
-            _make_record(
-                thread_id=200,
-                session_id="tmux-200",
-                origin="discord",
-                summary="Tmux task",
-            ),
-        ]
-        cog.repo.list_all = AsyncMock(return_value=records)
-
-        # Mock tmux manager to return window name mapping
-        tmux_mgr = MagicMock()
-        tmux_mgr._thread_to_window = {200: "work3"}
-        tmux_mgr._rebuild_mapping = MagicMock()
-        cog._resolve_all_tmux_managers = AsyncMock(return_value=[tmux_mgr])
-
-        interaction = _make_channel_interaction()
-        await cog.sessions_list.callback(cog, interaction)
-        embed = interaction.response.send_message.call_args.kwargs["embed"]
-        assert len(embed.fields) == 1
-        # Should show window name, not tmux-200
-        assert "work3" in embed.fields[0].value
-        assert "tmux-200" not in embed.fields[0].value
-
-    async def test_tmux_session_no_window_shows_tmux(self):
-        """tmux sessions with no live window should show 'tmux'."""
-        cog = _make_cog()
-        records = [
-            _make_record(
-                thread_id=200,
-                session_id="tmux-200",
-                origin="discord",
-                summary="Tmux task",
-            ),
-        ]
-        cog.repo.list_all = AsyncMock(return_value=records)
-
-        # No tmux managers available
-        cog._resolve_all_tmux_managers = AsyncMock(return_value=[])
-
-        interaction = _make_channel_interaction()
-        await cog.sessions_list.callback(cog, interaction)
-        embed = interaction.response.send_message.call_args.kwargs["embed"]
-        assert "`tmux`" in embed.fields[0].value
-
-    async def test_cli_session_shows_short_id(self):
-        """Non-tmux sessions should display truncated session ID as before."""
-        cog = _make_cog()
-        records = [
-            _make_record(session_id="abcdef12-3456-7890", origin="discord", summary="CLI task"),
-        ]
-        cog.repo.list_all = AsyncMock(return_value=records)
-        interaction = _make_channel_interaction()
-        await cog.sessions_list.callback(cog, interaction)
-        embed = interaction.response.send_message.call_args.kwargs["embed"]
-        assert "`abcdef12...`" in embed.fields[0].value
-
-
-class TestResumeInfoTmux:
-    """Tests for /resume-info with tmux sessions."""
-
-    async def test_tmux_session_shows_tmux_attach(self):
-        """tmux sessions should show tmux attach command, not claude --resume."""
-        cog = _make_cog()
-        record = _make_record(
-            thread_id=555,
-            session_id="tmux-1477909096400294011",
-        )
-        cog.repo.get = AsyncMock(return_value=record)
-        interaction = _make_thread_interaction(thread_id=555)
-        await cog.resume_info.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        embed = call_args.kwargs.get("embed")
-        assert embed is not None
-        # Should NOT contain claude --resume for tmux sessions
-        assert "claude --resume" not in embed.description
-        # Should contain tmux attach guidance
-        assert "tmux" in embed.description
-
-    async def test_cli_session_shows_claude_resume(self):
-        """Non-tmux sessions should still show claude --resume."""
-        cog = _make_cog()
-        record = _make_record(thread_id=555, session_id="def-456")
-        cog.repo.get = AsyncMock(return_value=record)
-        interaction = _make_thread_interaction(thread_id=555)
-        await cog.resume_info.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        embed = call_args.kwargs.get("embed")
-        assert embed is not None
-        assert "claude --resume def-456" in embed.description
-
-
 def _make_ctx(channel: MagicMock | None = None) -> MagicMock:
     """Return a mocked commands.Context for the !text twins."""
     ctx = MagicMock()
@@ -250,42 +87,109 @@ class TestReadonlyTextTwins:
         ctx.send.assert_called_once()
         assert ctx.send.call_args.kwargs.get("embed") is not None
 
-    async def test_resume_info_text_outside_thread(self):
-        cog = _make_cog()
-        ctx = _make_ctx()  # not a thread
-        await cog.resume_info_text.callback(cog, ctx)
-        ctx.send.assert_called_once()
-        assert "thread" in ctx.send.call_args.args[0].lower()
-
-    async def test_resume_info_text_shows_command(self):
-        cog = _make_cog()
-        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=555, session_id="def-456"))
-        ctx = _make_thread_ctx(thread_id=555)
-        await cog.resume_info_text.callback(cog, ctx)
-        embed = ctx.send.call_args.kwargs.get("embed")
-        assert embed is not None
-        assert "def-456" in embed.description
-
-    async def test_sessions_text_empty(self):
-        cog = _make_cog()
-        cog.repo.list_all = AsyncMock(return_value=[])
-        ctx = _make_ctx()
-        await cog.sessions_list_text.callback(cog, ctx)
-        assert ctx.send.call_args.kwargs.get("embed") is not None
-
-    async def test_session_dirs_text_no_bindings(self):
-        cog = _make_cog()  # bot.get_cog returns a non-ChannelRepoCog mock → no bindings
-        ctx = _make_ctx()
-        await cog.session_dirs_list_text.callback(cog, ctx)
-        ctx.send.assert_called_once()
-        assert "clord-init" in ctx.send.call_args.args[0]
-
     async def test_tmux_list_text_no_bindings(self):
         cog = _make_cog()
         ctx = _make_ctx()
         await cog.tmux_list_text.callback(cog, ctx)
         ctx.send.assert_called_once()
         assert "clord-init" in ctx.send.call_args.args[0]
+
+
+def _sdir(thread_id: int, path: str = "/x"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        path=f"{path}/{thread_id}",
+        thread_id=thread_id,
+        source_repo="https://github.com/yousan/c-lord.git",
+        commit="abc1234",
+        is_clean=True,
+    )
+
+
+def _status_cog(*, dirs, windows, records, monkeypatch=None):
+    """A cog wired with mocked per-channel managers for /clord-status (#363).
+
+    #616: the window list now comes from ``thread_state_sync._list_all_windows``
+    (every tmux session, so a thread bound to another repo is still found), not
+    from one channel manager's ``list_sessions``. Callers that assert on rows
+    must pass ``monkeypatch`` so the sweep can be stubbed.
+    """
+    cog = _make_cog()
+    sdm = MagicMock()
+    sdm.find_session_dirs = MagicMock(return_value=dirs)
+    tmux = MagicMock()
+    tmux.session_name = "c-lord"
+    tmux.list_sessions = MagicMock(return_value=windows)
+    cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
+    cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
+    cog.repo.get = AsyncMock(side_effect=lambda tid: records.get(tid))
+    cog.repo.list_all = AsyncMock(return_value=list(records.values()))
+    if monkeypatch is not None:
+        import c_lord.thread_state_sync as _tss
+
+        stamped = [{"session_name": "c-lord", **w} for w in windows]
+        monkeypatch.setattr(_tss, "_list_all_windows", lambda: stamped)
+    return cog
+
+
+class TestClordStatus:
+    """/clord-status — per-channel session view that supersedes the old 3 (#363)."""
+
+    async def test_no_binding_guides_to_init_without_hanging(self):
+        cog = _make_cog()
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        ctx = _make_ctx()
+        ctx.channel.id = 777
+        await cog.clord_status_text.callback(cog, ctx, None)
+        ctx.send.assert_called_once()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+    async def test_lists_live_session(self, monkeypatch):
+        import c_lord.cogs.session_manage as sm
+
+        monkeypatch.setattr(sm, "_dir_size_bytes", lambda _p: 412_000_000)
+        cog = _status_cog(
+            dirs=[_sdir(100)],
+            windows=[{"window_name": "work1", "working_dir": "/x/100", "thread_id": "100"}],
+            records={100: _make_record(thread_id=100, session_id="tmux-x", summary="auth-bug")},
+            monkeypatch=monkeypatch,
+        )
+        ctx = _make_ctx()
+        ctx.channel.id = 777
+        ctx.channel.name = "dev-claude"
+        await cog.clord_status_text.callback(cog, ctx, None)
+        sent = ctx.send.call_args.args[0]
+        assert "c-lord status" in sent
+        assert "auth-bug" in sent
+        assert "1 active" in sent
+        # #616: the target is measured per row, not built from a template.
+        assert "c-lord:work1" in sent
+        assert "work<#>" not in sent
+
+    async def test_closed_session_hidden_by_default_shown_in_all(self, monkeypatch):
+        import c_lord.cogs.session_manage as sm
+
+        monkeypatch.setattr(sm, "_dir_size_bytes", lambda _p: 96_000_000)
+        # dir exists but no tmux window -> closed
+        records = {200: _make_record(thread_id=200, session_id="tmux-y", summary="old-refactor")}
+
+        cog = _status_cog(dirs=[_sdir(200)], windows=[], records=records, monkeypatch=monkeypatch)
+        ctx = _make_ctx()
+        ctx.channel.id = 777
+        await cog.clord_status_text.callback(cog, ctx, None)  # default
+        default_out = ctx.send.call_args.args[0]
+        assert "old-refactor" not in default_out  # hidden by default
+        assert "1 closed" in default_out  # but surfaced in the footer
+
+        cog2 = _status_cog(dirs=[_sdir(200)], windows=[], records=records, monkeypatch=monkeypatch)
+        ctx2 = _make_ctx()
+        ctx2.channel.id = 777
+        await cog2.clord_status_text.callback(cog2, ctx2, "all")  # !clord-status all
+        all_out = ctx2.send.call_args.args[0]
+        assert "old-refactor" in all_out
+        assert "closed" in all_out
 
 
 class TestModelSetTextTwin:
@@ -301,8 +205,8 @@ class TestModelSetTextTwin:
     async def test_invalid_model(self):
         cog = _make_cog()
         ctx = _make_ctx()
-        await cog.model_set_text.callback(cog, ctx, model="nope")
-        assert "Unknown model" in ctx.send.call_args.args[0]
+        await cog.model_set_text.callback(cog, ctx, model="no pe")  # space → malformed
+        assert "Invalid" in ctx.send.call_args.args[0]
 
     async def test_valid_model_persisted(self):
         cog = _make_cog()
@@ -395,8 +299,8 @@ class TestCloseWorkspace:
 
         await cog.close_workspace_text.callback(cog, ctx)
 
-        thread.edit.assert_called_once()
-        assert thread.edit.call_args.kwargs.get("archived") is True
+        # Two edits since #512: the "[終了]" rename, then the archive.
+        assert any(c.kwargs.get("archived") is True for c in thread.edit.call_args_list)
 
     async def test_close_stops_mirror_before_archiving(self):
         """#379: close-workspace MUST stop the TranscriptMirror before archiving.
@@ -422,10 +326,14 @@ class TestCloseWorkspace:
         thread.parent_id = 999
         thread.edit = AsyncMock()
 
-        # Record global call order across stop_for and the archive edit.
+        # Record global call order across stop_for and the thread edits.  Since
+        # #512 there are two edits (the "[終了]" rename, then the archive), so the
+        # invariant under test is the *position* of stop_for, not the edit count.
         order: list[str] = []
         mirror_cog.stop_for.side_effect = lambda *a, **k: order.append("stop_for")
-        thread.edit.side_effect = lambda *a, **k: order.append("edit")
+        thread.edit.side_effect = lambda *a, **k: order.append(
+            "archive" if k.get("archived") else "rename"
+        )
 
         ctx = _make_ctx(channel=thread)
         await cog.close_workspace_text.callback(cog, ctx)
@@ -435,7 +343,7 @@ class TestCloseWorkspace:
         # Stopped for this exact thread.
         mirror_cog.stop_for.assert_awaited_once_with(555)
         # And stopped BEFORE the archive, so no echo can land post-archive.
-        assert order == ["stop_for", "edit"]
+        assert order.index("stop_for") < order.index("archive")
 
     async def test_close_works_when_mirror_cog_absent(self):
         """#379 zero-config: no TranscriptMirrorCog (bridge OFF) → no crash, still archives."""
@@ -454,8 +362,7 @@ class TestCloseWorkspace:
 
         await cog.close_workspace_text.callback(cog, ctx)
 
-        thread.edit.assert_called_once()
-        assert thread.edit.call_args.kwargs.get("archived") is True
+        assert any(c.kwargs.get("archived") is True for c in thread.edit.call_args_list)
 
     async def test_workspace_delete_stops_mirror(self):
         """#379: workspace-delete also tears the mirror down so it doesn't tail a removed JSONL."""
@@ -532,40 +439,6 @@ class TestThreadArchiveCommand:
         assert ctx.send.call_args.kwargs.get("embed") is not None
 
 
-class TestHelperFunctions:
-    """Tests for _is_tmux_session and _format_session_short."""
-
-    def test_is_tmux_session_true(self):
-        from c_lord.cogs.session_manage import _is_tmux_session
-
-        assert _is_tmux_session("tmux-1477909096400294011") is True
-
-    def test_is_tmux_session_false(self):
-        from c_lord.cogs.session_manage import _is_tmux_session
-
-        assert _is_tmux_session("abcdef12-3456-7890") is False
-
-    def test_is_tmux_session_empty(self):
-        from c_lord.cogs.session_manage import _is_tmux_session
-
-        assert _is_tmux_session("") is False
-
-    def test_format_session_short_tmux_without_window(self):
-        from c_lord.cogs.session_manage import _format_session_short
-
-        assert _format_session_short("tmux-1477909096400294011") == "tmux"
-
-    def test_format_session_short_tmux_with_window(self):
-        from c_lord.cogs.session_manage import _format_session_short
-
-        assert _format_session_short("tmux-1477909096400294011", window_name="work3") == "work3"
-
-    def test_format_session_short_cli(self):
-        from c_lord.cogs.session_manage import _format_session_short
-
-        assert _format_session_short("abcdef12-3456-7890") == "abcdef12"
-
-
 def _capture_responder():
     """A (respond, ack, sent) triple that records every respond() call."""
     sent: list[dict] = []
@@ -597,7 +470,7 @@ class TestTmuxScreenshot:
 
         tmux_mgr = MagicMock()
         tmux_mgr.session_name = "c-lord"
-        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.window_name = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="\x1b[31mhi\x1b[0m")
         tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
@@ -630,7 +503,7 @@ class TestTmuxScreenshot:
         thread.parent_id = 456
 
         tmux_mgr = MagicMock()
-        tmux_mgr._find_window_for_thread = MagicMock(return_value=None)
+        tmux_mgr.window_name = MagicMock(return_value=None)
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
 
         respond, ack, sent = _capture_responder()
@@ -638,6 +511,26 @@ class TestTmuxScreenshot:
 
         assert sent and sent[-1]["ephemeral"] is True
         assert all(s["file"] is None for s in sent)
+
+    async def test_impl_no_window_gives_actionable_recovery_hint(self):
+        """#464 ②-2: a stopped session must not dead-end with a bare 'No tmux
+        window found for this thread.' — tell the user that sending a message
+        auto-restores it (the #270/#465 dead-pane recovery)."""
+        cog = _make_cog()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 123
+        thread.parent_id = 456
+
+        tmux_mgr = MagicMock()
+        tmux_mgr.window_name = MagicMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        msg = sent[-1]["content"] or ""
+        assert "復元" in msg or "メッセージを送" in msg, msg
+        assert msg != "ℹ️ No tmux window found for this thread."
 
     async def test_impl_render_unavailable_sends_ephemeral(self, monkeypatch):
         import c_lord.cogs.session_manage as sm
@@ -649,7 +542,7 @@ class TestTmuxScreenshot:
 
         tmux_mgr = MagicMock()
         tmux_mgr.session_name = "c-lord"
-        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.window_name = MagicMock(return_value="work1")
         tmux_mgr.capture_screen = MagicMock(return_value="hi")
         tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
@@ -662,3 +555,150 @@ class TestTmuxScreenshot:
         assert all(s["file"] is None for s in sent)
         # Hint at the optional extra so consumers know how to enable it.
         assert "c-lord[table]" in (sent[-1]["content"] or "")
+
+
+class TestScreenshotWakesStoppedWorkspace:
+    """#642: a stopped workspace is restored and *then* captured.
+
+    #572 made "stopped" the ordinary state of any thread nobody touched for four
+    hours, so answering `/tmux-screenshot` with 「メッセージを送れば復元します」
+    turned the command into one that usually returns no picture at all.
+    """
+
+    @staticmethod
+    def _thread(thread_id: int = 123):
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = 456
+        return thread
+
+    @staticmethod
+    def _stopped_tmux(window_after_wake: str | None = "work3"):
+        """A manager whose window is missing until the workspace is woken."""
+        tmux_mgr = MagicMock()
+        tmux_mgr.session_name = "c-lord"
+        tmux_mgr.window_name = MagicMock(side_effect=[None, window_after_wake])
+        tmux_mgr.capture_screen = MagicMock(return_value="restored pane")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(3, "work3", True)])
+        return tmux_mgr
+
+    def _cog_with_chat(self, wake_result: bool | None):
+        """Cog whose ClaudeChatCog exposes ``wake_workspace`` (None = no cog)."""
+        cog = _make_cog()
+        if wake_result is None:
+            cog.bot.get_cog = MagicMock(return_value=None)
+            return cog, None
+        chat = MagicMock()
+        chat.wake_workspace = AsyncMock(return_value=wake_result)
+        cog.bot.get_cog = MagicMock(return_value=chat)
+        return cog, chat
+
+    async def test_stopped_workspace_is_restored_then_captured(self, monkeypatch):
+        import c_lord.cogs.session_manage as sm
+
+        cog, chat = self._cog_with_chat(True)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        thread = self._thread()
+        tmux_mgr = self._stopped_tmux()
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        monkeypatch.setattr(sm, "render_pane_png", lambda text, status_bar=None: b"PNG")
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_awaited_once_with(thread)
+        files = [s["file"] for s in sent if s["file"] is not None]
+        assert len(files) == 1, sent
+        assert files[0].filename == "tmux-c-lord-work3.png"
+        # The user waited several seconds for a restore they did not ask for —
+        # say so rather than leaving the delay unexplained.
+        assert "復元" in (sent[-1]["content"] or "")
+
+    async def test_live_workspace_is_not_woken(self, monkeypatch):
+        """The wake is for stopped workspaces only — an awake one is captured
+        as-is, with no restart and no notice."""
+        import c_lord.cogs.session_manage as sm
+
+        cog, chat = self._cog_with_chat(True)
+        thread = self._thread()
+        tmux_mgr = MagicMock()
+        tmux_mgr.session_name = "c-lord"
+        tmux_mgr.window_name = MagicMock(return_value="work1")
+        tmux_mgr.capture_screen = MagicMock(return_value="live pane")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        monkeypatch.setattr(sm, "render_pane_png", lambda text, status_bar=None: b"PNG")
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_not_awaited()
+        assert "復元" not in (sent[-1]["content"] or "")
+
+    async def test_closed_workspace_is_not_woken(self):
+        """`[終了]` is a state the user chose. Taking a picture must not undo it."""
+        cog, chat = self._cog_with_chat(True)
+        record = _make_record(thread_id=123)
+        record.closed_at = "2026-08-31 10:00:00"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_not_awaited()
+        assert all(s["file"] is None for s in sent)
+        assert "再開する" in (sent[-1]["content"] or "")
+
+    async def test_untracked_thread_is_not_woken(self):
+        """No ``sessions`` row means there is no conversation to restore — the
+        same rule a plain message follows (#538)."""
+        cog, chat = self._cog_with_chat(True)
+        cog.repo.get = AsyncMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_not_awaited()
+        assert all(s["file"] is None for s in sent)
+        assert "記録が見つかりません" in (sent[-1]["content"] or "")
+
+    async def test_failed_wake_says_so(self):
+        """A restore that did not work must not be reported as one that did."""
+        cog, _chat = self._cog_with_chat(False)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        assert all(s["file"] is None for s in sent)
+        assert "復元" in (sent[-1]["content"] or "")
+        assert "失敗" in (sent[-1]["content"] or "")
+
+    async def test_window_still_missing_after_a_wake_says_so(self, monkeypatch):
+        """``wake`` said yes but the window is not there — report the failure
+        rather than rendering an empty pane."""
+        cog, _chat = self._cog_with_chat(True)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux(None))
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        assert all(s["file"] is None for s in sent)
+        assert "失敗" in (sent[-1]["content"] or "")
+
+    async def test_without_the_chat_cog_it_says_it_could_not_restore(self):
+        """c-lord is a framework: a consumer may not have loaded ClaudeChatCog.
+        Nothing can be woken then — say so, and name the path that still works."""
+        cog, _ = self._cog_with_chat(None)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        assert all(s["file"] is None for s in sent)
+        assert "メッセージを送れば" in (sent[-1]["content"] or "")

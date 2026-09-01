@@ -158,7 +158,8 @@ Bot の再起動中にセッションが中断された場合、Bot が再起動
 - **コンテキスト使用率** — セッション完了 embed にコンテキストウィンドウの使用率（入力＋キャッシュトークン。出力トークンは除外）と自動コンパクトまでの残容量を表示。83.5% 以上で ⚠️ 警告
 - **コンパクト検出** — コンテキスト圧縮が発生した際にスレッド内で通知（トリガー種別 + 圧縮前のトークン数）
 - **長時間停止通知** — 30 秒間アクティビティがない場合にスレッドメッセージを送信（長考やコンテキスト圧縮中の可能性を通知）。Claude が再開すると自動リセット
-- **タイムアウト通知** — 経過時間とリジューム手順付きの embed 表示
+- **ターン中の進捗表示** — スレッドが 90 秒黙ったときだけ 1 行出る（`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`）。15 秒ごとにその場で書き換わり、実出力が戻った時点で消える。ツールも止まっていれば `⏳ 待機中`。ターン中以外は出ない。`CLORD_TURN_PROGRESS=0` で無効化（#539。あるべき動きは [docs/specs/turn-progress.md](../specs/turn-progress.md)）
+- **タイムアウト通知** — 経過時間とリジューム手順付きの embed 表示。**本当に固まったときだけ**出る（ペインが所定時間まったく動かず、かつ Claude が入力プロンプトで待機していない場合）。正常に終わったターンでは出ない（#541）
 
 #### 🔌 入力とスキル
 - **添付ファイル対応** — テキストファイルをプロンプトに自動追加（最大 5 ファイル × 50 KB）；画像は `--image` フラグ経由で渡す（最大 4 枚 × 5 MB）
@@ -189,8 +190,7 @@ Bot の再起動中にセッションが中断された場合、Bot が再起動
 
 ### セッション管理
 - **セッション同期** — CLI セッションを Discord スレッドにインポート（`/sync-sessions`）
-- **セッション一覧** — 起動元（Discord / CLI / 全て）と時間範囲でフィルタリング（`/sessions`）
-- **リジューム情報** — 現在のセッションをターミナルで継続する CLI コマンドを表示（`/resume-info`）
+- **チャンネル状態** — `/clord-status` がこのチャンネルのセッションをディレクトリ容量・`tmux attach` 先・`claude --resume` コマンド付きで一覧表示。`show_all` で closed も含む（`docker ps -a` 相当）。旧 `/sessions`・`/session-dirs`・`/resume-info` を統合。
 - **スタートアップリジューム** — 任意のBot 再起動後に中断セッションを自動再開。`AutoUpgradeCog`（アップグレード再起動）および `ClaudeChatCog.cog_unload()`（その他すべてのシャットダウン）が自動登録、または `POST /api/mark-resume` で手動登録
 - **プログラム的スポーン** — `POST /api/spawn` でスクリプトや Claude サブプロセスから新しい Discord スレッド + Claude セッションを作成。スレッド作成後すぐに非ブロッキング 201 を返す
 - **スレッド ID 注入** — すべての Claude サブプロセスに `DISCORD_THREAD_ID` 環境変数を渡し、セッションから `$CLORD_API_URL/api/spawn` で子セッションを起動可能
@@ -272,7 +272,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | 使用するモデル | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | CLI のパーミッションモード | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Claude の作業ディレクトリ | カレントディレクトリ |
-| `MAX_CONCURRENT_SESSIONS` | 最大並行セッション数 | `3` |
+| `MAX_CONCURRENT_SESSIONS` | **同時に走るターン数**の上限。常駐する `claude` の本数の上限ではありません（セマフォはターンの実行だけを包み、ターンが終われば解放されます。tmux の claude はその後も生き続けます）。常駐上限は `CLORD_MAX_RESIDENT_WORKSPACES` のほう (#576) | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | 同時に claude を抱えていられるワークスペース数の上限。超えたら「いちばん長く使われていないもの」からスリープし、**新規の作成は待たせません**。TTL と違いこの値だけはホスト規模に依存するので、既定は固定値ではなく `MemTotal`（コンテナなら cgroup の制限を優先）からの自動算出。`0` で無効。詳細は `docs/specs/resident-cap.md` | 自動算出 |
 | `SESSION_TIMEOUT_SECONDS` | セッション非アクティブタイムアウト | `300` |
 | `DISCORD_OWNER_ID` | Claude が入力待ちのとき @mention する Discord ユーザー ID | （オプション） |
 | `COORDINATION_CHANNEL_ID` | セッション間イベントブロードキャスト用チャンネル ID | （オプション） |
@@ -501,7 +502,7 @@ c_lord/
   cogs/
     claude_chat.py         # インタラクティブチャット（スレッド作成、メッセージ処理）
     skill_command.py       # /skill スラッシュコマンド（オートコンプリート付き）
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /clord-status, /sync-sessions
     scheduler.py           # 定期 Claude Code タスク実行エンジン
     webhook_trigger.py     # Webhook → Claude Code タスク実行（CI/CD）
     auto_upgrade.py        # Webhook → パッケージアップグレード + DrainAware 再起動

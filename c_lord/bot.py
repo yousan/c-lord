@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import sys
 from typing import TYPE_CHECKING
@@ -15,6 +17,8 @@ from .concurrency import SessionRegistry
 from .coordination.service import CoordinationService
 from .discord_ui.ask_bus import ask_bus
 from .discord_ui.ask_view import AskView
+from .discord_ui.authorization import Authorizer
+from .discord_ui.permission_help import command_error_help
 
 if TYPE_CHECKING:
     from .database.ask_repo import PendingAskRepository
@@ -72,6 +76,11 @@ class ClaudeDiscordBot(commands.Bot):
         # kills the process on mismatch (guards against booting with an
         # inherited production token — the #322 env-contamination class).
         self.expected_bot_user_id: int | None = expected_bot_user_id
+        # #466: allowlist predicate, published by ClaudeChatCog on load.  Used
+        # here to re-arm restored persistent AskViews and by AutoUpgradeCog so
+        # button clicks enforce the same allowlist as messages.  None until a
+        # cog sets it (⇒ no allowlist ⇒ everyone may click — zero-config).
+        self.authorizer: Authorizer | None = None
 
     async def process_commands(self, message: discord.Message, /) -> None:
         """Override to allow webhook messages to trigger text commands.
@@ -112,8 +121,41 @@ class ClaudeDiscordBot(commands.Bot):
     async def on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        """Log slash command errors that would otherwise be silently swallowed."""
+        """Log slash command errors AND surface an actionable reply (#444).
+
+        Logging alone (the pre-#444 behavior) left the user staring at Discord's
+        generic "アプリが応答しませんでした" with no idea what went wrong.  We now also
+        reply ephemerally with a sanitized message (no raw traceback): a
+        permission hint for ``discord.Forbidden``, otherwise a generic
+        "unexpected error" notice.  The reply itself is best-effort — if it also
+        fails (e.g. the interaction expired) we swallow that, since this is the
+        last-resort net.
+        """
         logger.error("Slash command error: %s", error, exc_info=error)
+        message = command_error_help(error)
+        with contextlib.suppress(discord.HTTPException):
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+
+    async def on_command_error(
+        self, context: commands.Context, error: commands.CommandError
+    ) -> None:
+        """Surface text-command (``!cmd``) errors to the user (#444).
+
+        discord.py's default handler only prints a traceback to stderr (invisible
+        on bot hosts), so before #444 a failing ``!clord``/``!stop`` looked like a
+        silent hang.  ``CommandNotFound`` is ignored (mentions and unrelated ``!``
+        text are not errors); everything else is logged and answered with a
+        sanitized message via ``ctx.send``.
+        """
+        if isinstance(error, commands.CommandNotFound):
+            return
+        logger.error("Text command error: %s", error, exc_info=error)
+        message = command_error_help(error)
+        with contextlib.suppress(discord.HTTPException):
+            await context.send(message)
 
     def _assert_expected_identity(self) -> None:
         """Fail fast when the logged-in identity is not the expected one.
@@ -165,19 +207,39 @@ class ClaudeDiscordBot(commands.Bot):
                 self.channel_id,
             )
 
-        # Sync slash commands — guild sync first for instant propagation,
-        # then global sync so commands are available outside the guild too.
+        # Register slash commands GLOBALLY so they are available in every guild the
+        # bot is in. c-lord is one bot instance that can serve multiple servers, and
+        # global registration is Discord's recommended approach for multi-guild bots.
+        #
+        # #462: a previous version (#461) registered commands only on the single guild
+        # derived from channel_id (and wiped the globals). That hid the commands from
+        # every OTHER server the bot was in. The trade-off of going global is that
+        # command *definition* changes take up to ~1h to propagate; normal use is
+        # unaffected once registered.
+        #
+        # Migration: before the global sync, clear any legacy guild-scoped commands on
+        # the primary guild — left in place they would duplicate against the global
+        # ones in Discord's command picker (the #460 double-entry bug). Pushing an
+        # empty guild command set removes them. On servers that never had guild
+        # commands this is a no-op.
         try:
             channel = self.get_channel(self.channel_id)
             guild = getattr(channel, "guild", None)
             if guild is not None:
-                self.tree.copy_global_to(guild=guild)
+                self.tree.clear_commands(guild=guild)
                 await self.tree.sync(guild=guild)
-                logger.info("Synced slash commands to guild %d (instant)", guild.id)
+                logger.info("Cleared legacy guild-scoped slash commands on guild %d", guild.id)
+
             synced = await self.tree.sync()
-            logger.info("Synced %d slash commands (global)", len(synced))
+            logger.info("Synced %d global slash commands (available in all guilds)", len(synced))
         except Exception:
             logger.exception("Failed to sync slash commands")
+
+        # #570: reap tmux windows whose Claude has exited. Fire-and-forget so a
+        # slow tmux never delays the bot coming up; the reaper swallows its own
+        # errors. Kept as a task reference so it is not garbage collected
+        # mid-flight (asyncio only holds a weak reference to running tasks).
+        self._reaper_task = asyncio.create_task(self._cleanup_orphaned_tmux_sessions())
 
     async def on_thread_update(self, before: discord.Thread, after: discord.Thread) -> None:
         """Detect manual renames in the Discord UI (Issue #95).
@@ -254,23 +316,52 @@ class ClaudeDiscordBot(commands.Bot):
         except Exception:
             logger.exception("Error during startup session dir cleanup")
 
-    async def _cleanup_orphaned_tmux_sessions(self) -> None:
-        """Kill leftover tmux sessions from previous bot runs.
+    def _in_flight_thread_ids(self) -> set[int]:
+        """Threads with a turn running right now, as far as the bot knows.
 
-        Runs in a background task so it does not block on_ready().
+        A turn that is still starting up can briefly show a shell rather than
+        ``claude`` in its pane, so the reaper's pane check needs this second
+        belt. Best-effort: an unavailable cog yields an empty set, and the pane
+        check alone still protects live sessions.
+        """
+        with contextlib.suppress(Exception):
+            cog = self.get_cog("ClaudeChatCog")
+            active = getattr(cog, "_active_tasks", None)
+            if isinstance(active, dict):
+                return {int(tid) for tid in active}
+        return set()
+
+    async def _cleanup_orphaned_tmux_sessions(self) -> None:
+        """Reap leftover c-lord tmux windows. Returns nothing; never raises.
+
+        Issue #570: this method existed but had no call site, so empty windows
+        accumulated forever — 175 of them on the production host, against 14
+        live sessions. Two things were needed before it could safely be wired:
+
+        * it now sweeps **every** tmux session via
+          :func:`c_lord.tmux.cleanup_orphaned_all_sessions`, not just
+          ``self.tmux_manager``'s. Since #427 the session name follows the repo,
+          so the default ``clord`` session holds no windows on a real host and
+          the old single-session sweep would have covered nothing, and
+        * :meth:`TmuxSessionManager.cleanup_orphaned` now refuses to kill a
+          window whose pane is running Claude, which is what makes calling it
+          with an (almost) empty ``active_thread_ids`` safe.
+
+        Runs in a background task so it does not block ``on_ready``.
         """
         import asyncio
 
-        assert self.tmux_manager is not None  # caller ensures this
+        from .tmux import cleanup_orphaned_all_sessions
+
         try:
-            killed = await asyncio.to_thread(
-                self.tmux_manager.cleanup_orphaned,
-                set(),  # no active sessions at startup
-            )
+            active = self._in_flight_thread_ids()
+            killed = await asyncio.to_thread(cleanup_orphaned_all_sessions, active)
             if killed:
-                logger.info("Startup tmux cleanup: killed %d orphaned session(s)", killed)
+                logger.info("tmux reaper: killed %d orphaned window(s)", killed)
+            else:
+                logger.debug("tmux reaper: nothing to reap")
         except Exception:
-            logger.exception("Error during startup tmux session cleanup")
+            logger.exception("Error during tmux window cleanup")
 
     async def _restore_pending_ask_views(self) -> None:
         """Re-register persistent AskViews for questions pending before restart.
@@ -314,6 +405,7 @@ class ClaudeDiscordBot(commands.Bot):
                     q_idx=q_idx,
                     bus=ask_bus,
                     ask_repo=self.ask_repo,
+                    authorizer=self.authorizer,
                 )
                 self.add_view(view)
                 logger.debug(

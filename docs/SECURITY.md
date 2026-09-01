@@ -13,6 +13,7 @@ The bridge's security goal is:
 | Threat | Mitigation |
 |--------|-----------|
 | Unauthorized users invoking Claude | `allowed_user_ids` allowlist in `ClaudeChatCog` and `SkillCommandCog` |
+| Unauthorized users clicking decision buttons (Allow/Approve/Stop) | Same allowlist enforced in every View via `AuthorizedViewMixin.interaction_check` (#466) |
 | Shell injection via user prompts | `create_subprocess_exec` (no shell), `--` separator before prompt arg |
 | Flag injection via prompts | `--` separator prevents `-p`, `--resume` etc. in prompt text |
 | Session hijacking via crafted IDs | Strict regex validation: `^[a-f0-9\-]+$` |
@@ -30,8 +31,36 @@ The bridge's security goal is:
 | Claude Code modifying its own config | This is expected behavior (CLAUDE.md, memory files, etc.) |
 | Discord server admin abuse | If someone has admin on your Discord server, they already have control |
 | Physical access to the host | Out of scope — standard server security applies |
+| Claude reading the bot token from c-lord's `.env` | Accepted (#259). Same-UID processes can already read `.env`; the spawn-read skill relies on that. See below. |
 
 **The security boundary is at the Discord layer, not the CLI layer.** Once a session starts, Claude Code has full CLI-level access. The bridge's job is to ensure only the right person can start sessions.
+
+### Accepted risk: `discord-read` skill exposes the bot token to the session (#259)
+
+The injected `discord-read` skill (`c_lord/skills/discord_read.py`) tells Claude
+to read other Discord channels by reading `DISCORD_BOT_TOKEN` from c-lord's
+`.env` at runtime and `curl`-ing the Discord REST API (instead of the MCP
+plugin, which fails with `Missing Access` on channels the bot can otherwise
+see — #454).
+
+This means the bot token is **readable by the Claude session** (it `grep`s the
+`.env` file). We accept this:
+
+- It exposes nothing new: any process running as the same Unix user can already
+  `cat` the `.env` file. Hiding the token from a same-UID Claude is security
+  theater (see #234) — the real isolation boundary is the OS file permissions
+  on `.env`, which separate different Unix users.
+- The skill **never bakes the literal token into a file**. Only the `.env`
+  *path* is written into `SKILL.md` (which lives inside the cloned user repo
+  working tree, where a literal token could be `git commit`-ed and pushed). The
+  token is read into a shell variable at runtime, so it does not appear in the
+  command text that the transcript mirror (#71) echoes to Discord.
+
+> Note: the env-var stripping described under "Environment Isolation" below
+> (`_STRIPPED_ENV_KEYS`) is **not currently implemented** in the tmux-based
+> architecture — see #458. Regardless of that, the spawn-read path reads the
+> token from the `.env` *file*, not from an environment variable, so the
+> accepted-risk reasoning above does not depend on it.
 
 ## Input Validation
 
@@ -115,6 +144,26 @@ class ClaudeChatCog(commands.Cog):
 - When `allowed_user_ids` is set: only listed Discord user IDs can invoke Claude
 - When `allowed_user_ids` is `None`: all users in the channel can invoke Claude (for trusted private servers)
 - The same check applies to `SkillCommandCog`
+
+#### Interactive buttons enforce the same allowlist (#466)
+
+The allowlist gates not only *messages* but every interactive button c-lord
+posts — tool-permission **Allow/Deny**, plan **Approve/Cancel**, MCP
+elicitation, AskUserQuestion choices, the **Stop** button, and the
+auto-upgrade **Approve** button. Because c-lord threads are *public*, any
+server member who can see the channel could otherwise click these and decide
+on the session owner's behalf (e.g. approve a tool permission → let Claude run
+something).
+
+Each `discord.ui.View` mixes in `AuthorizedViewMixin`
+(`c_lord/discord_ui/authorization.py`), whose `interaction_check` consults the
+same `Authorizer` (built from `allowed_user_ids` / `allowed_role_name`). A
+non-allowlisted click runs no callback and gets an ephemeral "権限がありません"
+notice. When no allowlist is configured, everyone may click (zero-config —
+unchanged). The allowlist is built once in `ClaudeChatCog` and shared with the
+in-session Views (via `RunConfig`), the persistent-view restore path
+(`bot.py`), and `AutoUpgradeCog` — so configuring the allowlist alone protects
+every button, no extra wiring.
 
 ### Channel-Level Authorization
 

@@ -21,6 +21,8 @@ client's actual rendering, a human screenshot remains authoritative.
 from __future__ import annotations
 
 import json
+import logging
+import unicodedata
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILImageDraw
     from PIL import ImageFont
+
+logger = logging.getLogger(__name__)
 
 
 # ── Data model (decoupled from live discord.py objects, for testability) ──────
@@ -234,18 +238,79 @@ class _Fonts:
     badge: ImageFont.FreeTypeFont
     emoji: object | None
     emoji_color: bool
+    # #623: the monospace faces we can find (DejaVu / Liberation Mono) carry no
+    # CJK glyphs, so a Japanese code block used to render as tofu. Code blocks
+    # draw wide glyphs with this proportional CJK face instead.
+    mono_cjk: object | None = None
+    mono_cell_w: float = 0.0
+    mono_cjk_dy: float = 0.0
 
 
-def _measure_rich(draw: PILImageDraw.ImageDraw, text: str, font: object, emoji_w: float) -> float:
-    """Pixel width of *text*, treating each emoji cluster as *emoji_w* wide."""
+@dataclass
+class _MonoGrid:
+    """Monospace cell metrics for the code-block path (#623).
+
+    ``cjk`` is the face wide glyphs are drawn with; ``cell_w`` is the width of
+    one monospace cell. A wide glyph is placed on a **two-cell** advance so a
+    table with Japanese in it still lines up, the way Discord renders it.
+    """
+
+    cjk: object | None
+    cell_w: float
+    #: baseline correction so the CJK face sits on the monospace baseline.
+    cjk_dy: float = 0.0
+
+
+def _wide_runs(text: str) -> list[tuple[str, bool]]:
+    """Split *text* into consecutive runs of (segment, is_fullwidth).
+
+    Width comes from ``unicodedata.east_asian_width`` — the same rule
+    ``status_view`` pads its tables by, so the mockup matches the real message.
+    """
+    runs: list[tuple[str, bool]] = []
+    for ch in text:
+        wide = unicodedata.east_asian_width(ch) in ("W", "F")
+        if runs and runs[-1][1] == wide:
+            runs[-1] = (runs[-1][0] + ch, wide)
+        else:
+            runs.append((ch, wide))
+    return runs
+
+
+def _measure_rich(
+    draw: PILImageDraw.ImageDraw,
+    text: str,
+    font: object,
+    emoji_w: float,
+    *,
+    grid: _MonoGrid | None = None,
+) -> float:
+    """Pixel width of *text*, treating each emoji cluster as *emoji_w* wide.
+
+    With *grid* (code blocks), width comes from the monospace cell count — one
+    cell per narrow glyph, two per wide one — so it matches what ``_draw_rich``
+    actually advances rather than the proportional CJK face's own metrics.
+    """
     total = 0.0
     for seg, is_emoji in _segment_runs(text):
-        total += emoji_w if is_emoji else draw.textlength(seg, font=font)  # type: ignore[arg-type]
+        if is_emoji:
+            total += emoji_w
+        elif grid is not None:
+            for run, wide in _wide_runs(seg):
+                total += len(run) * grid.cell_w * (2 if wide else 1)
+        else:
+            total += draw.textlength(seg, font=font)  # type: ignore[arg-type]
     return total
 
 
 def _wrap_rich(
-    draw: PILImageDraw.ImageDraw, text: str, font: object, max_px: float, emoji_w: float
+    draw: PILImageDraw.ImageDraw,
+    text: str,
+    font: object,
+    max_px: float,
+    emoji_w: float,
+    *,
+    grid: _MonoGrid | None = None,
 ) -> list[str]:
     """Word-wrap *text* to *max_px*, hard-breaking overlong tokens by cluster."""
     import re
@@ -258,7 +323,7 @@ def _wrap_rich(
         cur = ""
         cur_w = 0.0
         for tok in re.findall(r"\S+\s*|\s+", para) or [para]:
-            tok_w = _measure_rich(draw, tok, font, emoji_w)
+            tok_w = _measure_rich(draw, tok, font, emoji_w, grid=grid)
             if tok_w > max_px:  # token alone exceeds a line — flush then char-break
                 if cur:
                     lines.append(cur.rstrip())
@@ -266,7 +331,12 @@ def _wrap_rich(
                 for seg, is_emoji in _segment_runs(tok):
                     units: Iterable[str] = [seg] if is_emoji else list(seg)
                     for u in units:
-                        uw = emoji_w if is_emoji else draw.textlength(u, font=font)  # type: ignore[arg-type]
+                        if is_emoji:
+                            uw = emoji_w
+                        elif grid is not None:
+                            uw = _measure_rich(draw, u, font, emoji_w, grid=grid)
+                        else:
+                            uw = draw.textlength(u, font=font)  # type: ignore[arg-type]
                         if cur and cur_w + uw > max_px:
                             lines.append(cur)
                             cur, cur_w = u, uw
@@ -297,9 +367,17 @@ def _draw_rich(
     *,
     bold: bool = False,
     dry: bool = False,
+    grid: _MonoGrid | None = None,
 ) -> float:
-    """Draw *text* (mixing glyphs + color-emoji tiles); return the end x."""
+    """Draw *text* (mixing glyphs + color-emoji tiles); return the end x.
+
+    With *grid* (code blocks, #623) wide glyphs are drawn with the CJK face on a
+    two-cell advance — one character at a time, so a proportional CJK face can't
+    drift the column off the monospace grid. Narrow runs keep the mono face and
+    are drawn in one call.
+    """
     cx = x
+    kwargs = {"stroke_width": 1, "stroke_fill": fill} if bold else {}
     for seg, is_emoji in _segment_runs(text):
         if is_emoji and fonts.emoji is not None:
             tile = _emoji_tile(seg, fonts.emoji, fonts.emoji_color, emoji_h, cache)
@@ -308,10 +386,33 @@ def _draw_rich(
                     img.paste(tile, (int(cx), int(y) + 2), tile)  # type: ignore[attr-defined]
                 cx += tile.width + 1  # type: ignore[attr-defined]
                 continue
-        if not dry:
-            kwargs = {"stroke_width": 1, "stroke_fill": fill} if bold else {}
-            draw.text((cx, y), seg, font=font, fill=fill, **kwargs)  # type: ignore[arg-type]
-        cx += draw.textlength(seg, font=font)  # type: ignore[arg-type]
+        if grid is None:
+            if not dry:
+                draw.text((cx, y), seg, font=font, fill=fill, **kwargs)  # type: ignore[arg-type]
+            cx += draw.textlength(seg, font=font)  # type: ignore[arg-type]
+            continue
+        for run, wide in _wide_runs(seg):
+            if not wide:
+                if not dry:
+                    draw.text((cx, y), run, font=font, fill=fill, **kwargs)  # type: ignore[arg-type]
+                cx += len(run) * grid.cell_w
+                continue
+            # No CJK face available: keep the mono face (tofu beats crashing).
+            face = grid.cjk if grid.cjk is not None else font
+            slot = 2 * grid.cell_w
+            for ch in run:
+                if not dry:
+                    # Centre the glyph in its two cells: the CJK face is
+                    # proportional, so its advance rarely equals the slot.
+                    pad = 0.0
+                    try:
+                        pad = max(0.0, (slot - face.getlength(ch)) / 2)  # type: ignore[attr-defined]
+                    except (AttributeError, TypeError):
+                        pad = 0.0
+                    draw.text(  # type: ignore[arg-type]
+                        (cx + pad, y + grid.cjk_dy), ch, font=face, fill=fill, **kwargs
+                    )
+                cx += slot
     return cx
 
 
@@ -358,6 +459,86 @@ def _split_code_blocks(content: str) -> list[tuple[str, str]]:
     return [(k, v) for k, v in blocks if v.strip() or k == "text"]
 
 
+#: Discord packs at most three ``inline`` fields onto one row.
+INLINE_PER_ROW = 3
+
+#: Horizontal gap between inline columns, in pixels.
+_INLINE_GAP = 10
+
+
+def _messages_contain_emoji(messages: list[ConvMessage]) -> bool:
+    """True when any text in *messages* holds a character outside the BMP-text
+    range that the body font can be expected to cover.
+
+    Deliberately a cheap codepoint test rather than the ``emoji`` library: this
+    runs precisely when that library is unavailable.
+    """
+
+    def _has(text: str | None) -> bool:
+        if not text:
+            return False
+        return any(ord(ch) >= 0x2190 for ch in text)
+
+    for m in messages:
+        if _has(m.content) or _has(m.author):
+            return True
+        for a in m.attachments:
+            if _has(a.filename):
+                return True
+        for r in m.reactions:
+            if _has(r.emoji):
+                return True
+        for e in m.embeds:
+            if _has(e.title) or _has(e.description):
+                return True
+            for f in e.fields:
+                if _has(f.name) or _has(f.value):
+                    return True
+    return False
+
+
+def emoji_support_available() -> bool:
+    """Whether the optional ``emoji`` library is importable.
+
+    Without it :func:`c_lord.discord_ui.table_renderer._segment_runs` classifies
+    every cluster as *not* an emoji, so emoji get drawn with the body font — i.e.
+    as tofu. Callers use this to refuse rather than emit a broken picture (#588).
+    """
+    try:
+        import emoji  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def group_fields_into_rows(
+    fields: list[ConvField] | tuple[ConvField, ...],
+) -> list[list[ConvField]]:
+    """Group *fields* the way Discord lays them out.
+
+    Consecutive ``inline`` fields share a row, at most :data:`INLINE_PER_ROW` of
+    them. A non-inline field takes a whole row **and breaks the run**, so
+    ``a b | wide | c`` renders as three rows rather than folding ``c`` back up
+    next to ``a b``.
+    """
+    rows: list[list[ConvField]] = []
+    run: list[ConvField] = []
+    for f in fields:
+        if not f.inline:
+            if run:
+                rows.append(run)
+                run = []
+            rows.append([f])
+            continue
+        run.append(f)
+        if len(run) == INLINE_PER_ROW:
+            rows.append(run)
+            run = []
+    if run:
+        rows.append(run)
+    return rows
+
+
 def _layout_embed(
     e: ConvEmbed,
     y: int,
@@ -374,20 +555,55 @@ def _layout_embed(
     pad = 12
     emoji_h = int(BODY_SIZE * 1.15)
 
-    items: list[tuple[object, str, tuple[int, int, int], bool, int]] = []
-    if e.title:
-        for ln in _wrap_rich(draw, e.title, fonts.name, inner_w, emoji_h):
-            items.append((fonts.name, ln, _rgb(e.color) or NAME_DEFAULT, True, _line_h(fonts.name)))
-    if e.description:
-        for ln in _wrap_rich(draw, e.description, fonts.body, inner_w, emoji_h):
-            items.append((fonts.body, ln, EMBED_TEXT, False, body_h))
-    for f in e.fields:
-        for ln in _wrap_rich(draw, f.name, fonts.name, inner_w, emoji_h):
-            items.append((fonts.name, ln, NAME_DEFAULT, True, _line_h(fonts.name, 2)))
-        for ln in _wrap_rich(draw, f.value, fonts.body, inner_w, emoji_h):
-            items.append((fonts.body, ln, EMBED_TEXT, False, body_h))
+    # An embed is laid out as rows of columns. Title and description are
+    # single-column rows; a group of inline fields is one row with up to
+    # INLINE_PER_ROW columns. Every column in a row starts at the same y, and the
+    # row is as tall as its tallest column — which is what stops inline fields
+    # from stacking vertically (#588).
+    # (font, line, color, bold, height)
+    line_t = tuple[object, str, tuple[int, int, int], bool, int]
+    # (dx from inner_x, lines)
+    column_t = tuple[int, list[line_t]]
+    rows: list[list[column_t]] = []
 
-    inner_h = sum(it[4] for it in items)
+    def _lines(
+        text: str, font: object, color: tuple[int, int, int], bold: bool, h: int, width: int
+    ) -> list[line_t]:
+        return [(font, ln, color, bold, h) for ln in _wrap_rich(draw, text, font, width, emoji_h)]
+
+    if e.title:
+        rows.append(
+            [
+                (
+                    0,
+                    _lines(
+                        e.title,
+                        fonts.name,
+                        _rgb(e.color) or NAME_DEFAULT,
+                        True,
+                        _line_h(fonts.name),
+                        inner_w,
+                    ),
+                )
+            ]
+        )
+    if e.description:
+        rows.append([(0, _lines(e.description, fonts.body, EMBED_TEXT, False, body_h, inner_w))])
+
+    for group in group_fields_into_rows(e.fields):
+        n = len(group)
+        col_w = (inner_w - _INLINE_GAP * (n - 1)) // n
+        columns: list[column_t] = []
+        for i, f in enumerate(group):
+            lines = _lines(f.name, fonts.name, NAME_DEFAULT, True, _line_h(fonts.name, 2), col_w)
+            lines += _lines(f.value, fonts.body, EMBED_TEXT, False, body_h, col_w)
+            columns.append((i * (col_w + _INLINE_GAP), lines))
+        rows.append(columns)
+
+    def _row_h(row: list[column_t]) -> int:
+        return max((sum(ln[4] for ln in lines) for _, lines in row), default=0)
+
+    inner_h = sum(_row_h(r) for r in rows)
     box_h = inner_h + 2 * pad
     if not dry:
         draw.rounded_rectangle((GUTTER, y, WIDTH - MARGIN, y + box_h), radius=6, fill=EMBED_BG)
@@ -395,11 +611,26 @@ def _layout_embed(
             (GUTTER, y, GUTTER + 4, y + box_h), radius=2, fill=_rgb(e.color) or EMBED_BAR_DEFAULT
         )
         yy = y + pad
-        for font, ln, color, bold, h in items:
-            _draw_rich(
-                img, draw, inner_x, yy, ln, font, fonts, color, emoji_h, cache, bold=bold, dry=dry
-            )
-            yy += h
+        for row in rows:
+            for dx, lines in row:
+                ly = yy
+                for font, ln, color, bold, h in lines:
+                    _draw_rich(
+                        img,
+                        draw,
+                        inner_x + dx,
+                        ly,
+                        ln,
+                        font,
+                        fonts,
+                        color,
+                        emoji_h,
+                        cache,
+                        bold=bold,
+                        dry=dry,
+                    )
+                    ly += h
+            yy += _row_h(row)
     return y + box_h + 6
 
 
@@ -459,6 +690,9 @@ def _layout_message(
     content_w = WIDTH - MARGIN - GUTTER
     body_h = _line_h(fonts.body)
     mono_h = _line_h(fonts.mono, 4)
+    # #623: one monospace cell, so code blocks can place wide glyphs on a
+    # two-cell advance and keep Japanese tables aligned.
+    mono_grid = _MonoGrid(cjk=fonts.mono_cjk, cell_w=fonts.mono_cell_w, cjk_dy=fonts.mono_cjk_dy)
     emoji_h = int(BODY_SIZE * 1.15)
     top = y
 
@@ -498,7 +732,9 @@ def _layout_message(
         if kind == "code" and text.strip():
             wrapped: list[str] = []
             for ln in text.split("\n"):
-                wrapped.extend(_wrap_rich(draw, ln or " ", fonts.mono, content_w - 24, emoji_h))
+                wrapped.extend(
+                    _wrap_rich(draw, ln or " ", fonts.mono, content_w - 24, emoji_h, grid=mono_grid)
+                )
             box_h = len(wrapped) * mono_h + 16
             if not dry:
                 draw.rounded_rectangle(
@@ -518,6 +754,7 @@ def _layout_message(
                         emoji_h,
                         cache,
                         dry=dry,
+                        grid=mono_grid,
                     )
                     ly += mono_h
             y += box_h + 6
@@ -559,11 +796,31 @@ def render_conversation_png(
     except ImportError:
         return None
 
+    # #588: without the ``emoji`` library every emoji is drawn with the body font
+    # — as tofu — and the old code reported success anyway. A mockup is evidence
+    # someone adjudicates a design from, so a silently broken picture is worse
+    # than none. Only refuse when the spec actually contains emoji: an ASCII-only
+    # spec renders correctly without the extra.
+    if not emoji_support_available() and _messages_contain_emoji(messages):
+        logger.warning(
+            "conversation mockup: spec contains emoji but the 'emoji' library is "
+            "missing — refusing to render tofu. Install it with: uv sync --extra table"
+        )
+        return None
+
     text_font = load_text_font(BODY_SIZE)
     mono = load_mono_font(MONO_SIZE)
     if text_font is None or mono is None:
         return None
     emoji_font, emoji_color = load_emoji_font(109, BODY_SIZE)
+    # #623: size the CJK fallback to the two-cell slot a wide glyph occupies, and
+    # note the baseline shift, so Japanese sits on the monospace grid instead of
+    # floating small and high inside it.
+    cell_w = float(mono.getlength("M"))
+    mono_cjk = load_text_font(max(1, round(2 * cell_w))) or load_text_font(MONO_SIZE)
+    cjk_dy = 0.0
+    if mono_cjk is not None:
+        cjk_dy = float(mono.getmetrics()[0] - mono_cjk.getmetrics()[0])
     fonts = _Fonts(
         body=text_font,
         name=load_text_font(NAME_SIZE) or text_font,
@@ -572,6 +829,11 @@ def render_conversation_png(
         badge=load_text_font(BADGE_SIZE) or text_font,
         emoji=emoji_font,
         emoji_color=emoji_color,
+        # #623: wide glyphs in code blocks fall back to this face; None is fine
+        # (we then keep the mono face rather than failing to render).
+        mono_cjk=mono_cjk,
+        mono_cell_w=cell_w,
+        mono_cjk_dy=cjk_dy,
     )
 
     cache: dict[str, object | None] = {}

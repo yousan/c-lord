@@ -9,7 +9,11 @@ Evidence).
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "staging.sh"
@@ -23,6 +27,15 @@ def run_script(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
     )
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 class TestScriptGuards:
@@ -228,3 +241,187 @@ class TestLease:
         result = run_script(["stop", "--owner", "sess-B"], cwd=clone)
         assert result.returncode != 0
         assert "sess-A" in result.stdout + result.stderr
+
+
+class TestRestartBranchSync:
+    """restart <branch> は origin/<branch> へ確実に同期してから起動する (#436).
+
+    単なる `git checkout <branch>` はローカルブランチを古い HEAD のまま切り替える
+    だけで、`git fetch` 済みでも origin に追従しない。検証者は「最新の fix を回した
+    つもりで古いコード」を起動し、偽の RED/GREEN を得る (#399 検証中に実害)。
+    """
+
+    def _origin_and_clone(self, tmp_path: Path) -> tuple[Path, str, str]:
+        """origin/feature を 2 コミット先 (c2) に進め、clone は feature@c1 で stale。
+
+        戻り値: (clone, c1, c2) — c1=stale ローカル HEAD, c2=origin/feature。
+        """
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        _git(origin, "init", "-q", "-b", "main")
+        _git(origin, "config", "user.email", "t@example.com")
+        _git(origin, "config", "user.name", "t")
+        (origin / "VERSION").write_text("c1\n", encoding="utf-8")
+        _git(origin, "add", "-A")
+        _git(origin, "commit", "-qm", "c1")
+        _git(origin, "branch", "feature")  # feature@c1
+
+        clone = tmp_path / "clone"
+        subprocess.run(
+            ["git", "clone", "-q", str(origin), str(clone)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _git(clone, "config", "user.email", "t@example.com")
+        _git(clone, "config", "user.name", "t")
+        _git(clone, "checkout", "-q", "feature")  # ローカル feature@c1 (stale)
+        c1 = _git(clone, "rev-parse", "HEAD")
+
+        # origin/feature を c2 に進める (clone はまだ知らない)
+        _git(origin, "checkout", "-q", "feature")
+        (origin / "VERSION").write_text("c2\n", encoding="utf-8")
+        _git(origin, "commit", "-aqm", "c2")
+        c2 = _git(origin, "rev-parse", "HEAD")
+        _git(origin, "checkout", "-q", "main")  # fetch 専用にしておく
+
+        (clone / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\nEXPECTED_BOT_USER_ID=42\n",
+            encoding="utf-8",
+        )
+        return clone, c1, c2
+
+    def test_restart_fast_forwards_branch_to_origin(self, tmp_path: Path) -> None:
+        """AC1/AC2: restart <branch> は HEAD を origin/<branch> に ff し、回す sha を出す。
+
+        .venv が無いので launch 自体は後段で落ちるが、ブランチ同期はそれより前に
+        完了していなければならない (古いコードを起動させない)。
+        """
+        clone, c1, c2 = self._origin_and_clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-S", "--purpose", "sync test"], cwd=clone)
+        assert _git(clone, "rev-parse", "HEAD") == c1  # 前提: stale
+
+        result = run_script(["restart", "feature", "--owner", "sess-S"], cwd=clone)
+
+        after = _git(clone, "rev-parse", "HEAD")
+        assert after == c2, (
+            f"branch not fast-forwarded to origin (after={after[:7]} want={c2[:7]})\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+        # AC2: 回しているコミットを一目で確認できる行
+        assert f"checked out feature @ {c2[:7]}" in result.stdout
+
+    def test_restart_refuses_when_local_diverges(self, tmp_path: Path) -> None:
+        """AC1: ff 不能 (ローカルが分岐) なら黙って古いコードを起動せず明示エラーで止まる。"""
+        clone, _, _ = self._origin_and_clone(tmp_path)
+        run_script(["borrow", "--owner", "sess-S", "--purpose", "diverge test"], cwd=clone)
+        # ローカル feature に origin に無いコミットを積む → origin/feature と分岐
+        (clone / "LOCAL").write_text("local only\n", encoding="utf-8")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-qm", "local-only")
+        local_head = _git(clone, "rev-parse", "HEAD")
+
+        result = run_script(["restart", "feature", "--owner", "sess-S"], cwd=clone)
+
+        assert result.returncode != 0
+        assert "fast-forward" in (result.stdout + result.stderr).lower()
+        # 黙って origin の c2 に飛んだり起動したりしない (HEAD は触らず止まる)
+        assert _git(clone, "rev-parse", "HEAD") == local_head
+
+
+class TestInstanceCounting:
+    """status / restart は parent+child（uv ラッパ + python 子）を 1 インスタンスと数える (#437).
+
+    `uv run python -m c_lord.main` は uv ラッパ（親）+ python（実体・子）の 2 プロセスになり、
+    `pgrep -f c_lord.main` は両方に当たる。これを 2 と誤カウントすると、検証者は「正常な
+    parent+child」を「二重起動」と誤検出してしまう。論理インスタンス = 親が同一 clone の
+    c_lord.main でない pid（= プロセスツリーの代表）だけを数える。
+
+    テストは実プロセス（cwd=clone・cmdline に c_lord.main を含む sleep）を spawn して検証する。
+    本物の bot や Discord 接続は不要。find_pids は cwd 一致で絞るので、この clone(tmp) の
+    fake だけが対象になり、ホスト上の実 bot とは混ざらない。
+    """
+
+    def _clone_env(self, tmp_path: Path) -> Path:
+        (tmp_path / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\nEXPECTED_BOT_USER_ID=42\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    @staticmethod
+    def _spawn_single(clone: Path) -> subprocess.Popen[bytes]:
+        """staging 起動形: 単一 python プロセス（cmdline ~ c_lord.main, cwd=clone）。"""
+        return subprocess.Popen(
+            ["bash", "-c", 'exec -a "python -m c_lord.main" sleep 300'],
+            cwd=str(clone),
+            start_new_session=True,
+        )
+
+    @staticmethod
+    def _spawn_uv_style(clone: Path) -> subprocess.Popen[bytes]:
+        """prod 起動形: uv ラッパ（親）+ python（子）。子の ppid は親。両方 cmdline 一致。"""
+        script = (
+            'exec -a "uv run python -m c_lord.main" '
+            "bash -c 'exec -a \"python -m c_lord.main child\" sleep 300 & wait'"
+        )
+        return subprocess.Popen(
+            ["bash", "-c", script],
+            cwd=str(clone),
+            start_new_session=True,
+        )
+
+    @staticmethod
+    def _count_procs(clone: Path) -> int:
+        """staging.sh とは独立に、cwd=clone かつ cmdline ~ c_lord.main のプロセス数を数える。"""
+        out = subprocess.run(
+            ["pgrep", "-f", r"c_lord\.main"], capture_output=True, text=True
+        ).stdout.split()
+        n = 0
+        for pid in out:
+            with contextlib.suppress(OSError):
+                if os.readlink(f"/proc/{pid}/cwd") == str(clone):
+                    n += 1
+        return n
+
+    def _wait_procs(self, clone: Path, n: int, timeout: float = 6.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._count_procs(clone) >= n:
+                return
+            time.sleep(0.1)
+        raise AssertionError(f"fake procs (cwd={clone}) が {n} に到達しない")
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen[bytes]) -> None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+    def test_status_counts_uv_wrapper_and_child_as_one(self, tmp_path: Path) -> None:
+        """AC1: uv ラッパ(親)+python(子) は instances: 1（二重起動の誤検出をしない）。"""
+        clone = self._clone_env(tmp_path)
+        proc = self._spawn_uv_style(clone)
+        try:
+            self._wait_procs(clone, 2)  # 親+子の両方が上がるのを待つ
+            result = run_script(["status"], cwd=clone)
+            assert "instances: 1" in result.stdout, result.stdout
+            assert "二重起動" not in result.stdout, result.stdout
+            assert result.returncode == 0, result.stdout
+        finally:
+            self._kill(proc)
+
+    def test_status_counts_two_independent_bots_as_two(self, tmp_path: Path) -> None:
+        """本物の二重起動（独立した 2 プロセス）はちゃんと instances: 2 で検出する。"""
+        clone = self._clone_env(tmp_path)
+        p1 = self._spawn_single(clone)
+        p2 = self._spawn_single(clone)
+        try:
+            self._wait_procs(clone, 2)
+            result = run_script(["status"], cwd=clone)
+            assert "instances: 2" in result.stdout, result.stdout
+            assert result.returncode == 2, result.stdout  # WARNING: 二重起動の疑い
+        finally:
+            self._kill(p1)
+            self._kill(p2)

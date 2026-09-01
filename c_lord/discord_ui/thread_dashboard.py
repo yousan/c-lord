@@ -2,8 +2,26 @@
 
 Posts and maintains a pinned embed in the main channel that shows which
 threads are processing automatically vs. waiting for user input.
-When a thread transitions to WAITING_INPUT, the bot mentions the owner
-so Discord's notification system surfaces the request immediately.
+When a thread transitions to WAITING_INPUT, the bot mentions the turn's poster
+(``notify_user_id``, falling back to the configured owner) so Discord's
+notification system surfaces the request immediately (#481).
+
+Why the mention is its OWN message (not appended to Claude's final reply)
+------------------------------------------------------------------------
+Two different actors post: Claude posts the answer itself via the discord-reply
+skill (``POST /api/reply``), while c-lord posts this ``@poster`` mention when the
+bot's turn-completion detector fires (WAITING_INPUT). Merging them into one
+message was considered (issue discussion under #365) and is intentionally NOT
+done:
+
+* Editing Claude's last message to append ``@owner`` does **not** work — Discord
+  edits do not trigger a push notification, which defeats the entire purpose of
+  the mention (pinging the owner's device).
+* Having the skill append ``@owner`` to Claude's final reply *would* ping (it is
+  a new message), but it moves the notification's reliability from the bot
+  (which authoritatively detects "turn done") to Claude (which does not reliably
+  know which of its replies is the final one). That trade-off was judged not
+  worth it, so the mention stays a separate, bot-authored message.
 
 Issue: https://github.com/yousan/c-lord/issues/67
 """
@@ -17,6 +35,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import discord
+
+from ..notify_policy import owner_fallback_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +68,26 @@ class ThreadState(str, Enum):  # noqa: UP042 — requires-python = ">=3.10", Str
 
     WAITING_INPUT = "waiting"
     """Claude finished responding; awaiting the next user message."""
+
+
+def _completion_text(mention_id: int, no_response: bool) -> str:
+    """The turn-end ping. Says what actually happened (#562).
+
+    "終わりました" is a summons: the user drops what they are doing and comes to
+    look. When the turn produced nothing at all, that summons is a lie, and a
+    notification that lies stops being worth reading. So a turn that never
+    produced a response says so, and tells the reader what to do next instead of
+    implying an answer is waiting.
+
+    The mention trails the text either way so Discord's push preview leads with
+    the message rather than "@you" (#495).
+    """
+    if no_response:
+        return (
+            "⚠️ 応答がありませんでした — Claude がこのターンを開始しませんでした。"
+            f"もう一度送るか、tmux ペインを確認してください。 <@{mention_id}>"
+        )
+    return f"🟡 Claude has finished — your reply is needed here. <@{mention_id}>"
 
 
 @dataclass
@@ -108,12 +148,14 @@ class ThreadStatusDashboard:
         state: ThreadState,
         description: str,
         thread: discord.Thread | None = None,
+        notify_user_id: int | None = None,
+        no_response: bool = False,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
         When transitioning to ``WAITING_INPUT`` for the first time, the bot
-        posts a reply in *thread* mentioning the owner so Discord surfaces the
-        notification immediately.
+        posts a reply in *thread* mentioning the turn's poster so Discord
+        surfaces the notification immediately.
 
         Parameters
         ----------
@@ -124,7 +166,13 @@ class ThreadStatusDashboard:
         description:
             Short human-readable summary (e.g. the first 100 chars of the prompt).
         thread:
-            The ``discord.Thread`` object, required for owner mentions.
+            The ``discord.Thread`` object, required for mentions.
+        notify_user_id:
+            #481: the Discord user to @-mention on the WAITING_INPUT transition —
+            the poster of this turn. Falls back to the configured ``owner_id``
+            when ``None``. This makes the completion ping reach whoever is
+            actually waiting (any guild, any authorized user) instead of a single
+            fixed owner, and still fires when no owner is configured.
         """
         async with self._lock:
             prev_state = self._threads[thread_id].state if thread_id in self._threads else None
@@ -142,24 +190,36 @@ class ThreadStatusDashboard:
                 if description:
                     info.description = description
 
-            # Mention owner on first WAITING_INPUT transition
+            # #481: mention the turn's poster (notify_user_id); fall back to the
+            # configured owner. Mention on the first WAITING_INPUT transition.
+            # #525: the owner fallback for a turn nobody human asked for is
+            # deployment policy — a server running many automated threads reads
+            # "Claude has finished" pings for threads it never opened as noise.
+            owner_fallback = self._owner_id if owner_fallback_allowed("completion") else None
+            mention_id = notify_user_id if notify_user_id is not None else owner_fallback
             should_mention = (
                 state == ThreadState.WAITING_INPUT
                 and prev_state != ThreadState.WAITING_INPUT
-                and self._owner_id is not None
+                and mention_id is not None
                 and thread is not None
             )
 
             await self._refresh_dashboard()
 
         # Send mention outside the lock to avoid holding it during an HTTP call
-        if should_mention and thread is not None:
+        # ``mention_id`` is non-None whenever ``should_mention`` is set, but that
+        # is established inside the lock above and does not narrow out here.
+        if should_mention and thread is not None and mention_id is not None:
             try:
-                await thread.send(
-                    f"🟡 <@{self._owner_id}> Claude has finished — your reply is needed here."
-                )
+                # #495: the mention trails the text so the Discord push preview
+                # leads with "Claude has finished…" instead of "@you". A user
+                # mention pings anywhere in the content, so trailing it does not
+                # weaken the notification.
+                await thread.send(_completion_text(mention_id, no_response))
             except discord.HTTPException:
-                logger.debug("Failed to send owner mention in thread %d", thread_id, exc_info=True)
+                logger.debug(
+                    "Failed to send completion mention in thread %d", thread_id, exc_info=True
+                )
 
     async def remove(self, thread_id: int) -> None:
         """Remove a thread from the dashboard and refresh."""

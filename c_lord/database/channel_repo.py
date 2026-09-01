@@ -7,6 +7,7 @@ session directory management via /clord-init.
 from __future__ import annotations
 
 import logging
+import re
 
 import aiosqlite
 
@@ -69,6 +70,35 @@ def normalize_repo_url(url: str) -> str:
     return url
 
 
+# git's ``ext::`` remote helper runs the rest of the string as a command
+# (``git clone 'ext::sh -c id'``). No legitimate binding uses it.
+_EXEC_TRANSPORT_RE = re.compile(r"^\s*ext::", re.IGNORECASE)
+
+
+def validate_repo_url(url: str) -> str:
+    """Return *url* stripped, or raise ``ValueError`` if it is not safe to clone.
+
+    ``/clord repo:`` (#514) is the first path that puts an **end-user** string in
+    front of ``git clone`` — and unlike ``/clord-init`` it carries no
+    ``manage_guild`` requirement. That clone runs before Claude starts, so it is
+    outside the tool-permission model: whatever it executes is never approved by
+    anyone. Two forms are therefore refused outright:
+
+    * ``ext::<command>`` — git's remote helper that executes the command.
+    * anything starting with ``-`` — git reads it as an option, and
+      ``--upload-pack=<command>`` runs a command. ``session_dir`` also passes
+      ``--`` before the URL; this is the second lock on the same door.
+    """
+    url = url.strip()
+    if not url:
+        raise ValueError("リポジトリ URL が空です")
+    if url.startswith("-"):
+        raise ValueError(f"リポジトリ URL が `-` で始まっています: {url!r}")
+    if _EXEC_TRANSPORT_RE.match(url):
+        raise ValueError(f"`ext::` はコマンドを実行するため使えません: {url!r}")
+    return url
+
+
 def derive_session_name(source_repo: str) -> str:
     """Derive a tmux session name from a repository URL or path.
 
@@ -77,10 +107,20 @@ def derive_session_name(source_repo: str) -> str:
         'https://github.com/org/my-project.git' → 'my-project'
         'git@github.com:org/my-project.git'     → 'my-project'
         '/home/user/repos/my-project'           → 'my-project'
+        'git@github.com:org/NiyaReco.love.git'  → 'NiyaReco_love'
+
+    tmux forbids ``.`` and ``:`` in session names — its target syntax
+    ``session:window.pane`` uses them as separators — and silently rewrites
+    them to ``_`` when a session is created. We mirror that rewrite here so the
+    name c-lord later hands to ``tmux -t`` matches the one tmux actually stored.
+    Otherwise a dotted repo name (e.g. ``NiyaReco.love``) makes every window
+    op target a non-existent session and Claude never starts (#474).
     """
     name = source_repo.rstrip("/").rsplit("/", 1)[-1]
     if name.endswith(".git"):
         name = name[:-4]
+    # Match tmux's own `.`/`:` → `_` substitution (see session_check_name).
+    name = name.replace(".", "_").replace(":", "_")
     return name or "clord"
 
 

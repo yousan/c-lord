@@ -25,16 +25,95 @@ from c_lord.cogs._run_helper import (
 from c_lord.concurrency import SessionRegistry
 
 
+class TestPersistedContextWindow:
+    """#370: the window total is persisted per-model in the settings KV store.
+
+    tier is stable per (host, account, model), so a value learned once survives
+    bot restarts and other sessions on the same model — the /context probe
+    (which renders into the human-visible tmux pane) then fires at most once per
+    model per host, instead of once per session / bot-restart.
+    """
+
+    def _config(self, *, probe_total: int | None, settings_repo: object | None):
+        cfg = MagicMock()
+        cfg.runner.model = "opus"
+        cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        cfg.settings_repo = settings_repo
+        return cfg
+
+    def test_disk_hit_skips_probe(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value="1000000")
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=1_000_000, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-disk", "claude-opus-4-8", 50_000)
+        )
+
+        assert total == 1_000_000
+        settings.get.assert_awaited_once_with("context_window:claude-opus-4-8")
+        cfg.runner.probe_context_window.assert_not_awaited()
+
+    def test_disk_miss_probes_then_persists(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value=None)
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=1_000_000, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-miss", "claude-opus-4-8", 50_000)
+        )
+
+        assert total == 1_000_000
+        cfg.runner.probe_context_window.assert_awaited_once()
+        settings.set.assert_awaited_once_with("context_window:claude-opus-4-8", "1000000")
+
+    def test_probe_failure_is_not_persisted(self) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._context_window_cache.clear()
+        settings = MagicMock()
+        settings.get = AsyncMock(return_value=None)
+        settings.set = AsyncMock()
+        cfg = self._config(probe_total=None, settings_repo=settings)
+
+        total = asyncio.run(
+            _run_helper._resolve_context_window(cfg, "sess-failpersist", "claude-opus-4-8", 20_000)
+        )
+
+        # Probe failed → fallback used, and nothing is written to disk (a
+        # transient failure must not lock a wrong window in for every future
+        # session — mirrors the in-memory "do not cache on failure" rule).
+        assert total == 200_000
+        settings.set.assert_not_awaited()
+
+
 class TestPostContextUsage:
     """_post_context_usage posts the context line and caches the denominator."""
 
-    def _config(self, *, working_dir: str | None = "/tmp/x", probe_total: int | None = 1_000_000):
+    def _config(
+        self,
+        *,
+        working_dir: str | None = "/tmp/x",
+        probe_total: int | None = 1_000_000,
+        settings_repo: object | None = None,
+    ):
         cfg = MagicMock()
         cfg.thread.id = 12345
         cfg.thread.send = AsyncMock()
         cfg.runner.working_dir = working_dir
         cfg.runner.model = "opus"
         cfg.runner.probe_context_window = AsyncMock(return_value=probe_total)
+        # Default to None so existing tests exercise the no-persistence path; a
+        # bare MagicMock would make ``await settings_repo.get(...)`` blow up.
+        cfg.settings_repo = settings_repo
         return cfg
 
     def _patch_usage(self, monkeypatch, used: int | None):
@@ -147,12 +226,12 @@ class TestPostContextUsage:
         asyncio.run(rh._post_context_usage(cfg, "sess-4"))
         cfg.thread.send.assert_not_called()
 
-    def test_edits_last_reply_when_available(self, monkeypatch) -> None:
-        """The context line must be appended to the last reply (no new bubble).
+    def test_sends_new_message_ignoring_reply_tracker(self, monkeypatch) -> None:
+        """#455: footer is always a new message, never appended to the reply.
 
-        UX feedback: a separate bot message adds avatar/timestamp chrome that
-        feels obtrusive.  Editing the reply keeps the line inside the same
-        bubble as Claude's answer.
+        Even when reply_tracker has recorded the assistant reply message, the
+        footer must be sent as a standalone message so it appears AFTER
+        progress.txt and before the 🟡 mention.
         """
         from pathlib import Path
         from unittest.mock import MagicMock
@@ -164,9 +243,9 @@ class TestPostContextUsage:
         _run_helper._context_window_cache.clear()
         reply_tracker.reset_tracker()
 
-        # Simulate the api_server having recorded the assistant reply message.
+        # Even if the reply message is tracked, footer must NOT edit it.
         last_msg = MagicMock()
-        last_msg.content = "2"
+        last_msg.content = "Claude's answer"
         last_msg.edit = AsyncMock()
         reply_tracker.record_reply_message(12345, last_msg)
 
@@ -178,41 +257,24 @@ class TestPostContextUsage:
         monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
 
         cfg = self._config(probe_total=1_000_000)
-        asyncio.run(_run_helper._post_context_usage(cfg, "sess-edit"))
+        asyncio.run(_run_helper._post_context_usage(cfg, "sess-new-msg"))
 
-        # Edited the reply (no new send).
-        last_msg.edit.assert_awaited_once()
-        new_content = last_msg.edit.await_args.kwargs.get("content") or (
-            last_msg.edit.await_args.args[0] if last_msg.edit.await_args.args else ""
-        )
-        assert new_content.startswith("2\n")
-        assert "6%" in new_content
-        assert "1.0M" in new_content
-        cfg.thread.send.assert_not_called()
+        # Must send a new message, must NOT edit the reply.
+        cfg.thread.send.assert_awaited_once()
+        last_msg.edit.assert_not_called()
+        sent = cfg.thread.send.await_args.args[0]
+        assert "6%" in sent
+        assert "1.0M" in sent
 
-    def test_context_edit_preserves_embed_suppression_by_default(self, monkeypatch) -> None:
-        """#372: the context-line edit() must keep URL OGP cards suppressed.
-
-        discord.py's ``Message.edit`` defaults ``suppress=False`` (not MISSING),
-        so an edit that omits ``suppress`` explicitly *un*-suppresses embeds —
-        re-enabling the OGP card that reply_sink had suppressed at send-time.
-        ``_post_context_usage`` must pass ``suppress=True`` by default.
-        """
+    def test_send_suppresses_embeds_by_default(self, monkeypatch) -> None:
+        """#455/#372: new-message footer must suppress URL OGP embeds by default."""
         from pathlib import Path
-        from unittest.mock import MagicMock
 
         from c_lord.claude.context_usage import ContextUsage
         from c_lord.cogs import _run_helper
-        from c_lord.skills import reply_tracker
 
         monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
         _run_helper._context_window_cache.clear()
-        reply_tracker.reset_tracker()
-
-        last_msg = MagicMock()
-        last_msg.content = "see https://github.com/yousan/c-lord/issues"
-        last_msg.edit = AsyncMock()
-        reply_tracker.record_reply_message(12345, last_msg)
 
         monkeypatch.setattr(
             _run_helper, "read_latest_usage", lambda _p: ContextUsage(input_tokens=60_000)
@@ -222,26 +284,18 @@ class TestPostContextUsage:
         cfg = self._config(probe_total=1_000_000)
         asyncio.run(_run_helper._post_context_usage(cfg, "sess-suppress"))
 
-        last_msg.edit.assert_awaited_once()
-        assert last_msg.edit.await_args.kwargs.get("suppress") is True
+        cfg.thread.send.assert_awaited_once()
+        assert cfg.thread.send.await_args.kwargs.get("suppress_embeds") is True
 
-    def test_context_edit_respects_show_url_embeds_optin(self, monkeypatch) -> None:
-        """#372: CLORD_SHOW_URL_EMBEDS=true keeps embeds enabled on the edit too."""
+    def test_send_respects_show_url_embeds_optin(self, monkeypatch) -> None:
+        """#455/#372: CLORD_SHOW_URL_EMBEDS=true keeps embeds enabled on send."""
         from pathlib import Path
-        from unittest.mock import MagicMock
 
         from c_lord.claude.context_usage import ContextUsage
         from c_lord.cogs import _run_helper
-        from c_lord.skills import reply_tracker
 
         monkeypatch.setenv("CLORD_SHOW_URL_EMBEDS", "true")
         _run_helper._context_window_cache.clear()
-        reply_tracker.reset_tracker()
-
-        last_msg = MagicMock()
-        last_msg.content = "see https://github.com/yousan/c-lord/issues"
-        last_msg.edit = AsyncMock()
-        reply_tracker.record_reply_message(12345, last_msg)
 
         monkeypatch.setattr(
             _run_helper, "read_latest_usage", lambda _p: ContextUsage(input_tokens=60_000)
@@ -251,57 +305,11 @@ class TestPostContextUsage:
         cfg = self._config(probe_total=1_000_000)
         asyncio.run(_run_helper._post_context_usage(cfg, "sess-optin"))
 
-        last_msg.edit.assert_awaited_once()
-        assert last_msg.edit.await_args.kwargs.get("suppress") is False
+        cfg.thread.send.assert_awaited_once()
+        assert cfg.thread.send.await_args.kwargs.get("suppress_embeds") is False
 
-    def test_waits_briefly_for_reply_sink_then_edits(self, monkeypatch) -> None:
-        """In jsonl bridge mode the reply_sink races with the run-loop end.
-
-        Regression: _post_context_usage ran before transcript_mirror.reply_sink
-        finished posting + calling record_reply_message, so get_last_reply_message
-        returned None and the line was sent as a separate bubble. Wait briefly
-        (poll a few times) so the late reply_sink can still register before we
-        fall back.
-        """
-        from pathlib import Path
-        from unittest.mock import MagicMock
-
-        from c_lord.claude.context_usage import ContextUsage
-        from c_lord.cogs import _run_helper
-        from c_lord.skills import reply_tracker
-
-        _run_helper._context_window_cache.clear()
-        reply_tracker.reset_tracker()
-
-        # Schedule a late record_reply_message after a few asyncio ticks,
-        # simulating the transcript_mirror reply_sink firing slightly after
-        # _post_context_usage starts.
-        late_msg = MagicMock()
-        late_msg.content = "5"
-        late_msg.edit = AsyncMock()
-
-        async def runner():
-            async def late_register():
-                await asyncio.sleep(0.15)  # ~150ms after _post_context_usage starts
-                reply_tracker.record_reply_message(12345, late_msg)
-
-            asyncio.create_task(late_register())
-            await _run_helper._post_context_usage(cfg, "sess-race")
-
-        monkeypatch.setattr(
-            _run_helper,
-            "read_latest_usage",
-            lambda _p: ContextUsage(input_tokens=60_000),
-        )
-        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
-        cfg = self._config(probe_total=1_000_000)
-        asyncio.run(runner())
-
-        # Late-arriving reply was edited; no fresh send happened.
-        late_msg.edit.assert_awaited_once()
-        cfg.thread.send.assert_not_called()
-
-    def test_falls_back_to_send_when_no_tracked_message(self, monkeypatch) -> None:
+    def test_always_sends_new_message(self, monkeypatch) -> None:
+        """#455: footer always sent as new message regardless of reply tracker state."""
         from pathlib import Path
 
         from c_lord.claude.context_usage import ContextUsage
@@ -319,33 +327,6 @@ class TestPostContextUsage:
 
         cfg = self._config(probe_total=1_000_000)
         asyncio.run(_run_helper._post_context_usage(cfg, "sess-no-track"))
-        cfg.thread.send.assert_awaited_once()
-
-    def test_falls_back_to_send_when_edit_would_exceed_2000(self, monkeypatch) -> None:
-        from pathlib import Path
-        from unittest.mock import MagicMock
-
-        from c_lord.claude.context_usage import ContextUsage
-        from c_lord.cogs import _run_helper
-        from c_lord.skills import reply_tracker
-
-        _run_helper._context_window_cache.clear()
-        reply_tracker.reset_tracker()
-        last_msg = MagicMock()
-        last_msg.content = "x" * 1990  # leaves <= 10 chars; context line is longer
-        last_msg.edit = AsyncMock()
-        reply_tracker.record_reply_message(12345, last_msg)
-
-        monkeypatch.setattr(
-            _run_helper,
-            "read_latest_usage",
-            lambda _p: ContextUsage(input_tokens=60_000),
-        )
-        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/fake.jsonl"))
-
-        cfg = self._config(probe_total=1_000_000)
-        asyncio.run(_run_helper._post_context_usage(cfg, "sess-toobig"))
-        last_msg.edit.assert_not_called()
         cfg.thread.send.assert_awaited_once()
 
     def test_skips_when_no_usage_in_transcript(self, monkeypatch) -> None:
@@ -651,7 +632,16 @@ class TestRunClaudeInThread:
 class TestNoReplyFallback:
     """Issue #67: when Claude finishes a turn without calling discord-reply,
     run_claude_with_config must surface a fallback notification so the user
-    isn't left staring at silence."""
+    isn't left staring at silence.
+
+    This fallback only exists in skill mode (#216/#492 made jsonl the
+    default), so pin CLORD_BRIDGE_MODE=skill here; test_no_fallback_in_jsonl_mode
+    below overrides it back to jsonl to test the opposite case.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _skill_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
 
     @pytest.fixture
     def thread(self) -> MagicMock:
@@ -845,6 +835,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -892,6 +883,7 @@ class TestRecoverMissedPaneAsk:
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
                 StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -925,6 +917,7 @@ class TestRecoverMissedPaneAsk:
         reset_tracker()
 
         runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
 
         async def gen_with_reply(*args, **kwargs):
             yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
@@ -945,6 +938,47 @@ class TestRecoverMissedPaneAsk:
             await run_claude_in_thread(thread, runner, repo, "hello", None)
 
         bridge.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stopped_run_does_not_rebridge_post_turn(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """A pre-empted (stopped) run must NOT re-bridge its leftover menu (#315).
+
+        When a follow-up message interrupts a turn parked on a menu, the run is
+        torn down (``runner.stopped`` is True).  Re-bridging here would re-park it
+        on a fresh ``timeout=None`` await, so the new turn could never start — the
+        exact failure observed on staging (the ⚡ fired but no new run began).
+        """
+        from unittest.mock import patch
+
+        from c_lord.claude.tmux_runner import TmuxClaudeRunner
+        from c_lord.claude.types import AskOption, AskQuestion
+        from c_lord.skills.reply_tracker import reset_tracker
+
+        reset_tracker()
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = True  # deliberately pre-empted by a follow-up message
+        runner.run = self._make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
+            ]
+        )
+        runner.peek_pending_ask = AsyncMock(
+            return_value=AskQuestion(
+                question="Which environment?",
+                header="Deploy",
+                options=[AskOption(label="Production", description="本番")],
+            )
+        )
+
+        with patch("c_lord.cogs._run_helper.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        bridge.assert_not_awaited()
+        runner.peek_pending_ask.assert_not_called()
 
 
 class TestMakeErrorEmbed:
@@ -1261,3 +1295,57 @@ class TestLiveToolTimer:
 
         # All timers should be cleared after run completes
         # (verified indirectly: no ghost tasks, session finishes cleanly)
+
+
+class TestGetCliVersion:
+    """_get_cli_version() must parse the first token from ``claude --version``."""
+
+    def _make_proc(self, output: str):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(output.encode(), b""))
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_parses_version_from_first_token(self, monkeypatch) -> None:
+        """``2.1.181 (Claude Code)`` → ``"2.1.181"`` (parts[0], not parts[-1])."""
+        from c_lord.cogs import _run_helper
+
+        _run_helper._cli_version_fetched = False
+        _run_helper._cli_version = None
+
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=self._make_proc("2.1.181 (Claude Code)\n")),
+        )
+        version = await _run_helper._get_cli_version()
+        assert version == "2.1.181"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failure(self, monkeypatch) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._cli_version_fetched = False
+        _run_helper._cli_version = None
+
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError("claude not found")),
+        )
+        version = await _run_helper._get_cli_version()
+        assert version is None
+
+    @pytest.mark.asyncio
+    async def test_caches_after_first_call(self, monkeypatch) -> None:
+        from c_lord.cogs import _run_helper
+
+        _run_helper._cli_version_fetched = False
+        _run_helper._cli_version = None
+
+        exec_mock = AsyncMock(return_value=self._make_proc("1.0.0 (Claude Code)\n"))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
+
+        await _run_helper._get_cli_version()
+        await _run_helper._get_cli_version()
+        exec_mock.assert_awaited_once()

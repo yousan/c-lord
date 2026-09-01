@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 
+from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from ..discord_ui.embeds import (
@@ -31,6 +32,7 @@ from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
 from ..discord_ui.progress_folder import ProgressFolder
 from ..discord_ui.tool_timer import LiveToolTimer
+from ..utils.logger import log_ctx
 from .run_config import RunConfig
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,12 @@ logger = logging.getLogger(__name__)
 # Sized to show ~30 lines of typical output (100 chars/line × 30 = 3000).
 # The embed description limit is 4096, so this leaves room for code block markers.
 _TOOL_RESULT_MAX_CHARS = 3000
+
+# Caption for a standalone ``progress.txt`` post (#542).  Sent as Discord
+# subtext (``-# ``) so it identifies the attachment without adding a full-size
+# message to the thread — an attachment on an otherwise empty message tells the
+# reader nothing about what the file is.
+PROGRESS_ATTACHMENT_NOTE = "-# 📄 progress.txt — このターンのツール実行ログ"
 
 
 def _truncate_result(content: str) -> str:
@@ -126,6 +134,19 @@ class EventProcessor:
     # Public methods
     # ------------------------------------------------------------------
 
+    @property
+    def _notify_mention(self) -> str | None:
+        """Message content that pings the turn's poster, or None (#480).
+
+        Interactive prompts (permission / plan / elicitation / ask) block the
+        turn awaiting input. Discord only pushes reliably when the *message
+        content* carries ``<@id>`` — an embed never pings — so each prompt is
+        posted with this content. None when no notify user is configured, in
+        which case the prompt is posted with no content (unchanged behaviour).
+        """
+        uid = self._config.notify_user_id
+        return f"<@{uid}>" if uid is not None else None
+
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
         if event.message_type == MessageType.SYSTEM:
@@ -203,7 +224,7 @@ class EventProcessor:
         # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
         if not self._config.session_id and not self._session_start_sent:
             msg = await self._config.thread.send(embed=session_start_embed(self._state.session_id))
-            self._folder.track(msg, f"[session start] {self._state.session_id}")
+            self._folder.track(msg, f"[session start] {self._state.session_id}", meaningful=False)
             self._session_start_sent = True
 
     async def _on_assistant(self, event: StreamEvent) -> None:
@@ -283,6 +304,10 @@ class EventProcessor:
         from ._run_helper import _make_error_embed
 
         if event.error:
+            # #562: tell the caller this turn produced nothing, so the turn-end
+            # ping says "応答がありませんでした" instead of "Claude has finished".
+            if event.error.startswith(NO_RESPONSE_ERROR_PREFIX):
+                self._config.outcome.no_response = True
             err_msg = await self._config.thread.send(embed=_make_error_embed(event.error))
             if err_msg is not None:
                 self._last_response_msg = err_msg
@@ -343,18 +368,20 @@ class EventProcessor:
         # ExitPlanMode does not carry a request_id in the current CLI protocol;
         # we use the session_id as a stable identifier for the inject payload.
         request_id = self._state.session_id or "plan"
-        view = PlanApprovalView(self._config.runner, request_id)
+        view = PlanApprovalView(self._config.runner, request_id, authorizer=self._config.authorizer)
         with contextlib.suppress(Exception):
-            await self._config.thread.send(embed=embed, view=view)
+            await self._config.thread.send(content=self._notify_mention, embed=embed, view=view)
         logger.info("Plan approval prompt posted (session=%s)", request_id)
 
     async def _handle_permission_request(self, event: StreamEvent) -> None:
         """Post permission embed with Allow/Deny buttons."""
         assert event.permission_request is not None
         embed = permission_embed(event.permission_request)
-        view = PermissionView(self._config.runner, event.permission_request)
+        view = PermissionView(
+            self._config.runner, event.permission_request, authorizer=self._config.authorizer
+        )
         with contextlib.suppress(Exception):
-            await self._config.thread.send(embed=embed, view=view)
+            await self._config.thread.send(content=self._notify_mention, embed=embed, view=view)
         logger.info(
             "Permission request posted: %s (request_id=%s)",
             event.permission_request.tool_name,
@@ -374,6 +401,20 @@ class EventProcessor:
             # Non-tmux runner — nothing to answer in a pane.  Skip gracefully.
             logger.warning("pane_ask received but runner cannot answer menus; skipping")
             return
+        # #535: this menu may already be on screen — the transcript mirror and
+        # the #359 watchdog bridge the same TUI menu from their own triggers.
+        # Bridging it again posted a second, identical set of buttons and stole
+        # the first bridge's answer queue.  ``bridge_pane_ask`` refuses the
+        # duplicate on its own (register is the atomic claim); checking here as
+        # well keeps the "bridged and answered" log honest and skips the work.
+        from ..discord_ui.ask_bus import ask_bus
+
+        if ask_bus.is_active(self._config.thread.id):
+            logger.info(
+                "%s pane_ask ignored — another bridge already owns this menu (#535)",
+                log_ctx(thread_id=self._config.thread.id),
+            )
+            return
         from ..discord_ui.ask_handler import bridge_pane_ask
 
         await bridge_pane_ask(
@@ -381,6 +422,8 @@ class EventProcessor:
             event.pane_ask,
             runner,
             ask_repo=self._config.ask_repo,
+            authorizer=self._config.authorizer,
+            notify_user_id=self._config.notify_user_id,
         )
         logger.info(
             "AskUserQuestion bridged and answered for thread %d",
@@ -393,11 +436,11 @@ class EventProcessor:
         req = event.elicitation
         embed = elicitation_embed(req)
         if req.mode == "url-mode":
-            view = ElicitationUrlView(self._config.runner, req)
+            view = ElicitationUrlView(self._config.runner, req, authorizer=self._config.authorizer)
         else:
-            view = ElicitationFormView(self._config.runner, req)
+            view = ElicitationFormView(self._config.runner, req, authorizer=self._config.authorizer)
         with contextlib.suppress(Exception):
-            await self._config.thread.send(embed=embed, view=view)
+            await self._config.thread.send(content=self._notify_mention, embed=embed, view=view)
         logger.info(
             "Elicitation posted: %s (%s, request_id=%s)",
             req.server_name,
@@ -441,10 +484,16 @@ class EventProcessor:
         completed run.
         """
         if self._folder.is_empty:
+            # Nothing worth reading was collected — do NOT ship a progress.txt
+            # whose only line is the session-start banner (#542).  The tracked
+            # embeds are still cleaned up, so the thread ends in the same state
+            # as a folded turn, just without the empty bubble.
+            await self._folder.cleanup_messages()
             return
 
         file = self._folder.build_file()
         if file is None:
+            await self._folder.cleanup_messages()
             return
 
         attached = False
@@ -457,10 +506,12 @@ class EventProcessor:
 
         if not attached:
             # No final response message (or edit failed): rebuild and send standalone.
+            # #542: always carry a one-line caption — a bare attachment on an
+            # empty message gives the reader no idea what the file is.
             file = self._folder.build_file()
             if file is not None:
                 with contextlib.suppress(Exception):
-                    await self._config.thread.send(file=file)
+                    await self._config.thread.send(content=PROGRESS_ATTACHMENT_NOTE, file=file)
 
         await self._folder.cleanup_messages()
 

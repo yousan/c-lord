@@ -5,10 +5,20 @@ counterpart in the tmux pane are rendered.  Everything else (thinking,
 framing meta like ``ai-title`` / ``pr-link`` / ``permission-mode``, the
 self-loopback of c-lord-driven input marked with a zero-width-space prefix)
 returns ``None`` and is dropped before it ever reaches Discord.
+
+The rendered form mirrors what a human sees in the Claude Code **TUI**, not
+the raw JSONL storage bytes.  In particular, a ``!``-prefixed bash-mode
+command is stored as ``user``-role string events wrapped in
+``<bash-input>`` / ``<bash-stdout>`` / ``<bash-stderr>`` tags — an internal
+encoding the TUI renders as a bash block and never shows raw.  We therefore
+classify those as tool activity (``tool_use`` / ``tool_result``) so they
+fold into ``progress.txt`` in minimal mode instead of leaking the raw tags
+as a 👤 user-input bubble (#487).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +98,196 @@ def _tool_result_body(block: dict[str, Any]) -> str:
     return ""
 
 
+# Claude Code bash-mode (``! command``) markers (#487).  A ``!``-prefixed pane
+# command is stored in the JSONL as ``user``-role *string* events wrapped in
+# these tags — the CLI's internal storage form, which the TUI renders as a bash
+# block and never shows raw.  They are a bash *execution*, not human-typed
+# input, so the mirror must render them like the Bash tool (``tool_use`` /
+# ``tool_result`` → folded into progress.txt in minimal mode) rather than leak
+# the raw ``<bash-*>`` tags as a 👤 user_input bubble.
+_BASH_INPUT_RE = re.compile(r"^<bash-input>(.*)</bash-input>$", re.DOTALL)
+_BASH_OUTPUT_RE = re.compile(
+    r"^<bash-stdout>(.*)</bash-stdout><bash-stderr>(.*)</bash-stderr>$", re.DOTALL
+)
+# Placeholder the CLI writes when a ``!`` command produced no output — noise, drop it.
+_BASH_NO_OUTPUT = "(Bash completed with no output)"
+_BASH_TAG_RE = re.compile(r"</?bash-(?:input|stdout|stderr)>")
+
+
+# Claude Code harness task notifications (#380).  When a background task
+# finishes or is killed the harness injects a ``user``-role *string* event
+# wrapped in these tags.  Nobody typed it, so mirroring it as a 👤 bubble shows
+# the reader a message they never sent — raw XML, and with it the internal
+# ``<output-file>`` path (measured 2026-08-27: every leaked message exposed
+# one).  Same shape and same reasoning as the ``<bash-*>`` markers above:
+# harness bookkeeping, not human input.
+#
+# Only ``<summary>`` is worth keeping — it is the one field written for a person
+# to read ("Background command ... completed (exit code 0)").  The task id, the
+# tool-use id and the output path are internal, and the path is the leak itself.
+_TASK_NOTIFICATION_OPEN = "<task-notification>"
+_TASK_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
+_TASK_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.DOTALL)
+_TASK_TAG_RE = re.compile(r"</?task-notification>|<[^>]+>")
+
+
+def _is_task_notification(text: str) -> bool:
+    """True when *text* (already stripped) is a harness task notification."""
+    return text.startswith(_TASK_NOTIFICATION_OPEN)
+
+
+def _render_task_notification(text: str, session_id: str | None) -> RenderedEvent | None:
+    """Render a task notification as tool activity, or ``None`` to drop it (#380).
+
+    Folded into ``progress.txt`` in minimal mode like any other tool result, so
+    the record survives without a 👤 bubble per background task.  It also counts
+    as tool activity for the in-turn progress line (#539), which is what makes
+    "a background task is running" visible during the turn without spending a
+    message on it.
+
+    Falls back to ``<status>`` when there is no summary, and to tag-stripping for
+    a malformed marker — the raw storage form must never reach Discord (#487).
+    """
+    m = _TASK_SUMMARY_RE.search(text)
+    detail = m.group(1).strip() if m is not None else ""
+    if not detail:
+        m = _TASK_STATUS_RE.search(text)
+        detail = m.group(1).strip() if m is not None else ""
+    if not detail:
+        # Malformed or empty: strip every tag rather than leak the storage form.
+        detail = _TASK_TAG_RE.sub("", text).strip()
+    if not detail:
+        return None
+    return RenderedEvent(
+        kind="tool_result",
+        body=f"⏹ バックグラウンド: {detail}",
+        session_id=session_id,
+    )
+
+
+# Claude Code context compaction (#628).  When the context window fills, the
+# harness compacts the conversation and re-primes the session by injecting the
+# summary as a ``user``-role string event — 14 988 characters of English on
+# 2026-08-29, which the reply chunker split into **9** Discord messages, every
+# one of them wearing a 👤 saying the user had written it.
+#
+# The harness marks the event for exactly this purpose: ``isCompactSummary``
+# says it is the compaction prime, and ``isVisibleInTranscriptOnly`` says the
+# CLI shows it in the transcript view and nowhere else — the same judgement
+# Discord needs.  Matching on those beats matching on the English opening
+# sentence, which is a UI string that can be reworded and that a user could
+# legitimately quote; the text test stays only as a fallback for an older CLI
+# that wrote the block without the flags.
+_COMPACT_FLAGS = ("isCompactSummary", "isVisibleInTranscriptOnly")
+_COMPACT_OPENING = "This session is being continued from a previous conversation"
+_COMPACT_NOTICE = "🗜️ コンテキストを圧縮しました"
+
+# Slash commands typed in the pane (``/compact``, ``/clear``, …).  Same storage
+# shape and same reasoning as the ``<bash-*>`` markers of #487: the CLI records
+# the invocation and its output as ``user``-role strings wrapped in tags the TUI
+# renders and never shows raw.
+# A real record always closes its tag; requiring that is what keeps a human
+# *talking about* ``<command-name>`` from being mistaken for one (#628 AC4).
+_COMMAND_MARKER_RE = re.compile(r"^<(command-name|local-command-stdout)>.*</\1>", re.DOTALL)
+_COMMAND_NAME_RE = re.compile(r"^<command-name>(.*?)</command-name>", re.DOTALL)
+_LOCAL_STDOUT_RE = re.compile(r"^<local-command-stdout>(.*)</local-command-stdout>$", re.DOTALL)
+_COMMAND_TAG_RE = re.compile(r"</?(?:command-name|command-message|command-args)>")
+# The CLI writes its slash-command output with the terminal's own colour codes.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _is_compact_summary(event: dict[str, Any], text: str) -> bool:
+    """True when *event* is the post-compaction priming prompt (#628)."""
+    if any(event.get(flag) for flag in _COMPACT_FLAGS):
+        return True
+    return text.startswith(_COMPACT_OPENING)
+
+
+def _render_compact_summary(session_id: str | None) -> RenderedEvent:
+    """One line saying the context was compacted — never the summary itself.
+
+    Not dropped silently (#628 AC3): compaction is why Claude can suddenly seem
+    to have forgotten the earlier part of a thread, so the fact that it happened
+    is worth keeping.  What is not worth keeping is the wall of harness prompt it
+    arrived in.  ``tool_result`` folds it into ``progress.txt`` in minimal mode —
+    the same treatment ``<task-notification>`` got in #380 — so the record
+    survives without spending a Discord message on it.
+    """
+    return RenderedEvent(kind="tool_result", body=_COMPACT_NOTICE, session_id=session_id)
+
+
+def _is_slash_command_marker(text: str) -> bool:
+    """True when *text* (already stripped) is a slash-command storage marker.
+
+    The closing tag is required: unlike ``<bash-input>``/``<task-notification>``,
+    ``<command-name>`` is a short, quotable word, and "``<command-name>`` の話を
+    したい" is a person asking about it — not the CLI recording a command (#628
+    AC4).  A real record is always well-formed, so nothing genuine is lost.
+    """
+    return _COMMAND_MARKER_RE.match(text) is not None
+
+
+def _render_slash_command(text: str, session_id: str | None) -> RenderedEvent | None:
+    """Render a slash-command marker as tool activity, or ``None`` to drop it.
+
+    ``<command-name>`` → a ``tool_use`` reading like the command the user typed.
+    ``<local-command-stdout>`` → a ``tool_result`` with the terminal's colour
+    codes stripped; empty output is dropped rather than posted as a blank bubble.
+    Anything that starts with one of the tags but does not match falls back to
+    stripping them, so the raw storage form can never reach Discord (#487).
+    """
+    m = _COMMAND_NAME_RE.match(text)
+    if m is not None:
+        name = m.group(1).strip()
+        if name:
+            return RenderedEvent(kind="tool_use", body=f"🔧 {name}", session_id=session_id)
+    m = _LOCAL_STDOUT_RE.match(text)
+    if m is not None:
+        body = _ANSI_RE.sub("", m.group(1)).strip()
+        if not body:
+            return None
+        return RenderedEvent(kind="tool_result", body=body, session_id=session_id)
+    stripped = _ANSI_RE.sub("", _COMMAND_TAG_RE.sub("", text)).strip()
+    if not stripped:
+        return None
+    return RenderedEvent(kind="tool_result", body=stripped, session_id=session_id)
+
+
+def _is_bash_mode_marker(text: str) -> bool:
+    """True when *text* (already stripped) is a Claude Code bash-mode marker."""
+    return text.startswith("<bash-input>") or text.startswith("<bash-stdout>")
+
+
+def _render_bash_mode(text: str, session_id: str | None) -> RenderedEvent | None:
+    """Render a bash-mode marker as tool activity, or ``None`` to drop it (#487).
+
+    ``<bash-input>`` → a ``tool_use`` rendered exactly like the Bash tool.
+    ``<bash-stdout>``/``<bash-stderr>`` → a ``tool_result`` carrying the combined
+    output; empty output (or the "no output" placeholder) is dropped.  A marker
+    that starts with a bash tag but does not fully match falls back to stripping
+    the tags so the raw storage form can never reach Discord.
+    """
+    m = _BASH_INPUT_RE.match(text)
+    if m is not None:
+        command = m.group(1).strip()
+        return RenderedEvent(kind="tool_use", body=f"🔧 Bash: `{command}`", session_id=session_id)
+    m = _BASH_OUTPUT_RE.match(text)
+    if m is not None:
+        parts = [
+            chunk.strip()
+            for chunk in (m.group(1), m.group(2))
+            if chunk.strip() and chunk.strip() != _BASH_NO_OUTPUT
+        ]
+        if not parts:
+            return None
+        return RenderedEvent(kind="tool_result", body="\n".join(parts), session_id=session_id)
+    # Malformed marker: strip the tags rather than leak them raw.
+    stripped = _BASH_TAG_RE.sub("", text).strip()
+    if not stripped:
+        return None
+    return RenderedEvent(kind="tool_result", body=stripped, session_id=session_id)
+
+
 def _render_user(event: dict[str, Any]) -> RenderedEvent | None:
     if event.get("isMeta"):
         return None
@@ -115,10 +315,26 @@ def _render_user(event: dict[str, Any]) -> RenderedEvent | None:
         )
 
     if isinstance(content, str):
+        stripped = content.strip()
+        # #487: bash-mode markers are a bash execution, not human input — render
+        # them like the Bash tool (buffered to progress.txt) instead of leaking
+        # the raw ``<bash-*>`` tags as a 👤 bubble.  Handles both the render and
+        # the drop (empty output) cases.
+        if _is_bash_mode_marker(stripped):
+            return _render_bash_mode(stripped, event.get("sessionId"))
+        # #380: harness bookkeeping, not human input — same treatment as above.
+        if _is_task_notification(stripped):
+            return _render_task_notification(stripped, event.get("sessionId"))
+        # #628: the same class again — the harness's slash-command records and
+        # the prompt it re-primes the session with after compacting.
+        if _is_slash_command_marker(stripped):
+            return _render_slash_command(stripped, event.get("sessionId"))
+        if _is_compact_summary(event, stripped):
+            return _render_compact_summary(event.get("sessionId"))
         if content.startswith(ZWSP_MARKER):
             # Echo of c-lord-driven send-keys; Discord already has the original.
             return None
-        if not content.strip():
+        if not stripped:
             return None
         return RenderedEvent(
             kind="user_input",

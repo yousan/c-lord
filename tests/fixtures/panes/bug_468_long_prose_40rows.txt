@@ -1,0 +1,40 @@
+  meaning that two packets from the same message might take entirely different paths before arriving. This packet-switching approach makes the network resilient, because if one route fails, traffic   
+  can simply be redirected around the damage.                                                                                                                                                           
+                                                                                                                                                                                                        
+  Raw addressing alone does not guarantee that data arrives intact or in the right order, which is where the Transmission Control Protocol comes in. TCP sits atop IP and establishes a reliable        
+  connection between two endpoints through a process known as the three-way handshake, ensuring both sides are ready to communicate. It numbers each packet, waits for acknowledgments, and retransmits
+  anything that gets lost, reassembling the pieces into a faithful copy of the original data. For applications where speed matters more than perfect reliability, such as live video or online gaming, 
+  the lighter User Datagram Protocol offers a faster but less careful alternative. The pairing of IP for addressing and TCP for reliability forms the celebrated TCP/IP suite that underpins nearly all 
+  internet communication.                                                                                                                                                                               
+                                                                                                                                                                                                        
+  Because humans remember names far better than strings of numbers, the Domain Name System acts as the internet's distributed phone book. When you type a web address like example.com, your computer   
+  first queries a DNS resolver to translate that human-friendly name into the numerical IP address of the server that hosts the site. This lookup may cascade through several tiers of servers, from   
+  root servers down to authoritative name servers, with results cached along the way to speed up future requests. The hierarchical and decentralized nature of DNS means no single machine holds the   
+  entire map, yet the system reliably resolves billions of queries every day. Once the address is known, your device can finally open a connection to the correct server and begin requesting the       
+  content you actually want.                                                                                                                                                                            
+                                                                                                                                                                                                        
+  With a connection established to the right server, the web browser and the server converse using the Hypertext Transfer Protocol, or its encrypted variant HTTPS. The browser sends a request asking  
+  for a particular resource, and the server responds with the requested data along with status codes indicating success or failure. When HTTPS is used, a layer of encryption called TLS wraps the     
+  entire exchange, scrambling the data so that eavesdroppers along the path cannot read or tamper with it. This security relies on certificates and cryptographic keys that let the browser verify it is
+  genuinely talking to the intended server and not an impostor. The data that flows back is typically composed of HTML documents, stylesheets, scripts, images, and other assets that together make up  
+  a web page.                                                                                                                                                                                           
+                                                                                                                                                                                                        
+  Finally, the web browser takes this stream of raw resources and transforms it into the interactive experience a person actually sees and uses. It parses the HTML into a structured document tree,    
+  applies CSS rules to determine layout, color, and typography, and executes JavaScript to add behavior and interactivity. The browser's rendering engine paints pixels to the screen, while its       
+  networking, storage, and security subsystems quietly manage everything from cookies to cached files behind the scenes. All of this happens in a fraction of a second, repeated continuously as you   
+  scroll, click, and navigate from one page to the next. In this way the long journey from photons in a glass fiber culminates in the familiar window through which billions of people experience the   
+  internet every single day.                                                                                                                                                                            
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Continue?                                                                                                                                                                                            
+                                                                                                                                                                                                        
+The eight-paragraph essay is complete. Would you like me to continue?                                                                                                                                  
+                                                                                                                                                                                                        
+❯ 1. Yes                                                                                                                                                                                                
+     Continue with more content or a follow-up to the essay.                                                                                                                                            
+  2. No                                                                                                                                                                                                 
+     Stop here; the essay is finished.                                                                                                                                                                 
+  3. Type something.                                                                                                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this                                                                                                                                                                                    
+                                                                                                     
+Enter to select · ↑/↓ to navigate · Esc to cancel                          

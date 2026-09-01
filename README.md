@@ -160,7 +160,8 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
 - **Compact detection** — Notifies in-thread when context compaction occurs (trigger type + token count before compact)
 - **Hard stall notification** — Thread message after 30 s of no activity (extended thinking or context compression); resets automatically when Claude resumes
-- **Timeout notifications** — Embed with elapsed time and resume guidance on timeout
+- **Turn progress line** — When a turn goes quiet for 90 s, one subtext line appears (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), refreshes in place every 15 s, and disappears the moment real output returns; says `⏳ 待機中` when even tool activity has stopped. Never posted outside a turn. Opt out with `CLORD_TURN_PROGRESS=0` (#539)
+- **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541)
 
 #### 🔌 Input & Skills
 - **Attachment support** — Text files auto-appended to prompt (up to 5 × 50 KB); images downloaded and passed via `--image` (up to 4 × 5 MB)
@@ -190,13 +191,13 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Manual upgrade trigger** — `/upgrade` slash command lets authorised users trigger the upgrade pipeline directly from Discord (opt-in via `slash_command_enabled=True`)
 
 ### Session Management
-- **Session list** — `/sessions` lists all known sessions
-- **Resume info** — `/resume-info` shows the CLI command to continue the current session in a terminal
+- **Channel status** — `/clord-status` lists this channel's sessions with directory size, the `tmux attach` target, and the `claude --resume` command; `show_all` includes closed sessions (`docker ps -a` style). Supersedes the old `/sessions`, `/session-dirs`, `/resume-info`.
 - **Startup resume** — Interrupted sessions restart automatically after any bot reboot; `AutoUpgradeCog` (upgrade restarts) and `ClaudeChatCog.cog_unload()` (all other shutdowns) mark them automatically, or use `POST /api/mark-resume` manually
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
 - **Worktree management** — `/worktree-list` shows all active session worktrees with clean/dirty status; `/worktree-cleanup` removes orphaned clean worktrees (supports `dry_run` preview)
 - **Runtime model switching** — `/model-show` displays the current global model and per-thread session model; `/model-set` changes the model for all new sessions without restart
+- **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; the thread each one belonged to gets a 🧹 notice saying so and what survived on disk (#554). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
 
 ### Security
 - **No shell injection** — `asyncio.create_subprocess_exec` only, never `shell=True`
@@ -280,6 +281,43 @@ c-lord start --env /path/to/.env   # custom .env location
 
 Send a message in the configured channel — Claude will reply in a new thread.
 
+### Run as a Service (systemd --user — survives reboot)
+
+To keep c-lord running in the background and **start it automatically when the
+host reboots**, install it as a `systemd --user` service. From your clone:
+
+```bash
+bash scripts/install-systemd.sh
+```
+
+This generates `~/.config/systemd/user/c-lord.service` (pointing at this clone
+and your `uv`), enables it, and turns on **linger** so the service starts on
+boot even when no one is logged in. Then manage it with standard systemd:
+
+```bash
+systemctl --user restart c-lord.service     # after a `git pull`
+systemctl --user stop    c-lord.service
+systemctl --user status  c-lord.service
+journalctl --user -u c-lord.service -f      # live logs
+```
+
+Why `--user` instead of a system service: c-lord drives the user's `tmux`,
+`~/.claude` session files, `uv`, and the `claude` CLI, so it runs cleanest as
+**you**, with your environment — a root/system service would have to re-create
+all of that via `User=`/`Environment=`. `loginctl enable-linger "$USER"` is what
+makes a user service survive logout and start at boot; the installer runs it for
+you.
+
+> **Manual install:** copy [`deploy/c-lord.service`](deploy/c-lord.service), fix
+> the two `CHANGE-ME` paths (clone dir + `uv`), then
+> `systemctl --user daemon-reload && systemctl --user enable --now c-lord.service && loginctl enable-linger "$USER"`.
+
+> **WSL note:** if `systemctl --user` reports `Failed to connect to bus`, the
+> user D-Bus session isn't up. Ensure `systemd=true` under `[boot]` in
+> `/etc/wsl.conf` and reboot WSL (`wsl --shutdown`), or restart the bot by
+> killing it and letting `Restart=always` respawn it (`pkill -f c_lord.main` is
+> unsafe with multiple clones — kill by PID).
+
 ---
 
 ### Minimal Bot (Install as a Package)
@@ -343,13 +381,15 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | Model to use | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | Permission mode for CLI | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Working directory for Claude | current dir |
-| `MAX_CONCURRENT_SESSIONS` | Max parallel sessions | `3` |
+| `MAX_CONCURRENT_SESSIONS` | Max **turns running at once**. Not a cap on resident `claude` processes — the semaphore wraps turn execution only and is released when the turn ends, while the tmux pane lives on. For the resident cap see `CLORD_MAX_RESIDENT_WORKSPACES` (#576). | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | Max workspaces holding a live `claude` at once. Over the cap, the longest-idle ones are put to sleep; creating a new workspace is never blocked. Unlike the idle TTLs this default **is** host-dependent, so it is computed from `MemTotal` (cgroup limit first) rather than shipped as a constant. `0` disables. See `docs/specs/resident-cap.md`. | auto (`max(2, MemTotal_GiB × 0.4 / 0.45)`) |
 | `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout | `300` |
 | `DISCORD_OWNER_ID` | User ID to @-mention when Claude needs input | (optional) |
+| `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end + pauses), `blocked` (pauses only), `off` (never) | `blocked` |
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
-| `CLORD_BRIDGE_MODE` | Set to `jsonl` to enable TranscriptMirror (tails Claude Code JSONL transcripts and forwards events to Discord threads) | (optional) |
+| `CLORD_BRIDGE_MODE` | `jsonl` (default) tails Claude Code JSONL transcripts and forwards events to Discord threads (TranscriptMirror, #216). Set to `skill` to use the legacy discord-reply skill-push path instead (#53) — Claude must actively call a skill each turn to reach Discord, which is less reliable. | `jsonl` |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
 
@@ -360,6 +400,10 @@ When Claude's reply contains a URL (e.g. a GitHub Issues link), Discord would no
 ### Table Image Rendering (CLORD_RENDER_TABLE_IMAGES)
 
 When enabled, Markdown pipe tables in Claude's responses are rendered as PNG images using [Pillow](https://python-pillow.github.io/) and attached to the Discord message alongside the text. Each cell is split into text and emoji runs: **text is drawn with a CJK-capable font and emoji are drawn in full color** from a color emoji font, so 🟢/🔴 status lamps keep their color.
+
+**Inline markdown inside cells is collapsed to plain text** before drawing — the image cannot be made interactive, so leaving the raw syntax in would just leak noise. `[label](url)` / `![alt](url)` become `label` (the URL is unclickable in an image and only adds clutter), and `**bold**` / `*italic*` / `` `code` `` keep only their inner text. Underscore emphasis (`_x_`, `__x__`) is intentionally left untouched so identifiers such as `_is_allowed` / `__init__` are not mangled.
+
+**`~~strike~~` is the exception: it is drawn as a real strikethrough rule.** A picture *can* show a line through the text, and Claude uses strikethrough in tables to mean "this row is the one being dropped" — Discord strikes it in the message body, so collapsing it to plain text in the image would make the two disagree and invert the meaning of the table. The rule follows the text across wrapped lines and applies to part of a cell (`~~a~~ b`) as well as the whole of it.
 
 **Installation:**
 
@@ -388,6 +432,20 @@ c-lord renders text and emoji separately, picking the first font found in each g
 
 If no color emoji font is present, c-lord falls back to a monochrome emoji font (glyph shapes, no color), then to drawing the raw character. Use the **CBDT** Noto Color Emoji — Pillow renders it with `embedded_color=True`.
 
+> **Seeing empty boxes (□) instead of Japanese text in a screenshot?** That's a
+> missing font on *this* machine/user, not a bug — none of the paths above
+> were found, so rendering fell back to a Latin-only font. It's a per-user,
+> per-host install (`~/.local/share/fonts/`), so it won't carry over to a
+> different Linux user account or a fresh host even if it already works
+> elsewhere.
+>
+> **If you're not comfortable running terminal commands yourself, that's
+> fine — just hand the block below to your AI assistant** (your Claude Code
+> session, or the c-lord Claude thread itself) and ask it to run it for you.
+> It's written to be safe for an AI to execute unattended: it only writes to
+> your own home directory, needs no `sudo`, and touches nothing outside
+> `~/.local/share/fonts/`.
+
 **Quick install for Japanese + color emoji (Linux):**
 ```bash
 mkdir -p ~/.local/share/fonts
@@ -412,12 +470,27 @@ Long cells are wrapped to a bounded width (`MAX_COL_WIDTH`, display-width aware 
 2. Create a bot and copy the token
 3. Enable **Message Content Intent** under Privileged Gateway Intents
 4. Invite the bot with these permissions:
+   - View Channel
    - Send Messages
    - Create Public Threads
    - Send Messages in Threads
    - Add Reactions
    - Manage Messages (for reaction cleanup)
    - Read Message History
+
+> **Private / permission-locked channels:** if a channel denies **View Channel**
+> to `@everyone` (a private channel), the server-wide invite above is *not* enough
+> — Discord's channel-level deny overrides it. You must add the **bot's role**
+> (or the bot member) to that channel's permission overrides and grant at least
+> **View Channel**, **Create Public Threads**, **Send Messages**, and **Send
+> Messages in Threads**. Granting "Manage Threads" alone does **not** help.
+>
+> When the bot is missing these on a channel, **`/clord` replies (ephemerally)
+> with the exact permissions to grant** (#443). Note one limitation: if the bot
+> lacks **View Channel** entirely, it never receives plain messages in that
+> channel, so starting a session by *posting a message* cannot be detected there
+> — use `/clord` (a slash command is delivered regardless of channel visibility),
+> or grant View Channel.
 
 ---
 
@@ -527,6 +600,8 @@ curl -X POST http://localhost:8080/api/tasks \
 
 The 30-second master loop picks up due tasks and spawns Claude Code sessions automatically.
 
+Each run posts a `🔄 **[Scheduled]** <task name>` message, opens a thread on it, creates a tmux window in the task's `working_dir`, and runs Claude there — the answer lands in the thread like any other turn. What a scheduled run should look like (and what counts as a bug) is written up in [docs/specs/scheduled-tasks.md](docs/specs/scheduled-tasks.md).
+
 ---
 
 ## Auto-Upgrade
@@ -620,15 +695,16 @@ curl -X POST http://localhost:8080/api/tasks \
 
 ### How Discord maps to tmux
 
-The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Knowing this 1:1 mapping makes debugging and integration much easier (you can `tmux attach` to watch a session live):
+The "Discord thread = Claude Code session" idea sits on top of a tmux layout. Knowing where a thread actually lives makes debugging and integration much easier (you can `tmux attach` to watch a session live):
 
-| Discord | tmux         | Mapping |
-|---------|--------------|---------|
-| Channel | tmux session | 1:1     |
-| Thread  | tmux window  | 1:1     |
+| Unit | tmux | Mapping |
+|------|--------------|---------|
+| Repository a thread is bound to | tmux session | 1:1 |
+| Thread | tmux window | 1:1 |
 
-- **1 Discord channel = 1 tmux session.** All threads in a channel share that one session. The session name is derived from the channel's bound repo (via `/clord-init`); unbound channels fall back to the default `clord` session.
-- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`w1`, `w2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`.
+- **Sessions are only ever born in a channel.** `/clord` opens a *new* thread; inside a thread it continues that thread's session, offers to reconnect one whose record was swept, or refuses if the thread was never c-lord's (#551). An ordinary conversation thread cannot be turned into a Claude session — there is no command that adopts one, by design. See [docs/COMMANDS.md](docs/COMMANDS.md#chat--sessions).
+- **1 repository = 1 tmux session — not 1 channel.** The session name comes from the repo a thread is bound to: its own when it has one (`/clord-thread-init`, or `/clord repo:<url>`), otherwise the channel's (`/clord-init`); unbound channels fall back to the default `clord` session. So a channel whose threads are bound to different repos is spread over several sessions, and two channels bound to the same repo share one. Where a given thread lives — and why it is decided this way — is spelled out in [docs/specs/tmux-layout.md](docs/specs/tmux-layout.md).
+- **1 thread = 1 tmux window = 1 Claude Code session.** Each thread gets its own window (`w1`, `w2`, …) running one Claude Code session. So your back-and-forth in a thread *is* the back-and-forth with that Claude session — replies continue it via `--resume`. Window numbers are unique **within a session**, not within a channel.
 
 For the "why" behind this design, see [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
@@ -641,7 +717,7 @@ c_lord/
   cogs/
     claude_chat.py         # Interactive chat (thread creation, message handling)
     skill_command.py       # /skill slash command with autocomplete
-    session_manage.py      # /sessions, /resume-info
+    session_manage.py      # /clord-status
     scheduler.py           # Periodic Claude Code task executor
     webhook_trigger.py     # Webhook → Claude Code task execution (CI/CD)
     auto_upgrade.py        # Webhook → package upgrade + drain-aware restart

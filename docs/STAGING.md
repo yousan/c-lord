@@ -82,17 +82,129 @@ cd /home/yousan/c-lord-staging-1
 bash scripts/staging.sh status             # identity / branch / pid / instances / log
 bash scripts/staging.sh stop               # この clone の bot を安全停止
 bash scripts/staging.sh restart            # 現在のブランチで安全再起動
-bash scripts/staging.sh restart <branch>   # branch に切り替えて再起動 (PR 検証用)
+bash scripts/staging.sh restart <branch>   # branch を origin の最新に同期して再起動 (PR 検証用)
 ```
 
 `restart` は: /proc/cwd で自分の bot だけを同定 → PID 直 kill → setsid + venv python で起動 →
 per-run ログ → `Logged in as` を待って identity を検証(mismatch なら非0で失敗)→ 単一インスタンス確認、まで自動で行う。
+
+`restart <branch>` は起動前に **`git fetch origin <branch>` → checkout → `git merge --ff-only origin/<branch>`** まで行い、
+ローカルブランチを **origin の最新に確実に同期**する(#436)。単なる `checkout` は fetch 済みでも
+ローカルブランチを古い HEAD のまま切り替えるだけなので、これが無いと「最新の fix を回したつもりで
+**古いコードを検証**」して偽の RED/GREEN を得る(#399 検証中に実害)。ローカルが origin と分岐していて
+ff できない場合は、**黙って古いコードを起動せず明示エラーで停止**する(`git reset --hard origin/<branch>` で
+破棄するか push してから再実行)。起動ログには回しているコミットが `checked out <branch> @ <short-sha>` と出る。
 
 **禁止事項(全て実害のあった事故パターン — #322 根因D)**:
 - `pgrep -f "c_lord.main" | xargs kill` 系の**パターン kill**(本番・自分のシェルに当たる/相対パス起動を取り逃す)
 - kill を**並列ツールバッチに入れる**(キャンセルしても発射済みの kill は戻らない)
 - `nohup uv run ...` での起動(Bash ツール teardown で exit 144 死する)
 - 本番 (`/home/yousan/c-lord`) への手動 kill+nohup(supervised — #195 の二重 bot 事故になる)
+
+### systemd 操作で tmux / bot を巻き添えにする事故 (#504)
+
+上の 4 件が「c-lord を直接殺してしまう」系なのに対し、以下は **c-lord を狙っていないのに
+c-lord と tmux が死ぬ**系。2026-08-07 に 3 件とも実際に踏んだ。コマンド単体は正しく見えるので、
+知らないと必ず踏む。
+
+**1. `systemctl --user restart|stop c-lord.service` は tmux サーバを道連れにする**
+
+c-lord は Discord メッセージ受信時に `tmux new-session` でサーバを起こすため、
+**tmux サーバが `c-lord.service` の cgroup に入る**(→ [supervision モデル](#supervision-モデル--誰が-respawn-するか-437))。
+systemd はユニット停止時に cgroup 内の全プロセスを kill するので、bot を再起動しただけで
+**c-lord と無関係な作業セッションまで全滅**する。
+
+```
+Aug 07 14:33:19 c_lord.tmux: Created global tmux session: claude_base  ← ここで tmux が c-lord の cgroup に入る
+Aug 07 14:37:16 systemd[379]: Stopping c-lord.service...               ← restart しただけ
+→ tmux ls: no server running(16 セッション消滅)
+```
+
+- 事前確認: `systemd-cgls --user-unit c-lord.service` に `tmux: server` が居たらアウト
+- 回避: tmux を独立した user unit で先に起こす。根本対処は #503(c-lord 側が cgroup 外でサーバを起こす)
+- 復旧: tmux-continuum の `@continuum-restore on` が次のサーバ起動時に自動復元する。
+  ただしスナップショットは 15 分間隔なので直近の作業は失われ、**復元 window と c-lord が作る window が
+  二重になって #501 の発生条件を再生成する**
+
+**2. `systemctl kill` は `--kill-whom` を省略すると user slice 全体に飛ぶ**
+
+`systemd --user` のバスを直すため re-exec シグナルを送る場面があるが、**既定は `--kill-whom=all`**。
+
+```bash
+# ❌ user slice の全プロセスに飛ぶ(tmux・全ペインの zsh・実行中の claude・c-lord bot が即死)
+sudo systemctl kill -s SIGRTMIN+25 user@1000.service
+
+# ✅ systemd 本体だけに届く
+sudo systemctl kill -s SIGRTMIN+25 --kill-whom=main user@1000.service
+systemctl --user daemon-reexec        # バスが生きているならこちら
+```
+
+SIGRTMIN+25 を「再実行せよ」と解釈するのは systemd だけ。**他のプロセスにとっては未知の
+リアルタイムシグナルで、既定動作は即時終了**。だから全部死ぬ。実際の journal(2026-08-07 14:26):
+
+```
+sudo: yousan : COMMAND=/usr/bin/systemctl kill -s SIGRTMIN+25 user@1000.service
+systemd[1]: user@1000.service: Sent signal SIGRTMIN+25 to main process 379 (systemd)
+systemd[1]: user@1000.service: Sending signal SIGRTMIN+25 to process 2039564 (tmux: server)
+systemd[1]: user@1000.service: Sending signal SIGRTMIN+25 to process 1058 (python3)   ← prod bot
+(以下、全ペインの zsh と claude に続く)
+```
+
+同日に `--kill-whom=main` 付きで実行したところ、tmux 16 セッションと bot は**無傷のまま**
+systemd だけが再実行された。フラグ 1 つの差であることが対照実験として確認できている。
+
+**3. `systemd-analyze --user verify` は稼働中のユーザーマネージャを壊しうる**
+
+ユニットファイルの構文チェックのつもりで叩くと、**一時的な systemd テストインスタンスが起動**し、
+稼働中のユーザーマネージャの制御ソケット `$XDG_RUNTIME_DIR/systemd/private` を張り替える。
+以後 `systemctl --user` が `Failed to connect to bus: No such file or directory` になる。
+
+inode を見ると起動時からのものと別物になっている(実測):
+
+```
+/run/user/1006/systemd/private   inode=2796       ← 起動時から(別ユーザー、正常)
+/run/user/1000/bus               inode=4066       ← 起動時から
+/run/user/1000/systemd/private   inode=30768266   ← verify が張り替えた
+```
+
+- サービス自体は動き続ける(マネージャは生きている)。壊れるのは **`systemctl --user` の操作系だけ**
+- 復旧: 上の 2 の**正しい形**(`--kill-whom=main` 付き)を実行するか、再ログイン / 再起動
+- 代替: 本番の user manager に対して `systemd-analyze verify` を使わない
+  (構文チェックだけなら別ユーザーやコンテナで行う)
+
+## supervision モデル — 誰が respawn するか (#437)
+
+「prod に c_lord.main が **2 プロセス**見えるが二重起動か?」「`staging.sh stop` したのに復活するか?」を
+切り分けるための、起動・監視の実態:
+
+| | prod (`/home/yousan/c-lord`) | staging (`/home/yousan/c-lord-staging-N`) |
+|---|---|---|
+| 起動者 | **`systemd --user c-lord.service`**(`Restart=always`, `RestartSec=5`) | **`scripts/staging.sh`**(手動) |
+| 起動コマンド | `start-clord.sh` → `exec uv run python -m c_lord.main` | `setsid <venv>/bin/python -m c_lord.main`(uv ラッパ無し) |
+| プロセス数 | **2 が正常**: `uv` ラッパ(親) + `python` 実体(子) | **1**: `python` のみ |
+| 死んだら | systemd が 5 秒後に respawn | **respawn しない**(stop したら止まったまま) |
+
+- **prod の「2 プロセス」は二重起動ではない**。`uv run python -m c_lord.main` は uv ラッパ(親)を
+  立て、その子として実体の `python` を exec する。`pgrep -f c_lord.main` は cmdline に `c_lord.main` を
+  含む**両方**に当たるので 2 に見えるだけ。親子は `ps -o ppid=` で確認できる(子の ppid = 親の pid)。
+  `staging.sh status` / `restart` は**この parent+child を 1 インスタンスと数える**(`instance_leaders`:
+  親が同一 clone の matched pid である pid = 子 を代表から除く)。本物の二重起動(独立した 2 起動)は
+  ちゃんと `instances: 2` + 終了コード 2 で検出する。
+- **staging には systemd ユニットも guard も無い**。`staging.sh` は `setsid` で venv python を直起動する
+  だけなので、`stop` 後に勝手に復活する経路は無い。staging で churn(pid が数秒おきに変わる)を見たら、
+  それは respawn ではなく**手動 `restart` の競合**を疑う。
+- **tmux サーバは「最初に起こした人」の cgroup に入る (#504)**。c-lord は
+  `TmuxSessionManager._ensure_session()` でサーバ不在時に `tmux new-session` を実行するため、
+  **c-lord が第一発見者だと tmux サーバが `c-lord.service` の cgroup に入る**。systemd は
+  ユニット停止時に cgroup ごと kill するので、`systemctl --user restart c-lord.service` が
+  tmux 全セッションを道連れにする(→ [禁止事項](#systemd-操作で-tmux--bot-を巻き添えにする事故-504) 1)。
+  現状の切り分けは `systemd-cgls --user-unit c-lord.service` に `tmux: server` が居るかどうか。
+  staging は `setsid` 起動なので c-lord.service の cgroup には属さないが、**staging bot が
+  第一発見者になれば同じことが起きる**(その bot を kill すると tmux が落ちる)。根本対処は #503。
+- **`start-clord.sh --guard`**(ログインフックモード)は存在するが、**prod しか起動しない**
+  (`cd $HOME/c-lord`)。二重起動防止に global な `pgrep -f c_lord.main` を使うため、staging bot が
+  動いていると「既に起動済み」と判断して prod を起こさない、という相互作用がある。現状 `~/.zprofile`
+  等のシェルプロファイルには未配線。
 
 ## 占有(借用)プロトコル (#328)
 

@@ -53,6 +53,8 @@ PAD_Y = 14  # vertical cell padding
 LINE_GAP = 8  # extra space between wrapped lines
 EMOJI_GAP = 2  # space after an emoji glyph
 MAX_COL_WIDTH = 84  # max display width (CJK = 2) per column before wrapping
+STRIKE_WIDTH = 2  # thickness of the strikethrough rule
+STRIKE_EM_ABOVE_BASELINE = 0.40  # rule height, in em above the baseline
 
 BORDER_COLOR = (208, 213, 221)
 HEADER_BG = (68, 114, 196)
@@ -72,9 +74,142 @@ def has_tables(content: str) -> bool:
     return bool(_TABLE_PATTERN.search(content))
 
 
+# Inline markdown constructs we collapse to plain text before drawing a cell.
+# A table is rendered as a PNG, so none of these can be made interactive — a
+# link in an image is not clickable — and leaving the raw syntax in just leaks
+# noise into the cell (#415).
+_CODE_SPAN = re.compile(r"`+([^`]*?)`+")
+_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_BOLD = re.compile(r"\*\*([^*]+?)\*\*")
+_ITALIC = re.compile(r"\*([^*]+?)\*")
+_STRIKE = re.compile(r"~~([^~]+?)~~")
+_PLACEHOLDER = re.compile("\x00(\\d+)\x00")
+
+# Strikethrough is the one inline construct an image *can* express, so unlike
+# bold/links (which collapse to plain text, #415) it survives as a marked span
+# and is drawn as a real rule (#607). The markers are private control chars:
+# they never reach the canvas, never count toward width, and are stripped from
+# untrusted input so a cell cannot switch strike state on for the whole table.
+_STRIKE_OPEN = "\x02"
+_STRIKE_CLOSE = "\x03"
+_STRIKE_MARKS = frozenset((_STRIKE_OPEN, _STRIKE_CLOSE))
+
+
+def _strip_inline_markdown(text: str) -> str:
+    """Reduce inline GFM markdown in *text* to the plain text a reader wants.
+
+    The cell is drawn into an image, so inline syntax cannot be made
+    interactive; rendering it verbatim only leaks ``**``, ``[label](url)`` and
+    backticks into the picture. Each construct collapses to its display text:
+
+    - ``[label](url)`` / ``![alt](url)`` -> ``label`` (the URL is unclickable in
+      an image, so only the label is kept — this also removes long, noisy URLs)
+    - ``**bold**`` -> ``bold``; ``*italic*`` -> ``italic``
+    - ``~~s~~`` -> ``s`` wrapped in private strike markers, so
+      :func:`render_table_image` can draw the rule the message body shows
+      (#607). Use :func:`_split_strike_runs` to read them back.
+    - `` `code` `` -> ``code``
+
+    Underscore emphasis (``_x_`` / ``__x__``) is intentionally **not** stripped:
+    identifiers like ``_is_allowed`` / ``__init__`` / ``foo_bar`` use
+    underscores, and GFM likewise does not treat intra-word ``_`` as emphasis.
+    Code-span contents are protected so symbols inside them survive untouched.
+    """
+    if not text:
+        return text
+
+    # 0. Strip any pre-existing marker chars: they are ours, and a cell that
+    #    contained them could otherwise turn strike on for the rest of the row.
+    text = _strip_strike_markers(text)
+
+    # 1. Stash code-span contents so emphasis stripping can't touch symbols
+    #    inside them (e.g. `a*b*c` must not lose its asterisks).
+    saved: list[str] = []
+
+    def _stash(match: re.Match[str]) -> str:
+        saved.append(match.group(1))
+        return f"\x00{len(saved) - 1}\x00"
+
+    text = _CODE_SPAN.sub(_stash, text)
+
+    # 2. Links / images -> label, then emphasis / strikethrough.
+    text = _LINK.sub(r"\1", text)
+    text = _STRIKE.sub(rf"{_STRIKE_OPEN}\1{_STRIKE_CLOSE}", text)
+    text = _BOLD.sub(r"\1", text)  # before italic so ***x*** -> *x* -> x
+    text = _ITALIC.sub(r"\1", text)
+
+    # 3. Restore the protected code-span contents (without the backticks).
+    return _PLACEHOLDER.sub(lambda m: saved[int(m.group(1))], text)
+
+
+def _strip_strike_markers(text: str) -> str:
+    """Return *text* without the private strikethrough markers."""
+    return text.replace(_STRIKE_OPEN, "").replace(_STRIKE_CLOSE, "")
+
+
+def _split_strike_runs(text: str) -> list[tuple[str, bool]]:
+    """Split *text* into ``(substring, struck)`` runs on the strike markers.
+
+    Adjacent runs of the same state are merged, and the markers themselves are
+    dropped — callers get only visible text. Unbalanced markers are tolerated:
+    an unclosed span simply runs to the end of *text*.
+    """
+    if not text:
+        return []
+    runs: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    struck = False
+
+    def flush() -> None:
+        if buf:
+            if runs and runs[-1][1] == struck:
+                runs[-1] = (runs[-1][0] + "".join(buf), struck)
+            else:
+                runs.append(("".join(buf), struck))
+            buf.clear()
+
+    for ch in text:
+        if ch == _STRIKE_OPEN:
+            flush()
+            struck = True
+        elif ch == _STRIKE_CLOSE:
+            flush()
+            struck = False
+        else:
+            buf.append(ch)
+    flush()
+    return runs
+
+
+def _balance_strike_markers(text: str) -> str:
+    """Re-open/close strike markers per line so each line stands on its own.
+
+    Wrapping can cut a struck span in half; without this the continuation lines
+    would lose the rule (or, worse, close a span they never opened).
+    """
+    out: list[str] = []
+    open_ = False
+    for line in text.split("\n"):
+        prefix = _STRIKE_OPEN if open_ else ""
+        for ch in line:
+            if ch == _STRIKE_OPEN:
+                open_ = True
+            elif ch == _STRIKE_CLOSE:
+                open_ = False
+        out.append(prefix + line + (_STRIKE_CLOSE if open_ else ""))
+    return "\n".join(out)
+
+
 def _display_width(text: str) -> int:
-    """Display width of *text*, counting East Asian Wide/Fullwidth glyphs as 2."""
-    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+    """Display width of *text*, counting East Asian Wide/Fullwidth glyphs as 2.
+
+    Strike markers are metadata, not glyphs — counting them would silently
+    shrink the wrap budget of every struck cell.
+    """
+    return sum(
+        0 if c in _STRIKE_MARKS else (2 if unicodedata.east_asian_width(c) in ("W", "F") else 1)
+        for c in text
+    )
 
 
 def _wrap_cell(text: str, max_width: int) -> str:
@@ -111,6 +246,17 @@ def _wrap_cell(text: str, max_width: int) -> str:
                 cur = candidate
         lines.append(cur)
     return "\n".join(lines)
+
+
+def _prepare_cell(text: str, max_width: int) -> str:
+    """Turn a raw cell into drawable lines: collapse markdown, wrap, re-balance.
+
+    The three steps belong together — wrapping runs on the *collapsed* text (so
+    syntax does not eat the column budget) and the strike markers must be
+    re-balanced *after* wrapping (so a span cut in half keeps its rule on every
+    line).
+    """
+    return _balance_strike_markers(_wrap_cell(_strip_inline_markdown(text), max_width))
 
 
 def _segment_runs(text: str) -> list[tuple[str, bool]]:
@@ -243,8 +389,11 @@ def render_table_image(table_md: str) -> bytes | None:
     rows = [(r + [""] * max(0, n_cols - len(r)))[:n_cols] for r in rows]
     grid = [headers, *rows]
 
-    # Wrap every cell so lines stay within MAX_COL_WIDTH (bounds image width).
-    grid = [[_wrap_cell(cell, MAX_COL_WIDTH) for cell in row] for row in grid]
+    # Collapse inline markdown (links/bold/code) to plain text — it can't be
+    # made interactive in an image and otherwise leaks as raw syntax (#415) —
+    # keep strikethrough as a marked span (it *is* drawable, #607), then wrap
+    # every cell so lines stay within MAX_COL_WIDTH (bounds image width).
+    grid = [[_prepare_cell(cell, MAX_COL_WIDTH) for cell in row] for row in grid]
 
     ascent, descent = text_font.getmetrics()
     text_h = ascent + descent
@@ -256,12 +405,13 @@ def render_table_image(table_md: str) -> bytes | None:
 
     def line_width(line: str) -> float:
         width = 0.0
-        for text, is_emoji in _segment_runs(line):
-            if is_emoji and emoji_font is not None:
-                tile = _emoji_tile(text, emoji_font, emoji_is_color, emoji_h, tile_cache)
-                width += (tile.width if tile is not None else emoji_h) + EMOJI_GAP
-            else:
-                width += scratch.textlength(text, font=text_font)
+        for chunk, _struck in _split_strike_runs(line):
+            for text, is_emoji in _segment_runs(chunk):
+                if is_emoji and emoji_font is not None:
+                    tile = _emoji_tile(text, emoji_font, emoji_is_color, emoji_h, tile_cache)
+                    width += (tile.width if tile is not None else emoji_h) + EMOJI_GAP
+                else:
+                    width += scratch.textlength(text, font=text_font)
         return width
 
     # Column widths and row heights from wrapped, measured content.
@@ -282,20 +432,30 @@ def render_table_image(table_md: str) -> bytes | None:
     img = Image.new("RGB", (total_w, total_h), ROW_BG)
     draw = ImageDraw.Draw(img)
 
+    # Rule height: ~0.4em above the baseline. That is the vertical middle of a
+    # CJK ideograph and still crosses Latin lowercase, so mixed 日本語 + ASCII
+    # cells (the common case here) get one line at a sensible height.
+    strike_dy = ascent - round(FONT_SIZE * STRIKE_EM_ABOVE_BASELINE)
+
     def draw_line(line: str, x0: int, y0: int, fill: tuple[int, int, int]) -> None:
         x = float(x0)
-        for text, is_emoji in _segment_runs(line):
-            if is_emoji and emoji_font is not None:
-                tile = _emoji_tile(text, emoji_font, emoji_is_color, emoji_h, tile_cache)
-                if tile is not None:
-                    ey = y0 + (text_h - emoji_h) // 2
-                    img.paste(tile, (int(x), ey), tile)
-                    x += tile.width + EMOJI_GAP
+        for chunk, struck in _split_strike_runs(line):
+            run_x0 = x
+            for text, is_emoji in _segment_runs(chunk):
+                if is_emoji and emoji_font is not None:
+                    tile = _emoji_tile(text, emoji_font, emoji_is_color, emoji_h, tile_cache)
+                    if tile is not None:
+                        ey = y0 + (text_h - emoji_h) // 2
+                        img.paste(tile, (int(x), ey), tile)
+                        x += tile.width + EMOJI_GAP
+                    else:
+                        x += emoji_h + EMOJI_GAP
                 else:
-                    x += emoji_h + EMOJI_GAP
-            else:
-                draw.text((x, y0), text, font=text_font, fill=fill, anchor="la")
-                x += scratch.textlength(text, font=text_font)
+                    draw.text((x, y0), text, font=text_font, fill=fill, anchor="la")
+                    x += scratch.textlength(text, font=text_font)
+            if struck and x > run_x0:
+                sy = y0 + strike_dy
+                draw.line([(run_x0, sy), (x, sy)], fill=fill, width=STRIKE_WIDTH)
 
     y = 0
     for r, row in enumerate(grid):

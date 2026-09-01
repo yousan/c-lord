@@ -15,6 +15,7 @@ Legacy shim (kept for backward compatibility):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -27,13 +28,13 @@ from ..claude.context_usage import (
     format_context_line,
     read_latest_usage,
 )
-from ..claude.tmux_runner import TmuxClaudeRunner
+from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX, TmuxClaudeRunner
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
     bridge_pane_ask,
     collect_ask_answers,
 )
-from ..discord_ui.embeds import error_embed, timeout_embed
+from ..discord_ui.embeds import error_embed, no_response_embed, timeout_embed
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
@@ -43,13 +44,6 @@ from .run_config import RunConfig  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# How long to wait for transcript_mirror.reply_sink to register the assistant
-# reply before falling back to a fresh send.  jsonl bridge mode polls the
-# JSONL on a separate loop, so reply_sink may fire slightly after run_claude
-# returns; the line should ride on the same bubble in the common case.
-_REPLY_WAIT_ATTEMPTS = 8
-_REPLY_WAIT_INTERVAL = 0.2  # 8 × 200ms = up to 1.6 s
-
 # Context-window total per session_id, learned via TmuxClaudeRunner's /context
 # probe (or a per-model fallback) and reused for the rest of the session.  The
 # value is ``(model, total)``: when the model in the transcript changes (e.g.
@@ -57,17 +51,36 @@ _REPLY_WAIT_INTERVAL = 0.2  # 8 × 200ms = up to 1.6 s
 # mismatch forces a re-probe.  The numerator is re-read every turn regardless.
 _context_window_cache: dict[str, tuple[str | None, int]] = {}
 
+# #370: settings-table key prefix for the per-model context-window total.  The
+# in-memory cache above is cleared on every bot restart, so the /context probe
+# (which renders into the human-visible tmux pane) re-fires once per session
+# after each restart.  Persisting the learned total per model — the tier is
+# stable per (host, account, model) — lets the probe fire at most once per model
+# per host instead.  One scalar key per model (not a JSON blob) so concurrent
+# probes of different models are independent ON CONFLICT upserts, no read-
+# modify-write race.  Stored in the existing ``settings`` KV (no new table).
+_CONTEXT_WINDOW_KEY_PREFIX = "context_window:"
+
 # Max characters for tool result display (re-exported for backward compat).
 TOOL_RESULT_MAX_CHARS = 3000
 
 _TIMEOUT_PATTERN = re.compile(r"Timed out after (\d+) seconds")
 
+# CLI version: fetched once per process via ``claude --version``, then cached.
+# ``None`` before the first fetch; empty string on failure (so we skip retrying).
+_cli_version: str | None = None
+_cli_version_fetched: bool = False
+
 
 def _make_error_embed(error: str) -> discord.Embed:
-    """Return a timeout_embed for timeout errors, error_embed otherwise."""
+    """Pick the embed that matches what actually went wrong."""
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))
+    # #562: "never started" is not "stopped responding" — a timeout embed here
+    # would send the reader looking for output that was never produced.
+    if error.startswith(NO_RESPONSE_ERROR_PREFIX):
+        return no_response_embed(error)
     return error_embed(error)
 
 
@@ -124,8 +137,6 @@ async def _cleanup_session_dir(config: RunConfig) -> None:
     Runs git operations in a thread pool to avoid blocking the event loop.
     Logs the outcome but never raises — cleanup failures are non-fatal.
     """
-    import asyncio
-
     assert config.session_dir_manager is not None  # caller ensures this
 
     try:
@@ -165,8 +176,6 @@ async def _cleanup_session_dir(config: RunConfig) -> None:
 
 async def _cleanup_tmux_session(config: RunConfig) -> None:
     """Kill the tmux session for this thread. Non-fatal on failure."""
-    import asyncio
-
     assert config.tmux_manager is not None  # caller ensures this
 
     try:
@@ -185,21 +194,56 @@ async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:
             logger.debug("Deleted image tempfile: %s", path)
 
 
+async def _load_persisted_window(settings_repo: object, model: str) -> int | None:
+    """Return the disk-persisted context-window total for ``model``, or None.
+
+    Best-effort: a missing key, a malformed value, or any storage error yields
+    None so the caller falls back to a live probe.
+    """
+    with contextlib.suppress(Exception):
+        raw = await settings_repo.get(f"{_CONTEXT_WINDOW_KEY_PREFIX}{model}")  # type: ignore[attr-defined]
+        if raw is not None:
+            value = int(raw)
+            if value > 0:
+                return value
+    return None
+
+
+async def _store_persisted_window(settings_repo: object, model: str, total: int) -> None:
+    """Persist ``total`` as the context-window for ``model`` (best-effort)."""
+    with contextlib.suppress(Exception):
+        await settings_repo.set(f"{_CONTEXT_WINDOW_KEY_PREFIX}{model}", str(total))  # type: ignore[attr-defined]
+
+
 async def _resolve_context_window(
     config: RunConfig, session_id: str, model: str | None, used: int = 0
 ) -> int:
     """Return the context-window total for ``session_id`` running ``model``.
 
-    Learned by scraping ``/context`` (Claude is idle at the prompt after a turn
-    completes), then cached.  A re-probe is forced when ``model`` differs from
-    the value cached for this session, since the window size can change with the
-    model.  Falls back to a per-model default when the runner cannot probe or
-    the pane cannot be parsed — ``used`` is passed so the fallback can never
-    report a window smaller than the tokens already in it (#292).
+    Resolution order: in-memory cache → disk (``settings`` KV, keyed by model,
+    #370) → live ``/context`` probe → per-model fallback.  The probe scrapes
+    ``/context`` (Claude is idle at the prompt after a turn completes) and
+    renders into the human-visible tmux pane, so it is avoided whenever the
+    total is already known on disk.  A re-probe is forced when ``model`` differs
+    from the value cached for this session, since the window size can change
+    with the model.  Falls back to a per-model default when the runner cannot
+    probe or the pane cannot be parsed — ``used`` is passed so the fallback can
+    never report a window smaller than the tokens already in it (#292).
     """
     cached = _context_window_cache.get(session_id)
     if cached is not None and cached[0] == model:
         return cached[1]
+
+    settings_repo = getattr(config, "settings_repo", None)
+
+    # Disk layer (#370): the total is stable per (host, account, model), so a
+    # value learned once survives bot restarts and other sessions — no probe,
+    # no tmux-pane pollution.  Keyed by model; skipped when model is unknown.
+    if settings_repo is not None and model:
+        persisted = await _load_persisted_window(settings_repo, model)
+        if persisted is not None:
+            _context_window_cache[session_id] = (model, persisted)
+            return persisted
 
     total: int | None = None
     probe = getattr(config.runner, "probe_context_window", None)
@@ -211,16 +255,55 @@ async def _resolve_context_window(
         # Cache only successful probes — a transient pane-parse failure must
         # not lock the per-model fallback in for the rest of the session.
         _context_window_cache[session_id] = (model, total)
+        if settings_repo is not None and model:
+            await _store_persisted_window(settings_repo, model, total)
         return total
     return fallback_window(model or getattr(config.runner, "model", None), used)
+
+
+async def _get_cli_version() -> str | None:
+    """Return the ``claude`` CLI version string, fetched once and cached.
+
+    Runs ``claude --version`` on the first call; subsequent calls return the
+    cached value without spawning a subprocess.  Returns ``None`` on failure.
+    """
+    global _cli_version, _cli_version_fetched
+    if _cli_version_fetched:
+        return _cli_version
+    _cli_version_fetched = True
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude",
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        # ``claude --version`` outputs ``2.1.181 (Claude Code)`` — version is parts[0]
+        parts = stdout.decode().strip().split()
+        _cli_version = parts[0] if parts else None
+    except Exception:
+        _cli_version = None
+    return _cli_version
+
+
+async def _context_footer_enabled(settings_repo: object | None, field: str) -> bool:
+    """Return True unless ``context_footer.<field>`` is explicitly set to ``"0"``."""
+    if settings_repo is None:
+        return True
+    with contextlib.suppress(Exception):
+        val = await settings_repo.get(f"context_footer.{field}", default="1")  # type: ignore[attr-defined]
+        return val != "0"
+    return True
 
 
 async def _post_context_usage(config: RunConfig, session_id: str | None) -> None:
     """Post a subtle context-window usage line after a completed turn.
 
     Numerator (tokens in context) comes from the session transcript; the
-    denominator from :func:`_resolve_context_window`.  Best-effort — any failure
-    is swallowed so it never disturbs the turn.
+    denominator from :func:`_resolve_context_window`.  Optional extras (model,
+    effort, CLI version, cost) are appended when enabled via ``context_footer.*``
+    settings.  Best-effort — any failure is swallowed so it never disturbs the turn.
     """
     working_dir = getattr(config.runner, "working_dir", None)
     if not session_id or not working_dir:
@@ -236,37 +319,47 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     if usage is None:
         return
     total = await _resolve_context_window(config, session_id, usage.model, usage.used)
-    line = format_context_line(usage.used, total)
 
-    # Prefer appending to Claude's last reply message — keeps the addendum
-    # inside the same bubble (no fresh avatar/timestamp chrome).  In jsonl
-    # bridge mode the transcript_mirror.reply_sink races with run_claude's
-    # loop end, so the message may not be registered yet — poll briefly
-    # before falling back to a fresh send.
-    import asyncio
+    settings_repo = getattr(config, "settings_repo", None)
 
-    from ..skills.reply_tracker import get_last_reply_message
+    model: str | None = None
+    if await _context_footer_enabled(settings_repo, "model"):
+        model = usage.model
 
-    last_reply = None
-    for _ in range(_REPLY_WAIT_ATTEMPTS):
-        last_reply = get_last_reply_message(config.thread.id)
-        if last_reply is not None:
-            break
-        await asyncio.sleep(_REPLY_WAIT_INTERVAL)
-    # #372: discord.py's Message.edit defaults suppress=False (NOT MISSING), so
-    # an edit that omits suppress explicitly *un*-suppresses embeds — which would
-    # re-enable the URL OGP card that reply_sink suppressed at send-time. Pass
-    # suppress explicitly so appending the context line preserves the setting.
+    effort: str | None = None
+    if await _context_footer_enabled(settings_repo, "effort"):
+        raw_effort = getattr(config.runner, "effort", None)
+        effort = raw_effort if isinstance(raw_effort, str) else None
+
+    cli_version: str | None = None
+    if await _context_footer_enabled(settings_repo, "cli_version"):
+        with contextlib.suppress(Exception):
+            cli_version = await _get_cli_version()
+
+    cost_usd: float | None = None
+    if await _context_footer_enabled(settings_repo, "cost"):
+        get_cost = getattr(config.runner, "get_cost_from_pane", None)
+        if callable(get_cost):
+            with contextlib.suppress(Exception):
+                coro = get_cost()
+                if asyncio.iscoroutine(coro):
+                    raw_cost = await coro
+                    cost_usd = raw_cost if isinstance(raw_cost, (int, float)) else None
+
+    line = format_context_line(
+        usage.used,
+        total,
+        model=model,
+        effort=effort,
+        cli_version=cli_version,
+        cost_usd=cost_usd,
+    )
+
+    # #455: send footer as a standalone new message so it appears AFTER
+    # progress.txt and BEFORE the 🟡 mention — not appended to the reply.
     from ..transcript.mirror import show_url_embeds_enabled
 
     suppress_embeds = not show_url_embeds_enabled()
-    if last_reply is not None:
-        existing = last_reply.content or ""
-        combined = f"{existing}\n{line}" if existing else line
-        if len(combined) <= 2000:
-            with contextlib.suppress(discord.HTTPException):
-                await last_reply.edit(content=combined, suppress=suppress_embeds)
-            return
     with contextlib.suppress(discord.HTTPException):
         await config.thread.send(line, suppress_embeds=suppress_embeds)
 
@@ -302,9 +395,14 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             await processor.process(event)
             if event.is_complete and event.error:
                 run_errored = True
+                # #621: hand the reason back to the caller. A scheduled/webhook
+                # turn has nobody reading the thread, so an error that only ever
+                # became an embed is an error nobody ever sees.
+                config.outcome.error = event.error
     except Exception:
         logger.exception("%s Error running Claude CLI", ctx)
         run_errored = True
+        config.outcome.error = "An unexpected error occurred."
         # Wrap Discord sends in suppress — the connection may already be closed
         # (e.g. ServerDisconnectedError on bot shutdown), and sending would fail too.
         with contextlib.suppress(Exception):
@@ -331,7 +429,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     # guards that gate the #67 notice below. (Gating it there left prod's jsonl
     # mode never recovering a post-turn menu, so the user saw no choices — #222.)
     pending_pane_ask = None
-    if not run_errored and not processor.pending_ask and isinstance(runner, TmuxClaudeRunner):
+    if (
+        not run_errored
+        and not processor.pending_ask
+        and isinstance(runner, TmuxClaudeRunner)
+        and not runner.stopped
+    ):
+        # ``runner.stopped`` guard (#315): a turn pre-empted by a follow-up message
+        # was deliberately torn down; re-bridging its leftover menu here would
+        # re-park the run on a fresh ``timeout=None`` await and the new turn could
+        # never start (observed on staging — the ⚡ fired but no new run began).
         pending_pane_ask = await runner.peek_pending_ask()
 
     if pending_pane_ask is not None:
@@ -344,6 +451,8 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             pending_pane_ask,
             runner,
             ask_repo=config.ask_repo,
+            authorizer=config.authorizer,
+            notify_user_id=config.notify_user_id,
         )
     elif not run_errored and not processor.pending_ask and skills_enabled():
         # Issue #67: surface a fallback notice when the skill-reply path was
@@ -373,6 +482,8 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             processor.pending_ask,
             processor.session_id,
             ask_repo=config.ask_repo,
+            authorizer=config.authorizer,
+            notify_user_id=config.notify_user_id,
         )
         if answer_prompt:
             logger.info(

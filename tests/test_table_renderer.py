@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from io import BytesIO
 
 import pytest
 
@@ -10,7 +11,11 @@ from c_lord.discord_ui.table_renderer import (
     _JP_FONT_PATHS,
     _display_width,
     _first_existing,
+    _prepare_cell,
     _segment_runs,
+    _split_strike_runs,
+    _strip_inline_markdown,
+    _strip_strike_markers,
     _wrap_cell,
     detect_tables,
     has_tables,
@@ -229,6 +234,78 @@ class TestSegmentRuns:
 
 
 # ===========================================================================
+# _strip_inline_markdown
+# ===========================================================================
+
+
+class TestStripInlineMarkdown:
+    """Inline markdown is rendered into a PNG, so it cannot be made interactive.
+
+    The renderer must collapse it to the plain text a reader cares about instead
+    of leaking the raw syntax into the image (#415).
+    """
+
+    def test_empty_unchanged(self) -> None:
+        assert _strip_inline_markdown("") == ""
+
+    def test_plain_text_unchanged(self) -> None:
+        assert _strip_inline_markdown("plain text 123") == "plain text 123"
+
+    def test_strips_bold(self) -> None:
+        assert _strip_inline_markdown("**クローズ 6件**") == "クローズ 6件"
+
+    def test_strips_italic(self) -> None:
+        assert _strip_inline_markdown("*italic*") == "italic"
+
+    def test_strips_bold_italic(self) -> None:
+        assert _strip_inline_markdown("***both***") == "both"
+
+    def test_strikethrough_is_marked_not_dropped(self) -> None:
+        # `~~x~~` is the one construct an image CAN express (#607): the syntax
+        # goes away but the span is marked so the renderer can draw a line.
+        marked = _strip_inline_markdown("~~old~~")
+        assert _strip_strike_markers(marked) == "old"
+        assert _split_strike_runs(marked) == [("old", True)]
+
+    def test_strips_inline_code(self) -> None:
+        assert _strip_inline_markdown("`/clear`") == "/clear"
+
+    def test_link_collapses_to_label(self) -> None:
+        # The URL is unclickable inside an image, so only the label is kept.
+        url = "https://github.com/yousan/c-lord/issues/61"
+        assert _strip_inline_markdown(f"[#61]({url})") == "#61"
+
+    def test_image_collapses_to_alt(self) -> None:
+        assert _strip_inline_markdown("![alt](https://x/y.png)") == "alt"
+
+    def test_link_with_trailing_text(self) -> None:
+        url = "https://github.com/yousan/c-lord/issues/61"
+        assert _strip_inline_markdown(f"[#61]({url})(not planned)") == "#61(not planned)"
+
+    def test_code_preserves_underscores(self) -> None:
+        # Identifiers inside code spans must survive intact.
+        assert _strip_inline_markdown("`_is_allowed`") == "_is_allowed"
+
+    def test_underscore_emphasis_left_untouched(self) -> None:
+        # Intra-word underscores are identifiers, not emphasis (GFM agrees).
+        assert _strip_inline_markdown("foo_bar_baz") == "foo_bar_baz"
+        assert _strip_inline_markdown("__init__") == "__init__"
+
+    def test_multiple_constructs_in_one_cell(self) -> None:
+        url = "https://github.com/yousan/c-lord/issues/405"
+        text = f"[#405]({url}) — `/clear`・`!clear` の `_is_allowed` 欠如 (#56由来)"
+        expected = "#405 — /clear・!clear の _is_allowed 欠如 (#56由来)"
+        assert _strip_inline_markdown(text) == expected
+
+    def test_mixed_bold_link_code(self) -> None:
+        assert _strip_inline_markdown("**a** and [b](http://u) and `c`") == "a and b and c"
+
+    def test_hash_reference_unchanged(self) -> None:
+        # `#61` is an issue ref, not a heading — must not be touched.
+        assert _strip_inline_markdown("#61(not planned)") == "#61(not planned)"
+
+
+# ===========================================================================
 # render_table_image
 # ===========================================================================
 
@@ -285,3 +362,108 @@ class TestRenderTableImageNoPillow:
             assert result is None
         finally:
             importlib.reload(mod)
+
+
+# ===========================================================================
+# Strikethrough (#607)
+# ===========================================================================
+
+
+class TestStrikeMarkers:
+    """`~~x~~` survives as a marked span so the renderer can draw a real line.
+
+    Claude uses strikethrough in tables to mean "this one is dropped". Collapsing
+    it to plain text (as #415 did for every inline construct) makes the image say
+    the opposite of the message body, which Discord *does* strike (#607).
+    """
+
+    def test_plain_text_has_one_unstruck_run(self) -> None:
+        assert _split_strike_runs("abc") == [("abc", False)]
+
+    def test_empty_text_has_no_runs(self) -> None:
+        assert _split_strike_runs("") == []
+
+    def test_partial_strike_splits_into_two_runs(self) -> None:
+        marked = _strip_inline_markdown("~~a~~ b")
+        assert _split_strike_runs(marked) == [("a", True), (" b", False)]
+
+    def test_strike_around_bold_keeps_both_effects(self) -> None:
+        # `~~**x**~~` -> the bold syntax goes (unrepresentable), the strike stays.
+        assert _split_strike_runs(_strip_inline_markdown("~~**x**~~")) == [("x", True)]
+
+    def test_markers_never_reach_the_visible_text(self) -> None:
+        marked = _strip_inline_markdown("~~old~~ new")
+        assert _strip_strike_markers(marked) == "old new"
+        assert "~" not in marked
+
+    def test_display_width_ignores_markers(self) -> None:
+        # Markers are metadata; counting them would shrink the wrap budget.
+        assert _display_width(_strip_inline_markdown("~~abc~~")) == 3
+
+    def test_hostile_marker_chars_in_input_are_dropped(self) -> None:
+        # A cell containing the internal control chars must not be able to
+        # switch strike state on for the rest of the table.
+        assert _split_strike_runs(_strip_inline_markdown("a\x02b\x03c")) == [("abc", False)]
+
+    def test_reassembles_to_original_visible_text(self) -> None:
+        marked = _strip_inline_markdown("~~やめる~~ → **やる**")
+        assert "".join(chunk for chunk, _ in _split_strike_runs(marked)) == "やめる → やる"
+
+
+class TestPrepareCell:
+    """strip -> wrap -> re-balance, so every wrapped line stands on its own."""
+
+    def test_short_cell_keeps_single_struck_run(self) -> None:
+        assert _split_strike_runs(_prepare_cell("~~old~~", 84)) == [("old", True)]
+
+    def test_wrapped_strike_continues_on_every_line(self) -> None:
+        # A struck span wider than the column must stay struck after wrapping —
+        # not only on the first line (AC3).
+        cell = _prepare_cell("~~あいうえおかきくけこ~~", 8)
+        lines = cell.split("\n")
+        assert len(lines) > 1
+        for line in lines:
+            runs = _split_strike_runs(line)
+            assert runs, line
+            assert all(struck for _, struck in runs), runs
+
+    def test_wrapped_plain_text_stays_unstruck(self) -> None:
+        cell = _prepare_cell("あいうえおかきくけこ", 8)
+        for line in cell.split("\n"):
+            assert all(not struck for _, struck in _split_strike_runs(line))
+
+    def test_wrap_budget_is_measured_without_markers(self) -> None:
+        # 8 display units of CJK == 4 chars per line; markers must not steal room.
+        cell = _prepare_cell("~~あいうえおかきくけこ~~", 8)
+        for line in cell.split("\n"):
+            assert _display_width(line) <= 8
+
+
+@pytest.mark.skipif(not RENDER_AVAILABLE, reason="Pillow or a usable font not installed")
+class TestRenderStrikethrough:
+    STRUCK = "| x |\n|---|\n| ~~old~~ |\n"
+    PLAIN = "| x |\n|---|\n| old |\n"
+    PARTIAL = "| x |\n|---|\n| ~~old~~ new |\n"
+
+    def test_struck_cell_differs_from_plain_cell(self) -> None:
+        # AC1 — the line must actually be drawn, so the PNGs cannot be identical.
+        assert render_table_image(self.STRUCK) != render_table_image(self.PLAIN)
+
+    def test_partial_strike_differs_from_full_strike(self) -> None:
+        # AC2 — striking only part of the cell is a third, distinct rendering.
+        both = "| x |\n|---|\n| ~~old new~~ |\n"
+        assert render_table_image(self.PARTIAL) != render_table_image(both)
+        assert render_table_image(self.PARTIAL) != render_table_image("| x |\n|---|\n| old new |\n")
+
+    def test_strike_syntax_is_not_drawn(self) -> None:
+        # AC4 — the image must not leak `~~` (a #415 regression would widen it).
+        from PIL import Image
+
+        struck = Image.open(BytesIO(render_table_image(self.STRUCK)))
+        plain = Image.open(BytesIO(render_table_image(self.PLAIN)))
+        assert struck.size == plain.size
+
+    def test_plain_table_rendering_unchanged(self) -> None:
+        # AC5 — tables without strikethrough render byte-identically to before.
+        assert render_table_image(SIMPLE_TABLE) == render_table_image(SIMPLE_TABLE)
+        assert render_table_image(JAPANESE_TABLE)[:4] == b"\x89PNG"

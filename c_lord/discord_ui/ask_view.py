@@ -22,13 +22,25 @@ custom_id format:  ``ask_{thread_id}_{q_idx}_{slot}``
 
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
 import logging
 from typing import TYPE_CHECKING
 
 import discord
 
-from .ask_bus import AskAnswerBus
+from .ask_bus import (
+    CLOSE_ANSWERED,
+    CLOSE_INTERRUPTED,
+    CLOSE_TERMINAL,
+    CLOSE_TIMEOUT,
+    AskAnswerBus,
+)
 from .ask_bus import ask_bus as _default_ask_bus
+from .ask_menus import ask_menus, disable_stale_copies
+from .authorization import AuthorizedViewMixin, Authorizer
+from .embeds import ask_sending_embed, ask_undelivered_embed
+from .error_reporting import ErrorReportingViewMixin
 
 if TYPE_CHECKING:
     from ..claude.types import AskQuestion
@@ -36,13 +48,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_RESTART_MSG = (
-    "⚠️ The bot was restarted since this question was asked. "
-    "The session is no longer active. Please send a new message to continue."
-)
+# When this process started.  A menu message older than this can only have come
+# from a previous process — which is the one case where "the bot restarted" is
+# the true explanation for an undeliverable answer (#536).
+_PROCESS_STARTED_AT = dt.datetime.now(dt.timezone.utc)  # noqa: UP017 — dt.UTC is 3.11+, we support 3.10
+
+# Cause → what to tell the user.  The old code told everyone the bot had been
+# restarted, which was false for every menu that was answered in the terminal,
+# timed out, or was pre-empted — and reading "the bot was restarted" when it had
+# not is worse than no message at all (#536).
+_CLOSE_REASON_TEXT = {
+    CLOSE_ANSWERED: "この質問はすでに回答済みです（別のメッセージで回答されました）",
+    CLOSE_TERMINAL: "この質問はすでに端末（tmux ペイン）側で回答済みです",
+    CLOSE_TIMEOUT: "この質問は時間切れで締め切られました",
+    CLOSE_INTERRUPTED: "新しい指示が届いたため、この質問は取り消されました",
+}
+_CLOSED_UNKNOWN = "この質問はすでに閉じられています"
+_CLOSED_RESTARTED = "この質問のあとに bot が再起動したため、セッションが失われました"
+
+# Left on the other copies of a menu once one of them is resolved (#536).
+_STALE_COPY_NOTE = "-# 🔁 この質問は別のメッセージで解決済みです（このボタンは無効です）"
 
 
-class AskView(discord.ui.View):
+def _button_label(label: str, index: int) -> str:
+    """A label Discord will accept, for the option at *index* (#579).
+
+    Discord rejects an empty button label — and rejects the **whole message**
+    with it, so one option the pane parser could not read silenced the entire
+    menu (400 ``In components.0.components.1.label: This field is required``),
+    which the watchdog then retried every 30–60s forever.
+
+    Substituting a placeholder rather than dropping the option is deliberate:
+    the option still exists in the TUI, and answers are delivered as
+    ``Down × index``, so a shorter list would select the wrong one. The number
+    shown is the TUI's own, which is what the user sees in the pane.
+    """
+    text = (label or "").strip()
+    return text[:80] if text else f"{index + 1}."
+
+
+class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """Renders buttons or a select menu for a single AskUserQuestion prompt.
 
     This is a **persistent** view — ``timeout=None``.  Register it with the
@@ -52,6 +97,11 @@ class AskView(discord.ui.View):
     Answers are routed via :data:`ask_bus` rather than an internal Future,
     so the waiting coroutine (``_collect_ask_answers``) can use any timeout
     and ``view.stop()`` is always called on interaction.
+
+    A click leaves the message in the **interim** ``⏳ 送信中`` state, never ✅
+    (#651): at this point the answer has only reached an in-process queue. The
+    bridge that actually types it into the pane replaces this with the outcome
+    it verified against Claude's transcript.
 
     Usage::
 
@@ -68,11 +118,20 @@ class AskView(discord.ui.View):
         q_idx: int,
         bus: AskAnswerBus | None = None,
         ask_repo: PendingAskRepository | None = None,
+        authorizer: Authorizer | None = None,
     ) -> None:
         super().__init__(timeout=None)  # persistent — survives bot restarts
+        self._authorizer = authorizer
         self._thread_id = thread_id
+        # Kept so the resolved message can still show WHAT was asked (#536):
+        # the old code wiped the embed and left a bare "Selected: X".
+        self._question = question
         self._bus = bus if bus is not None else _default_ask_bus
         self._ask_repo = ask_repo
+        # multiSelect records the choice in the Select and submits via the
+        # ✅ confirm button (#418); single-select delivers immediately.
+        self._multi_select = question.multi_select
+        self._selected_values: list[str] = []
 
         options = question.options
         use_select = question.multi_select or len(options) > 4
@@ -85,26 +144,41 @@ class AskView(discord.ui.View):
                 max_values=min(max_vals, 25),
                 options=[
                     discord.SelectOption(
-                        label=opt.label[:100],
+                        label=_button_label(opt.label, i)[:100],
                         description=opt.description[:100] if opt.description else None,
-                        value=opt.label[:100],
+                        value=_button_label(opt.label, i)[:100],
                     )
-                    for opt in options[:25]
+                    for i, opt in enumerate(options[:25])
                 ],
                 custom_id=f"ask_{thread_id}_{q_idx}_select",
             )
-            select.callback = self._select_callback
+            select.callback = (
+                self._multi_select_record if question.multi_select else self._select_callback
+            )
             self.add_item(select)
         elif options:
             for i, opt in enumerate(options[:4]):
                 btn = discord.ui.Button(
-                    label=opt.label[:80],
+                    label=_button_label(opt.label, i),
                     style=discord.ButtonStyle.primary,
                     custom_id=f"ask_{thread_id}_{q_idx}_{i}",
                     row=0,
                 )
                 btn.callback = _make_button_callback(self, opt.label)
                 self.add_item(btn)
+
+        # multiSelect needs an explicit submit affordance — the Select only
+        # records the choice, so without this button the user has no way to
+        # confirm (Discord's dismiss-to-submit is undiscoverable) (#418).
+        if question.multi_select and options:
+            confirm_btn = discord.ui.Button(
+                label="✅ 確定",
+                style=discord.ButtonStyle.success,
+                custom_id=f"ask_{thread_id}_{q_idx}_confirm",
+                row=1,
+            )
+            confirm_btn.callback = self._confirm_callback
+            self.add_item(confirm_btn)
 
         # Plan-approval menus (#251) suppress the free-text affordance: their
         # "Tell Claude what to change" option is selected like any other (and
@@ -124,34 +198,90 @@ class AskView(discord.ui.View):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _undeliverable_reason(self, interaction: discord.Interaction) -> str:
+        """Explain, in the user's words, why *this* click could not be delivered.
+
+        Order matters: a recorded closure reason (#536) is first-hand knowledge
+        and always beats inference.  Only when this process knows nothing about
+        the thread do we fall back to the message's age — a menu posted before
+        this process started really did lose its session to a restart.
+        """
+        reason = self._bus.closed_reason(self._thread_id)
+        if reason is not None:
+            return _CLOSE_REASON_TEXT.get(reason, _CLOSED_UNKNOWN)
+        created_at = getattr(getattr(interaction, "message", None), "created_at", None)
+        if isinstance(created_at, dt.datetime) and created_at < _PROCESS_STARTED_AT:
+            return _CLOSED_RESTARTED
+        return _CLOSED_UNKNOWN
+
     async def _deliver(self, interaction: discord.Interaction, values: list[str]) -> None:
-        """Deliver *values* via the bus and update the Discord message.
+        """Deliver *values* via the bus and show the outcome IN THE THREAD (#536).
 
-        If the session is still alive (bus has a waiter), the interaction
-        message is edited to show the selection and buttons are removed —
-        giving clear visual confirmation before Claude resumes.
+        Both outcomes replace the menu with an embed that still carries the
+        question, so the thread reads as "asked X, answered Y" long after the
+        buttons are gone — and so a failure is visible to everyone in the thread
+        rather than only to the person who clicked.
 
-        If the session is gone (bot restarted), an ephemeral error message is
-        sent and the stale DB entry is cleaned up.
+        Whatever happens, the buttons stop inviting clicks: on the clicked
+        message via this edit, on every other live copy via
+        :func:`disable_stale_copies`.
         """
         delivered = self._bus.post_answer(self._thread_id, values)
+        question = self._question
         if delivered:
-            label = ", ".join(values)
-            await interaction.response.edit_message(
-                content=f"-# ✅ **Selected:** {label}",
-                embed=None,
-                view=None,
-            )
+            # #651: the bus accepted the answer — that is all that is known
+            # right now. The keystrokes have not been sent, and "sent" is not
+            # "received" either (#650). The bridge replaces this with the
+            # verified outcome once Claude's transcript says what happened.
+            embed = ask_sending_embed(question.question, question.header, values)
         else:
-            # Bot was restarted — clean up stale DB entry and inform user.
             if self._ask_repo is not None:
                 await self._ask_repo.delete(self._thread_id)
-            await interaction.response.send_message(_RESTART_MSG, ephemeral=True)
+            reason = self._undeliverable_reason(interaction)
+            logger.info(
+                "AskView: answer %r could not be delivered for thread %d (%s)",
+                values,
+                self._thread_id,
+                reason,
+            )
+            embed = ask_undelivered_embed(question.question, question.header, values, reason)
+
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+        message_id = getattr(getattr(interaction, "message", None), "id", None)
+        ask_menus.forget(self._thread_id, message_id)
+        with contextlib.suppress(Exception):
+            await disable_stale_copies(self._thread_id, message_id, _STALE_COPY_NOTE)
         self.stop()
 
     async def _select_callback(self, interaction: discord.Interaction) -> None:
         values: list[str] = interaction.data.get("values", [])  # type: ignore[union-attr]
         await self._deliver(interaction, values)
+
+    async def _multi_select_record(self, interaction: discord.Interaction) -> None:
+        """Record a multiSelect choice WITHOUT delivering — the user submits via
+        the ✅ confirm button (#418).  Echo the running selection so it is clear
+        what will be sent."""
+        self._selected_values = interaction.data.get("values", [])  # type: ignore[union-attr]
+        chosen = ", ".join(self._selected_values) or "（未選択）"
+        # Full-size, not Discord's grey ``-#`` small text (#536): "picked but not
+        # submitted" is the state users mistook for "submitted and ignored", so
+        # it has to be the loudest thing on the message, not the quietest.
+        await interaction.response.edit_message(
+            content=(
+                f"🔲 **選択中:** {chosen}\n"
+                "**まだ送信されていません** — 下の「✅ 確定」を押すと Claude に届きます。"
+            ),
+        )
+
+    async def _confirm_callback(self, interaction: discord.Interaction) -> None:
+        """Deliver the recorded multiSelect choice when ✅ 確定 is pressed (#418)."""
+        if not self._selected_values:
+            await interaction.response.send_message(
+                "1つ以上選択してから「✅ 確定」を押してください。", ephemeral=True
+            )
+            return
+        await self._deliver(interaction, self._selected_values)
 
     async def _other_callback(self, interaction: discord.Interaction) -> None:
         modal = AskModal(title="Your answer")
@@ -159,13 +289,37 @@ class AskView(discord.ui.View):
         timed_out = await modal.wait()
         if not timed_out and modal.answer:
             delivered = self._bus.post_answer(self._thread_id, [modal.answer])
-            if not delivered:
+            message = getattr(interaction, "message", None)
+            question = self._question
+            if delivered:
+                # #651: interim — the bridge confirms and rewrites this.
+                embed = ask_sending_embed(question.question, question.header, [modal.answer])
+            else:
                 if self._ask_repo is not None:
                     await self._ask_repo.delete(self._thread_id)
+                reason = self._undeliverable_reason(interaction)
+                # The free text is whatever the user typed — length only, never
+                # the content (same convention as the prompt logging in
+                # _run_helper: a modal is exactly where a secret would be pasted).
                 logger.warning(
-                    "AskView._other_callback: session gone for thread %d after restart",
+                    "AskView._other_callback: free text (%d chars) undeliverable "
+                    "for thread %d (%s)",
+                    len(modal.answer),
                     self._thread_id,
+                    reason,
                 )
+                embed = ask_undelivered_embed(
+                    question.question, question.header, [modal.answer], reason
+                )
+            # The modal already consumed the interaction response, so the menu
+            # message is edited directly rather than through the interaction.
+            if message is not None:
+                with contextlib.suppress(discord.HTTPException, Exception):
+                    await message.edit(content=None, embed=embed, view=None)
+            message_id = getattr(message, "id", None)
+            ask_menus.forget(self._thread_id, message_id)
+            with contextlib.suppress(Exception):
+                await disable_stale_copies(self._thread_id, message_id, _STALE_COPY_NOTE)
             self.stop()
 
 

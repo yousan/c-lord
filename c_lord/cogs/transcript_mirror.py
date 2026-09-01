@@ -24,15 +24,19 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from ..discord_ui.turn_progress import TurnProgress
+from ..notify_policy import owner_notify_id
 from ..transcript.mirror import (
     TranscriptMirror,
     bridge_mode_jsonl,
     reply_to_trigger_enabled,
     show_url_embeds_enabled,
     silent_posts_enabled,
+    turn_progress_enabled,
+    turn_progress_quiet_seconds,
     verbosity_mode,
 )
-from ..transcript.recovery import last_completed_final_answer
+from ..transcript.recovery import final_answer_needs_recovery_async
 from ..transcript.resolver import derive_project_dir
 
 if TYPE_CHECKING:
@@ -57,6 +61,11 @@ class TranscriptMirrorCog(commands.Cog):
         thread the final answer back to the user's message.
         """
         self._trigger_messages[thread_id] = message_id
+        # #539: this is the earliest point c-lord knows a turn started, so it is
+        # where the "how long have I been waiting" clock should start.
+        mirror = self._mirrors.get(thread_id)
+        if mirror is not None:
+            mirror.note_turn_started()
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -67,8 +76,16 @@ class TranscriptMirrorCog(commands.Cog):
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
         recovered = 0
+        closed = 0
         for row in rows:
             if not row.working_dir:
+                continue
+            # Issue #537: a closed workspace (``!close-workspace``) keeps its
+            # row and its transcript — often the biggest ones on disk. Nobody is
+            # waiting on it, so neither the recovery scan nor a mirror is worth
+            # the startup cost.
+            if getattr(row, "closed_at", None):
+                closed += 1
                 continue
             # Issue #215: re-deliver a final answer that was written to the
             # jsonl while the bot was down (mirror not tailing). The resumed
@@ -85,26 +102,32 @@ class TranscriptMirrorCog(commands.Cog):
             if self.start_for(row.thread_id, row.working_dir):
                 started += 1
         logger.info(
-            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s), "
-            "recovered %d dropped final answer(s)",
+            "TranscriptMirrorCog: started %d mirror(s) from %d session row(s) "
+            "(%d closed row(s) skipped), recovered %d dropped final answer(s)",
             started,
             len(rows),
+            closed,
             recovered,
         )
 
     async def _recover_final_answer(self, thread_id: int, working_dir: str, row) -> bool:
         """Re-deliver the last completed turn's final answer if it was dropped.
 
-        Returns True if a recovery post was made. Dedup is by the assistant
-        event uuid: a final answer whose uuid already matches the stored
-        ``mirror_replied_uuid`` was delivered live and is left alone.
+        Returns True if a recovery post was made. Whether an answer counts as
+        delivered is decided by :func:`final_answer_needs_recovery` — by the
+        *position* of the stored ``mirror_replied_uuid`` cursor relative to the
+        answer, not by equality with it (#553).
         """
-        fa = last_completed_final_answer(derive_project_dir(working_dir))
+        stored = getattr(row, "mirror_replied_uuid", None)
+        # #553: "not equal to the cursor" is NOT the same as "was dropped". A
+        # turn still running at shutdown leaves the cursor on a later line than
+        # the last completed turn's final answer, and the equality test then read
+        # that as a drop and re-posted an answer the user had already read. Ask
+        # the ordering question instead: has the cursor already passed it?
+        # Awaited off the loop (#537): the scan reads a whole transcript.
+        fa = await final_answer_needs_recovery_async(derive_project_dir(working_dir), stored)
         if fa is None:
             return False
-        stored = getattr(row, "mirror_replied_uuid", None)
-        if fa.uuid == stored:
-            return False  # already delivered live
         if stored is None:
             # First time we track this session (e.g. right after the column was
             # added by migration). We cannot tell whether the pre-fix mirror
@@ -114,8 +137,8 @@ class TranscriptMirrorCog(commands.Cog):
             # restart, when the cursor is set and a newer turn differs.
             await self._session_repo.set_mirror_replied_uuid(thread_id, fa.uuid)
             return False
-        # Cursor is set and a newer completed turn's final answer differs from
-        # it → that answer was written while the mirror was down. Re-deliver it.
+        # The cursor sits BEFORE this answer: it completed while the mirror was
+        # down, so nothing ever posted it. Re-deliver it once.
         reply_sink = self._make_reply_sink(thread_id)
         await reply_sink(fa.text)
         await self._session_repo.set_mirror_replied_uuid(thread_id, fa.uuid)
@@ -151,6 +174,7 @@ class TranscriptMirrorCog(commands.Cog):
             reply_cursor_sink=reply_cursor_sink,
             verbosity=verbosity_mode(),
             ask_bridge_cb=self._make_ask_bridge(thread_id),
+            progress=self._make_progress(thread_id),
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -169,6 +193,38 @@ class TranscriptMirrorCog(commands.Cog):
     async def cog_unload(self) -> None:
         await asyncio.gather(*(m.stop() for m in self._mirrors.values()), return_exceptions=True)
         self._mirrors.clear()
+
+    def _make_progress(self, thread_id: int) -> TurnProgress | None:
+        """Build the #539 silence filler for *thread_id*, or None when disabled.
+
+        Wired here rather than left to consumers: a c-lord upgrade alone has to
+        turn the feature on (Zero-Config Principle). ``CLORD_TURN_PROGRESS=0``
+        opts out.
+        """
+        if not turn_progress_enabled():
+            return None
+        bot = self.bot
+
+        async def post(text: str):
+            channel = await self._resolve_channel(bot, thread_id)
+            send = getattr(channel, "send", None) if channel is not None else None
+            if send is None:
+                return None
+            # Silent: the whole point is a low-noise hint, not a notification.
+            return await send(text, silent=True)
+
+        async def edit(handle, text: str) -> None:
+            await handle.edit(content=text)
+
+        async def delete(handle) -> None:
+            await handle.delete()
+
+        return TurnProgress(
+            post=post,
+            edit=edit,
+            delete=delete,
+            quiet_seconds=turn_progress_quiet_seconds(),
+        )
 
     def _make_cursor_sink(self, thread_id: int):
         """Return an awaitable that records the delivered final-answer uuid.
@@ -209,7 +265,9 @@ class TranscriptMirrorCog(commands.Cog):
             channel_cog = bot.get_cog("ChannelRepoCog")
             tmux_manager = None
             if isinstance(channel_cog, ChannelRepoCog):
-                tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
+                tmux_manager = await channel_cog.resolve_tmux_manager(
+                    parent_id, thread_id=thread_id
+                )
             if tmux_manager is None:
                 tmux_manager = getattr(bot, "tmux_manager", None)
             if tmux_manager is None:
@@ -218,8 +276,15 @@ class TranscriptMirrorCog(commands.Cog):
                 )
                 return
             runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
+            # #480: this menu was raised outside a Discord-driven turn (terminal /
+            # autonomous continuation), so there is no per-turn poster — fall back
+            # to the bot owner so the blocking question still pings someone.
             await bridge_pane_ask(
-                channel, question, runner, ask_repo=getattr(bot, "ask_repo", None)
+                channel,
+                question,
+                runner,
+                ask_repo=getattr(bot, "ask_repo", None),
+                notify_user_id=owner_notify_id(bot, kind="blocked"),
             )
 
         return ask_bridge

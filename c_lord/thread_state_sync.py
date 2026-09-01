@@ -20,7 +20,10 @@ Every ``poll_interval`` seconds:
 
 The loop deliberately never touches the ``topic`` body — that is
 the user-visible stable identity. Only the leading status emoji and
-the leading ``W<N> │`` work-number hint are kept fresh.
+the leading ``W<N> │`` work-number hint are kept fresh.  A session closed with
+``/close-workspace`` keeps its ``[終了]`` marker here (#512): the loop sees it as
+``dead`` like any window-less thread, so without the flag the repaint would strip
+the marker off.
 """
 
 from __future__ import annotations
@@ -28,16 +31,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import logging
+import os
 import re
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
 
+from .notify_policy import owner_notify_id
+from .session_close import is_closed
 from .thread_name import build_name
 from .tmux import parse_work_number
+from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
@@ -60,6 +69,30 @@ def _now() -> datetime.datetime:
 _LIST_WINDOWS_FORMAT = "#{session_name}|#{window_id}|#{window_index}|#{@thread_id}|#{window_name}"
 
 _DEFAULT_INTERVAL_SECONDS = 60.0
+
+# #359: where a pane that looks like a menu but will not parse gets kept, so the
+# population that has never been explainable finally leaves evidence. These are
+# diagnostic captures, not state — losing them costs nothing.
+_UNPARSABLE_DIR_ENV = "CLORD_UNPARSABLE_MENU_DIR"
+_DEFAULT_UNPARSABLE_DIR = "~/.cache/c-lord/unparsable-menus"
+# The sweep revisits the same stuck menu every tick; a bounded, deduplicated
+# store keeps one stuck menu from writing 1,440 files a day (the "loop buries
+# the signal" failure #579 had to undo).
+_MAX_UNPARSABLE_CAPTURES = 40
+
+# How many times the menu watchdog may fail to post the same thread's menu
+# before it stops trying (#579). A failed post leaves the menu unbridged, which
+# is exactly the condition that triggers the sweep — so without a cap the pair
+# is a closed loop: production retried one unpostable menu 116 times in a day,
+# every failure swallowed as "Task exception was never retrieved".
+_ASK_BRIDGE_MAX_FAILURES = 3
+
+# #600: how many times the watchdog may re-post the SAME question in a thread.
+# When an answer cannot reach the TUI the menu never closes, so every sweep sees
+# it as "unbridged" and posts it again — production stacked six copies of one ❓
+# over two days. Capping the re-posts turns an endless stream into a bounded,
+# noticeable event; the #579 cap does the same for repeated post *failures*.
+_MAX_REBRIDGES_PER_MENU = 3
 
 # Timeout for a single rename HTTP call.  Long enough for normal API response;
 # short enough not to block the tick when discord.py's rate-limit sleep fires.
@@ -171,6 +204,36 @@ def _capture_pane_text(
     return result.stdout
 
 
+def _pane_foreground_command(session_name: str, window_name: str) -> str | None:
+    """Foreground command of ``session:window``'s pane, or None when unreadable (#510).
+
+    The sweep already knows the session/window it captured from, so it asks tmux
+    directly rather than routing through a :class:`TmuxSessionManager` (same
+    reason :func:`_capture_pane_text` exists). None means "could not tell",
+    never "dead" — see :func:`c_lord.tmux.pane_command_is_dead`.
+    """
+    if not session_name or not window_name:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{session_name}:{window_name}",
+                "-F",
+                "#{pane_current_command}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _list_all_windows() -> list[dict[str, str]]:
     """Run ``tmux list-windows -a`` and parse the result.
 
@@ -214,6 +277,91 @@ def _index_by_thread_id(
         if tid.isdigit():
             by_tid[int(tid)] = w
     return by_tid
+
+
+def _unparsable_dir() -> Path:
+    """Directory for #359 diagnostic captures (override with the env var)."""
+    return Path(os.path.expanduser(os.getenv(_UNPARSABLE_DIR_ENV) or _DEFAULT_UNPARSABLE_DIR))
+
+
+def record_unparsable_menu(
+    *,
+    thread_id: int,
+    session_name: str,
+    window_name: str,
+    pane_text: str,
+    directory: Path | None = None,
+) -> Path | None:
+    """Keep a pane that shows a menu the parser could not read (#359).
+
+    The watchdog's cheap signature gate said "there is a menu here" and the full
+    parse then produced nothing. Before this, that combination returned silently
+    on every 60-second tick — no log, no capture — so the "buttons never
+    appeared" reports could never be traced to a cause. Now each distinct frame
+    is written once, which is also exactly the material the DoD's detection-bug
+    fixture rule requires before any parser change.
+
+    Returns the file written, or ``None`` when nothing was written (a duplicate
+    frame, the store is full, or the write failed). Never raises: a diagnostic
+    must not be able to take the sweep down.
+    """
+    logger.warning(
+        "%s pane shows a menu signature but the parser produced nothing — "
+        "the choices cannot reach Discord (session=%s window=%s) (#359)",
+        log_ctx(thread_id=thread_id),
+        session_name,
+        window_name,
+    )
+    try:
+        target = directory if directory is not None else _unparsable_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        existing = sorted(target.glob("*.txt"))
+        if len(existing) >= _MAX_UNPARSABLE_CAPTURES:
+            return None
+        digest = hashlib.sha1(pane_text.encode("utf-8", "replace")).hexdigest()[:12]
+        if any(f.name.endswith(f"-{digest}.txt") for f in existing):
+            return None  # same frame as a previous tick
+        path = target / f"thread{thread_id}-{digest}.txt"
+        path.write_text(pane_text, encoding="utf-8", errors="replace")
+        logger.warning(
+            "%s captured the unparsable pane for diagnosis: %s (#359)",
+            log_ctx(thread_id=thread_id),
+            path,
+        )
+        return path
+    except Exception:
+        logger.debug("record_unparsable_menu: could not store the pane", exc_info=True)
+        return None
+
+
+class MenuRebridgeLedger:
+    """Counts how often each distinct menu has been re-posted to a thread (#600).
+
+    Keyed by (thread, menu signature) rather than by thread: a stuck question
+    must stop repeating, but the *next* question in that thread is a different
+    decision and starts with a full budget. Keying on the thread alone would
+    silence menus the user has never seen.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[tuple[int, str], int] = {}
+
+    @staticmethod
+    def _key(thread_id: int, signature: str) -> tuple[int, str]:
+        return (thread_id, signature or "")
+
+    def record(self, thread_id: int, signature: str) -> int:
+        key = self._key(thread_id, signature)
+        self._counts[key] = self._counts.get(key, 0) + 1
+        return self._counts[key]
+
+    def exhausted(self, thread_id: int, signature: str) -> bool:
+        return self._counts.get(self._key(thread_id, signature), 0) >= _MAX_REBRIDGES_PER_MENU
+
+    def clear(self, thread_id: int) -> None:
+        """Forget this thread's budget — the menu resolved, or the turn moved on."""
+        for key in [k for k in self._counts if k[0] == thread_id]:
+            del self._counts[key]
 
 
 class ThreadStateSyncLoop:
@@ -291,6 +439,25 @@ class ThreadStateSyncLoop:
             )
             self._initial_pass = False
 
+    async def _divergent_session_name(self, thread: discord.Thread) -> str | None:
+        """The tmux session *thread* is in, when it is not its channel's (#618).
+
+        ``None`` for the common case, which keeps the name byte-identical and so
+        produces no rename — important on a 60s loop against Discord's ~2
+        renames / 10 min limit.
+        """
+        from .cogs.channel_repo import ChannelRepoCog
+
+        parent_id = getattr(thread, "parent_id", None)
+        if parent_id is None:
+            return None
+        cog = self._bot.get_cog("ChannelRepoCog")
+        if not isinstance(cog, ChannelRepoCog):
+            return None
+        with contextlib.suppress(Exception):
+            return await cog.divergent_session_name(parent_id, thread.id)
+        return None
+
     async def _sync_one(
         self,
         record,  # SessionRecord
@@ -345,9 +512,17 @@ class ThreadStateSyncLoop:
         if not record.topic:
             return
 
-        new_name = build_name(record.topic, new_state, window_number)
-
-        # Fetch the Discord thread and rename if different.
+        # #414: keep the Issue/PR number in the lamp-sync rename too, otherwise
+        # the slow sidebar repaint would drop it from the name.
+        # #593: likewise the *origin* number. This loop repaints every thread on a
+        # 60s tick, so omitting it here would quietly undo the identity half of
+        # the name a minute after the naming pass wrote it.
+        # #512: likewise the ``[終了]`` marker. A closed session has no tmux window,
+        # so this loop computes state="dead" for it every tick — without the flag
+        # it would rebuild the plain name and quietly undo the marker that
+        # /close-workspace just applied.
+        # Fetch the Discord thread first: the name needs its parent channel to
+        # tell "this thread is in another repo's session" from the common case.
         try:
             channel = self._bot.get_channel(thread_id)
             if channel is None:
@@ -359,6 +534,20 @@ class ThreadStateSyncLoop:
 
         if not isinstance(channel, discord.Thread):
             return
+
+        # #618: without this the 60s sweep would rebuild the name without the
+        # session label and quietly undo it a minute after the naming pass wrote
+        # it — the same way #414/#593/#512 had to be repeated here.
+        new_name = build_name(
+            record.topic,
+            new_state,
+            window_number,
+            issue_ref=record.issue_ref,
+            origin_issue_ref=record.origin_issue_ref,
+            closed=is_closed(record),
+            session_label=await self._divergent_session_name(channel),
+        )
+
         if (channel.name or "") == new_name:
             return
 
@@ -454,8 +643,19 @@ class MenuWatchdogLoop:
     Independent of the thread-name lamp (which is off by default, #329): the
     user's ability to see and answer AskUserQuestion/plan menus must not depend
     on an opt-in cosmetic feature.  Iterates every tmux window that carries an
-    ``@thread_id`` — no DB dependency — so it also recovers menus opened before
-    the bot (re)started.
+    ``@thread_id`` so it also recovers menus opened before the bot (re)started.
+
+    Ownership filter (#438): ``tmux list-windows -a`` returns every session on
+    the (shared) tmux server, including OTHER bots' sessions on the same host.
+    Bridging a foreign window would post another bot's menu into a thread we do
+    not own.  Each sweep is therefore restricted to windows this bot owns:
+      * AC2 — ``@thread_id`` must be a session in our own ``sessions.db``
+        (each bot has its own DB, so a foreign thread_id is absent), and
+      * AC1 — the window must live in a tmux session this bot manages
+        (binding-derived names + the global default).
+    ``repo`` defaults to ``None`` for backward compatibility (consumers that
+    do not wire it keep the old, unfiltered behaviour); ``setup.py`` always
+    passes it so the filter is on by default (zero-config).
     """
 
     def __init__(
@@ -464,13 +664,19 @@ class MenuWatchdogLoop:
         *,
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         is_processing: Callable[[int], bool] | None = None,
+        repo: SessionRepository | None = None,
     ) -> None:
         self._bot = bot
         self._interval = interval_seconds
         self._is_processing: Callable[[int], bool] = is_processing or (lambda _tid: False)
+        self._repo = repo
         self._task: asyncio.Task[None] | None = None
         # Per-thread background bridge task — one at a time per thread.
         self._ask_bridges: dict[int, asyncio.Task[None]] = {}
+        # thread_id -> consecutive failed bridge attempts (#579)
+        self._ask_bridge_failures: dict[int, int] = {}
+        # #600: how often each distinct menu has been re-posted here.
+        self._rebridges = MenuRebridgeLedger()
 
     def start(self) -> None:
         """Spawn the loop task. Idempotent."""
@@ -504,17 +710,59 @@ class MenuWatchdogLoop:
     async def tick(self) -> None:
         """One sweep over every tmux window bound to a thread. Public for tests."""
         windows = await asyncio.to_thread(_list_all_windows)
+        managed = await self._managed_session_names()
         for w in windows:
             tid = w.get("thread_id") or ""
             if not tid.isdigit():
                 continue
+            thread_id = int(tid)
             session_name = w.get("session_name", "")
+            # #438: skip windows this bot does not own BEFORE capturing the pane
+            # (a foreign bot's window on the shared tmux server). This is the
+            # whole guard against cross-bot menu bridging.
+            if not await self._owns_window(thread_id, session_name, managed):
+                continue
             window_name = w.get("window_name", "")
             pane_text = await asyncio.to_thread(_capture_pane_text, session_name, window_name)
             try:
-                await self._maybe_bridge_open_menu(int(tid), session_name, window_name, pane_text)
+                await self._maybe_bridge_open_menu(thread_id, session_name, window_name, pane_text)
             except Exception:
                 logger.exception("menu watchdog failed for thread=%s", tid)
+
+    async def _managed_session_names(self) -> set[str] | None:
+        """tmux session names this bot manages, for the #438 ownership filter.
+
+        Returns ``None`` when undeterminable (no ChannelRepoCog) — in that case
+        the session-name guard (AC1) is skipped and ownership rests on the DB
+        guard (AC2) alone.
+        """
+        from .cogs.channel_repo import ChannelRepoCog
+
+        cog = self._bot.get_cog("ChannelRepoCog")
+        if not isinstance(cog, ChannelRepoCog):
+            return None
+        with contextlib.suppress(Exception):
+            return await cog.managed_session_names()
+        return None
+
+    async def _owns_window(
+        self, thread_id: int, session_name: str, managed: set[str] | None
+    ) -> bool:
+        """#438: does this tmux window belong to THIS bot? See class docstring.
+
+        AC2 (DB) is authoritative; AC1 (managed session set) is the second guard.
+        Both must hold. A window in a session we do not manage, or for a thread
+        absent from our ``sessions.db``, is another bot's — never bridge it.
+        """
+        # AC2 — the thread must be one of our own sessions.
+        if self._repo is not None and await self._repo.get(thread_id) is None:
+            return False
+        # AC1 — the window must live in a tmux session we manage. ``managed``
+        # includes the default session, so unbound-channel windows (#420) for an
+        # owned thread still pass. Skip the guard when undeterminable / no name.
+        if managed is None or not session_name:
+            return True
+        return session_name in managed
 
     async def _maybe_bridge_open_menu(
         self, thread_id: int, session_name: str, window_name: str, pane_text: str
@@ -536,11 +784,33 @@ class MenuWatchdogLoop:
 
         if _ASK_SIGNATURE not in pane_text and _PLAN_SIGNATURE not in pane_text:
             return
+        # #510: the signature can outlive claude. tmux-resurrect restores a dead
+        # pane's saved screen (``cat <dump>; exec zsh``) after a reboot, so the
+        # menu of a session that ended weeks ago is still on display — and
+        # bridging it pinged the owner once every 24h forever (the bridge's Esc
+        # lands in zsh, so the "menu" never resolves). Ask the process table.
+        from .tmux import pane_command_is_dead
+
+        command = await asyncio.to_thread(_pane_foreground_command, session_name, window_name)
+        if pane_command_is_dead(command):
+            logger.debug(
+                "menu watchdog: ignoring menu in dead pane (thread=%d %s:%s cmd=%s)",
+                thread_id,
+                session_name,
+                window_name,
+                command,
+            )
+            return
         # A live turn's poll loop owns menus while it is processing (#166).
         if self._is_processing(thread_id):
             return
         existing = self._ask_bridges.get(thread_id)
         if existing is not None and not existing.done():
+            return
+        # #579: this menu has failed to post repeatedly — stop. Retrying cannot
+        # help (the pane is unchanged, so the post will fail the same way) and
+        # the loop is what buried the logs.
+        if self._ask_bridge_failures.get(thread_id, 0) >= _ASK_BRIDGE_MAX_FAILURES:
             return
         from .discord_ui.ask_bus import ask_bus
 
@@ -558,6 +828,15 @@ class MenuWatchdogLoop:
         norm = _normalize_capture(full)
         question = _parse_ask_from_pane(norm) or _parse_plan_from_pane(norm)
         if question is None:
+            # #359: the signature gate above said this pane is showing a menu, so
+            # a parse that yields nothing means the user is looking at choices we
+            # cannot bridge. Keep the frame instead of returning in silence.
+            record_unparsable_menu(
+                thread_id=thread_id,
+                session_name=session_name,
+                window_name=window_name,
+                pane_text=full,
+            )
             return
 
         channel = self._bot.get_channel(thread_id)
@@ -573,24 +852,128 @@ class MenuWatchdogLoop:
         tmux_manager = None
         channel_cog = self._bot.get_cog("ChannelRepoCog")
         if isinstance(channel_cog, ChannelRepoCog):
-            tmux_manager = await channel_cog.resolve_tmux_manager(parent_id)
+            tmux_manager = await channel_cog.resolve_tmux_manager(parent_id, thread_id=thread_id)
         if tmux_manager is None:
             tmux_manager = getattr(self._bot, "tmux_manager", None)
+        if tmux_manager is None and session_name:
+            # #420: A channel without a /clord-init binding resolves no manager,
+            # and bot.tmux_manager is unwired (main.py never passes one). But the
+            # sweep already located the live tmux session this menu's window lives
+            # in (we captured the pane from it), so target that session directly —
+            # same construction resolve_tmux_manager itself uses. Without this the
+            # watchdog gives up every tick and the tmux→Discord mirror "cuts off":
+            # the stranded menu never reaches Discord buttons.
+            from .tmux import TmuxSessionManager
+
+            tmux_manager = TmuxSessionManager(session_name=session_name)
         if tmux_manager is None:
             logger.warning("menu watchdog: no tmux manager for thread=%d", thread_id)
             return
         runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=thread_id)
 
+        # #549: long pre-menu prose (経緯・推し) scrolls off the alternate screen,
+        # which keeps no scrollback, so the capture above returns the menu with
+        # ``context=""`` — the question then reaches Discord with no decision
+        # context, and the prose only appears after the answer, out of order.
+        # The poll loop has recovered this since #468 by transiently growing the
+        # window (Claude redraws its conversation on SIGWINCH); the watchdog
+        # never did, which is exactly the reported #549 case. Same conditions as
+        # the poll loop: only when the first read came up empty, so an ordinary
+        # menu never pays the resize round-trip.
+        if not question.context and hasattr(tmux_manager, "capture_pane_tall"):
+            tall = await asyncio.to_thread(tmux_manager.capture_pane_tall, thread_id)
+            if isinstance(tall, str) and tall:
+                recovered = _parse_ask_from_pane(_normalize_capture(tall)) or _parse_plan_from_pane(
+                    _normalize_capture(tall)
+                )
+                if recovered is not None and recovered.context:
+                    question = recovered
+                    logger.info(
+                        "menu watchdog: recovered pre-menu context via tall capture "
+                        "(thread=%d, context_chars=%d)",
+                        thread_id,
+                        len(recovered.context),
+                    )
+
         from .discord_ui.ask_handler import bridge_pane_ask
 
+        # #600: an answer that cannot reach the TUI leaves the menu open, so every
+        # sweep sees it as unbridged and posts it again. Cap the repeats.
+        signature = f"{question.header}|{'|'.join(o.label for o in question.options)}"
+        if self._rebridges.exhausted(thread_id, signature):
+            logger.warning(
+                "%s menu re-posted %d times without being answered — not posting it "
+                "again. The answer is probably not reaching the pane; check "
+                "`tmux attach -t %s` window %s (#600)",
+                log_ctx(thread_id=thread_id),
+                _MAX_REBRIDGES_PER_MENU,
+                session_name,
+                window_name,
+            )
+            return
+        attempt = self._rebridges.record(thread_id, signature)
         logger.info(
-            "menu watchdog: bridging unwatched TUI menu (thread=%d header=%r)",
+            "menu watchdog: bridging unwatched TUI menu "
+            "(thread=%d header=%r context_chars=%d attempt=%d/%d)",
             thread_id,
             question.header,
+            len(question.context),
+            attempt,
+            _MAX_REBRIDGES_PER_MENU,
         )
+
+        async def _bridge_and_report() -> None:
+            """Bridge, and make a failure visible instead of swallowing it (#579).
+
+            The task is spawned and never awaited, so a raise used to surface
+            only as asyncio's ``Task exception was never retrieved`` — which is
+            why a menu failing to post 116 times in one day went unnoticed.
+            """
+            try:
+                await bridge_pane_ask(
+                    channel,
+                    question,
+                    runner,
+                    ask_repo=getattr(self._bot, "ask_repo", None),
+                    # #480: watchdog bridges a menu no Discord turn is watching
+                    # (terminal-driven), so ping the bot owner as the fallback
+                    # (#525: unless this deployment turned that fallback off).
+                    notify_user_id=owner_notify_id(self._bot, kind="blocked"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failures = self._ask_bridge_failures.get(thread_id, 0) + 1
+                self._ask_bridge_failures[thread_id] = failures
+                logger.warning(
+                    "menu watchdog: bridge failed for thread=%d (attempt %d/%d)",
+                    thread_id,
+                    failures,
+                    _ASK_BRIDGE_MAX_FAILURES,
+                    exc_info=True,
+                )
+                if failures >= _ASK_BRIDGE_MAX_FAILURES:
+                    # Giving up quietly would leave the user waiting on choices
+                    # that are never coming, with the question still blocking
+                    # Claude in the pane.
+                    with contextlib.suppress(Exception):
+                        await channel.send(
+                            "-# ⚠️ この質問の選択肢を Discord に表示できませんでした"
+                            f"（{failures} 回失敗）。tmux ペインで直接回答してください: "
+                            f"`tmux attach -t {session_name}` → `{window_name}`"
+                        )
+                    logger.error(
+                        "menu watchdog: giving up on thread=%d after %d failures (#579)",
+                        thread_id,
+                        failures,
+                    )
+            else:
+                self._ask_bridge_failures.pop(thread_id, None)
+                # The menu was answered/dismissed — the next question in this
+                # thread starts with a fresh re-post budget (#600).
+                self._rebridges.clear(thread_id)
+
         self._ask_bridges[thread_id] = asyncio.create_task(
-            bridge_pane_ask(
-                channel, question, runner, ask_repo=getattr(self._bot, "ask_repo", None)
-            ),
+            _bridge_and_report(),
             name=f"menu-watchdog-{thread_id}",
         )

@@ -242,7 +242,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | 사용할 모델 | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | CLI 권한 모드 | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Claude 작업 디렉토리 | 현재 디렉토리 |
-| `MAX_CONCURRENT_SESSIONS` | 최대 동시 세션 수 | `3` |
+| `MAX_CONCURRENT_SESSIONS` | **동시에 실행되는 턴 수**의 상한. 상주하는 `claude` 프로세스 수의 상한이 아닙니다 (#576) | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | 상주 워크스페이스 수의 상한. 초과하면 가장 오래 사용되지 않은 것부터 절전되며, 새 워크스페이스 생성은 결코 차단되지 않습니다. 기본값은 `MemTotal` 에서 자동 산출 (`docs/specs/resident-cap.md`) | 자동 산출 |
 | `SESSION_TIMEOUT_SECONDS` | 세션 비활성 시간 초과 | `300` |
 | `DISCORD_OWNER_ID` | Claude가 입력이 필요할 때 @멘션할 사용자 ID | (선택) |
 | `COORDINATION_CHANNEL_ID` | 세션 간 이벤트 브로드캐스트 채널 ID | (선택) |

@@ -37,16 +37,37 @@ class ProgressFolder:
         self._lines: list[str] = []
         # tool_id -> index into _lines, so a tool result can amend its own line
         self._tool_idx: dict[str, int] = {}
+        # Lines a reader would actually get something out of.  Bookkeeping lines
+        # (the session-start banner) are tracked but not counted (#542).
+        self._meaningful = 0
 
     @property
     def is_empty(self) -> bool:
-        return not self._lines
+        """True when nothing worth attaching was collected this turn.
 
-    def track(self, msg: discord.Message | None, line: str) -> None:
-        """Record a progress message and its transcript line."""
+        #542: this used to be ``not self._lines``, which counted the
+        ``[session start] <id>`` banner — a line every turn records — as
+        content.  In the default jsonl bridge mode ``_last_response_msg`` is
+        None (Claude's answer is posted by the transcript mirror, not here), so
+        every first turn fell through to the standalone send and shipped a
+        40-byte ``progress.txt`` with nothing in it but that banner, attached to
+        an empty message.  Emptiness is now about whether a *reader* would get
+        anything out of the file, not whether we happened to append a line.
+        """
+        return self._meaningful == 0
+
+    def track(self, msg: discord.Message | None, line: str, *, meaningful: bool = True) -> None:
+        """Record a progress message and its transcript line.
+
+        Pass ``meaningful=False`` for bookkeeping lines that should be kept in
+        the transcript when it is built, but must not by themselves make the
+        folder look non-empty (#542).
+        """
         if msg is not None:
             self._messages.append(msg)
         self._lines.append(line)
+        if meaningful:
+            self._meaningful += 1
 
     def track_tool(self, tool_id: str, msg: discord.Message | None, line: str) -> None:
         """Record a tool-use message; later updatable via ``update_tool_result``."""
@@ -54,6 +75,7 @@ class ProgressFolder:
             self._messages.append(msg)
         self._tool_idx[tool_id] = len(self._lines)
         self._lines.append(line)
+        self._meaningful += 1
 
     def update_tool_result(self, tool_id: str, result: str) -> None:
         """Append a tool result snippet to the line previously tracked for ``tool_id``."""

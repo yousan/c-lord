@@ -42,6 +42,9 @@ _CONTEXT_TOTAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ``Cost: $X.XXXX  Session: ...`` ccstatusline row 2.
+_COST_RE = re.compile(r"Cost:\s+\$([\d.]+)")
+
 
 @dataclass(frozen=True)
 class ContextUsage:
@@ -64,11 +67,23 @@ class ContextUsage:
         return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
 
 
+# Claude Code writes a synthetic assistant entry (this placeholder model id,
+# all-zero usage) for failed tool-call parses and no-op turns.  These do not
+# occupy context and must not be treated as the latest real turn (#425).
+_SYNTHETIC_MODEL = "<synthetic>"
+
+
 def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
-    """Return the usage of the most recent assistant turn in ``jsonl_path``.
+    """Return the usage of the most recent *real* assistant turn in ``jsonl_path``.
+
+    Synthetic / no-op assistant entries are skipped: Claude Code emits a
+    ``<synthetic>``-model entry with all-zero usage for failed tool-call parses
+    and no-op turns.  Reporting one would show 0 tokens used (a wrong
+    ``0% context`` line) and key the context-window probe on a phantom model
+    (#425), so the last entry carrying real usage is used instead.
 
     Returns ``None`` when the file is missing or contains no assistant message
-    with a ``usage`` block.  Malformed lines are skipped.
+    with real ``usage``.  Malformed lines are skipped.
     """
     if not jsonl_path.is_file():
         return None
@@ -89,14 +104,33 @@ def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
             usage = message.get("usage")
             if not isinstance(usage, dict):
                 continue
-            latest = ContextUsage(
+            candidate = ContextUsage(
                 input_tokens=int(usage.get("input_tokens", 0) or 0),
                 output_tokens=int(usage.get("output_tokens", 0) or 0),
                 cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
                 cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
                 model=message.get("model"),
             )
+            # Skip synthetic / no-op entries (#425): they carry no real context
+            # tokens, so the last entry with real usage is the true window state.
+            if candidate.model == _SYNTHETIC_MODEL or candidate.used == 0:
+                continue
+            latest = candidate
     return latest
+
+
+def parse_cost_from_pane(pane_text: str) -> float | None:
+    """Extract the per-turn cost from the ccstatusline ``Cost: $X.XXXX`` row.
+
+    Returns the turn cost in USD, or ``None`` when not found.
+    """
+    match = _COST_RE.search(pane_text)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def _scale(suffix: str) -> int:
@@ -164,17 +198,44 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def format_context_line(used: int, total: int) -> str:
+def _shorten_model(model: str) -> str:
+    """Strip the ``claude-`` prefix: ``claude-sonnet-4-6`` → ``sonnet-4-6``."""
+    return re.sub(r"^claude-", "", model)
+
+
+def format_context_line(
+    used: int,
+    total: int,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    cli_version: str | None = None,
+    cost_usd: float | None = None,
+) -> str:
     """Build the Discord message announcing context usage.
 
     Below the auto-compact threshold this is a subtle ``-#`` line; at or above
     it the message is promoted to a visible warning so the user can ``/clear``
-    or ``/compact`` before auto-compact kicks in.
+    or ``/compact`` before auto-compact kicks in.  Optional keyword arguments
+    append model, effort, CLI version, and cost separated by ``·``.
     """
     pct = min(100.0, used / total * 100) if total else 0.0
     used_str, total_str = _fmt_tokens(used), _fmt_tokens(total)
+
+    extras: list[str] = []
+    if model:
+        extras.append(_shorten_model(model))
+    if effort:
+        extras.append(effort)
+    if cli_version:
+        extras.append(f"CLI {cli_version}")
+    if cost_usd is not None:
+        extras.append(f"${cost_usd:.4f}")
+    suffix = (" · " + " · ".join(extras)) if extras else ""
+
     if pct >= AUTOCOMPACT_THRESHOLD:
         return (
-            f"⚠️ Context {pct:.0f}% full ({used_str}/{total_str}) — auto-compact may run next turn"
+            f"⚠️ Context {pct:.0f}% full ({used_str}/{total_str})"
+            f" — auto-compact may run next turn{suffix}"
         )
-    return f"-# \U0001f4ca {pct:.0f}% context ({used_str}/{total_str})"
+    return f"-# \U0001f4ca {pct:.0f}% context ({used_str}/{total_str}){suffix}"

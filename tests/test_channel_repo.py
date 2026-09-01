@@ -12,6 +12,7 @@ from c_lord.database.channel_repo import (
     derive_session_name,
     normalize_repo_url,
 )
+from c_lord.database.repository import SessionRecord
 from c_lord.database.thread_repo import ThreadRepository
 
 # ---------------------------------------------------------------------------
@@ -33,10 +34,30 @@ async def thread_repo(tmp_path) -> ThreadRepository:
     return r
 
 
-def _make_bot() -> MagicMock:
+def _session_record() -> SessionRecord:
+    """A minimal open ``sessions`` row — enough to read as a c-lord thread."""
+    return SessionRecord(
+        thread_id=0,
+        session_id="sess-existing",
+        working_dir="/tmp/x",
+        model=None,
+        origin="discord",
+        summary=None,
+        created_at="2026-08-20 10:00:00",
+        last_used_at="2026-08-20 11:00:00",
+        closed_at=None,
+    )
+
+
+def _make_bot(*, clord_thread: bool = True) -> MagicMock:
     bot = MagicMock()
     bot.loop = MagicMock()
     bot.get_cog = MagicMock(return_value=None)
+    # #551 gates ``/clord-thread-init repo:`` on the thread being c-lord's.
+    # These tests are about URL handling and channel access, so the thread is
+    # one of c-lord's own unless a test says otherwise.
+    bot.session_repo = MagicMock()
+    bot.session_repo.get = AsyncMock(return_value=_session_record() if clord_thread else None)
     return bot
 
 
@@ -157,6 +178,20 @@ class TestDeriveSessionName:
 
     def test_dot_git_only_returns_fallback(self) -> None:
         assert derive_session_name(".git") == "clord"
+
+    def test_dotted_repo_name_sanitized_for_tmux(self) -> None:
+        # tmux forbids '.' in session names and silently rewrites it to '_'
+        # (its target syntax `session:window.pane` uses '.'/':' as separators).
+        # derive_session_name must mirror that rewrite so the name c-lord hands
+        # to `tmux -t` matches the one tmux actually stored — otherwise every
+        # window op for a dotted repo targets a non-existent session and Claude
+        # never starts ("Failed to start Claude in tmux"). (#474)
+        assert derive_session_name("git@github.com:sakana1235/NiyaReco.love.git") == "NiyaReco_love"
+        assert derive_session_name("https://github.com/foo/site.dev") == "site_dev"
+
+    def test_colon_in_name_sanitized_for_tmux(self) -> None:
+        # ':' is likewise illegal in a tmux session name.
+        assert derive_session_name("/home/user/repos/weird:name") == "weird_name"
 
 
 # ===========================================================================
@@ -288,7 +323,7 @@ class TestBindNormalizesUrl:
 
 class TestChannelRepoCogResolveTmuxManager:
     async def test_resolve_returns_none_without_binding(self, cog: ChannelRepoCog) -> None:
-        manager = await cog.resolve_tmux_manager(999)
+        manager = await cog.resolve_tmux_manager(999, thread_id=None)
         assert manager is None
 
     async def test_resolve_auto_derives_from_repo(
@@ -298,7 +333,7 @@ class TestChannelRepoCogResolveTmuxManager:
             channel_id=200,
             source_repo="https://github.com/org/my-project.git",
         )
-        manager = await cog.resolve_tmux_manager(200)
+        manager = await cog.resolve_tmux_manager(200, thread_id=None)
         assert manager is not None
         assert manager.session_name == "my-project"
 
@@ -307,8 +342,8 @@ class TestChannelRepoCogResolveTmuxManager:
             channel_id=300,
             source_repo="https://github.com/org/repo.git",
         )
-        m1 = await cog.resolve_tmux_manager(300)
-        m2 = await cog.resolve_tmux_manager(300)
+        m1 = await cog.resolve_tmux_manager(300, thread_id=None)
+        m2 = await cog.resolve_tmux_manager(300, thread_id=None)
         assert m1 is m2  # same object from cache
 
 
@@ -326,7 +361,7 @@ class TestChannelRepoCogEvictCache:
         self, cog: ChannelRepoCog, repo: ChannelRepository
     ) -> None:
         await repo.save(channel_id=100, source_repo="https://github.com/org/repo.git")
-        await cog.resolve_tmux_manager(100)
+        await cog.resolve_tmux_manager(100, thread_id=None)
         assert 100 in cog._tmux_cache
         cog.evict_cache(100)
         assert 100 not in cog._tmux_cache
@@ -593,3 +628,83 @@ class TestClordThreadInitTextTwin:
         binding = await thread_repo.get(5555)
         assert binding is not None
         assert "Bound thread" in ctx.send.call_args.args[0]
+
+
+# ===========================================================================
+# #427: tmux manager must honour thread-level bindings
+# ===========================================================================
+
+
+class TestResolveTmuxManagerThreadBinding:
+    """`resolve_tmux_manager` resolved only channel bindings, so a thread bound
+    to another repo got its session_dir from the thread repo but its tmux
+    window in the *parent channel's* session (#427)."""
+
+    async def test_thread_binding_wins_over_channel(
+        self, cog: ChannelRepoCog, repo: ChannelRepository, thread_repo: ThreadRepository
+    ) -> None:
+        await repo.save(channel_id=10, source_repo="https://github.com/org/games.git")
+        await thread_repo.save(
+            thread_id=11, source_repo="https://github.com/org/monitoring.git", channel_id=10
+        )
+        manager = await cog.resolve_tmux_manager(10, thread_id=11)
+        assert manager is not None
+        assert manager.session_name == "monitoring"
+
+    async def test_falls_back_to_channel_without_thread_binding(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        await repo.save(channel_id=20, source_repo="https://github.com/org/games.git")
+        manager = await cog.resolve_tmux_manager(20, thread_id=21)
+        assert manager is not None
+        assert manager.session_name == "games"
+
+    async def test_thread_binding_without_channel_binding(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        """Unbound channel + thread binding → still get a tmux session (#514 AC3)."""
+        await thread_repo.save(
+            thread_id=31, source_repo="git@github.com:yousan/dotclaude.git", channel_id=30
+        )
+        manager = await cog.resolve_tmux_manager(30, thread_id=31)
+        assert manager is not None
+        assert manager.session_name == "dotclaude"
+
+    async def test_thread_manager_is_cached(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        await thread_repo.save(
+            thread_id=41, source_repo="https://github.com/org/repo.git", channel_id=40
+        )
+        m1 = await cog.resolve_tmux_manager(40, thread_id=41)
+        m2 = await cog.resolve_tmux_manager(40, thread_id=41)
+        assert m1 is m2
+
+    async def test_evict_thread_cache_drops_tmux_manager(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        await thread_repo.save(
+            thread_id=51, source_repo="https://github.com/org/before.git", channel_id=50
+        )
+        first = await cog.resolve_tmux_manager(50, thread_id=51)
+        assert first is not None and first.session_name == "before"
+
+        await thread_repo.save(
+            thread_id=51, source_repo="https://github.com/org/after.git", channel_id=50
+        )
+        cog.evict_thread_cache(51)
+        second = await cog.resolve_tmux_manager(50, thread_id=51)
+        assert second is not None
+        assert second.session_name == "after"
+
+    async def test_managed_session_names_includes_thread_bindings(
+        self, cog: ChannelRepoCog, repo: ChannelRepository, thread_repo: ThreadRepository
+    ) -> None:
+        """The menu watchdog ignores sessions it does not manage (#438); a
+        thread-derived session must not look like another bot's."""
+        await repo.save(channel_id=60, source_repo="https://github.com/org/games.git")
+        await thread_repo.save(
+            thread_id=61, source_repo="https://github.com/org/monitoring.git", channel_id=60
+        )
+        names = await cog.managed_session_names()
+        assert {"clord", "games", "monitoring"} <= names

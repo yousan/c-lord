@@ -15,10 +15,21 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
-from ..tmux import TmuxSessionManager
-from .context_usage import parse_context_total
-from .types import AskOption, AskQuestion, MessageType, StreamEvent
+from ..tmux import TmuxSessionManager, pane_command_is_dead
+from ..transcript.resolver import derive_project_dir
+from .context_usage import parse_context_total, parse_cost_from_pane
+from .types import (
+    FREE_TEXT_NONE,
+    FREE_TEXT_NOTES,
+    FREE_TEXT_ROW,
+    AskOption,
+    AskQuestion,
+    FreeTextMode,
+    MessageType,
+    StreamEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +54,18 @@ _IDLE_TIMEOUT = 60.0
 
 # How long to wait for Claude to become ready (show input prompt).
 _STARTUP_TIMEOUT = 30.0
+
+# How long a turn is allowed to not-start-yet before the idle exit gives up on
+# it (#562).  Distinct from ``_STARTUP_TIMEOUT``, which only covers a *cold*
+# claude: a warm session used to get no grace at all, so 60s of pane silence on
+# a busy host ended the turn and reported it finished.  Generous on purpose —
+# a late "no response" notice is far cheaper than a false "finished", and the
+# ``timeout_seconds`` backstop still bounds the wait.
+_TURN_START_GRACE = 120.0
+
+# Prefix of the RESULT error for "this turn never produced anything" (#562).
+# Exported so callers can recognise the outcome without string-sniffing.
+NO_RESPONSE_ERROR_PREFIX = "No response —"
 
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
@@ -73,18 +96,133 @@ _POST_STARTUP_DELAY = 1.0
 # back to a plain fresh start.
 _CONTINUE_CHECK_DELAY = 3.0
 
+#: How long :meth:`TmuxClaudeRunner.wake` waits for a restored pane to reach its
+#: input box. Generous on purpose: a cold ``claude --continue`` re-renders the
+#: whole conversation on a host that may already be running a dozen of them, and
+#: the caller (``/tmux-screenshot``) has deferred its Discord response, which
+#: buys 15 minutes. Reporting failure while the pane is in fact still coming up
+#: is the worse error: it leaves a Claude nobody photographed.
+_WAKE_TIMEOUT = 120.0
+
+
+# #560: how many Enter presses send_input tries before giving up. Mirrors
+# c_lord.tmux._SUBMIT_ATTEMPTS; kept as a literal here so the user-facing
+# wording does not drag a tmux import into this module.
+_SUBMIT_ATTEMPTS_HINT = 3
+
+
+def _delivery_failure(action: str, prompt: str) -> str:
+    """User-facing text for "the message never reached Claude" (#527).
+
+    The old wording was ``Failed to send input to Claude in tmux`` — true, but
+    it left the user with no idea what broke or what to do, which is how a
+    19,852-byte attachment silently going nowhere looked from Discord.  Name
+    the input size (the usual culprit) and the one command that fixes a dead
+    pane.
+    """
+    size = len(prompt.encode("utf-8"))
+    return (
+        f"{action}に失敗しました — tmux のペインが入力を受け付けませんでした "
+        f"(入力 {size:,} bytes)。ペインが落ちているか応答しない状態です。"
+        "`/restart-claude` でセッションを立て直してから、もう一度送ってください。"
+    )
+
+
+def _missing_window(action: str, thread_id: int) -> str:
+    """User-facing text for "there is no window to start Claude in" (#621).
+
+    ``start_claude`` returns False for two unrelated reasons, and #527's wording
+    only fits one of them.  When the window was never created there is no pane
+    to be unresponsive, and ``/restart-claude`` — which restarts the process
+    *inside* an existing pane — cannot conjure one.  Sending the reader there
+    (as every scheduled run did) costs them the one attempt they had at fixing
+    it themselves.  So name what is actually absent, and point at the two things
+    that can actually be absent: the channel's repo binding, and tmux itself.
+    """
+    return (
+        f"{action}に失敗しました — このスレッド用の tmux ウィンドウが作られていません "
+        f"(thread={thread_id})。ペインが落ちているのではなく、Claude を動かす先の"
+        "ウィンドウがそもそも存在しない状態です。"
+        "チャンネルが `/clord-init` で repo に紐づいているか、"
+        "ホストで tmux が使えるかを確認してください。"
+    )
+
+
+def _ambiguous_window(action: str, thread_id: int, session: str, names: list[str]) -> str:
+    """User-facing text for "the tmux target does not identify one window" (#649).
+
+    Two windows sharing a name make every ``session:NAME`` target ambiguous, so
+    keystrokes land in whichever tmux matched first — another thread's checkout.
+    The pane is alive and well, which is why the #527 wording ("ペインが落ちて
+    いる", go run ``/restart-claude``) sent people to a command that could not
+    possibly help: it restarts Claude *inside* a window, and the duplicate name
+    is still there afterwards. Two threads sat dead for a day following that
+    advice. Name the real problem and give the command that actually shows it.
+    """
+    listed = ", ".join(f"`{n}`" for n in names)
+    return (
+        f"{action}に失敗しました — このスレッドの tmux ウィンドウを一意に特定できません "
+        f"(thread={thread_id})。同じ名前のウィンドウが複数あります: {listed}。"
+        "ペインが落ちているのではなくターゲットが曖昧なので、"
+        "`/restart-claude` では直りません。"
+        f"ホストで `tmux list-windows -t {session} "
+        "-F '#{window_id} #{window_name} #{@thread_id} #{pane_current_path}'` を確認し、"
+        "重複したウィンドウを rename するか、不要な方を kill してください。"
+    )
+
+
+def _stuck_in_input_box(prompt: str) -> str:
+    """User-facing text for "typed into the pane, but it would not submit" (#560).
+
+    Deliberately does **not** suggest ``/restart-claude``: the message is sitting
+    in the input box right now, and restarting the session would throw it away.
+    """
+    size = len(prompt.encode("utf-8"))
+    return (
+        f"メッセージの送信に失敗しました — 本文はペインの入力欄に入りましたが、"
+        f"Enter を {_SUBMIT_ATTEMPTS_HINT} 回試しても送信されませんでした "
+        f"(入力 {size:,} bytes)。本文はまだ入力欄に残っています。"
+        "もう一度送り直すか、`/tmux-screenshot` で状態を確認してください "
+        "(`/restart-claude` は入力欄の本文ごと破棄されるので、まず送り直しを試してください)。"
+    )
+
+
 # Patterns that indicate a trust/safety prompt that needs Enter to dismiss.
 _TRUST_PROMPT_MARKERS = (
     "Yes, I trust this folder",
     "Enter to confirm",
 )
 
-# The trust dialog's distinctive *menu option line*: "❯ 1. Yes, I trust this
-# folder".  Detection keys on this anchored line rather than a loose substring
-# of the marker phrases anywhere in the pane: the runner captures ~500 lines of
+# The trust dialog's distinctive *menu option line*.  Claude Code has shipped it
+# in two shapes, and BOTH must be handled:
+#
+#   <= 2.1.247   "❯ 1. Yes, I trust this folder" / "  2. No, exit"  (numbered, Yes first)
+#   >= 2.1.248   "❯ No, exit" / "  Yes, I trust this folder"        (unnumbered, No first)
+#
+# Detection keys on the anchored option line rather than a loose substring of the
+# marker phrases anywhere in the pane: the runner captures ~500 lines of
 # scrollback, so a session that merely *mentions* the dialog's wording (e.g. a
 # chat about this very feature) must not trip a spurious Enter into the input.
-_TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*1\.\s+Yes, I trust this folder\s*$", re.MULTILINE)
+# The unnumbered line is plainer prose than the numbered one, so detection also
+# requires the dialog's confirm footer to be present.
+# The numbered line is a structure prose does not reproduce, so it stands alone.
+_TRUST_PROMPT_NUMBERED_RE = re.compile(
+    r"^\s*❯?\s*\d+\.\s+Yes, I trust this folder\s*$", re.MULTILINE
+)
+# The unnumbered line is plain enough that quoted prose could reproduce it, so it
+# is only trusted alongside the dialog's confirm footer.
+_TRUST_PROMPT_RE = re.compile(r"^\s*❯?\s*Yes, I trust this folder\s*$", re.MULTILINE)
+
+# One option line of the trust dialog, in either shape.  Used to work out how
+# many Downs land the cursor on "Yes" — on the newer dialog the cursor starts on
+# "No, exit", so a bare Enter DECLINES trust and Claude exits without ever
+# starting the turn.
+_TRUST_OPTION_RE = re.compile(
+    r"^(?P<cursor>\s*❯)?\s*(?:\d+\.\s+)?(?P<label>Yes, I trust this folder|No, exit)\s*$"
+)
+
+# Footer the trust dialog always prints under its options.
+_TRUST_CONFIRM_FOOTER = "Enter to confirm"
 
 # Patterns from legacy AskUserQuestion TUI menus that must NOT be flagged as
 # "unknown" interactive prompts (#153).
@@ -177,8 +315,22 @@ def _permission_zone(text: str) -> str:
     Only this zone is scanned for permission / y/N / unknown-interactive markers.
     Conversation text in the scrollback above is excluded, preventing false
     positives when Claude's own output contains marker phrases (#156).
+
+    The window is anchored to the last line carrying *content*, not to the last
+    line of the capture (#611).  A prompt that draws no input box under itself —
+    an AskUserQuestion menu, or its "Review your answers" confirmation — leaves
+    the rest of the pane as blank rows, and a flat ``lines[-N:]`` then returned
+    nothing but that padding.  Every zone-based check went blind at the same
+    moment: ``_is_ask_submit_screen`` stopped pressing Enter on an answered
+    flow, *and* ``_has_unknown_interactive`` — the fail-safe whose whole job is
+    to shout about a stuck menu — could not see it either, so the session
+    stalled without emitting a single log line.  Skipping the padding only moves
+    the window across rows that carry no signal, so the #156 guarantee is intact:
+    conversation text above a pane that really does end in chrome stays excluded.
     """
     lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
     return "\n".join(lines[-_PERMISSION_SCAN_LINES:])
 
 
@@ -226,6 +378,49 @@ _ASK_TAB_HEADER_RE = re.compile(r"☐\s+(.+?)\s{2,}")
 # list; any of these box-drawing characters on an option line marks where the
 # pane starts, and everything from that column on must be ignored.
 _ASK_PREVIEW_BOX_CHARS = ("┌", "│", "└", "╭", "╰", "┐", "┘")
+
+
+def _join_wrapped(label: str, tail: str) -> str:
+    """Re-join an option label the TUI wrapped onto the next line (#579).
+
+    The wrap happens wherever the column runs out, so it can land mid-word:
+    Japanese needs the halves glued (「…（推」+「奨）」), while a Latin wrap broke
+    at a space that the capture then stripped, and gluing there would read as
+    "somewordelse". Insert a space only between two word characters.
+    """
+    if not label:
+        return tail
+    if label[-1].isalnum() and label[-1].isascii() and tail[:1].isalnum() and tail[:1].isascii():
+        return f"{label} {tail}"
+    return f"{label}{tail}"
+
+
+# #650: the two ways an open menu accepts free text.  The classic layout has a
+# "Type something." row to type onto; the preview layout (drawn as soon as any
+# option carries a ``preview``) replaces it with a ``Notes:`` field opened by
+# ``n``.  Both footers advertise "n to add notes", so that substring matches the
+# hint line and the "press n to add notes" placeholder alike.
+_ASK_NOTES_AFFORDANCE = "n to add notes"
+
+
+def _free_text_mode(menu_text: str) -> FreeTextMode:
+    """Which keystrokes this menu takes for a typed answer (#650).
+
+    Read off the pane rather than assumed, because guessing is not survivable:
+    on a preview menu the classic sequence (``Down`` × option_count → type →
+    ``Enter``) parks the cursor on "Chat about this", where printable keys are
+    ignored and ``Enter`` returns "(No answer provided)" — the user's sentence
+    is silently dropped (production incident, 2026-09-01).
+
+    *menu_text* must cover the ACTIVE menu and the hint line below it, not the
+    whole scrollback: an older menu's affordance would otherwise decide how the
+    current one is answered.
+    """
+    if "Type something" in menu_text:
+        return FREE_TEXT_ROW
+    if _ASK_NOTES_AFFORDANCE in menu_text:
+        return FREE_TEXT_NOTES
+    return FREE_TEXT_NONE
 
 
 def _is_ask_meta_label(label: str) -> bool:
@@ -323,7 +518,18 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
                 pane_col = c if pane_col is None else min(pane_col, c)
 
     def _menu_text(line: str) -> str:
-        return line[:pane_col] if pane_col is not None else line
+        """The menu-column part of *line*, with any preview-pane box cut off.
+
+        ``pane_col`` is a *character* index taken from the numbered option lines,
+        but the box is drawn at a fixed *display* column: a line whose text is
+        double-width (Japanese) reaches that column in fewer characters, so the
+        slice alone leaves the box character (and the preview text) behind. That
+        leftover is what put "…並べる    │" into an option label (#579), so cut
+        again at the first box character actually present in this line.
+        """
+        text = line[:pane_col] if pane_col is not None else line
+        cuts = [text.find(ch) for ch in _ASK_PREVIEW_BOX_CHARS if ch in text]
+        return text[: min(cuts)] if cuts else text
 
     # Indices of every numbered line (including meta-options) within the menu —
     # used to bound the region from which each real option's description is read.
@@ -347,13 +553,41 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         # Description (#169): the first non-empty, non-separator line between this
         # option and the next numbered line — Claude renders it indented below
         # the option.  Empty when the option has no description.
-        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx + 1
+        #
+        # #579: in a preview-table menu (``pane_col`` set) the left column is
+        # narrow and holds labels only — the explanation is in the box on the
+        # right — so a non-numbered line there is the continuation of an option
+        # whose text did not fit on one line. Two shapes, both real:
+        #   "❯ 1. 具体的な場面から入る（推" / "    奨）"   → a label cut mid-word
+        #   "  2." / "    欠けているものを先に並べる"      → the whole label wrapped
+        # The second used to produce ``label=""``, which Discord rejects with 400
+        # ("This field is required"), so the menu never posted at all. Dropping
+        # such an option instead would be worse than an empty label: the TUI
+        # still shows it and answers are delivered as ``Down × index``, so a
+        # shorter list would select the wrong option.
+        #
+        # Indentation cannot be the test here: descriptions sit at column 5 in
+        # a plain menu but at column 2 in a multiSelect one (the "[ ] " checkbox
+        # shifts them), which overlaps the wrapped-tail indent.
+        #
+        # ``end_idx`` (exclusive) rather than ``end_idx + 1``: that line is the
+        # "Chat about this" affordance, which was being read as the last
+        # option's description.
+        next_i = all_opt_indices[pos + 1] if pos + 1 < len(all_opt_indices) else end_idx
         description = ""
         for j in range(i + 1, next_i):
-            s = _menu_text(lines[j]).strip()
-            if not s or _SEPARATOR_RE.match(_menu_text(lines[j])):
+            raw = _menu_text(lines[j])
+            text = raw.strip()
+            if not text or _SEPARATOR_RE.match(raw):
                 continue
-            description = s
+            if pane_col is not None and not description:
+                # Preview-table layout: the explanation lives in the box on the
+                # right, so the narrow left column carries labels and nothing
+                # else. A non-numbered line in it is therefore the tail of the
+                # label above, never a description (#579).
+                label = _join_wrapped(label, text)
+                continue
+            description = text
             break
         options.append(AskOption(label=label, description=description))
 
@@ -370,7 +604,27 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
             continue
         question = s
 
-    return AskQuestion(question=question, header=header, options=options, multi_select=multi_select)
+    # #399: carry the prose spoken directly above the menu (経緯・推し). Only
+    # when the ☐ header anchored the menu — the scrolled-off fallback window
+    # gives no reliable upper bound, so guessing there risks chrome leaks.
+    context = _extract_pane_context(lines, header_idx) if header_idx >= 0 else ""
+
+    # #650: the free-text affordance sits at the very bottom of the menu — the
+    # "Type something." row just above "Chat about this", or the ``Notes:``
+    # field plus the "n to add notes" hint printed *below* it.  Scan from the
+    # menu's own start to the end of the capture so the hint line is included
+    # and an older menu higher up in the scrollback is not.
+    free_text_mode = _free_text_mode("\n".join(lines[scan_from:]))
+
+    return AskQuestion(
+        question=question,
+        header=header,
+        options=options,
+        multi_select=multi_select,
+        context=context,
+        allow_other=free_text_mode != FREE_TEXT_NONE,
+        free_text_mode=free_text_mode,
+    )
 
 
 # -- Plan approval (ExitPlanMode) TUI menu parsing (#251) ---------------------
@@ -438,12 +692,17 @@ def _parse_plan_from_pane(text: str) -> AskQuestion | None:
     body = _extract_plan_body(lines, sig_idx)
     if body:
         question = f"{body}\n\n{question}"
+    # #399 (AC4): prose spoken before ExitPlanMode sits above the plan box —
+    # same buffering gap as AskUserQuestion, same narrow extraction.
+    body_starts = [i for i, line in enumerate(lines[:sig_idx]) if _PLAN_BODY_START in line]
+    context = _extract_pane_context(lines, max(body_starts)) if body_starts else ""
     return AskQuestion(
         question=question,
         header="📋 Plan ready — approve?",
         options=options,
         multi_select=False,
         allow_other=False,
+        context=context,
     )
 
 
@@ -470,6 +729,104 @@ def _extract_plan_body(lines: list[str], sig_idx: int) -> str:
     return "\n".join(out).strip()
 
 
+# -- #399: prose context above a menu ------------------------------------------
+# When Claude talks (経緯・推し) and then opens an AskUserQuestion / plan menu,
+# the CLI buffers the whole jsonl chunk — preceding text block included — until
+# the menu resolves, so the transcript mirror structurally cannot deliver that
+# prose while the menu is open (#359 S2). The pane is the only live source.
+#
+# To avoid reviving the #53 TUI-scrape path, extraction is deliberately narrow:
+# ONLY the last column-0 "● " response block sitting directly above the menu
+# frame is carried, and nothing at all when that block is a tool invocation
+# ("● Bash(date)"), tool output ("⎿ …"), the echoed user prompt ("❯ …"), or
+# known chrome. The blast radius of a future chrome change is thus confined to
+# the single context message attached to the ask bridge.
+#
+# Tool invocations render as "● ToolName(args)" with an ASCII identifier —
+# prose virtually never starts with one ("● 案A(楽観ロック)…" does not match
+# because 案 is not [A-Za-z]). MCP tools render "● plugin:x:y - reply (MCP)(…)".
+_TOOL_INVOCATION_RE = re.compile(r"^●\s+[A-Za-z][\w.:|-]*(?:\s+-\s+\S+)*\s*\(")
+# Chrome painted between the response and a plan box.
+_PRE_MENU_CHROME = ("Ready to code?",)
+# Column-0 ● blocks that are TUI affordances, not assistant prose.
+_CONTEXT_CHROME_BLOCKS = ("Updated plan", "User answered Claude's questions")
+# Upper bound on the upward scan for the block start — a prose block before a
+# menu is short; anything larger is a runaway and must not be carried.
+_CONTEXT_SCAN_LIMIT = 120
+# Chrome that can be painted INSIDE the walked-up region during a mid-redraw
+# ghost frame (#32 class). Any hit kills the whole extraction — fail closed.
+_CONTEXT_INTERIOR_BAIL = (
+    re.compile(r"\(esc to interrupt.*"),
+    re.compile(r"Context left until auto-compact.*"),
+    re.compile(r"[\u2800-\u28FF] .+"),  # braille spinner frames ("⠧ Worked for 5m 3s")
+)
+
+
+def _extract_pane_context(lines: list[str], boundary_idx: int) -> str:
+    """Return the cleaned ``●`` prose block directly above ``boundary_idx``.
+
+    ``boundary_idx`` is the menu's anchor line (the ``☐`` header for
+    AskUserQuestion, the ``Here is Claude's plan:`` header for plans). Returns
+    ``""`` whenever the block directly above is anything but clean assistant
+    prose — missing, a tool block, the echoed user prompt, another menu, or
+    chrome. Conservative by design (#53): no guess is ever bridged.
+    """
+
+    def _is_skippable(line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return True
+        if _SEPARATOR_RE.match(s) or _PLAN_RULE_RE.match(s):
+            return True
+        if s in _PRE_MENU_CHROME:
+            return True
+        # Spinner / completion summaries ("✻ Baked for 37s").
+        return bool(_GENERATION_STATUS_RE.match(s))
+
+    # Skip the chrome padding between the menu frame and the content above it.
+    i = boundary_idx - 1
+    while i >= 0 and _is_skippable(lines[i]):
+        i -= 1
+    if i < 0:
+        return ""
+
+    # Walk up to the block start (a column-0 "● " line). Hitting anything that
+    # marks a different kind of block first means there is no prose to carry.
+    start = -1
+    for j in range(i, max(-1, i - _CONTEXT_SCAN_LIMIT), -1):
+        line = lines[j]
+        s = line.strip()
+        if line.startswith("● "):
+            start = j
+            break
+        if s.startswith(("❯", "⎿", "●")) or "☐" in s or _ASK_SIGNATURE in s or _PLAN_SIGNATURE in s:
+            return ""
+    if start < 0:
+        return ""
+
+    head = lines[start].strip()
+    if _TOOL_INVOCATION_RE.match(head):
+        return ""
+    if head[2:].lstrip().startswith(_CONTEXT_CHROME_BLOCKS):
+        return ""
+
+    # Validate the block INTERIOR (review blocker 2): a mid-redraw ghost frame
+    # can paint chrome between the ● head and the menu. Only space-indented
+    # continuations and blanks are prose; any other column-0 line or known
+    # status/hint line means the region is not a clean prose block → carry
+    # nothing (fail closed), never "most of it".
+    block = lines[start : i + 1]
+    for line in block[1:]:
+        s = line.strip()
+        if not s:
+            continue
+        if any(p.fullmatch(s) for p in _CONTEXT_INTERIOR_BAIL):
+            return ""
+        if not line.startswith(" "):
+            return ""
+    return _clean_tui_lines(block)
+
+
 # TUI status bar patterns at the very bottom.
 # Use prefix-only ("-- INSERT") because the TUI sometimes omits the closing "--"
 # e.g. "-- INSERT ⏵⏵ bypass permissions on (shift…"
@@ -484,6 +841,18 @@ _STATUS_BAR_MARKERS = ("-- INSERT", "-- NORMAL", "--", "⏵⏵", "⏸⏸")
 _GENERATION_STATUS_RE = re.compile(r"^(?!❯)[\u2700-\u27BF*·] .+$")
 # Additional explicit markers.
 _GENERATION_STATUS_MARKERS = ("Tip:", "·")
+
+# #365 (follow-up): the live working spinner shows a "(<elapsed> · …)" timer that
+# only exists while Claude is actively generating/executing, e.g.
+#   ✻ Running… (12s · ↑ 4.2k tokens · esc to interrupt)
+# While a tool runs, its result preview + the input box + footer push that timer
+# line 10-20 lines off the bottom, so a bottom-6-only scan misses it and the turn
+# is finalized early (premature mention before the real answer). We scan the
+# timer across a WIDE bottom window — the same heuristic the #190 lamp detector
+# (`thread_state_sync._pane_lamp_state`) already uses. Matching the timer (not the
+# bare glyph) avoids false-positives on stale completed spinners in scrollback.
+_RUNNING_PROBE_LINES = 30
+_RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
 
 # Markers that indicate Claude has actually started producing output:
 #   ● — assistant response paragraph
@@ -611,6 +980,62 @@ class TmuxClaudeRunner:
         self._silent_stop = False
         self._last_capture: str = ""
 
+    async def _duplicate_window_names(self) -> list[str]:
+        """Ambiguous window names in this thread's session, or ``[]`` (#649).
+
+        Undecidable reads as "no duplicates": this only ever *replaces* a
+        broader message with a sharper one, so a failed probe must fall back to
+        the general wording rather than assert a cause we did not verify.
+        """
+        try:
+            return await asyncio.to_thread(self._tmux.duplicate_window_names)
+        except Exception:
+            logger.warning(
+                "Could not check thread %d's session for duplicate window names",
+                self._thread_id,
+            )
+            return []
+
+    async def _start_failure_reason(self, prompt: str) -> str:
+        """Explain a failed ``start_claude`` by asking tmux, not by guessing (#621).
+
+        The call returns a bare ``False`` for failures that need opposite
+        advice: a pane that will not take the keystrokes, a window that was
+        never created (which is what every scheduled run hit — see #621), and a
+        window name that identifies two windows (#649).  Same shape as the #560
+        probe on the send path: read the actual state before telling the user
+        what to do about it.
+        """
+        try:
+            has_window = bool(await asyncio.to_thread(self._tmux.session_exists, self._thread_id))
+        except Exception:
+            # Undecidable — keep the broader #527 wording rather than assert a
+            # cause we did not verify.
+            logger.warning("Could not check whether thread %d has a tmux window", self._thread_id)
+            has_window = True
+        if has_window:
+            # #649: a duplicate name means the keystrokes went somewhere — just
+            # not here. Check before blaming a pane that is running fine.
+            if dupes := await self._duplicate_window_names():
+                logger.error(
+                    "start_claude failed for thread %d while %d window name(s) are "
+                    "duplicated in session %s (%s) — the target is ambiguous (#649)",
+                    self._thread_id,
+                    len(dupes),
+                    self._tmux.session_name,
+                    ", ".join(dupes),
+                )
+                return _ambiguous_window(
+                    "Claude の起動", self._thread_id, self._tmux.session_name, dupes
+                )
+            return _delivery_failure("Claude の起動", prompt)
+        logger.error(
+            "start_claude failed with no tmux window for thread %d — "
+            "the window was never created (#621)",
+            self._thread_id,
+        )
+        return _missing_window("Claude の起動", self._thread_id)
+
     async def run(
         self,
         prompt: str,
@@ -659,11 +1084,35 @@ class TmuxClaudeRunner:
                 await asyncio.sleep(_MENU_NAV_DELAY)
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
+                # #560: two very different failures reach this branch. Either the
+                # pane never took the input (#527), or the text is typed in and
+                # simply will not submit. Telling the second case to
+                # ``/restart-claude`` would discard the message the user just
+                # wrote, so ask the pane which one it is before advising.
+                stuck = await asyncio.to_thread(self._tmux.input_box_holds, self._thread_id, prompt)
+                if stuck:
+                    reason = _stuck_in_input_box(prompt)
+                elif dupes := await self._duplicate_window_names():
+                    # #649: not stuck and not dead — the keystrokes were typed
+                    # into a window this thread does not own.
+                    logger.error(
+                        "send_input failed for thread %d while %d window name(s) are "
+                        "duplicated in session %s (%s) — the target is ambiguous (#649)",
+                        self._thread_id,
+                        len(dupes),
+                        self._tmux.session_name,
+                        ", ".join(dupes),
+                    )
+                    reason = _ambiguous_window(
+                        "メッセージの送信", self._thread_id, self._tmux.session_name, dupes
+                    )
+                else:
+                    reason = _delivery_failure("メッセージの送信", prompt)
                 yield StreamEvent(
                     raw={},
                     message_type=MessageType.RESULT,
                     is_complete=True,
-                    error="Failed to send input to Claude in tmux",
+                    error=reason,
                 )
                 return
         else:
@@ -686,7 +1135,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error="Failed to start Claude in tmux",
+                        error=await self._start_failure_reason(prompt),
                     )
                     return
 
@@ -716,7 +1165,7 @@ class TmuxClaudeRunner:
                             raw={},
                             message_type=MessageType.RESULT,
                             is_complete=True,
-                            error="Failed to start Claude in tmux",
+                            error=await self._start_failure_reason(prompt),
                         )
                         return
             else:
@@ -737,7 +1186,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error="Failed to start Claude in tmux",
+                        error=await self._start_failure_reason(prompt),
                     )
                     return
 
@@ -809,6 +1258,10 @@ class TmuxClaudeRunner:
         # response trivially differs and cold starts are unaffected.
         saw_generation = False
         baseline_response: str | None = None
+        # #562: the #365 gate, hoisted out of the loop body. The idle exit and
+        # the final verdict both need it, and it must be defined even if the
+        # loop body never runs.
+        new_turn_started = False
 
         # The hard ``timeout_seconds`` backstop is INACTIVITY-based, not total
         # wall-clock (#94).  A heavy turn — Explore subagent + extended thinking
@@ -866,7 +1319,7 @@ class TmuxClaudeRunner:
             # c-lord already runs these dirs with --dangerously-skip-permissions, so
             # trusting the dir it just cloned is consistent with that threat model.
             if self._has_trust_prompt(current):
-                await self._accept_trust_prompt()
+                await self._accept_trust_prompt(current)
                 continue
 
             # Auto-accept permission prompts so the bot doesn't stall.
@@ -897,9 +1350,36 @@ class TmuxClaudeRunner:
                 ask_sig = "\n".join(o.label for o in ask_q.options)
                 if ask_stable >= _ASK_ALERT_DELAY and ask_sig != last_bridged_ask:
                     last_bridged_ask = ask_sig
+                    # #468: long pre-menu prose (経緯・推し) scrolls off the
+                    # alternate screen and is lost to the normal capture
+                    # (context_chars=0), so the question would reach Discord with
+                    # no decision context. Claude redraws its whole conversation
+                    # on SIGWINCH, so re-capture at a taller height to recover
+                    # the prose, then the window is restored. Only when context
+                    # is empty (the failing case) — avoids a resize round-trip on
+                    # every menu.
+                    if not ask_q.context and hasattr(self._tmux, "capture_pane_tall"):
+                        tall = await asyncio.to_thread(
+                            self._tmux.capture_pane_tall, self._thread_id
+                        )
+                        if isinstance(tall, str) and tall:
+                            norm_tall = _normalize_capture(tall)
+                            recovered = _parse_ask_from_pane(norm_tall) or _parse_plan_from_pane(
+                                norm_tall
+                            )
+                            if recovered is not None and recovered.context:
+                                ask_q = recovered
+                                logger.info(
+                                    "Recovered pre-menu context via tall capture "
+                                    "(thread=%d, context_chars=%d)",
+                                    self._thread_id,
+                                    len(recovered.context),
+                                )
                     logger.info(
-                        "Interactive menu detected, bridging to Discord (thread=%d)",
+                        "Interactive menu detected, bridging to Discord "
+                        "(thread=%d, context_chars=%d)",
                         self._thread_id,
+                        len(ask_q.context),
                     )
                     yield StreamEvent(
                         raw={},
@@ -1017,6 +1497,7 @@ class TmuxClaudeRunner:
             new_turn_started = saw_generation or (
                 bool(last_response) and last_response != baseline_response
             )
+
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
@@ -1037,8 +1518,16 @@ class TmuxClaudeRunner:
                 and stable_seconds >= _IDLE_TIMEOUT
                 and raw_static_seconds >= _IDLE_TIMEOUT
             ):
-                # During a fresh start, allow extra time for Claude to load.
-                if not claude_running and elapsed < _STARTUP_TIMEOUT:
+                # #562: a turn that never started is not a turn that finished.
+                # #365 gates the *completion* detector on the new turn actually
+                # having begun; this exit ignored that gate, so a warm session
+                # that simply had not started drawing yet was declared done —
+                # and the verdict below then read it as a normal completion,
+                # firing "🟡 Claude has finished" at a user with no answer.
+                # The old grace was `not claude_running and elapsed <
+                # _STARTUP_TIMEOUT`, i.e. cold starts only; a warm session got
+                # none. Wait out `_TURN_START_GRACE` either way.
+                if not new_turn_started and elapsed < _TURN_START_GRACE:
                     continue
                 logger.info(
                     "Idle timeout (%.1fs) — no response (thread=%d)",
@@ -1050,21 +1539,38 @@ class TmuxClaudeRunner:
         # Yield final complete event.  ``error`` is computed first so the single
         # yield below carries the right outcome (#366: a failed/empty run must
         # surface an error, not a silent "done").
+        timed_out = raw_static_seconds >= self.timeout_seconds
         if self._stopped:
             error = None if self._silent_stop else "Stopped by user"
-        elif raw_static_seconds >= self.timeout_seconds:
-            error = f"Timed out after {self.timeout_seconds} seconds"
-        elif not last_response:
-            # Reached completion (idle timeout or startup fast-fail) without ever
-            # extracting a response.  This is NOT a normal completion — decide
-            # whether to surface it (#366):
+        elif timed_out or not last_response:
+            # Reached completion without a usable response — either the hard
+            # inactivity backstop fired (``timed_out``) or we never extracted
+            # any response text.  Neither is automatically a failure, so run the
+            # #366 liveness ladder before blaming the session:
             #   1. A fatal startup error is on the pane → report it verbatim.
             #   2. No marker, but ``claude`` is no longer running → it exited
             #      without answering (crash / unrecognised fatal error).
-            #   3. ``claude`` is still alive at its prompt → most likely it
-            #      answered via the discord-reply skill and we simply didn't
-            #      scrape the text; stay silent to avoid a false error embed.
-            pane_error = startup_error or _extract_startup_error(current)
+            #   3. ``claude`` is alive but NOT idle at its prompt → it really is
+            #      wedged mid-turn; a frozen pane for the whole timeout window is
+            #      a genuine hang, so report the timeout.
+            #   4. ``claude`` is alive and idle at its prompt → the turn is over
+            #      and the answer went out through the jsonl mirror / reply skill
+            #      (#541).  Stay silent rather than posting a false error embed.
+            #
+            # #541: step 3/4 is what the backstop was missing.  In jsonl mode the
+            # pane freezes completely once a turn ends, and the idle pane yields
+            # no scrapable response, so EVERY normal turn hit the backstop ~312s
+            # after answering and posted "⏱️ Session timed out" (33 of 35 observed
+            # timeouts were this false alarm).  The ladder has to run first —
+            # which also means an ordinary timeout no longer masks a crashed
+            # ``claude`` (step 2 now reports the crash instead).
+            # The pane scrape stays gated on "no response was ever produced":
+            # a marker phrase like ``command not found: claude`` can legitimately
+            # appear inside Claude's own answer, and a timed-out turn that DID
+            # produce text must not be re-labelled a startup failure (#366).
+            pane_error = startup_error
+            if pane_error is None and not last_response:
+                pane_error = _extract_startup_error(current)
             if pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
@@ -1072,6 +1578,33 @@ class TmuxClaudeRunner:
                     "Claude exited without producing a response "
                     "(possible startup failure or crash) — check the tmux pane."
                 )
+            elif not new_turn_started:
+                # #562: claude is alive but this turn never produced anything —
+                # no generation was ever seen and the pane still shows only the
+                # previous turn's residue. Reporting "done" here is what made
+                # c-lord ping people about work that had not started. Note this
+                # is checked AFTER the #541 rungs: a turn that DID generate has
+                # ``new_turn_started`` set, so an answered-then-silent pane
+                # (the #541 case) never lands here.
+                #
+                # ``new_turn_started`` is the whole test, deliberately: an
+                # earlier revision also required ``not last_response`` (matching
+                # the journal line in the report, ``Idle timeout … no
+                # response``). Reproducing the bug on staging showed that scoping
+                # left the other half in place — when the frozen pane still had
+                # the PREVIOUS turn's output on it the scrape succeeded, the run
+                # fell through to the inactivity backstop, and c-lord announced
+                # "finished" for a turn Claude never received. A turn that really
+                # produced something always moves the extracted text away from
+                # the baseline captured right after the prompt was sent, so the
+                # gate alone is both sufficient and safe.
+                error = (
+                    f"{NO_RESPONSE_ERROR_PREFIX} Claude never started this turn "
+                    f"(pane unchanged for {raw_static_seconds:.0f}s). "
+                    "Send the message again, or check the tmux pane."
+                )
+            elif timed_out and not self._is_idle_at_prompt(current):
+                error = f"Timed out after {self.timeout_seconds} seconds"
             else:
                 error = None
         else:
@@ -1086,6 +1619,109 @@ class TmuxClaudeRunner:
             is_complete=True,
             error=error,
         )
+
+    async def wake(self, *, timeout: float = _WAKE_TIMEOUT) -> bool:
+        """Bring a stopped workspace back up **without running a turn** (#642).
+
+        Same startup as :meth:`run` — ``--continue`` first so the conversation
+        comes back, a fresh start when there is nothing to continue (#123 Part 2)
+        — but with no prompt, so Claude opens its TUI and waits. That matters
+        twice: the pane can be photographed (``/tmux-screenshot``), and the
+        process left behind is the one the user's *next* message talks to, so
+        nothing spawns twice.
+
+        Readiness is "the input box is on screen **and** the process is alive".
+        The pane text alone cannot decide it: a zsh theme renders the very same
+        ``❯`` glyph, so a claude that exited on startup would otherwise read as
+        a ready prompt.
+
+        Returns True only when the pane really came back.
+        """
+        if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            return True  # already awake — restarting would kill a live turn
+
+        started = await asyncio.to_thread(
+            self._tmux.start_claude,
+            self._thread_id,
+            None,
+            self.model,
+            permission_mode=self._permission_mode,
+            dangerously_skip_permissions=self._dangerously_skip_permissions,
+            try_continue=True,
+            effort=self._effort,
+        )
+        if not started:
+            logger.warning("wake: start_claude --continue failed (thread=%d)", self._thread_id)
+            return False
+
+        await asyncio.sleep(_CONTINUE_CHECK_DELAY)
+        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            logger.info(
+                "wake: --continue found no conversation for thread %d; starting fresh",
+                self._thread_id,
+            )
+            started = await asyncio.to_thread(
+                self._tmux.start_claude,
+                self._thread_id,
+                None,
+                self.model,
+                permission_mode=self._permission_mode,
+                dangerously_skip_permissions=self._dangerously_skip_permissions,
+                try_continue=False,
+                effort=self._effort,
+            )
+            if not started:
+                logger.warning("wake: fresh start_claude failed (thread=%d)", self._thread_id)
+                return False
+
+        # One loop for both jobs: a recreated window can land on the folder-trust
+        # dialog, and an unanswered dialog never reaches an input box — so the
+        # wait for readiness has to be able to answer it.
+        elapsed = 0.0
+        trust_handled = False
+        while elapsed < timeout:
+            await asyncio.sleep(_POLL_INTERVAL)
+            elapsed += _POLL_INTERVAL
+            # ``capture_pane`` keeps the escape sequences (``-e``), so the input
+            # box arrives as ``\x1b[39m❯\xa0`` and every text check below would
+            # miss it. The turn loop normalises before it looks; staging proved
+            # what happens when this one does not — a restored, idle pane read as
+            # "never came up" and the wake reported a failure (#642).
+            pane = _normalize_capture(
+                await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            )
+            if not trust_handled and self._has_trust_prompt(pane):
+                await self._accept_trust_prompt(pane)
+                trust_handled = True
+                continue
+            if not self._is_idle_at_prompt(pane):
+                continue
+            if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+                logger.info(
+                    "wake: workspace restored in %.1fs (thread=%d)", elapsed, self._thread_id
+                )
+                return True
+
+        logger.warning(
+            "wake: pane never reached an idle prompt in %.0fs (thread=%d)", timeout, self._thread_id
+        )
+        return False
+
+    @property
+    def effort(self) -> str | None:
+        """Reasoning effort passed to the CLI (``--effort``), or ``None`` for default."""
+        return self._effort
+
+    @property
+    def stopped(self) -> bool:
+        """True once :meth:`interrupt` or :meth:`kill` has been called.
+
+        Lets callers (e.g. ``_run_helper``'s post-turn menu recovery) tell a turn
+        that was deliberately pre-empted from one that ended on its own, so a
+        pre-empted turn is not re-bridged into a fresh menu it would re-park on
+        (#315).
+        """
+        return self._stopped
 
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).
@@ -1138,6 +1774,18 @@ class TmuxClaudeRunner:
         logger.info("probe_context_window: could not parse /context (thread=%d)", self._thread_id)
         return None
 
+    async def get_cost_from_pane(self) -> float | None:
+        """Extract the per-turn cost from the ccstatusline ``Cost: $X.XXXX`` row.
+
+        Captures the current pane without sending any command, so it is safe to
+        call between turns.  Returns ``None`` when Claude is not running or the
+        cost row is absent.
+        """
+        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            return None
+        pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        return parse_cost_from_pane(_normalize_capture(pane))
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -1154,16 +1802,7 @@ class TmuxClaudeRunner:
             pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
 
             if not trust_handled and self._has_trust_prompt(pane):
-                logger.info(
-                    "Trust prompt detected, sending Enter to accept (thread=%d)",
-                    self._thread_id,
-                )
-                from ..tmux import _run
-
-                window = self._tmux._find_window_for_thread(self._thread_id)
-                if window:
-                    target = f"{self._tmux.session_name}:{window}"
-                    _run(["tmux", "send-keys", "-t", target, "Enter"])
+                await self._accept_trust_prompt(pane)
                 trust_handled = True
                 await asyncio.sleep(1.0)
                 elapsed += 1.0
@@ -1185,11 +1824,54 @@ class TmuxClaudeRunner:
         The dialog is top-anchored (its content is near the top of the pane,
         bottom rows blank), so this scans the WHOLE pane rather than the bottom
         permission zone.  To stay robust against the ~500 lines of scrollback the
-        runner captures, it keys on the *menu option line* "❯ 1. Yes, I trust
-        this folder" — a structure prose does not reproduce — instead of a loose
-        substring of the marker phrases.
+        runner captures, it keys on the *menu option line* "Yes, I trust this
+        folder" — anchored to its own line — instead of a loose substring of the
+        marker phrases.  The pre-2.1.248 line carries a "1." that prose does not
+        reproduce; the current unnumbered line is plainer, so it additionally
+        requires the dialog's "Enter to confirm" footer.
         """
+        if _TRUST_PROMPT_NUMBERED_RE.search(text):
+            return True
+        if _TRUST_CONFIRM_FOOTER not in text:
+            return False
         return bool(_TRUST_PROMPT_RE.search(text))
+
+    @staticmethod
+    def _trust_option_offset(text: str) -> int:
+        """Downs needed to move the cursor onto "Yes, I trust this folder".
+
+        Returns 0 for the pre-2.1.248 dialog (the cursor already starts on
+        "1. Yes, I trust this folder") and 1 for the current one, whose options
+        are unnumbered with "❯ No, exit" selected by default.
+
+        Only the LAST contiguous run of option lines counts: the runner captures
+        ~500 lines of scrollback, which may hold an older copy of the dialog
+        above the live one.
+        """
+        block: list[tuple[bool, str]] = []
+        run: list[tuple[bool, str]] = []
+        for line in text.splitlines():
+            match = _TRUST_OPTION_RE.match(line)
+            if match:
+                run.append((bool(match.group("cursor")), match.group("label")))
+            elif line.strip():
+                # A non-blank, non-option line ends the run (blank lines do not,
+                # so a spacer between options does not split the menu).  The
+                # footer under the options ends it too, which is why a finished
+                # run is banked here and not only after the loop.
+                if run:
+                    block = run
+                run = []
+        if run:
+            block = run
+        if not block:
+            return 0
+        cursor_idx = next((i for i, (sel, _) in enumerate(block) if sel), 0)
+        yes_idx = next(
+            (i for i, (_, label) in enumerate(block) if label.startswith("Yes")),
+            cursor_idx,
+        )
+        return max(0, yes_idx - cursor_idx)
 
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
@@ -1249,14 +1931,20 @@ class TmuxClaudeRunner:
         # confuse users with a duplicate warning alongside the real Discord UI.
         return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
 
-    async def _accept_trust_prompt(self) -> None:
-        """Accept the folder-trust dialog by confirming option 1 with Enter.
+    async def _accept_trust_prompt(self, pane_text: str = "") -> None:
+        """Accept the folder-trust dialog by selecting "Yes, I trust this folder".
 
-        The dialog's cursor starts on "1. Yes, I trust this folder", so a bare
-        Enter confirms trust and lets Claude proceed with the original prompt.
+        Which keys do that depends on the Claude Code version: the older dialog
+        starts on "1. Yes, I trust this folder" (bare Enter), the current one
+        starts on "No, exit" (Down, then Enter).  Passing the pane text lets the
+        offset be read off the live dialog instead of assumed — confirming the
+        wrong default makes Claude exit without ever starting the turn.
         """
-        logger.info("Trust prompt detected, accepting (thread=%d)", self._thread_id)
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        offset = self._trust_option_offset(pane_text)
+        logger.info(
+            "Trust prompt detected, accepting (down=%d, thread=%d)", offset, self._thread_id
+        )
+        await self._navigate_menu(offset)
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.
@@ -1272,7 +1960,11 @@ class TmuxClaudeRunner:
 
         window = self._tmux._find_window_for_thread(self._thread_id)
         if window:
-            target = f"{self._tmux.session_name}:{window}"
+            # #649: address the unique window_id. Accepting a permission prompt
+            # is a keystroke that changes what Claude is allowed to do — the one
+            # place an ambiguous ``session:name`` target must never send it to
+            # whichever window happened to be first.
+            target = self._tmux._target(window)
             key = "y" if self._is_yn_prompt(pane_text) else "Enter"
             _run(["tmux", "send-keys", "-t", target, key])
 
@@ -1289,7 +1981,7 @@ class TmuxClaudeRunner:
         )
         await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
 
-    async def _navigate_menu(self, index: int) -> None:
+    async def _navigate_menu(self, index: int) -> bool:
         """Move the menu cursor down *index* times then confirm with Enter.
 
         Each key is sent as a SEPARATE ``send-keys`` call with a delay between
@@ -1297,12 +1989,24 @@ class TmuxClaudeRunner:
         fast — the TUI drops the Down navigations and Enter selects the wrong
         (first) option.
         """
+        delivered = True
         for _ in range(max(0, index)):
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            if not await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"):
+                delivered = False
             await asyncio.sleep(_MENU_NAV_DELAY)
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        if not await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"):
+            delivered = False
+        if not delivered:
+            # #600: send_keys returns False when the thread has no tmux window —
+            # the answer went nowhere. Reporting it is what stops the menu from
+            # sitting open and being re-posted on every restart.
+            logger.warning(
+                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+                self._thread_id,
+            )
+        return delivered
 
-    async def answer_menu(self, index: int) -> None:
+    async def answer_menu(self, index: int) -> bool:
         """Select option *index* (0-based) of an open AskUserQuestion menu (#166).
 
         The cursor always starts on the first option, so landing on option
@@ -1315,12 +2019,80 @@ class TmuxClaudeRunner:
             index,
             self._thread_id,
         )
-        await self._navigate_menu(index)
+        return await self._navigate_menu(index)
 
-    async def answer_menu_text(self, text_option_index: int, text: str) -> None:
-        """Answer via the free-text ("Type something.") affordance (#172).
+    async def answer_menu_multi(self, indices: list[int], option_count: int) -> bool:
+        """Answer a multiSelect AskUserQuestion: toggle each option then Submit (#418).
 
-        Verified on a live Claude Code v2.1.150 TUI, the correct interaction is:
+        ``answer_menu`` (Down×index + Enter) is single-select only, so the bridge
+        used to drop every checkbox but the first.  The multiSelect TUI, verified
+        on a live Claude Code TUI, works differently:
+
+        - the cursor starts on option 0;
+        - **Space** toggles the checkbox under the cursor (``[ ]`` ⇄ ``[✔]``);
+        - a **"Submit"** row sits just past the real options and the
+          "Type something" affordance, i.e. at index ``option_count + 1``
+          (mirroring the ``option_count`` index :meth:`answer_menu_text` uses for
+          the "Type something" row); ``Down`` to it and ``Enter`` opens the
+          "Submit answers" review screen whose cursor defaults to submit, so a
+          final ``Enter`` records every toggled value.
+
+        Keys are sent one-per-call with ``_MENU_NAV_DELAY`` spacing — batching is
+        dropped by the TUI (#171).
+        """
+        # #600: every keystroke reports whether it reached a window; an
+        # undelivered answer must not read as an answered menu.
+        _delivered = True
+
+        def _ok(sent: object) -> None:
+            nonlocal _delivered
+            if not sent:
+                _delivered = False
+
+        logger.info(
+            "Answering multiSelect AskUserQuestion menu: indices=%s (thread=%d)",
+            indices,
+            self._thread_id,
+        )
+        cursor = 0
+        for idx in sorted({i for i in indices if i >= 0}):
+            for _ in range(idx - cursor):
+                _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
+                await asyncio.sleep(_MENU_NAV_DELAY)
+            cursor = idx
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Space"))
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        # Navigate to the "Submit" row (one past "Type something") and open the
+        # "Submit answers" review screen.
+        for _ in range(max(0, (option_count + 1) - cursor)):
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
+            await asyncio.sleep(_MENU_NAV_DELAY)
+        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        await asyncio.sleep(_MENU_NAV_DELAY)
+        # Confirm the review screen (cursor defaults to "Submit answers").
+        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        if not _delivered:
+            logger.warning(
+                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+                self._thread_id,
+            )
+        return _delivered
+
+    async def answer_menu_text(
+        self,
+        text_option_index: int,
+        text: str,
+        *,
+        mode: FreeTextMode = FREE_TEXT_ROW,
+    ) -> bool:
+        """Answer with free text, the way *this* menu's layout accepts it (#172, #650).
+
+        The two layouts Claude Code draws take different keystrokes, and the
+        wrong ones do not fail loudly — they answer the tool with "(No answer
+        provided)" and throw the typed sentence away.  *mode* therefore comes
+        from the pane (:func:`_free_text_mode`), never from an assumption.
+
+        ``row`` — classic layout, verified on a live Claude Code v2.1.150 TUI:
 
         1. Navigate to the "Type something." row with ``Down`` × *text_option_index*
            — **without** pressing Enter.  (Pressing Enter on that row registers a
@@ -1332,25 +2104,75 @@ class TmuxClaudeRunner:
            separate message instead of the answer.
         3. Press ``Enter`` once to record the typed text as the menu answer.
 
+        ``notes`` — preview layout (any option carries a ``preview``), verified
+        on a live Claude Code v2.1.252 TUI in an isolated tmux (2026-09-01):
+
+        1. Press ``n`` from the option list.  There is no "Type something." row
+           here; ``n`` opens the ``Notes:`` field beside the preview box.
+           *text_option_index* is unused — walking down that far would land on
+           "Chat about this", which ignores typed characters and answers
+           "(No answer provided)" on Enter (#650).
+        2. Type *text* literally into the field.
+        3. Press ``Enter`` once — with no option selected the notes become the
+           answer (``"…"=(no option selected) notes: <text>``).
+
         Keystrokes are spaced by ``_MENU_NAV_DELAY`` for the same reason as
         :meth:`answer_menu` (#171): the TUI drops keys sent too fast.
         """
+        # #600: every keystroke reports whether it reached a window; an
+        # undelivered answer must not read as an answered menu.
+        _delivered = True
+
+        def _ok(sent: object) -> None:
+            nonlocal _delivered
+            if not sent:
+                _delivered = False
+
         logger.info(
-            "Answering AskUserQuestion with free text (thread=%d)",
+            "Answering AskUserQuestion with free text (thread=%d, mode=%s)",
             self._thread_id,
+            mode,
         )
-        for _ in range(max(0, text_option_index)):
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+        if mode == FREE_TEXT_NOTES:
+            # Open the Notes field — the preview layout's only free-text input.
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "n"))
             await asyncio.sleep(_MENU_NAV_DELAY)
-        # Type the free text directly onto the highlighted "Type something." row.
-        await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text)
+        else:
+            for _ in range(max(0, text_option_index)):
+                _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
+                await asyncio.sleep(_MENU_NAV_DELAY)
+        # Type the free text onto the highlighted row / into the notes field.
+        _ok(await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text))
         await asyncio.sleep(_MENU_NAV_DELAY)
         # Confirm — records the typed text as the AskUserQuestion answer.
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        if not _delivered:
+            logger.warning(
+                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+                self._thread_id,
+            )
+        return _delivered
 
-    async def cancel_menu(self) -> None:
+    async def transcript_project_dir(self) -> Path | None:
+        """Where Claude Code writes this pane's transcript, or None (#651).
+
+        The transcript is how c-lord confirms that an answer actually reached
+        Claude rather than merely reaching the terminal — see
+        :func:`c_lord.discord_ui.ask_handler._verify_answer_reached_claude`.
+        None whenever the pane's cwd cannot be read; the caller then falls back
+        to the weaker "did the menu close" evidence.
+        """
+        getter = getattr(self._tmux, "pane_working_dir", None)
+        if not callable(getter):
+            return None
+        cwd = await asyncio.to_thread(getter, self._thread_id)
+        if not isinstance(cwd, str) or not cwd:
+            return None
+        return derive_project_dir(cwd)
+
+    async def cancel_menu(self) -> bool:
         """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape")
+        return bool(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Escape"))
 
     async def peek_pending_ask(self) -> AskQuestion | None:
         """Re-capture the pane and return an open AskUserQuestion/plan menu (#219).
@@ -1365,9 +2187,48 @@ class TmuxClaudeRunner:
         Recovers both AskUserQuestion and plan-approval (#251) menus, which share
         the pane_ask bridge.
         """
+        if await self._pane_is_dead():
+            return None
         raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
         pane = _normalize_capture(raw)
         return _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
+
+    async def _pane_is_dead(self) -> bool:
+        """True when the pane's foreground process is positively not claude (#510).
+
+        A menu drawn by a claude that has since exited stays on screen forever —
+        tmux-resurrect even restores it verbatim after a reboot. Text alone
+        cannot tell that apart from a live question, so every menu peek asks the
+        process table first. Unreadable ⇒ False (unknown, not dead).
+        """
+        getter = getattr(self._tmux, "pane_foreground_command", None)
+        if not callable(getter):  # pragma: no cover - legacy/stub managers
+            return False
+        return pane_command_is_dead(await asyncio.to_thread(getter, self._thread_id))
+
+    async def peek_menu_state(self) -> tuple[AskQuestion | None, bool]:
+        """Return ``(open menu or None, capture_ok)`` (#485).
+
+        ``capture_ok`` is False when the pane capture came back **empty** — a
+        tmux/window hiccup (e.g. the window mapping momentarily unresolved), NOT
+        evidence the menu closed. The bridge's resolve-watcher must treat that as
+        "unknown, keep waiting" rather than "menu gone"; treating an empty
+        capture as resolution is what let a still-open menu be marked answered,
+        then get selected by the next reply. Distinct from
+        :meth:`peek_pending_ask` (kept as-is for the post-turn recovery caller).
+
+        #510: a pane whose claude has exited reports ``(None, True)`` — a
+        healthy read with no live menu — so an in-flight bridge winds down in
+        seconds instead of sitting on the 24h answer timeout and then re-posting
+        the same dead question every day.
+        """
+        if await self._pane_is_dead():
+            return None, True
+        raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        capture_ok = bool(raw.strip())
+        pane = _normalize_capture(raw)
+        menu = _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
+        return menu, capture_ok
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:
@@ -1514,6 +2375,17 @@ class TmuxClaudeRunner:
         the ellipsis off the end and the turn was wrongly finalized early (#179).
         """
         lines = text.rstrip().splitlines()
+        # #365 follow-up: scan the live-spinner "(Ns ·" timer across a WIDE bottom
+        # window. While a tool runs, its result preview + input box + footer push
+        # the timer line 10-20 lines off the bottom; a bottom-6-only scan misses
+        # it and the turn is finalized early. The timer only exists while actively
+        # working, so a wide scan does not false-positive on idle panes.
+        for line in lines[-_RUNNING_PROBE_LINES:]:
+            if _RUNNING_SPINNER_RE.search(line):
+                return True
+        # Fallback: an ellipsis-bearing status glyph in the bottom few lines —
+        # catches a spinner that has no timer line yet (just "✻ Running…"). Kept
+        # narrow so a stale in-progress spinner up in scrollback is not matched.
         for line in lines[-6:]:
             stripped = line.strip()
             if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:
@@ -1561,6 +2433,23 @@ class TmuxClaudeRunner:
             ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
                 return True
         return False
+
+    @classmethod
+    def _is_idle_at_prompt(cls, text: str) -> bool:
+        """Return True when the pane shows ``claude`` parked at an idle prompt.
+
+        Used by the inactivity backstop to tell "the turn is over" from "the
+        turn is wedged" (#541).  ``_has_input_prompt`` alone is not enough: the
+        TUI keeps the input box on screen *while generating too*, so a session
+        frozen mid-tool would look idle.  Requiring the generation indicator to
+        be absent as well makes the pair a real idle check —
+        no spinner **and** a ready input box means Claude finished and is
+        waiting for the next message.
+
+        The caller checks process liveness separately, which is what keeps a
+        dead pane's leftover ``❯`` in the scrollback from reading as idle.
+        """
+        return cls._has_input_prompt(text) and not cls._is_generating(text)
 
     # Keep for backward compatibility / testing.
     @staticmethod

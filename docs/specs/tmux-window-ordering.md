@@ -1,4 +1,4 @@
-# あるべき動き: tmux window の並び順とフォーカス
+# あるべき動き: tmux window の並び順・フォーカス・サイズ
 
 > これは「あるべき動き」。理念 [`docs/PHILOSOPHY.md`](../PHILOSOPHY.md) の下位。迷ったら理念に照らす。
 
@@ -27,12 +27,26 @@ window 名 `new-window`（`-a`/index 指定なし）は tmux の既定で **最�
 | 項目 | 実装 |
 |------|------|
 | トリガ | `create_session()` の**新規 window 作成パス**末尾で `_sort_windows_unlocked()` を呼ぶ（adoption / 既存再利用パスでは呼ばない） |
-| 並べ替え | `#{window_id}`（不変 ID）で各 window を一旦高 index 帯（`_SORT_TMP_BASE`）へ希望順に退避 → `move-window -r` で base-index から詰め直す。**index だけ変わり、名前・`@thread_id`・ペインは保持**（bot の識別は `@thread_id`/名前ベースで index 非依存） |
+| 並べ替え | `#{window_id}`（不変 ID）で各 window を一旦高 index 帯（`_SORT_TMP_BASE`）へ希望順に退避 → `move-window -r` で base-index から詰め直す。**index だけ変わり、名前・`@thread_id`・ペインは保持**（bot の識別は `@thread_id` → `window_id` ベースで index 非依存。#649 以降、名前はターゲットに使わない） |
 | 不要 churn 回避 | 既に整列済みなら `move-window` を発行しない |
 | フォーカス | `new-window -d` |
-| 直列化 | `TmuxSessionManager._lock`（`threading.Lock`）で「作成 → `@thread_id` 設定 → ソート」を 1 クリティカルセクションに。同時 add で `move-window` が交錯しない |
+| 直列化 | 「作成 → `@thread_id` 設定 → ソート」を 1 クリティカルセクションに。同時 add で `move-window` が交錯しない。ロックは**tmux セッション名をキーにしたプロセス内のロック**（`_session_lock()`）で、`TmuxSessionManager._lock` は毎回そこから引く。#649 以前はインスタンス変数の `threading.Lock` だったため、同じセッションを指す別インスタンス同士では直列化されず、同名 window が2枚できていた → [tmux-window-identity.md](./tmux-window-identity.md) |
 | ソートキー | `_window_sort_key()` に分離（番号付き昇順 → 非番号は末尾・相対順保持） |
 | 起動時 | 専用フックは無い。再起動後に既存 window が乱れていても、**次に新スレッドが立った時のフルソートで一括整列**する（per-channel の遅延生成モデルに沿う） |
+
+## ウィンドウサイズ（端末リサイズ耐性） — #403
+
+`tmux attach` 中に**利用者の端末（SSH クライアント）のサイズが変わっても、各 window のサイズは変わりません**（固定）。新規 window は作成時に接続中クライアントへフィットし、以後は固定されます。
+
+なぜ要るか: tmux の既定 `window-size latest` だと、クライアントが少しでもサイズ変化するたびに**全 window が resize** され、各 window で idle 状態の Claude TUI に SIGWINCH が飛ぶ。inactive な pane の再描画はしばしば不完全で、**下部の status 行ブロックが多重ゴーストして数時間 stuck** する（実測: #403。全再描画＝手動 resize / Ctrl-L でしか直らない）。bot は多数の window を抱えるため「端末を少し触ると別 window が崩れる」が起きやすい。window サイズを端末から切り離すことで構造的に断つ。
+
+### 実装の要点（`c_lord/tmux.py`）
+
+| 項目 | 実装 |
+|------|------|
+| ポリシー | session に `set-option window-size manual`（`_ensure_window_size_manual()`、`_ensure_session()` から呼ぶ）。クライアントの resize が window に伝播しなくなる |
+| 新規 window のフィット | `create_session()` で新規 window 作成直後（まだ空＝走行中 TUI を崩さない）に `_fit_window_to_client()` が接続中クライアントのサイズへ resize。未接続時は `DEFAULT_MANAGED_WINDOW_SIZE` |
+| トレードオフ | window はフィット時のサイズに固定。後から端末を大きくすると余白、小さくすると下部がクリップしうる（status 行のゴースト固着よりは軽微）。主参照は Discord の `/tmux-screenshot`、生 attach はデバッグ用途 |
 
 ## 将来の拡張（今回は未実装・記録のみ）
 

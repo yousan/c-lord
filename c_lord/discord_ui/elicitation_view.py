@@ -18,19 +18,24 @@ from typing import Any
 import discord
 
 from ..claude.types import ElicitationRequest
+from .authorization import AuthorizedViewMixin, Authorizer
+from .error_reporting import ErrorReportingViewMixin
 
 logger = logging.getLogger(__name__)
 
 ELICITATION_TIMEOUT = 300  # 5 minutes
 
 
-class ElicitationUrlView(discord.ui.View):
+class ElicitationUrlView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """Single button opening a URL for url-mode elicitation."""
 
-    def __init__(self, runner, request: ElicitationRequest) -> None:
+    def __init__(
+        self, runner, request: ElicitationRequest, authorizer: Authorizer | None = None
+    ) -> None:
         super().__init__(timeout=ELICITATION_TIMEOUT)
         self._runner = runner
         self._request = request
+        self._authorizer = authorizer
         # Add the URL as a link button (no callback needed — Discord opens it).
         if request.url:
             self.add_item(discord.ui.Button(label="🔗 Open link", url=request.url))
@@ -129,13 +134,16 @@ class ElicitationFormModal(discord.ui.Modal):
         )
 
 
-class ElicitationFormView(discord.ui.View):
+class ElicitationFormView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """Single button that opens the form Modal for form-mode elicitation."""
 
-    def __init__(self, runner, request: ElicitationRequest) -> None:
+    def __init__(
+        self, runner, request: ElicitationRequest, authorizer: Authorizer | None = None
+    ) -> None:
         super().__init__(timeout=ELICITATION_TIMEOUT)
         self._runner = runner
         self._request = request
+        self._authorizer = authorizer
 
     @discord.ui.button(label="📝 Fill in form", style=discord.ButtonStyle.primary)
     async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:

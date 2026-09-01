@@ -1,0 +1,28 @@
+{
+ "messages": [
+  {
+   "author": "yousan",
+   "timestamp": "2026-09-01 10:30",
+   "content": "/clord-status"
+  },
+  {
+   "author": "C-lord",
+   "is_bot": true,
+   "color": "#5865F2",
+   "timestamp": "2026-09-01 10:30",
+   "content": "c-lord status · #claude_base · yousan/claude_base · 4 active · 1.7 GB\n```\ntmux attach -t <attach 欄をコピペ>\n```\n```\nattach             status  topic                size    used\nqiita-article:w1   wait    OpenClawのQiita記事  412 MB  2h\nmonitoring:w5      run     monitoring 監視改修  1.1 GB  5m\nclaude_base:work5  wait    2017.l2tp.org        120 MB  6h\nclaude_base:w9     wait    pt-jp 調査           88 MB   1d\n```\n+ 1 closed (96 MB) · deleted 2   →   /clord-status all"
+  },
+  {
+   "author": "yousan",
+   "timestamp": "2026-09-01 10:31",
+   "content": "/clord-status all"
+  },
+  {
+   "author": "C-lord",
+   "is_bot": true,
+   "color": "#5865F2",
+   "timestamp": "2026-09-01 10:31",
+   "content": "c-lord status (all) · #claude_base · yousan/claude_base · 4 active · 1 closed · 1.8 GB\n```\ntmux attach -t <attach 欄をコピペ>\n```\n```\nattach             status  topic                size    used  cc-session\nqiita-article:w1   wait    OpenClawのQiita記事  412 MB  2h    a1b2c3d4\nmonitoring:w5      run     monitoring 監視改修  1.1 GB  5m    e5f6a7b8\nclaude_base:work5  wait    2017.l2tp.org        120 MB  6h    9c591869\nclaude_base:w9     wait    pt-jp 調査           88 MB   1d    6d86bf1a\n-                  closed  古いリファクタ       96 MB   5d    c1d2e3f4\n```\ndeleted: 2 (作業dir削除済 — 会話はホームに残存し再投稿で復活可)"
+  }
+ ]
+}

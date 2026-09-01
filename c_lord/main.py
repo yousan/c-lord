@@ -16,10 +16,16 @@ from dotenv import find_dotenv, load_dotenv
 
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
+from .session_cleanup import DirOutcome, remove_clean_session_dir, sweep_days
 from .setup import setup_bridge
 from .utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
+
+#: Days of disuse after which a ``sessions`` row is swept at startup. Named here
+#: rather than inlined because #554 made it user-visible: the notice posted into
+#: each swept thread quotes it, and README/docs/COMMANDS.md now state it.
+SESSION_CLEANUP_DAYS = 30
 
 
 def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
@@ -136,8 +142,10 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     single source of truth for every key it defines. Keys absent from the
     file still fall back to the process env (env-var-only setups keep working).
     """
+    resolved_env_path: str | None = None
     if env_path is not None:
         load_dotenv(env_path, override=True)
+        resolved_env_path = str(Path(env_path).resolve())
     else:
         # find_dotenv(usecwd=True): search from the CURRENT DIRECTORY upward,
         # not from this package's location. README documents the bare launch as
@@ -147,6 +155,14 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         found = find_dotenv(usecwd=True)
         if found:
             load_dotenv(found, override=True)
+            resolved_env_path = str(Path(found).resolve())
+
+    # Issue #259: expose the resolved .env path so the injected discord-read
+    # skill can tell Claude where to read DISCORD_BOT_TOKEN from at runtime.
+    # Only the path is shared — never the token. Skip if no .env file was used
+    # (env-var-only setups); the read skill then renders its path-less variant.
+    if resolved_env_path:
+        os.environ.setdefault("CLORD_ENV_PATH", resolved_env_path)
 
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     if not token:
@@ -168,6 +184,17 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         )
         sys.exit(1)
 
+    # Issue #451: DISCORD_OWNER_ID must be a numeric Discord snowflake.
+    # Fail loudly so users don't enter their username by mistake.
+    owner_id_raw = os.getenv("DISCORD_OWNER_ID", "")
+    if owner_id_raw and not owner_id_raw.isdigit():
+        logger.error(
+            "DISCORD_OWNER_ID must be a numeric Discord user ID (snowflake), got %r."
+            " Enable Developer Mode in Discord, then right-click your username → Copy User ID.",
+            owner_id_raw,
+        )
+        sys.exit(1)
+
     return {
         "token": token,
         "channel_id": channel_id,
@@ -179,7 +206,7 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT_SESSIONS", "3"),
         "timeout": os.getenv("SESSION_TIMEOUT_SECONDS", "300"),
-        "owner_id": os.getenv("DISCORD_OWNER_ID", ""),
+        "owner_id": owner_id_raw,
         "coordination_channel_id": os.getenv("COORDINATION_CHANNEL_ID", ""),
     }
 
@@ -287,10 +314,42 @@ async def main(env_path: Path | None = None) -> None:
                 api_server.port,
             )
 
-        # Cleanup old sessions on startup
-        deleted = await components.session_repo.cleanup_old(days=30)
-        if deleted:
-            logger.info("Cleaned up %d old sessions", deleted)
+        # Cleanup old sessions on startup.
+        # #554: this used to be silent — a count in the log, nothing in Discord —
+        # so a user returning to a month-old thread was told there was no session
+        # with no way to learn that one had been deleted. The sweep still runs
+        # here, before the connection, so it cannot race TranscriptMirrorCog's
+        # on_ready walk of the same table; the cog posts the notices once the bot
+        # is connected. It logs the thread ids, so the count line is gone.
+        # #575: the period follows Claude Code's own transcript retention
+        # (cleanupPeriodDays) rather than a constant c-lord chose. Once Claude
+        # has forgotten the conversation, the checkout that existed to serve it
+        # has nothing left to serve — and keeping the two in step closes the
+        # window that produced 118 GB of stranded directories.
+        sweep_days_value = sweep_days()
+        deleted = await components.session_repo.cleanup_old(days=sweep_days_value)
+
+        # Deleting the row alone strands the directory: the row is the only
+        # handle tying a Discord thread to its working copy. Clean checkouts go
+        # with it; anything with uncommitted or untracked work is kept (#575).
+        for record in deleted:
+            outcome = await asyncio.to_thread(remove_clean_session_dir, record)
+            if outcome is DirOutcome.KEPT_DIRTY:
+                logger.info(
+                    "Session cleanup: kept %s (uncommitted work) thread=%s",
+                    record.working_dir,
+                    record.thread_id,
+                )
+        cleanup_cog = bot.get_cog("SessionCleanupCog")
+        if cleanup_cog is not None:
+            cleanup_cog.announce(deleted)  # type: ignore[attr-defined]
+        elif deleted:
+            logger.info(
+                "Cleaned up %d session(s) unused for %d+ days: threads=%s (no notice cog)",
+                len(deleted),
+                sweep_days_value,
+                [r.thread_id for r in deleted],
+            )
 
         # Handle signals
         loop = asyncio.get_running_loop()

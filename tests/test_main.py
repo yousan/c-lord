@@ -139,6 +139,56 @@ class TestExpectedBotUserId:
         mock_exit.assert_called_with(1)
 
 
+class TestDiscordOwnerId:
+    """Issue #451: DISCORD_OWNER_ID must be a numeric snowflake or absent."""
+
+    def _base_env(self, monkeypatch: object) -> None:
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")  # type: ignore[attr-defined]
+        monkeypatch.setenv("DISCORD_CHANNEL_ID", "999")  # type: ignore[attr-defined]
+
+    def test_non_numeric_value_exits(self, monkeypatch: object) -> None:
+        """'yousan' instead of a snowflake must fail loudly at startup."""
+        import sys
+        from unittest.mock import patch
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("DISCORD_OWNER_ID", "yousan")  # type: ignore[attr-defined]
+        with patch.object(sys, "exit") as mock_exit:
+            load_config()
+        mock_exit.assert_called_with(1)
+
+    def test_non_numeric_error_message(
+        self, monkeypatch: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Error message must mention snowflake and the bad value."""
+        import logging
+        import sys
+        from unittest.mock import patch
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("DISCORD_OWNER_ID", "yousan")  # type: ignore[attr-defined]
+        with (
+            caplog.at_level(logging.ERROR, logger="c_lord.main"),
+            patch.object(sys, "exit"),
+        ):
+            load_config()
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "DISCORD_OWNER_ID" in joined
+        assert "yousan" in joined
+
+    def test_valid_snowflake_accepted(self, monkeypatch: object) -> None:
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("DISCORD_OWNER_ID", "123456789012345678")  # type: ignore[attr-defined]
+        config = load_config()
+        assert config["owner_id"] == "123456789012345678"
+
+    def test_empty_when_unset(self, monkeypatch: object) -> None:
+        self._base_env(monkeypatch)
+        monkeypatch.delenv("DISCORD_OWNER_ID", raising=False)  # type: ignore[attr-defined]
+        config = load_config()
+        assert config["owner_id"] == ""
+
+
 class TestDotenvOverride:
     """Issue #324: keys present in the .env file must beat inherited process env.
 

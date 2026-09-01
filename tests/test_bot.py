@@ -72,9 +72,17 @@ class TestOnAppCommandError:
 
     @pytest.mark.asyncio
     async def test_handler_logs_error(self, caplog: pytest.LogCaptureFixture) -> None:
-        """on_app_command_error should log the error at ERROR level."""
+        """on_app_command_error should log the error at ERROR level.
+
+        #444 also makes it reply to the user, so the interaction's response
+        methods must be awaitable mocks (see test_error_safety_net.py for the
+        reply-behavior assertions).
+        """
         bot = ClaudeDiscordBot(channel_id=123)
         interaction = MagicMock()
+        interaction.response.is_done.return_value = False
+        interaction.response.send_message = AsyncMock()
+        interaction.followup.send = AsyncMock()
         error = app_commands.AppCommandError("test failure")
 
         with caplog.at_level(logging.ERROR, logger="c_lord.bot"):
@@ -214,3 +222,127 @@ class TestOnError:
 
         assert any(r.levelno >= logging.ERROR for r in caplog.records)
         assert any("zombie" in r.message.lower() for r in caplog.records)
+
+
+class TestSlashCommandSync:
+    """Slash command sync must register GLOBALLY so commands work in every guild.
+
+    #462 regression: #461 registered commands only on the one guild derived from
+    channel_id (and wiped globals), so the bot — which serves multiple servers —
+    lost its slash commands on every OTHER server. The fix registers globally
+    (Discord's multi-guild standard) and clears the legacy guild-scoped commands
+    on the primary guild so they don't duplicate against the global ones.
+    """
+
+    def _make_bot_with_mocks(self) -> tuple:
+        from unittest.mock import AsyncMock, MagicMock
+
+        bot = ClaudeDiscordBot(channel_id=123)
+        guild = MagicMock()
+        channel = MagicMock()
+        channel.guild = guild
+        bot.tree.copy_global_to = MagicMock()
+        bot.tree.clear_commands = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+        return bot, guild
+
+    @pytest.mark.asyncio
+    async def test_global_sync_called(self) -> None:
+        """tree.sync() with NO guild kwarg must be called to register globally."""
+        from unittest.mock import AsyncMock, call, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        # A global sync (no guild kwarg) must have happened
+        assert call() in bot.tree.sync.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_copy_global_to_not_called(self) -> None:
+        """copy_global_to must NOT be used — that re-creates the per-guild duplicates."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.copy_global_to.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_guild_commands_cleared(self) -> None:
+        """clear_commands(guild=guild) + sync(guild=guild) must wipe legacy guild commands."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        bot.tree.clear_commands.assert_called_once_with(guild=guild)
+        # A guild-scoped sync (to push the now-empty guild command set) must have happened
+        guild_syncs = [c for c in bot.tree.sync.call_args_list if c.kwargs.get("guild") == guild]
+        assert len(guild_syncs) == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_order_guild_clear_before_global(self) -> None:
+        """Legacy guild clear must happen before the global registration."""
+        from unittest.mock import AsyncMock, patch
+
+        bot, guild = self._make_bot_with_mocks()
+        call_order: list[str] = []
+
+        async def tracking_sync(**kwargs: object) -> list:
+            if kwargs.get("guild") is not None:
+                call_order.append("guild_clear")
+            else:
+                call_order.append("global")
+            return []
+
+        bot.tree.sync.side_effect = tracking_sync
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        assert call_order == ["guild_clear", "global"]
+
+    @pytest.mark.asyncio
+    async def test_global_sync_runs_even_without_guild(self) -> None:
+        """If the channel's guild can't be resolved, global sync must still run."""
+        from unittest.mock import AsyncMock, MagicMock, call, patch
+
+        bot = ClaudeDiscordBot(channel_id=123)
+        channel = MagicMock()
+        channel.guild = None  # cannot resolve guild
+        bot.tree.clear_commands = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+
+        with (
+            patch.object(bot, "_assert_expected_identity"),
+            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
+            patch("c_lord.bot.isinstance", return_value=False),
+        ):
+            await bot.on_ready()
+
+        # Global sync still happened so commands are registered everywhere
+        assert call() in bot.tree.sync.call_args_list

@@ -66,7 +66,7 @@ class TestResolveWithoutBinding:
     @pytest.mark.asyncio
     async def test_resolve_tmux_returns_none_without_binding(self) -> None:
         cog = _make_cog()
-        result = await cog._resolve_tmux_manager(channel_id=12345)
+        result = await cog._resolve_tmux_manager(channel_id=12345, thread_id=None)
         assert result is None
 
 
@@ -135,3 +135,113 @@ class TestStartSessionUnboundChannel:
         error_msg = interaction.response.send_message.call_args.args[0]
         assert "/clord-init" in error_msg
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+# ---------------------------------------------------------------------------
+# #522: several c-lord instances can share a guild
+# ---------------------------------------------------------------------------
+
+
+class TestForeignChannelStaysSilent:
+    """A text command aimed at another instance's channel must not be answered.
+
+    ``!clord`` reaches every instance that can read the channel, so answering
+    an unbound channel means each bystander bot posts the same public warning
+    (and one holding a stale binding spawns a real session). Slash commands are
+    ephemeral — only the invoker sees them — so those keep explaining.
+    """
+
+    def _text_message(self) -> MagicMock:
+        message = MagicMock(spec=discord.Message)
+        message.id = 1
+        message.webhook_id = 4242  # webhook-driven, as `!clord` E2E is
+        message.author = MagicMock()
+        return message
+
+    @pytest.mark.asyncio
+    async def test_text_command_in_a_foreign_unbound_channel_says_nothing(self) -> None:
+        cog = _make_cog()
+        cog.spawn_session = AsyncMock()  # type: ignore[method-assign]
+        respond = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 777  # not bot.channel_id (999), no binding
+
+        await cog._clord_impl(
+            channel=channel,
+            channel_id_fallback=channel.id,
+            user=MagicMock(),
+            prompt="やること",
+            respond=respond,
+            ack=AsyncMock(),
+            message=self._text_message(),
+        )
+
+        respond.assert_not_awaited()
+        cog.spawn_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_text_command_in_a_foreign_unbound_thread_says_nothing(self) -> None:
+        cog = _make_cog()
+        cog._run_claude = AsyncMock()  # type: ignore[method-assign]
+        respond = AsyncMock()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 601
+        thread.parent_id = 777
+        thread.send = AsyncMock(return_value=MagicMock())
+
+        await cog._clord_impl(
+            channel=thread,
+            channel_id_fallback=None,
+            user=MagicMock(),
+            prompt="やること",
+            respond=respond,
+            ack=AsyncMock(),
+            message=self._text_message(),
+        )
+
+        respond.assert_not_awaited()
+        cog._run_claude.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slash_in_an_unbound_channel_still_explains(self) -> None:
+        """Ephemeral, so it reaches only the invoker — no cross-bot noise."""
+        cog = _make_cog()
+        cog.spawn_session = AsyncMock()  # type: ignore[method-assign]
+        respond = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 777
+
+        await cog._clord_impl(
+            channel=channel,
+            channel_id_fallback=channel.id,
+            user=MagicMock(),
+            prompt="やること",
+            respond=respond,
+            ack=AsyncMock(),
+            message=None,
+        )
+
+        respond.assert_awaited()
+        assert "/clord-init" in str(respond.await_args.args[0])
+
+    @pytest.mark.asyncio
+    async def test_text_command_in_our_own_unbound_channel_still_explains(self) -> None:
+        """This instance *is* configured for the channel, so the user gets help."""
+        cog = _make_cog()
+        cog.spawn_session = AsyncMock()  # type: ignore[method-assign]
+        respond = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 999  # == bot.channel_id
+
+        await cog._clord_impl(
+            channel=channel,
+            channel_id_fallback=channel.id,
+            user=MagicMock(),
+            prompt="やること",
+            respond=respond,
+            ack=AsyncMock(),
+            message=self._text_message(),
+        )
+
+        respond.assert_awaited()
+        assert "/clord-init" in str(respond.await_args.args[0])

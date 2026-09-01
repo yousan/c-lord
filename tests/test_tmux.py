@@ -12,6 +12,64 @@ from c_lord.tmux import (
 )
 
 
+def _typed_command(mock_run: MagicMock) -> str:
+    """Reassemble the shell command ``start_claude`` typed into the pane.
+
+    Since #527 it is typed in chunks (tmux refuses a single oversized
+    ``send-keys``), so the command is the concatenation of every
+    ``send-keys -l`` payload rather than one argv element.
+    """
+    return "".join(
+        call[0][0][-1]
+        for call in mock_run.call_args_list
+        if "send-keys" in call[0][0] and "-l" in call[0][0]
+    )
+
+
+def _staged_prompt(mock_run: MagicMock) -> str:
+    """Read back the prompt ``start_claude`` staged in a file (#529).
+
+    The prompt is no longer typed at the pane's shell prompt — zsh's
+    ``url-quote-magic`` rewrote URLs on the way in — so it is read from the
+    file the command points at.
+    """
+    import re
+    from pathlib import Path
+
+    cmd = _typed_command(mock_run)
+    match = re.search(r'"\$\(cat (\S+)\)"', cmd)
+    assert match, f"expected a staged prompt file in: {cmd!r}"
+    path = Path(match.group(1))
+    try:
+        return path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _render_windows(fmt: str, rows: list[dict[str, str]]) -> str:
+    """Render ``tmux list-windows -F <fmt>`` output for *rows*.
+
+    Keys: ``id`` / ``name`` / ``tid`` / ``path``. Faking by format rather than by
+    a fixed string keeps these tests honest about *which* window a row is: #649
+    added ``#{window_id}`` to several call sites precisely because the name alone
+    does not identify one.
+    """
+    out = []
+    for row in rows:
+        line = fmt
+        for token, key in (
+            ("#{window_id}", "id"),
+            ("#{window_name}", "name"),
+            ("#{@thread_id}", "tid"),
+            ("#{pane_current_path}", "path"),
+            ("#{window_index}", "index"),
+            ("#{window_active}", "active"),
+        ):
+            line = line.replace(token, row.get(key, ""))
+        out.append(line + "\n")
+    return "".join(out)
+
+
 class TestTmuxSessionManager:
     """Tests for the window-based TmuxSessionManager."""
 
@@ -21,6 +79,9 @@ class TestTmuxSessionManager:
         mgr._available = True
         # Isolate from the post-create window sort (#374) — tested separately.
         mgr._sort_windows_unlocked = lambda: None  # type: ignore[method-assign]
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
+        mgr._fit_window_to_client = lambda *_: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
@@ -28,24 +89,40 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1, stdout=""),
                 # _ensure_session → has-session (not exists)
                 MagicMock(returncode=1),
+                # #503: list-sessions → a server is already up, so the session is
+                # created directly. The server-start path has its own coverage in
+                # tests/test_tmux_server_cgroup.py.
+                MagicMock(returncode=0),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
+                # #649: re-check under the session lock → _rebuild_mapping → list-windows
+                MagicMock(returncode=1, stdout=""),
                 # _find_window_by_working_dir → list-windows (no windows yet)
                 MagicMock(returncode=1, stdout=""),
-                # new-window
-                MagicMock(returncode=0),
+                # #427: _adopt_window_from_other_session → list-windows -a (nothing elsewhere)
+                MagicMock(returncode=1, stdout=""),
+                # #649: _next_window_name → list-windows (empty session → w1)
+                MagicMock(returncode=0, stdout=""),
+                # new-window -P -F '#{window_id}' → the new window's id
+                MagicMock(returncode=0, stdout="@1\n"),
                 # set-option @thread_id
                 MagicMock(returncode=0),
             ]
             name = mgr.create_session(12345, "/work/dir")
 
         assert name == "w1"
-        assert mgr._thread_to_window[12345] == "w1"
+        # #649: the mapping keys on the unique window_id, not the name — a name
+        # can be shared by two windows, and then every target is ambiguous.
+        assert mgr._thread_to_window[12345] == "@1"
+
+        # Look calls up by subcommand rather than by position: any new probe on
+        # the bootstrap path (e.g. #503's list-sessions) shifts every index and
+        # would break this test for no real reason.
+        def call_with(subcommand: str) -> list[str]:
+            return next(c[0][0] for c in mock_run.call_args_list if subcommand in c[0][0])
 
         # Verify new-window was called correctly
-        new_window_call = mock_run.call_args_list[4]
-        args = new_window_call[0][0]
-        assert "new-window" in args
+        args = call_with("new-window")
         assert SESSION_NAME in args
         assert "w1" in args
         assert "/work/dir" in args
@@ -54,9 +131,7 @@ class TestTmuxSessionManager:
         assert "-d" in args
 
         # Verify set-option was called to store thread_id
-        set_opt_call = mock_run.call_args_list[5]
-        args = set_opt_call[0][0]
-        assert "set-option" in args
+        args = call_with("set-option")
         assert "@thread_id" in args
         assert "12345" in args
 
@@ -92,26 +167,41 @@ class TestTmuxSessionManager:
         mgr._available = True
         # Isolate from the post-create window sort (#374) — tested separately.
         mgr._sort_windows_unlocked = lambda: None  # type: ignore[method-assign]
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
+        mgr._fit_window_to_client = lambda *_: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             # First thread
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout=""),  # _find_window_by_working_dir: no match for "/a"
-                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=1, stdout=""),  # #649 re-check under lock: list-windows
+                MagicMock(
+                    returncode=0, stdout=""
+                ),  # _find_window_by_working_dir: no match for "/a"
+                MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
+                MagicMock(returncode=0, stdout=""),  # #649 _next_window_name: empty → w1
+                MagicMock(returncode=0, stdout="@1\n"),  # new-window -P -F
                 MagicMock(returncode=0),  # set-option
             ]
             name1 = mgr.create_session(111, "/a")
 
-            # Second thread
+            # Second thread. #649: the number now comes from live tmux state, so
+            # ``w2`` follows from the session already holding ``w1`` — not from an
+            # instance counter that a second manager would not share.
+            rows = "@1\tw1\t111\t/a\n"
             mock_run.side_effect = [
                 # _find_window_for_thread cache miss → _rebuild_mapping
-                MagicMock(returncode=0, stdout="w1\n"),  # list-windows
-                MagicMock(returncode=0, stdout="111\n"),  # show-option w1
+                MagicMock(returncode=0, stdout=rows),  # list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0, stdout="w1\t/a\n"),  # _find_window_by_working_dir: no match for "/b"
-                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=0, stdout=rows),  # #649 re-check under lock
+                MagicMock(
+                    returncode=0, stdout="@1\t/a\n"
+                ),  # _find_window_by_working_dir: no match for "/b"
+                MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
+                MagicMock(returncode=0, stdout="w1\n"),  # #649 _next_window_name: w1 live → w2
+                MagicMock(returncode=0, stdout="@2\n"),  # new-window -P -F
                 MagicMock(returncode=0),  # set-option
             ]
             name2 = mgr.create_session(222, "/b")
@@ -143,10 +233,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # show-option verify
-                MagicMock(returncode=0),  # kill-window
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             assert mgr.kill_session(12345) is True
 
         # Cache should be cleared
@@ -172,26 +261,28 @@ class TestTmuxSessionManager:
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows
-                MagicMock(
-                    returncode=0,
-                    stdout="work1:/work/a\nwork2:/work/b\n",
-                ),
-                # show-option for work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option for work2
-                MagicMock(returncode=0, stdout="222\n"),
-            ]
+            # #649: one list-windows carries name, path, tag and id together. The
+            # old per-row ``show-option -t session:NAME`` follow-up re-resolved
+            # the name, so with duplicate names every duplicate reported the
+            # first one's tag.
+            # name / @thread_id / window_id / path — the path goes LAST so a tab
+            # inside it cannot shift the other columns.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="work1\t111\t@1\t/work/a\nwork2\t222\t@2\t/work/b\n",
+            )
             windows = mgr.list_sessions()
 
+        assert mock_run.call_count == 1
         assert len(windows) == 2
         assert windows[0]["window_name"] == "work1"
         assert windows[0]["working_dir"] == "/work/a"
         assert windows[0]["thread_id"] == "111"
+        assert windows[0]["window_id"] == "@1"
         assert windows[1]["window_name"] == "work2"
         assert windows[1]["working_dir"] == "/work/b"
         assert windows[1]["thread_id"] == "222"
+        assert windows[1]["window_id"] == "@2"
 
     def test_list_sessions_empty(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -204,35 +295,58 @@ class TestTmuxSessionManager:
         assert windows == []
 
     def test_cleanup_orphaned(self) -> None:
+        """Windows whose thread is not active are killed; active ones survive.
+
+        Dispatches ``_run`` by subcommand rather than replaying a fixed call
+        sequence: since #570 the reaper also probes each window's pane before
+        killing it, and a positional ``side_effect`` list silently mis-aligns
+        whenever a probe is added. The reaper-specific cases (a live Claude
+        pane, a window with no ``@thread_id``) live in
+        ``tests/test_tmux_reaper.py``.
+        """
+        windows = {"@1": ("work1", "111"), "@2": ("work2", "222"), "@3": ("work3", "333")}
+        killed_targets: list[str] = []
+
+        def fake_run(argv: list[str], **_: object) -> MagicMock:
+            if "list-windows" in argv:
+                # Render whatever format the caller asked for — #649 added the
+                # window_id to several of them.
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                rows = []
+                for wid, (name, tid) in windows.items():
+                    row = fmt
+                    for token, value in (
+                        ("#{window_id}", wid),
+                        ("#{window_name}", name),
+                        ("#{@thread_id}", tid),
+                        ("#{pane_current_path}", f"/work/{name}"),
+                    ):
+                        row = row.replace(token, value)
+                    rows.append(row + "\n")
+                return MagicMock(returncode=0, stdout="".join(rows))
+            if "show-option" in argv:
+                target = argv[argv.index("-t") + 1]
+                entry = windows.get(target)
+                if entry is None:
+                    return MagicMock(returncode=1, stdout="")
+                return MagicMock(returncode=0, stdout=f"{entry[1]}\n")
+            if "list-panes" in argv:
+                return MagicMock(returncode=0, stdout="zsh\n")
+            if "kill-window" in argv:
+                killed_targets.append(argv[argv.index("-t") + 1])
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
 
-        with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list_sessions: list-windows
-                MagicMock(
-                    returncode=0,
-                    stdout="work1:/a\nwork2:/b\nwork3:/c\n",
-                ),
-                # show-option for work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option for work2
-                MagicMock(returncode=0, stdout="222\n"),
-                # show-option for work3
-                MagicMock(returncode=0, stdout="333\n"),
-                # kill_session(111): _find → cache miss → rebuild list-windows
-                MagicMock(returncode=0, stdout="work1:/a\nwork2:/b\nwork3:/c\n"),
-                MagicMock(returncode=0, stdout="111\n"),  # show-option work1
-                MagicMock(returncode=0, stdout="222\n"),  # show-option work2
-                MagicMock(returncode=0, stdout="333\n"),  # show-option work3
-                MagicMock(returncode=0),  # kill-window work1
-                # kill_session(333): _find → cache hit → show-option verify
-                MagicMock(returncode=0, stdout="333\n"),
-                MagicMock(returncode=0),  # kill-window work3
-            ]
+        with patch("c_lord.tmux._run", side_effect=fake_run):
             killed = mgr.cleanup_orphaned(active_thread_ids={222})
 
         assert killed == 2
+        # #649: the reaper kills the window it actually inspected, by id. A
+        # ``session:name`` target could resolve to a live twin.
+        assert sorted(killed_targets) == ["@1", "@3"]
 
     def test_cleanup_orphaned_tmux_unavailable(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -263,32 +377,30 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 # show-option verify → wrong thread (stale)
                 MagicMock(returncode=0, stdout="99999\n"),
-                # rebuild: list-windows
-                MagicMock(returncode=0, stdout="work2\n"),
-                # rebuild: show-option for work2
-                MagicMock(returncode=0, stdout="12345\n"),
+                # rebuild: list-windows (id / name / @thread_id / path — #649)
+                MagicMock(returncode=0, stdout="@2\twork2\t12345\t/work/b\n"),
             ]
             result = mgr._find_window_for_thread(12345)
 
-        assert result == "work2"
-        assert mgr._thread_to_window[12345] == "work2"
+        # #649: lookups resolve to the unique window_id, never the name.
+        assert result == "@2"
+        assert mgr._thread_to_window[12345] == "@2"
 
     def test_rebuild_mapping(self) -> None:
         """_rebuild_mapping populates _thread_to_window and updates _next_work_id."""
         mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows
-                MagicMock(returncode=0, stdout="work1\nwork3\n"),
-                # show-option work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option work3
-                MagicMock(returncode=0, stdout="333\n"),
-            ]
+            # #649: one list-windows carries all four fields, so a row's tag can
+            # no longer be read off a same-named sibling.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="@1\twork1\t111\t/work/a\n@3\twork3\t333\t/work/c\n",
+            )
             mgr._rebuild_mapping()
 
-        assert mgr._thread_to_window == {111: "work1", 333: "work3"}
+        assert mgr._thread_to_window == {111: "@1", 333: "@3"}
+        assert mock_run.call_count == 1
         assert mgr._next_work_id == 4  # one past highest (3)
 
     def test_rebuild_mapping_recovers_from_pane_path(self) -> None:
@@ -302,46 +414,50 @@ class TestTmuxSessionManager:
         """
         mgr = TmuxSessionManager(mapping_path="")
 
-        with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows with pane_current_path
-                MagicMock(
+        # Dispatch on the command rather than a fixed call sequence: #501 moved
+        # the repairing set-option after the scan, and an ordered side_effect
+        # list silently hands a set-option's reply to the next show-option.
+        def fake_run(args: list[str]) -> MagicMock:
+            if "list-windows" in args:
+                # @thread_id column empty == the option is unset.
+                return MagicMock(
                     returncode=0,
                     stdout=(
-                        "work1\t/home/u/c-lord-sessions/999/1501841644457300038\n"
-                        "work2\t/home/u/other\n"
+                        "@1\twork1\t\t/home/u/c-lord-sessions/999/1501841644457300038\n"
+                        "@2\twork2\t\t/home/u/other\n"
                     ),
-                ),
-                # show-option @thread_id for work1 → option unset (rc=1)
-                MagicMock(returncode=1, stdout=""),
-                # set-option to repair @thread_id for work1
-                MagicMock(returncode=0),
-                # show-option @thread_id for work2 → option unset (rc=1)
-                MagicMock(returncode=1, stdout=""),
-            ]
+                )
+            if "show-option" in args:
+                return MagicMock(returncode=1, stdout="")  # option unset
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
             mgr._rebuild_mapping()
 
         # Recovered from path
-        assert mgr._thread_to_window == {1501841644457300038: "work1"}
+        assert mgr._thread_to_window == {1501841644457300038: "@1"}
         # work2 has no recoverable thread_id → not mapped
         assert 2 not in mgr._thread_to_window
+        # …and the option was repaired on work1 so later lookups stay cheap.
+        assert any(
+            "set-option" in call.args[0] and call.args[0][-1] == "1501841644457300038"
+            for call in mock_run.call_args_list
+        )
 
     def test_rebuild_mapping_prefers_option_over_path(self) -> None:
         """When @thread_id is set, it wins over pane_current_path inference."""
         mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(
-                    returncode=0,
-                    stdout="work1\t/home/u/c-lord-sessions/999/1501841644457300038\n",
-                ),
-                # show-option returns the authoritative thread_id
-                MagicMock(returncode=0, stdout="42\n"),
-            ]
+            # The @thread_id column (42) disagrees with the path (…038); the
+            # option is authoritative.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="@1\twork1\t42\t/home/u/c-lord-sessions/999/1501841644457300038\n",
+            )
             mgr._rebuild_mapping()
 
-        assert mgr._thread_to_window == {42: "work1"}
+        assert mgr._thread_to_window == {42: "@1"}
 
     def test_rebuild_mapping_empty(self) -> None:
         """_rebuild_mapping with no windows results in empty state."""
@@ -357,6 +473,8 @@ class TestTmuxSessionManager:
     def test_ensure_session_already_exists(self) -> None:
         """_ensure_session returns True when session already exists."""
         mgr = TmuxSessionManager(mapping_path="")
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
@@ -368,10 +486,16 @@ class TestTmuxSessionManager:
     def test_ensure_session_creates_new(self) -> None:
         """_ensure_session creates session when it doesn't exist."""
         mgr = TmuxSessionManager(mapping_path="")
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
+                # #503: list-sessions → a server is already up, so the session is
+                # created directly. The server-start path (which goes through
+                # systemd-run) is covered in tests/test_tmux_server_cgroup.py.
+                MagicMock(returncode=0),
                 MagicMock(returncode=0),  # new-session → success
             ]
             assert mgr._ensure_session() is True
@@ -383,6 +507,7 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
+                MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=1, stderr="error"),  # new-session → fail
             ]
             assert mgr._ensure_session() is False
@@ -404,24 +529,81 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: show-option verify
-                MagicMock(returncode=0),  # send-keys for claude command
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.start_claude(12345, "hello world", "sonnet")
 
         assert result is True
 
-        # Verify the claude command was sent with prompt
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        assert "send-keys" in args
-        assert f"{SESSION_NAME}:work1" in args
-        # The command string should contain the prompt
-        cmd_str = " ".join(args[3:])
+        # Verify the claude command was sent, and the prompt handed over
+        send_keys = [c[0][0] for c in mock_run.call_args_list if "send-keys" in c[0][0]]
+        assert send_keys, "start_claude must send keys to the pane"
+        assert all(f"{SESSION_NAME}:work1" in args for args in send_keys)
+        cmd_str = _typed_command(mock_run)
         assert "claude --model sonnet" in cmd_str
-        assert "hello world" in cmd_str
-        assert "Enter" in args
+        # #529: the prompt rides in a file, never on the typed command line.
+        assert "hello world" not in cmd_str
+        assert "hello world" in _staged_prompt(mock_run)
+        # …and the command is submitted by a separate Enter (#527: the command
+        # itself is typed literally, so Enter can no longer ride along).
+        assert send_keys[-1][-1] == "Enter"
+
+    def test_start_claude_sets_otel_resource_attributes(self) -> None:
+        """start_claude labels Claude Code's telemetry with cwd + repo (#NNN).
+
+        Without this the OTel metrics land with empty ``cwd``/``project``
+        labels, so per-repository cost attribution is impossible for every
+        session c-lord starts (only shell-wrapper launches were labelled).
+        """
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        def fake_run(args: list[str]) -> MagicMock:
+            if "display-message" in args:
+                return MagicMock(returncode=0, stdout="/home/yousan/c-lord-sessions/1/2\n")
+            if "remote" in args and "get-url" in args:
+                return MagicMock(
+                    returncode=0, stdout="git@github.com:kater-iam/project_30_ehon-ya.git\n"
+                )
+            return MagicMock(returncode=0, stdout="12345\n")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
+            assert mgr.start_claude(12345, "hello world", "sonnet") is True
+
+        cmd_str = _typed_command(mock_run)
+        assert "OTEL_RESOURCE_ATTRIBUTES=" in cmd_str, (
+            "start_claude must set OTEL_RESOURCE_ATTRIBUTES so the telemetry "
+            f"can be attributed to a repo; got: {cmd_str}"
+        )
+        assert "project=project_30_ehon-ya" in cmd_str
+        assert "cwd=/home/yousan/c-lord-sessions/1/2" in cmd_str
+        # The assignment must sit in the env(1) prefix, before the binary.
+        # (A plain "is it earlier than ' claude '" check would be fooled by the
+        # "unalias claude" prelude, which also contains that substring.)
+        assert "env -u CLAUDECODE OTEL_RESOURCE_ATTRIBUTES=" in cmd_str
+
+    def test_start_claude_without_git_repo_still_starts(self) -> None:
+        """A non-repo working directory must not break the launch (#NNN)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        def fake_run(args: list[str]) -> MagicMock:
+            if "display-message" in args:
+                return MagicMock(returncode=0, stdout="/tmp/not-a-repo\n")
+            if "remote" in args and "get-url" in args:
+                return MagicMock(returncode=128, stdout="", stderr="not a git repository")
+            return MagicMock(returncode=0, stdout="12345\n")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
+            assert mgr.start_claude(12345, "hello", "sonnet") is True
+
+        cmd_str = _typed_command(mock_run)
+        assert "claude --model sonnet" in cmd_str
+        assert "project=" not in cmd_str  # unknown repo -> attribute omitted
+        assert "cwd=/tmp/not-a-repo" in cmd_str
 
     def test_start_claude_no_window_returns_false(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -446,35 +628,32 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys for claude command
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello", dangerously_skip_permissions=True)
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])  # everything after -t
+        cmd_str = _typed_command(mock_run)
         assert "--dangerously-skip-permissions" in cmd_str
 
-    def test_start_claude_escapes_single_quotes(self) -> None:
-        """Prompt with single quotes is properly escaped."""
+    def test_start_claude_survives_shell_metacharacters_in_the_prompt(self) -> None:
+        """Quotes, backticks and $ reach Claude untouched.
+
+        They used to need shell escaping because the prompt was part of the
+        typed command line; since #529 it is read from a file, so nothing in it
+        is shell syntax in the first place.
+        """
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
+        hostile = 'it\'s a `test` with $HOME and "quotes"'
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),
-                MagicMock(returncode=0),
-            ]
-            mgr.start_claude(12345, "it's a test")
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
+            mgr.start_claude(12345, hostile)
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
-        # Single quote should be escaped
-        assert "'" in cmd_str
+        assert _staged_prompt(mock_run).endswith(hostile)
+        assert hostile not in _typed_command(mock_run)
 
     def test_start_claude_with_try_continue_flag(self) -> None:
         """start_claude with try_continue=True includes --continue in the command."""
@@ -483,16 +662,13 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.start_claude(12345, "hello", try_continue=True)
 
         assert result is True
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--continue" in cmd_str
 
     def test_start_claude_default_no_try_continue(self) -> None:
@@ -502,15 +678,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--continue" not in cmd_str
 
     def test_start_claude_includes_effort_flag(self) -> None:
@@ -520,15 +693,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello", effort="max")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--effort max" in cmd_str
 
     def test_start_claude_no_effort_flag_when_none(self) -> None:
@@ -538,15 +708,12 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello")
 
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--effort" not in cmd_str
 
     def test_start_claude_invalid_effort_is_skipped(self) -> None:
@@ -558,19 +725,19 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.start_claude(12345, "hello", effort="ultracode")
 
         assert result is True
-        cmd_call = mock_run.call_args_list[1]
-        args = cmd_call[0][0]
-        cmd_str = " ".join(args[3:])
+        cmd_str = _typed_command(mock_run)
         assert "--effort" not in cmd_str
 
-    def test_send_input_sends_text_and_enter(self) -> None:
+    def test_send_input_sends_text_and_enter(self, monkeypatch) -> None:
+        # #492: pin skill mode — this test checks general send_input mechanics,
+        # not the jsonl ZWSP marker (that has its own dedicated tests below).
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
@@ -581,6 +748,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             result = mgr.send_input(12345, "my prompt")
 
@@ -598,9 +766,7 @@ class TestTmuxSessionManager:
         args = enter_call[0][0]
         assert "Enter" in args
 
-    def test_send_input_prefixes_zwsp_marker_under_jsonl_mode(
-        self, monkeypatch=None
-    ) -> None:
+    def test_send_input_prefixes_zwsp_marker_under_jsonl_mode(self, monkeypatch=None) -> None:
         # In CLORD_BRIDGE_MODE=jsonl the input must be prefixed with a
         # zero-width-space so the resulting JSONL ``user`` event is recognised
         # as c-lord-originated and not double-posted back to Discord (#71).
@@ -619,6 +785,9 @@ class TestTmuxSessionManager:
                     MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
+                    # #560: send_input now reads the box back to confirm the
+                    # message actually left it.
+                    MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
@@ -636,7 +805,7 @@ class TestTmuxSessionManager:
         import os
 
         prev = os.environ.get("CLORD_BRIDGE_MODE")
-        os.environ.pop("CLORD_BRIDGE_MODE", None)
+        os.environ["CLORD_BRIDGE_MODE"] = "skill"
         try:
             mgr = TmuxSessionManager(mapping_path="")
             mgr._available = True
@@ -648,26 +817,47 @@ class TestTmuxSessionManager:
                     MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                     MagicMock(returncode=0),
                     MagicMock(returncode=0),
+                    # #560: send_input now reads the box back to confirm the
+                    # message actually left it.
+                    MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
                 ]
                 assert mgr.send_input(12345, "hi") is True
 
             text_call = mock_run.call_args_list[2]
             args = text_call[0][0]
             assert "hi" in args
-            # No ZWSP under default mode (backward compat with skill path).
+            # No ZWSP under skill mode.
             assert "​hi" not in args
         finally:
-            if prev is not None:
+            if prev is None:
+                os.environ.pop("CLORD_BRIDGE_MODE", None)
+            else:
                 os.environ["CLORD_BRIDGE_MODE"] = prev
 
-    # -- #147: vim NORMAL-mode correction before literal input --------------
+    # -- #147/#544: vim NORMAL-mode correction before literal input ---------
     #
-    # Claude Code runs with ``editorMode: vim``. When the input box is in
+    # When Claude Code runs with ``editorMode: vim`` and the input box is in
     # NORMAL mode, ``send-keys -l`` characters are interpreted as vim commands
-    # and the message is corrupted. This Claude version (v2.1.150) shows
-    # ``-- INSERT`` in the status bar only in INSERT mode; NORMAL omits it
-    # entirely (no ``-- NORMAL`` marker). So send_input must capture the pane,
-    # and if not in INSERT, press ``i`` to enter INSERT before the literal text.
+    # and the message is corrupted, so send_input presses ``i`` first.
+    #
+    # #544: that correction must fire ONLY for panes that actually run vim
+    # mode.  A bare ``⏵⏵ bypass permissions on …`` bar is what a vim-*less*
+    # input box shows, so it is not evidence of NORMAL — the fixture below
+    # therefore carries an explicit ``-- NORMAL`` marker.  The vim-off pane and
+    # the marker-less vim NORMAL pane (which v2.1.246 renders identically) are
+    # covered in tests/test_send_input_vim_mode.py.
+
+    # #560: an input box that is empty — what the pane looks like once the
+    # message has actually been submitted. send_input reads this back to confirm
+    # delivery instead of trusting the Enter keypress's exit code.
+    _EMPTY_BOX_PANE = (
+        "● done\n"
+        "─────────────────────────────\n"
+        "❯ \n"
+        "─────────────────────────────\n"
+        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
 
     _INSERT_PANE = (
         "❯ \n"
@@ -681,11 +871,12 @@ class TestTmuxSessionManager:
         "─────────────────────────────\n"
         "   Model: Opus 4.7  v2.1.150  Style: default\n"
         "   ⎇ no git  cwd: /tmp  Skill: none\n"
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+        "  -- NORMAL -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
 
-    def test_send_input_enters_insert_when_normal_mode(self) -> None:
-        """NORMAL mode → press ``i`` (key) before sending the literal text (#147)."""
+    def test_send_input_enters_insert_when_normal_mode(self, monkeypatch) -> None:
+        """vim NORMAL → press ``i`` (key) before sending the literal text (#147)."""
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
@@ -697,6 +888,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),  # send-keys i
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             assert mgr.send_input(12345, "melon") is True
 
@@ -712,8 +904,9 @@ class TestTmuxSessionManager:
         # Then Enter.
         assert "Enter" in calls[4][0][0]
 
-    def test_send_input_no_extra_i_when_insert_mode(self) -> None:
+    def test_send_input_no_extra_i_when_insert_mode(self, monkeypatch) -> None:
         """INSERT mode → no extra ``i`` injected (AC2: no regression / double-i) (#147)."""
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
@@ -724,6 +917,7 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),  # send-keys -l (text)
                 MagicMock(returncode=0),  # send-keys Enter
+                MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),  # #560: confirm box empty
             ]
             assert mgr.send_input(12345, "melon") is True
 
@@ -751,10 +945,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys -l (text)
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             assert mgr.send_literal(12345, "メロン") is True
 
         calls = mock_run.call_args_list
@@ -876,10 +1069,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
-                MagicMock(returncode=0),  # send-keys C-c
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             result = mgr.send_interrupt(12345)
 
         assert result is True
@@ -958,10 +1150,9 @@ class TestTmuxSessionManager:
         mgr._thread_to_window[12345] = "work1"
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="12345\n"),  # _find: show-option verify
-                MagicMock(returncode=0),  # send-keys
-            ]
+            # #527: start_claude now types the command in chunks + a separate
+            # Enter, so the call count is no longer fixed at two.
+            mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             mgr.start_claude(12345, "hello", "sonnet")
 
         # Verify the custom session name is used in the target
@@ -972,10 +1163,13 @@ class TestTmuxSessionManager:
     def test_custom_session_name_in_ensure_session(self) -> None:
         """Custom session name is used when creating the tmux session."""
         mgr = TmuxSessionManager(session_name="custom", mapping_path="")
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # has-session → not exists
+                MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session → success
             ]
             assert mgr._ensure_session() is True
@@ -985,7 +1179,7 @@ class TestTmuxSessionManager:
         assert "custom" in has_call[0][0]
 
         # Verify new-session used custom name
-        new_call = mock_run.call_args_list[1]
+        new_call = mock_run.call_args_list[2]
         assert "custom" in new_call[0][0]
 
     def test_none_session_name_uses_default(self) -> None:
@@ -1002,22 +1196,37 @@ class TestTmuxSessionManager:
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
-                # list-windows → window exists
-                MagicMock(returncode=0, stdout="work1\n"),
+                # list-windows → window exists (id\tname — #649)
+                MagicMock(returncode=0, stdout="@1\twork1\n"),
                 # set-option @thread_id
                 MagicMock(returncode=0),
             ]
             result = mgr.remap_window(99999, "work1")
 
         assert result is True
-        assert mgr._thread_to_window[99999] == "work1"
+        # #649: the operator names a window; the mapping stores its unique id.
+        assert mgr._thread_to_window[99999] == "@1"
 
-        # Verify set-option was called with new thread_id
+        # Verify set-option was called with new thread_id, targeting the id
         set_call = mock_run.call_args_list[1]
         args = set_call[0][0]
         assert "set-option" in args
         assert "@thread_id" in args
         assert "99999" in args
+        assert args[args.index("-t") + 1] == "@1"
+
+    def test_remap_window_refuses_an_ambiguous_name(self) -> None:
+        """#649: two windows named ``w134`` — remap must not guess which is meant."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="@1\tw134\n@2\tw134\n")
+            result = mgr.remap_window(99999, "w134")
+
+        assert result is False
+        assert 99999 not in mgr._thread_to_window
+        assert not [c for c in mock_run.call_args_list if "set-option" in c[0][0]]
 
     def test_remap_window_not_found(self) -> None:
         """remap_window returns False when the window does not exist."""
@@ -1036,12 +1245,12 @@ class TestTmuxSessionManager:
         """remap_window removes old mapping and adds new one."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
-        # Pre-existing mapping: thread 11111 → work1
-        mgr._thread_to_window[11111] = "work1"
+        # Pre-existing mapping: thread 11111 → the window named work1
+        mgr._thread_to_window[11111] = "@1"
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="work1\n"),  # list-windows → exists
+                MagicMock(returncode=0, stdout="@1\twork1\n"),  # list-windows → exists
                 MagicMock(returncode=0),  # set-option
             ]
             result = mgr.remap_window(22222, "work1")
@@ -1050,7 +1259,7 @@ class TestTmuxSessionManager:
         # Old thread removed from cache
         assert 11111 not in mgr._thread_to_window
         # New thread mapped
-        assert mgr._thread_to_window[22222] == "work1"
+        assert mgr._thread_to_window[22222] == "@1"
 
     def test_remap_window_tmux_unavailable(self) -> None:
         """remap_window returns False when tmux is not installed."""
@@ -1076,9 +1285,9 @@ class TestTmuxSessionManager:
             # show-option for @thread_id on a manually-created window → rc=1
             if "show-option" in argv and "@thread_id" in argv:
                 return MagicMock(returncode=1, stdout="")
-            # list-windows → window exists in session
+            # list-windows → window exists in session (id\tname — #649)
             if "list-windows" in argv:
-                return MagicMock(returncode=0, stdout="work1\nproj34\nwork2\n")
+                return MagicMock(returncode=0, stdout="@1\twork1\n@2\tproj34\n@3\twork2\n")
             # set-option succeeds
             if "set-option" in argv:
                 return MagicMock(returncode=0, stdout="")
@@ -1088,7 +1297,7 @@ class TestTmuxSessionManager:
             result = mgr.remap_window(77777, "proj34")
 
         assert result is True
-        assert mgr._thread_to_window[77777] == "proj34"
+        assert mgr._thread_to_window[77777] == "@2"  # #649: id, not name
 
     def test_remap_window_truly_missing(self) -> None:
         """remap_window returns False when window genuinely does not exist."""
@@ -1159,11 +1368,15 @@ class TestTmuxSessionManager:
             cmd = argv[1] if len(argv) > 1 else ""
             if cmd == "list-windows":
                 # pane is at a completely unrelated path
-                return MagicMock(returncode=0, stdout="work1\t/home/user/other-project\n")
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                rows = [{"id": "@1", "name": "work1", "path": "/home/user/other-project"}]
+                return MagicMock(returncode=0, stdout=_render_windows(fmt, rows))
             if cmd == "show-option":
                 return MagicMock(returncode=1, stdout="")
             if cmd == "has-session":
                 return MagicMock(returncode=0, stdout="")
+            if cmd == "new-window":
+                return MagicMock(returncode=0, stdout="@2\n")
             return MagicMock(returncode=0, stdout="")
 
         with patch("c_lord.tmux._run", side_effect=fake_run):
@@ -1204,8 +1417,18 @@ class TestTmuxSessionManager:
             recorded_calls.append(list(argv))
             cmd = argv[1] if len(argv) > 1 else ""
             if cmd == "list-windows":
-                # pane is at /tmp (totally different from session dir)
-                return MagicMock(returncode=0, stdout="work1\t/tmp\n")
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                # pane is at /tmp (totally different from session dir), and
+                # @thread_id is unset — an empty column (#649 format).
+                row = fmt
+                for token, value in (
+                    ("#{window_id}", "@1"),
+                    ("#{window_name}", "work1"),
+                    ("#{@thread_id}", ""),
+                    ("#{pane_current_path}", "/tmp"),
+                ):
+                    row = row.replace(token, value)
+                return MagicMock(returncode=0, stdout=row + "\n")
             if cmd == "show-option":
                 return MagicMock(returncode=1, stdout="")
             if cmd == "set-option":
@@ -1215,12 +1438,16 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run", side_effect=fake_run):
             mgr._rebuild_mapping()
 
-        # thread_id 22222 must have been restored from file
-        assert mgr._thread_to_window.get(22222) == "work1"
+        # thread_id 22222 must have been restored from file. #649: the file
+        # stores the NAME (ids are reassigned by a tmux restart, which is the
+        # very case this file exists for), resolved to the id on load.
+        assert mgr._thread_to_window.get(22222) == "@1"
         set_calls = [c for c in recorded_calls if "set-option" in c and "@thread_id" in c]
         assert any("22222" in c for c in set_calls), "@thread_id not restored from file"
+        assert all("@1" in c for c in set_calls), "repair must target the unique window_id"
 
         import os
+
         os.unlink(mapping_path)
 
     def test_create_session_adopts_window_via_mapping_file(self) -> None:
@@ -1250,11 +1477,17 @@ class TestTmuxSessionManager:
             cmd = argv[1] if len(argv) > 1 else ""
             if cmd == "list-windows":
                 # pane at /tmp, not WORKING_DIR (cd'd away) — but file has the mapping
-                return MagicMock(returncode=0, stdout="work1\t/tmp\n")
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                return MagicMock(
+                    returncode=0,
+                    stdout=_render_windows(fmt, [{"id": "@1", "name": "work1", "path": "/tmp"}]),
+                )
             if cmd == "show-option":
                 return MagicMock(returncode=1, stdout="")
             if cmd == "has-session":
                 return MagicMock(returncode=0, stdout="")
+            if cmd == "display-message":
+                return MagicMock(returncode=0, stdout="work1\n")
             return MagicMock(returncode=0, stdout="")
 
         with patch("c_lord.tmux._run", side_effect=fake_run):
@@ -1265,6 +1498,7 @@ class TestTmuxSessionManager:
         assert new_window_calls == [], f"new-window was called despite mapping file entry"
 
         import os
+
         os.unlink(mapping_path)
 
     # ── Issue #111: duplicate window prevention after tmux restart ───
@@ -1313,33 +1547,139 @@ class TestTmuxSessionManager:
         )
 
 
-class TestPaneInsertModeDetection:
-    """#147: detect vim INSERT vs NORMAL from the pane status bar.
+class TestWindowSizePolicy:
+    """#403: pin bot session to a fixed (manual) window size so a client (the
+    human's SSH terminal) resizing does not SIGWINCH-storm every idle Claude TUI
+    into ghosting its status line."""
 
-    Claude Code (v2.1.150) shows ``-- INSERT`` in the status bar only in
-    INSERT mode. NORMAL mode omits it — there is NO ``-- NORMAL`` marker —
-    so detection keys on the presence of ``-- INSERT`` plus a recognisable
-    status-bar anchor for the NORMAL case.
+    def test_ensure_window_size_manual_sets_option(self) -> None:
+        """window-size is pinned to ``manual`` on the bot session."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._ensure_window_size_manual()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert any("set-option" in a and "window-size" in a and "manual" in a for a in calls), calls
+
+    def test_ensure_window_size_manual_noop_when_unavailable(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = False
+        with patch("c_lord.tmux._run") as mock_run:
+            mgr._ensure_window_size_manual()
+        mock_run.assert_not_called()
+
+    def test_current_client_size_parses_list_clients(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="146 38\n")
+            assert mgr._current_client_size() == (146, 38)
+
+    def test_current_client_size_none_when_no_client(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            assert mgr._current_client_size() is None
+
+    def test_fit_window_to_client_uses_client_size(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="146 38\n"),  # list-clients
+                MagicMock(returncode=0),  # resize-window
+            ]
+            mgr._fit_window_to_client("w1")
+        resize = mock_run.call_args_list[-1].args[0]
+        assert "resize-window" in resize
+        assert "146" in resize and "38" in resize
+
+    def test_fit_window_to_client_falls_back_to_default(self) -> None:
+        from c_lord.tmux import DEFAULT_MANAGED_WINDOW_SIZE
+
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout=""),  # list-clients: none attached
+                MagicMock(returncode=0),  # resize-window
+            ]
+            mgr._fit_window_to_client("w1")
+        resize = mock_run.call_args_list[-1].args[0]
+        assert str(DEFAULT_MANAGED_WINDOW_SIZE[0]) in resize
+        assert str(DEFAULT_MANAGED_WINDOW_SIZE[1]) in resize
+
+    def test_ensure_session_pins_window_size_manual(self) -> None:
+        """_ensure_session wires in the manual window-size policy (#403)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._ensure_session()
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert any("set-option" in a and "window-size" in a and "manual" in a for a in calls), calls
+
+
+class TestPaneInsertModeDetection:
+    """#147/#544: decide vim INSERT vs NORMAL from the pane status bar.
+
+    Claude Code (verified on v2.1.246) renders the vim mode marker like this:
+
+    ==========================  ==========================================
+    editor state                bottom status bar
+    ==========================  ==========================================
+    vim on, INSERT              ``-- INSERT -- ⏵⏵ bypass permissions on …``
+    vim on, NORMAL              ``⏵⏵ bypass permissions on …``
+    vim **off** (the default)   ``⏵⏵ bypass permissions on …``
+    ==========================  ==========================================
+
+    The last two rows are byte-identical, so ``⏵⏵`` alone proves only that the
+    pane is sitting at the input prompt — it is **not** evidence of vim NORMAL.
+    Treating it as such was #544: every message from a consumer who does not use
+    vim mode got an ``i`` typed in front of it.  ``_pane_in_insert_mode`` must
+    therefore report ``None`` ("cannot tell — do not touch the input") for that
+    frame, and only commit to NORMAL on a positive ``-- NORMAL`` marker.
     """
 
     _INSERT = (
         "❯ some text\n"
         "──────────\n"
-        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "   Model: Opus 5  v2.1.246  Style: default\n"
         "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
+    # vim enabled and dropped to NORMAL, on a build that renders the explicit
+    # marker.  This is the only frame that positively proves "vim, not INSERT".
     _NORMAL = (
         "❯ some text\n"
         "──────────\n"
-        "   Model: Opus 4.7  v2.1.150  Style: default\n"
+        "   Model: Opus 5  v2.1.246  Style: default\n"
+        "  -- NORMAL -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+    )
+    # A consumer with the default editor mode (no vim).  Perfectly normal,
+    # ready-for-input pane — pressing ``i`` here types a literal ``i`` (#544).
+    _VIM_DISABLED = (
+        "❯ some text\n"
+        "──────────\n"
+        "   Model: Opus 5  v2.1.246  Style: default\n"
         "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
     )
 
     def test_insert_marker_present(self) -> None:
         assert _pane_in_insert_mode(self._INSERT) is True
 
-    def test_normal_no_insert_marker(self) -> None:
+    def test_explicit_normal_marker_is_normal(self) -> None:
+        """``-- NORMAL`` is the only positive proof of vim-but-not-INSERT."""
         assert _pane_in_insert_mode(self._NORMAL) is False
+
+    def test_vim_disabled_status_bar_is_undecidable(self) -> None:
+        """#544: ``⏵⏵`` without any vim marker must NOT read as NORMAL.
+
+        It is indistinguishable from vim-on-NORMAL, so the only safe answer is
+        "unknown" — the caller must not press ``i`` on this evidence alone.
+        """
+        assert _pane_in_insert_mode(self._VIM_DISABLED) is None
 
     def test_old_insert_in_scrollback_ignored(self) -> None:
         """A stale ``-- INSERT`` far above the current status bar must not win.
@@ -1353,6 +1693,43 @@ class TestPaneInsertModeDetection:
     def test_empty_or_unknown_returns_none(self) -> None:
         assert _pane_in_insert_mode("") is None
         assert _pane_in_insert_mode("just some\nresponse text\n") is None
+
+
+class TestPaneInsertModeRealCaptures:
+    """#544 AC5: the same three states, as real ``capture-pane`` snapshots.
+
+    ``vim_disabled_staging_pane.txt`` is the #544 bug fixture: a real staging-1
+    pane (Claude Code v2.1.246) whose session dir set ``editorMode: "normal"``.
+    Before the fix, ``_pane_in_insert_mode`` answered ``False`` on it and
+    send_input typed an ``i`` in front of the message. The vim-enabled captures
+    come from the same Claude build with vim mode left on.
+    """
+
+    def _load(self, name: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "fixtures" / "panes" / name).read_text()
+
+    def test_real_vim_disabled_pane_is_undecidable(self) -> None:
+        """The bug fixture: a real vim-less pane must never read as NORMAL."""
+        assert _pane_in_insert_mode(self._load("vim_disabled_staging_pane.txt")) is None
+
+    def test_real_vim_enabled_insert_pane(self) -> None:
+        assert _pane_in_insert_mode(self._load("vim_enabled_insert.txt")) is True
+
+    def test_real_vim_enabled_normal_pane_is_undecidable(self) -> None:
+        """v2.1.246 renders NO marker in vim NORMAL — identical to vim-off.
+
+        This is why :meth:`TmuxSessionManager.send_input` cannot rely on the
+        status bar alone and has to probe (see test_send_input_vim_mode.py).
+        """
+        assert _pane_in_insert_mode(self._load("vim_enabled_normal.txt")) is None
+
+    def test_vim_off_and_vim_normal_status_bars_are_identical(self) -> None:
+        """Documents the root cause of #544 with the real captures."""
+        off = self._load("vim_disabled_staging_pane.txt").splitlines()[-1]
+        normal = self._load("vim_enabled_normal.txt").splitlines()[-1]
+        assert off == normal
 
 
 class TestParseWorkNumber:
@@ -1389,28 +1766,56 @@ class TestWindowNameGeneration:
 
     def test_next_window_name_uses_short_prefix(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
-        assert mgr._next_window_name() == "w1"
-        assert mgr._next_window_name() == "w2"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")  # empty session
+            assert mgr._next_window_name() == "w1"
+            mock_run.return_value = MagicMock(returncode=0, stdout="w1\n")
+            assert mgr._next_window_name() == "w2"
+
+    def test_next_window_name_reads_live_tmux_not_an_instance_counter(self) -> None:
+        """#649: the number comes from tmux, so a second manager sees the first's window.
+
+        Two managers pointing at one session each had their own counter, so both
+        handed out the same ``w{N}`` and tmux — which does not enforce unique
+        window names — created two windows answering to it.
+        """
+        first = TmuxSessionManager(mapping_path="")
+        second = TmuxSessionManager(mapping_path="")
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="w1\nw2\n")
+            # A manager that has never created anything still picks the next
+            # free number, because it asks tmux rather than its own counter.
+            assert second._next_window_name() == "w3"
+            assert first._next_window_name() == "w3"
+
+    def test_next_window_name_falls_back_to_the_counter_when_tmux_is_unreadable(self) -> None:
+        """A failed ``list-windows`` must not stop the window from being created."""
+        mgr = TmuxSessionManager(mapping_path="")
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr._next_window_name() == "w1"
+            assert mgr._next_window_name() == "w2"
 
     def test_rebuild_continues_sequence_after_legacy_work_window(self) -> None:
         """A legacy ``work{N}`` window left over from before the rename still
-        counts toward ``_next_work_id`` so the next new window is ``w{N+1}`` —
+        counts toward the high-water mark, so the next new window is ``w{N+1}`` —
         the numbering stays monotonic across the transition (no w1 colliding
         with an existing work3)."""
         mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows: one legacy work3 window survives
-                MagicMock(returncode=0, stdout="work3\n"),
-                # show-option @thread_id for work3
-                MagicMock(returncode=0, stdout="333\n"),
-            ]
+            # list-windows: one legacy work3 window survives (#649 format)
+            mock_run.return_value = MagicMock(returncode=0, stdout="@3\twork3\t333\t/work/c\n")
             mgr._rebuild_mapping()
 
-        assert mgr._thread_to_window == {333: "work3"}
-        assert mgr._next_work_id == 4
-        assert mgr._next_window_name() == "w4"
+            assert mgr._thread_to_window == {333: "@3"}
+            assert mgr._next_work_id == 4
+
+            mock_run.return_value = MagicMock(returncode=0, stdout="work3\n")
+            assert mgr._next_window_name() == "w4"
 
 
 class TestSortWindows:
@@ -1446,9 +1851,7 @@ class TestSortWindows:
             mgr._sort_windows_unlocked()
         # sources must be ascending by number: w5(@6), w12(@7), w30(@5)
         assert self._move_sources(mock_run) == ["@6", "@7", "@5"]
-        assert any(
-            "move-window" in c[0][0] and "-r" in c[0][0] for c in mock_run.call_args_list
-        )
+        assert any("move-window" in c[0][0] and "-r" in c[0][0] for c in mock_run.call_args_list)
 
     def test_non_numbered_windows_go_to_end(self) -> None:
         mgr = self._avail_mgr()
@@ -1538,15 +1941,22 @@ class TestSortWindows:
         """The new-window path triggers a sort; the existing-window path does not."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
+        # Isolate from the window-size policy (#403) — tested separately.
+        mgr._ensure_window_size_manual = lambda: None  # type: ignore[method-assign]
+        mgr._fit_window_to_client = lambda *_: None  # type: ignore[method-assign]
         called = {"n": 0}
         mgr._sort_windows_unlocked = lambda: called.__setitem__("n", called["n"] + 1)  # type: ignore[method-assign]
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild list-windows (no session)
                 MagicMock(returncode=1),  # has-session (no)
+                MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session
+                MagicMock(returncode=1, stdout=""),  # #649 re-check under the lock
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
-                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
+                MagicMock(returncode=0, stdout=""),  # #649 _next_window_name
+                MagicMock(returncode=0, stdout="@1\n"),  # new-window -P -F
                 MagicMock(returncode=0),  # set-option
             ]
             mgr.create_session(12345, "/work/dir")
@@ -1559,14 +1969,15 @@ class TestGetWindowInfo:
     def test_returns_work_number_not_window_index(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
-        mgr._thread_to_window[12345] = "work3"
+        mgr._thread_to_window[12345] = "@7"
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 # _find_window_for_thread cache hit → show-option verify
                 MagicMock(returncode=0, stdout="12345\n"),
-                # list-windows for window_id lookup — index 0 diverges from work3
-                MagicMock(returncode=0, stdout="work3\t@7\n"),
+                # #649: the id is already known; list-windows resolves its NAME,
+                # whose number (3) is the stable label — never the window index.
+                MagicMock(returncode=0, stdout="@7\twork3\n"),
             ]
             info = mgr.get_window_info(12345)
 
@@ -1575,12 +1986,12 @@ class TestGetWindowInfo:
     def test_returns_none_work_number_for_non_work_window(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
-        mgr._thread_to_window[12345] = "adopted-window"
+        mgr._thread_to_window[12345] = "@2"
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="12345\n"),
-                MagicMock(returncode=0, stdout="adopted-window\t@2\n"),
+                MagicMock(returncode=0, stdout="@2\tadopted-window\n"),
             ]
             info = mgr.get_window_info(12345)
 

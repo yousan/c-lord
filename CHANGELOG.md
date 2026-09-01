@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **`/resync-channel` (and `!resync-channel`)** — removed. It claimed to reconnect the Discord mirror for "every thread in this channel" but only ever swept **one** tmux session, so threads bound to another repo (`/clord-thread-init`) were silently skipped while the reply still reported a count. The 60s menu watchdog already re-bridges stranded menus across **all** sessions automatically, so the manual command was a narrower version of an automatic one. Use `/resync` for a single thread (it also posts a pane snapshot); channel-wide reconnection needs no command (#619)
+
 ### Added
 - **Versioning & releases** — version is now derived from git tags via `hatch-vcs` (single source of truth; `pyproject.toml` no longer hardcodes it). New `/version` slash command + `!version` text twin and `c-lord version` CLI report the running build in the article format `v1.4.0-b<commit>-<YYYYMMDD>` (semver + short commit + commit date). Tag-triggered `release.yml` publishes a GitHub Release with notes extracted from this changelog; `scripts/release.sh` cuts the tag
 

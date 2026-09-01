@@ -22,6 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from ..discord_ui.authorization import AuthorizedViewMixin, Authorizer
 from ..protocols import DrainAware
 from ..thread_settings import resolve_auto_archive_duration
 
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 _STEP_TIMEOUT = 120
 
 
-class UpgradeApprovalView(discord.ui.View):
+class UpgradeApprovalView(AuthorizedViewMixin, discord.ui.View):
     """A Discord View with a single approval button for upgrade/restart gates.
 
     Posts to the parent channel (not the upgrade thread) so users can approve
@@ -56,10 +57,12 @@ class UpgradeApprovalView(discord.ui.View):
         approved_event: asyncio.Event,
         bot_id: int | None = None,
         label: str = "✅ Approve",
+        authorizer: Authorizer | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self._event = approved_event
         self._bot_id = bot_id
+        self._authorizer = authorizer
         # Override the default label set by the decorator
         for child in self.children:
             if isinstance(child, discord.ui.Button):
@@ -339,14 +342,18 @@ class AutoUpgradeCog(commands.Cog):
         thread_ids: frozenset[int],
         status_thread: discord.Thread,
     ) -> None:
-        """Mark *thread_ids* in the pending-resumes table.
+        """Record *thread_ids* in the pending-resumes table for a restart notice.
 
         Called just before the restart command so that Claude sessions which
-        were active at upgrade time are automatically resumed on the next bot
+        were active at upgrade time get a quiet restart notice on the next bot
         startup.  No-op when ``bot.resume_repo`` is not configured.
 
-        ``session_id`` is auto-resolved from ``bot.session_repo`` when
-        available, enabling ``--resume`` continuity.
+        #406: we do **not** re-prompt Claude on restart — the ``claude`` process
+        survives the upgrade restart and the observers self-restore, so
+        ``on_ready`` only posts a quiet notice (it never re-runs Claude).
+
+        ``session_id`` is auto-resolved from ``bot.session_repo`` when available
+        (kept for diagnostics / future use).
         """
         if not thread_ids:
             return
@@ -366,22 +373,22 @@ class AutoUpgradeCog(commands.Cog):
                     if record is not None:
                         session_id = record.session_id
 
+                # resume_prompt is intentionally None (#406): on_ready posts a
+                # quiet restart notice, it never re-runs Claude with a prompt.
                 await resume_repo.mark(
                     tid,
                     session_id=session_id,
                     reason="bot_upgrade",
-                    resume_prompt=(
-                        "ボットがパッケージアップグレードのため再起動しました。"
-                        "前の作業の続きを確認し、必要な残作業があれば完了してください。"
-                    ),
+                    resume_prompt=None,
                 )
                 marked += 1
             except Exception:
-                logger.warning("Failed to mark thread %d for resume", tid, exc_info=True)
+                logger.warning("Failed to record thread %d for restart notice", tid, exc_info=True)
 
         if marked:
             await status_thread.send(
-                f"📌 {marked} active session(s) marked for auto-resume after restart."
+                f"📌 {marked} active session(s) noted — "
+                "a quiet restart notice will be posted (no auto-resume)."
             )
 
     def _auto_drain_check(self) -> bool:
@@ -454,7 +461,11 @@ class AutoUpgradeCog(commands.Cog):
         parent = getattr(thread, "parent", None)
         if parent is not None:
             bot_id = self.bot.user.id if self.bot.user else None
-            view = UpgradeApprovalView(approved_event=approved, bot_id=bot_id)
+            view = UpgradeApprovalView(
+                approved_event=approved,
+                bot_id=bot_id,
+                authorizer=getattr(self.bot, "authorizer", None),
+            )
             try:
                 channel_msg = await parent.send(
                     f"🔔 **Approval needed** — {text}\n"

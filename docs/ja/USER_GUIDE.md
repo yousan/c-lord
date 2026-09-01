@@ -16,41 +16,37 @@ Bot (c-lord プロセス)                                    ← 1つ
 ├── アクセス制御: @claude-operator ロール
 │   └── このロールを持つユーザーのみ Bot と対話可能
 │
-├── #project-a (channel)
+├── #project-a (channel) ── /clord-init で github.com/user/project-a.git に紐づけ
 │   │
-│   ├── リポジトリ: github.com/user/project-a.git
-│   │   └── /clord-init で紐づけ (DB に保存)
-│   │
-│   ├── tmux session: "project-a"
-│   │   ├── w1 ── Thread 101 の Claude Code CLI
-│   │   └── w2 ── Thread 102 の Claude Code CLI
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-a/
-│       ├── 101/ ── git clone of project-a (Thread 101 用)
-│       └── 102/ ── git clone of project-a (Thread 102 用)
+│   ├── Thread 101 ── tmux session "project-a" の window w1
+│   ├── Thread 102 ── tmux session "project-a" の window w2
+│   └── Thread 103 ── /clord-thread-init で project-c.git に紐づけ
+│                     → tmux session "project-c" の window w1   ← "project-a" では**ない**
 │
-├── #project-b (channel)
-│   │
-│   ├── リポジトリ: github.com/user/project-b.git
-│   │
-│   ├── tmux session: "project-b"
-│   │   └── w1 ── Thread 201 の Claude Code CLI
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-b/
-│       └── 201/ ── git clone of project-b (Thread 201 用)
+├── #project-b (channel) ── github.com/user/project-b.git に紐づけ
+│   └── Thread 201 ── tmux session "project-b" の window w1
 │
 └── #general (リポジトリ未設定)
     └── /clord → エラー「リポジトリが設定されていません」
+
+session_dir (各スレッドが作業する git clone):
+    ~/c-lord-sessions/<channel_id>/<thread_id>/
 ```
+
+**tmux セッションはチャンネルではなくリポジトリに従います。** 上の Thread 103 は
+#project-a のスレッドですが `project-c` セッションにいます。同じリポジトリに紐づいた
+チャンネルが2つあれば1つのセッションを共有します。詳しくは
+[specs/tmux-layout.md](../specs/tmux-layout.md)。
 
 ### 各要素の関係
 
 | 関係 | 対応 | 紐づけキー |
 |------|------|-----------|
 | Channel : リポジトリ | 1:1 | `/clord-init` で DB に保存 |
-| Channel : tmux session | 1:1 | リポジトリ名から自動生成 |
-| Thread : tmux window | 1:1 | `@thread_id` (tmux window option) |
-| Thread : session_dir | 1:1 | `~/c-lord-sessions/{project}/{thread_id}/` |
+| Thread : リポジトリ | 1:1 | チャンネルのもの、またはスレッド固有（`/clord-thread-init`） |
+| リポジトリ : tmux session | 1:1 | リポジトリ名から自動生成 — 1チャンネルが**複数**セッションに散ることも、2チャンネルが1セッションを**共有**することもある |
+| Thread : tmux window | 1:1 | `@thread_id` (tmux window option)。番号が一意なのはセッション内であってチャンネル内ではない |
+| Thread : session_dir | 1:1 | `~/c-lord-sessions/{channel_id}/{thread_id}/` |
 | Thread : Claude session | 1:1 | DB (`sessions` テーブル) |
 
 ### 紐づけの流れ
@@ -145,12 +141,60 @@ Claude が実装計画を提案すると、計画全文を含む embed が **承
 
 Claude がツールの実行許可を求める場合、ツール名と入力内容を表示した embed が **許可** / **拒否** ボタン付きで表示されます。2 分でタイムアウト（自動拒否）。
 
+### 入力待ちの @メンション通知
+
+上記の質問モード（**AskUserQuestion / プラン承認 / ツール権限 / MCP elicitation**）は、いずれも Claude がターンの途中で**あなたの回答待ちでブロック**している状態です。これらのプロンプトが表示されるとき、**そのターンを投稿した本人**を `@メンション` するメッセージが同時に送られるため、スレッドの通知設定が「@メンションのみ」でも push 通知が届きます（Discord の embed 単体では通知が飛ばないため）。
+
+- 通知先は**そのターンを頼んだ人**（初回プロンプトならスレッド作成者、リプライならリプライした人、`/clord` ならコマンドを叩いた本人）。
+- `/clord` のようにスレッドの最初の投稿を C-lord 自身が行うコマンドでも、通知先は**コマンドを叩いた本人**であって bot ではありません。
+- Webhook / CI / スケジュール実行 / `POST /api/spawn` など**人間ではないもの**が起こしたターンや、tmux ペインで直接操作したターンでは、`DISCORD_OWNER_ID` が設定されていればそのオーナーに通知されます（未設定なら通知しません）。メンションは人が読むものなので、webhook や bot 自身を `@` しても意味がないためです。
+- この「オーナーへのフォールバック」の強さは `CLORD_OWNER_FALLBACK` で選べます（#525）。**人が頼んだターンの通知先は、どの設定でも変わりません**（常にその本人）。
+
+  | 値 | ターン完了の 🟡 | 回答待ちで止まったとき |
+  |---|---|---|
+  | `all` | オーナーに通知 | オーナーに通知 |
+  | `blocked`（既定） | 通知しない | オーナーに通知 |
+  | `off` | 通知しない | 通知しない |
+
+  自動運転のスレッドを大量に回しているサーバーでは、完了通知がオーナーの通知欄を埋めてしまうため `blocked` や `off` が向いています。
+
+Claude がターンを終えて**あなたの返信待ち**になったときも、同じ相手に `🟡 Claude has finished — your reply is needed here.` という `@メンション` 付きのメッセージが 1 通届きます。
+
+### ターン中の進捗表示
+
+ターン中に **90 秒**なにもスレッドへ届かなかったときだけ、1 行が出ます。
+
+```
+-# ⚙️ 作業中 5:56 · 🔧 Bash(rg -n 'timeout' c_lord/) · ツール 61 件
+```
+
+この 1 行は 15 秒ごとに**その場で書き換わり**、Claude が実際に出力した時点で
+**消えます**。スレッドに増える追加メッセージは同時に最大 1 通で、ターンが
+終われば 0 通です。ツールも止まっているときは `⏳ 待機中 …` になるので、
+「進んでいる」と「詰まっている」を見分けられます。
+
+ターン中以外は出ません（何も起きていないスレッドは何時間放置しても黙ったまま）。
+`CLORD_TURN_PROGRESS=0` で無効化、`CLORD_TURN_PROGRESS_QUIET_SECONDS` で閾値を
+変更できます。あるべき動きの全文は [docs/specs/turn-progress.md](../specs/turn-progress.md)。
+
 ### TodoWrite 進捗表示
 
 Claude が `TodoWrite` でタスクを管理すると、1 つの embed が投稿され、更新のたびにその場で編集されます:
 - ✅ 完了
 - 🔄 進行中
 - ⬜ 未着手
+
+### 進捗の畳み込み (`progress.txt`)
+
+ターン中に出る途中経過の embed（セッション開始・思考・ツール実行と結果・
+TODO リスト）は、実行中は役に立ちますが終わるとノイズになります。そこで
+ターン終了時に 1 つの `progress.txt` にまとめ、元の embed は削除します。
+
+- **読む価値のある中身が何も無かった**ターン（ツール実行も思考も無く、
+  セッション開始の行しか無い場合）は、`progress.txt` を**まったく投稿しません**。
+  途中経過の embed は従来どおり片付けるので、スレッドには回答だけが残ります（#542）。
+- 本文のあるメッセージに添付できず `progress.txt` を単独で投稿するときは、
+  何のファイルかが分かる 1 行の説明が必ず付きます。
 
 ---
 
@@ -164,12 +208,10 @@ Claude が `TodoWrite` でタスクを管理すると、1 つの embed が投稿
 | `/stop` | 現在のセッションを停止（リジューム可能な状態で保持） | 利用可能 |
 | `/clear` | スレッドの Claude Code セッションをリセット | 利用可能 |
 | `/skill <名前> [引数]` | Claude Code スキルを実行（オートコンプリート付き） | 利用可能 |
-| `/sessions` | セッション一覧（origin、時間帯でフィルタ可能） | 利用可能 |
+| `/clord-status [show_all]` | このチャンネルのセッション一覧（容量・attach・resume。`/sessions`・`/session-dirs`・`/resume-info` を統合） | 利用可能 |
 | `/sync-sessions` | CLI セッションを Discord スレッドにインポート | 利用可能 |
-| `/resume-info` | このセッションをターミナルで継続するための CLI コマンドを表示 | 利用可能 |
 | `/model show` | 現在のモデル表示（グローバル + スレッド別） | 利用可能 |
 | `/model set <モデル>` | 新規セッションのモデルを変更（再起動不要） | 利用可能 |
-| `/session-dirs` | アクティブなセッションディレクトリ一覧 | 利用可能 |
 | `/session-cleanup` | クリーンな孤立セッションディレクトリを削除 | 利用可能 |
 | `/tmux-list` | アクティブな tmux ウィンドウ一覧 | 利用可能 |
 | `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | 利用可能 |
@@ -209,6 +251,16 @@ Bot と対話できるユーザーは Discord のロールで制御します。
 ボット再起動 → セッション自動再開
 ```
 
+### c-lord が記録を持っていないスレッド
+
+セッションの記録が無いスレッド（ワークスペースを削除した / DB を作り直した / 別ホストで
+作られたスレッド）は **復元できません**。以前はそこへ送ったメッセージが返信もログも無く
+捨てられていましたが、いまは **⚠️ のリアクション**が付き、**「いま送ったメッセージは Claude に
+届いていません」＋次の一手**（`/clord <やること>` でこのスレッドを新しく始められる）が
+1 回だけ案内されます。`/tmux-screenshot` / `/resync` の「セッションが停止しています」案内も、
+復元できないときは「復元できます」と言わなくなりました（#538）。詳しくは
+[specs/session-resume.md](../specs/session-resume.md)。
+
 ### 裏側で起きていること
 
 ```
@@ -230,7 +282,15 @@ Bot と対話できるユーザーは Discord のロールで制御します。
 
 ### タイムアウト
 
-一定時間操作がないとセッションがタイムアウトします（デフォルト: 5 分）。経過時間とガイダンスを含む embed が表示されます。新しいメッセージを送ると同じスレッドで新しいセッションが開始されます。
+タイムアウトは「Claude が本当に固まっているとき」だけ通知されます。判定は
+**tmux ペインが無変化のまま所定の時間（デフォルト: 5 分）経過し、かつ Claude が
+入力プロンプトで待機していない**ことです。該当すると経過時間とガイダンスを含む
+embed が表示されます。新しいメッセージを送ると同じスレッドで新しいセッションが
+開始されます。
+
+**正常に回答が終わったターンでは表示されません**。既定の `jsonl` モードでは回答は
+transcript mirror が届けるため、回答後にペインが完全に静止するのは正常な状態で
+あって、ハングではないからです（#541）。
 
 ### 割り込み
 

@@ -242,7 +242,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | Modelo a usar | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | Modo de permisos del CLI | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Directorio de trabajo para Claude | directorio actual |
-| `MAX_CONCURRENT_SESSIONS` | Máximo de sesiones paralelas | `3` |
+| `MAX_CONCURRENT_SESSIONS` | Máximo de **turnos ejecutándose a la vez**. No limita los procesos `claude` residentes (#576) | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | Máximo de workspaces con un `claude` vivo. Al superarlo se duermen los más inactivos; crear uno nuevo nunca se bloquea. Por defecto se calcula desde `MemTotal` (`docs/specs/resident-cap.md`) | automático |
 | `SESSION_TIMEOUT_SECONDS` | Timeout de inactividad de sesión | `300` |
 | `DISCORD_OWNER_ID` | ID de usuario para @mencionar cuando Claude necesita entrada | (opcional) |
 | `COORDINATION_CHANNEL_ID` | ID del canal para transmisiones de eventos entre sesiones | (opcional) |
@@ -462,7 +463,7 @@ c_lord/
   cogs/
     claude_chat.py         # Chat interactivo (creación de hilos, manejo de mensajes)
     skill_command.py       # Comando slash /skill con autocompletado
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /clord-status, /sync-sessions
     scheduler.py           # Ejecutor de tareas periódicas de Claude Code
     webhook_trigger.py     # Webhook → tarea de Claude Code (CI/CD)
     auto_upgrade.py        # Webhook → actualización de paquete + reinicio con drenaje

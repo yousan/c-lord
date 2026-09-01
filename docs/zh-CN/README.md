@@ -262,7 +262,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | 使用的模型 | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | CLI 权限模式 | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Claude 的工作目录 | 当前目录 |
-| `MAX_CONCURRENT_SESSIONS` | 最大并发会话数 | `3` |
+| `MAX_CONCURRENT_SESSIONS` | **同时运行的轮次数**上限。不是常驻 `claude` 进程数的上限 (#576) | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | 同时持有 `claude` 的工作区数上限。超过后从最久未使用的开始休眠；新建工作区永不被阻塞。默认由 `MemTotal` 自动计算（`docs/specs/resident-cap.md`） | 自动计算 |
 | `SESSION_TIMEOUT_SECONDS` | 会话非活动超时 | `300` |
 | `DISCORD_OWNER_ID` | Claude 需要输入时 @提及的用户 ID | （可选） |
 | `COORDINATION_CHANNEL_ID` | 跨会话事件广播的频道 ID | （可选） |
@@ -484,7 +485,7 @@ c_lord/
   cogs/
     claude_chat.py         # 交互式聊天（线程创建，消息处理）
     skill_command.py       # /skill 斜杠命令，含自动补全
-    session_manage.py      # /sessions, /sync-sessions, /resume-info
+    session_manage.py      # /clord-status, /sync-sessions
     scheduler.py           # 定期 Claude Code 任务执行器
     webhook_trigger.py     # Webhook → Claude Code 任务（CI/CD）
     auto_upgrade.py        # Webhook → 包升级 + 感知排空重启

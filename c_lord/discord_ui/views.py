@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Protocol, runtime_checkable
 
 import discord
 
+from .authorization import AuthorizedViewMixin, Authorizer
 from .embeds import stopped_embed
+from .error_reporting import ErrorReportingViewMixin
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ class Interruptable(Protocol):
     async def interrupt(self) -> None: ...
 
 
-class StopView(discord.ui.View):
+class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """A ⏹ Stop button attached to the session status message.
 
     Clicking it sends SIGINT to the active Claude runner (graceful interrupt,
@@ -34,9 +37,10 @@ class StopView(discord.ui.View):
     button at the bottom of the thread (most recently visible position).
     """
 
-    def __init__(self, runner: Interruptable) -> None:
+    def __init__(self, runner: Interruptable, authorizer: Authorizer | None = None) -> None:
         super().__init__(timeout=None)
         self._runner = runner
+        self._authorizer = authorizer
         self._stopped = False
         self._message: discord.Message | None = None
 
@@ -103,3 +107,182 @@ class StopView(discord.ui.View):
             except RuntimeError as exc:
                 # aiohttp session already closed during bot shutdown (#91)
                 logger.warning("StopView.disable: could not delete message — %s", exc)
+
+
+class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+    """A ▶️ 再開する button attached to the "this thread is closed" notice (#512).
+
+    A message sent to a session the user closed with ``/close-workspace`` is
+    **held**, not run — c-lord posts :func:`c_lord.session_close.closed_notice_embed`
+    with this view instead. Clicking the button reopens the session and then runs
+    the message that was held, so the user does not have to retype it.
+
+    ``on_reopen`` is an async callable taking the button's
+    :class:`discord.Interaction`; it does the actual reopen (clear ``closed_at``,
+    restore the thread name, dispatch the held message). Keeping it injected
+    leaves this class free of cog/database imports.
+
+    ``timeout=None`` on purpose: the notice may sit unread for days, and a
+    timed-out button that silently stops working would strand the only visible
+    way back into the session.
+    """
+
+    def __init__(
+        self,
+        on_reopen: Callable[[discord.Interaction], Awaitable[None]],
+        authorizer: Authorizer | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self._on_reopen = on_reopen
+        self._authorizer = authorizer
+        self._reopened = False
+
+    @discord.ui.button(label="再開する", emoji="▶️", style=discord.ButtonStyle.primary)
+    async def reopen_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Reopen the session and run the held message."""
+        # Guard against a double click: reopening twice would dispatch the held
+        # message twice, i.e. run the user's instruction two times.
+        if self._reopened:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "▶️ このスレッドは再開済みです。", ephemeral=True
+                )
+            return
+        self._reopened = True
+
+        button.disabled = True
+        button.label = "再開しました"
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        # ``interaction.message`` is None for interactions that did not originate
+        # from a message (never the case for a button, but the type allows it).
+        if interaction.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+
+        await self._on_reopen(interaction)
+        self.stop()
+
+
+class ReattachSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+    """A 🔗 再接続する button on the "no session record" notice — #538 AC6.
+
+    A thread whose ``sessions`` row was swept (#554) still has its checkout, and
+    usually its Discord history; what it lost is the link between them. This
+    button restores the link. It sits on the notice because that notice is where
+    the confusion actually happens — someone sent a message, got told it did not
+    reach Claude, and needs the way out right there rather than in a command they
+    would first have to learn exists.
+
+    ``on_reattach`` is an async callable taking the :class:`discord.Interaction`
+    and returning the :class:`~c_lord.session_reattach.Plan` that was carried out;
+    the button reports what came back, since "reconnected" means something
+    different when the conversation survived than when only the work did. Keeping
+    it injected leaves this class free of cog/database imports.
+
+    ``timeout=None`` for the same reason as :class:`ReopenSessionView`: the notice
+    may sit unread for days, and a silently dead button would strand the only
+    visible way back.
+    """
+
+    def __init__(
+        self,
+        on_reattach: Callable[[discord.Interaction], Awaitable[object]],
+        authorizer: Authorizer | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self._on_reattach = on_reattach
+        self._authorizer = authorizer
+        self._reattached = False
+
+    @discord.ui.button(label="再接続する", emoji="🔗", style=discord.ButtonStyle.primary)
+    async def reattach_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button | None = None
+    ) -> None:
+        """Reattach the thread and report what was recovered."""
+        # A second click would write the row again — harmless in itself, but it
+        # would also re-export the thread history over the copy Claude may
+        # already be reading.
+        if self._reattached:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "🔗 このスレッドは再接続済みです。", ephemeral=True
+                )
+            return
+        self._reattached = True
+
+        if button is not None:
+            button.disabled = True
+            button.label = "再接続しました"
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        if interaction.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+
+        plan = await self._on_reattach(interaction)
+        from ..session_reattach import reattach_notice
+
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.followup.send(reattach_notice(plan))  # type: ignore[arg-type]
+        self.stop()
+
+
+class TextAnsweredMenuView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+    """The undo for "your sentence was used as the menu's answer" (#536 AC7).
+
+    A sentence typed while a menu is open is delivered as that menu's answer
+    rather than interrupting the turn — because typing is what users do when the
+    buttons feel unresponsive, and dropping the question they were answering is
+    the worse failure.  When the guess is wrong, this button turns the sentence
+    back into a new instruction: exactly the old behaviour, one click away.
+
+    ``on_rerun`` re-dispatches the original message as an instruction (it
+    pre-empts the running turn, as an ordinary reply does).  Injecting it keeps
+    this class free of cog imports.
+
+    ``timeout=None``: the notice can sit for a while before someone notices the
+    answer went to the wrong place, and a button that silently stopped working
+    would strand the only way back.
+    """
+
+    def __init__(
+        self,
+        on_rerun: Callable[[discord.Interaction], Awaitable[None]],
+        authorizer: Authorizer | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self._on_rerun = on_rerun
+        self._authorizer = authorizer
+        self._rerun = False
+
+    @discord.ui.button(
+        label="これは新しい指示でした",
+        emoji="⚡",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def rerun_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Re-run the message as a new instruction instead of a menu answer."""
+        # A double click would dispatch the instruction twice.
+        if self._rerun:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "⚡ すでに新しい指示として実行しています。", ephemeral=True
+                )
+            return
+        self._rerun = True
+
+        button.disabled = True
+        button.label = "新しい指示として実行しました"
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.defer()
+        if interaction.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.message.edit(view=self)
+
+        await self._on_rerun(interaction)
+        self.stop()
