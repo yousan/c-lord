@@ -41,7 +41,12 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
-from ..discord_ui.views import ReopenSessionView, StopView, TextAnsweredMenuView
+from ..discord_ui.views import (
+    STOP_MESSAGE_PREFIX,
+    ReopenSessionView,
+    StopView,
+    TextAnsweredMenuView,
+)
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..session_reattach import (
@@ -167,6 +172,33 @@ def _notify_target(requester: object, bot: object, *, kind: Kind) -> int | None:
     return owner_notify_id(bot, kind=kind)
 
 
+async def _safe_set_state(
+    dashboard: ThreadStatusDashboard,
+    thread_id: int,
+    state: ThreadState,
+    description: str,
+    **kwargs: object,
+) -> None:
+    """Update the dashboard, never letting its failure take the turn down (#632).
+
+    The dashboard embed is decoration: a closed aiohttp session, a revoked
+    permission or a Discord outage must not stop Claude from running or from
+    answering. Before #632 the PROCESSING update was the one un-guarded Discord
+    call on the turn path, so any of those killed the task before
+    ``run_claude_with_config`` was reached and the user's message vanished with
+    no reply, no ❌, nothing. Swallowed — but logged at WARNING, never silently.
+    """
+    try:
+        await dashboard.set_state(thread_id, state, description, **kwargs)  # type: ignore[arg-type]
+    except Exception:
+        logger.warning(
+            "%s dashboard set_state(%s) failed; continuing the turn",
+            log_ctx(thread_id=thread_id),
+            state.value,
+            exc_info=True,
+        )
+
+
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
 
@@ -212,6 +244,9 @@ class ClaudeChatCog(commands.Cog):
             bot.authorizer = self._authorizer
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        # #634: the startup sweep for a previous process's dead ⏹ Stop buttons.
+        # Held so the fire-and-forget task is not garbage-collected mid-sweep.
+        self._stop_sweep_task: asyncio.Task[None] | None = None
         self._active_runners: dict[int, TmuxClaudeRunner] = {}
         # Per-thread lock to prevent duplicate _run_claude invocations.
         # Without this, two messages arriving in quick succession could
@@ -1511,7 +1546,7 @@ class ClaudeChatCog(commands.Cog):
         await self._clear_impl(ctx.channel, respond)
 
     async def _restart_impl(self, channel: object, respond: _Responder) -> None:
-        """Shared core for /restart-claude and !restart-claude (#440).
+        """Shared core for /claude-restart and its /restart-claude alias (#440, #578).
 
         Restarts the Claude **process** for this thread while PRESERVING the
         conversation. It kills the active runner and the tmux window — so a
@@ -1559,12 +1594,9 @@ class ClaudeChatCog(commands.Cog):
             "次のメッセージで `--continue` により文脈を引き継いで再開します。"
         )
 
-    @app_commands.command(
-        name="restart-claude",
-        description="Restart the Claude process for this thread (keeps the conversation)",
-    )
-    async def restart_claude(self, interaction: discord.Interaction) -> None:
-        """Restart Claude for this thread, preserving context (#440)."""
+    @staticmethod
+    def _slash_text_responder(interaction: discord.Interaction) -> _Responder:
+        """Responder that answers a slash interaction with plain text."""
 
         async def respond(
             content: str | None = None,
@@ -1574,11 +1606,11 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await interaction.response.send_message(content, ephemeral=ephemeral)
 
-        await self._restart_impl(interaction.channel, respond)
+        return respond
 
-    @commands.command(name="restart-claude")
-    async def restart_claude_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /restart-claude — invokable from webhooks (#440)."""
+    @staticmethod
+    def _ctx_text_responder(ctx: commands.Context) -> _Responder:
+        """Responder that answers a text/mention command with plain text."""
 
         async def respond(
             content: str | None = None,
@@ -1588,7 +1620,45 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await ctx.send(content or "")
 
-        await self._restart_impl(ctx.channel, respond)
+        return respond
+
+    @app_commands.command(
+        name="claude-restart",
+        description="Restart the Claude process for this thread (keeps the conversation)",
+    )
+    async def claude_restart(self, interaction: discord.Interaction) -> None:
+        """Restart Claude for this thread, preserving context (#440).
+
+        Named object-first (``claude-restart``) in #578: the object is the
+        Claude **process**, and Discord's autocomplete matches by prefix, so
+        typing ``/claude`` surfaces this next to the other Claude-scoped
+        commands instead of hiding it under ``/restart``.
+        """
+        await self._restart_impl(interaction.channel, self._slash_text_responder(interaction))
+
+    @commands.command(name="claude-restart")
+    async def claude_restart_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /claude-restart — invokable from webhooks (#440)."""
+        await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
+
+    @app_commands.command(
+        name="restart-claude",
+        description="(旧名) /claude-restart と同じです",
+    )
+    async def restart_claude(self, interaction: discord.Interaction) -> None:
+        """Old name for :meth:`claude_restart`, kept working (#578).
+
+        Renaming a command people have in their fingers is not free. The alias
+        calls the same implementation, so there is nothing to keep in sync — and
+        consumers get the new name by updating the package alone, which is the
+        Zero-Config Principle.
+        """
+        await self._restart_impl(interaction.channel, self._slash_text_responder(interaction))
+
+    @commands.command(name="restart-claude")
+    async def restart_claude_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of the /restart-claude alias (#440)."""
+        await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
 
     async def _compact_impl(
         self, channel: object, respond: _Responder, *, instructions: str = ""
@@ -1848,7 +1918,16 @@ class ClaudeChatCog(commands.Cog):
           downtime or accidental second restart.
         - A resume failure (e.g. channel not found) is logged and skipped
           gracefully — it never prevents the bot from becoming ready.
+
+        It also sweeps away ``⏹ Stop`` buttons a previous process could not
+        delete (#634). Startup is the only moment at which "every stop button in
+        the DB's threads is dead" is guaranteed true, so it is the only moment
+        the sweep is safe. Spawned as its own task: it walks up to a few hundred
+        threads and must not hold up becoming ready.
         """
+        # Held on the cog so the task is not garbage-collected mid-sweep.
+        self._stop_sweep_task = asyncio.create_task(self._sweep_dead_stop_buttons())
+
         if self._resume_repo is None:
             return
 
@@ -1906,6 +1985,13 @@ class ClaudeChatCog(commands.Cog):
                 )
             except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
+
+    async def _sweep_dead_stop_buttons(self) -> None:
+        """Remove the previous process's dead ⏹ Stop buttons (#634). Never raises."""
+        from ..stale_stop_buttons import sweep_dead_stop_buttons
+
+        with contextlib.suppress(Exception):
+            await sweep_dead_stop_buttons(self.bot, self.repo)
 
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
@@ -2494,10 +2580,12 @@ class ClaudeChatCog(commands.Cog):
             return
 
         if self._semaphore.locked():
-            await thread.send(
-                f"\u23f3 Waiting for a free session slot... "
-                f"({self._max_concurrent} max sessions running)"
-            )
+            # #632: a courtesy notice — never a reason to drop the turn.
+            with contextlib.suppress(Exception):
+                await thread.send(
+                    f"\u23f3 Waiting for a free session slot... "
+                    f"({self._max_concurrent} max sessions running)"
+                )
 
         async with self._semaphore:
             # #565: distinguishes "waiting for a slot" from "never got here".
@@ -2521,9 +2609,12 @@ class ClaudeChatCog(commands.Cog):
             # view owned by the state-sync poll (its is_processing guard still
             # promotes waiting→running within ≤60s).
 
-            # Mark thread as PROCESSING when Claude starts
+            # Mark thread as PROCESSING when Claude starts. #632: through
+            # _safe_set_state — a failed embed refresh is decoration failing,
+            # and it must never be the reason a turn never happened.
             if dashboard is not None:
-                await dashboard.set_state(
+                await _safe_set_state(
+                    dashboard,
                     thread.id,
                     ThreadState.PROCESSING,
                     description,
@@ -2636,14 +2727,21 @@ class ClaudeChatCog(commands.Cog):
                 await self.repo.update_trigger_message(thread.id, user_message.id)
 
             stop_view = StopView(runner, authorizer=self._authorizer)
-            if window_name:
-                stop_msg = await thread.send(
-                    f"-# ⏺ Session running (`{window_name}`)",
-                    view=stop_view,
+            # #632: the Stop-button notice is decoration too. If Discord refuses
+            # it (rate limit, revoked permission, closed session) the turn must
+            # still run — StopView already treats a missing message as "nothing
+            # to delete", so the only thing lost is the button.
+            notice = (
+                f"{STOP_MESSAGE_PREFIX} (`{window_name}`)" if window_name else STOP_MESSAGE_PREFIX
+            )
+            try:
+                stop_view.set_message(await thread.send(notice, view=stop_view))
+            except Exception:
+                logger.warning(
+                    "%s could not post the Stop-button notice; continuing the turn",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
                 )
-            else:
-                stop_msg = await thread.send("-# ⏺ Session running", view=stop_view)
-            stop_view.set_message(stop_msg)
 
             # #562: kept in a variable so the turn-end ping below can read the
             # run's outcome — a turn that produced nothing must not be announced
@@ -2697,24 +2795,26 @@ class ClaudeChatCog(commands.Cog):
                 # poll (is_processing() is already False after the pop above).
 
                 if dashboard is not None:
-                    with contextlib.suppress(Exception):
-                        await dashboard.set_state(
-                            thread.id,
-                            ThreadState.WAITING_INPUT,
-                            description,
-                            thread=thread,
-                            # #481: ping the requester of THIS turn, not a
-                            # fixed owner — so completion reaches whoever is
-                            # waiting (any guild / any authorized user, owner or
-                            # not). #520: bot-seeded turns fall back to owner,
-                            # #525: and only when the deployment asked for it.
-                            notify_user_id=completion_notify_id,
-                            # #562: say what happened. "終わりました" is a summons;
-                            # when nothing was produced it is a lie, and a
-                            # notification that lies stops being worth reading.
-                            no_response=run_config.outcome.no_response,
-                            # #631: and when it was a plan limit, say so
-                            # with the reset time instead of asking for a
-                            # resend that cannot work yet.
-                            usage_limit=run_config.outcome.usage_limit,
-                        )
+                    # #632: same guard as the PROCESSING update above, but this
+                    # one logs instead of suppressing silently.
+                    await _safe_set_state(
+                        dashboard,
+                        thread.id,
+                        ThreadState.WAITING_INPUT,
+                        description,
+                        thread=thread,
+                        # #481: ping the requester of THIS turn, not a
+                        # fixed owner — so completion reaches whoever is
+                        # waiting (any guild / any authorized user, owner or
+                        # not). #520: bot-seeded turns fall back to owner,
+                        # #525: and only when the deployment asked for it.
+                        notify_user_id=completion_notify_id,
+                        # #562: say what happened. "終わりました" is a summons;
+                        # when nothing was produced it is a lie, and a
+                        # notification that lies stops being worth reading.
+                        no_response=run_config.outcome.no_response,
+                        # #631: and when it was a plan limit, say so with the
+                        # reset time instead of asking for a resend that cannot
+                        # work until the limit resets.
+                        usage_limit=run_config.outcome.usage_limit,
+                    )

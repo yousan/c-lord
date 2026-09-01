@@ -3,7 +3,7 @@
 ``SchedulerCog._run_task`` built a ``TmuxClaudeRunner`` and called
 ``run_claude_with_config`` without ever creating the window that runner types
 into, so *every* scheduled task died two seconds in with a single ❌ embed —
-and that embed blamed a dead pane and told the user to ``/restart-claude``,
+and that embed blamed a dead pane and told the user to ``/claude-restart``,
 which cannot fix a window that was never created.
 
 The tests below pin all four halves of that bug:
@@ -245,8 +245,8 @@ class TestMissingWindowWording:
 
         text = _missing_window("Claude の起動", 1543873803061301401)
         assert "ウィンドウ" in text, "must say the window is what is missing"
-        assert "/restart-claude" not in text, (
-            "/restart-claude restarts an existing pane — it cannot create a window"
+        assert "/claude-restart" not in text, (
+            "/claude-restart restarts an existing pane — it cannot create a window"
         )
         # The #527 wording's two false claims. Naming a pane is fine — and the
         # text does, to rebut the theory the old message installed; *asserting*
@@ -271,7 +271,7 @@ class TestMissingWindowWording:
 
         assert errors and errors[0] is not None
         assert "ウィンドウ" in errors[0]
-        assert "/restart-claude" not in errors[0]
+        assert "/claude-restart" not in errors[0]
 
     async def test_runner_still_reports_a_dead_pane_as_a_dead_pane(self) -> None:
         """The window exists, so #527's wording (and its advice) is still right."""
@@ -288,4 +288,4 @@ class TestMissingWindowWording:
         ]
 
         assert errors and errors[0] is not None
-        assert "/restart-claude" in errors[0]
+        assert "/claude-restart" in errors[0]

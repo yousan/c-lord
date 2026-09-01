@@ -3,7 +3,7 @@
 Provides slash commands for viewing and managing Claude Code sessions:
 - /clord-status: Per-channel session status (size, attach, resume) — supersedes
   the removed /sessions, /session-dirs, /resume-info (#363)
-- /session-cleanup, /tmux-list, /tmux-screenshot, /workspace-delete, ...
+- /workspace-cleanup, /tmux-list, /tmux-screenshot, /workspace-delete, ...
 """
 
 from __future__ import annotations
@@ -687,10 +687,10 @@ class SessionManageCog(commands.Cog):
             channel=ctx.channel, show_all=show_all, respond=respond, ack=ack
         )
 
-    async def _session_cleanup_impl(
+    async def _workspace_cleanup_impl(
         self, *, dry_run: bool, respond: _Responder, ack: _Acknowledger
     ) -> None:
-        """Shared core for /session-cleanup and !session-cleanup (#209 follow-up)."""
+        """Shared core for /workspace-cleanup and its /session-cleanup alias (#209, #578)."""
         bindings = await self._get_all_bindings()
         if not bindings:
             await respond(
@@ -718,8 +718,8 @@ class SessionManageCog(commands.Cog):
         if not managers:
             await respond(
                 embed=discord.Embed(
-                    title="📁 Session Cleanup",
-                    description="No session directory managers found.",
+                    title="📁 ワークスペースの作業ディレクトリ回収",
+                    description="作業ディレクトリを管理しているチャンネルがありません。",
                     color=COLOR_INFO,
                 )
             )
@@ -743,7 +743,7 @@ class SessionManageCog(commands.Cog):
                     skipped.append((d, "dirty"))
 
             embed = discord.Embed(
-                title="📁 Session Cleanup — Dry Run",
+                title="📁 ワークスペースの作業ディレクトリ回収 — Dry Run",
                 color=COLOR_INFO,
             )
             if candidates:
@@ -759,7 +759,7 @@ class SessionManageCog(commands.Cog):
                     inline=False,
                 )
             if not candidates and not skipped:
-                embed.description = "No session directories found."
+                embed.description = "作業ディレクトリが見つかりませんでした。"
             embed.set_footer(text="Re-run without dry_run=True to actually remove.")
             await respond(embed=embed)
             return
@@ -784,7 +784,7 @@ class SessionManageCog(commands.Cog):
             color = COLOR_TOOL
 
         embed = discord.Embed(
-            title="📁 Session Cleanup Complete",
+            title="📁 ワークスペースの作業ディレクトリを回収しました",
             color=color,
         )
         embed.add_field(
@@ -807,9 +807,49 @@ class SessionManageCog(commands.Cog):
 
         await respond(embed=embed)
 
+    @staticmethod
+    def _dry_run_arg(arg: str | None) -> bool:
+        """``dry`` / ``dry-run`` / ``true`` / ``1`` all mean "preview only"."""
+        return (arg or "").lower() in {"dry", "dry_run", "dry-run", "true", "1"}
+
+    @app_commands.command(
+        name="workspace-cleanup",
+        description="使われていないワークスペースの作業ディレクトリを回収する",
+    )
+    @app_commands.describe(
+        dry_run="Preview what would be removed without actually removing anything",
+    )
+    async def workspace_cleanup(
+        self,
+        interaction: discord.Interaction,
+        dry_run: bool = False,
+    ) -> None:
+        """Reclaim the working directories of workspaces nothing is using (#578).
+
+        Renamed from ``/session-cleanup``. What it removes is the **作業
+        ディレクトリ** — the filesystem half of a workspace — never the
+        conversation, the transcript, or the DB row. Calling that a "session"
+        put a third meaning on a word #571 reserved for ``session_id`` and the
+        tmux session, so the name had to go. ``workspace`` is the umbrella noun
+        the vocabulary spec already teaches, and it groups this command with
+        ``/workspace-start`` / ``-stop`` / ``-delete`` under Discord's
+        prefix-matching autocomplete.
+        """
+        respond, ack = self._slash_io(interaction)
+        await self._workspace_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-cleanup")
+    async def workspace_cleanup_text(self, ctx: commands.Context, arg: str | None = None) -> None:
+        """Text/mention twin of /workspace-cleanup — webhook-invokable for E2E (#209).
+
+        Usage: ``!workspace-cleanup`` (remove) / ``!workspace-cleanup dry`` (preview).
+        """
+        respond, ack = self._ctx_io(ctx)
+        await self._workspace_cleanup_impl(dry_run=self._dry_run_arg(arg), respond=respond, ack=ack)
+
     @app_commands.command(
         name="session-cleanup",
-        description="Remove clean orphaned session directories",
+        description="(旧名) /workspace-cleanup と同じです",
     )
     @app_commands.describe(
         dry_run="Preview what would be removed without actually removing anything",
@@ -819,19 +859,20 @@ class SessionManageCog(commands.Cog):
         interaction: discord.Interaction,
         dry_run: bool = False,
     ) -> None:
-        """Remove session directories that have no active session and are clean."""
+        """Old name for :meth:`workspace_cleanup`, kept working (#578).
+
+        Same implementation, so there is nothing to keep in sync — and the
+        muscle memory of everyone who already types this keeps working after a
+        package update alone (Zero-Config Principle).
+        """
         respond, ack = self._slash_io(interaction)
-        await self._session_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
+        await self._workspace_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
 
     @commands.command(name="session-cleanup")
     async def session_cleanup_text(self, ctx: commands.Context, arg: str | None = None) -> None:
-        """Text/mention twin of /session-cleanup — webhook-invokable for E2E (#209).
-
-        Usage: ``!session-cleanup`` (remove) / ``!session-cleanup dry`` (preview).
-        """
-        dry_run = (arg or "").lower() in {"dry", "dry_run", "dry-run", "true", "1"}
+        """Text/mention twin of the /session-cleanup alias (#209)."""
         respond, ack = self._ctx_io(ctx)
-        await self._session_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
+        await self._workspace_cleanup_impl(dry_run=self._dry_run_arg(arg), respond=respond, ack=ack)
 
     async def _tmux_list_impl(self, *, respond: _Responder, ack: _Acknowledger) -> None:
         """Shared core for /tmux-list and !tmux-list (#209 follow-up)."""
@@ -1023,7 +1064,7 @@ class SessionManageCog(commands.Cog):
     # touch the claude process or the session — only re-projects the *current*
     # tmux state onto Discord: (1) re-bridge any stranded TUI menu via the menu
     # watchdog (#359/#420), and (2) post a fresh pane snapshot. Restarting the
-    # claude process is /restart-claude (#440); wiping context is /clear (#56).
+    # claude process is /claude-restart (#440); wiping context is /clear (#56).
 
     async def _find_thread_window(self, thread_id: int) -> tuple[str | None, str | None]:
         """Locate the tmux session+window backing *thread_id* via the @thread_id sweep.

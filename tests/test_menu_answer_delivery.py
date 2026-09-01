@@ -131,24 +131,26 @@ class TestRebridgeIsCapped:
             "low enough that a stuck menu is obvious rather than endless"
         )
 
-    def test_counts_per_menu_signature_not_per_thread(self) -> None:
+    @pytest.mark.asyncio
+    async def test_counts_per_menu_signature_not_per_thread(self) -> None:
         """A *new* question in the same thread must start with a fresh budget."""
         from c_lord.thread_state_sync import MenuRebridgeLedger
 
         ledger = MenuRebridgeLedger()
         for _ in range(10):
-            ledger.record(4242, "切り口")
-        assert ledger.exhausted(4242, "切り口") is True
-        assert ledger.exhausted(4242, "別の質問") is False, (
+            await ledger.record(4242, "切り口")
+        assert await ledger.exhausted(4242, "切り口") is True
+        assert await ledger.exhausted(4242, "別の質問") is False, (
             "a different menu in the same thread is a different question — it must "
             "not inherit the stuck one's exhausted budget"
         )
 
-    def test_a_thread_that_moves_on_is_forgiven(self) -> None:
+    @pytest.mark.asyncio
+    async def test_a_thread_that_moves_on_is_forgiven(self) -> None:
         from c_lord.thread_state_sync import MenuRebridgeLedger
 
         ledger = MenuRebridgeLedger()
         for _ in range(10):
-            ledger.record(4242, "切り口")
-        ledger.clear(4242)
-        assert ledger.exhausted(4242, "切り口") is False
+            await ledger.record(4242, "切り口")
+        await ledger.clear(4242)
+        assert await ledger.exhausted(4242, "切り口") is False

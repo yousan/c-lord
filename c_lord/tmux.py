@@ -57,6 +57,20 @@ def _session_lock(session_name: str) -> threading.Lock:
 
 
 SESSION_NAME = "clord"
+
+# #353: secrets that must never be readable from inside a tmux pane.
+#
+# A tmux SERVER inherits the environment of whichever process first runs a tmux
+# command, and every window it creates inherits that. When the bot wins that
+# race, every pane can read the production token with a plain ``printenv``.
+# That inheritance was the supply of the #322 contamination incidents: a staging
+# bot started inside a pane picked up the production token and became a second
+# production bot.
+#
+# This is NOT confidentiality. The token stays readable at the bot's ``.env``,
+# and the injected ``discord-read`` skill (#259) tells Claude to read it there —
+# see docs/SECURITY.md. What this prevents is *accidental inheritance*.
+SENSITIVE_ENV_KEYS = ("DISCORD_BOT_TOKEN", "CLORD_API_SECRET")
 # Short window prefix (#356): windows are named ``w1``, ``w2``, … so the tmux
 # window list / status bar stays compact (``w73`` instead of ``work73``).
 WINDOW_PREFIX = "w"
@@ -348,12 +362,32 @@ def _write_prompt_file(prompt: str) -> Path:
     return path
 
 
+def _tmux_client_env() -> dict[str, str]:
+    """Our environment minus :data:`SENSITIVE_ENV_KEYS` (#353).
+
+    Every tmux command here goes through :func:`_run`, and *any* of them can be
+    the one that starts the server — ``_create_global_session`` falls back to a
+    plain ``tmux new-session`` whenever systemd-run is unavailable (containers,
+    CI) or its unit fails to come up. A server started that way inherits this
+    process's environment wholesale, so the secrets have to be gone before the
+    call, not cleaned up after it.
+
+    tmux itself reads none of these keys, so removing them changes nothing about
+    how the command behaves.
+    """
+    env = os.environ.copy()
+    for key in SENSITIVE_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
     return subprocess.run(
         args,
         capture_output=True,
         text=True,
+        env=_tmux_client_env(),
     )
 
 
@@ -589,6 +623,9 @@ class TmuxSessionManager:
         self._next_work_id: int = 1
         # thread_id -> tmux ``window_id`` (``@218``), never a window name (#649).
         self._thread_to_window: dict[int, str] = {}
+        # #353: the session's secret-removal mark is issued once per manager,
+        # not once per turn — it is a property of the session, not of the call.
+        self._env_stripped: bool = False
         # #544: window id -> "is this pane's Claude running in vim editor
         # mode?".  Learned from the pane (an observed ``-- INSERT``/``-- NORMAL``
         # marker, or a probe), never assumed.  In-memory only: a restart just
@@ -706,6 +743,7 @@ class TmuxSessionManager:
         result = _run(["tmux", "has-session", "-t", self.session_name])
         if result.returncode == 0:
             self._ensure_window_size_manual()  # #403
+            self._strip_sensitive_env()  # #353
             return True
 
         if not self._create_global_session():
@@ -713,7 +751,41 @@ class TmuxSessionManager:
 
         logger.info("Created global tmux session: %s", self.session_name)
         self._ensure_window_size_manual()  # #403
+        self._strip_sensitive_env()  # #353
         return True
+
+    def _strip_sensitive_env(self) -> None:
+        """Mark :data:`SENSITIVE_ENV_KEYS` for removal in this session (#353).
+
+        ``set-environment -r`` drops the variable from the environment of every
+        process spawned in this session from now on, whatever the *server*
+        inherited from whoever started it. :func:`_tmux_client_env` already keeps
+        a server *we* start clean; this is what repairs a server that was already
+        started dirty — by a c-lord older than this fix, or by any other process
+        that held the token.
+
+        Scoped to this session on purpose. A ``-g`` (server-global) mark would
+        also reach the many unrelated sessions sharing this host's tmux server,
+        and windows nobody tagged are none of our business (same principle as
+        :meth:`cleanup_orphaned`). The cost is that a session c-lord does not
+        manage stays dirty on an already-dirty server; ``_tmux_client_env`` means
+        we stop *creating* that situation.
+
+        Panes that are **already running** keep the environment they started
+        with — that cannot be fixed retroactively, so they age out as windows are
+        recreated. Idempotent: issued once per manager, not once per turn.
+        """
+        if self._env_stripped:
+            return
+        for key in SENSITIVE_ENV_KEYS:
+            _run(["tmux", "set-environment", "-t", self.session_name, "-r", key])
+        self._env_stripped = True
+        logger.info(
+            "Marked %d secret(s) for removal in tmux session %s — new windows "
+            "will not inherit them (#353)",
+            len(SENSITIVE_ENV_KEYS),
+            self.session_name,
+        )
 
     def _create_global_session(self) -> bool:
         """Create the global session with a temporary first window.
@@ -1897,7 +1969,13 @@ class TmuxSessionManager:
         self._vim_mode.pop(window, None)
 
         target = self._target(window)
+        # #353: unset the secrets on the command line too. Layers 1 and 2 keep
+        # the pane's environment clean; this one still holds when Claude is
+        # started in a session nobody marked (a hand-made window, or a server
+        # some other process started dirty).
         cmd_parts = ["env", "-u", "CLAUDECODE"]
+        for key in SENSITIVE_ENV_KEYS:
+            cmd_parts.extend(["-u", key])
         # Label the telemetry with the working directory and its repository so
         # cost/token metrics can be attributed per project instead of piling up
         # in one unlabelled bucket.
@@ -2192,7 +2270,7 @@ class TmuxSessionManager:
 
         Used on the delivery-failure path to tell the two failure modes apart:
         a pane that never took the input at all (#527 — the advice there is
-        ``/restart-claude``) versus a message that is typed in and just will not
+        ``/claude-restart``) versus a message that is typed in and just will not
         submit, where restarting would **throw the user's message away**.
 
         ``None`` when it cannot be determined.

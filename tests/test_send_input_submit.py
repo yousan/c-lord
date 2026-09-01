@@ -249,7 +249,7 @@ def test_input_box_holds_reports_a_stuck_message() -> None:
 
 
 def test_stuck_message_error_does_not_tell_the_user_to_restart() -> None:
-    """``/restart-claude`` would discard the text sitting in the input box.
+    """``/claude-restart`` would discard the text sitting in the input box.
 
     The #527 wording leads with it, which is right when the pane never took the
     input and wrong when it did — so the stuck case gets its own wording.
@@ -260,7 +260,7 @@ def test_stuck_message_error_does_not_tell_the_user_to_restart() -> None:
     assert "入力欄に残っています" in stuck, "must say where the message actually is"
     assert "送り直す" in stuck, "must offer the action that does not lose the message"
     # It may mention /restart-claude, but only as the discouraged option.
-    if "/restart-claude" in stuck:
+    if "/claude-restart" in stuck:
         assert "破棄" in stuck, "if /restart-claude is mentioned, say what it costs"
 
     dead_pane = _delivery_failure("メッセージの送信", "あ" * 500)

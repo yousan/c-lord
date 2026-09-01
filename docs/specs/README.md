@@ -29,6 +29,7 @@
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
 | [input-delivery.md](./input-delivery.md) | 送ったメッセージが Claude に届くこと | 本文・貼り付け・テキスト添付は長さに関係なく全文が届く。届かないときは理由と次の一手が出る |
 | [attachments.md](./attachments.md) | 添付ファイル | 添付は Claude が開ける実ファイルとして渡る。渡せないときは名前と理由がスレッドに出る（黙って捨てない） |
+| [stop-button.md](./stop-button.md) | ⏹ Stop ボタン | ターン中だけ末尾に1個出て、終わると消える。前のプロセスが残した押せないボタンは起動時に掃除される (#634) |
 | [turn-progress.md](./turn-progress.md) | ターン中の進捗表示 | スレッドが90秒黙ったときだけ1行出て、15秒ごとに書き換わり、実出力が戻ると消える（常時は出さない） |
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
 | [usage-limit.md](./usage-limit.md) | 利用上限（クォータ）に当たったとき | 上限は上限として、回復時刻つきで出す。「もう一度送ってください」とは言わない（送っても通らないため） |
@@ -36,6 +37,7 @@
 | [scheduled-tasks.md](./scheduled-tasks.md) | スケジュール実行（定期タスク） | 時間になるとスレッドが立ち、Claude が実際に起動して応答が投稿される。失敗したら本当の理由が出てログにも残る |
 | [tmux-layout.md](./tmux-layout.md) | tmux のセッションとウィンドウの割り当て | セッションは**リポジトリ**ごと（チャンネルごとではない）。スレッドは紐づくリポジトリのセッションのウィンドウに入る |
 | [tmux-window-identity.md](./tmux-window-identity.md) | 1 スレッド = 1 ウィンドウ | 同時に何本立てても全部そのまま起動し、あるスレッド宛のキーが別スレッドの作業ディレクトリに入ることはない |
+| [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
 

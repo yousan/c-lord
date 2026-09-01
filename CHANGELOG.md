@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **コマンド名を名詞先頭に統一** — `/restart-claude` → **`/claude-restart`**、`/session-cleanup` → **`/workspace-cleanup`**（テキスト版も同様）。24 コマンドに命名規約が3つ並立していたので、既に多数派だった目的語-動詞（名詞先頭）に揃えた。Discord のオートコンプリートは前方一致なので、`/workspace` と打てば start / stop / delete / cleanup が揃って出る。`session-cleanup` の「セッション」は #571 で `session_id` / tmux セッションに予約した語で、このコマンドが消すのは**作業ディレクトリ**なので `workspace` に改めた。**旧名はスラッシュ・テキストの両方でエイリアスとして動き続ける**ので、利用者側の変更は不要（パッケージ更新のみ）。規約そのものは `docs/COMMANDS.md` の「コマンド命名規約」に明記し、`tests/test_command_naming.py` が新規コマンド名を CI で検査する (#578)
+
 ### Removed
 - **`/resync-channel` (and `!resync-channel`)** — removed. It claimed to reconnect the Discord mirror for "every thread in this channel" but only ever swept **one** tmux session, so threads bound to another repo (`/clord-thread-init`) were silently skipped while the reply still reported a count. The 60s menu watchdog already re-bridges stranded menus across **all** sessions automatically, so the manual command was a narrower version of an automatic one. Use `/resync` for a single thread (it also posts a pane snapshot); channel-wide reconnection needs no command (#619)
 

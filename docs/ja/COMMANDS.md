@@ -2,6 +2,8 @@
 
 > **#574 で改名**: 操作名は「終了」→「**停止**」、コマンドは `/close-workspace` → `/workspace-stop`、`/reopen-workspace` → `/workspace-start`、スレッド名のマーカーは `[終了]` → `[停止]` になりました。**旧コマンド名はエイリアスとして動き続けます**（利用者側の変更は不要）。既存スレッドに残る `[終了]` も引き続き正しく解釈されます。理由: 7日で自動発火するようになるため、何も失っていないのに「終了」と言われると誤解を招くから。詳細は [workspace-vocabulary.md](specs/workspace-vocabulary.md)。
 
+> **#578 で改名**: `/restart-claude` → **`/claude-restart`**、`/session-cleanup` → **`/workspace-cleanup`**。**旧名はエイリアスとして動き続けます**（利用者側の変更は不要 — パッケージを更新するだけ）。理由: コマンド名の規約が3つ並立していたので、既に多数派だった**名詞先頭**に揃えたため。`session-cleanup` の「セッション」は #571 で `session_id` / tmux に予約した語で、このコマンドが消すのは**作業ディレクトリ**なので `workspace` に改めました。規約そのものは [COMMANDS.md の「コマンド命名規約」](../COMMANDS.md#コマンド命名規約) にあります。
+
 Discord ユーザーおよび API 利用者が使えるすべてのコマンド一覧です。
 
 > アーキテクチャ図、セッションのライフサイクル、Tips 等の包括的なガイドは **[利用者ガイド](USER_GUIDE.md)** を参照してください。
@@ -76,7 +78,7 @@ tmux セッションはチャンネルではなく**リポジトリ**に従い�
 | `/clord-status` | **このチャンネル**の稼働中セッション一覧（容量・attach・resume） | どこでも |
 | `/clord-status show_all:true` | closed なセッションも含める（`docker ps -a` 相当） | どこでも |
 
-**`/clord-status`** はチャンネル単位のセッション状態を 1 コマンドにまとめたものです。各行に `attach`（そのスレッドが**実際にいる** `session:window`。そのままコピペできる）・`status`・スレッドの `topic`・`size`・`used`（最終活動からの経過）を表示。並び順は従来どおり window 番号の昇順です。#615 以降、1 チャンネルのスレッドは**複数の** tmux セッションに分かれうる（紐づくリポジトリごと）ため、attach 先は行ごとに出します。従来の `<session>:work<#>` テンプレートは存在しないウィンドウを指していました（#616）。`closed` はウィンドウが無いので `attach` 欄が `-` になります。Claude Code セッション ID（`cc-session`、ターミナルで `claude --resume <id>` する用）は **`all` の時だけ右端**に出ます。既定は **live** のみ（`docker ps` 相当）、`show_all` で **closed**（`/close-workspace` 済み — tmux は閉じたが dir は残り容量を食う）も表示。`/workspace-delete` 済み（作業 dir 削除）のものは footer に件数のみ。**削除された `/sessions`・`/session-dirs`・`/resume-info` を統合**したものです（#363）。
+**`/clord-status`** はチャンネル単位のセッション状態を 1 コマンドにまとめたものです。各行に `attach`（そのスレッドが**実際にいる** `session:window`。そのままコピペできる）・`status`・スレッドの `topic`・`size`・`used`（最終活動からの経過）を表示。並び順は従来どおり window 番号の昇順です。#615 以降、1 チャンネルのスレッドは**複数の** tmux セッションに分かれうる（紐づくリポジトリごと）ため、attach 先は行ごとに出します。従来の `<session>:work<#>` テンプレートは存在しないウィンドウを指していました（#616）。`closed` はウィンドウが無いので `attach` 欄が `-` になります。Claude Code セッション ID（`cc-session`、ターミナルで `claude --resume <id>` する用）は **`all` の時だけ右端**に出ます。既定は **live** のみ（`docker ps` 相当）、`show_all` で **closed**（`/workspace-stop` 済み — tmux は閉じたが dir は残り容量を食う）も表示。`/workspace-delete` 済み（作業 dir 削除）のものは footer に件数のみ。**削除された `/sessions`・`/session-dirs`・`/resume-info` を統合**したものです（#363）。
 
 **status の値**（DB ではなく呼び出し時のライブ判定）：
 
@@ -85,15 +87,19 @@ tmux セッションはチャンネルではなく**リポジトリ**に従い�
 | `run` | tmux window あり・Claude 実行中（🟢） |
 | `wait` | tmux window あり・ターン完了で入力待ち（🟡） |
 | `err` | tmux window あり・ペインにエラー（🔴） |
-| `closed` | tmux window 無しだが session dir は残存（`/close-workspace` 済み — 容量を食う／メッセージ送信で再開）（⚪） |
+| `closed` | tmux window 無しだが session dir は残存（`/workspace-stop` 済み — 容量を食う／メッセージ送信で再開）（⚪） |
 
 ### ワークスペース管理
 
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
-| `/session-cleanup [dry_run]` | 孤立したセッションディレクトリを削除 | どこでも |
+| `/workspace-cleanup [dry_run]` | 使われていないワークスペースの作業ディレクトリを回収 | どこでも |
 | `/tmux-list` | アクティブな tmux ウィンドウを一覧表示 | どこでも |
-| `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | スレッドのみ |
+| `/workspace-stop` | **停止**: tmux ウィンドウを閉じ、セッションは残す | スレッドのみ |
+| `/workspace-start` | 停止したスレッドを再開し、メッセージがまた動くようにする | スレッドのみ |
+| `/workspace-delete` | このスレッドの tmux ウィンドウと作業ディレクトリを削除 | スレッドのみ |
+
+旧名 `/session-cleanup` / `/close-workspace` / `/reopen-workspace` も**同じ実装**を呼び続けます。
 
 ### アップグレード
 
@@ -110,8 +116,11 @@ Bot 運用者がアップグレードコマンドを有効にしている場合�
 | コマンド | 説明 | 例 |
 |---------|------|---|
 | `!attach <window>` | このスレッドを tmux ウィンドウに接続 | `!attach w13` |
+| `!claude-restart` | Claude のプロセスを再起動（会話は残る） | `!claude-restart` |
+| `!workspace-cleanup [dry]` | 使われていないワークスペースの作業ディレクトリを回収（`dry` = 下見） | `!workspace-cleanup dry` |
 
 テキストコマンドは `!` プレフィックスを使います。`!attach` は `/clord-attach` と同じ機能です。
+旧名の `!restart-claude` / `!session-cleanup` もそのまま動きます（#578）。
 
 ---
 

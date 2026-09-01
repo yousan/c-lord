@@ -167,12 +167,12 @@ def test_config_twins_non_mutating_via_webhook(
 
 
 @pytest.mark.e2e
-def test_session_cleanup_dryrun_twin_via_webhook(
+def test_workspace_cleanup_dryrun_twin_via_webhook(
     discord_client: DiscordE2EClient,
     bot_id: str,
 ) -> None:
-    """!session-cleanup dry (preview, non-destructive) fires from a webhook."""
-    wh_msg = discord_client.webhook_post("!session-cleanup dry")
+    """!workspace-cleanup dry (preview, non-destructive) fires from a webhook."""
+    wh_msg = discord_client.webhook_post("!workspace-cleanup dry")
     reply = discord_client.wait_for_bot_reply(
         discord_client.channel_id,
         after_message_id=wh_msg["id"],
@@ -180,7 +180,7 @@ def test_session_cleanup_dryrun_twin_via_webhook(
         timeout=30.0,
         poll=2.0,
     )
-    assert reply is not None, "Bot did not reply to !session-cleanup dry within 30s"
+    assert reply is not None, "Bot did not reply to !workspace-cleanup dry within 30s"
     assert reply["content"] or reply.get("embeds")
 
 

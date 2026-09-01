@@ -51,6 +51,8 @@ from .utils.logger import log_ctx
 if TYPE_CHECKING:
     from discord.ext.commands import Bot
 
+    from .claude.types import AskQuestion
+    from .database.menu_bridge_repo import MenuBridgeRepository
     from .database.repository import SessionRepository
 
 logger = logging.getLogger(__name__)
@@ -87,12 +89,15 @@ _MAX_UNPARSABLE_CAPTURES = 40
 # every failure swallowed as "Task exception was never retrieved".
 _ASK_BRIDGE_MAX_FAILURES = 3
 
-# #600: how many times the watchdog may re-post the SAME question in a thread.
+# #600/#633: how many times the watchdog may post the SAME question in a thread.
 # When an answer cannot reach the TUI the menu never closes, so every sweep sees
-# it as "unbridged" and posts it again — production stacked six copies of one ❓
-# over two days. Capping the re-posts turns an endless stream into a bounded,
-# noticeable event; the #579 cap does the same for repeated post *failures*.
-_MAX_REBRIDGES_PER_MENU = 3
+# it as "unbridged" and would post it again — production stacked six copies of
+# one ❓ over three days and logged 188 re-bridges in a single thread. #600 set
+# this to 3 and reset it on every successful bridge, which is why the stream
+# never ended; #633 makes it ONE post per menu, released only when the pane is
+# observed with no menu on it (see MenuRebridgeLedger). The #579 cap does the
+# same for repeated post *failures*.
+_MAX_REBRIDGES_PER_MENU = 1
 
 # Timeout for a single rename HTTP call.  Long enough for normal API response;
 # short enough not to block the tick when discord.py's rate-limit sleep fires.
@@ -334,32 +339,78 @@ def record_unparsable_menu(
         return None
 
 
-class MenuRebridgeLedger:
-    """Counts how often each distinct menu has been re-posted to a thread (#600).
+def menu_fingerprint(question: AskQuestion) -> str:
+    """Stable identity of a TUI menu — the rule the watchdog dedups on (#633).
 
-    Keyed by (thread, menu signature) rather than by thread: a stuck question
+    Two panes show *the same menu* when the user is being asked the same thing:
+    same ``header``, same question line, same option labels in the same order.
+    Descriptions and the pre-menu 経緯 are deliberately excluded — they are
+    re-wrapped by every redraw and by every window resize, so including them
+    would make one stranded menu look like a fresh question on each tick.
+
+    Hashed rather than stored verbatim: the ledger is only ever compared for
+    equality, and a hash keeps the user's question text out of a second table.
+    """
+    payload = "␟".join(
+        [
+            question.header or "",
+            question.question or "",
+            *(o.label for o in question.options),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+class MenuRebridgeLedger:
+    """Tracks which menus the watchdog has already posted to a thread (#600, #633).
+
+    Keyed by (thread, menu fingerprint) rather than by thread: a stuck question
     must stop repeating, but the *next* question in that thread is a different
     decision and starts with a full budget. Keying on the thread alone would
     silence menus the user has never seen.
+
+    #633: the counts are held in SQLite when a ``MenuBridgeRepository`` is
+    given. In memory alone they were wiped by every bot restart — and the
+    production bot restarts several times a day, so a menu nobody could answer
+    was re-posted with a fresh ``attempt=1/3`` on each new process (188
+    re-bridges in one thread, one embed six times over three days). Consumers
+    that pass no repo keep the old process-local behaviour.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, repo: MenuBridgeRepository | None = None) -> None:
+        self._repo = repo
         self._counts: dict[tuple[int, str], int] = {}
 
     @staticmethod
     def _key(thread_id: int, signature: str) -> tuple[int, str]:
         return (thread_id, signature or "")
 
-    def record(self, thread_id: int, signature: str) -> int:
+    async def record(self, thread_id: int, signature: str) -> int:
+        if self._repo is not None:
+            with contextlib.suppress(Exception):
+                return await self._repo.record(thread_id, signature or "")
         key = self._key(thread_id, signature)
         self._counts[key] = self._counts.get(key, 0) + 1
         return self._counts[key]
 
-    def exhausted(self, thread_id: int, signature: str) -> bool:
+    async def exhausted(self, thread_id: int, signature: str) -> bool:
+        if self._repo is not None:
+            with contextlib.suppress(Exception):
+                return await self._repo.posts(thread_id, signature or "") >= _MAX_REBRIDGES_PER_MENU
         return self._counts.get(self._key(thread_id, signature), 0) >= _MAX_REBRIDGES_PER_MENU
 
-    def clear(self, thread_id: int) -> None:
-        """Forget this thread's budget — the menu resolved, or the turn moved on."""
+    async def forget(self, thread_id: int, signature: str) -> None:
+        """Undo one :meth:`record` — the bridge raised, so nothing was posted."""
+        if self._repo is not None:
+            with contextlib.suppress(Exception):
+                await self._repo.forget(thread_id, signature or "")
+        self._counts.pop(self._key(thread_id, signature), None)
+
+    async def clear(self, thread_id: int) -> None:
+        """Forget this thread's budget — its pane no longer shows any menu."""
+        if self._repo is not None:
+            with contextlib.suppress(Exception):
+                await self._repo.clear(thread_id)
         for key in [k for k in self._counts if k[0] == thread_id]:
             del self._counts[key]
 
@@ -665,6 +716,7 @@ class MenuWatchdogLoop:
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         is_processing: Callable[[int], bool] | None = None,
         repo: SessionRepository | None = None,
+        rebridge_ledger: MenuRebridgeLedger | None = None,
     ) -> None:
         self._bot = bot
         self._interval = interval_seconds
@@ -675,8 +727,12 @@ class MenuWatchdogLoop:
         self._ask_bridges: dict[int, asyncio.Task[None]] = {}
         # thread_id -> consecutive failed bridge attempts (#579)
         self._ask_bridge_failures: dict[int, int] = {}
-        # #600: how often each distinct menu has been re-posted here.
-        self._rebridges = MenuRebridgeLedger()
+        # #600/#633: which menus have already been posted here. Defaults to the
+        # process-local ledger so consumers that wire nothing keep working;
+        # ``setup.py`` always passes the SQLite-backed one, because an in-memory
+        # ledger is reset by every bot restart — which is what re-posted one
+        # stranded menu 188 times.
+        self._rebridges = rebridge_ledger or MenuRebridgeLedger()
 
     def start(self) -> None:
         """Spawn the loop task. Idempotent."""
@@ -783,6 +839,17 @@ class MenuWatchdogLoop:
         from .claude.tmux_runner import _ASK_SIGNATURE, _PLAN_SIGNATURE
 
         if _ASK_SIGNATURE not in pane_text and _PLAN_SIGNATURE not in pane_text:
+            # #633: the menu episode is over — release this thread's budget so a
+            # genuinely NEW question (even one worded identically) is bridged
+            # again. Observation is what releases it, never a bridge completing:
+            # resetting on success is exactly what let a menu whose answer never
+            # reached the TUI be re-posted for three days.
+            #
+            # #485: an EMPTY capture is "could not read", not "no menu" — a
+            # momentarily unresolved window mapping must not look like the user
+            # answering, or the next tick would post the same menu again.
+            if pane_text.strip():
+                await self._rebridges.clear(thread_id)
             return
         # #510: the signature can outlive claude. tmux-resurrect restores a dead
         # pane's saved screen (``cat <dump>; exec zsh``) after a reboot, so the
@@ -897,21 +964,22 @@ class MenuWatchdogLoop:
 
         from .discord_ui.ask_handler import bridge_pane_ask
 
-        # #600: an answer that cannot reach the TUI leaves the menu open, so every
-        # sweep sees it as unbridged and posts it again. Cap the repeats.
-        signature = f"{question.header}|{'|'.join(o.label for o in question.options)}"
-        if self._rebridges.exhausted(thread_id, signature):
-            logger.warning(
-                "%s menu re-posted %d times without being answered — not posting it "
-                "again. The answer is probably not reaching the pane; check "
-                "`tmux attach -t %s` window %s (#600)",
+        # #600/#633: an answer that cannot reach the TUI leaves the menu open, so
+        # every sweep sees it as unbridged. Post each distinct menu once; the
+        # budget comes back only when the pane is seen without a menu on it.
+        signature = menu_fingerprint(question)
+        if await self._rebridges.exhausted(thread_id, signature):
+            logger.debug(
+                "%s menu %r already bridged and still open — not posting it again. "
+                "If it needs answering, the answer is probably not reaching the "
+                "pane; check `tmux attach -t %s` window %s (#633)",
                 log_ctx(thread_id=thread_id),
-                _MAX_REBRIDGES_PER_MENU,
+                question.header,
                 session_name,
                 window_name,
             )
             return
-        attempt = self._rebridges.record(thread_id, signature)
+        attempt = await self._rebridges.record(thread_id, signature)
         logger.info(
             "menu watchdog: bridging unwatched TUI menu "
             "(thread=%d header=%r context_chars=%d attempt=%d/%d)",
@@ -943,6 +1011,11 @@ class MenuWatchdogLoop:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # #633 must not eat #579's retry: the one-post budget is spent by
+                # a menu the user can SEE, so an attempt that raised gives it
+                # back. (A raise after the embed already posted would re-post it
+                # once more; _ASK_BRIDGE_MAX_FAILURES still bounds that at 3.)
+                await self._rebridges.forget(thread_id, signature)
                 failures = self._ask_bridge_failures.get(thread_id, 0) + 1
                 self._ask_bridge_failures[thread_id] = failures
                 logger.warning(
@@ -969,9 +1042,11 @@ class MenuWatchdogLoop:
                     )
             else:
                 self._ask_bridge_failures.pop(thread_id, None)
-                # The menu was answered/dismissed — the next question in this
-                # thread starts with a fresh re-post budget (#600).
-                self._rebridges.clear(thread_id)
+                # #633: the budget is NOT released here. bridge_pane_ask returns
+                # as soon as it stops waiting — including when the answer went
+                # out but never took effect in the pane — so releasing on
+                # success is what re-posted the same still-open menu on the next
+                # tick. Only a sweep that sees the pane menu-free releases it.
 
         self._ask_bridges[thread_id] = asyncio.create_task(
             _bridge_and_report(),
