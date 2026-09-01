@@ -503,6 +503,62 @@ class TestTmuxSessionManager:
         # itself is typed literally, so Enter can no longer ride along).
         assert send_keys[-1][-1] == "Enter"
 
+    def test_start_claude_sets_otel_resource_attributes(self) -> None:
+        """start_claude labels Claude Code's telemetry with cwd + repo (#NNN).
+
+        Without this the OTel metrics land with empty ``cwd``/``project``
+        labels, so per-repository cost attribution is impossible for every
+        session c-lord starts (only shell-wrapper launches were labelled).
+        """
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        def fake_run(args: list[str]) -> MagicMock:
+            if "display-message" in args:
+                return MagicMock(returncode=0, stdout="/home/yousan/c-lord-sessions/1/2\n")
+            if "remote" in args and "get-url" in args:
+                return MagicMock(
+                    returncode=0, stdout="git@github.com:kater-iam/project_30_ehon-ya.git\n"
+                )
+            return MagicMock(returncode=0, stdout="12345\n")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
+            assert mgr.start_claude(12345, "hello world", "sonnet") is True
+
+        cmd_str = _typed_command(mock_run)
+        assert "OTEL_RESOURCE_ATTRIBUTES=" in cmd_str, (
+            "start_claude must set OTEL_RESOURCE_ATTRIBUTES so the telemetry "
+            f"can be attributed to a repo; got: {cmd_str}"
+        )
+        assert "project=project_30_ehon-ya" in cmd_str
+        assert "cwd=/home/yousan/c-lord-sessions/1/2" in cmd_str
+        # The assignment must sit in the env(1) prefix, before the binary.
+        # (A plain "is it earlier than ' claude '" check would be fooled by the
+        # "unalias claude" prelude, which also contains that substring.)
+        assert "env -u CLAUDECODE OTEL_RESOURCE_ATTRIBUTES=" in cmd_str
+
+    def test_start_claude_without_git_repo_still_starts(self) -> None:
+        """A non-repo working directory must not break the launch (#NNN)."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        def fake_run(args: list[str]) -> MagicMock:
+            if "display-message" in args:
+                return MagicMock(returncode=0, stdout="/tmp/not-a-repo\n")
+            if "remote" in args and "get-url" in args:
+                return MagicMock(returncode=128, stdout="", stderr="not a git repository")
+            return MagicMock(returncode=0, stdout="12345\n")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
+            assert mgr.start_claude(12345, "hello", "sonnet") is True
+
+        cmd_str = _typed_command(mock_run)
+        assert "claude --model sonnet" in cmd_str
+        assert "project=" not in cmd_str  # unknown repo -> attribute omitted
+        assert "cwd=/tmp/not-a-repo" in cmd_str
+
     def test_start_claude_no_window_returns_false(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True

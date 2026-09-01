@@ -13,6 +13,8 @@ import pytest
 
 from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
 
+from .transcript.helpers import clord_marker_event, clord_transcript
+
 
 def _make_repo(rows: list) -> MagicMock:
     repo = MagicMock()
@@ -226,8 +228,7 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
-    jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    jsonl = clord_transcript(project / "s.jsonl")
     os.utime(jsonl, (1, 1))
 
     bot = MagicMock()
@@ -242,18 +243,19 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     cog._mirrors[123]._poll_interval = 0.05
     try:
         await _asyncio.sleep(0.15)
-        jsonl.write_text(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "via cog"}],
-                    },
-                }
+        with jsonl.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "via cog"}],
+                        },
+                    }
+                )
+                + "\n"
             )
-            + "\n"
-        )
         await _asyncio.sleep(0.3)
     finally:
         await cog.cog_unload()
@@ -844,8 +846,10 @@ async def test_on_ready_recovers_undelivered_final_answer(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 # Previous turn, already delivered (cursor points here).
                 {
                     "type": "assistant",
@@ -901,8 +905,10 @@ async def test_on_ready_seeds_cursor_silently_when_null(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 {
                     "type": "assistant",
                     "uuid": "u-final",
@@ -945,8 +951,10 @@ async def test_on_ready_does_not_redeliver_when_uuid_matches(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 {
                     "type": "assistant",
                     "uuid": "u-final",
@@ -985,8 +993,13 @@ async def test_on_ready_does_not_redeliver_when_uuid_matches(
 
 def _write_transcript(project: Path, events: list[dict]) -> None:
     project.mkdir(parents=True, exist_ok=True)
+    # #627: the rescue only reads a transcript c-lord itself drove, so the
+    # fixture opens with one of c-lord's marked prompts as a real one does.
+    # ensure_ascii=False because Claude Code writes non-ASCII raw.
     (project / "s.jsonl").write_text(
-        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in [clord_marker_event(), *events])
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -1088,8 +1101,10 @@ async def test_on_ready_skips_closed_sessions(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 {
                     "type": "assistant",
                     "uuid": "u-final",

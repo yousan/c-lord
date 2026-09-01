@@ -134,6 +134,7 @@ async def setup_bridge(
     from .cogs.version_cmd import VersionCog
     from .database.ask_repo import PendingAskRepository
     from .database.channel_repo import ChannelRepository
+    from .database.devenv_repo import DevEnvRepository
     from .database.lounge_repo import LoungeRepository
     from .database.models import init_db
     from .database.repository import SessionRepository
@@ -201,11 +202,19 @@ async def setup_bridge(
     await bot.add_cog(chat_cog)
     logger.info("Registered ClaudeChatCog (max_concurrent=%d)", max_concurrent)
 
+    # --- Dev environment ownership (#573, wired in #612) ---
+    # init_db() here is what creates the `dev_environments` table. #573 shipped
+    # the repository without a single call site, so the table never existed on
+    # the production host and the docker↔workspace link was never written.
+    devenv_repo = DevEnvRepository(session_db_path)
+    await devenv_repo.init_db()
+
     # --- SessionManageCog ---
     session_manage_cog = SessionManageCog(
         bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
         repo=session_repo,
         settings_repo=settings_repo,
+        devenv_repo=devenv_repo,
     )
     await bot.add_cog(session_manage_cog)
     logger.info("Registered SessionManageCog")
@@ -323,6 +332,68 @@ async def setup_bridge(
         bot.idle_stop_loop = idle_loop  # type: ignore[attr-defined]
     else:
         logger.info("Idle-stop disabled (CLORD_IDLE_STOP_DAYS=0)")
+
+    # --- Idle sleep (#572) ---
+    # Always-on (zero-config): stops just the *claude process* of workspaces
+    # nobody has touched for CLORD_IDLE_SLEEP_HOURS (default 4). docker keeps
+    # running, the checkout / transcript / volumes / DB row all stay, and the
+    # next message resumes without a word — so the user never sees it. The
+    # threshold is a constant for the same reason the 7-day one is: it describes
+    # how people use Discord, not how much RAM the host has. Set the env to 0 to
+    # disable. See docs/specs/workspace-sleep.md.
+    from .idle_sleep import IdleSleepLoop, idle_sleep_hours
+
+    _sleep_hours = idle_sleep_hours()
+    if _sleep_hours > 0:
+        sleep_loop = IdleSleepLoop(bot, session_repo, threshold_hours=_sleep_hours)
+        sleep_loop.start()
+        bot.idle_sleep_loop = sleep_loop  # type: ignore[attr-defined]
+    else:
+        logger.info("Idle-sleep disabled (CLORD_IDLE_SLEEP_HOURS=0)")
+
+    # --- Resident workspace cap (#576) ---
+    # Backstop, not the main control: TTL (sleep 4h / stop 7d) is. This only
+    # exists so a runaway cannot take the host down before a TTL fires. Unlike
+    # the TTLs, the value **is** host-dependent, so the default is computed from
+    # MemTotal (cgroup limit first) rather than shipped as a constant — a fixed
+    # default would break every host smaller than the one it was measured on
+    # (#540). Override with CLORD_MAX_RESIDENT_WORKSPACES; 0 disables.
+    #
+    # It never blocks a new workspace. The loop only removes residents; there is
+    # nothing on the turn path that consults it. See docs/specs/resident-cap.md.
+    from .resident_cap import ResidentCapLoop, max_resident_workspaces, memory_total
+
+    _total = memory_total()
+    _cap = max_resident_workspaces(total_bytes=_total)
+    logger.info(
+        "Resident cap: %s (memory budget source: %.1f GiB total)",
+        f"{_cap} workspace(s)" if _cap > 0 else "disabled (CLORD_MAX_RESIDENT_WORKSPACES=0)",
+        _total / (1024**3) if _total else 0.0,
+    )
+    if _cap > 0:
+        cap_loop = ResidentCapLoop(bot, session_repo, limit=_cap)
+        cap_loop.start()
+        bot.resident_cap_loop = cap_loop  # type: ignore[attr-defined]
+
+    # --- Orphan working-directory sweep (#613) ---
+    # Always-on (zero-config): reclaims workspace directories no ``sessions``
+    # row points at any more. #575 deletes a directory as it deletes its row, so
+    # a directory whose row is already gone is unreachable by that path — 313 of
+    # them (17.3 GB) had piled up on the production host. Needs the base path to
+    # know where to look, so it stays off when session dirs are not configured.
+    # Set CLORD_ORPHAN_SWEEP_DAYS=0 to disable.
+    if session_dir_base:
+        from .orphan_dirs import OrphanSweepLoop, orphan_sweep_days
+
+        _orphan_days = orphan_sweep_days()
+        if _orphan_days > 0:
+            orphan_loop = OrphanSweepLoop(
+                session_repo, session_dir_base, min_idle_days=_orphan_days
+            )
+            orphan_loop.start()
+            bot.orphan_sweep_loop = orphan_loop  # type: ignore[attr-defined]
+        else:
+            logger.info("Orphan-dir sweep disabled (CLORD_ORPHAN_SWEEP_DAYS=0)")
 
     # --- Menu watchdog (#359) ---
     # Always-on (zero-config): bridges TUI AskUserQuestion/plan menus that no
