@@ -1,16 +1,18 @@
-"""Unit tests for StatusManager stall notification feature."""
+"""Unit tests for StatusManager: the per-turn reaction lamp and stall detection."""
 
 from __future__ import annotations
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 from c_lord.claude.types import ToolCategory
 from c_lord.discord_ui.status import (
     EMOJI_ERROR,
     EMOJI_RUNNING,
+    EMOJI_STALL_HARD,
     EMOJI_WAITING,
     STALL_HARD_SECONDS,
     StatusManager,
@@ -27,69 +29,64 @@ def _make_message() -> MagicMock:
     return msg
 
 
-class TestHardStallCallback:
-    """Tests for the on_hard_stall callback feature."""
+class TestHardStall:
+    """#473: a 30s stall paints ⚠️ on the trigger message — and posts nothing.
+
+    The lamp used to be accompanied by an ``on_hard_stall`` callback that the
+    chat cog used to post a "no activity" line into the thread. The reaction
+    already says it, so the callback and the line are gone.
+    """
 
     @pytest.mark.asyncio
-    async def test_callback_fires_on_hard_stall(self) -> None:
-        callback = AsyncMock()
-        msg = _make_message()
-        sm = StatusManager(msg, on_hard_stall=callback)
-        await sm.set_thinking()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
-        callback.assert_awaited_once()
-        await sm.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_callback_fires_only_once_per_stall(self) -> None:
-        callback = AsyncMock()
-        msg = _make_message()
-        sm = StatusManager(msg, on_hard_stall=callback)
-        await sm.set_thinking()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(5)
-        callback.assert_awaited_once()
-        await sm.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_callback_resets_after_activity(self) -> None:
-        callback = AsyncMock()
-        msg = _make_message()
-        sm = StatusManager(msg, on_hard_stall=callback)
-        await sm.set_thinking()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
-        assert callback.await_count == 1
-        await sm.set_tool(ToolCategory.READ)
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
-        assert callback.await_count == 2
-        await sm.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_no_callback_when_not_provided(self) -> None:
+    async def test_hard_stall_paints_the_warning_lamp(self) -> None:
         msg = _make_message()
         sm = StatusManager(msg)
         await sm.set_thinking()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_STALL_HARD
         await sm.cleanup()
 
     @pytest.mark.asyncio
-    async def test_callback_exception_does_not_crash_monitor(self) -> None:
-        callback = AsyncMock(side_effect=Exception("Discord API error"))
+    async def test_the_lamp_is_painted_once_per_stall(self) -> None:
+        """Staying stalled must not re-paint (and re-notify) every 2s tick."""
         msg = _make_message()
-        sm = StatusManager(msg, on_hard_stall=callback)
+        sm = StatusManager(msg)
+        await sm.set_thinking()
+        loop = asyncio.get_running_loop()
+        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(5)
+        hard = [c for c in msg.add_reaction.await_args_list if c.args[0] == EMOJI_STALL_HARD]
+        assert len(hard) == 1
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_the_lamp_comes_back_after_activity_and_another_stall(self) -> None:
+        msg = _make_message()
+        sm = StatusManager(msg)
         await sm.set_thinking()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(2.5)
-        callback.assert_awaited_once()
+        assert sm._current_emoji == EMOJI_STALL_HARD
+
+        await sm.set_tool(ToolCategory.READ)  # activity → back to 🟢
+        assert sm._current_emoji == EMOJI_RUNNING
+        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_STALL_HARD
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_reaction_does_not_crash_the_monitor(self) -> None:
+        msg = _make_message()
+        msg.add_reaction = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+        sm = StatusManager(msg)
+        await sm.set_thinking()
+        loop = asyncio.get_running_loop()
+        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
         assert sm._stall_task is not None
         assert not sm._stall_task.done()
         await sm.cleanup()
@@ -112,10 +109,11 @@ class TestCompactStatus:
 
     @pytest.mark.asyncio
     async def test_set_compact_resets_stall_timer(self) -> None:
-        """set_compact should reset stall timer so warning doesn't appear during compaction."""
-        callback = AsyncMock()
+        """set_compact should reset the stall timer so ⚠️ doesn't appear during compaction."""
+        from c_lord.discord_ui.status import EMOJI_COMPACT
+
         msg = _make_message()
-        sm = StatusManager(msg, on_hard_stall=callback)
+        sm = StatusManager(msg)
         await sm.set_thinking()
         # Simulate time passing
         loop = asyncio.get_running_loop()
@@ -124,8 +122,8 @@ class TestCompactStatus:
         await sm.set_compact()
         # Wait past what would have been the stall threshold
         await asyncio.sleep(3)
-        # Callback should NOT have fired because compact reset the timer
-        callback.assert_not_awaited()
+        # Still 🗜️ — the stall lamp must NOT have taken over.
+        assert sm._current_emoji == EMOJI_COMPACT
         await sm.cleanup()
 
 
