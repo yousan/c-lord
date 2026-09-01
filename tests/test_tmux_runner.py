@@ -13,6 +13,7 @@ from c_lord.claude.tmux_runner import (
     USAGE_LIMIT_ERROR_PREFIX,
     TmuxClaudeRunner,
     _clean_tui_lines,
+    _count_usage_limit,
     _extract_startup_error,
     _extract_usage_limit,
     _is_ask_submit_screen,
@@ -20,6 +21,7 @@ from c_lord.claude.tmux_runner import (
     _parse_ask_from_pane,
     _parse_plan_from_pane,
     _unknown_prompt_signature,
+    _usage_limit_menu_open,
     _usage_limit_wait_option,
 )
 from c_lord.claude.types import (
@@ -4319,3 +4321,69 @@ class TestUsageLimitChoiceMenu:
         # Option 1 is already under the cursor: confirm it, and send no Downs
         # that could walk onto "Switch to usage credits".
         assert flat == ["Enter"], flat
+
+
+class TestUsageLimitRepeatDetection:
+    """#631: hitting the SAME limit twice in one thread must be caught too.
+
+    The reporter sent the identical request three times. Each refusal prints the
+    identical banner, so "is this line different from the one already on the
+    pane?" silently misses every attempt after the first — the exact case the
+    issue is about. Reproduced on staging: the second turn's banner was
+    suppressed and the turn fell back to "No response".
+
+    Two signals separate a fresh refusal from a re-rendered old one:
+      * the limit's choice menu is OPEN — it only stays open until answered, and
+        while it is open the next message goes into the menu, so the turn is
+        blocked whatever the banner says;
+      * the number of banners on the pane went UP.
+    """
+
+    def test_repeat_pane_has_two_banners_and_an_open_menu(self) -> None:
+        """The staging capture of a second consecutive refusal."""
+        pane = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
+        assert _count_usage_limit(pane) == 2
+        assert _usage_limit_menu_open(pane) is True
+        # 4 options here, not 3 — the menu shape varies, so the wait option must
+        # still be found by name.
+        assert _usage_limit_wait_option(pane) == 0
+
+    def test_menu_is_not_open_on_a_plain_banner_pane(self) -> None:
+        pane = _load_fixture("usage_limit_weekly_hit.txt")
+        assert _usage_limit_menu_open(pane) is False
+        assert _count_usage_limit(pane) == 1
+
+    def test_an_unrelated_menu_is_not_the_limit_menu(self) -> None:
+        """Only the limit's own menu counts — not every numbered TUI menu."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        assert _usage_limit_menu_open(pane) is False
+
+    @pytest.mark.asyncio
+    async def test_identical_banner_repeat_is_still_reported(
+        self, runner, tmux_manager
+    ) -> None:
+        """RED: the same banner twice was suppressed as 'history' and lost."""
+        before = _normalize_capture(_load_fixture("usage_limit_weekly_hit.txt"))
+        after = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
+        captures = [before, before]
+
+        def _capture(*_a, **_k):
+            return captures.pop(0) if captures else after
+
+        tmux_manager.capture_pane.side_effect = _capture
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_keys.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("same request, third time")]
+
+        result = [e for e in events if e.is_complete]
+        assert result[0].usage_limit is not None
+        assert result[0].usage_limit.scope == "weekly limit"

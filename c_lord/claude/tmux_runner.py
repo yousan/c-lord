@@ -372,6 +372,53 @@ _LIMIT_MENU_OPTION_RE = re.compile(
 _LIMIT_MENU_WAIT_MARKERS = ("stop and wait", "wait for limit")
 
 
+# Header of the limit's choice menu, and the options only IT offers.  Both are
+# required: "What do you want to do?" alone is too plain to key on, and the
+# option labels alone could appear in prose about this very feature.
+_LIMIT_MENU_HEADER = "What do you want to do?"
+_LIMIT_MENU_SIGNATURE_MARKERS = (
+    "stop and wait",
+    "wait for limit",
+    "switch to usage credits",
+    "switch to team plan",
+    "continue automatically",
+)
+
+
+def _usage_limit_menu_open(pane: str) -> bool:
+    """True when the limit's choice menu is on screen and unanswered (#631).
+
+    This is the strongest "the turn is blocked right now" signal there is: the
+    menu closes as soon as it is answered, and while it is open the next message
+    typed into the pane lands in the menu instead of the prompt.  It is what
+    tells a fresh refusal apart from a re-rendered old banner — including the
+    case the reporter actually hit, where the SAME request was sent three times
+    and every refusal printed the identical line.
+    """
+    if not pane or _LIMIT_MENU_HEADER not in pane:
+        return False
+    for line in pane.splitlines():
+        match = _LIMIT_MENU_OPTION_RE.match(line)
+        if match is None:
+            continue
+        label = match.group("label").lower()
+        if any(marker in label for marker in _LIMIT_MENU_SIGNATURE_MARKERS):
+            return True
+    return False
+
+
+def _count_usage_limit(pane: str) -> int:
+    """How many blocking limit banners are on *pane*.
+
+    A rising count means this turn added one.  Comparing counts rather than the
+    banner text is what makes a repeat of the *same* limit detectable — the text
+    is identical every time.
+    """
+    if not pane:
+        return 0
+    return sum(1 for _ in _USAGE_LIMIT_RE.finditer(pane))
+
+
 def _usage_limit_wait_option(pane: str) -> int | None:
     """0-based index of the limit menu's "keep waiting" option, else None.
 
@@ -1392,14 +1439,19 @@ class TmuxClaudeRunner:
         # outcome so Discord reports the reset time instead of telling the user
         # to send the same message again (which can only fail again).
         usage_limit: UsageLimit | None = None
-        # The limit banner that was ALREADY on the pane when this turn started
+        # How many limit banners were ALREADY on the pane when this turn started
         # (#631).  Claude Code re-renders the conversation tail on ``--resume``,
         # so a thread that hit the limit yesterday opens today's turn with
         # yesterday's banner on screen.  Treating that as today's outcome would
         # refuse a turn that is about to work — the opposite mistake, and the
-        # worse one, because it leaves the session with no way forward.  Only a
-        # banner that DIFFERS from this baseline is this turn's answer.
-        baseline_usage_limit: UsageLimit | None = None
+        # worse one, because it leaves the session with no way forward.
+        #
+        # Counting rather than comparing the text is deliberate: a repeat of the
+        # same limit prints the IDENTICAL line, so a text comparison misses every
+        # attempt after the first — which is precisely what the reporter did,
+        # three times.  An open choice menu says the same thing more directly and
+        # is checked alongside it.
+        baseline_limit_count = 0
         baseline_limit_captured = False
 
         # #365: Gate completion on the NEW turn actually having started. When a
@@ -1475,11 +1527,12 @@ class TmuxClaudeRunner:
                 # the same reason as the startup error above: the phrase can
                 # legitimately appear inside Claude's own answer.
                 found_limit = _extract_usage_limit(current)
+                limit_count = _count_usage_limit(current)
                 if not baseline_limit_captured:
                     baseline_limit_captured = True
-                    baseline_usage_limit = found_limit
+                    baseline_limit_count = limit_count
                 if found_limit is not None and (
-                    baseline_usage_limit is None or found_limit.line != baseline_usage_limit.line
+                    _usage_limit_menu_open(current) or limit_count > baseline_limit_count
                 ):
                     usage_limit = found_limit
                     logger.warning(
@@ -1758,7 +1811,8 @@ class TmuxClaudeRunner:
                 # there when the turn started belongs to an earlier turn.
                 found_limit = _extract_usage_limit(current)
                 if found_limit is not None and (
-                    baseline_usage_limit is None or found_limit.line != baseline_usage_limit.line
+                    _usage_limit_menu_open(current)
+                    or _count_usage_limit(current) > baseline_limit_count
                 ):
                     usage_limit = found_limit
             if pane_error is not None:
