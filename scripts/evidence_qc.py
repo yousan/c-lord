@@ -74,6 +74,12 @@ _COMPOSER_EDGES = 0.010  # below this there is no message input box on screen
 _MIN_SIZE = (700, 500)  # smaller frames are crops; only the modal check applies
 
 
+# Bias: reject when in doubt. A false reject fails loudly with a reason and a
+# `--no-qc` escape hatch; a false accept is the bug this module exists to kill.
+# Known tight spot: a channel where the capture account cannot post shows a
+# "you do not have permission to send messages" bar instead of the composer.
+
+
 @dataclass(frozen=True)
 class Finding:
     """One reason this PNG must not be pasted into a PR as evidence."""
