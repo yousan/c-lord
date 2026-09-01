@@ -2111,6 +2111,22 @@ class TmuxSessionManager:
         target = f"{self.session_name}:{window}"
         return self._type_literal(target, text, what="send_literal")
 
+    def pane_working_dir(self, thread_id: int) -> str | None:
+        """The cwd of the thread's tmux pane, or None when it cannot be read (#651).
+
+        Used to locate Claude Code's transcript for that pane
+        (``transcript.resolver.derive_project_dir``), which is where the real
+        outcome of an AskUserQuestion menu is recorded. Read from tmux rather
+        than from c-lord's own session-dir bookkeeping so it reflects where the
+        Claude process actually is.
+        """
+        if not self._check_available():
+            return None
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return None
+        return self._pane_path(f"{self.session_name}:{window}")
+
     def send_keys(self, thread_id: int, *keys: str) -> bool:
         """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).
 

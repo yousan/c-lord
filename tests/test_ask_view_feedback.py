@@ -157,6 +157,58 @@ class TestUndeliveredAnswer:
         assert "A案" in text
 
 
+class TestClickIsNotYetProof:
+    """#651: a click proves the bus took the answer — nothing more.
+
+    ✅ used to be printed right here, before a single keystroke had been sent to
+    the pane. On 2026-09-01 that ✅ sat over an answer Claude never received
+    (#650). The click now leaves an interim state, and the bridge writes the
+    verified outcome once the transcript says what happened.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_click_reads_as_sending_not_as_answered(self) -> None:
+        bus = AskAnswerBus()
+        tid = 651_0010
+        bus.register(tid)
+        view = AskView(_question(), thread_id=tid, q_idx=0, bus=bus)
+        interaction = _interaction()
+
+        await view._deliver(interaction, ["A案"])
+
+        text = _edit_text(interaction)
+        assert "✅" not in text, f"claimed an answer that has not been sent yet: {text!r}"
+        assert "送信中" in text, f"should say it is in flight: {text!r}"
+
+    @pytest.mark.asyncio
+    async def test_free_text_click_is_interim_too(self) -> None:
+        """The ✏️ Other modal path made the same claim (#650's actual path)."""
+        bus = AskAnswerBus()
+        tid = 651_0011
+        bus.register(tid, allow_free_text=True)
+        view = AskView(_question(), thread_id=tid, q_idx=0, bus=bus)
+        message = MagicMock()
+        message.id = 778
+        message.edit = AsyncMock()
+        interaction = _interaction()
+        interaction.message = message
+        interaction.response.send_modal = AsyncMock()
+
+        modal = MagicMock()
+        modal.answer = "全部あげてOK"
+        modal.wait = AsyncMock(return_value=False)
+        with __import__("unittest.mock", fromlist=["patch"]).patch.object(
+            ask_view_mod, "AskModal", return_value=modal
+        ):
+            await view._other_callback(interaction)
+
+        kwargs = message.edit.await_args.kwargs
+        embed = kwargs.get("embed")
+        text = f"{embed.title}\n{embed.description}"
+        assert "✅" not in text, f"claimed an answer that has not been sent yet: {text!r}"
+        assert "送信中" in text, text
+
+
 class TestDeliveredAnswer:
     """AC4: after a successful click the thread still shows what was asked."""
 

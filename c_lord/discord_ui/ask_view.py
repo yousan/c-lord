@@ -39,7 +39,7 @@ from .ask_bus import (
 from .ask_bus import ask_bus as _default_ask_bus
 from .ask_menus import ask_menus, disable_stale_copies
 from .authorization import AuthorizedViewMixin, Authorizer
-from .embeds import ask_answered_embed, ask_undelivered_embed
+from .embeds import ask_sending_embed, ask_undelivered_embed
 from .error_reporting import ErrorReportingViewMixin
 
 if TYPE_CHECKING:
@@ -97,6 +97,11 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     Answers are routed via :data:`ask_bus` rather than an internal Future,
     so the waiting coroutine (``_collect_ask_answers``) can use any timeout
     and ``view.stop()`` is always called on interaction.
+
+    A click leaves the message in the **interim** ``⏳ 送信中`` state, never ✅
+    (#651): at this point the answer has only reached an in-process queue. The
+    bridge that actually types it into the pane replaces this with the outcome
+    it verified against Claude's transcript.
 
     Usage::
 
@@ -224,7 +229,11 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         delivered = self._bus.post_answer(self._thread_id, values)
         question = self._question
         if delivered:
-            embed = ask_answered_embed(question.question, question.header, values)
+            # #651: the bus accepted the answer — that is all that is known
+            # right now. The keystrokes have not been sent, and "sent" is not
+            # "received" either (#650). The bridge replaces this with the
+            # verified outcome once Claude's transcript says what happened.
+            embed = ask_sending_embed(question.question, question.header, values)
         else:
             if self._ask_repo is not None:
                 await self._ask_repo.delete(self._thread_id)
@@ -283,7 +292,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             message = getattr(interaction, "message", None)
             question = self._question
             if delivered:
-                embed = ask_answered_embed(question.question, question.header, [modal.answer])
+                # #651: interim — the bridge confirms and rewrites this.
+                embed = ask_sending_embed(question.question, question.header, [modal.answer])
             else:
                 if self._ask_repo is not None:
                     await self._ask_repo.delete(self._thread_id)

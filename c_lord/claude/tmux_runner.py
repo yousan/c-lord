@@ -15,8 +15,10 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 from ..tmux import TmuxSessionManager, pane_command_is_dead
+from ..transcript.resolver import derive_project_dir
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import (
     FREE_TEXT_NONE,
@@ -2078,6 +2080,23 @@ class TmuxClaudeRunner:
                 self._thread_id,
             )
         return _delivered
+
+    async def transcript_project_dir(self) -> Path | None:
+        """Where Claude Code writes this pane's transcript, or None (#651).
+
+        The transcript is how c-lord confirms that an answer actually reached
+        Claude rather than merely reaching the terminal — see
+        :func:`c_lord.discord_ui.ask_handler._verify_answer_reached_claude`.
+        None whenever the pane's cwd cannot be read; the caller then falls back
+        to the weaker "did the menu close" evidence.
+        """
+        getter = getattr(self._tmux, "pane_working_dir", None)
+        if not callable(getter):
+            return None
+        cwd = await asyncio.to_thread(getter, self._thread_id)
+        if not isinstance(cwd, str) or not cwd:
+            return None
+        return derive_project_dir(cwd)
 
     async def cancel_menu(self) -> bool:
         """Dismiss an open AskUserQuestion menu with Esc (e.g. on timeout) (#166)."""
