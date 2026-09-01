@@ -18,41 +18,36 @@ Bot (c-lord process)                                     ← one instance
 ├── Access control: @claude-operator role
 │   └── Only users with this role can interact with the bot
 │
-├── #project-a (channel)
+├── #project-a (channel) ── bound to github.com/user/project-a.git via /clord-init
 │   │
-│   ├── Repository: github.com/user/project-a.git
-│   │   └── Linked via /clord-init (stored in DB)
-│   │
-│   ├── tmux session: "project-a"
-│   │   ├── w1 ── Claude Code CLI for Thread 101
-│   │   └── w2 ── Claude Code CLI for Thread 102
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-a/
-│       ├── 101/ ── git clone of project-a (for Thread 101)
-│       └── 102/ ── git clone of project-a (for Thread 102)
+│   ├── Thread 101 ── tmux session "project-a", window w1
+│   ├── Thread 102 ── tmux session "project-a", window w2
+│   └── Thread 103 ── bound to project-c.git via /clord-thread-init
+│                     → tmux session "project-c", window w1   ← NOT "project-a"
 │
-├── #project-b (channel)
-│   │
-│   ├── Repository: github.com/user/project-b.git
-│   │
-│   ├── tmux session: "project-b"
-│   │   └── w1 ── Claude Code CLI for Thread 201
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-b/
-│       └── 201/ ── git clone of project-b (for Thread 201)
+├── #project-b (channel) ── bound to github.com/user/project-b.git
+│   └── Thread 201 ── tmux session "project-b", window w1
 │
 └── #general (no repository linked)
     └── /clord → error "No repository configured"
+
+session_dir (the git clone each thread works in):
+    ~/c-lord-sessions/<channel_id>/<thread_id>/
 ```
+
+**The tmux session follows the repository, not the channel.** Thread 103 above is
+in #project-a but lives in the `project-c` session. Two channels bound to the same
+repo share one session. See [specs/tmux-layout.md](specs/tmux-layout.md).
 
 ### How Things Relate
 
 | Relationship | Mapping | Linked by |
 |-------------|---------|-----------|
 | Channel : Repository | 1:1 | `/clord-init` (stored in DB) |
-| Channel : tmux session | 1:1 | Auto-generated from repo name |
-| Thread : tmux window | 1:1 | `@thread_id` (tmux window option) |
-| Thread : session_dir | 1:1 | `~/c-lord-sessions/{project}/{thread_id}/` |
+| Thread : Repository | 1:1 | the channel's, or the thread's own via `/clord-thread-init` |
+| Repository : tmux session | 1:1 | Auto-generated from the repo name — so a channel can span **several** sessions, and two channels on the same repo **share** one |
+| Thread : tmux window | 1:1 | `@thread_id` (tmux window option). Numbers are unique within a session, not within a channel |
+| Thread : session_dir | 1:1 | `~/c-lord-sessions/{channel_id}/{thread_id}/` |
 | Thread : Claude session | 1:1 | DB (`sessions` table) |
 
 ### Setup Flow

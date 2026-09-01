@@ -9,8 +9,13 @@ All commands available to Discord users and API consumers.
 ## Architecture Overview
 
 ```
-Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
+Bot → Channel (= 1 repo) → Thread (= 1 tmux window)
+                             └─ in the tmux session of the repo THAT THREAD is bound to
 ```
+
+The tmux session follows the **repository**, not the channel: a channel whose threads
+are bound to different repos spans several sessions, and two channels on the same repo
+share one. See [specs/tmux-layout.md](specs/tmux-layout.md).
 
 - **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
 - **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
@@ -156,7 +161,7 @@ resumable.
 
 **`/resync`** is a safety valve for when the tmux→Discord *mirror* feels out of sync — a selection menu's buttons never appeared, or a tool embed looks stale. It re-projects the **current** tmux state onto Discord: (1) re-bridges any stranded TUI menu so its buttons (re)appear, and (2) posts a fresh PNG snapshot of the pane so you can see the live state. It does this immediately, without waiting for the 60s menu-watchdog sweep or a bot restart.
 
-It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
+It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in **one** tmux session — the one the channel (or the invoking thread) resolves to — and reports how many it touched. Threads bound to a different repo live in a different session and are **not** covered; see #619.
 
 If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` and `/tmux-screenshot` no longer dead-end with a bare "No tmux window found." They tell you what sending a message will *actually* do, which depends on the thread (#538):
 
