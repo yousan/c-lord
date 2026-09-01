@@ -1,0 +1,37 @@
+
+
+yousan @ tachikoma1.l2tporg in /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1544225553790275644/
+a8e2f6a7-f6d3-48cf-b6ed-d0ae867ff5c6/scratchpad/repro657 (master)
+$ unalias claude 2>/dev/null; env -u CLAUDECODE claude --continue --model sonnet --permission-mode acceptEdits 'say h
+i'
+No conversation found to continue
+
+yousan @ tachikoma1.l2tporg in /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1544225553790275644/
+a8e2f6a7-f6d3-48cf-b6ed-d0ae867ff5c6/scratchpad/repro657 (master)
+$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

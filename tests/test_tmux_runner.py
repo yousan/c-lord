@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -2135,7 +2136,9 @@ class TestContinueFallback:
             False,  # initial check
             True,  # after --continue delay — Claude started successfully
         )
-        pane = _make_pane(["● Resumed."])
+        # A --continue that worked lands on the restored conversation with its
+        # input box on screen — that is the signal the verdict waits for (#657).
+        pane = _make_pane(["● Resumed."], with_input_prompt=True)
         tmux_manager.capture_pane.return_value = pane
 
         events = []
@@ -2145,6 +2148,7 @@ class TestContinueFallback:
             patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.09),
             patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
             patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
+            patch("c_lord.claude.tmux_runner._CONTINUE_VERDICT_TIMEOUT", 0.5),
         ):
             async for event in resume_runner.run("hello"):
                 events.append(event)
@@ -2252,6 +2256,156 @@ class TestContinueFallback:
         # distinguishes the two paths: the --continue attempt would have started
         # claude a second time, and it never did.
         assert tmux_manager.start_claude.call_count == 1
+        assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
+
+
+class _ContinueTrustTimeline:
+    """Replays the #657 production timeline (2026-09-01 13:49) against the mock.
+
+    Real captured panes drive it, so a future change that breaks the verdict
+    fails here with "this pane snapshot broke things".  Phases, in order:
+
+    1. ``booting``  — the window exists but claude is not up yet (``run``'s
+       opening liveness probe).
+    2. ``trust``    — ``claude --continue`` is alive **showing the folder-trust
+       dialog**.  This is the state the fixed 3s verdict used to read as
+       "--continue succeeded": the process really is running, it just has not
+       decided anything yet.
+    3. ``exited``   — the dialog was answered, ``--continue`` printed
+       ``No conversation found to continue`` and claude is gone.
+    4. ``fresh``    — the fallback fresh start is up and answering.
+    """
+
+    def __init__(self) -> None:
+        self.phase = "booting"
+        self._panes = {
+            "booting": "",
+            "trust": _load_fixture("continue_trust_prompt_at_verdict.txt"),
+            "exited": _load_fixture("continue_no_conversation_exited.txt"),
+            "fresh": _make_pane(["● Fresh start response."], with_input_prompt=True),
+        }
+
+    def start_claude(self, *_args, **kwargs) -> bool:
+        self.phase = "trust" if kwargs.get("try_continue") else "fresh"
+        return True
+
+    def send_keys(self, _thread_id, key) -> bool:
+        # Confirming the dialog is what lets --continue reach its real outcome:
+        # there is no conversation to resume, so claude exits straight away.
+        if key == "Enter" and self.phase == "trust":
+            self.phase = "exited"
+        return True
+
+    def capture_pane(self, _thread_id=None) -> str:
+        return self._panes[self.phase]
+
+    def is_claude_running(self, _thread_id=None) -> bool:
+        return self.phase in ("trust", "fresh")
+
+
+class TestContinueVerdictVsTrustPrompt:
+    """#657: the folder-trust dialog must not be mistaken for "--continue worked".
+
+    A thread that is being restored into a session dir where claude has never
+    run hits both at once: the restart-resume path starts ``claude --continue``,
+    and that claude opens the folder-trust dialog.  While the dialog is up the
+    process is alive whatever ``--continue`` is going to do, so a liveness check
+    taken at a fixed offset reads "started fine", the fallback never fires, and
+    the user's first message dies with the process.
+    """
+
+    @pytest.mark.asyncio
+    async def test_trust_prompt_defers_verdict_then_falls_back(self, tmux_manager, caplog) -> None:
+        """RED (#657): dialog up at the verdict → still must fall back on exit."""
+        timeline = _ContinueTrustTimeline()
+        tmux_manager.start_claude.side_effect = timeline.start_claude
+        tmux_manager.send_keys.side_effect = timeline.send_keys
+        tmux_manager.capture_pane.side_effect = timeline.capture_pane
+        tmux_manager.is_claude_running.side_effect = timeline.is_claude_running
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        resume_runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=12345,
+            model="sonnet",
+            timeout_seconds=10,
+            try_continue=True,
+        )
+
+        caplog.set_level(logging.INFO, logger="c_lord.claude.tmux_runner")
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.03),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.05),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+            patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
+        ):
+            async for event in resume_runner.run("hello"):
+                events.append(event)
+
+        assert tmux_manager.start_claude.call_count == 2, (
+            "the --continue verdict was taken while the folder-trust dialog was "
+            "still up, so the fresh-start fallback never fired (#657)"
+        )
+        first, second = tmux_manager.start_claude.call_args_list
+        assert first.kwargs["try_continue"] is True
+        assert second.kwargs["try_continue"] is False
+        # AC3: the fallback re-runs the SAME prompt — the user must not have to
+        # send their message a second time.
+        assert second.args[1] == "hello"
+        # AC4: the fallback is visible in the log.
+        assert "falling back to fresh start" in caplog.text
+        assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
+
+    @pytest.mark.asyncio
+    async def test_trust_prompt_then_continue_succeeds_keeps_one_start(
+        self, tmux_manager, caplog
+    ) -> None:
+        """The other half: dialog up at the verdict, but --continue *did* work.
+
+        Waiting past the dialog must not turn into "always fall back" — when the
+        restored conversation comes up, claude is still alive with its input box
+        on screen and there must be exactly one start_claude call (a second one
+        would mean two Claude processes on one checkout).
+        """
+        timeline = _ContinueTrustTimeline()
+        # Answering the dialog leaves --continue running on the restored
+        # conversation instead of exiting.
+        timeline._panes["exited"] = _make_pane(["● Resumed."], with_input_prompt=True)
+        timeline.is_claude_running = lambda _tid=None: timeline.phase != "booting"
+
+        tmux_manager.start_claude.side_effect = timeline.start_claude
+        tmux_manager.send_keys.side_effect = timeline.send_keys
+        tmux_manager.capture_pane.side_effect = timeline.capture_pane
+        tmux_manager.is_claude_running.side_effect = timeline.is_claude_running
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        resume_runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=12345,
+            model="sonnet",
+            timeout_seconds=10,
+            try_continue=True,
+        )
+
+        caplog.set_level(logging.INFO, logger="c_lord.claude.tmux_runner")
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.03),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.05),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+            patch("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.01),
+        ):
+            async for event in resume_runner.run("hello"):
+                events.append(event)
+
+        assert tmux_manager.start_claude.call_count == 1
+        assert tmux_manager.start_claude.call_args_list[0].kwargs["try_continue"] is True
+        assert "falling back to fresh start" not in caplog.text
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
 

@@ -90,11 +90,26 @@ _MENU_NAV_DELAY = 0.25
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
 
-# How long to wait after sending ``claude --continue`` before checking whether
-# Claude actually started (issue #123 Part 2).  If Claude is still not running
-# after this delay, ``--continue`` failed (no session to resume) and we fall
-# back to a plain fresh start.
+# Startup grace after sending ``claude --continue`` before its outcome is
+# judged at all (issue #123 Part 2).  The pane still runs zsh for a moment
+# while claude execs, so a liveness probe taken any earlier reads every start
+# as a failure.
 _CONTINUE_CHECK_DELAY = 3.0
+
+# How long a ``--continue`` with no folder-trust dialog on screen must stay
+# alive before it counts as started (#657).  The grace above is not a verdict on
+# its own: a session dir where claude has never run opens the trust dialog
+# first, and a claude parked on that dialog is alive whatever ``--continue`` is
+# going to do — staging measured the exit landing ~1.5s AFTER the dialog was
+# answered.  So the clock only runs while the dialog is gone, and this is the
+# margin over that observed exit.
+_CONTINUE_SETTLE = 5.0
+
+# Absolute ceiling on the undecided window (#657).  Only reachable when the
+# trust dialog never closes — i.e. the keystrokes that answer it did not take —
+# in which case "assume it started" is the same answer the old fixed-delay check
+# gave, and the turn loop's own timeouts take it from there.
+_CONTINUE_VERDICT_TIMEOUT = 15.0
 
 #: How long :meth:`TmuxClaudeRunner.wake` waits for a restored pane to reach its
 #: input box. Generous on purpose: a cold ``claude --continue`` re-renders the
@@ -1160,12 +1175,7 @@ class TmuxClaudeRunner:
                     )
                     return
 
-                # Wait briefly; if Claude still not running, --continue failed.
-                await asyncio.sleep(_CONTINUE_CHECK_DELAY)
-                still_running = await asyncio.to_thread(
-                    self._tmux.is_claude_running, self._thread_id
-                )
-                if not still_running:
+                if not await self._continue_came_up():
                     logger.info(
                         "start_claude --continue found no session for thread %d; "
                         "falling back to fresh start",
@@ -1675,8 +1685,7 @@ class TmuxClaudeRunner:
             logger.warning("wake: start_claude --continue failed (thread=%d)", self._thread_id)
             return False
 
-        await asyncio.sleep(_CONTINUE_CHECK_DELAY)
-        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+        if not await self._continue_came_up():
             logger.info(
                 "wake: --continue found no conversation for thread %d; starting fresh",
                 self._thread_id,
@@ -1810,6 +1819,78 @@ class TmuxClaudeRunner:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _continue_came_up(self) -> bool:
+        """Decide whether ``claude --continue`` actually came up (#657).
+
+        ``--continue`` gives us no exit status to read — the pane is all there
+        is — so "did it work?" is answered by watching the process.  The obvious
+        way to do that (wait a fixed few seconds, then ask whether claude is
+        running) is wrong for the case that hurts most: a session dir where
+        claude has never run opens the **folder-trust dialog** first, and a
+        claude parked on that dialog is alive no matter what ``--continue`` is
+        going to do.  In production (2026-09-01 13:49) the dialog was still up
+        at the 3s mark, the check read "started fine", the fresh-start fallback
+        never fired, and the exit six seconds later — ``No conversation found to
+        continue`` — took the user's first message with it.
+
+        So the verdict is *deferred* while the dialog is up (and the dialog is
+        answered here, which is what lets the real outcome happen at all), then
+        settled on something that separates the two outcomes:
+
+        * claude is gone                    → nothing to continue → False
+        * claude is up at its input box     → the conversation loaded → True
+        * claude simply outlives the window in which a failed ``--continue``
+          exits → it started
+
+        Returns True when the caller should keep this process, False when it
+        must fall back to a fresh start.
+        """
+        # Startup grace: the pane runs zsh for a moment while claude execs.
+        await asyncio.sleep(_CONTINUE_CHECK_DELAY)
+
+        elapsed = 0.0
+        settled = 0.0
+        trust_handled = False
+        while elapsed < _CONTINUE_VERDICT_TIMEOUT and not self._stopped:
+            # ``capture_pane`` keeps the escape sequences (``-e``), so the input
+            # box arrives as ``\x1b[39m❯\xa0`` and would never be recognised
+            # unnormalised — the same trap #642 hit in ``wake``.
+            pane = _normalize_capture(
+                await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            )
+            if self._has_trust_prompt(pane):
+                # Not a verdict: answer it, and hold the settle clock at zero —
+                # nothing about ``--continue`` is decided while this is up.
+                if not trust_handled:
+                    await self._accept_trust_prompt(pane)
+                    trust_handled = True
+                settled = 0.0
+            elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+                return False
+            elif self._has_input_prompt(pane) or self._is_generating(pane):
+                # Liveness is checked first on purpose: a zsh theme renders the
+                # very same ``❯``, so a claude that just exited must not read as
+                # a ready input box.
+                return True
+            elif settled >= _CONTINUE_SETTLE:
+                # Still alive, dialog gone, but the TUI has painted nothing we
+                # recognise. It outlived the window in which a failed
+                # ``--continue`` exits, so it started.
+                return True
+            else:
+                settled += _POLL_INTERVAL
+            await asyncio.sleep(_POLL_INTERVAL)
+            elapsed += _POLL_INTERVAL
+
+        if not self._stopped:
+            logger.warning(
+                "--continue neither reached its input box nor exited within %.0fs "
+                "(thread=%d); treating it as started",
+                _CONTINUE_VERDICT_TIMEOUT,
+                self._thread_id,
+            )
+        return True
 
     async def _handle_startup_prompts(self) -> None:
         """Handle any interactive prompts during Claude startup."""
