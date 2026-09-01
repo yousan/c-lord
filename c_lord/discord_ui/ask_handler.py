@@ -16,13 +16,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
 
 from ..claude.types import AskQuestion
 from ..database.ask_repo import PendingAskRepository
+from ..transcript.ask_result import (
+    ASK_ANSWERED,
+    ASK_NOT_ANSWERED,
+    ASK_UNKNOWN,
+    AskOutcome,
+    classify_ask_result,
+    latest_ask_tool_use,
+    read_ask_result,
+)
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
@@ -34,7 +45,12 @@ from .ask_menus import ask_menus as _ask_menus
 from .ask_view import AskView
 from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
-from .embeds import ask_embed
+from .embeds import (
+    ask_answered_embed,
+    ask_embed,
+    ask_unconfirmed_embed,
+    ask_undelivered_embed,
+)
 
 if TYPE_CHECKING:
     from ..claude.tmux_runner import TmuxClaudeRunner
@@ -54,6 +70,14 @@ ASK_ANSWER_TIMEOUT = 86_400  # 24 h
 # (a small dwell guards against a transient half-drawn capture).
 _PANE_RESOLVE_POLL = 2.0
 _PANE_RESOLVE_MISSES = 2
+
+# #651: after the answer keystrokes go out, wait this long for Claude's own
+# transcript to record what the menu resolved to.  Bounded on purpose: the ✅ is
+# held back until the outcome is known, so this is latency the user sees.
+# Measured on staging, the tool_result lands ~1s after the keys — 12s is slack
+# for a busy host, not an expected wait.
+_ANSWER_CONFIRM_TIMEOUT = 12.0
+_ANSWER_CONFIRM_POLL = 0.5
 
 # #399: the prose context above the menu is posted as its own message(s).
 # Up to _CONTEXT_MAX_MSGS sequential chunks deliver the text IN FULL — clipping
@@ -111,6 +135,116 @@ def _answer_undeliverable_notice(selected: list[str]) -> str:
         "スレッドの tmux ウィンドウが見つかりませんでした。"
         "もう一度送るか、`/tmux-screenshot` でセッションの状態を確認してください。"
     )
+
+
+_NOT_ANSWERED_REASON = (
+    "キーは送れましたが、Claude 側には「回答なし」として渡りました"
+    "（メニューが回答を受け取らずに閉じています）"
+)
+_NO_WINDOW_REASON = "スレッドの tmux ウィンドウが見つかりませんでした"
+
+
+async def _transcript_dir(runner: TmuxClaudeRunner) -> Path | None:
+    """The runner's transcript directory, or None when it cannot be determined."""
+    getter = getattr(runner, "transcript_project_dir", None)
+    if not callable(getter):
+        return None
+    try:
+        result = getter()
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:  # pragma: no cover - defensive: never fail a turn on this
+        logger.debug("could not resolve the transcript dir for verification", exc_info=True)
+        return None
+    return result if isinstance(result, Path) else None
+
+
+async def _menu_is_gone(runner: TmuxClaudeRunner) -> bool | None:
+    """True/False if the pane says the menu closed, None when it cannot say.
+
+    Every step is defensive: this runs on the answer path, where an exception
+    would strand the menu in its interim state — worse than the missing check
+    it replaces.
+    """
+    try:
+        state = getattr(runner, "peek_menu_state", None)
+        if callable(state):
+            result = state()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, tuple) and len(result) == 2:
+                menu, capture_ok = result
+                # #485: an empty capture is "unknown", never "the menu closed".
+                return None if not capture_ok else menu is None
+        peek = getattr(runner, "peek_pending_ask", None)
+        if callable(peek):
+            result = peek()
+            if inspect.isawaitable(result):
+                result = await result
+            return result is None
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("pane check failed while confirming the answer", exc_info=True)
+    return None
+
+
+async def _verify_answer_reached_claude(
+    runner: TmuxClaudeRunner,
+    project_dir: Path | None,
+    ask_ref: tuple[str, Path] | None,
+) -> AskOutcome:
+    """Did the answer actually reach Claude? (#651)
+
+    Evidence, best first:
+
+    1. **The transcript.** Claude Code records the menu's ``tool_result``, and it
+       states outright whether the user answered or the tool was rejected. This
+       is the only evidence that is about the *answer*; everything else is about
+       the machinery around it. It is what distinguishes the #650 failure — keys
+       delivered, menu closed, answer discarded — from a real answer.
+    2. **The pane.** Where there is no transcript to read (no tmux pane path, a
+       non-tmux runner), "the menu is gone" is the best available proxy. Weaker,
+       but far better than the pre-#651 answer of not checking at all.
+
+    Polling is bounded by ``_ANSWER_CONFIRM_TIMEOUT`` because the ✅ waits on it.
+    """
+    deadline = asyncio.get_running_loop().time() + _ANSWER_CONFIRM_TIMEOUT
+    while True:
+        if project_dir is not None and ask_ref is not None:
+            tool_use_id, session_path = ask_ref
+            outcome = classify_ask_result(
+                await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path)
+            )
+            if outcome != ASK_UNKNOWN:
+                return outcome
+        elif await _menu_is_gone(runner) is True:
+            # No transcript to consult — the menu closing is all we have.
+            return ASK_ANSWERED
+        if asyncio.get_running_loop().time() >= deadline:
+            return ASK_UNKNOWN
+        await asyncio.sleep(_ANSWER_CONFIRM_POLL)
+
+
+async def _finalize_menu_message(
+    msg, question: AskQuestion, selected: list[str], outcome: AskOutcome, reason: str = ""
+) -> None:
+    """Replace the menu with what actually happened to the answer (#651).
+
+    The menu message is the one place a reader looks back at to see what was
+    asked and what became of it, so the verified outcome belongs there — not in
+    a separate line that scrolls away from the question it belongs to.
+    """
+    if outcome == ASK_ANSWERED:
+        embed = ask_answered_embed(question.question, question.header, selected)
+    elif outcome == ASK_NOT_ANSWERED:
+        embed = ask_undelivered_embed(
+            question.question, question.header, selected, reason or _NOT_ANSWERED_REASON
+        )
+    else:
+        embed = ask_unconfirmed_embed(question.question, question.header, selected)
+    # Never let the report itself break the turn: a menu stuck in its interim
+    # state is worse than the missing check this replaces.
+    with contextlib.suppress(Exception):
+        await msg.edit(content=None, embed=embed, view=None)
 
 
 async def _report_answer_delivery(
@@ -344,6 +478,16 @@ async def _bridge_claimed_menu(
 
     _close(thread.id, CLOSE_ANSWERED, msg)
 
+    # #651: identify the menu in Claude's own transcript BEFORE answering it, so
+    # the outcome can be read back from the authoritative place. Done up front
+    # because after the answer a *new* menu may already be the newest one.
+    project_dir = await _transcript_dir(runner)
+    ask_ref = (
+        await asyncio.to_thread(latest_ask_tool_use, project_dir)
+        if project_dir is not None
+        else None
+    )
+
     labels = [opt.label for opt in question.options]
     indices = [labels.index(s) for s in selected if s in labels]
     if question.multi_select and indices:
@@ -364,6 +508,23 @@ async def _bridge_claimed_menu(
     # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
     # is what keeps the menu from silently staying open and being re-posted.
     await _report_answer_delivery(thread, delivered=delivered is not False, selected=selected)
+
+    # #651: keystrokes accepted by tmux is NOT the same as the answer reaching
+    # Claude — #650 delivered every key, closed the menu, and still recorded
+    # "(No answer provided)". Confirm before the menu is allowed to read as
+    # answered.
+    if delivered is False:
+        await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
+        return
+    outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
+    if outcome != ASK_ANSWERED:
+        logger.warning(
+            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
+            outcome,
+            thread.id,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
 
 
 async def collect_ask_answers(
@@ -465,6 +626,10 @@ async def collect_ask_answers(
             continue
 
         _close(thread.id, CLOSE_ANSWERED, msg)
+        # #651: on this path the answer needs no verification — it is returned
+        # from here and injected as Claude's next prompt, so it cannot be lost
+        # in a menu. Say so, rather than leaving the click's interim ⏳ standing.
+        await _finalize_menu_message(msg, q, selected, ASK_ANSWERED)
 
         answer_text = ", ".join(selected)
         parts.append(f"**{q.question}**\nAnswer: {answer_text}")
