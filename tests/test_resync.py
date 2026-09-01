@@ -5,9 +5,7 @@ of sync (a menu's buttons never showed, an embed looks stale), the user runs it
 to (a) re-bridge any stranded TUI menu and (b) post a fresh pane snapshot —
 without waiting for the 60s watchdog sweep or a bot restart.
 
-Two scopes:
-- ``thread``  — just the invoking thread.
-- ``channel`` — every thread window in this channel's tmux session.
+Thread-scoped only — the channel-wide twin was removed in #619.
 
 These tests drive ``SessionManageCog._resync_impl`` directly with mocks (the
 slash/text commands are thin wrappers over it, same pattern as the other
@@ -69,7 +67,7 @@ class TestResyncThread:
         cog._snapshot_pane = AsyncMock(return_value=b"PNGDATA")
 
         respond, ack = _io()
-        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=thread, respond=respond, ack=ack)
 
         # Re-bridged the stranded menu for this exact thread/session/window.
         watchdog._maybe_bridge_open_menu.assert_awaited_once_with(
@@ -89,7 +87,7 @@ class TestResyncThread:
         cog._snapshot_pane = AsyncMock(return_value=b"PNGDATA")
 
         respond, ack = _io()
-        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=thread, respond=respond, ack=ack)
 
         watchdog._maybe_bridge_open_menu.assert_not_awaited()
         cog._snapshot_pane.assert_not_awaited()
@@ -107,7 +105,7 @@ class TestResyncThread:
         cog._snapshot_pane = AsyncMock(return_value=b"PNGDATA")
 
         respond, ack = _io()
-        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=thread, respond=respond, ack=ack)
 
         texts = []
         for a, k in respond.await_args_list:
@@ -125,7 +123,7 @@ class TestResyncThread:
         channel = MagicMock(spec=discord.TextChannel)
 
         respond, ack = _io()
-        await cog._resync_impl(channel=channel, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=channel, respond=respond, ack=ack)
 
         watchdog._maybe_bridge_open_menu.assert_not_awaited()
         # Rejected with an ephemeral hint.
@@ -148,53 +146,35 @@ class TestResyncThread:
 
         respond, ack = _io()
         # Must not raise even with no watchdog; snapshot still posts.
-        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=thread, respond=respond, ack=ack)
         assert any(kwargs.get("file") is not None for _args, kwargs in respond.await_args_list)
 
 
-class TestResyncChannel:
-    @pytest.mark.asyncio
-    async def test_channel_rebridges_only_this_channels_session(self, monkeypatch):
-        cog, bot, watchdog = _make_cog()
-        thread = _make_thread(12345, parent_id=999)
+class TestResyncChannelRemoved:
+    """``/resync-channel`` was removed in #619.
 
-        # This channel resolves to session "c-lord"; windows in "other" must be skipped.
-        mgr = MagicMock()
-        mgr.session_name = "c-lord"
-        cog._resolve_tmux_manager = AsyncMock(return_value=mgr)
+    It claimed to reconnect "every thread in this channel" but only ever swept
+    **one** tmux session, so threads bound to another repo were silently left
+    out — and the 60s menu watchdog already does the same job across *all*
+    sessions, automatically. A manual command that is a narrower version of an
+    automatic one is worse than no command.
+    """
 
-        monkeypatch.setattr(
-            tss,
-            "_list_all_windows",
-            lambda: [
-                {"thread_id": "111", "session_name": "c-lord", "window_name": "work1"},
-                {"thread_id": "222", "session_name": "c-lord", "window_name": "work2"},
-                {"thread_id": "333", "session_name": "other", "window_name": "work1"},
-                {"thread_id": "", "session_name": "c-lord", "window_name": "work3"},
-            ],
-        )
-        monkeypatch.setattr(tss, "_capture_pane_text", lambda *a, **k: "pane body")
+    def test_slash_command_is_gone(self) -> None:
+        cog, _bot, _watchdog = _make_cog()
+        names = {c.name for c in cog.get_app_commands()}
+        assert "resync-channel" not in names
+        assert "resync" in names, "the thread-scoped command must survive"
 
-        respond, ack = _io()
-        await cog._resync_impl(channel=thread, scope="channel", respond=respond, ack=ack)
+    def test_text_twin_is_gone(self) -> None:
+        cog, _bot, _watchdog = _make_cog()
+        names = {c.name for c in cog.get_commands()}
+        assert "resync-channel" not in names
+        assert "resync" in names, "the thread-scoped text twin must survive"
 
-        bridged_ids = {call.args[0] for call in watchdog._maybe_bridge_open_menu.await_args_list}
-        assert bridged_ids == {111, 222}  # not 333 (other session), not "" (no thread)
-        # Summary mentions the count.
-        joined = " ".join(str(a) for c in respond.await_args_list for a in c.args)
-        assert "2" in joined
+    def test_channel_scope_helper_is_gone(self) -> None:
+        """The dead branch and its wrong-premise helper must not linger (AC4)."""
+        from c_lord.cogs.session_manage import SessionManageCog
 
-    @pytest.mark.asyncio
-    async def test_channel_no_session_reports_and_skips(self, monkeypatch):
-        cog, bot, watchdog = _make_cog()
-        channel = MagicMock(spec=discord.TextChannel)
-        channel.id = 999
-        channel.parent_id = None
-        cog._resolve_tmux_manager = AsyncMock(return_value=None)
-        monkeypatch.setattr(tss, "_list_all_windows", lambda: [])
-
-        respond, ack = _io()
-        await cog._resync_impl(channel=channel, scope="channel", respond=respond, ack=ack)
-
-        watchdog._maybe_bridge_open_menu.assert_not_awaited()
-        assert respond.await_count >= 1
+        assert not hasattr(SessionManageCog, "_resolve_channel_session")
+        assert not hasattr(SessionManageCog, "resync_channel")
