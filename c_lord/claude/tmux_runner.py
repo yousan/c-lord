@@ -96,13 +96,19 @@ _POST_STARTUP_DELAY = 1.0
 # as a failure.
 _CONTINUE_CHECK_DELAY = 3.0
 
-# Ceiling on how long the ``--continue`` verdict may stay undecided (#657).
-# The grace above is not a verdict on its own: a session dir where claude has
-# never run opens the folder-trust dialog first, and a claude parked on that
-# dialog is alive whatever ``--continue`` is going to do.  So the decision waits
-# for something that actually separates the outcomes — the process exiting, or
-# its input box appearing — and only falls back on this timeout, where "assume
-# it started" is the same answer the fixed-delay check used to give.
+# How long a ``--continue`` with no folder-trust dialog on screen must stay
+# alive before it counts as started (#657).  The grace above is not a verdict on
+# its own: a session dir where claude has never run opens the trust dialog
+# first, and a claude parked on that dialog is alive whatever ``--continue`` is
+# going to do — staging measured the exit landing ~1.5s AFTER the dialog was
+# answered.  So the clock only runs while the dialog is gone, and this is the
+# margin over that observed exit.
+_CONTINUE_SETTLE = 5.0
+
+# Absolute ceiling on the undecided window (#657).  Only reachable when the
+# trust dialog never closes — i.e. the keystrokes that answer it did not take —
+# in which case "assume it started" is the same answer the old fixed-delay check
+# gave, and the turn loop's own timeouts take it from there.
 _CONTINUE_VERDICT_TIMEOUT = 15.0
 
 #: How long :meth:`TmuxClaudeRunner.wake` waits for a restored pane to reach its
@@ -1832,8 +1838,10 @@ class TmuxClaudeRunner:
         answered here, which is what lets the real outcome happen at all), then
         settled on something that separates the two outcomes:
 
-        * claude is gone                → nothing to continue → False
-        * claude is up at its input box → the conversation loaded → True
+        * claude is gone                    → nothing to continue → False
+        * claude is up at its input box     → the conversation loaded → True
+        * claude simply outlives the window in which a failed ``--continue``
+          exits → it started
 
         Returns True when the caller should keep this process, False when it
         must fall back to a fresh start.
@@ -1842,6 +1850,7 @@ class TmuxClaudeRunner:
         await asyncio.sleep(_CONTINUE_CHECK_DELAY)
 
         elapsed = 0.0
+        settled = 0.0
         trust_handled = False
         while elapsed < _CONTINUE_VERDICT_TIMEOUT and not self._stopped:
             # ``capture_pane`` keeps the escape sequences (``-e``), so the input
@@ -1851,10 +1860,12 @@ class TmuxClaudeRunner:
                 await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
             )
             if self._has_trust_prompt(pane):
-                # Not a verdict: answer it and keep watching.
+                # Not a verdict: answer it, and hold the settle clock at zero —
+                # nothing about ``--continue`` is decided while this is up.
                 if not trust_handled:
                     await self._accept_trust_prompt(pane)
                     trust_handled = True
+                settled = 0.0
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
                 return False
             elif self._has_input_prompt(pane) or self._is_generating(pane):
@@ -1862,6 +1873,13 @@ class TmuxClaudeRunner:
                 # very same ``❯``, so a claude that just exited must not read as
                 # a ready input box.
                 return True
+            elif settled >= _CONTINUE_SETTLE:
+                # Still alive, dialog gone, but the TUI has painted nothing we
+                # recognise. It outlived the window in which a failed
+                # ``--continue`` exits, so it started.
+                return True
+            else:
+                settled += _POLL_INTERVAL
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 

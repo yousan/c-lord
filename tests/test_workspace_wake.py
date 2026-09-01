@@ -48,6 +48,10 @@ def _fast(monkeypatch):
     """Collapse the runner's real-time waits so a test finishes in milliseconds."""
     monkeypatch.setattr("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.001)
     monkeypatch.setattr("c_lord.claude.tmux_runner._CONTINUE_CHECK_DELAY", 0.001)
+    # #657: the --continue verdict now watches the pane instead of trusting a
+    # fixed delay, so its settle window and ceiling are real-time waits too.
+    monkeypatch.setattr("c_lord.claude.tmux_runner._CONTINUE_SETTLE", 0.002)
+    monkeypatch.setattr("c_lord.claude.tmux_runner._CONTINUE_VERDICT_TIMEOUT", 0.05)
 
 
 class TestRunnerWake:
