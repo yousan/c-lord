@@ -24,6 +24,13 @@ class Interruptable(Protocol):
     async def interrupt(self) -> None: ...
 
 
+# Every message that carries a ⏹ Stop button starts with this. The startup sweep
+# (:mod:`c_lord.stale_stop_buttons`, #634) finds a previous process's leftovers
+# by it, so the text lives here and nowhere else — a copy that drifts becomes
+# residue nobody cleans up.
+STOP_MESSAGE_PREFIX = "-# ⏺ Session running"
+
+
 class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """A ⏹ Stop button attached to the session status message.
 
@@ -60,7 +67,7 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
 
         old_message = self._message
         with contextlib.suppress(discord.HTTPException):
-            new_message = await thread.send("-# ⏺ Session running", view=self)
+            new_message = await thread.send(STOP_MESSAGE_PREFIX, view=self)
             self._message = new_message
 
         if old_message:
