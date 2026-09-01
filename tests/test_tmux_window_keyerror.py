@@ -41,14 +41,15 @@ def test_remap_window_cleanup_removes_old_mapping() -> None:
     the old thread→window mapping is removed and the window is rebound.
     """
     mgr = TmuxSessionManager(mapping_path="")
-    mgr._thread_to_window[111] = "work1"  # old mapping to the window being remapped
+    mgr._thread_to_window[111] = "@1"  # old mapping to the window being remapped
 
     with (
         patch.object(mgr, "_check_available", return_value=True),
-        patch("c_lord.tmux._run", return_value=MagicMock(returncode=0, stdout="work1\n")),
+        # #649: list-windows now reports id\tname, and the mapping keys on the id.
+        patch("c_lord.tmux._run", return_value=MagicMock(returncode=0, stdout="@1\twork1\n")),
     ):
         ok = mgr.remap_window(999, "work1")
 
     assert ok is True
-    assert mgr._thread_to_window[999] == "work1"
+    assert mgr._thread_to_window[999] == "@1"
     assert 111 not in mgr._thread_to_window

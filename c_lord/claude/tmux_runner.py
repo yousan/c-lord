@@ -146,6 +146,29 @@ def _missing_window(action: str, thread_id: int) -> str:
     )
 
 
+def _ambiguous_window(action: str, thread_id: int, session: str, names: list[str]) -> str:
+    """User-facing text for "the tmux target does not identify one window" (#649).
+
+    Two windows sharing a name make every ``session:NAME`` target ambiguous, so
+    keystrokes land in whichever tmux matched first — another thread's checkout.
+    The pane is alive and well, which is why the #527 wording ("ペインが落ちて
+    いる", go run ``/restart-claude``) sent people to a command that could not
+    possibly help: it restarts Claude *inside* a window, and the duplicate name
+    is still there afterwards. Two threads sat dead for a day following that
+    advice. Name the real problem and give the command that actually shows it.
+    """
+    listed = ", ".join(f"`{n}`" for n in names)
+    return (
+        f"{action}に失敗しました — このスレッドの tmux ウィンドウを一意に特定できません "
+        f"(thread={thread_id})。同じ名前のウィンドウが複数あります: {listed}。"
+        "ペインが落ちているのではなくターゲットが曖昧なので、"
+        "`/restart-claude` では直りません。"
+        f"ホストで `tmux list-windows -t {session} "
+        "-F '#{window_id} #{window_name} #{@thread_id} #{pane_current_path}'` を確認し、"
+        "重複したウィンドウを rename するか、不要な方を kill してください。"
+    )
+
+
 def _stuck_in_input_box(prompt: str) -> str:
     """User-facing text for "typed into the pane, but it would not submit" (#560).
 
@@ -955,14 +978,31 @@ class TmuxClaudeRunner:
         self._silent_stop = False
         self._last_capture: str = ""
 
+    async def _duplicate_window_names(self) -> list[str]:
+        """Ambiguous window names in this thread's session, or ``[]`` (#649).
+
+        Undecidable reads as "no duplicates": this only ever *replaces* a
+        broader message with a sharper one, so a failed probe must fall back to
+        the general wording rather than assert a cause we did not verify.
+        """
+        try:
+            return await asyncio.to_thread(self._tmux.duplicate_window_names)
+        except Exception:
+            logger.warning(
+                "Could not check thread %d's session for duplicate window names",
+                self._thread_id,
+            )
+            return []
+
     async def _start_failure_reason(self, prompt: str) -> str:
         """Explain a failed ``start_claude`` by asking tmux, not by guessing (#621).
 
-        The call returns a bare ``False`` for two failures that need opposite
-        advice: a pane that will not take the keystrokes, and a window that was
-        never created (which is what every scheduled run hit — see #621).  Same
-        shape as the #560 probe on the send path: read the actual state before
-        telling the user what to do about it.
+        The call returns a bare ``False`` for failures that need opposite
+        advice: a pane that will not take the keystrokes, a window that was
+        never created (which is what every scheduled run hit — see #621), and a
+        window name that identifies two windows (#649).  Same shape as the #560
+        probe on the send path: read the actual state before telling the user
+        what to do about it.
         """
         try:
             has_window = bool(await asyncio.to_thread(self._tmux.session_exists, self._thread_id))
@@ -972,6 +1012,20 @@ class TmuxClaudeRunner:
             logger.warning("Could not check whether thread %d has a tmux window", self._thread_id)
             has_window = True
         if has_window:
+            # #649: a duplicate name means the keystrokes went somewhere — just
+            # not here. Check before blaming a pane that is running fine.
+            if dupes := await self._duplicate_window_names():
+                logger.error(
+                    "start_claude failed for thread %d while %d window name(s) are "
+                    "duplicated in session %s (%s) — the target is ambiguous (#649)",
+                    self._thread_id,
+                    len(dupes),
+                    self._tmux.session_name,
+                    ", ".join(dupes),
+                )
+                return _ambiguous_window(
+                    "Claude の起動", self._thread_id, self._tmux.session_name, dupes
+                )
             return _delivery_failure("Claude の起動", prompt)
         logger.error(
             "start_claude failed with no tmux window for thread %d — "
@@ -1034,15 +1088,29 @@ class TmuxClaudeRunner:
                 # ``/restart-claude`` would discard the message the user just
                 # wrote, so ask the pane which one it is before advising.
                 stuck = await asyncio.to_thread(self._tmux.input_box_holds, self._thread_id, prompt)
+                if stuck:
+                    reason = _stuck_in_input_box(prompt)
+                elif dupes := await self._duplicate_window_names():
+                    # #649: not stuck and not dead — the keystrokes were typed
+                    # into a window this thread does not own.
+                    logger.error(
+                        "send_input failed for thread %d while %d window name(s) are "
+                        "duplicated in session %s (%s) — the target is ambiguous (#649)",
+                        self._thread_id,
+                        len(dupes),
+                        self._tmux.session_name,
+                        ", ".join(dupes),
+                    )
+                    reason = _ambiguous_window(
+                        "メッセージの送信", self._thread_id, self._tmux.session_name, dupes
+                    )
+                else:
+                    reason = _delivery_failure("メッセージの送信", prompt)
                 yield StreamEvent(
                     raw={},
                     message_type=MessageType.RESULT,
                     is_complete=True,
-                    error=(
-                        _stuck_in_input_box(prompt)
-                        if stuck
-                        else _delivery_failure("メッセージの送信", prompt)
-                    ),
+                    error=reason,
                 )
                 return
         else:
@@ -1890,7 +1958,11 @@ class TmuxClaudeRunner:
 
         window = self._tmux._find_window_for_thread(self._thread_id)
         if window:
-            target = f"{self._tmux.session_name}:{window}"
+            # #649: address the unique window_id. Accepting a permission prompt
+            # is a keystroke that changes what Claude is allowed to do — the one
+            # place an ambiguous ``session:name`` target must never send it to
+            # whichever window happened to be first.
+            target = self._tmux._target(window)
             key = "y" if self._is_yn_prompt(pane_text) else "Enter"
             _run(["tmux", "send-keys", "-t", target, key])
 

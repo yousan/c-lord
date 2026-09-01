@@ -27,10 +27,10 @@ window 名 `new-window`（`-a`/index 指定なし）は tmux の既定で **最�
 | 項目 | 実装 |
 |------|------|
 | トリガ | `create_session()` の**新規 window 作成パス**末尾で `_sort_windows_unlocked()` を呼ぶ（adoption / 既存再利用パスでは呼ばない） |
-| 並べ替え | `#{window_id}`（不変 ID）で各 window を一旦高 index 帯（`_SORT_TMP_BASE`）へ希望順に退避 → `move-window -r` で base-index から詰め直す。**index だけ変わり、名前・`@thread_id`・ペインは保持**（bot の識別は `@thread_id`/名前ベースで index 非依存） |
+| 並べ替え | `#{window_id}`（不変 ID）で各 window を一旦高 index 帯（`_SORT_TMP_BASE`）へ希望順に退避 → `move-window -r` で base-index から詰め直す。**index だけ変わり、名前・`@thread_id`・ペインは保持**（bot の識別は `@thread_id` → `window_id` ベースで index 非依存。#649 以降、名前はターゲットに使わない） |
 | 不要 churn 回避 | 既に整列済みなら `move-window` を発行しない |
 | フォーカス | `new-window -d` |
-| 直列化 | `TmuxSessionManager._lock`（`threading.Lock`）で「作成 → `@thread_id` 設定 → ソート」を 1 クリティカルセクションに。同時 add で `move-window` が交錯しない |
+| 直列化 | 「作成 → `@thread_id` 設定 → ソート」を 1 クリティカルセクションに。同時 add で `move-window` が交錯しない。ロックは**tmux セッション名をキーにしたプロセス内のロック**（`_session_lock()`）で、`TmuxSessionManager._lock` は毎回そこから引く。#649 以前はインスタンス変数の `threading.Lock` だったため、同じセッションを指す別インスタンス同士では直列化されず、同名 window が2枚できていた → [tmux-window-identity.md](./tmux-window-identity.md) |
 | ソートキー | `_window_sort_key()` に分離（番号付き昇順 → 非番号は末尾・相対順保持） |
 | 起動時 | 専用フックは無い。再起動後に既存 window が乱れていても、**次に新スレッドが立った時のフルソートで一括整列**する（per-channel の遅延生成モデルに沿う） |
 

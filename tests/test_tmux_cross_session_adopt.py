@@ -54,7 +54,10 @@ class TestAdoptWindowFromOtherSession:
         subs = [c[1] for c in calls if len(c) > 1]
         assert "move-window" in subs, "the existing window must be moved, not abandoned"
         assert "new-window" not in subs, "a second window would mean a second Claude"
-        assert mgr._thread_to_window[THREAD] == name
+        # #649: the mapping tracks the moved window by its immutable id, even
+        # though the window was renamed into this session's ``w{N}`` scheme.
+        assert mgr._thread_to_window[THREAD] == "@42"
+        assert name.startswith("w")
 
         move = next(c for c in calls if c[1] == "move-window")
         # Addressed by window_id: "games:w5" is ambiguous the moment another
