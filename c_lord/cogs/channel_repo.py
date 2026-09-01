@@ -228,6 +228,27 @@ class ChannelRepoCog(commands.Cog):
         self._tmux_cache[channel_id] = manager
         return manager
 
+    async def divergent_session_name(self, channel_id: int, thread_id: int) -> str | None:
+        """The thread's tmux session name, but only when it is not the channel's (#618).
+
+        Returns ``None`` for the common case — a thread working in its own
+        channel's repository — so its Discord name is left exactly as it was and
+        no existing thread gets renamed. Returns the session name when the thread
+        was bound elsewhere (``/clord-thread-init``, ``/clord repo:``), which is
+        the case where reading ``W<N>`` and attaching to the channel's session
+        lands on the wrong window (or on nothing at all).
+        """
+        from ..tmux import SESSION_NAME
+
+        thread_mgr = await self.resolve_tmux_manager(channel_id, thread_id=thread_id)
+        if thread_mgr is None:
+            return None
+        channel_mgr = await self.resolve_tmux_manager(channel_id, thread_id=None)
+        channel_session = channel_mgr.session_name if channel_mgr else SESSION_NAME
+        if thread_mgr.session_name == channel_session:
+            return None
+        return thread_mgr.session_name
+
     async def managed_session_names(self) -> set[str]:
         """tmux session names this bot manages (#438).
 

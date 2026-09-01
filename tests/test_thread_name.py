@@ -306,3 +306,98 @@ def test_parse_topic_strips_closed_marker():
         assert parse_topic_from_name(f"{mark} #404 認証リファクタ") == "認証リファクタ"
         assert parse_topic_from_name(f"{mark} W3 │ 認証リファクタ") == "認証リファクタ"
         assert parse_topic_from_name(f"{mark} 認証リファクタ") == "認証リファクタ"
+
+
+# ── #618: a thread in another repo's session says so, on the left ───────────
+
+
+class TestSessionLabel:
+    """The name must say which tmux session a thread is in, when it is not the
+    channel's own.
+
+    Window numbers restart per session, so ``W5`` appears twice in one channel's
+    sidebar (production really shows ``W5 │ 2017.l2tp.org`` next to
+    ``W5 │ monitoring``). Reading ``W1`` and attaching to the channel's session
+    is exactly the mistake #616/#618 came from — the window lives in
+    ``qiita-article``. Prefixing the *left* edge, where the sidebar never clips,
+    makes the name carry its own attach target.
+    """
+
+    def test_session_label_leads_the_window_number(self):
+        name = build_name(
+            "Qiita記事執筆",
+            "waiting",
+            1,
+            lamp=False,
+            issue_ref="#598",
+            origin_issue_ref="#598",
+            session_label="qiita-article",
+        )
+        assert name.startswith("qiita-article:W1 │ #598 ")
+
+    def test_no_label_renders_exactly_as_before(self):
+        without = build_name("pt-jp 調査", "waiting", 9, lamp=False, issue_ref="#612")
+        explicit_none = build_name(
+            "pt-jp 調査", "waiting", 9, lamp=False, issue_ref="#612", session_label=None
+        )
+        assert without == explicit_none == "W9 │ #612 pt-jp 調査"
+
+    def test_two_w5_threads_become_distinguishable(self):
+        a = build_name(
+            "2017.l2tp.org",
+            "waiting",
+            5,
+            lamp=False,
+            issue_ref="#540",
+            session_label="2017_l2tp_org",
+        )
+        b = build_name(
+            "monitoring 監視改修",
+            "waiting",
+            5,
+            lamp=False,
+            issue_ref="#577",
+            session_label="monitoring",
+        )
+        assert a != b
+        assert a.startswith("2017_l2tp_org:W5")
+        assert b.startswith("monitoring:W5")
+
+    def test_label_survives_a_long_topic_which_is_truncated_instead(self):
+        name = build_name(
+            "とても長いトピックがここに延々と続いていくのでいずれ上限に当たります",
+            "waiting",
+            1,
+            lamp=False,
+            issue_ref="#598",
+            session_label="qiita-article",
+        )
+        assert len(name) <= MAX_NAME_LEN
+        assert name.startswith("qiita-article:W1 │ #598 "), (
+            "the attach target must not be shed first"
+        )
+
+    def test_closed_thread_has_no_window_so_no_label(self):
+        name = build_name(
+            "Qiita記事執筆",
+            "dead",
+            None,
+            lamp=False,
+            issue_ref="#598",
+            session_label="qiita-article",
+            closed=True,
+        )
+        assert "qiita-article" not in name
+        assert name.startswith(CLOSED_MARK)
+
+    def test_topic_extraction_strips_the_label(self):
+        """A manual rename must not fold the prefix into the stored topic."""
+        name = build_name(
+            "Qiita記事執筆",
+            "waiting",
+            1,
+            lamp=False,
+            issue_ref="#598",
+            session_label="qiita-article",
+        )
+        assert parse_topic_from_name(name) == "Qiita記事執筆"

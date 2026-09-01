@@ -360,6 +360,25 @@ class ClaudeChatCog(commands.Cog):
             return await channel_cog.resolve_manager(channel_id, thread_id=thread_id)
         return None
 
+    async def _divergent_session_name(self, thread: object) -> str | None:
+        """The tmux session this thread is in, when it is not its channel's (#618).
+
+        ``None`` for the common case, which keeps every existing thread name
+        byte-identical (and therefore un-renamed).
+        """
+        from .channel_repo import ChannelRepoCog
+
+        channel_id = getattr(thread, "parent_id", None)
+        thread_id = getattr(thread, "id", None)
+        if channel_id is None or thread_id is None:
+            return None
+        channel_cog = self.bot.get_cog("ChannelRepoCog")
+        if channel_cog is None or not isinstance(channel_cog, ChannelRepoCog):
+            return None
+        with contextlib.suppress(Exception):
+            return await channel_cog.divergent_session_name(channel_id, thread_id)
+        return None
+
     async def _bind_thread_repo(self, thread_id: int, channel_id: int, repo: str) -> str | None:
         """Bind a freshly created thread to *repo* (#514).
 
@@ -568,6 +587,10 @@ class ClaudeChatCog(commands.Cog):
             issue_ref=issue_ref,
             origin_issue_ref=origin_issue_ref,
             closed=is_closed(record),
+            # #618: only set when the thread sits in another repo's session, so
+            # the name carries its own attach target instead of a W<N> that is
+            # ambiguous across sessions.
+            session_label=await self._divergent_session_name(thread),
         )
         if (thread.name or "") == new_name:
             return

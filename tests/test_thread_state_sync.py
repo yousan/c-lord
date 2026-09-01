@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from c_lord.thread_name import CLOSED_MARK
 from c_lord import thread_state_sync
+from c_lord.thread_name import CLOSED_MARK
 from c_lord.thread_state_sync import (
     ThreadStateSyncLoop,
     _index_by_thread_id,
@@ -638,7 +638,7 @@ async def test_sync_one_timeout_sets_conservative_backoff():
 
     fake_thread = MagicMock()
     fake_thread.name = "old name"
-    fake_thread.edit = AsyncMock(side_effect=asyncio.TimeoutError())
+    fake_thread.edit = AsyncMock(side_effect=TimeoutError())
 
     bot = MagicMock()
     bot.get_channel.return_value = fake_thread
@@ -1467,3 +1467,55 @@ async def test_a_successful_bridge_clears_the_failure_count():
             await asyncio.gather(loop._ask_bridges.pop(579_103), return_exceptions=True)
 
     assert loop._ask_bridge_failures.get(579_103, 0) == 0
+
+
+async def test_sync_one_keeps_the_session_label_in_name():
+    """#618: the 60s sweep must not repaint the session label away.
+
+    The same trap #414 / #593 / #512 each fell into: the naming pass writes a
+    part of the name, then this loop rebuilds the name a minute later without
+    it and quietly undoes the work.
+    """
+    repo = MagicMock()
+    repo.set_state = AsyncMock()
+    repo.set_tmux_window_id = AsyncMock()
+
+    fake_thread = MagicMock()
+    fake_thread.name = "old name"
+    fake_thread.parent_id = 999
+    fake_thread.id = 333
+    fake_thread.edit = AsyncMock()
+
+    channel_cog = MagicMock()
+    channel_cog.divergent_session_name = AsyncMock(return_value="qiita-article")
+
+    bot = MagicMock()
+    bot.get_channel.return_value = fake_thread
+
+    loop = ThreadStateSyncLoop(bot, repo, interval_seconds=999)
+    # The helper is what decides "another repo's session"; stub it directly so
+    # the test stays about the sweep, not about cog lookup.
+    loop._divergent_session_name = AsyncMock(return_value="qiita-article")
+
+    rec = _Rec(thread_id=333, state="dead", topic="Qiita記事", issue_ref="598")
+    by_tid = {
+        333: {
+            "window_id": "@9",
+            "window_index": "0",
+            "thread_id": "333",
+            "session_name": "qiita-article",
+            "window_name": "w1",
+        }
+    }
+
+    with (
+        patch.object(thread_state_sync, "discord") as discord_mock,
+        patch.object(thread_state_sync, "_capture_pane_text", return_value="❯ "),
+    ):
+        discord_mock.Thread = fake_thread.__class__
+        discord_mock.HTTPException = Exception
+        await loop._sync_one(rec, by_tid)
+
+    name = fake_thread.edit.await_args.kwargs["name"]
+    # (the sweep keeps the lamp emoji, so match the token, not the string start)
+    assert "qiita-article:W1 │ " in name, name

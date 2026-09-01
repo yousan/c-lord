@@ -439,6 +439,25 @@ class ThreadStateSyncLoop:
             )
             self._initial_pass = False
 
+    async def _divergent_session_name(self, thread: discord.Thread) -> str | None:
+        """The tmux session *thread* is in, when it is not its channel's (#618).
+
+        ``None`` for the common case, which keeps the name byte-identical and so
+        produces no rename — important on a 60s loop against Discord's ~2
+        renames / 10 min limit.
+        """
+        from .cogs.channel_repo import ChannelRepoCog
+
+        parent_id = getattr(thread, "parent_id", None)
+        if parent_id is None:
+            return None
+        cog = self._bot.get_cog("ChannelRepoCog")
+        if not isinstance(cog, ChannelRepoCog):
+            return None
+        with contextlib.suppress(Exception):
+            return await cog.divergent_session_name(parent_id, thread.id)
+        return None
+
     async def _sync_one(
         self,
         record,  # SessionRecord
@@ -502,16 +521,8 @@ class ThreadStateSyncLoop:
         # so this loop computes state="dead" for it every tick — without the flag
         # it would rebuild the plain name and quietly undo the marker that
         # /close-workspace just applied.
-        new_name = build_name(
-            record.topic,
-            new_state,
-            window_number,
-            issue_ref=record.issue_ref,
-            origin_issue_ref=record.origin_issue_ref,
-            closed=is_closed(record),
-        )
-
-        # Fetch the Discord thread and rename if different.
+        # Fetch the Discord thread first: the name needs its parent channel to
+        # tell "this thread is in another repo's session" from the common case.
         try:
             channel = self._bot.get_channel(thread_id)
             if channel is None:
@@ -523,6 +534,20 @@ class ThreadStateSyncLoop:
 
         if not isinstance(channel, discord.Thread):
             return
+
+        # #618: without this the 60s sweep would rebuild the name without the
+        # session label and quietly undo it a minute after the naming pass wrote
+        # it — the same way #414/#593/#512 had to be repeated here.
+        new_name = build_name(
+            record.topic,
+            new_state,
+            window_number,
+            issue_ref=record.issue_ref,
+            origin_issue_ref=record.origin_issue_ref,
+            closed=is_closed(record),
+            session_label=await self._divergent_session_name(channel),
+        )
+
         if (channel.name or "") == new_name:
             return
 
