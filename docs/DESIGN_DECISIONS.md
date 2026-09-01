@@ -399,3 +399,20 @@ Discord の返信機能で別メッセージに返信した）とき、c-lord �
 - token は prompt にもファイルにも一切出さない（discord.py が内部で auth を運ぶ）。
 
 参照: #318（実装）/ #259（読み取り経路の設計）/ #71（経路B の3原則）/ #234（アクセス方針）。
+
+## 17. Loop engineering — c-lord は「いつ/どこで/どう見えるか」を持ち、ループの中身は Claude が持つ
+
+**決定 (2026-07-14, #489):** c-lord における loop engineering（観測→判断→行動→再観測を
+自走で回し続ける作り方）の役割分担を、単一の設計方針として固定する。**c-lord が持つのは
+ループの〈いつ (when) / どこで (where) / どう見えるか (visibility) / 状態の永続〉だけ**で、
+**〈何を (what) / いつ止めるか / dedup 判断〉は Claude 側**（プロンプト・`/loop`）に置く。
+
+これは design decision #7（No Custom AI Logic）と #9（Claude=what / c-lord=when）を
+loop engineering 全体に一般化したもの。真ん中の判断を c-lord に持たせたくなったら理念違反の
+サイン。可視化（理念 B）は自走するほど命綱になるため最優先。
+
+**全文・境界の表・既存資産マップ（scheduler / webhook / spawn / reply / fuzz / monitor /
+`/loop`）・ギャップ・次の一手・理念(A/B/C)整合チェックは
+[`docs/LOOP_ENGINEERING.md`](./LOOP_ENGINEERING.md) を参照。**
+
+参照: #489（本ノート）/ #7・#9（下敷きの設計判断）/ #90（SchedulerCog）/ #377（fuzz）/ #404（monitor）。
