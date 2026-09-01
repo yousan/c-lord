@@ -100,8 +100,11 @@ _LEADING_EMOJI_RE = re.compile(
 _CLOSED_PREFIX_RE = re.compile(
     r"^(?:" + "|".join(re.escape(m) for m in (CLOSED_MARK, *LEGACY_CLOSED_MARKS)) + r")\s*"
 )
-# Matches a leading "W<digits> │ " prefix (new format).
-_WORK_PREFIX_RE = re.compile(r"^W\d+\s*[│]\s*")
+# Matches a leading "W<digits> │ " prefix (new format), optionally preceded by
+# the tmux session the window lives in ("qiita-article:W1 │ ", #618). Stripping
+# it matters as much as building it: a manual rename would otherwise fold the
+# session name into the stored topic and it would double on the next rebuild.
+_WORK_PREFIX_RE = re.compile(r"^(?:[\w.-]+:)?W\d+\s*[│]\s*")
 # Matches a trailing " #<digits>" suffix (legacy backward-compat).
 _TRAILING_INDEX_RE = re.compile(r"\s*#\d+\s*$")
 # Matches a leading "#<digits> " issue/PR token (new format, #414). Sits between
@@ -125,6 +128,7 @@ def build_name(
     issue_ref: str | None = None,
     origin_issue_ref: str | None = None,
     closed: bool = False,
+    session_label: str | None = None,
 ) -> str:
     """Build a thread name from its parts, capped at :data:`MAX_NAME_LEN` characters.
 
@@ -156,6 +160,18 @@ def build_name(
     state change never produces a different name and never triggers a Discord
     rename (which is rate-limited to ~2 per 10 min per thread).
 
+    ``session_label`` (#618) is the tmux session the thread's window lives in,
+    and is passed **only when it is not the channel's own** — i.e. the thread was
+    bound to a different repository. It renders as ``<session>:W<N> │ …``.
+
+    Why the left edge, and why only then: window numbers restart per session, so
+    one channel's sidebar really does show ``W5`` twice (``W5 │ 2017.l2tp.org``
+    beside ``W5 │ monitoring`` on the production server). Reading ``W1`` and
+    attaching to the channel's session is the mistake #616/#618 came from. The
+    sidebar clips names on the *right*, so a suffix would vanish exactly when
+    names are long — which is when it is needed. The common case (a thread in
+    its own channel's repo) is left untouched, so no existing thread renames.
+
     ``closed=True`` (#512) means the user closed this session on purpose with
     ``/close-workspace``. It overrides both the lamp emoji and the ``W<N> │``
     prefix with ``[終了] ``: the lamp describes a *live* pane and the window
@@ -186,15 +202,21 @@ def build_name(
     # pane's own ``@thread_id``, never through this name.
     if window_number is not None and (closed or state not in _NO_PREFIX_STATES):
         work = f"W{window_number} │ "
+        # #618: only the divergent case is labelled — see the docstring.
+        labelled_work = f"{session_label}:{work}" if session_label else work
     else:
         work = ""
+        labelled_work = ""
 
     mark = _CLOSED_PREFIX if closed else ""
 
     topic_clean = (topic or "").strip()
     # Shed name parts in priority order when the budget is too tight: the topic
     # is most valuable, so drop the work prefix first, then the issue number.
+    # The session label sheds before the bare window number, which sheds before
+    # the issue number — the topic is only ever truncated, never dropped.
     for fixed in (
+        f"{mark}{prefix_emoji}{labelled_work}{ref_token}",
         f"{mark}{prefix_emoji}{work}{ref_token}",
         f"{mark}{prefix_emoji}{ref_token}",
         f"{mark}{prefix_emoji}",
