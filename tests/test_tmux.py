@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
+
 from unittest.mock import MagicMock, patch
 
 from c_lord.tmux import (
+    SENSITIVE_ENV_KEYS,
     SESSION_NAME,
     TmuxSessionManager,
     _pane_in_insert_mode,
@@ -95,6 +98,9 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
+                # #353: set-environment -r ×2 (secrets removed for new windows)
+                MagicMock(returncode=0),
+                MagicMock(returncode=0),
                 # #649: re-check under the session lock → _rebuild_mapping → list-windows
                 MagicMock(returncode=1, stdout=""),
                 # _find_window_by_working_dir → list-windows (no windows yet)
@@ -176,6 +182,8 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
+                MagicMock(returncode=0),  # #353 set-environment -r ×2
+                MagicMock(returncode=0),
                 MagicMock(returncode=1, stdout=""),  # #649 re-check under lock: list-windows
                 MagicMock(
                     returncode=0, stdout=""
@@ -195,6 +203,8 @@ class TestTmuxSessionManager:
                 # _find_window_for_thread cache miss → _rebuild_mapping
                 MagicMock(returncode=0, stdout=rows),  # list-windows
                 MagicMock(returncode=0),  # has-session (exists)
+                # no #353 set-environment here: the mark is issued once per
+                # manager and this is the same manager's second call.
                 MagicMock(returncode=0, stdout=rows),  # #649 re-check under lock
                 MagicMock(
                     returncode=0, stdout="@1\t/a\n"
@@ -480,8 +490,10 @@ class TestTmuxSessionManager:
             mock_run.return_value = MagicMock(returncode=0)
             assert mgr._ensure_session() is True
 
-        # Only has-session called, no new-session
-        assert mock_run.call_count == 1
+        # has-session + 2× set-environment -r (#353); no new-session
+        assert mock_run.call_count == 3
+        marked = {c[0][0][-1] for c in mock_run.call_args_list if "set-environment" in c[0][0]}
+        assert marked == set(SENSITIVE_ENV_KEYS)
 
     def test_ensure_session_creates_new(self) -> None:
         """_ensure_session creates session when it doesn't exist."""
@@ -497,6 +509,8 @@ class TestTmuxSessionManager:
                 # systemd-run) is covered in tests/test_tmux_server_cgroup.py.
                 MagicMock(returncode=0),
                 MagicMock(returncode=0),  # new-session → success
+                MagicMock(returncode=0),  # #353 set-environment -r ×2
+                MagicMock(returncode=0),
             ]
             assert mgr._ensure_session() is True
 
@@ -582,7 +596,8 @@ class TestTmuxSessionManager:
         # The assignment must sit in the env(1) prefix, before the binary.
         # (A plain "is it earlier than ' claude '" check would be fooled by the
         # "unalias claude" prelude, which also contains that substring.)
-        assert "env -u CLAUDECODE OTEL_RESOURCE_ATTRIBUTES=" in cmd_str
+        # #353 unsets the secrets between CLAUDECODE and the OTEL assignment.
+        assert re.search(r"env -u CLAUDECODE(?: -u \w+)* OTEL_RESOURCE_ATTRIBUTES=", cmd_str)
 
     def test_start_claude_without_git_repo_still_starts(self) -> None:
         """A non-repo working directory must not break the launch (#NNN)."""
@@ -1171,6 +1186,8 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1),  # has-session → not exists
                 MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session → success
+                MagicMock(returncode=0),  # #353 set-environment -r ×2
+                MagicMock(returncode=0),
             ]
             assert mgr._ensure_session() is True
 
@@ -1952,6 +1969,8 @@ class TestSortWindows:
                 MagicMock(returncode=1),  # has-session (no)
                 MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session
+                MagicMock(returncode=0),  # #353 set-environment -r ×2
+                MagicMock(returncode=0),
                 MagicMock(returncode=1, stdout=""),  # #649 re-check under the lock
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
