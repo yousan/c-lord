@@ -18,8 +18,8 @@ The bridge's security goal is:
 | Flag injection via prompts | `--` separator prevents `-p`, `--resume` etc. in prompt text |
 | Session hijacking via crafted IDs | Strict regex validation: `^[a-f0-9\-]+$` |
 | Skill name injection | Strict regex validation: `^[\w-]+$` |
-| Secrets leaking to Claude subprocess | `_STRIPPED_ENV_KEYS` removes `DISCORD_BOT_TOKEN`, `CLAUDECODE`, etc. from subprocess env |
-| Claude reading Discord secrets via Bash tool | Environment stripping prevents `echo $DISCORD_BOT_TOKEN` in Claude's Bash |
+| Secrets *inherited* by tmux panes | `SENSITIVE_ENV_KEYS` (`c_lord/tmux.py`) is removed from every tmux client env, marked `set-environment -r` on bot-managed sessions, and `env -u`'d on the `claude` command line (#353) |
+| A process started inside a pane silently becoming a second production bot | Same mechanism — this inheritance is what caused the #322 contamination incidents |
 | Nesting detection bypass | `CLAUDECODE` env var stripped — subprocess won't think it's already inside Claude Code |
 
 ### What We Do NOT Protect Against
@@ -56,11 +56,11 @@ This means the bot token is **readable by the Claude session** (it `grep`s the
   token is read into a shell variable at runtime, so it does not appear in the
   command text that the transcript mirror (#71) echoes to Discord.
 
-> Note: the env-var stripping described under "Environment Isolation" below
-> (`_STRIPPED_ENV_KEYS`) is **not currently implemented** in the tmux-based
-> architecture — see #458. Regardless of that, the spawn-read path reads the
-> token from the `.env` *file*, not from an environment variable, so the
-> accepted-risk reasoning above does not depend on it.
+> Note: the env stripping described under "Environment Isolation" below **is**
+> implemented (#353, closing the #458 drift), but it does **not** make the token
+> secret from the session — the spawn-read path reads it from the `.env` *file*,
+> not from an environment variable. The accepted-risk reasoning above therefore
+> does not depend on it, and stripping is not a substitute for it.
 
 ## Input Validation
 
@@ -104,22 +104,45 @@ Skill names are passed to Claude Code as `/{name}`. The regex ensures only alpha
 
 ## Environment Isolation
 
-### Stripped Environment Variables (runner.py)
+### Secrets are kept out of the tmux environment (#353)
 
 ```python
-_STRIPPED_ENV_KEYS = frozenset({
-    "CLAUDECODE",           # Nesting detection
-    "DISCORD_BOT_TOKEN",    # Bot authentication
-    "DISCORD_TOKEN",        # Alternative token var
-    "API_SECRET_KEY",       # API authentication
-})
+# c_lord/tmux.py
+SENSITIVE_ENV_KEYS = ("DISCORD_BOT_TOKEN", "CLORD_API_SECRET")
 ```
 
-These variables are removed from the subprocess environment before spawning Claude Code:
+A tmux **server** inherits the environment of whichever process first runs a
+tmux command, and every window it creates inherits that. When the bot wins that
+race, every pane can read the token with a plain `printenv`. Three layers keep
+that from happening:
 
-1. **DISCORD_BOT_TOKEN / DISCORD_TOKEN**: Prevents Claude Code from reading the Discord token via its Bash tool
-2. **CLAUDECODE**: Claude Code uses this to detect nesting. Stripping it ensures the subprocess runs as a fresh top-level instance
-3. **API_SECRET_KEY**: If the host bot exposes a REST API, this key shouldn't leak to Claude
+1. **`_tmux_client_env()`** removes the keys from the environment of every tmux
+   command c-lord runs, so a server *c-lord* starts is born clean. This is the
+   source fix — the leak lives in `_create_global_session`'s plain
+   `tmux new-session` fallback, taken whenever `systemd-run` is unavailable
+   (containers, CI) or its unit fails.
+2. **`_strip_sensitive_env()`** marks the keys `set-environment -r` on each
+   bot-managed session, which repairs a server that was *already* started dirty
+   — by a c-lord older than this fix, or by any other token-holding process.
+   Scoped per session on purpose: a server-global mark would also reach the
+   unrelated sessions sharing the host's tmux server.
+3. **`start_claude()`** adds `env -u <key>` to the `claude` command line, so the
+   Claude process is clean even in a session nobody marked.
+
+Panes that are **already running** keep the environment they started with —
+that cannot be fixed retroactively. They age out as windows are recreated.
+
+**What this does and does not buy.** It does *not* make the token secret from
+the session: the `.env` file is readable by the same Unix user, and the injected
+`discord-read` skill (#259) tells Claude to read it from there — see the
+accepted risk above, and #234. What it prevents is **accidental inheritance**:
+a process started inside a pane picking the production token out of its
+environment without anyone intending it. That is exactly what happened in #322,
+where a staging bot became a second production bot. Treat it as
+contamination-prevention, not confidentiality.
+
+`CLAUDECODE` is separately removed (`env -u CLAUDECODE`) so the spawned Claude
+does not think it is nested inside another Claude Code.
 
 ### What's NOT Stripped
 
@@ -219,7 +242,7 @@ Before merging changes to `runner.py`, `_run_helper.py`, or any Cog:
 - [ ] No `shell=True` in any subprocess call
 - [ ] `--` separator present before user-supplied arguments
 - [ ] All external input validated (session IDs, skill names, channel IDs)
-- [ ] `_STRIPPED_ENV_KEYS` covers any new secret variables
+- [ ] `SENSITIVE_ENV_KEYS` (`c_lord/tmux.py`) covers any new secret variables
 - [ ] No string formatting in SQL queries (use `?` placeholders)
 - [ ] `allowed_user_ids` check present in any new message handler
 - [ ] No new `os.system()`, `subprocess.run(shell=True)`, or `eval()` calls
