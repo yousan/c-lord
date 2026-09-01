@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .claude.types import AskOption, AskQuestion
+from .command_gate import owns_channel
 from .concurrency import SessionRegistry
 from .coordination.service import CoordinationService
 from .discord_ui.ask_bus import ask_bus
@@ -90,10 +91,29 @@ class ClaudeDiscordBot(commands.Bot):
         messages are marked as bot-authored, this prevents E2E testing via
         webhooks.  We relax the check: webhook messages (identified by
         ``message.webhook_id``) are allowed through.
+
+        This is also where a text command is checked against the instance that
+        is supposed to run it (#596).  Discord delivers ``!workspace-stop`` to
+        **every** c-lord that can read the channel, so a command that decides
+        for itself — or, as ~22 of them did, decides nothing — is executed by
+        the whole fleet: three staging bots stopped two production workspaces
+        on 2026-08-27.  The gate lives here rather than in the commands because
+        one check per command is a check that will be forgotten by the next
+        command (#596 AC3); a command we are not responsible for is dropped in
+        **silence**, since an error is one more bot talking over the one that
+        does own the thread (#522).
         """
         if message.author.bot and not message.webhook_id:
             return
         ctx = await self.get_context(message)
+        if ctx.command is not None and not await owns_channel(self, message.channel):
+            # DEBUG: in a shared guild every bystander logs this for every
+            # command, and there is nobody to tell — the point is to be quiet.
+            logger.debug(
+                "Command %r ignored — not this instance's channel (#596)",
+                getattr(ctx.command, "qualified_name", ctx.command),
+            )
+            return
         await self.invoke(ctx)
 
     async def on_error(self, event_method: str, /, *args: object, **kwargs: object) -> None:
