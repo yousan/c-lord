@@ -2621,13 +2621,9 @@ class ClaudeChatCog(commands.Cog):
                     thread=thread,
                 )
 
-            async def _notify_stall() -> None:
-                await thread.send(
-                    "-# \u26a0\ufe0f No activity for 30s — could be extended thinking "
-                    "or context compression. Will resume automatically."
-                )
-
-            status = StatusManager(user_message, on_hard_stall=_notify_stall)
+            # #473: a hard stall shows the ⚠️ lamp on the trigger message and
+            # nothing else — no prose line in the thread.
+            status = StatusManager(user_message)
             await status.set_running()
 
             model_override = await self._get_current_model()
