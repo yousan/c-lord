@@ -638,7 +638,11 @@ async def test_sync_one_timeout_sets_conservative_backoff():
 
     fake_thread = MagicMock()
     fake_thread.name = "old name"
-    fake_thread.edit = AsyncMock(side_effect=TimeoutError())
+    # noqa: UP041 is deliberate — on Python 3.10 ``asyncio.TimeoutError`` is NOT
+    # the builtin ``TimeoutError``, and the handler under test catches the asyncio
+    # one (see the matching noqa in thread_state_sync). Autofixing this to the
+    # builtin makes the test raise something the code cannot catch.
+    fake_thread.edit = AsyncMock(side_effect=asyncio.TimeoutError())  # noqa: UP041
 
     bot = MagicMock()
     bot.get_channel.return_value = fake_thread
