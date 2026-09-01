@@ -122,7 +122,7 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 |---------|-------------|-------|
 | `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
-| `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
+| `/tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane — a stopped workspace is restored first (debug) | Thread only |
 | `/close-workspace` | **終了**: close the tmux window, keep the session (see below) | Thread only |
 | `/reopen-workspace` | Reopen a 終了 thread so messages run again | Thread only |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
@@ -158,7 +158,9 @@ resumable.
 
 It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
 
-If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` and `/tmux-screenshot` no longer dead-end with a bare "No tmux window found." They tell you what sending a message will *actually* do, which depends on the thread (#538):
+**`/tmux-screenshot` on a stopped workspace restores it and then takes the picture (#642).** No tmux window means no pixels to capture, and since [the 4-hour sleep](specs/workspace-sleep.md) any thread nobody touched for four hours is in exactly that state — so answering with "send a message and it will come back" made the command stop returning pictures at all. It now brings the workspace back the way a message would (`claude --continue`, but with **no prompt**, so no turn runs), captures the restored pane, and posts the PNG with a `-# 🔄 …復元してから撮影しました` line so the few seconds of waiting are accounted for. Two thread states are **not** restored, because a message would not restore them either: a `[終了]` thread (that state was your decision — it still offers **▶️ 再開する**) and a thread c-lord has no record of. If the restore itself fails, it says so instead of posting an empty screen.
+
+If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` (and `/tmux-screenshot`, for the two states above) no longer dead-ends with a bare "No tmux window found." It tells you what sending a message will *actually* do, which depends on the thread (#538):
 
 - **The thread has a session record** → sending a message auto-restores it (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
 - **The session was closed** (`[終了]` / `/close-workspace`) → the message is held and a **▶️ 再開する** button is offered instead (#512).
@@ -237,7 +239,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
 | `!clord-status [all]` | List this channel's sessions (`all` = include closed) | `!clord-status all` | `/clord-status` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
-| `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
+| `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane (restores a stopped workspace first) | `!tmux-screenshot` | `/tmux-screenshot` |
 | `!resync` | Reconnect this thread's Discord mirror to tmux | `!resync` | `/resync` |
 | `!resync-channel` | Reconnect the mirror for every thread in the channel | `!resync-channel` | `/resync-channel` |
 | `!restart-claude` | Restart the Claude process (keeps the conversation) | `!restart-claude` | `/restart-claude` |

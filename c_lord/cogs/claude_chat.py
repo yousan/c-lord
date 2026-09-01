@@ -2115,6 +2115,96 @@ class ClaudeChatCog(commands.Cog):
             )
         return True
 
+    async def wake_workspace(self, thread: discord.Thread) -> bool:
+        """Restore a stopped workspace without running a turn — #642.
+
+        Public so ``SessionManageCog``'s ``/tmux-screenshot`` can reach it through
+        ``bot.get_cog``, the same loose coupling as :meth:`mark_reopened`. It
+        lives here rather than in the command because **this** is where a turn's
+        spawn is assembled — checkout, tmux window, model, effort, permission
+        flags. A second assembly of those in another cog is how the process a
+        wake leaves behind stops matching the one the next message expects, and
+        the user gets two Claudes on one checkout.
+
+        Whether a workspace *may* be woken is the caller's decision (a `[終了]`
+        thread must not be), so this only reports whether it worked.
+
+        Takes the same per-thread setup lock ``on_message`` does. Two
+        ``/tmux-screenshot`` clicks (or a message landing mid-wake) would
+        otherwise both find no running Claude and each type a ``claude`` command
+        line into the same pane — the second one landing inside the first one's
+        TUI as a stray turn. Unlike a turn, the whole wake runs under the lock:
+        the race is the startup itself, and it is bounded by ``wake``'s timeout.
+        """
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+        if tmux_manager is None:
+            logger.info("%s wake: no repo binding for this channel", log_ctx(thread_id=thread.id))
+            return False
+
+        lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
+        async with lock:
+            return await self._wake_locked(thread, tmux_manager, parent_channel_id)
+
+    async def _wake_locked(
+        self,
+        thread: discord.Thread,
+        tmux_manager: TmuxSessionManager,
+        parent_channel_id: int,
+    ) -> bool:
+        """The body of :meth:`wake_workspace`, under the per-thread setup lock."""
+        import asyncio as _asyncio
+
+        session_dir_manager = await self._resolve_session_dir_manager(
+            parent_channel_id, thread_id=thread.id
+        )
+        working_dir = self.runner.working_dir
+        if session_dir_manager is not None:
+            # Idempotent: the checkout is still there after a sleep (sleep takes
+            # the tmux window and nothing else), so this returns the existing
+            # path. It re-clones only when the directory really is gone.
+            working_dir = await _asyncio.to_thread(
+                session_dir_manager.create_session_dir, thread.id, None
+            )
+        await _asyncio.to_thread(tmux_manager.create_session, thread.id, working_dir or ".")
+
+        model = await self._get_current_model() or self.runner.model
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=thread.id,
+            model=model,
+            working_dir=working_dir,
+            timeout_seconds=self.runner.timeout_seconds,
+            dangerously_skip_permissions=True,
+            effort=self.runner.effort,
+        )
+        if not await runner.wake():
+            return False
+
+        # Awake and used — see ``SessionRepository.touch``. Without the
+        # ``last_used_at`` bump the idle sweep would never revisit this thread,
+        # and a screenshot would cost 400 MB of resident Claude indefinitely.
+        with contextlib.suppress(Exception):
+            await self.repo.touch(thread.id)
+
+        # The restore assigns a new tmux window, and the thread name carries that
+        # number as a hint (#95). Left stale it points at a window that no longer
+        # exists — the same rename the message path performs.
+        try:
+            await self._apply_thread_naming(
+                thread=thread,
+                tmux_manager=tmux_manager,
+                first_message="",
+                working_dir=working_dir,
+            )
+        except Exception:
+            logger.warning(
+                "%s wake: thread naming failed", log_ctx(thread_id=thread.id), exc_info=True
+            )
+
+        logger.info("%s workspace woken for capture (#642)", log_ctx(thread_id=thread.id))
+        return True
+
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).
 

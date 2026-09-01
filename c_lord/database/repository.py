@@ -297,6 +297,29 @@ class SessionRepository:
                 )
             await db.commit()
 
+    async def touch(self, thread_id: int) -> None:
+        """Mark this workspace as used now, and awake — #642.
+
+        What :meth:`save` does for a turn, for the paths that bring a workspace
+        back up **without** running one (``/tmux-screenshot`` waking a stopped
+        thread). Both halves are load-bearing:
+
+        * ``slept_at`` — the workspace is resident again, so leaving the mark set
+          would have the next message announce a restore that already happened.
+        * ``last_used_at`` — :class:`c_lord.idle_sleep.IdleSleepLoop` skips a
+          thread it has already acted on *at that timestamp*, so a wake that did
+          not move it would leave the restored Claude resident forever: the sweep
+          would never look at it again until the user typed. Waking without this
+          is a memory leak wearing a feature's clothes.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET slept_at = NULL, "
+                "last_used_at = datetime('now', 'localtime') WHERE thread_id = ?",
+                (thread_id,),
+            )
+            await db.commit()
+
     async def update_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Persist the Discord message ID that triggered the current Claude turn.
 
