@@ -85,11 +85,17 @@ def format_relative(last_used: str, *, now: datetime) -> str:
 class StatusRow:
     """One session's row in the status table.
 
-    ``window_number`` is ``None`` for ``closed`` sessions (no tmux window), which
-    renders as ``-`` and means "no attach target".
+    ``attach`` is the **measured** ``session:window`` this thread actually lives
+    in — read back from tmux, never assembled from a template (#616). It is
+    ``None`` for ``closed`` sessions (no tmux window), which renders as ``-``
+    and means "no attach target".
+
+    ``window_number`` is kept for ordering only (it is the number inside
+    ``attach``); it is not a column any more.
     """
 
     window_number: int | None
+    attach: str | None
     status: str  # run | wait | err | closed
     topic: str
     size_bytes: int
@@ -134,15 +140,17 @@ def _build_table(
 ) -> str:
     # The CC-session id is niche (few people resume from a cold terminal), so it
     # only rides along in the ``all`` view, at the right edge (#363 feedback).
-    header = ["#", "status", "topic", "size", "used"]
+    header = ["attach", "status", "topic", "size", "used"]
     if include_session:
         header.append("cc-session")
     body: list[list[str]] = []
     for r in rows[:max_rows]:
         cells = [
-            str(r.window_number) if r.window_number is not None else "-",
+            _cell(r.attach, cap=24) if r.attach else "-",
             r.status,
-            _cell(r.topic, cap=28),
+            # #616: the attach column costs ~16 columns, paid for out of the
+            # topic's budget so the table still fits a phone-width code block.
+            _cell(r.topic, cap=20),
             format_size(r.size_bytes),
             format_relative(r.last_used, now=now),
         ]
@@ -173,7 +181,6 @@ def render_status(
     show_all: bool,
     channel_name: str,
     repo: str,
-    session_name: str,
     deleted_count: int,
     now: datetime,
     max_rows: int = 25,
@@ -183,6 +190,9 @@ def render_status(
     ``rows`` is always the full set of live **and** closed sessions for the
     channel; ``show_all`` only decides what lands in the table. Header/footer
     counts are derived from the full set plus ``deleted_count``.
+
+    There is no channel-wide session name any more (#615/#616): a channel's
+    threads can sit in several tmux sessions, so the attach target is per row.
     """
     live = [r for r in rows if r.status != "closed"]
     closed = [r for r in rows if r.status == "closed"]
@@ -196,17 +206,18 @@ def render_status(
     title = "c-lord status (all)" if show_all else "c-lord status"
     if show_all:
         head = (
-            f"{title} · #{channel_name} · {repo} · session {session_name} · "
+            f"{title} · #{channel_name} · {repo} · "
             f"{len(live)} active · {len(closed)} closed · {format_size(total_all)}"
         )
     else:
         head = (
-            f"{title} · #{channel_name} · {repo} · session {session_name} · "
-            f"{len(live)} active · {format_size(total_live)}"
+            f"{title} · #{channel_name} · {repo} · {len(live)} active · {format_size(total_live)}"
         )
 
     # attach pattern in its own copyable code block (#363 feedback: attach-only, pre).
-    attach_block = f"```\ntmux attach -t {session_name}:work<#>\n```"
+    # #616: it names no session — rows disagree, so it points at the column that
+    # carries the measured target instead of building one from a template.
+    attach_block = "```\ntmux attach -t <attach 欄をコピペ>\n```"
 
     table_rows = (live + closed) if show_all else live
     table = _build_table(table_rows, now=now, max_rows=max_rows, include_session=show_all)

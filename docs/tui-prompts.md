@@ -99,7 +99,7 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **画面シグネチャ** | TUI に選択メニュー（`☐ header` / `❯ N. label` / `Type something.` / `Chat about this`） |
 | **操作** | ↑/↓ + Enter（TUI）/ Discord ボタン・セレクト（Discord） |
 | **JSONL** | ⚠️ `StreamEvent.ask_questions` は **SDK ストリーミング経路でのみ** 埋まる。jsonl/tmux モードの tmux runner は埋めない |
-| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。自由記入 ✏️Other は「Type something. 行に直接タイプ→Enter」で回答（#172） |
+| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。自由記入 ✏️Other は、そのメニューのレイアウトに合わせて回答（#172, #650）— 旧レイアウトは「Type something. 行に直接タイプ→Enter」、preview 付きレイアウト（`Type something.` 行が無い）は「`n` で Notes を開く→タイプ→Enter」 |
 | **詳細** | [`askuserquestion-bridge.md`](./askuserquestion-bridge.md)（変換表・画像・制限） |
 
 ### 2-4. Elicitation（MCP サーバーからの入力要求）

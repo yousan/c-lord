@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from c_lord.claude.types import AskOption, AskQuestion
+from c_lord.claude.types import FREE_TEXT_NOTES, AskOption, AskQuestion
 from c_lord.discord_ui import ask_handler
 from c_lord.discord_ui.ask_bus import ask_bus
 from c_lord.discord_ui.ask_handler import bridge_pane_ask, collect_ask_answers
@@ -166,8 +166,52 @@ async def test_multi_select_other_freetext_uses_text_path(monkeypatch):
         asyncio.wait_for(bridge_pane_ask(thread, _multi_question(), runner), timeout=3.0),
         _click_soon(),
     )
-    runner.answer_menu_text.assert_awaited_once_with(3, "something custom")
+    runner.answer_menu_text.assert_awaited_once_with(3, "something custom", mode="row")
     runner.answer_menu_multi.assert_not_called()
+
+
+
+def _preview_question() -> AskQuestion:
+    """A menu drawn in the preview layout — free text goes through Notes (#650)."""
+    return AskQuestion(
+        question="どの配色にしますか？",
+        header="配色案",
+        options=[AskOption("案A", "dark"), AskOption("案B", "light"), AskOption("案C", "hc")],
+        free_text_mode=FREE_TEXT_NOTES,
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_layout_freetext_uses_the_notes_keystrokes(monkeypatch):
+    """#650: the layout the pane reported has to reach the keystroke sender.
+
+    A preview menu has no "Type something." row, so the Down×N sequence lands on
+    "Chat about this" and Enter there answers the tool with "(No answer
+    provided)" — the user's sentence is gone. The bridge must forward the mode
+    the parser read off the pane.
+    """
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    thread, _msg = _thread(650_0001)
+    runner = MagicMock()
+    runner.peek_pending_ask = AsyncMock(return_value=_preview_question())
+    runner.peek_menu_state = AsyncMock(return_value=(_preview_question(), True))
+    runner.answer_menu = AsyncMock()
+    runner.answer_menu_text = AsyncMock()
+    runner.cancel_menu = AsyncMock()
+
+    async def _click_soon():
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["stable に上げて全部あげてOK"])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _preview_question(), runner), timeout=3.0),
+        _click_soon(),
+    )
+    runner.answer_menu_text.assert_awaited_once_with(
+        3, "stable に上げて全部あげてOK", mode=FREE_TEXT_NOTES
+    )
+    runner.answer_menu.assert_not_called()
 
 
 # -- #399: prose context above the menu -------------------------------------

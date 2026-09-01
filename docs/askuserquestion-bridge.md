@@ -66,7 +66,7 @@ C案 — いったん保留
 | `☐ <header>` | embed title `❓ <header>` | header extracted |
 | question line | embed body (first line) | question extracted |
 | `❯ N. <label>` + indented description | **button `<label>`** + body legend `<label> — <description>` | label → button; description → legend (#169) |
-| `Type something.` (meta) | **`✏️ Other` button** (free-text modal) | mapped to free text — typed onto the row, then confirmed (#172) |
+| `Type something.` (meta) *or* the `Notes:` field | **`✏️ Other` button** (free-text modal) | mapped to free text; which of the two the menu has decides the keystrokes (#172, #650) |
 | `Chat about this` (meta) | *(dropped)* | TUI-only affordance |
 | `Enter to select · ↑/↓ · Esc` footer | *(dropped)* | replaced by clicking |
 | ANSI colour codes | *(stripped)* | `_normalize_capture` before detection (#166) |
@@ -126,7 +126,17 @@ spaced by `_MENU_NAV_DELAY` (#171). Free text from `✏️ Other` in a multi-sel
 question still goes through the single free-text path below (Other yields one
 typed string, not toggled options).
 
-## How free text (`✏️ Other`) is answered (#172)
+## How free text (`✏️ Other`) is answered (#172, #650)
+
+**There are two menu layouts, and they take different keystrokes.** Claude Code
+draws the classic list unless an option carries a `preview`, in which case the
+options move into a narrow left column with the preview box beside them — and
+that layout has **no `Type something.` row at all**. The free-text affordance is
+read off the pane (`_free_text_mode`, carried on `AskQuestion.free_text_mode`),
+never assumed, because sending the other layout's keys does not fail loudly: it
+answers the tool with `(No answer provided)` and the typed sentence is gone.
+
+### `row` — classic layout
 
 The `Type something.` row is **not** confirmed with Enter. Verified on a live
 Claude Code v2.1.150 TUI, pressing Enter on that row registers a *decline* and
@@ -141,11 +151,53 @@ Enter                     # records the typed text as the answer
 ```
 
 `index` is the number of real options (the meta-row sits immediately after
-them). `TmuxClaudeRunner.answer_menu_text` implements this; `send_literal`
-(in `tmux.py`) sends raw `send-keys -l` with no Enter and no jsonl ZWSP marker.
+them). Verified end-to-end: the typed text is recorded as `<question> → <text>`
+(not "User declined to answer questions").
+
+### `notes` — preview layout
+
+```
+ ☐ 配色案
+
+どの配色にしますか？
+
+❯ 1. 案A ダーク                   ┌──────────────────────────┐
+  2. 案B ライト                   │ 案A ダーク               │
+  3. 案C 高コントラスト           │ …preview…                │
+                                  └──────────────────────────┘
+
+                                  Notes: press n to add notes
+──────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
+```
+
+There is no row to walk to. Verified on a live Claude Code v2.1.252 TUI in an
+isolated tmux (2026-09-01):
+
+```
+n                         # opens the "Notes:" field (do NOT navigate first)
+send_literal(text)        # type into the field
+Enter                     # with no option selected, the notes ARE the answer
+```
+
+and the tool records
+`"どの配色にしますか？"=(no option selected) notes: <text>`.
+
+Walking `Down` × option_count here instead parks the cursor on **`Chat about
+this`**, where every printable key is ignored and `Enter` returns
+`(No answer provided)` — that is exactly how a user's typed answer was lost in
+production on 2026-09-01 (#650).
+
+### Shared
+
+`TmuxClaudeRunner.answer_menu_text` implements both; `send_literal` (in
+`tmux.py`) sends raw `send-keys -l` with no Enter and no jsonl ZWSP marker.
 Keystrokes are spaced by `_MENU_NAV_DELAY` for the same timing reason as
-`answer_menu` (#171). Verified end-to-end: the typed text is recorded as
-`<question> → <text>` (not "User declined to answer questions").
+`answer_menu` (#171). A menu that shows **neither** affordance gets
+`allow_other=False`, so no `✏️ Other` button is offered at all — better than a
+button whose keystrokes have nowhere to land.
 
 ## Multi-question Submit screen
 
@@ -362,12 +414,14 @@ Three cases stay instructions, because as answers they are nonsense:
 |---|---|
 | empty body | nothing to deliver |
 | message with attachments | a file is not a menu choice |
-| menu with no free-text row | plan-approval menus (`allow_other=False`) have no `Type something.` row (#251); typing there would mis-send keystrokes |
+| menu with no free-text affordance | plan-approval menus (`allow_other=False`) have no `Type something.` row (#251), and a menu whose pane shows neither that row nor a `Notes:` field is read the same way (#650); typing there would mis-send keystrokes |
 
 The bridge is what knows which menus take free text, so it declares it when it
 claims the menu: `ask_bus.register(thread_id, allow_free_text=question.allow_other)`.
 The flag defaults to False, so a caller that has not thought about it cannot opt
-a menu in by accident.
+a menu in by accident. For a pane-parsed menu `allow_other` is derived from the
+pane (`free_text_mode != "none"`), so the button and the keystrokes can never
+disagree about whether this menu takes typed text.
 
 ## The prose is only readable from the pane (#549)
 

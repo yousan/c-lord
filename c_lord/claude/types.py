@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import discord
@@ -63,6 +63,23 @@ TOOL_CATEGORIES: dict[str, ToolCategory] = {
 }
 
 
+#: How the open TUI menu lets a free-text answer be typed (#650).  The two
+#: layouts Claude Code draws take *different* keystrokes, and sending the wrong
+#: ones answers the tool with "(No answer provided)" — losing what the user
+#: wrote.  Read off the pane, never assumed.
+#:
+#: - ``row``   — classic layout: a "Type something." row below the options.
+#:               Type onto the highlighted row (``Down`` × N → text → Enter).
+#: - ``notes`` — preview layout (any option carries a ``preview``): no such row;
+#:               a ``Notes:`` field opened with ``n`` (``n`` → text → Enter).
+#: - ``none``  — neither affordance is on screen: the menu takes no free text.
+FREE_TEXT_ROW = "row"
+FREE_TEXT_NOTES = "notes"
+FREE_TEXT_NONE = "none"
+
+FreeTextMode = Literal["row", "notes", "none"]
+
+
 @dataclass
 class AskOption:
     """A single selectable option in an AskUserQuestion prompt."""
@@ -85,6 +102,11 @@ class AskQuestion:
     # Claude what to change") uses a different keystroke flow, so a generic
     # Other modal would mis-send keys into the open TUI menu.
     allow_other: bool = True
+    # #650: which keystrokes deliver free text on THIS menu — see FreeTextMode.
+    # ``allow_other`` says whether to offer the ✏️ Other button at all; this says
+    # how to type the answer once it arrives.  Defaults to the classic row so a
+    # hand-built AskQuestion keeps the pre-#650 behaviour.
+    free_text_mode: FreeTextMode = FREE_TEXT_ROW
     # #399: the assistant prose spoken directly above the menu (経緯・推し),
     # extracted from the pane. The CLI buffers the jsonl chunk containing the
     # menu until resolution, so without this the question reaches Discord with
@@ -201,24 +223,40 @@ class StreamEvent:
 
 
 def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
-    """Parse AskUserQuestion tool input into a list of AskQuestion objects."""
+    """Parse AskUserQuestion tool input into a list of AskQuestion objects.
+
+    The tool input is also where the menu's TUI *layout* is decided (#650):
+    Claude Code draws the preview layout — no "Type something." row, free text
+    typed into a ``Notes:`` field — exactly when the question is single-select
+    and at least one option carries a ``preview``. Deriving
+    ``free_text_mode`` here matters for the transcript-mirror bridge, which
+    builds its menu from this input and never sees the pane; without it the
+    answer keystrokes go to the wrong affordance and the user's typed sentence
+    is answered as "(No answer provided)".
+    """
     questions_raw = tool_input.get("questions", [])
     result: list[AskQuestion] = []
     for q in questions_raw:
+        raw_options = q.get("options", [])
         options = [
             AskOption(
                 label=o.get("label", ""),
                 description=o.get("description", ""),
             )
-            for o in q.get("options", [])
+            for o in raw_options
             if o.get("label")
         ]
+        multi_select = bool(q.get("multiSelect", False))
+        has_preview = any(o.get("preview") is not None for o in raw_options)
         result.append(
             AskQuestion(
                 question=q.get("question", ""),
                 header=q.get("header", ""),
-                multi_select=bool(q.get("multiSelect", False)),
+                multi_select=multi_select,
                 options=options,
+                free_text_mode=(
+                    FREE_TEXT_NOTES if has_preview and not multi_select else FREE_TEXT_ROW
+                ),
             )
         )
     return result

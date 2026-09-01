@@ -147,8 +147,9 @@ async def bridge_pane_ask(
     still-open TUI menu by sending keystrokes via *runner*:
 
     - a real option → ``runner.answer_menu(index)`` (Down×index + Enter)
-    - free text ("✏️ Other") → ``runner.answer_menu_text`` on the
-      "Type something." affordance that follows the real options
+    - free text ("✏️ Other") → ``runner.answer_menu_text`` on whichever
+      affordance this menu has: the "Type something." row that follows the real
+      options, or (preview layout) the ``Notes:`` field opened with ``n`` (#650)
     - timeout / no answer → ``runner.cancel_menu()`` (Esc)
     """
     # #535: registering IS claiming the menu. Several paths can spot the same
@@ -352,9 +353,14 @@ async def _bridge_claimed_menu(
     elif selected[0] in labels:
         delivered = await runner.answer_menu(labels.index(selected[0]))
     else:
-        # Free text from the "Other" modal → use the "Type something." option,
-        # which the TUI numbers immediately after the real options.
-        delivered = await runner.answer_menu_text(len(question.options), selected[0])
+        # Free text from the "Other" modal.  How it is typed depends on the
+        # layout the parser read off the pane (#650): the classic menu numbers a
+        # "Type something." row immediately after the real options, while a
+        # preview menu has no such row and takes the text in its ``Notes:``
+        # field instead.  Sending the wrong one answers "(No answer provided)".
+        delivered = await runner.answer_menu_text(
+            len(question.options), selected[0], mode=question.free_text_mode
+        )
     # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
     # is what keeps the menu from silently staying open and being re-posted.
     await _report_answer_delivery(thread, delivered=delivered is not False, selected=selected)

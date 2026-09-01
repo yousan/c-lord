@@ -579,7 +579,9 @@ class SessionManageCog(commands.Cog):
             return
 
         sdm = await self._resolve_session_dir_manager(parent_id)
-        # /clord-status lists the *channel's* sessions by design (#600 audit).
+        # Resolved only to answer "is this channel bound to a repo at all?".
+        # #616: it must NOT decide which session a row is in — after #615 the
+        # channel's threads can sit in several sessions, one per bound repo.
         tmux_mgr = await self._resolve_tmux_manager(parent_id, thread_id=None)
         if sdm is None or tmux_mgr is None:
             await respond(
@@ -591,14 +593,25 @@ class SessionManageCog(commands.Cog):
 
         await ack()
 
+        from ..thread_state_sync import _list_all_windows
+
         dirs = await asyncio.to_thread(sdm.find_session_dirs)
-        windows = await asyncio.to_thread(tmux_mgr.list_sessions)
+        # #616: read every session on the tmux server, not just this channel's.
+        # A thread bound to another repo lives elsewhere, and the whole point of
+        # the attach column is that it is measured rather than assembled.
+        windows = await asyncio.to_thread(_list_all_windows)
         window_by_thread: dict[int, str] = {}
+        attach_by_thread: dict[int, str] = {}
         for w in windows:
             tid = w.get("thread_id")
-            if tid:
-                with contextlib.suppress(ValueError, TypeError):
-                    window_by_thread[int(tid)] = w["window_name"]
+            window_name = w.get("window_name") or ""
+            session = w.get("session_name") or ""
+            if not tid or not window_name:
+                continue
+            with contextlib.suppress(ValueError, TypeError):
+                key = int(tid)
+                window_by_thread[key] = window_name
+                attach_by_thread[key] = f"{session}:{window_name}" if session else window_name
 
         rows: list[StatusRow] = []
         for d in dirs:
@@ -617,6 +630,7 @@ class SessionManageCog(commands.Cog):
             rows.append(
                 StatusRow(
                     window_number=parse_work_number(window_name) if window_name else None,
+                    attach=attach_by_thread.get(d.thread_id),
                     status=status,
                     topic=topic,
                     size_bytes=size,
@@ -647,7 +661,6 @@ class SessionManageCog(commands.Cog):
             show_all=show_all,
             channel_name=channel_name,
             repo=repo_label,
-            session_name=tmux_mgr.session_name,
             deleted_count=deleted_count,
             now=datetime.now(),
         )
