@@ -791,7 +791,7 @@ class ClaudeChatCog(commands.Cog):
             # here would be wrong, and would be the first thing a new user sees.
             logger.info("%s message not run — the first turn is still starting (#538)", ctx)
             return
-        if not await self._is_our_thread(parent_channel_id, thread.id, message):
+        if not await self._is_our_thread(parent_channel_id, thread.id):
             # Another instance's thread: DEBUG, so a shared guild's traffic does
             # not drown the log — the INFO line below is for threads we own.
             logger.debug("%s message ignored — not this instance's thread (#538)", ctx)
@@ -842,9 +842,7 @@ class ClaudeChatCog(commands.Cog):
         with contextlib.suppress(discord.HTTPException):
             await thread.send(recoverable_notice(plan), view=view)
 
-    async def _is_our_thread(
-        self, parent_channel_id: int, thread_id: int, message: discord.Message
-    ) -> bool:
+    async def _is_our_thread(self, parent_channel_id: int, thread_id: int) -> bool:
         """Whether this instance should speak up in this thread (#522).
 
         Ours when the parent channel is the configured ``DISCORD_CHANNEL_ID``,
@@ -852,11 +850,17 @@ class ClaudeChatCog(commands.Cog):
         binding for it, or when our own ``sessions`` table still holds the
         thread. Everything else belongs to another bot in the same guild.
 
-        Delegates to :func:`c_lord.command_gate.owns` — the same predicate
-        ``process_commands`` applies to every text command (#596), so a thread
-        this cog treats as someone else's cannot be one a command acts on.
+        The rule itself is :func:`c_lord.command_gate.owns` — the same one
+        ``process_commands`` applies to every text command (#596) — given this
+        cog's own resolvers and repository. One rule, two callers, no copy.
         """
-        return await owns(self.bot, channel_id=parent_channel_id, thread_id=thread_id)
+        return await owns(
+            home_channel_id=getattr(self.bot, "channel_id", None),
+            channel_id=parent_channel_id,
+            thread_id=thread_id,
+            resolvers=(self._resolve_tmux_manager, self._resolve_session_dir_manager),
+            session_get=self.repo.get,
+        )
 
     async def _was_ever_our_thread(self, thread: discord.Thread, parent_channel_id: int) -> bool:
         """Whether this thread carries any trace of having been c-lord's (#556).

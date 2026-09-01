@@ -35,12 +35,15 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 import discord
 
 logger = logging.getLogger(__name__)
+
+# A binding lookup: ``(channel_id, thread_id=...) -> manager | None``.
+_Resolver = Callable[..., Awaitable[Any]]
 
 
 def _trusted_bot_ids() -> set[int]:
@@ -78,56 +81,67 @@ def is_message_authorized(
     return is_allowed(message.author)
 
 
-async def owns(bot: Any, *, channel_id: int | None, thread_id: int | None = None) -> bool:
+async def owns(
+    *,
+    home_channel_id: int | None,
+    channel_id: int | None,
+    thread_id: int | None = None,
+    resolvers: Iterable[_Resolver] = (),
+    session_get: Callable[[int], Awaitable[Any]] | None = None,
+) -> bool:
     """Whether this instance is responsible for this channel / thread (#596).
 
     True when it can point at a record claiming the place:
 
-    1. the channel is the configured ``DISCORD_CHANNEL_ID``;
-    2. ``/clord-init`` or ``/clord-thread-init`` bound it to this instance;
-    3. this instance's ``sessions`` table holds a row for the thread — the
-       thread is ours even if its channel later lost its binding.
+    1. the channel is the configured ``DISCORD_CHANNEL_ID`` (*home_channel_id*);
+    2. one of *resolvers* finds a ``/clord-init`` / ``/clord-thread-init``
+       binding for it — each is called ``(channel_id, thread_id=...)`` and a
+       non-``None`` return means "bound";
+    3. *session_get* finds a row for the thread in this instance's ``sessions``
+       table — the thread is ours even if its channel later lost its binding.
 
     Otherwise the answer is no, and the caller must stay **silent**: an error in
     a channel we do not own is one more bot talking over the one that does
     (#522).
 
+    The lookups are passed in rather than reached for, so the one rule can be
+    applied both to a bot (``process_commands``, via :func:`owns_channel`) and
+    to a cog holding its own resolvers and repository — without either growing
+    a second copy of the rule.
+
     A lookup that raises answers nothing rather than granting ownership — a DB
     hiccup must not promote a bystander into the owner, which is the exact
     failure #596 is about.
     """
-    if channel_id is not None and channel_id == getattr(bot, "channel_id", None):
+    if channel_id is not None and channel_id == home_channel_id:
         return True
 
-    # Duck-typed on purpose: the gate sits below the cogs and must not import
-    # them (circular), and a consumer may register its own resolver under this
-    # name — the Zero-Config Principle cuts both ways.
-    channel_cog = bot.get_cog("ChannelRepoCog") if hasattr(bot, "get_cog") else None
-    if channel_cog is not None and channel_id is not None:
-        for attr in ("resolve_tmux_manager", "resolve_manager"):
-            resolve = getattr(channel_cog, attr, None)
-            if resolve is None:
-                continue
+    if channel_id is not None:
+        for resolve in resolvers:
             try:
                 if await resolve(channel_id, thread_id=thread_id) is not None:
                     return True
             except Exception:
-                logger.warning("command gate: %s failed — not claiming", attr, exc_info=True)
+                logger.warning("command gate: binding lookup failed — not claiming", exc_info=True)
 
-    if thread_id is not None:
-        session_repo = getattr(bot, "session_repo", None)
-        if session_repo is not None:
-            try:
-                if await session_repo.get(thread_id) is not None:
-                    return True
-            except Exception:
-                logger.warning("command gate: session lookup failed — not claiming", exc_info=True)
+    if thread_id is not None and session_get is not None:
+        try:
+            if await session_get(thread_id) is not None:
+                return True
+        except Exception:
+            logger.warning("command gate: session lookup failed — not claiming", exc_info=True)
 
     return False
 
 
 async def owns_channel(bot: Any, channel: Any) -> bool:
-    """:func:`owns`, addressed by the channel object a command was invoked in.
+    """:func:`owns` for a bot, addressed by the channel a command was invoked in.
+
+    Collects the bot's own lookups — ``ChannelRepoCog``'s resolvers and the
+    ``sessions`` repository — and applies the shared rule to them.  The cog is
+    fetched by name and duck-typed on purpose: the gate sits below the cogs and
+    must not import them, and a consumer may register its own resolver under
+    that name (the Zero-Config Principle cuts both ways).
 
     A channel outside a guild (a DM) is always ours: it reaches exactly this
     bot, so there is no other instance to defer to.
@@ -141,4 +155,18 @@ async def owns_channel(bot: Any, channel: Any) -> bool:
         thread_id = channel.id
         channel_id = channel.parent_id or channel.id
 
-    return await owns(bot, channel_id=channel_id, thread_id=thread_id)
+    channel_cog = bot.get_cog("ChannelRepoCog") if hasattr(bot, "get_cog") else None
+    resolvers = [
+        resolve
+        for name in ("resolve_tmux_manager", "resolve_manager")
+        if (resolve := getattr(channel_cog, name, None)) is not None
+    ]
+    session_repo = getattr(bot, "session_repo", None)
+
+    return await owns(
+        home_channel_id=getattr(bot, "channel_id", None),
+        channel_id=channel_id,
+        thread_id=thread_id,
+        resolvers=resolvers,
+        session_get=getattr(session_repo, "get", None),
+    )
