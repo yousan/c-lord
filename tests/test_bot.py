@@ -13,7 +13,12 @@ from c_lord.bot import ClaudeDiscordBot
 
 
 class TestProcessCommands:
-    """process_commands override: allow webhook messages, block normal bot messages."""
+    """process_commands override: allow webhook messages, block normal bot messages.
+
+    Every message here is posted in the bot's *own* channel, so the ownership
+    gate (#596) passes and these stay tests of the author check alone. The gate
+    itself is covered by ``tests/test_command_gate.py``.
+    """
 
     @pytest.mark.asyncio
     async def test_webhook_message_not_blocked(self) -> None:
@@ -26,6 +31,8 @@ class TestProcessCommands:
         msg.author = MagicMock()
         msg.author.bot = True
         msg.webhook_id = 999  # webhook message
+        msg.channel = MagicMock(spec=discord.TextChannel)
+        msg.channel.id = 123  # this bot's channel
 
         await bot.process_commands(msg)
 
@@ -60,6 +67,8 @@ class TestProcessCommands:
         msg.author = MagicMock()
         msg.author.bot = False
         msg.webhook_id = None
+        msg.channel = MagicMock(spec=discord.TextChannel)
+        msg.channel.id = 123  # this bot's channel
 
         await bot.process_commands(msg)
 

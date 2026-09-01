@@ -607,11 +607,20 @@ class TestPerChannelResolution:
 
 
 def _make_ctx(channel: MagicMock | None = None, author_id: int = 1) -> MagicMock:
-    """Return a mocked commands.Context for the !skill text twin."""
+    """Return a mocked commands.Context for the !skill text twin.
+
+    ``ctx.message`` is a *human* message: since #508 the text twin authorizes on
+    the message (webhook / trusted bot / allowlisted human), so leaving it an
+    unconfigured mock would make every author look like a webhook.
+    """
     ctx = MagicMock()
     ctx.send = AsyncMock()
     ctx.author = MagicMock()
     ctx.author.id = author_id
+    ctx.message = MagicMock(spec=discord.Message)
+    ctx.message.webhook_id = None
+    ctx.message.author = ctx.author
+    ctx.message.author.bot = False
     if channel is not None:
         ctx.channel = channel
     else:

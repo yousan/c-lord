@@ -28,6 +28,7 @@ from .. import topic as topic_module
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
+from ..command_gate import is_message_authorized, owns
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
 from ..database.ask_repo import PendingAskRepository
@@ -325,30 +326,12 @@ class ClaudeChatCog(commands.Cog):
     def _is_message_authorized(self, message: discord.Message) -> bool:
         """Whether *message* is allowed to drive Claude.
 
-        Infrastructure bypasses the human allowlist so that configuring an
-        owner does not break it:
-
-        - **Webhook** messages (``webhook_id`` set): possession of the webhook
-          URL is itself authorization (CI/CD triggers, E2E).
-        - **Trusted bots** (``CLORD_TRUSTED_BOT_IDS``): companion bots treated
-          like humans; pre-authorized.
-
-        Any other bot is rejected. Human users must satisfy :meth:`_is_allowed`
-        (owner / role), so a configured ``DISCORD_OWNER_ID`` restricts access to
-        the owner **without** locking out webhooks or trusted bots.
-
-        Applies to every request that has a message behind it: ``on_message``
-        and the text commands ``!clord`` / ``!attach`` (#507). Slash commands
-        have no message and can never be webhook-driven, so they gate on
-        :meth:`_is_allowed` directly.
+        Delegates to :func:`c_lord.command_gate.is_message_authorized` so that
+        the rule this cog applies to ``on_message`` / ``!clord`` / ``!attach``
+        (#507) and the one ``!skill`` / ``!clord-init`` / ``!clord-thread-init``
+        apply (#508) are the same rule, not two copies of it.
         """
-        if message.webhook_id:
-            return True
-        if message.author.bot:
-            trusted_raw = os.getenv("CLORD_TRUSTED_BOT_IDS", "")
-            trusted_ids = {int(x.strip()) for x in trusted_raw.split(",") if x.strip().isdigit()}
-            return message.author.id in trusted_ids
-        return self._is_allowed(message.author)
+        return is_message_authorized(message, self._is_allowed)
 
     def is_processing(self, thread_id: int) -> bool:
         """True while a Claude turn is actively running for ``thread_id``.
@@ -864,18 +847,16 @@ class ClaudeChatCog(commands.Cog):
     ) -> bool:
         """Whether this instance should speak up in this thread (#522).
 
-        Ours when the parent channel is the configured ``DISCORD_CHANNEL_ID``, or
+        Ours when the parent channel is the configured ``DISCORD_CHANNEL_ID``,
         when either resolver finds a ``/clord-init`` / ``/clord-thread-init``
-        binding for it. Everything else belongs to another bot in the same guild.
+        binding for it, or when our own ``sessions`` table still holds the
+        thread. Everything else belongs to another bot in the same guild.
+
+        Delegates to :func:`c_lord.command_gate.owns` — the same predicate
+        ``process_commands`` applies to every text command (#596), so a thread
+        this cog treats as someone else's cannot be one a command acts on.
         """
-        if not self._is_someone_elses_channel(parent_channel_id, message):
-            return True
-        if await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id) is not None:
-            return True
-        return (
-            await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread_id)
-            is not None
-        )
+        return await owns(self.bot, channel_id=parent_channel_id, thread_id=thread_id)
 
     async def _was_ever_our_thread(self, thread: discord.Thread, parent_channel_id: int) -> bool:
         """Whether this thread carries any trace of having been c-lord's (#556).
