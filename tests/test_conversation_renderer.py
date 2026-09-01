@@ -230,3 +230,99 @@ class TestCli:
         out = tmp_path / "example.png"
         assert cli.main([str(example), "-o", str(out)]) == 0
         assert out.read_bytes().startswith(PNG_MAGIC)
+
+
+# ---------------------------------------------------------------------------
+# #623: CJK inside fenced code blocks must not render as tofu
+# ---------------------------------------------------------------------------
+
+
+class TestCodeBlockCJK:
+    """Code blocks are drawn with a monospace font that has no CJK glyphs.
+
+    Before #623 the renderer drew every code-block glyph with that font, so a
+    Japanese table — the thing design comps are actually for — came out as
+    ``□□□□``. Wide glyphs must fall back to the CJK text face while still
+    occupying exactly two monospace cells, so table columns stay aligned.
+    """
+
+    def test_wide_runs_splits_by_east_asian_width(self) -> None:
+        from c_lord.discord_ui.conversation_renderer import _wide_runs
+
+        assert _wide_runs("ab") == [("ab", False)]
+        assert _wide_runs("あい") == [("あい", True)]
+        assert _wide_runs("w1 記事 x") == [
+            ("w1 ", False),
+            ("記事", True),
+            (" x", False),
+        ]
+        assert _wide_runs("") == []
+
+    def test_wide_glyphs_drawn_with_cjk_face_on_a_two_cell_grid(self) -> None:
+        """Wide chars use the CJK face; each advances exactly 2 monospace cells."""
+        from c_lord.discord_ui.conversation_renderer import _draw_rich, _MonoGrid
+
+        mono, cjk = object(), object()
+        calls: list[tuple[float, str, object]] = []
+
+        class _Draw:
+            def text(self, xy, s, font=None, fill=None, **kw):  # noqa: ANN001
+                calls.append((xy[0], s, font))
+
+            def textlength(self, s, font=None):  # noqa: ANN001
+                return 10.0 * len(s)  # mono cell = 10px
+
+        fonts = _FakeFonts(mono=mono)
+        grid = _MonoGrid(cjk=cjk, cell_w=10.0)
+        end_x = _draw_rich(
+            None, _Draw(), 0.0, 0.0, "a記b", mono, fonts, (0, 0, 0), 16, {}, grid=grid
+        )
+
+        by_font = {s: f for _x, s, f in calls}
+        assert by_font["a"] is mono, "narrow glyph must keep the monospace face"
+        assert by_font["記"] is cjk, "wide glyph must use the CJK face, not tofu"
+        # a(1 cell) + 記(2 cells) + b(1 cell) = 4 cells = 40px
+        assert end_x == 40.0
+        # ...and 記 must start right after 'a', at exactly one cell in.
+        assert dict((s, x) for x, s, _f in calls)["記"] == 10.0
+        assert dict((s, x) for x, s, _f in calls)["b"] == 30.0
+
+    def test_measure_matches_what_is_drawn(self) -> None:
+        """Wrapping must measure the same width the draw path advances (AC3)."""
+        from c_lord.discord_ui.conversation_renderer import _measure_rich, _MonoGrid
+
+        class _Draw:
+            def textlength(self, s, font=None):  # noqa: ANN001
+                return 10.0 * len(s)
+
+        grid = _MonoGrid(cjk=object(), cell_w=10.0)
+        assert _measure_rich(_Draw(), "a記b", object(), 16, grid=grid) == 40.0
+
+    def test_missing_cjk_face_still_renders(self) -> None:
+        """No CJK font available → keep drawing with mono instead of crashing (AC4)."""
+        from c_lord.discord_ui.conversation_renderer import _draw_rich, _MonoGrid
+
+        mono = object()
+        seen: list[object] = []
+
+        class _Draw:
+            def text(self, xy, s, font=None, fill=None, **kw):  # noqa: ANN001
+                seen.append(font)
+
+            def textlength(self, s, font=None):  # noqa: ANN001
+                return 10.0 * len(s)
+
+        grid = _MonoGrid(cjk=None, cell_w=10.0)
+        _draw_rich(
+            None, _Draw(), 0.0, 0.0, "記", mono, _FakeFonts(mono=mono), (0, 0, 0), 16, {}, grid=grid
+        )
+        assert seen == [mono]
+
+
+class _FakeFonts:
+    """Minimal stand-in for ``_Fonts`` — only the fields ``_draw_rich`` reads."""
+
+    def __init__(self, mono: object) -> None:
+        self.mono = mono
+        self.emoji = None
+        self.emoji_color = False
