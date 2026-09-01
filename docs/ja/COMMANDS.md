@@ -76,7 +76,7 @@ tmux セッションはチャンネルではなく**リポジトリ**に従い�
 | `/clord-status` | **このチャンネル**の稼働中セッション一覧（容量・attach・resume） | どこでも |
 | `/clord-status show_all:true` | closed なセッションも含める（`docker ps -a` 相当） | どこでも |
 
-**`/clord-status`** はチャンネル単位のセッション状態を 1 コマンドにまとめたものです。各行に window 番号 `#`（昇順）・`status`・スレッドの `topic`・`size`・`used`（最終活動からの経過）を表示。表の上にコピペ可能な `tmux attach -t <session>:work<#>` を出します（`#` を置換）。Claude Code セッション ID（`cc-session`、ターミナルで `claude --resume <id>` する用）は **`all` の時だけ右端**に出ます。既定は **live** のみ（`docker ps` 相当）、`show_all` で **closed**（`/close-workspace` 済み — tmux は閉じたが dir は残り容量を食う）も表示。`/workspace-delete` 済み（作業 dir 削除）のものは footer に件数のみ。**削除された `/sessions`・`/session-dirs`・`/resume-info` を統合**したものです（#363）。
+**`/clord-status`** はチャンネル単位のセッション状態を 1 コマンドにまとめたものです。各行に `attach`（そのスレッドが**実際にいる** `session:window`。そのままコピペできる）・`status`・スレッドの `topic`・`size`・`used`（最終活動からの経過）を表示。並び順は従来どおり window 番号の昇順です。#615 以降、1 チャンネルのスレッドは**複数の** tmux セッションに分かれうる（紐づくリポジトリごと）ため、attach 先は行ごとに出します。従来の `<session>:work<#>` テンプレートは存在しないウィンドウを指していました（#616）。`closed` はウィンドウが無いので `attach` 欄が `-` になります。Claude Code セッション ID（`cc-session`、ターミナルで `claude --resume <id>` する用）は **`all` の時だけ右端**に出ます。既定は **live** のみ（`docker ps` 相当）、`show_all` で **closed**（`/close-workspace` 済み — tmux は閉じたが dir は残り容量を食う）も表示。`/workspace-delete` 済み（作業 dir 削除）のものは footer に件数のみ。**削除された `/sessions`・`/session-dirs`・`/resume-info` を統合**したものです（#363）。
 
 **status の値**（DB ではなく呼び出し時のライブ判定）：
 

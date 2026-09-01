@@ -24,9 +24,11 @@ _THREAD = 1515873566166483074
 _DIR = f"/home/yousan/c-lord-sessions/1504670029923352597/{_THREAD}"
 
 # Reproduces the incident: the live window comes FIRST in list order, the dead
-# one last, so a last-write-wins rebuild picks the dead one.
-_LIVE = "work2"
-_DEAD = "w8"
+# one last, so a last-write-wins rebuild picks the dead one. Windows are keyed by
+# tmux ``window_id`` (#649) — a name identifies no single window.
+_LIVE = "@2"
+_DEAD = "@8"
+_NAMES = {_LIVE: "work2", _DEAD: "w8"}
 
 
 def _make_run(options: dict[str, str], *, live_window: str):
@@ -34,17 +36,28 @@ def _make_run(options: dict[str, str], *, live_window: str):
 
     def _fake_run(args: list[str]) -> MagicMock:
         if "list-windows" in args:
-            rows = "".join(f"{w}\t{_DIR}\n" for w in (_LIVE, _DEAD))
+            fmt = args[args.index("-F") + 1] if "-F" in args else "#{window_name}"
+            rows = ""
+            for wid in (_LIVE, _DEAD):
+                row = fmt
+                for token, value in (
+                    ("#{window_id}", wid),
+                    ("#{window_name}", _NAMES[wid]),
+                    ("#{@thread_id}", options.get(wid, "")),
+                    ("#{pane_current_path}", _DIR),
+                ):
+                    row = row.replace(token, value)
+                rows += row + "\n"
             return MagicMock(returncode=0, stdout=rows)
 
         if "show-option" in args and "@thread_id" in args:
-            win = args[args.index("-t") + 1].split(":", 1)[1]
+            win = args[args.index("-t") + 1]
             val = options.get(win, "")
             # tmux exits non-zero when the option is unset.
             return MagicMock(returncode=0 if val else 1, stdout=f"{val}\n" if val else "")
 
         if "set-option" in args and "@thread_id" in args:
-            win = args[args.index("-t") + 1].split(":", 1)[1]
+            win = args[args.index("-t") + 1]
             if "-uw" in args:
                 options.pop(win, None)
             else:
@@ -52,7 +65,7 @@ def _make_run(options: dict[str, str], *, live_window: str):
             return MagicMock(returncode=0, stdout="")
 
         if "list-panes" in args:
-            win = args[args.index("-t") + 1].split(":", 1)[1]
+            win = args[args.index("-t") + 1]
             return MagicMock(returncode=0, stdout="claude\n" if win == live_window else "zsh\n")
 
         return MagicMock(returncode=0, stdout="")
