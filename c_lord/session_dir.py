@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .coauthor import install_coauthor_hook
+from .git_mirrors import ensure_mirror, mirrors_root_for
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,20 @@ class SessionDirManager:
     def source_repo(self) -> str:
         return self._source_repo
 
+    def _mirror_for_clone(self) -> Path | None:
+        """共有オブジェクトの置き場。用意できなければ ``None`` (#643).
+
+        **ここで何が起きてもクローンを止めない。** 同じリポジトリを240回
+        ダウンロードして持つのをやめるための最適化であって、正しさには
+        関わらない。だから広い ``except`` を置いてある — このモジュールの
+        ためにスレッドが立たなくなるのは、割に合わない交換。
+        """
+        try:
+            return ensure_mirror(mirrors_root_for(self._base_dir), self._source_repo)
+        except Exception:
+            logger.warning("git mirror unavailable, cloning without it", exc_info=True)
+            return None
+
     def create_session_dir(self, thread_id: int, coauthor: Any | None = None) -> str:
         """Create (or return existing) session directory for a thread.
 
@@ -139,9 +154,18 @@ class SessionDirManager:
 
             args = ["git", "clone"]
             if _is_local_repo(self._source_repo):
+                # ``--local`` は既に hardlink でオブジェクトを共有しているので
+                # ミラーを挟む意味が無い (実測: ``/home/yousan/c-lord`` の
+                # 300クローンで合計 0.5 GB)。
                 args.append("--local")
             else:
                 args.extend(["--depth=1", "--single-branch"])
+                mirror = self._mirror_for_clone()
+                if mirror is not None:
+                    # ``-if-able``: ミラーが消えていても info を1行出して
+                    # 通常のクローンに落ちる。ミラーは高速化と節約のための
+                    # ものであって、動作の前提ではない (#643)。
+                    args.extend(["--reference-if-able", str(mirror)])
 
             # `--` so a flag-shaped source_repo can never be read as a git
             # option (`--upload-pack=<cmd>` executes it). Repo strings reach
