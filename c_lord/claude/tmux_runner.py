@@ -1566,7 +1566,14 @@ class TmuxClaudeRunner:
         while elapsed < timeout:
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
-            pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            # ``capture_pane`` keeps the escape sequences (``-e``), so the input
+            # box arrives as ``\x1b[39m❯\xa0`` and every text check below would
+            # miss it. The turn loop normalises before it looks; staging proved
+            # what happens when this one does not — a restored, idle pane read as
+            # "never came up" and the wake reported a failure (#642).
+            pane = _normalize_capture(
+                await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            )
             if not trust_handled and self._has_trust_prompt(pane):
                 await self._accept_trust_prompt(pane)
                 trust_handled = True

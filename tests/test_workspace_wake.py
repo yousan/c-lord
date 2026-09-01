@@ -10,11 +10,14 @@ would have restored anyway.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "panes"
 
 #: A pane parked at Claude's input box: idle, not generating.
 IDLE_PANE = "\n".join(["  ⏺ done", "", "╭──────────╮", "❯", "╰──────────╯", "  -- INSERT --"])
@@ -116,6 +119,20 @@ class TestRunnerWake:
         tmux_manager.is_claude_running.side_effect = [False, True] + [False] * 50
 
         assert await runner.wake(timeout=0.05) is False
+
+    async def test_a_real_restored_pane_counts_as_ready(self, runner, tmux_manager, monkeypatch):
+        """Captured from staging (#642): ``claude --continue`` had come back and
+        was sitting at its input box, but the raw ``capture-pane -e`` output
+        carries ANSI, so the box reads as ``\x1b[39m❯\xa0`` — and the readiness
+        check saw no prompt and reported a failed wake while the pane was fine.
+        The turn loop normalises before it looks; so must this."""
+        _fast(monkeypatch)
+        pane = (_FIXTURES_DIR / "wake_restored_idle_ansi.txt").read_text()
+        assert "\x1b[" in pane, "fixture must keep its escape sequences"
+        tmux_manager.is_claude_running.side_effect = [False] + [True] * 50
+        tmux_manager.capture_pane.return_value = pane
+
+        assert await runner.wake(timeout=0.5) is True
 
     async def test_accepts_the_trust_dialog(self, runner, tmux_manager, monkeypatch):
         """A recreated window can land on the folder-trust dialog; left
