@@ -12,7 +12,14 @@ import asyncio
 
 import pytest
 
-from c_lord.claude.types import AskOption, AskQuestion, ToolCategory, _parse_ask_questions
+from c_lord.claude.types import (
+    FREE_TEXT_NOTES,
+    FREE_TEXT_ROW,
+    AskOption,
+    AskQuestion,
+    ToolCategory,
+    _parse_ask_questions,
+)
 from c_lord.discord_ui.embeds import ask_embed
 
 # ---------------------------------------------------------------------------
@@ -123,6 +130,59 @@ class TestParseAskQuestions:
         }
         questions = _parse_ask_questions(tool_input)
         assert questions[0].multi_select is True
+
+    def test_preview_options_mean_the_notes_layout(self) -> None:
+        """#650: ``preview`` is what makes Claude Code draw the other TUI menu.
+
+        The menu the mirror bridges is never read off the pane, so the tool
+        input is the only place the layout can be known here — and getting it
+        wrong loses the user's typed answer (the answer keystrokes land on
+        "Chat about this", which answers "(No answer provided)").
+        """
+        tool_input = {
+            "questions": [
+                {
+                    "question": "どの配色にしますか？",
+                    "header": "配色案",
+                    "options": [
+                        {"label": "案A ダーク", "preview": "#121212 …"},
+                        {"label": "案B ライト", "preview": "#ffffff …"},
+                    ],
+                }
+            ]
+        }
+        assert _parse_ask_questions(tool_input)[0].free_text_mode == FREE_TEXT_NOTES
+
+    def test_one_preview_is_enough_to_switch_the_layout(self) -> None:
+        """The CLI switches on ``options.some(o => o.preview !== undefined)``."""
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Choose?",
+                    "options": [{"label": "A"}, {"label": "B", "preview": "…"}],
+                }
+            ]
+        }
+        assert _parse_ask_questions(tool_input)[0].free_text_mode == FREE_TEXT_NOTES
+
+    def test_no_preview_keeps_the_classic_row(self) -> None:
+        tool_input = {
+            "questions": [{"question": "Choose?", "options": [{"label": "A"}, {"label": "B"}]}]
+        }
+        assert _parse_ask_questions(tool_input)[0].free_text_mode == FREE_TEXT_ROW
+
+    def test_multi_select_keeps_the_row_even_with_previews(self) -> None:
+        """A multiSelect menu never gets the preview layout, previews or not."""
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which?",
+                    "multiSelect": True,
+                    "options": [{"label": "A", "preview": "…"}, {"label": "B", "preview": "…"}],
+                }
+            ]
+        }
+        assert _parse_ask_questions(tool_input)[0].free_text_mode == FREE_TEXT_ROW
 
 
 # ---------------------------------------------------------------------------

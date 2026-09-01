@@ -223,24 +223,40 @@ class StreamEvent:
 
 
 def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
-    """Parse AskUserQuestion tool input into a list of AskQuestion objects."""
+    """Parse AskUserQuestion tool input into a list of AskQuestion objects.
+
+    The tool input is also where the menu's TUI *layout* is decided (#650):
+    Claude Code draws the preview layout — no "Type something." row, free text
+    typed into a ``Notes:`` field — exactly when the question is single-select
+    and at least one option carries a ``preview``. Deriving
+    ``free_text_mode`` here matters for the transcript-mirror bridge, which
+    builds its menu from this input and never sees the pane; without it the
+    answer keystrokes go to the wrong affordance and the user's typed sentence
+    is answered as "(No answer provided)".
+    """
     questions_raw = tool_input.get("questions", [])
     result: list[AskQuestion] = []
     for q in questions_raw:
+        raw_options = q.get("options", [])
         options = [
             AskOption(
                 label=o.get("label", ""),
                 description=o.get("description", ""),
             )
-            for o in q.get("options", [])
+            for o in raw_options
             if o.get("label")
         ]
+        multi_select = bool(q.get("multiSelect", False))
+        has_preview = any(o.get("preview") is not None for o in raw_options)
         result.append(
             AskQuestion(
                 question=q.get("question", ""),
                 header=q.get("header", ""),
-                multi_select=bool(q.get("multiSelect", False)),
+                multi_select=multi_select,
                 options=options,
+                free_text_mode=(
+                    FREE_TEXT_NOTES if has_preview and not multi_select else FREE_TEXT_ROW
+                ),
             )
         )
     return result
