@@ -124,7 +124,7 @@ def _delivery_failure(action: str, prompt: str) -> str:
     return (
         f"{action}に失敗しました — tmux のペインが入力を受け付けませんでした "
         f"(入力 {size:,} bytes)。ペインが落ちているか応答しない状態です。"
-        "`/restart-claude` でセッションを立て直してから、もう一度送ってください。"
+        "`/claude-restart` でセッションを立て直してから、もう一度送ってください。"
     )
 
 
@@ -133,7 +133,7 @@ def _missing_window(action: str, thread_id: int) -> str:
 
     ``start_claude`` returns False for two unrelated reasons, and #527's wording
     only fits one of them.  When the window was never created there is no pane
-    to be unresponsive, and ``/restart-claude`` — which restarts the process
+    to be unresponsive, and ``/claude-restart`` — which restarts the process
     *inside* an existing pane — cannot conjure one.  Sending the reader there
     (as every scheduled run did) costs them the one attempt they had at fixing
     it themselves.  So name what is actually absent, and point at the two things
@@ -154,7 +154,7 @@ def _ambiguous_window(action: str, thread_id: int, session: str, names: list[str
     Two windows sharing a name make every ``session:NAME`` target ambiguous, so
     keystrokes land in whichever tmux matched first — another thread's checkout.
     The pane is alive and well, which is why the #527 wording ("ペインが落ちて
-    いる", go run ``/restart-claude``) sent people to a command that could not
+    いる", go run ``/claude-restart``) sent people to a command that could not
     possibly help: it restarts Claude *inside* a window, and the duplicate name
     is still there afterwards. Two threads sat dead for a day following that
     advice. Name the real problem and give the command that actually shows it.
@@ -164,7 +164,7 @@ def _ambiguous_window(action: str, thread_id: int, session: str, names: list[str
         f"{action}に失敗しました — このスレッドの tmux ウィンドウを一意に特定できません "
         f"(thread={thread_id})。同じ名前のウィンドウが複数あります: {listed}。"
         "ペインが落ちているのではなくターゲットが曖昧なので、"
-        "`/restart-claude` では直りません。"
+        "`/claude-restart` では直りません。"
         f"ホストで `tmux list-windows -t {session} "
         "-F '#{window_id} #{window_name} #{@thread_id} #{pane_current_path}'` を確認し、"
         "重複したウィンドウを rename するか、不要な方を kill してください。"
@@ -174,7 +174,7 @@ def _ambiguous_window(action: str, thread_id: int, session: str, names: list[str
 def _stuck_in_input_box(prompt: str) -> str:
     """User-facing text for "typed into the pane, but it would not submit" (#560).
 
-    Deliberately does **not** suggest ``/restart-claude``: the message is sitting
+    Deliberately does **not** suggest ``/claude-restart``: the message is sitting
     in the input box right now, and restarting the session would throw it away.
     """
     size = len(prompt.encode("utf-8"))
@@ -183,7 +183,7 @@ def _stuck_in_input_box(prompt: str) -> str:
         f"Enter を {_SUBMIT_ATTEMPTS_HINT} 回試しても送信されませんでした "
         f"(入力 {size:,} bytes)。本文はまだ入力欄に残っています。"
         "もう一度送り直すか、`/tmux-screenshot` で状態を確認してください "
-        "(`/restart-claude` は入力欄の本文ごと破棄されるので、まず送り直しを試してください)。"
+        "(`/claude-restart` は入力欄の本文ごと破棄されるので、まず送り直しを試してください)。"
     )
 
 
@@ -1087,7 +1087,7 @@ class TmuxClaudeRunner:
                 # #560: two very different failures reach this branch. Either the
                 # pane never took the input (#527), or the text is typed in and
                 # simply will not submit. Telling the second case to
-                # ``/restart-claude`` would discard the message the user just
+                # ``/claude-restart`` would discard the message the user just
                 # wrote, so ask the pane which one it is before advising.
                 stuck = await asyncio.to_thread(self._tmux.input_box_holds, self._thread_id, prompt)
                 if stuck:

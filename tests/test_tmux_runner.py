@@ -1199,7 +1199,7 @@ class TestTmuxClaudeRunnerRun:
         # they could act on. Name the size and the way out.
         err = events[-1].error or ""
         assert "tmux" in err
-        assert "restart-claude" in err, "the error must say how to recover"
+        assert "claude-restart" in err, "the error must say how to recover"
         assert "bytes" in err, "the error must name the input size"
 
     @pytest.mark.asyncio
@@ -1217,7 +1217,7 @@ class TestTmuxClaudeRunnerRun:
         assert events[-1].is_complete
         err = events[-1].error or ""
         assert "tmux" in err
-        assert "restart-claude" in err, "the error must say how to recover"
+        assert "claude-restart" in err, "the error must say how to recover"
         assert "bytes" in err, "the error must name the input size"
 
     @pytest.mark.asyncio

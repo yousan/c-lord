@@ -212,7 +212,7 @@ once it is over. At the end of a turn they are folded into a single
 | `/sync-sessions` | Import CLI sessions as Discord threads | Available |
 | `/model show` | Show current model (global + per-thread) | Available |
 | `/model set <model>` | Change model for all new sessions | Available |
-| `/session-cleanup` | Remove clean orphaned session directories | Available |
+| `/workspace-cleanup` | Reclaim the working directories of workspaces nothing is using (old name `/session-cleanup` still works) | Available |
 | `/tmux-list` | List all active tmux windows | Available |
 | `/close-workspace` | 終了: close the tmux window, keep the session (thread renamed `[終了] …`; a later message is held and offers a 再開 button) | Available |
 | `/reopen-workspace` | Reopen a 終了 thread so messages run again | Available |

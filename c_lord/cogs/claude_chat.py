@@ -1511,7 +1511,7 @@ class ClaudeChatCog(commands.Cog):
         await self._clear_impl(ctx.channel, respond)
 
     async def _restart_impl(self, channel: object, respond: _Responder) -> None:
-        """Shared core for /restart-claude and !restart-claude (#440).
+        """Shared core for /claude-restart and its /restart-claude alias (#440, #578).
 
         Restarts the Claude **process** for this thread while PRESERVING the
         conversation. It kills the active runner and the tmux window — so a
@@ -1559,12 +1559,9 @@ class ClaudeChatCog(commands.Cog):
             "次のメッセージで `--continue` により文脈を引き継いで再開します。"
         )
 
-    @app_commands.command(
-        name="restart-claude",
-        description="Restart the Claude process for this thread (keeps the conversation)",
-    )
-    async def restart_claude(self, interaction: discord.Interaction) -> None:
-        """Restart Claude for this thread, preserving context (#440)."""
+    @staticmethod
+    def _slash_text_responder(interaction: discord.Interaction) -> _Responder:
+        """Responder that answers a slash interaction with plain text."""
 
         async def respond(
             content: str | None = None,
@@ -1574,11 +1571,11 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await interaction.response.send_message(content, ephemeral=ephemeral)
 
-        await self._restart_impl(interaction.channel, respond)
+        return respond
 
-    @commands.command(name="restart-claude")
-    async def restart_claude_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /restart-claude — invokable from webhooks (#440)."""
+    @staticmethod
+    def _ctx_text_responder(ctx: commands.Context) -> _Responder:
+        """Responder that answers a text/mention command with plain text."""
 
         async def respond(
             content: str | None = None,
@@ -1588,7 +1585,45 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await ctx.send(content or "")
 
-        await self._restart_impl(ctx.channel, respond)
+        return respond
+
+    @app_commands.command(
+        name="claude-restart",
+        description="Restart the Claude process for this thread (keeps the conversation)",
+    )
+    async def claude_restart(self, interaction: discord.Interaction) -> None:
+        """Restart Claude for this thread, preserving context (#440).
+
+        Named object-first (``claude-restart``) in #578: the object is the
+        Claude **process**, and Discord's autocomplete matches by prefix, so
+        typing ``/claude`` surfaces this next to the other Claude-scoped
+        commands instead of hiding it under ``/restart``.
+        """
+        await self._restart_impl(interaction.channel, self._slash_text_responder(interaction))
+
+    @commands.command(name="claude-restart")
+    async def claude_restart_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /claude-restart — invokable from webhooks (#440)."""
+        await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
+
+    @app_commands.command(
+        name="restart-claude",
+        description="(旧名) /claude-restart と同じです",
+    )
+    async def restart_claude(self, interaction: discord.Interaction) -> None:
+        """Old name for :meth:`claude_restart`, kept working (#578).
+
+        Renaming a command people have in their fingers is not free. The alias
+        calls the same implementation, so there is nothing to keep in sync — and
+        consumers get the new name by updating the package alone, which is the
+        Zero-Config Principle.
+        """
+        await self._restart_impl(interaction.channel, self._slash_text_responder(interaction))
+
+    @commands.command(name="restart-claude")
+    async def restart_claude_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of the /restart-claude alias (#440)."""
+        await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
 
     async def _compact_impl(
         self, channel: object, respond: _Responder, *, instructions: str = ""
