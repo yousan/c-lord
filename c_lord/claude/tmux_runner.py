@@ -67,6 +67,22 @@ _TURN_START_GRACE = 120.0
 # Exported so callers can recognise the outcome without string-sniffing.
 NO_RESPONSE_ERROR_PREFIX = "No response —"
 
+# Prefix of the RESULT error for "the folder-trust dialog would not close"
+# (#630).  Distinct from NO_RESPONSE: the turn produced nothing either way,
+# but here c-lord knows exactly what blocked it and can say so.
+TRUST_STUCK_ERROR_PREFIX = "Trust prompt stuck —"
+
+# How many times the SAME folder-trust dialog may be accepted before giving
+# up (#630).  One Enter closes a live dialog; a couple of retries cover a
+# keystroke that raced the redraw.  Beyond that the dialog is not going to
+# close, and repeating is how 178 Enters got sent into a dead shell in 2m20s.
+_TRUST_ACCEPT_MAX_ATTEMPTS = 3
+
+# How long to let the TUI redraw after accepting the trust dialog, before
+# deciding it is still up (seconds).  Without a settle the poll interval
+# alone (0.5s) would count normal redraw latency as a failed accept.
+_TRUST_ACCEPT_SETTLE = 2.0
+
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
 _UNKNOWN_ALERT_DELAY = 5.0
@@ -238,6 +254,36 @@ _TRUST_OPTION_RE = re.compile(
 
 # Footer the trust dialog always prints under its options.
 _TRUST_CONFIRM_FOOTER = "Enter to confirm"
+
+
+def _trust_dialog_is_live(text: str) -> bool:
+    """True when the trust dialog on *text* is still being drawn by ``claude``.
+
+    The dialog is a full-screen modal: its "Enter to confirm · Esc to cancel"
+    footer is the last thing on the pane while it is up.  Once ``claude`` has
+    exited, the same text is still printed but the shell has written its prompt
+    underneath it — so anything non-blank BELOW the footer means we are looking
+    at a corpse, not a prompt.
+
+    Deliberately keyed on what is *below* the footer rather than on spotting a
+    shell prompt: prompts are user-configured and unguessable, and the dialog's
+    own launch command sits ABOVE it in a real capture (the pane still holds the
+    ``claude`` command line that started it), so "is there a shell prompt
+    anywhere" would reject every genuine dialog.
+    """
+    if not text:
+        return False
+    lines = text.splitlines()
+    last_footer = -1
+    for i, line in enumerate(lines):
+        if _TRUST_CONFIRM_FOOTER in line:
+            last_footer = i
+    if last_footer < 0:
+        # The pre-2.1.248 numbered dialog is matched without the footer; with no
+        # footer at all there is nothing to measure, so do not veto it here.
+        return True
+    return not any(line.strip() for line in lines[last_footer + 1 :])
+
 
 # Patterns from legacy AskUserQuestion TUI menus that must NOT be flagged as
 # "unknown" interactive prompts (#153).
@@ -1272,6 +1318,13 @@ class TmuxClaudeRunner:
         # surfaced as the RESULT error so Discord shows the cause instead of a
         # silent "done".
         startup_error: str | None = None
+        # #630: how many times the CURRENT folder-trust dialog has been accepted,
+        # and the signature of the dialog those accepts went to.  Without this the
+        # loop re-accepts every poll for as long as the dialog stays matchable —
+        # 178 times in 2m20s in the report — and the turn dies with no idea why.
+        trust_accepts = 0
+        trust_signature: str | None = None
+        trust_stuck = False
 
         # #365: Gate completion on the NEW turn actually having started. When a
         # follow-up message is delivered to an already-running Claude
@@ -1350,8 +1403,31 @@ class TmuxClaudeRunner:
             # c-lord already runs these dirs with --dangerously-skip-permissions, so
             # trusting the dir it just cloned is consistent with that threat model.
             if self._has_trust_prompt(current):
+                # #630: one dialog, one accept.  A dialog that is still up after
+                # ``_TRUST_ACCEPT_MAX_ATTEMPTS`` is not going to close, and
+                # keeping at it is the keystroke storm — which also kept the pane
+                # changing, so the inactivity backstop never fired and the turn
+                # ran until the text scrolled away.  Stop, and say why.
+                signature = _unknown_prompt_signature(current) or current[-400:]
+                if signature != trust_signature:
+                    trust_signature = signature
+                    trust_accepts = 0
+                if trust_accepts >= _TRUST_ACCEPT_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Trust prompt still up after %d accepts, giving up (thread=%d)",
+                        trust_accepts,
+                        self._thread_id,
+                    )
+                    trust_stuck = True
+                    break
+                trust_accepts += 1
                 await self._accept_trust_prompt(current)
+                # Give the TUI time to redraw before judging the accept failed;
+                # the poll interval alone is shorter than a normal redraw.
+                await asyncio.sleep(_TRUST_ACCEPT_SETTLE)
                 continue
+            trust_signature = None
+            trust_accepts = 0
 
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
@@ -1602,7 +1678,17 @@ class TmuxClaudeRunner:
             pane_error = startup_error
             if pane_error is None and not last_response:
                 pane_error = _extract_startup_error(current)
-            if pane_error is not None:
+            if trust_stuck:
+                # #630 sits above the rungs below because it is the only one that
+                # knows what blocked the turn. The others would report a timeout
+                # or "send it again" — both of which send the reader looking in
+                # the wrong place while a dialog sits open in the pane.
+                error = (
+                    f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog "
+                    f'("Yes, I trust this folder") did not close after '
+                    f"{_TRUST_ACCEPT_MAX_ATTEMPTS} attempts, so this turn never ran."
+                )
+            elif pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
                 error = (
@@ -1931,7 +2017,17 @@ class TmuxClaudeRunner:
         marker phrases.  The pre-2.1.248 line carries a "1." that prose does not
         reproduce; the current unnumbered line is plainer, so it additionally
         requires the dialog's "Enter to confirm" footer.
+
+        #630 adds one more requirement: the dialog has to still be ALIVE.  The
+        CLI does not use the alternate screen, so when ``claude`` exits (which is
+        what happens if the confirm lands on "No, exit") the whole dialog stays
+        *printed* on the terminal with a shell prompt under it.  Matching that
+        made the poll loop send Enter into a dead shell once a second — and each
+        Enter printed a new shell prompt, which counts as pane activity, so the
+        inactivity backstop could not fire either.  See :func:`_trust_dialog_is_live`.
         """
+        if not _trust_dialog_is_live(text):
+            return False
         if _TRUST_PROMPT_NUMBERED_RE.search(text):
             return True
         if _TRUST_CONFIRM_FOOTER not in text:

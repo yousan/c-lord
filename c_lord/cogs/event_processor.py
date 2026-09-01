@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 
-from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX
+from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX, TRUST_STUCK_ERROR_PREFIX
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from ..discord_ui.embeds import (
@@ -306,7 +306,10 @@ class EventProcessor:
         if event.error:
             # #562: tell the caller this turn produced nothing, so the turn-end
             # ping says "応答がありませんでした" instead of "Claude has finished".
-            if event.error.startswith(NO_RESPONSE_ERROR_PREFIX):
+            # #630: a turn blocked on the trust dialog also produced nothing, so
+            # it must not be announced as finished either. The embed carries the
+            # specific cause; this flag only stops the "終わりました" summons.
+            if event.error.startswith((NO_RESPONSE_ERROR_PREFIX, TRUST_STUCK_ERROR_PREFIX)):
                 self._config.outcome.no_response = True
             err_msg = await self._config.thread.send(embed=_make_error_embed(event.error))
             if err_msg is not None:

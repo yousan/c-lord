@@ -239,6 +239,31 @@ def no_response_embed(detail: str) -> discord.Embed:
     )
 
 
+def trust_stuck_embed(detail: str) -> discord.Embed:
+    """Embed for a turn blocked on a folder-trust dialog that would not close (#630).
+
+    Before this existed the same situation was reported as a timeout or as "no
+    response — send it again", both of which point the reader away from the one
+    place that shows the problem: the pane, where the dialog is still sitting
+    open. It is also the outcome of a bug that used to answer that dialog 178
+    times in two minutes, so saying plainly that c-lord stopped trying matters.
+    """
+    return discord.Embed(
+        title="\u26a0\ufe0f 信頼ダイアログが閉じられませんでした",
+        description=(
+            f"{detail}\n\n"
+            "作業ディレクトリを信頼するか確認するダイアログ"
+            "（`Yes, I trust this folder`）がペインに出たまま閉じません。"
+            "同じ承認を送り続けないよう、c-lord はここで中断しました。\n\n"
+            "**確認すること:**\n"
+            "\u2022 `/clord-attach` (または tmux) でペインを開き、ダイアログを手で承認する\n"
+            "\u2022 `claude` が落ちていないか（ペインがシェルに戻っていないか）を見る\n"
+            "\u2022 復旧したらもう一度送る"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def timeout_embed(seconds: int) -> discord.Embed:
     """Create an embed for session timeout with actionable guidance."""
     return discord.Embed(

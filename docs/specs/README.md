@@ -35,6 +35,7 @@
 | [mirrored-events.md](./mirrored-events.md) | スレッドに流れるイベントの選別 | 👤 はその人が実際に打ったものだけ。ハーネス内部の通知は progress.txt に畳み、内部パスは出さない |
 | [scheduled-tasks.md](./scheduled-tasks.md) | スケジュール実行（定期タスク） | 時間になるとスレッドが立ち、Claude が実際に起動して応答が投稿される。失敗したら本当の理由が出てログにも残る |
 | [tmux-layout.md](./tmux-layout.md) | tmux のセッションとウィンドウの割り当て | セッションは**リポジトリ**ごと（チャンネルごとではない）。スレッドは紐づくリポジトリのセッションのウィンドウに入る |
+| [trust-prompt.md](./trust-prompt.md) | 作業ディレクトリの信頼ダイアログ | 1つのダイアログにつき承認は1回。閉じないときは数回でやめて理由を出す（黙って撃ち続けない） |
 | [tmux-window-identity.md](./tmux-window-identity.md) | 1 スレッド = 1 ウィンドウ | 同時に何本立てても全部そのまま起動し、あるスレッド宛のキーが別スレッドの作業ディレクトリに入ることはない |
 | [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
 

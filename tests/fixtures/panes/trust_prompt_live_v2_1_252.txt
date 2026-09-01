@@ -1,0 +1,36 @@
+cd /home/yousan/tmp-i630-trust && /home/yousan/.nvm/versions/node/v22.16.0/lib/node_modules/@anthropic-ai/claude-code
+/bin/claude.exe --dangerously-skip-permissions
+
+yousan @ tachikoma1.l2tporg in ~/tmp-i630-trust
+$ cd /home/yousan/tmp-i630-trust && /home/yousan/.nvm/versions/node/v22.16.0/lib/node_modules/@anthropic-ai/claude-co
+de/bin/claude.exe --dangerously-skip-permissions
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /home/yousan/tmp-i630-trust
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+

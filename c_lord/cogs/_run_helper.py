@@ -28,13 +28,22 @@ from ..claude.context_usage import (
     format_context_line,
     read_latest_usage,
 )
-from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX, TmuxClaudeRunner
+from ..claude.tmux_runner import (
+    NO_RESPONSE_ERROR_PREFIX,
+    TRUST_STUCK_ERROR_PREFIX,
+    TmuxClaudeRunner,
+)
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
     bridge_pane_ask,
     collect_ask_answers,
 )
-from ..discord_ui.embeds import error_embed, no_response_embed, timeout_embed
+from ..discord_ui.embeds import (
+    error_embed,
+    no_response_embed,
+    timeout_embed,
+    trust_stuck_embed,
+)
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
@@ -74,6 +83,11 @@ _cli_version_fetched: bool = False
 
 def _make_error_embed(error: str) -> discord.Embed:
     """Pick the embed that matches what actually went wrong."""
+    # #630: checked before the timeout/no-response embeds because it is the one
+    # outcome that knows what blocked the turn — the others would send the
+    # reader looking anywhere but the pane the dialog is still open in.
+    if error.startswith(TRUST_STUCK_ERROR_PREFIX):
+        return trust_stuck_embed(error)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))
