@@ -1,26 +1,28 @@
-[
+{
+ "messages": [
   {
-    "author": "yousan",
-    "timestamp": "2026-06-11 10:00",
-    "content": "/clord-status"
+   "author": "yousan",
+   "timestamp": "2026-09-01 10:30",
+   "content": "/clord-status"
   },
   {
-    "author": "C-lord",
-    "is_bot": true,
-    "timestamp": "2026-06-11 10:00",
-    "color": "#5865F2",
-    "content": "c-lord status · #dev-claude · yousan/c-lord · session c-lord · 2 active · 600 MB\nattach: tmux attach -t c-lord:work<#>      resume: claude --resume <id>\nlegend: run=実行中  wait=入力待ち  err=エラー\n```\n#  status  topic          size    used   resume\n1  run     auth-bug-fix   412 MB  2h     a1b2c3d4\n2  wait    readme-update  188 MB  5m     e5f6a7b8\n```\n+ 3 idle (288 MB) · deleted 2   →   /clord-status all"
+   "author": "C-lord",
+   "is_bot": true,
+   "color": "#5865F2",
+   "timestamp": "2026-09-01 10:30",
+   "content": "c-lord status · #claude_base · yousan/claude_base · 4 active · 1.7 GB\n```\ntmux attach -t <attach 欄をコピペ>\n```\n```\nattach             status  topic                size    used\nqiita-article:w1   wait    OpenClawのQiita記事  412 MB  2h\nmonitoring:w5      run     monitoring 監視改修  1.1 GB  5m\nclaude_base:work5  wait    2017.l2tp.org        120 MB  6h\nclaude_base:w9     wait    pt-jp 調査           88 MB   1d\n```\n+ 1 closed (96 MB) · deleted 2   →   /clord-status all"
   },
   {
-    "author": "yousan",
-    "timestamp": "2026-06-11 10:01",
-    "content": "/clord-status all"
+   "author": "yousan",
+   "timestamp": "2026-09-01 10:31",
+   "content": "/clord-status all"
   },
   {
-    "author": "C-lord",
-    "is_bot": true,
-    "timestamp": "2026-06-11 10:01",
-    "color": "#5865F2",
-    "content": "c-lord status (all) · #dev-claude · session c-lord · 2 active · 3 idle · 888 MB\nlegend: idle=closed(window無し/dir残/容量を食う)   deleted=dir削除済(行なし)\n```\n#  status  topic          size    used   resume\n1  run     auth-bug-fix   412 MB  2h     a1b2c3d4\n2  wait    readme-update  188 MB  5m     e5f6a7b8\n-  idle    old-refactor    96 MB  3d     c1d2e3f4\n-  idle    spike-test     110 MB  8d     d4e5f6a7\n-  idle    docs-pass       82 MB  12d    e7f8a9b0\n```\ndeleted: 2 (dir removed) — resume は claude 本体に履歴が残れば可"
+   "author": "C-lord",
+   "is_bot": true,
+   "color": "#5865F2",
+   "timestamp": "2026-09-01 10:31",
+   "content": "c-lord status (all) · #claude_base · yousan/claude_base · 4 active · 1 closed · 1.8 GB\n```\ntmux attach -t <attach 欄をコピペ>\n```\n```\nattach             status  topic                size    used  cc-session\nqiita-article:w1   wait    OpenClawのQiita記事  412 MB  2h    a1b2c3d4\nmonitoring:w5      run     monitoring 監視改修  1.1 GB  5m    e5f6a7b8\nclaude_base:work5  wait    2017.l2tp.org        120 MB  6h    9c591869\nclaude_base:w9     wait    pt-jp 調査           88 MB   1d    6d86bf1a\n-                  closed  古いリファクタ       96 MB   5d    c1d2e3f4\n```\ndeleted: 2 (作業dir削除済 — 会話はホームに残存し再投稿で復活可)"
   }
-]
+ ]
+}

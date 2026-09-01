@@ -3,7 +3,7 @@
 チャンネル内のセッション状態を 1 コマンドに集約する `/clord-status` の「あるべき見た目」。
 散文 spec では裁定しづらいため、`scripts/discord_mockup.py` で描いた Discord 風モックで合意する（#316）。
 
-- 仕様の本体・受け入れ条件は **Issue #363** を参照（こちらが現在の真実）。
+- 仕様の本体・受け入れ条件は **Issue #363**、attach 列の実測化は **Issue #616** を参照（こちらが現在の真実）。
 - `mockup_spec.json` … 最新モックの spec（`uv run python scripts/discord_mockup.py docs/specs/clord-status/mockup_spec.json -o out.png` で再描画可）。
 - `history/` … 設計の変遷スナップショット（経緯）。
 
@@ -15,6 +15,7 @@
 | 02 | `history/02-wide-table.png` | 「縦短く横長く」要望 → 1 セッション=1 行の等幅テーブルへ |
 | 03 | `history/03-dense-hash-status.png` | `#`=window 番号の数字のみ／attach をヘッダのパターンに集約（文字削減）／status 列追加 |
 | 04 | `history/04-docker-ps-aps.png` | `docker ps`/`docker ps -a` モデル採用。既定=live、`all`=live+closed、deleted は行なし・footer 件数のみ |
+| 05 | `history/05-measured-attach-column.png` | `#`(window 番号) 列を **`attach`（実測の `session:window`）** に置き換え。#615 で「セッションはリポジトリごと」が確定し、1 チャンネルのスレッドが複数セッションに分かれるようになったため、ヘッダの `<session>:work<#>` テンプレートが存在しないウィンドウを指していた（#616）。行そのものを実測にすることで、仕様が変わっても移行の途中でも案内が当たる。横幅ぶんは topic の上限を 28→20 桁に詰めて吸収 |
 
 > 注：history 内のモックは status を `idle` と表記しているが、`wait` と紛らわしいため **`closed` に改名**した（最新仕様は Issue #363 本文）。
 > モックツールは `**`/バッククォート/絵文字を描画しないため、実 Discord ではそれらが正しく描画される。
