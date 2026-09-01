@@ -35,10 +35,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# How far back in each thread to look. The stop message is re-posted at the
-# bottom on every bump, so a leftover is always near the tail; a deep scan would
-# buy nothing and cost pagination.
-_SCAN_MESSAGES = 15
+# How far back in each thread to look. Discord returns at most 100 messages per
+# request, so this is one page — the deepest reach available for the same single
+# API call. A narrower window is a false economy: measured on staging, a leftover
+# from one turn was already 20+ messages from the tail because the turn it
+# belonged to kept posting after it, and later turns pushed it further down.
+_SCAN_MESSAGES = 100
 
 # Upper bound on threads visited in one sweep, newest-used first. Production
 # carries hundreds of live sessions and this runs at startup, so the sweep is
