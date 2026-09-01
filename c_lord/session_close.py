@@ -188,6 +188,23 @@ async def _build_and_apply(
     current = thread.name if isinstance(thread.name, str) else ""
     rename_to = new_name if (new_name and new_name != current) else None
 
+    # #634: Discord rejects every field but ``archived`` on a thread that is
+    # already archived (400, code 50083), so a combined rename+archive PATCH
+    # aimed at one fails as a WHOLE — and the retry below re-applies only the
+    # archive flag, dropping the ``[停止]`` marker in silence (11 threads on
+    # 2026-08-31; it started the moment #605 began auto-stopping, because that
+    # sweep archives before the marker is applied). Clear the flag first so the
+    # rename is accepted. Only the second PATCH carries a name, so the thread's
+    # ~2-per-10-minutes rename allowance is still spent once (#512).
+    # ``apply_open_name`` needs none of this: its PATCH sets ``archived=False``
+    # itself, which is exactly what makes Discord accept the rename with it.
+    # ``is True`` rather than a truthiness test: an object that cannot say
+    # whether it is archived is *unknown*, never archived — the same asymmetry
+    # the menu-watchdog's dead-pane check uses. Guessing "archived" here would
+    # spend a second PATCH on every ordinary close.
+    if rename_to is not None and archived and getattr(thread, "archived", None) is True:
+        await _edit(thread, archived=False)
+
     if not await _edit(thread, archived=archived, name=rename_to) and rename_to is not None:
         # The rename half is what failed (no Manage Threads, or a rename
         # rate-limit we could not wait out). Keep the archive flag, drop the name.

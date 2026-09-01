@@ -41,7 +41,12 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
-from ..discord_ui.views import ReopenSessionView, StopView, TextAnsweredMenuView
+from ..discord_ui.views import (
+    STOP_MESSAGE_PREFIX,
+    ReopenSessionView,
+    StopView,
+    TextAnsweredMenuView,
+)
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..session_reattach import (
@@ -239,6 +244,9 @@ class ClaudeChatCog(commands.Cog):
             bot.authorizer = self._authorizer
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        # #634: the startup sweep for a previous process's dead ⏹ Stop buttons.
+        # Held so the fire-and-forget task is not garbage-collected mid-sweep.
+        self._stop_sweep_task: asyncio.Task[None] | None = None
         self._active_runners: dict[int, TmuxClaudeRunner] = {}
         # Per-thread lock to prevent duplicate _run_claude invocations.
         # Without this, two messages arriving in quick succession could
@@ -1910,7 +1918,16 @@ class ClaudeChatCog(commands.Cog):
           downtime or accidental second restart.
         - A resume failure (e.g. channel not found) is logged and skipped
           gracefully — it never prevents the bot from becoming ready.
+
+        It also sweeps away ``⏹ Stop`` buttons a previous process could not
+        delete (#634). Startup is the only moment at which "every stop button in
+        the DB's threads is dead" is guaranteed true, so it is the only moment
+        the sweep is safe. Spawned as its own task: it walks up to a few hundred
+        threads and must not hold up becoming ready.
         """
+        # Held on the cog so the task is not garbage-collected mid-sweep.
+        self._stop_sweep_task = asyncio.create_task(self._sweep_dead_stop_buttons())
+
         if self._resume_repo is None:
             return
 
@@ -1968,6 +1985,13 @@ class ClaudeChatCog(commands.Cog):
                 )
             except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
+
+    async def _sweep_dead_stop_buttons(self) -> None:
+        """Remove the previous process's dead ⏹ Stop buttons (#634). Never raises."""
+        from ..stale_stop_buttons import sweep_dead_stop_buttons
+
+        with contextlib.suppress(Exception):
+            await sweep_dead_stop_buttons(self.bot, self.repo)
 
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
@@ -2708,7 +2732,7 @@ class ClaudeChatCog(commands.Cog):
             # still run — StopView already treats a missing message as "nothing
             # to delete", so the only thing lost is the button.
             notice = (
-                f"-# ⏺ Session running (`{window_name}`)" if window_name else "-# ⏺ Session running"
+                f"{STOP_MESSAGE_PREFIX} (`{window_name}`)" if window_name else STOP_MESSAGE_PREFIX
             )
             try:
                 stop_view.set_message(await thread.send(notice, view=stop_view))
