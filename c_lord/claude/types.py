@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import discord
@@ -63,6 +63,23 @@ TOOL_CATEGORIES: dict[str, ToolCategory] = {
 }
 
 
+#: How the open TUI menu lets a free-text answer be typed (#650).  The two
+#: layouts Claude Code draws take *different* keystrokes, and sending the wrong
+#: ones answers the tool with "(No answer provided)" — losing what the user
+#: wrote.  Read off the pane, never assumed.
+#:
+#: - ``row``   — classic layout: a "Type something." row below the options.
+#:               Type onto the highlighted row (``Down`` × N → text → Enter).
+#: - ``notes`` — preview layout (any option carries a ``preview``): no such row;
+#:               a ``Notes:`` field opened with ``n`` (``n`` → text → Enter).
+#: - ``none``  — neither affordance is on screen: the menu takes no free text.
+FREE_TEXT_ROW = "row"
+FREE_TEXT_NOTES = "notes"
+FREE_TEXT_NONE = "none"
+
+FreeTextMode = Literal["row", "notes", "none"]
+
+
 @dataclass
 class AskOption:
     """A single selectable option in an AskUserQuestion prompt."""
@@ -85,6 +102,11 @@ class AskQuestion:
     # Claude what to change") uses a different keystroke flow, so a generic
     # Other modal would mis-send keys into the open TUI menu.
     allow_other: bool = True
+    # #650: which keystrokes deliver free text on THIS menu — see FreeTextMode.
+    # ``allow_other`` says whether to offer the ✏️ Other button at all; this says
+    # how to type the answer once it arrives.  Defaults to the classic row so a
+    # hand-built AskQuestion keeps the pre-#650 behaviour.
+    free_text_mode: FreeTextMode = FREE_TEXT_ROW
     # #399: the assistant prose spoken directly above the menu (経緯・推し),
     # extracted from the pane. The CLI buffers the jsonl chunk containing the
     # menu until resolution, so without this the question reaches Discord with

@@ -18,7 +18,12 @@ from c_lord.claude.tmux_runner import (
     _parse_plan_from_pane,
     _unknown_prompt_signature,
 )
-from c_lord.claude.types import MessageType
+from c_lord.claude.types import (
+    FREE_TEXT_NONE,
+    FREE_TEXT_NOTES,
+    FREE_TEXT_ROW,
+    MessageType,
+)
 
 
 @pytest.fixture
@@ -3147,6 +3152,36 @@ class TestRunYieldsPaneAsk:
         tmux_manager.send_input.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_answer_menu_text_notes_mode_opens_the_notes_field(
+        self, runner, tmux_manager
+    ) -> None:
+        """#650: on a preview menu the free text goes through ``Notes:``, not a row.
+
+        Verified on a live Claude Code v2.1.252 pane (isolated tmux, 2026-09-01):
+
+        - ``n`` swaps "press n to add notes" for the input placeholder,
+        - the literal text fills it, and a single ``Enter`` answers the tool
+          (``"…"=(no option selected) notes: <text>``).
+
+        The old sequence (``Down`` × option_count → type → ``Enter``) parks the
+        cursor on "Chat about this" instead, where every printable key is
+        ignored and ``Enter`` returns "(No answer provided)" — the production
+        failure this test exists to prevent.
+        """
+        from unittest.mock import call
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner.answer_menu_text(3, "全部あげてOK", mode=FREE_TEXT_NOTES)
+
+        relevant = [c for c in tmux_manager.mock_calls if c[0] in ("send_keys", "send_literal")]
+        assert relevant == [
+            call.send_keys(12345, "n"),
+            call.send_literal(12345, "全部あげてOK"),
+            call.send_keys(12345, "Enter"),
+        ]
+        tmux_manager.send_input.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_answer_menu_text_index_zero_no_navigation(self, runner, tmux_manager) -> None:
         """When the text row is already highlighted (index 0): type then Enter."""
         from unittest.mock import call
@@ -3570,6 +3605,57 @@ class TestParseAskNewLayouts:
         ]
         assert all(len(o.description) > 20 for o in q.options)
         assert q.multi_select is False
+
+
+class TestPreviewLayoutFreeText:
+    """#650: how free text is delivered depends on the menu's TUI layout.
+
+    Claude Code 2.1.252 draws a *different* AskUserQuestion as soon as any
+    option carries a ``preview``: the options move into a narrow left column,
+    the preview box sits beside them, and the ``Type something.`` row is gone —
+    free text is typed into a ``Notes:`` field opened with ``n``.  The pane
+    therefore has to say which of the two ways is available, because sending
+    the other one answers the tool with "(No answer provided)" and drops what
+    the user wrote (production incident, 2026-09-01).
+
+    ``ask_preview_menu_v2_1_252.txt`` is a real capture from the CLI version
+    that produced that incident.
+    """
+
+    def test_preview_layout_takes_free_text_through_notes(self) -> None:
+        q = _parse_ask_from_pane(_load_fixture("ask_preview_menu_v2_1_252.txt"))
+        assert q is not None
+        assert [o.label for o in q.options] == ["案A ダーク", "案B ライト", "案C 高コントラスト"]
+        assert q.free_text_mode == FREE_TEXT_NOTES
+        assert q.allow_other is True, "the pane offers a notes field — ✏️ Other must stay"
+
+    def test_classic_layout_still_takes_free_text_on_the_row(self) -> None:
+        """AC3: the layout that already worked must keep its answer path."""
+        for name in ("ask_user_question_3options.txt", "ask_rich_descriptions.txt"):
+            q = _parse_ask_from_pane(_load_fixture(name))
+            assert q is not None, name
+            assert q.free_text_mode == FREE_TEXT_ROW, name
+            assert q.allow_other is True, name
+
+    def test_multiselect_layout_keeps_the_row(self) -> None:
+        """Its row lost the trailing period ("Type something") but is still there."""
+        q = _parse_ask_from_pane(_load_fixture("ask_multiselect_menu.txt"))
+        assert q is not None
+        assert q.free_text_mode == FREE_TEXT_ROW
+
+    def test_a_menu_with_no_free_text_affordance_hides_other(self) -> None:
+        """AC4: no row and no notes field ⇒ no ✏️ Other button.
+
+        Offering it would send keystrokes a menu cannot take.  Derived from the
+        real preview capture with the notes affordance removed, because a menu
+        with neither affordance is not something the current CLI draws — the
+        point is that c-lord reads the pane instead of assuming.
+        """
+        pane = _load_fixture("ask_preview_menu_v2_1_252.txt").replace("n to add notes", "")
+        q = _parse_ask_from_pane(pane)
+        assert q is not None
+        assert q.free_text_mode == FREE_TEXT_NONE
+        assert q.allow_other is False
 
 
 class TestAskContextExtraction:
