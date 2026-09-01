@@ -46,7 +46,6 @@ def _staged_prompt(mock_run: MagicMock) -> str:
         path.unlink(missing_ok=True)
 
 
-
 def _render_windows(fmt: str, rows: list[dict[str, str]]) -> str:
     """Render ``tmux list-windows -F <fmt>`` output for *rows*.
 
@@ -1288,9 +1287,7 @@ class TestTmuxSessionManager:
                 return MagicMock(returncode=1, stdout="")
             # list-windows → window exists in session (id\tname — #649)
             if "list-windows" in argv:
-                return MagicMock(
-                    returncode=0, stdout="@1\twork1\n@2\tproj34\n@3\twork2\n"
-                )
+                return MagicMock(returncode=0, stdout="@1\twork1\n@2\tproj34\n@3\twork2\n")
             # set-option succeeds
             if "set-option" in argv:
                 return MagicMock(returncode=0, stdout="")
