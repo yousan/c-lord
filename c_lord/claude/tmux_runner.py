@@ -86,10 +86,12 @@ _POST_STARTUP_DELAY = 1.0
 _CONTINUE_CHECK_DELAY = 3.0
 
 #: How long :meth:`TmuxClaudeRunner.wake` waits for a restored pane to reach its
-#: input box. Generous on purpose: a cold ``claude --continue`` on a large
-#: transcript takes seconds, and the caller (``/tmux-screenshot``) has already
-#: deferred its Discord response, so waiting costs nothing but the wait.
-_WAKE_TIMEOUT = 60.0
+#: input box. Generous on purpose: a cold ``claude --continue`` re-renders the
+#: whole conversation on a host that may already be running a dozen of them, and
+#: the caller (``/tmux-screenshot``) has deferred its Discord response, which
+#: buys 15 minutes. Reporting failure while the pane is in fact still coming up
+#: is the worse error: it leaves a Claude nobody photographed.
+_WAKE_TIMEOUT = 120.0
 
 
 # #560: how many Enter presses send_input tries before giving up. Mirrors

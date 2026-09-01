@@ -298,24 +298,31 @@ class SessionRepository:
             await db.commit()
 
     async def touch(self, thread_id: int) -> None:
-        """Mark this workspace as used now, and awake — #642.
+        """Mark this workspace as used *now* — #642.
 
         What :meth:`save` does for a turn, for the paths that bring a workspace
         back up **without** running one (``/tmux-screenshot`` waking a stopped
-        thread). Both halves are load-bearing:
+        thread). ``last_used_at`` is what every reaper reads, so a wake has to
+        write it, and has to write it **first**:
 
-        * ``slept_at`` — the workspace is resident again, so leaving the mark set
-          would have the next message announce a restore that already happened.
-        * ``last_used_at`` — :class:`c_lord.idle_sleep.IdleSleepLoop` skips a
-          thread it has already acted on *at that timestamp*, so a wake that did
-          not move it would leave the restored Claude resident forever: the sweep
-          would never look at it again until the user typed. Waking without this
-          is a memory leak wearing a feature's clothes.
+        * the 4-hour sweep and #576's LRU cap both select on this column. Waking
+          a workspace whose row still says "idle since yesterday" means the very
+          next tick kills the window *while Claude is still booting* — observed
+          on staging: the pane was killed 47s into a wake, and the wake then
+          timed out looking at a window that no longer existed.
+        * :class:`c_lord.idle_sleep.IdleSleepLoop` also skips a thread it has
+          already acted on at that timestamp, so a wake that never moved it
+          would leave the restored Claude resident forever.
+
+        It deliberately does **not** clear ``slept_at``: that column only picks
+        the wording of the next resume (#572), and until the pane is actually up
+        the honest answer is still "this was slept". The caller clears it once
+        the wake succeeds.
         """
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "UPDATE sessions SET slept_at = NULL, "
-                "last_used_at = datetime('now', 'localtime') WHERE thread_id = ?",
+                "UPDATE sessions SET last_used_at = datetime('now', 'localtime') "
+                "WHERE thread_id = ?",
                 (thread_id,),
             )
             await db.commit()

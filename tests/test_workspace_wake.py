@@ -184,6 +184,7 @@ class TestChatCogWakeWorkspace:
         repo = MagicMock()
         repo.get = AsyncMock(return_value=None)
         repo.touch = AsyncMock()
+        repo.set_slept = AsyncMock()
         runner = MagicMock()
         runner.model = "sonnet"
         runner.effort = None
@@ -200,7 +201,7 @@ class TestChatCogWakeWorkspace:
         thread.parent_id = 456
         return cog, thread
 
-    async def test_creates_the_window_then_wakes_and_touches(self, monkeypatch):
+    async def test_creates_the_window_then_wakes_and_clears_the_sleep_mark(self, monkeypatch):
         _fast(monkeypatch)
         tmux_mgr = MagicMock()
         tmux_mgr.is_claude_running.side_effect = [False, True, True]
@@ -216,15 +217,29 @@ class TestChatCogWakeWorkspace:
         # start_claude — which refuses when there is no window.
         tmux_mgr.create_session.assert_called_once_with(123, "/work/123")
         cog.repo.touch.assert_awaited_once_with(123)
+        cog.repo.set_slept.assert_awaited_once_with(123, False)
 
-    async def test_unbound_channel_cannot_be_woken(self):
-        cog, thread = self._cog(None)
-        assert await cog.wake_workspace(thread) is False
+    async def test_marks_the_row_used_before_starting_claude(self, monkeypatch):
+        """Observed on staging: the 4-hour sweep killed the window 47s into a
+        wake, because the row still carried yesterday's ``last_used_at``. The
+        claim has to land before the pane exists, or a reaper can take it."""
+        _fast(monkeypatch)
+        order: list[str] = []
+        tmux_mgr = MagicMock()
+        tmux_mgr.is_claude_running.side_effect = [False, True, True]
+        tmux_mgr.start_claude.side_effect = lambda *a, **k: order.append("start") or True
+        tmux_mgr.create_session.side_effect = lambda *a, **k: order.append("window")
+        tmux_mgr.capture_pane.return_value = IDLE_PANE
+        cog, thread = self._cog(tmux_mgr)
+        cog.repo.touch = AsyncMock(side_effect=lambda _tid: order.append("touch"))
 
-    async def test_a_failed_wake_does_not_touch_the_row(self, monkeypatch):
-        """``last_used_at`` says "this workspace was used". A restore that never
-        came up did not use it, and moving the clock would hide it from the
-        7-day stop and the 30-day sweep for nothing."""
+        assert await cog.wake_workspace(thread) is True
+        assert order[0] == "touch", order
+
+    async def test_a_failed_wake_leaves_the_sleep_mark_alone(self, monkeypatch):
+        """``slept_at`` words the next resume. A restore that never came up did
+        not change what happened, so claiming otherwise would make the next
+        message announce a crash the user never had."""
         _fast(monkeypatch)
         tmux_mgr = MagicMock()
         tmux_mgr.is_claude_running.return_value = False
@@ -232,7 +247,12 @@ class TestChatCogWakeWorkspace:
         cog, thread = self._cog(tmux_mgr)
 
         assert await cog.wake_workspace(thread) is False
-        cog.repo.touch.assert_not_awaited()
+        cog.repo.set_slept.assert_not_awaited()
+
+    async def test_unbound_channel_cannot_be_woken(self):
+        cog, thread = self._cog(None)
+        assert await cog.wake_workspace(thread) is False
+
 
     async def test_waits_for_the_per_thread_setup_lock(self, monkeypatch):
         """Two clicks (or a message landing mid-wake) must not each start a

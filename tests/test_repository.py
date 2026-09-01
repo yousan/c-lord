@@ -119,7 +119,7 @@ class TestSessionRepository:
 class TestTouch:
     """``touch`` — used by paths that wake a workspace without running a turn (#642)."""
 
-    async def test_clears_the_sleep_mark_and_moves_last_used(self, repo):
+    async def test_moves_last_used_and_leaves_the_sleep_mark(self, repo):
         await repo.save(thread_id=77, session_id="s")
         await repo.set_slept(77, True)
         before = await repo.get(77)
@@ -138,10 +138,12 @@ class TestTouch:
 
         after = await repo.get(77)
         assert after is not None
-        assert after.slept_at is None
-        # The idle sweep keys on this value; a wake that left it alone would keep
-        # the restored Claude resident forever.
+        # The sweeps key on this value: an un-bumped row is both killed mid-wake
+        # and never revisited afterwards.
         assert after.last_used_at != "2020-01-01 00:00:00"
+        # ``slept_at`` words the next resume and is the caller's to clear once
+        # the pane is actually back up.
+        assert after.slept_at is not None
 
     async def test_missing_row_is_not_an_error(self, repo):
         await repo.touch(999999)

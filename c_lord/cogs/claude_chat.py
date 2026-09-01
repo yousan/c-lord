@@ -2155,6 +2155,15 @@ class ClaudeChatCog(commands.Cog):
         """The body of :meth:`wake_workspace`, under the per-thread setup lock."""
         import asyncio as _asyncio
 
+        # Claim the row as "used now" BEFORE anything starts. The 4-hour sweep
+        # and #576's LRU cap both select on ``last_used_at``, and a workspace
+        # being woken still carries yesterday's value — on staging the sweep
+        # killed the window 47 seconds into the wake, and the wake then sat
+        # watching a window that no longer existed. Marking it first takes the
+        # thread out of both reapers' candidate sets for the whole startup.
+        with contextlib.suppress(Exception):
+            await self.repo.touch(thread.id)
+
         session_dir_manager = await self._resolve_session_dir_manager(
             parent_channel_id, thread_id=thread.id
         )
@@ -2181,11 +2190,12 @@ class ClaudeChatCog(commands.Cog):
         if not await runner.wake():
             return False
 
-        # Awake and used — see ``SessionRepository.touch``. Without the
-        # ``last_used_at`` bump the idle sweep would never revisit this thread,
-        # and a screenshot would cost 400 MB of resident Claude indefinitely.
+        # The pane is up, so the sleep mark is no longer true. It only ever
+        # words the next resume (#572), which is why it is cleared here and not
+        # with the ``touch`` above: until this point "this workspace was slept"
+        # was still the honest answer.
         with contextlib.suppress(Exception):
-            await self.repo.touch(thread.id)
+            await self.repo.set_slept(thread.id, False)
 
         # The restore assigns a new tmux window, and the thread name carries that
         # number as a hint (#95). Left stale it points at a window that no longer
