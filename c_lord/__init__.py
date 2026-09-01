@@ -17,6 +17,7 @@ from .cogs.claude_chat import ClaudeChatCog
 from .cogs.event_processor import EventProcessor
 from .cogs.run_config import RunConfig
 from .cogs.scheduler import SchedulerCog
+from .cogs.session_cleanup import SessionCleanupCog
 from .cogs.session_manage import SessionManageCog
 from .cogs.skill_command import SkillCommandCog
 from .cogs.version_cmd import VersionCog
@@ -76,6 +77,7 @@ __all__ = [
     # Concurrency
     "ActiveSession",
     "SessionRegistry",
+    "SessionCleanupCog",
     "SessionManageCog",
     "SkillCommandCog",
     "VersionCog",

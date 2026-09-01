@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     auto_topic_locked INTEGER NOT NULL DEFAULT 0,
     topic_source TEXT,
     rename_backoff_until TEXT,
+    closed_at TEXT,
+    closed_reason TEXT,
+    slept_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -150,6 +153,34 @@ _MIGRATIONS = [
     # from the session's git branch or first message and shown in the thread
     # name as "#<n>". Persisted so it is stable across restarts.
     "ALTER TABLE sessions ADD COLUMN issue_ref TEXT",
+    # Issue #593: the Issue/PR number the thread was *opened for* — its identity
+    # in the sidebar. Written once (the first time any number is known) and never
+    # moved again, unlike issue_ref which follows the git branch every turn. The
+    # two were one column, so switching to a spun-off Issue's branch erased the
+    # number the thread was findable by.
+    "ALTER TABLE sessions ADD COLUMN origin_issue_ref TEXT",
+    # Backfill for rows written before the column existed: adopt the number they
+    # currently carry. Their display does not change (origin == current renders
+    # as one number) and the *next* branch switch is tracked. Idempotent — it
+    # only ever fills NULLs, so re-running it on every startup is a no-op.
+    "UPDATE sessions SET origin_issue_ref = issue_ref "
+    "WHERE origin_issue_ref IS NULL AND issue_ref IS NOT NULL",
+    # Issue #512: when the user closed this session on purpose
+    # (/close-workspace). NULL = open. Persisting it is what lets c-lord tell an
+    # intentional 終了 apart from a pane that merely died (bot restart, tmux-server
+    # death) — the latter still auto-resumes via --continue (#270), the former
+    # holds the message and asks the user to reopen.
+    "ALTER TABLE sessions ADD COLUMN closed_at TEXT",
+    # #574: why it was stopped ("manual" / "idle"). Wording only — the
+    # state itself is still decided by closed_at alone, so the two can
+    # never disagree.
+    "ALTER TABLE sessions ADD COLUMN closed_reason TEXT",
+    # #572: when the 4-hour sleep stopped this workspace's Claude. NULL once any
+    # turn has run since. Read **only** to word the resume — a slept workspace
+    # comes back without a word, a crashed one says so (#464). Whether to resume
+    # at all is still decided by "is the pane alive?" alone, so this column can
+    # never contradict the thing it describes (the closed_reason rule).
+    "ALTER TABLE sessions ADD COLUMN slept_at TEXT",
 ]
 
 

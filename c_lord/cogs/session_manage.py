@@ -13,6 +13,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
@@ -21,9 +22,17 @@ from discord.ext import commands
 
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
+from ..devenv import DevContainer, containers_for_session_dir, stop_containers
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
+from ..session_close import (
+    apply_closed_name,
+    apply_open_name,
+    is_closed,
+    reopen_rename_notice,
+)
 from ..session_dir import SessionDirManager
+from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
 from ..status_view import StatusRow, classify_status, render_status
 from ..thread_settings import (
     SETTING_THREAD_AUTO_ARCHIVE,
@@ -33,6 +42,12 @@ from ..thread_settings import (
 from ..tmux import parse_work_number
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
+from ..workspace_notice import (
+    DockerOutcome,
+    WorkspaceAction,
+    WorkspaceReason,
+    workspace_notice_embed,
+)
 
 if TYPE_CHECKING:
     from ..bot import ClaudeDiscordBot
@@ -44,18 +59,6 @@ logger = logging.getLogger(__name__)
 # without duplicating the body (#209 follow-up).
 _Responder = Callable[..., Awaitable[None]]
 _Acknowledger = Callable[..., Awaitable[None]]
-
-# #464 ②-2: commands that inspect/reconnect a live session (/tmux-screenshot,
-# /resync) used to dead-end with a bare "No tmux window found for this thread."
-# when the work session was stopped (bot restart / tmux-server death). That left
-# the user stuck with no next step during the 2026-06-25 incident. Point them at
-# the recovery path instead: a normal message auto-resumes the on-disk session
-# via --continue (#270) and announces it (#465), so the session comes back.
-_SESSION_STOPPED_HINT = (
-    "ℹ️ この作業セッションは現在停止しています（tmux ウィンドウがありません）。\n"
-    "**このスレッドにメッセージを送れば自動で復元し、続きから再開します。**"
-)
-
 
 # Model management
 SETTING_CLAUDE_MODEL = "claude_model"
@@ -80,6 +83,18 @@ _MODEL_CHOICES = [
 # (flag injection). Whether the model actually *exists* is left to the CLI to
 # decide; c-lord keeps no model registry (security-audit, #478).
 _MODEL_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+
+#: Posted with the PNG when the capture had to restore the workspace first (#642).
+#: Small text: it explains the wait, it is not the answer the user asked for.
+_RESTORED_NOTICE = "-# 🔄 停止していたワークスペースを復元してから撮影しました。"
+
+#: The restore itself failed. Says so plainly and points at the path that has the
+#: rest of the recovery machinery behind it (announcements, reopen buttons, the
+#: untracked-thread notice) rather than leaving the user with a dead command.
+_WAKE_FAILED = (
+    "⚠️ 停止していたワークスペースの復元に失敗したため、スクリーンショットを撮れませんでした。\n"
+    "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
+)
 
 
 def _is_valid_model_id(model: str) -> bool:
@@ -158,10 +173,16 @@ class SessionManageCog(commands.Cog):
         repo: SessionRepository,
         settings_repo: SettingsRepository | None = None,
         runner: object | None = None,
+        devenv_repo: object | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
         self.settings_repo = settings_repo
+        # #612: where the docker↔workspace link is written down. Optional so
+        # consumers constructing the cog themselves keep working, but the
+        # standard setup always passes it — without a call site, #573's
+        # persistence layer was dead code and its table was never created.
+        self._devenv_repo = devenv_repo
         # Optional ClaudeConfig reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
@@ -486,13 +507,19 @@ class SessionManageCog(commands.Cog):
             return await channel_cog.resolve_manager(channel_id)
         return None
 
-    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
-        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+    async def _resolve_tmux_manager(
+        self, channel_id: int, *, thread_id: int | None
+    ) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
+
+        #427: pass ``thread_id`` whenever a thread is in scope, so a thread
+        bound to its own repo is looked up in that repo's tmux session.
+        """
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_tmux_manager(channel_id)
+            return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
     async def _resolve_all_tmux_managers(self) -> list[TmuxSessionManager]:
@@ -500,7 +527,8 @@ class SessionManageCog(commands.Cog):
         bindings = await self._get_all_bindings()
         managers: list[TmuxSessionManager] = []
         for binding in bindings:
-            mgr = await self._resolve_tmux_manager(binding["channel_id"])
+            # Walks channel bindings, not threads (#600 audit).
+            mgr = await self._resolve_tmux_manager(binding["channel_id"], thread_id=None)
             if mgr is not None:
                 managers.append(mgr)
         return managers
@@ -551,7 +579,10 @@ class SessionManageCog(commands.Cog):
             return
 
         sdm = await self._resolve_session_dir_manager(parent_id)
-        tmux_mgr = await self._resolve_tmux_manager(parent_id)
+        # Resolved only to answer "is this channel bound to a repo at all?".
+        # #616: it must NOT decide which session a row is in — after #615 the
+        # channel's threads can sit in several sessions, one per bound repo.
+        tmux_mgr = await self._resolve_tmux_manager(parent_id, thread_id=None)
         if sdm is None or tmux_mgr is None:
             await respond(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
@@ -562,14 +593,25 @@ class SessionManageCog(commands.Cog):
 
         await ack()
 
+        from ..thread_state_sync import _list_all_windows
+
         dirs = await asyncio.to_thread(sdm.find_session_dirs)
-        windows = await asyncio.to_thread(tmux_mgr.list_sessions)
+        # #616: read every session on the tmux server, not just this channel's.
+        # A thread bound to another repo lives elsewhere, and the whole point of
+        # the attach column is that it is measured rather than assembled.
+        windows = await asyncio.to_thread(_list_all_windows)
         window_by_thread: dict[int, str] = {}
+        attach_by_thread: dict[int, str] = {}
         for w in windows:
             tid = w.get("thread_id")
-            if tid:
-                with contextlib.suppress(ValueError, TypeError):
-                    window_by_thread[int(tid)] = w["window_name"]
+            window_name = w.get("window_name") or ""
+            session = w.get("session_name") or ""
+            if not tid or not window_name:
+                continue
+            with contextlib.suppress(ValueError, TypeError):
+                key = int(tid)
+                window_by_thread[key] = window_name
+                attach_by_thread[key] = f"{session}:{window_name}" if session else window_name
 
         rows: list[StatusRow] = []
         for d in dirs:
@@ -588,6 +630,7 @@ class SessionManageCog(commands.Cog):
             rows.append(
                 StatusRow(
                     window_number=parse_work_number(window_name) if window_name else None,
+                    attach=attach_by_thread.get(d.thread_id),
                     status=status,
                     topic=topic,
                     size_bytes=size,
@@ -618,7 +661,6 @@ class SessionManageCog(commands.Cog):
             show_all=show_all,
             channel_name=channel_name,
             repo=repo_label,
-            session_name=tmux_mgr.session_name,
             deleted_count=deleted_count,
             now=datetime.now(),
         )
@@ -807,7 +849,8 @@ class SessionManageCog(commands.Cog):
 
         all_windows: list[dict] = []
         for binding in bindings:
-            tmux_mgr = await self._resolve_tmux_manager(binding["channel_id"])
+            # Walks channel bindings, not threads (#600 audit).
+            tmux_mgr = await self._resolve_tmux_manager(binding["channel_id"], thread_id=None)
             if tmux_mgr is not None:
                 windows = await asyncio.to_thread(tmux_mgr.list_sessions)
                 all_windows.extend(windows)
@@ -875,7 +918,7 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is None:
             await respond(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
@@ -884,10 +927,32 @@ class SessionManageCog(commands.Cog):
             )
             return
 
-        window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
+        window = await asyncio.to_thread(tmux_mgr.window_name, thread_id)
+        restored = False
         if window is None:
-            await respond(_SESSION_STOPPED_HINT, ephemeral=True)
-            return
+            # #642: a stopped workspace used to end here with a sentence telling
+            # the user to send a message. #572 then made "stopped" the ordinary
+            # state of anything untouched for four hours, so that sentence became
+            # the usual answer and the command stopped returning pictures. Bring
+            # the workspace back and photograph it — but only where a message
+            # would have restored it too: 終了 is a state the user chose, and an
+            # untracked thread has no conversation to restore (#538).
+            verdict = classify(await self.repo.get(thread_id))
+            if verdict is not ThreadResume.RESUMES:
+                await respond(stopped_hint(verdict), ephemeral=True)
+                return
+            if not await self._wake_workspace(channel):
+                await respond(_WAKE_FAILED, ephemeral=True)
+                return
+            window = await asyncio.to_thread(tmux_mgr.window_name, thread_id)
+            if window is None:
+                logger.warning(
+                    "%s wake reported success but no tmux window exists",
+                    log_ctx(thread_id=thread_id),
+                )
+                await respond(_WAKE_FAILED, ephemeral=True)
+                return
+            restored = True
 
         ansi = await asyncio.to_thread(tmux_mgr.capture_screen, thread_id)
         if not ansi.strip():
@@ -909,7 +974,33 @@ class SessionManageCog(commands.Cog):
 
         filename = f"tmux-{tmux_mgr.session_name}-{window}.png"
         file = discord.File(BytesIO(png), filename=filename)
-        await respond(file=file)
+        # Say when the picture cost a restore: the user waited several seconds
+        # for something they did not ask for, and the pane they are looking at
+        # is a Claude that was not running a moment ago.
+        await respond(_RESTORED_NOTICE if restored else None, file=file)
+
+    async def _wake_workspace(self, channel: discord.Thread) -> bool:
+        """Restore this thread's stopped workspace, via ClaudeChatCog (#642).
+
+        Loose-coupled through ``bot.get_cog`` (as ``/reopen-workspace`` is): the
+        spawn conditions — checkout, tmux window, model, effort, permission flags
+        — live with the turn path, and a copy of them here would drift into
+        starting a *different* Claude than the next message expects. A consumer
+        that never loaded ClaudeChatCog simply cannot wake anything, which is a
+        False, not a crash.
+        """
+        wake = getattr(self.bot.get_cog("ClaudeChatCog"), "wake_workspace", None)
+        if wake is None:
+            logger.info(
+                "%s no ClaudeChatCog — cannot wake this workspace",
+                log_ctx(thread_id=channel.id),
+            )
+            return False
+        try:
+            return bool(await wake(channel))
+        except Exception:
+            logger.warning("%s wake failed", log_ctx(thread_id=channel.id), exc_info=True)
+            return False
 
     @app_commands.command(
         name="tmux-screenshot",
@@ -992,84 +1083,42 @@ class SessionManageCog(commands.Cog):
         status_bar = (tmux_mgr.session_name, tabs, window_name) if tabs else None
         return await asyncio.to_thread(render_pane_png, ansi, status_bar)
 
-    async def _resolve_channel_session(self, channel: object, parent_id: int | None) -> str | None:
-        """Return the tmux session name backing *channel*'s threads.
-
-        Per the per-channel session model (#10), all threads in a channel share
-        one tmux session. Prefer the channel's bound manager; fall back to the
-        session the invoking thread's window actually lives in (covers unbound
-        channels, mirroring the #420 watchdog fallback).
-        """
-        if parent_id is not None:
-            tmux_mgr = await self._resolve_tmux_manager(parent_id)
-            if tmux_mgr is not None:
-                return tmux_mgr.session_name
-        if isinstance(channel, discord.Thread):
-            session_name, _ = await self._find_thread_window(channel.id)
-            return session_name
-        return None
-
     async def _resync_impl(
-        self, *, channel: object, scope: str, respond: _Responder, ack: _Acknowledger
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
     ) -> None:
-        """Shared core for /resync (thread) and /resync-channel (#439)."""
-        import asyncio
+        """Shared core for /resync — reconnect *this thread's* mirror (#439).
 
-        if scope == "thread":
-            if not isinstance(channel, discord.Thread):
-                await respond(
-                    "This command can only be used in a Claude chat thread.",
-                    ephemeral=True,
-                )
-                return
-            thread_id = channel.id
-            await ack()
-            session_name, window_name = await self._find_thread_window(thread_id)
-            if not session_name or not window_name:
-                await respond(_SESSION_STOPPED_HINT, ephemeral=True)
-                return
-            # 1. Re-bridge any stranded TUI menu so its buttons (re)appear.
-            await self._rebridge_menu(thread_id, session_name, window_name)
-            # 2. Post the current pane snapshot so the user sees the live state.
-            png = await self._snapshot_pane(session_name, window_name, thread_id)
-            if png is not None:
-                file = discord.File(
-                    BytesIO(png), filename=f"resync-{session_name}-{window_name}.png"
-                )
-                await respond("🔄 ミラーを今の tmux 状態に繋ぎ直しました。", file=file)
-            else:
-                await respond(
-                    "🔄 ミラーを繋ぎ直しました（pane は空、または PNG 依存 "
-                    "`c-lord[table]` が未導入）。"
-                )
-            return
-
-        # channel scope — resync every thread window in this channel's session.
-        channel_id = getattr(channel, "id", None)
-        parent_id = getattr(channel, "parent_id", None) or channel_id
-        await ack()
-        session_name = await self._resolve_channel_session(channel, parent_id)
-        if not session_name:
+        Thread-scoped only. The channel-wide twin was removed in #619: it swept
+        a single tmux session, so threads bound to another repo were silently
+        skipped, while the 60s menu watchdog already re-bridges every session
+        automatically. A manual command narrower than the automatic one is worse
+        than none.
+        """
+        if not isinstance(channel, discord.Thread):
             await respond(
-                "ℹ️ このチャンネルの tmux セッションが見つかりません。"
-                " `/clord-init` でリポジトリを紐づけてください。",
+                "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
             return
-
-        from ..thread_state_sync import _list_all_windows
-
-        windows = await asyncio.to_thread(_list_all_windows)
-        count = 0
-        for w in windows:
-            if w.get("session_name") != session_name:
-                continue
-            tid = w.get("thread_id") or ""
-            if not tid.isdigit():
-                continue
-            await self._rebridge_menu(int(tid), session_name, w.get("window_name") or "")
-            count += 1
-        await respond(f"🔄 {count} スレッドのミラーを繋ぎ直しました（session={session_name}）。")
+        thread_id = channel.id
+        await ack()
+        session_name, window_name = await self._find_thread_window(thread_id)
+        if not session_name or not window_name:
+            # Stopped session: which sentence is true depends on what a message would
+            # actually do in this thread, which session_resume owns (#464 ②-2, #538).
+            await respond(await hint_for_thread(self.repo, thread_id), ephemeral=True)
+            return
+        # 1. Re-bridge any stranded TUI menu so its buttons (re)appear.
+        await self._rebridge_menu(thread_id, session_name, window_name)
+        # 2. Post the current pane snapshot so the user sees the live state.
+        png = await self._snapshot_pane(session_name, window_name, thread_id)
+        if png is not None:
+            file = discord.File(BytesIO(png), filename=f"resync-{session_name}-{window_name}.png")
+            await respond("🔄 ミラーを今の tmux 状態に繋ぎ直しました。", file=file)
+        else:
+            await respond(
+                "🔄 ミラーを繋ぎ直しました（pane は空、または PNG 依存 `c-lord[table]` が未導入）。"
+            )
 
     @app_commands.command(
         name="resync",
@@ -1078,32 +1127,13 @@ class SessionManageCog(commands.Cog):
     async def resync(self, interaction: discord.Interaction) -> None:
         """Re-bridge a stranded menu and post a fresh pane snapshot (#439)."""
         respond, ack = self._slash_io(interaction)
-        await self._resync_impl(
-            channel=interaction.channel, scope="thread", respond=respond, ack=ack
-        )
+        await self._resync_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="resync")
     async def resync_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /resync — webhook-invokable for E2E (#439)."""
         respond, ack = self._ctx_io(ctx)
-        await self._resync_impl(channel=ctx.channel, scope="thread", respond=respond, ack=ack)
-
-    @app_commands.command(
-        name="resync-channel",
-        description="Reconnect the Discord mirror for every thread in this channel",
-    )
-    async def resync_channel(self, interaction: discord.Interaction) -> None:
-        """Channel-wide /resync — re-bridge every thread in this channel (#439)."""
-        respond, ack = self._slash_io(interaction)
-        await self._resync_impl(
-            channel=interaction.channel, scope="channel", respond=respond, ack=ack
-        )
-
-    @commands.command(name="resync-channel")
-    async def resync_channel_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /resync-channel (#439)."""
-        respond, ack = self._ctx_io(ctx)
-        await self._resync_impl(channel=ctx.channel, scope="channel", respond=respond, ack=ack)
+        await self._resync_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     async def _stop_transcript_mirror(self, thread_id: int) -> None:
         """Stop the TranscriptMirror tailing this thread, if any (#379).
@@ -1159,7 +1189,7 @@ class SessionManageCog(commands.Cog):
         results: list[str] = []
 
         # Kill tmux window
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is not None:
             killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
             if killed:
@@ -1204,8 +1234,115 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
 
+    async def _sleep_workspace_impl(
+        self,
+        *,
+        channel: object,
+        reason: WorkspaceReason = WorkspaceReason.IDLE,
+        idle_label: str | None = None,
+    ) -> bool:
+        """スリープ — stop this workspace's Claude and nothing else (#572).
+
+        The innermost of the three lifecycle operations (スリープ ⊂ 停止 ⊂ 削除).
+        It kills the tmux window, which is the whole 400 MB, and stops there:
+
+        * **docker keeps running.** A build in progress or a database must not
+          die because nobody typed for four hours, and the memory this reclaims
+          is Claude's, not docker's — so stopping containers would cost real work
+          to buy nothing. Their host ports stay held, which is the one thing the
+          user is told about (below).
+        * the working copy, the transcript, the volumes and the ``sessions`` row
+          are untouched,
+        * no ``closed_at``, no rename, no marker. 停止 is a state the user can
+          see and undo; sleep is not a state they should ever have to know about.
+
+        Returns ``True`` only when a window was actually killed. The callers —
+        :class:`c_lord.idle_sleep.IdleSleepLoop`, and #576's resident cap — count
+        that, not the number of calls: a sweep that counts attempts reports
+        progress it never made (#604).
+
+        There is no slash command on purpose. Being invisible is the feature; a
+        手動 twin would add a concept ("how is this different from 停止?") that
+        buys the user nothing.
+        """
+        if not isinstance(channel, discord.Thread):
+            return False
+
+        import asyncio
+
+        thread_id = channel.id
+        parent_channel_id = channel.parent_id or thread_id
+
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
+        if tmux_mgr is None:
+            return False
+
+        # Already asleep (or never resident): there is nothing to reclaim, and
+        # going further would re-post the docker line on every tick — which is
+        # how an invisible feature turns into a nuisance.
+        if not await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
+            return False
+
+        # Stop the mirror BEFORE the kill (#379): killing the pane can make the
+        # harness write a final ``<task-notification>`` row into the transcript,
+        # and a mirror still tailing would echo it into the thread as 👤. Sleep
+        # must leave no trace.
+        await self._stop_transcript_mirror(thread_id)
+
+        if not await asyncio.to_thread(tmux_mgr.kill_session, thread_id):
+            logger.info("%s sleep: no tmux window to kill", log_ctx(thread_id=thread_id))
+            return False
+
+        # Remember it, so the next message resumes without a word even across a
+        # bot restart. Wording only — see ``SessionRepository.set_slept``.
+        with contextlib.suppress(Exception):
+            await self.repo.set_slept(thread_id, True)
+
+        logger.info(
+            "%s workspace slept (reason=%s, idle=%s)",
+            log_ctx(thread_id=thread_id),
+            reason.value,
+            idle_label or "-",
+        )
+
+        # ── the one exception to silence ──────────────────────────────────
+        # docker was left running on purpose, so this workspace still holds its
+        # host ports. The user cannot work that out for themselves and it comes
+        # back as a port collision the next time they start an environment
+        # (measured: one supabase workspace holds five ports). Everything else
+        # about a sleep is deliberately unremarkable, so nothing else is said.
+        containers: list[DevContainer] = []
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(parent_channel_id)
+            if sdm is not None:
+                session_dir = str(Path(sdm.base_dir) / str(thread_id))
+                containers = await containers_for_session_dir(session_dir)
+
+        if any(c.running for c in containers):
+            # Built by the shared inventory builder, not a bespoke line: a notice
+            # says what stopped *and what survived*, because "did I just lose
+            # something?" is the reader's actual question (#571). Two functions
+            # producing "the same" message always drift — that was #538.
+            embed = workspace_notice_embed(
+                WorkspaceAction.SLEEP,
+                reason=reason,
+                idle_label=idle_label,
+                containers=containers,
+                docker=DockerOutcome.LEFT_RUNNING,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await channel.send(embed=embed)
+
+        return True
+
     async def _close_workspace_impl(
-        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+        self,
+        *,
+        channel: object,
+        respond: _Responder,
+        ack: _Acknowledger,
+        reason: WorkspaceReason = WorkspaceReason.MANUAL,
+        idle_label: str | None = None,
     ) -> None:
         """Shared core for /close-workspace and !close-workspace (#271).
 
@@ -1243,42 +1380,224 @@ class SessionManageCog(commands.Cog):
         results: list[str] = []
 
         # Kill the tmux window to free the w<N> slot.
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id)
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is not None:
-            killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
-            if killed:
-                results.append("✅ Tmux window closed")
-            else:
-                results.append("ℹ️ No tmux window found")
-            results.append("📂 Session directory kept — send a message to resume.")
+            await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
         else:
             results.append(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
                 " `/clord-init` で設定してください。"
             )
 
-        embed = discord.Embed(
-            title="🧹 Workspace Closed",
-            description="\n".join(results),
-            color=COLOR_SUCCESS,
+        # #512: record the close so a later message can tell this apart from a
+        # pane that merely died — the latter still auto-resumes via --continue
+        # (#270), this one holds the message and offers the reopen button.
+        with contextlib.suppress(Exception):
+            await self.repo.set_closed(thread_id, True, reason=reason.value)
+
+        # Rename to "[終了] …" **and** archive (#271) in a single PATCH. They must
+        # not be two calls: Discord refuses to rename an archived thread (code
+        # 50083), and each rename spends one of the thread's ~2-per-10-minutes
+        # allowance — two edits make a 429 (and a silently lost marker) twice as
+        # likely. apply_closed_name falls back to archive-only if the rename half
+        # fails, so a missing Manage Threads permission still leaves the thread
+        # archived (#512).
+
+        # #574: stop the dev environment too. Leaving it running is how 12
+        # supabase containers ended up on the production host holding ports
+        # 55321-55327 with no owner: the workspace was gone, so nothing was left
+        # that knew they existed. Stopping frees the ports; the volumes (the
+        # actual data) are untouched — see docs/specs/workspace-vocabulary.md.
+        containers: list[DevContainer] = []
+        # Only a discovery that actually completed may be written down. An empty
+        # list from a *failed* docker call is indistinguishable from "nothing is
+        # running" at the call site, and recording it would mark live containers
+        # as gone — losing the very ownership record #612 exists to keep.
+        discovered_dir: str | None = None
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(parent_channel_id)
+            if sdm is not None:
+                session_dir = str(Path(sdm.base_dir) / str(thread_id))
+                containers = await containers_for_session_dir(session_dir)
+                discovered_dir = session_dir
+
+        # #612: write the link down *before* stopping. This is the last moment
+        # anything knows these containers belong to this thread — after the
+        # workspace goes, only this row can answer "who is holding port 55322?".
+        if self._devenv_repo is not None and discovered_dir is not None:
+            with contextlib.suppress(Exception):
+                await self._devenv_repo.record(  # type: ignore[attr-defined]
+                    thread_id, discovered_dir, containers
+                )
+
+        docker_outcome = DockerOutcome.NONE
+        if containers:
+            stopped = await stop_containers(containers)
+            # Report what actually happened, not what was attempted: a docker
+            # that refused leaves the ports held, and the notice must say so
+            # rather than announcing a release that did not occur (#571).
+            docker_outcome = DockerOutcome.STOPPED if stopped else DockerOutcome.LEFT_RUNNING
+
+        # #571: the notice is an inventory, not a label — it says what stopped
+        # *and* what survived, because that is the question the reader has.
+        # Built by the one shared function so the manual and automatic notices
+        # cannot drift (the #538 failure mode).
+        embed = workspace_notice_embed(
+            WorkspaceAction.STOP,
+            reason=reason,
+            idle_label=idle_label,
+            containers=containers,
+            docker=docker_outcome,
         )
+        if results:
+            embed.add_field(name="メモ", value="\n".join(results), inline=False)
+
+        # #607: post *before* archiving. Discord un-archives a thread the moment
+        # anything is posted to it, so archiving first meant every automatically
+        # stopped thread bounced straight back open — measured in production,
+        # 6 out of 6 ended up ``archived=False`` and kept cluttering the sidebar.
+        # The rename lost too: Discord refuses to rename an archived thread
+        # (code 50083), so the ``[停止]`` marker never landed either.
         await respond(embed=embed)
 
-        # Archive the thread to declutter the sidebar (best-effort).
-        with contextlib.suppress(discord.HTTPException):
-            await channel.edit(archived=True)
+        new_name = await apply_closed_name(self.repo, channel)
+        if new_name:
+            logger.info(
+                "%s stopped workspace renamed to %r",
+                log_ctx(thread_id=thread_id),
+                new_name,
+            )
+
+    @app_commands.command(
+        name="workspace-stop",
+        description="停止: stop Claude and the dev environment, keep everything else",
+    )
+    async def workspace_stop(self, interaction: discord.Interaction) -> None:
+        """停止 — kill the tmux window and the dev environment (#574).
+
+        Named object-first (``workspace-stop``) because that is already the
+        majority convention in this command set (9 of 13 that take an object) and
+        because Discord's autocomplete groups by prefix: typing ``/workspace``
+        surfaces the whole lifecycle together, which ``close-workspace`` never
+        did.
+        """
+        respond, ack = self._slash_io(interaction)
+        await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-stop")
+    async def workspace_stop_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /workspace-stop — webhook-invokable for E2E (#271)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     @app_commands.command(
         name="close-workspace",
-        description="Close the tmux window but keep the session (resumes on next message)",
+        description="(旧名) /workspace-stop と同じです",
     )
     async def close_workspace(self, interaction: discord.Interaction) -> None:
-        """Close the tmux window + archive the thread, keeping the session dir (#271)."""
+        """Old name for :meth:`workspace_stop`, kept working (#574).
+
+        Renaming a command people have in their fingers is not free. The alias
+        calls the same implementation, so there is nothing to keep in sync — and
+        consumers get the new name by updating the package alone, which is the
+        Zero-Config Principle.
+        """
         respond, ack = self._slash_io(interaction)
         await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="close-workspace")
     async def close_workspace_text(self, ctx: commands.Context) -> None:
-        """Text/mention twin of /close-workspace — webhook-invokable for E2E (#271)."""
+        """Text/mention twin of the /close-workspace alias (#271)."""
         respond, ack = self._ctx_io(ctx)
         await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    async def _reopen_workspace_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /reopen-workspace and !reopen-workspace (#512).
+
+        Inverse of :meth:`_close_workspace_impl`: clears ``closed_at`` and drops
+        the ``[終了]`` marker from the thread name, so the next message runs
+        normally again (resuming the kept session via ``--continue``, #270).
+
+        Deliberately does **not** recreate the tmux window — that happens on the
+        next message like any other resume, which keeps one spawn path instead of
+        two.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond(
+                "This command can only be used in a Claude chat thread.",
+                ephemeral=True,
+            )
+            return
+
+        await ack()
+
+        record = await self.repo.get(channel.id)
+        if record is None:
+            await respond("ℹ️ このスレッドには c-lord のワークスペースがありません。")
+            return
+        if not is_closed(record):
+            await respond(
+                "ℹ️ このワークスペースは停止していません（そのままメッセージを送れます）。"
+            )
+            return
+
+        await self.repo.set_closed(channel.id, False)
+        # Let the chat cog know this was a deliberate reopen, so the resume it
+        # performs on the next message says so instead of reporting a crash
+        # ("前回のセッションが落ちていたので…", #464). Loose-coupled through
+        # bot.get_cog so this command stays usable when the cog is absent (#512).
+        mark_reopened = getattr(self.bot.get_cog("ClaudeChatCog"), "mark_reopened", None)
+        if mark_reopened is not None:
+            with contextlib.suppress(Exception):
+                mark_reopened(channel.id)
+        # #607: capture the stopped name before the rename wipes it. It carries
+        # the window number, and reopening is exactly when that handle is lost.
+        old_name = channel.name if isinstance(channel.name, str) else ""
+        new_name = await apply_open_name(self.repo, channel)
+
+        lines = [reopen_rename_notice(old_name, new_name) or f"🏷️ スレッド名: `{new_name}`"]
+        lines.append("💬 このスレッドにメッセージを送ると、これまでの会話の続きから再開します。")
+
+        embed = discord.Embed(
+            title="▶️ このスレッドのワークスペースを再開しました",
+            description="\n".join(lines),
+            color=COLOR_SUCCESS,
+        )
+        await respond(embed=embed)
+
+    @app_commands.command(
+        name="workspace-start",
+        description="再開: start a stopped (停止) workspace so messages run again",
+    )
+    async def workspace_start(self, interaction: discord.Interaction) -> None:
+        """再開 — clear the 停止 state (#512, renamed in #574).
+
+        ``start`` rather than ``reopen`` because it is the inverse of ``stop``:
+        open/close is about visibility, start/stop is about running state, and
+        running state is what this actually changes.
+        """
+        respond, ack = self._slash_io(interaction)
+        await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="workspace-start")
+    async def workspace_start_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /workspace-start — webhook-invokable for E2E (#512)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
+
+    @app_commands.command(
+        name="reopen-workspace",
+        description="(旧名) /workspace-start と同じです",
+    )
+    async def reopen_workspace(self, interaction: discord.Interaction) -> None:
+        """Old name for :meth:`workspace_start`, kept working (#574)."""
+        respond, ack = self._slash_io(interaction)
+        await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="reopen-workspace")
+    async def reopen_workspace_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of the /reopen-workspace alias (#512)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)

@@ -1,5 +1,7 @@
 # c-lord User Guide
 
+> **#574 で改名**: 操作名は「終了」→「**停止**」、コマンドは `/close-workspace` → `/workspace-stop`、`/reopen-workspace` → `/workspace-start`、スレッド名のマーカーは `[終了]` → `[停止]` になりました。**旧コマンド名はエイリアスとして動き続けます**（利用者側の変更は不要）。既存スレッドに残る `[終了]` も引き続き正しく解釈されます。理由: 7日で自動発火するようになるため、何も失っていないのに「終了」と言われると誤解を招くから。詳細は [workspace-vocabulary.md](specs/workspace-vocabulary.md)。
+
 A guide for Discord users interacting with the c-lord bot.
 
 **[日本語版はこちら](ja/USER_GUIDE.md)**
@@ -16,41 +18,36 @@ Bot (c-lord process)                                     ← one instance
 ├── Access control: @claude-operator role
 │   └── Only users with this role can interact with the bot
 │
-├── #project-a (channel)
+├── #project-a (channel) ── bound to github.com/user/project-a.git via /clord-init
 │   │
-│   ├── Repository: github.com/user/project-a.git
-│   │   └── Linked via /clord-init (stored in DB)
-│   │
-│   ├── tmux session: "project-a"
-│   │   ├── w1 ── Claude Code CLI for Thread 101
-│   │   └── w2 ── Claude Code CLI for Thread 102
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-a/
-│       ├── 101/ ── git clone of project-a (for Thread 101)
-│       └── 102/ ── git clone of project-a (for Thread 102)
+│   ├── Thread 101 ── tmux session "project-a", window w1
+│   ├── Thread 102 ── tmux session "project-a", window w2
+│   └── Thread 103 ── bound to project-c.git via /clord-thread-init
+│                     → tmux session "project-c", window w1   ← NOT "project-a"
 │
-├── #project-b (channel)
-│   │
-│   ├── Repository: github.com/user/project-b.git
-│   │
-│   ├── tmux session: "project-b"
-│   │   └── w1 ── Claude Code CLI for Thread 201
-│   │
-│   └── session_dir: ~/c-lord-sessions/project-b/
-│       └── 201/ ── git clone of project-b (for Thread 201)
+├── #project-b (channel) ── bound to github.com/user/project-b.git
+│   └── Thread 201 ── tmux session "project-b", window w1
 │
 └── #general (no repository linked)
     └── /clord → error "No repository configured"
+
+session_dir (the git clone each thread works in):
+    ~/c-lord-sessions/<channel_id>/<thread_id>/
 ```
+
+**The tmux session follows the repository, not the channel.** Thread 103 above is
+in #project-a but lives in the `project-c` session. Two channels bound to the same
+repo share one session. See [specs/tmux-layout.md](specs/tmux-layout.md).
 
 ### How Things Relate
 
 | Relationship | Mapping | Linked by |
 |-------------|---------|-----------|
 | Channel : Repository | 1:1 | `/clord-init` (stored in DB) |
-| Channel : tmux session | 1:1 | Auto-generated from repo name |
-| Thread : tmux window | 1:1 | `@thread_id` (tmux window option) |
-| Thread : session_dir | 1:1 | `~/c-lord-sessions/{project}/{thread_id}/` |
+| Thread : Repository | 1:1 | the channel's, or the thread's own via `/clord-thread-init` |
+| Repository : tmux session | 1:1 | Auto-generated from the repo name — so a channel can span **several** sessions, and two channels on the same repo **share** one |
+| Thread : tmux window | 1:1 | `@thread_id` (tmux window option). Numbers are unique within a session, not within a channel |
+| Thread : session_dir | 1:1 | `~/c-lord-sessions/{channel_id}/{thread_id}/` |
 | Thread : Claude session | 1:1 | DB (`sessions` table) |
 
 ### Setup Flow
@@ -108,10 +105,17 @@ The bot **only responds in threads it knows about** — threads created via `/cl
 
 Type normally in the thread. Each message is sent to Claude as a new prompt. If Claude is already processing a previous message, the new message interrupts it (sends SIGINT) and starts fresh with your new instruction.
 
+There is **no length limit** on what you send — long pastes and large text attachments are delivered to Claude in full (they are split internally on the way into the tmux pane; you see no difference). If a message genuinely cannot be delivered, the bot says so with the input size and how to recover — it never silently finishes an empty turn. See [あるべき動き: 送ったメッセージが Claude に届くこと](specs/input-delivery.md).
+
 ### Attachments
 
-- **Text files** (`.txt`, `.md`, `.csv`, `.json`, `.xml`, etc.) — automatically appended to the prompt. Up to 5 files, 50 KB each, 100 KB total.
-- **Images** (`.png`, `.jpg`, etc.) — downloaded and passed to Claude via `--image`. Up to 4 images, 5 MB each.
+Attach any file — text, image, PDF, archive. Each one is **saved into the session's checkout** and Claude is given its path, so "read the file I attached" works the way you'd expect. Nothing is inlined into the prompt, so file size does not affect whether your message gets through.
+
+- Up to **10 files per message**, each up to Discord's own upload limit (100 MB).
+- Saved under `.clord/attachments/<message-id>/` inside the session directory, and git-excluded so Claude's commits never pick them up.
+- If a file **cannot** be handed over (too large, too many, download failed, or the channel has no repository bound), the bot says so in the thread, naming the file and the reason — it is never dropped silently.
+
+See [あるべき動き: 添付ファイル](specs/attachments.md).
 
 ### Status Indicators (Emoji Reactions)
 
@@ -146,12 +150,51 @@ When Claude proposes a plan, an embed shows the full plan text with **Approve** 
 
 When Claude needs permission to run a tool, an embed shows the tool name and input with **Allow** / **Deny** buttons. Auto-denies after 2 minutes.
 
+### @-mention when your input is needed
+
+All of the prompts above (**AskUserQuestion / plan approval / tool permission / MCP elicitation**) pause the turn mid-flight, blocking on your answer. When one appears, c-lord posts a message that `@`-mentions **the person who sent that turn**, so you get a push notification even if your thread notifications are set to "mentions only" (a Discord embed on its own never pushes).
+
+- The mention targets **whoever posted the turn** (the thread creator for the first prompt, or the replier for a follow-up).
+- For turns with no human poster (webhook / scheduled runs) or turns driven directly in the tmux pane, the mention falls back to `DISCORD_OWNER_ID` when set (no mention when it is unset).
+
+### Turn progress line
+
+When a turn goes **90 seconds** without anything reaching the thread, a single
+subtext line appears:
+
+```
+-# ⚙️ 作業中 5:56 · 🔧 Bash(rg -n 'timeout' c_lord/) · ツール 61 件
+```
+
+It refreshes **in place** every 15 seconds and disappears the moment real output
+returns, so the thread never grows by more than one message at a time and ends
+the turn back at zero. When even tool activity has stopped it says
+`⏳ 待機中 …` instead, so a stall is distinguishable from progress.
+
+It is never posted outside a turn: an idle thread stays silent no matter how
+long it idles. Opt out with `CLORD_TURN_PROGRESS=0`; change the threshold with
+`CLORD_TURN_PROGRESS_QUIET_SECONDS`. Full behaviour: `docs/specs/turn-progress.md`.
+
 ### TodoWrite Progress
 
 When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated in-place:
 - ✅ Completed
 - 🔄 In progress
 - ⬜ Pending
+
+### Progress folding (`progress.txt`)
+
+The intermediate embeds a turn produces — session start, thinking, tool use and
+tool results, the todo list — are useful while the turn is in flight and noise
+once it is over. At the end of a turn they are folded into a single
+`progress.txt` transcript and the originals are deleted.
+
+- A turn that produced **nothing worth reading** (no tool use, no thinking — the
+  session-start banner alone does not count) posts **no `progress.txt` at all**.
+  The intermediate embeds are still cleaned up, so the thread simply ends with
+  the answer (#542).
+- When `progress.txt` is posted on its own rather than attached to a message
+  that already has text, it carries a one-line caption saying what the file is.
 
 ---
 
@@ -171,6 +214,8 @@ When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated 
 | `/model set <model>` | Change model for all new sessions | Available |
 | `/session-cleanup` | Remove clean orphaned session directories | Available |
 | `/tmux-list` | List all active tmux windows | Available |
+| `/close-workspace` | 終了: close the tmux window, keep the session (thread renamed `[終了] …`; a later message is held and offers a 再開 button) | Available |
+| `/reopen-workspace` | Reopen a 終了 thread so messages run again | Available |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Available |
 | `/upgrade` | Trigger bot upgrade (if enabled) | Available |
 
@@ -216,6 +261,16 @@ tmux session gone (killed together with the bot / tmux-server death):
               context reads as a restore, not a broken bot (#464).
 ```
 
+### Threads c-lord has no record of
+
+A thread whose session record is gone (deleted workspace, rebuilt database, a thread
+created by another host) **cannot** be resumed. c-lord no longer swallows those
+messages: the message gets a ⚠️ reaction, the thread gets a one-time notice saying it
+did **not** reach Claude, and the notice names the way forward — `/clord <task>` starts
+a fresh session right there. The stopped-session hint from `/tmux-screenshot` and
+`/resync` says the same thing rather than promising a resume that cannot happen (#538).
+See [specs/session-resume.md](specs/session-resume.md).
+
 ### What Happens Under the Hood
 
 ```
@@ -237,7 +292,15 @@ Message sent to thread
 
 ### Timeout
 
-Sessions time out after a configurable period of inactivity (default: 5 minutes). An embed with elapsed time and guidance is shown. Send a new message to start a fresh session in the same thread.
+A session times out only when Claude is genuinely wedged: the tmux pane has
+stopped changing for the whole inactivity window (default: 5 minutes) **and**
+Claude is not sitting idle at its input prompt. An embed with elapsed time and
+guidance is shown; send a new message to start a fresh session in the same thread.
+
+A turn that finished normally never produces this embed, even though its pane
+goes completely silent afterwards — in the default `jsonl` bridge mode the answer
+is delivered by the transcript mirror, so pane silence after an answer is the
+expected steady state, not a hang (#541).
 
 ### Interrupting
 

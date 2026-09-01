@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import aiosqlite
 
@@ -38,6 +38,42 @@ class SessionRecord:
     # Issue #414: the Issue/PR number this thread is working on, shown in the
     # thread name as "#<n>". Auto-detected from the git branch / first message.
     issue_ref: str | None = None
+    # Issue #593: the Issue/PR number this thread was *opened for*. Written once
+    # and never moved, so the sidebar keeps a stable handle on the thread even
+    # after the work moves to a spun-off Issue. ``None`` on rows that never had a
+    # number — nothing is invented for them.
+    origin_issue_ref: str | None = None
+    # Issue #512: timestamp of an intentional stop, or None when the workspace
+    # is open. Distinct from a merely dead tmux pane (#270).
+    closed_at: str | None = None
+    # Issue #574: who stopped it — "manual" or "idle". Read **only** to word the
+    # notice. The state itself is still decided by closed_at alone, so a second
+    # column can never contradict the first (the #538 failure mode).
+    closed_reason: str | None = None
+    # Issue #572: when the 4-hour sleep stopped this workspace's Claude, or None
+    # once any turn has run since. Read **only** to word the resume: a slept
+    # workspace comes back silently, a crashed one announces itself (#464).
+    # Whether to resume is still decided by "is the pane alive?" alone.
+    slept_at: str | None = None
+
+
+def _record(row) -> SessionRecord:
+    """Build a :class:`SessionRecord` from a ``SELECT *`` row.
+
+    Columns the dataclass does not know about are **dropped** rather than passed
+    through. Migrations here only ever add columns, so a database is always at or
+    ahead of the code that opens it — and a bot running yesterday's code against
+    a database today's code migrated used to die on every single read with
+    ``TypeError: unexpected keyword argument``. That is not a hypothetical: it is
+    what a staging clone does the moment it is switched back to ``main`` after
+    verifying a branch that added a column (#576, observed 2026-08-31 with
+    ``slept_at``), and it is what a rollback of a release would do in production.
+
+    Dropping unknown columns makes the older code simply not see the new field,
+    which is exactly what it did before the column existed.
+    """
+    known = {f.name for f in fields(SessionRecord)}
+    return SessionRecord(**{k: v for k, v in dict(row).items() if k in known})
 
 
 class SessionRepository:
@@ -57,7 +93,7 @@ class SessionRepository:
             row = await cursor.fetchone()
             if row is None:
                 return None
-            return SessionRecord(**dict(row))
+            return _record(row)
 
     async def save(
         self,
@@ -80,6 +116,12 @@ class SessionRepository:
                      model = COALESCE(excluded.model, sessions.model),
                      origin = COALESCE(excluded.origin, sessions.origin),
                      summary = COALESCE(excluded.summary, sessions.summary),
+                     -- A turn is starting, so this workspace is awake by
+                     -- definition. Clearing it here rather than at each call
+                     -- site means no turn path (scheduler, skill, webhook) can
+                     -- forget to, and it can only ever be cleared — never set —
+                     -- so it cannot contradict `set_slept` (#572).
+                     slept_at = NULL,
                      last_used_at = datetime('now', 'localtime')""",
                 (thread_id, session_id, working_dir, model, origin, summary),
             )
@@ -103,7 +145,7 @@ class SessionRepository:
                 (limit,),
             )
             rows = await cursor.fetchall()
-            return [SessionRecord(**dict(row)) for row in rows]
+            return [_record(row) for row in rows]
 
     async def delete(self, thread_id: int) -> bool:
         """Delete a session mapping. Returns True if a row was deleted."""
@@ -174,14 +216,114 @@ class SessionRepository:
             await db.commit()
 
     async def set_issue_ref(self, thread_id: int, issue_ref: str | None) -> None:
-        """Persist the Issue/PR number shown in the thread name (Issue #414).
+        """Persist the Issue/PR number the thread is working on (Issue #414).
 
         ``issue_ref`` is a bare digit string (e.g. ``"404"``) or ``None`` to clear.
+
+        The **first** number a thread is ever given also becomes its
+        ``origin_issue_ref`` (#593) — the identity shown in the sidebar. The
+        ``COALESCE`` is what makes that write-once: later branch switches move
+        ``issue_ref`` alone, and clearing ``issue_ref`` never clears the origin.
+        Keeping it here rather than at the call sites means every path that
+        records a number (naming pass, pending drain, API) seeds the origin.
         """
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "UPDATE sessions SET issue_ref = ? WHERE thread_id = ?",
-                (issue_ref, thread_id),
+                "UPDATE sessions "
+                "   SET issue_ref = ?, "
+                "       origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+                " WHERE thread_id = ?",
+                (issue_ref, issue_ref, thread_id),
+            )
+            await db.commit()
+
+    async def set_closed(self, thread_id: int, closed: bool, *, reason: str = "manual") -> None:
+        """Mark the workspace stopped (停止) or reopen it (#512, #574).
+
+        ``closed=True`` stamps ``closed_at`` with the local wall clock;
+        ``closed=False`` clears it back to ``NULL``.
+
+        This is what distinguishes a deliberate ``/workspace-stop`` from a tmux
+        pane that merely died: a dead pane still auto-resumes on the next message
+        via ``--continue`` (#270), whereas a stopped workspace holds the message
+        and shows the reopen notice instead.
+
+        *reason* (``"manual"`` / ``"idle"``) is stored alongside so the notice can
+        say **why** it happened. It is never consulted to decide *whether* the
+        workspace is stopped — ``closed_at`` alone answers that, so the two
+        cannot drift apart.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if closed:
+                await db.execute(
+                    "UPDATE sessions SET closed_at = datetime('now', 'localtime'), "
+                    "closed_reason = ? WHERE thread_id = ?",
+                    (reason, thread_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sessions SET closed_at = NULL, closed_reason = NULL "
+                    "WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            await db.commit()
+
+    async def set_slept(self, thread_id: int, slept: bool) -> None:
+        """Record (or clear) the 4-hour sleep for this workspace (#572).
+
+        Sleep stops the workspace's Claude and nothing else — no ``closed_at``,
+        no rename, no notice — because the whole point is that the user does not
+        notice. That leaves the next message facing a dead pane, which is
+        indistinguishable from a crash; and a crash *must* be announced,
+        otherwise the resumed turn re-emits the prior output and reads as the bot
+        replaying garbage (#464). This column is what tells the two apart.
+
+        It words the resume and nothing else. Whether to resume at all is still
+        decided by "is the pane alive?", exactly as before, so a stale value here
+        can never resume (or refuse to resume) anything — the same discipline as
+        ``closed_reason``.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if slept:
+                await db.execute(
+                    "UPDATE sessions SET slept_at = datetime('now', 'localtime') "
+                    "WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sessions SET slept_at = NULL WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            await db.commit()
+
+    async def touch(self, thread_id: int) -> None:
+        """Mark this workspace as used *now* — #642.
+
+        What :meth:`save` does for a turn, for the paths that bring a workspace
+        back up **without** running one (``/tmux-screenshot`` waking a stopped
+        thread). ``last_used_at`` is what every reaper reads, so a wake has to
+        write it, and has to write it **first**:
+
+        * the 4-hour sweep and #576's LRU cap both select on this column. Waking
+          a workspace whose row still says "idle since yesterday" means the very
+          next tick kills the window *while Claude is still booting* — observed
+          on staging: the pane was killed 47s into a wake, and the wake then
+          timed out looking at a window that no longer existed.
+        * :class:`c_lord.idle_sleep.IdleSleepLoop` also skips a thread it has
+          already acted on at that timestamp, so a wake that never moved it
+          would leave the restored Claude resident forever.
+
+        It deliberately does **not** clear ``slept_at``: that column only picks
+        the wording of the next resume (#572), and until the pane is actually up
+        the honest answer is still "this was slept". The caller clears it once
+        the wake succeeds.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET last_used_at = datetime('now', 'localtime') "
+                "WHERE thread_id = ?",
+                (thread_id,),
             )
             await db.commit()
 
@@ -234,15 +376,44 @@ class SessionRepository:
                 "SELECT * FROM sessions WHERE state = 'alive' ORDER BY last_used_at DESC"
             )
             rows = await cursor.fetchall()
-            return [SessionRecord(**dict(row)) for row in rows]
+            return [_record(row) for row in rows]
 
-    async def cleanup_old(self, days: int = 30) -> int:
-        """Delete sessions older than N days. Returns count deleted."""
+    async def all_working_dirs(self) -> set[str]:
+        """Every ``working_dir`` any row still claims — closed rows included.
+
+        The orphan sweep (#613) decides what to delete by *absence* from this
+        set, so it must err towards listing too much. A stopped workspace is
+        still someone's checkout; filtering by state here would hand it to the
+        sweep as an orphan.
+        """
         async with aiosqlite.connect(self.db_path) as db:
-            query = (
-                "DELETE FROM sessions"
-                " WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ?"
+            cursor = await db.execute(
+                "SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL"
             )
-            cursor = await db.execute(query, (days,))
+            rows = await cursor.fetchall()
+            return {row[0] for row in rows if row[0]}
+
+    async def cleanup_old(self, days: int = 30) -> list[SessionRecord]:
+        """Delete sessions unused for N days. Returns the rows that were deleted.
+
+        Returns the rows rather than a count (#554) because the caller has to
+        tell each of those threads what happened, and a count names no thread.
+        They are read inside the same transaction as the DELETE and with the
+        same predicate, so the list is exactly what went — no row can be deleted
+        without being reported, and none reported without being deleted.
+
+        The row carries ``working_dir``, which is the only handle left on the
+        session dir and the transcript once the row is gone. Reading it after the
+        delete would be too late; :func:`c_lord.session_cleanup.inspect_survivors`
+        needs it to say what survived.
+        """
+        where = " WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ?"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
+            doomed = [_record(row) for row in await cursor.fetchall()]
+            if not doomed:
+                return []
+            await db.execute("DELETE FROM sessions" + where, (days,))
             await db.commit()
-            return cursor.rowcount
+            return doomed

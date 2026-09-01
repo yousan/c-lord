@@ -81,6 +81,13 @@ class TestClordImplThreadSendForbidden:
         async def ack(*_a, **_k):
             return None
 
+        # #551: /clord only continues threads that are c-lord's own, so this
+        # thread needs a session row to reach the seed send at all.
+        record = MagicMock()
+        record.closed_at = None
+        record.session_id = "sess-abc"
+        cog.repo.get = AsyncMock(return_value=record)
+
         # _run_claude must NOT be invoked once the seed send fails.
         cog._run_claude = AsyncMock()
 

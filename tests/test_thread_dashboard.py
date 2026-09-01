@@ -143,6 +143,15 @@ class TestSetState:
 
 
 class TestOwnerMention:
+    @pytest.fixture(autouse=True)
+    def _owner_fallback_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#525: these cover the owner *fallback* itself, so ask for it.
+
+        The shipped default is ``blocked`` (turn-end pings only the human who
+        asked), and TestOwnerFallbackPolicy below covers that side.
+        """
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
+
     @pytest.mark.asyncio
     async def test_mention_sent_on_waiting_input_transition(self) -> None:
         dashboard, channel = _make_dashboard(owner_id=42)
@@ -154,6 +163,81 @@ class TestOwnerMention:
         await dashboard.set_state(10, ThreadState.WAITING_INPUT, "working", thread=thread)
 
         thread.send.assert_called_once()
+        sent_text = thread.send.call_args.args[0]
+        assert "<@42>" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_mention_trails_the_text_not_leads(self) -> None:
+        """#495: the @mention must trail the descriptive text.
+
+        A Discord push preview renders the message content in order, so leading
+        with ``<@id>`` shows "@you …" first. Putting the mention at the END makes
+        the preview lead with "Claude has finished — your reply is needed here",
+        which is the useful part. The mention still pings anywhere in content.
+        """
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        sent_text = thread.send.call_args.args[0]
+        mention = "<@42>"
+        assert mention in sent_text, "mention must still be present so it pings"
+        # The descriptive text must come BEFORE the mention.
+        assert sent_text.index("Claude has finished") < sent_text.index(mention), (
+            f"mention should trail the descriptive text; got: {sent_text!r}"
+        )
+        # And the content must not lead with the mention.
+        assert not sent_text.lstrip().startswith(mention), (
+            f"content must not lead with the mention; got: {sent_text!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mentions_notify_user_over_owner(self) -> None:
+        """#481: the completion mention targets the turn's poster, not a fixed owner."""
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(
+            10, ThreadState.WAITING_INPUT, "w", thread=thread, notify_user_id=999
+        )
+
+        sent_text = thread.send.call_args.args[0]
+        assert "<@999>" in sent_text, f"should mention the poster (999); got: {sent_text!r}"
+        assert "<@42>" not in sent_text, (
+            f"should NOT mention the fixed owner (42); got: {sent_text!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mentions_author_even_when_owner_unset(self) -> None:
+        """#481: with no owner configured (e.g. another guild), the poster is still pinged."""
+        dashboard, _ = _make_dashboard(owner_id=None)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(
+            10, ThreadState.WAITING_INPUT, "w", thread=thread, notify_user_id=999
+        )
+
+        thread.send.assert_called_once()
+        sent_text = thread.send.call_args.args[0]
+        assert "<@999>" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_owner_when_no_notify_user(self) -> None:
+        """Backward compat: without notify_user_id, the owner is still mentioned."""
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
         sent_text = thread.send.call_args.args[0]
         assert "<@42>" in sent_text
 
@@ -301,3 +385,107 @@ def _thread_info(
     description: str,
 ) -> _ThreadInfo:
     return _ThreadInfo(thread_id=thread_id, description=description, state=state)
+
+
+class TestOwnerFallbackPolicy:
+    """#525: CLORD_OWNER_FALLBACK decides whether a turn nobody asked for pings."""
+
+    @pytest.mark.asyncio
+    async def test_default_does_not_ping_the_owner_on_turn_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default ``blocked``: a turn no human asked for finishes silently."""
+        monkeypatch.delenv("CLORD_OWNER_FALLBACK", raising=False)
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_off_does_not_ping_the_owner_either(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLORD_OWNER_FALLBACK", "off")
+        dashboard, _ = _make_dashboard(owner_id=42)
+        await dashboard.initialize()
+        thread = _make_thread(10)
+
+        await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+        await dashboard.set_state(10, ThreadState.WAITING_INPUT, "w", thread=thread)
+
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_real_poster_is_mentioned_in_every_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The policy governs the fallback only — never a human requester."""
+        for mode in ("all", "blocked", "off"):
+            monkeypatch.setenv("CLORD_OWNER_FALLBACK", mode)
+            dashboard, _ = _make_dashboard(owner_id=42)
+            await dashboard.initialize()
+            thread = _make_thread(10)
+
+            await dashboard.set_state(10, ThreadState.PROCESSING, "w", thread=thread)
+            await dashboard.set_state(
+                10, ThreadState.WAITING_INPUT, "w", thread=thread, notify_user_id=999
+            )
+
+            sent_text = thread.send.call_args.args[0]
+            assert "<@999>" in sent_text, f"mode={mode} must still mention the poster"
+
+
+class TestNoResponseMention:
+    """#562 AC2/AC3: the turn-end ping must say what actually happened."""
+
+    @staticmethod
+    def _dash(thread):
+        from c_lord.discord_ui.thread_dashboard import ThreadStatusDashboard
+
+        d = ThreadStatusDashboard(MagicMock(), owner_id=999)
+        d._refresh_dashboard = AsyncMock()  # type: ignore[method-assign]
+        return d
+
+    @pytest.mark.asyncio
+    async def test_answered_turn_still_says_finished(self) -> None:
+        """AC5: the normal wording is untouched."""
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        thread = MagicMock()
+        thread.send = AsyncMock()
+        d = self._dash(thread)
+
+        await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=7)
+        await d.set_state(1, ThreadState.WAITING_INPUT, "x", thread=thread, notify_user_id=7)
+
+        thread.send.assert_awaited_once()
+        assert "Claude has finished" in thread.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_turn_with_no_response_says_so_instead(self) -> None:
+        """AC2/AC3: no answer → do not claim the work finished."""
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        thread = MagicMock()
+        thread.send = AsyncMock()
+        d = self._dash(thread)
+
+        await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=7)
+        await d.set_state(
+            1,
+            ThreadState.WAITING_INPUT,
+            "x",
+            thread=thread,
+            notify_user_id=7,
+            no_response=True,
+        )
+
+        thread.send.assert_awaited_once()
+        body = thread.send.await_args.args[0]
+        assert "Claude has finished" not in body, body
+        assert "応答がありません" in body, body
+        assert "<@7>" in body, "the waiting user must still be told"

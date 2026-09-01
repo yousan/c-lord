@@ -1,0 +1,52 @@
+  既存のclose済み#213はjsonlモードのfalse positiveで別物、skillモードでのこの再現パターン（短文プロンプトで発生しやすい）を追跡するopen issueは現状ありません。
+
+  この先どうしますか？
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ 次のアクション
+
+この後どう進めますか？
+
+❯ 1. Issue化して再現条件を記録する
+     「短文プロンプトで discord-reply skill 呼び出しが欠落しやすい」というパターンを GitHub Issue として記録（修正はまだ着手しない）
+  2. 対策の設計に進む
+     discord-reply 呼び出しを強制する仕組み（リトライ/プロンプト強化等）を検討・実装
+  3. まず babeln さんに共有するだけ
+     「警告が出ていたらそれが症状。tmux確認か retry で回避可能」と伝えるのみで今回は終了
+  4. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+[oh-my-zsh] plugin 'zsh-syntax-highlighting' not found
+No GitHub token for homebrew found.
+Go to https://github.com/settings/tokens and create token with public_repo scope.
+No OPENAI token for homebrew found.
+/home/yousan/.zshrc:236: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:244: command not found: phpenv
+/home/yousan/.zshrc:247: command not found: nodenv
+/home/yousan/.zshrc:297: command not found: direnv
+
+yousan @ tachikoma1.l2tporg in ~/c-lord-sessions/1505747831447883806/1526549150655713350 (main●) (.venv)
+$
+[oh-my-zsh] plugin 'zsh-syntax-highlighting' not found
+No GitHub token for homebrew found.
+Go to https://github.com/settings/tokens and create token with public_repo scope.
+No OPENAI token for homebrew found.
+/home/yousan/.zshrc:236: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:238: command not found: brew
+/home/yousan/.zshrc:244: command not found: phpenv
+/home/yousan/.zshrc:247: command not found: nodenv
+/home/yousan/.zshrc:297: command not found: direnv
+
+yousan @ tachikoma1.l2tporg in ~/c-lord-sessions/1505747831447883806/1526549150655713350 (main●) (.venv)
+
+yousan @ tachikoma1.l2tporg in ~/c-lord-sessions/1505747831447883806/1526549150655713350 (main●)
+$
+
+yousan @ tachikoma1.l2tporg in ~/c-lord-sessions/1505747831447883806/1526549150655713350 (main●)
+$

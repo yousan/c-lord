@@ -360,27 +360,45 @@ class TestRemoveInjectedSkills:
 
 
 class TestSkillsEnabled:
-    """Issue #53: skill path is now the ONLY path → default ON.
+    """Issue #216/#492: jsonl (TranscriptMirror) is the default bridge mode, so
+    skill-based reply is now OFF by default. It stays available as a legacy
+    opt-in via ``CLORD_BRIDGE_MODE=skill``.
 
-    USE_SKILL_REPLY remains as an opt-out emergency switch. Empty string
-    keeps the default (= ON) rather than disabling, so accidentally
-    setting USE_SKILL_REPLY= does not silently kill Discord output.
+    USE_SKILL_REPLY remains an opt-out emergency switch *within* skill mode:
+    it can only turn skill mode off (never on by itself), so these tests pin
+    ``CLORD_BRIDGE_MODE=skill`` to isolate USE_SKILL_REPLY's own parsing from
+    the bridge-mode default tested separately below.
     """
 
     @pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "on"])
-    def test_truthy_values_enabled(self, value: str, monkeypatch) -> None:
+    def test_truthy_values_do_not_disable_skill_mode(self, value: str, monkeypatch) -> None:
         monkeypatch.setenv("USE_SKILL_REPLY", value)
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         assert skills_enabled() is True
 
     @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
     def test_explicit_disable(self, value: str, monkeypatch) -> None:
         monkeypatch.setenv("USE_SKILL_REPLY", value)
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         assert skills_enabled() is False
 
-    def test_empty_value_keeps_default(self, monkeypatch) -> None:
+    def test_empty_value_keeps_skill_mode_on(self, monkeypatch) -> None:
         monkeypatch.setenv("USE_SKILL_REPLY", "")
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         assert skills_enabled() is True
 
-    def test_unset_defaults_to_enabled(self, monkeypatch) -> None:
+    def test_unset_use_skill_reply_keeps_skill_mode_on(self, monkeypatch) -> None:
         monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
+        assert skills_enabled() is True
+
+    def test_unset_bridge_mode_defaults_to_jsonl_skills_disabled(self, monkeypatch) -> None:
+        """#492: no CLORD_BRIDGE_MODE set at all -> jsonl default -> skills off."""
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
+        assert skills_enabled() is False
+
+    def test_explicit_skill_bridge_mode_enables_skills(self, monkeypatch) -> None:
+        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         assert skills_enabled() is True

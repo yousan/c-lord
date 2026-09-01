@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from c_lord.thread_name import (
+    CLOSED_MARK,
+    LEGACY_CLOSED_MARKS,
+    MAX_NAME_LEN,
     STATUS_EMOJI,
     build_name,
     parse_topic_from_name,
@@ -64,7 +67,7 @@ def test_build_name_running_no_index():
 def test_build_name_truncates_long_topic():
     long = "あ" * 100
     out = build_name(long, "alive", 12)
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
     assert out.startswith("🟢 W12 │ ")
 
 
@@ -141,7 +144,7 @@ def test_build_name_lamp_false_no_status_emoji_for_any_state():
 
 def test_build_name_lamp_false_truncates_long_topic():
     out = build_name("あ" * 100, "running", 12, lamp=False)
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
     assert out.startswith("W12 │ ")
 
 
@@ -219,7 +222,7 @@ def test_build_name_issue_ref_no_window():
 
 def test_build_name_issue_ref_truncates_topic_to_fit():
     out = build_name("あ" * 100, "running", 12, issue_ref="404")
-    assert len(out) <= 30
+    assert len(out) <= MAX_NAME_LEN
     assert out.startswith("🟢 W12 │ #404 ")
 
 
@@ -253,3 +256,148 @@ def test_thread_retitle_enabled_explicit_overrides_env(monkeypatch):
     assert thread_retitle_enabled(False) is False
     monkeypatch.delenv("CLORD_THREAD_RETITLE", raising=False)
     assert thread_retitle_enabled(True) is True
+
+
+# ── #512/#574: 停止 (stopped) marker ─────────────────────────────────────────
+
+
+def test_build_name_closed_prefixes_marker():
+    """#512: a stopped workspace is marked with :data:`CLOSED_MARK` up front.
+
+    Asserted through the constant, not its literal text: #574 renamed it from
+    「終了」 to 「停止」 and these tests should track the marker, not re-encode the
+    wording. The wording itself is pinned once, in ``test_workspace_stop.py``.
+    """
+    assert (
+        build_name("認証リファクタ", "dead", None, lamp=False, issue_ref="404", closed=True)
+        == f"{CLOSED_MARK} #404 認証リファクタ"
+    )
+
+
+def test_build_name_closed_keeps_work_prefix_but_drops_the_lamp():
+    """#607: 停止しても ``W<N>`` は残す（#512 では落としていた）。
+
+    #512 は「その番号が指す tmux ウィンドウはもう無い」を理由に落としていた。
+    「いまどこを見ればいいか」としては正しいが、名前の用途はそれだけではない —
+    あとから「W28 で作業していた」を辿る手掛かりでもある。``[停止]`` が付くので
+    生きているスレッドと取り違えることはない。ランプ絵文字は止まっているものに
+    付けても意味がないので、引き続き落とす。
+    """
+    out = build_name("topic", "alive", 3, closed=True)
+    assert out == f"{CLOSED_MARK} W3 │ topic"
+    assert not out.startswith(("🟢", "🟡", "🔴", "⚪"))
+
+
+def test_build_name_closed_keeps_issue_ref_and_truncates_topic():
+    """#512: under the name cap the marker + number survive; the topic is trimmed."""
+    out = build_name("あ" * 40, "dead", None, lamp=False, issue_ref="404", closed=True)
+    assert out.startswith(f"{CLOSED_MARK} #404 ")
+    assert len(out) <= MAX_NAME_LEN
+
+
+def test_build_name_not_closed_is_unchanged():
+    """#512: closed=False (the default) must not alter any existing name."""
+    assert build_name("c-lord命名検討", "alive", 5) == "🟢 W5 │ c-lord命名検討"
+
+
+def test_parse_topic_strips_closed_marker():
+    """#512: the marker must not be absorbed into the stored topic on manual rename."""
+    for mark in (CLOSED_MARK, *LEGACY_CLOSED_MARKS):
+        assert parse_topic_from_name(f"{mark} #404 認証リファクタ") == "認証リファクタ"
+        assert parse_topic_from_name(f"{mark} W3 │ 認証リファクタ") == "認証リファクタ"
+        assert parse_topic_from_name(f"{mark} 認証リファクタ") == "認証リファクタ"
+
+
+# ── #618: a thread in another repo's session says so, on the left ───────────
+
+
+class TestSessionLabel:
+    """The name must say which tmux session a thread is in, when it is not the
+    channel's own.
+
+    Window numbers restart per session, so ``W5`` appears twice in one channel's
+    sidebar (production really shows ``W5 │ 2017.l2tp.org`` next to
+    ``W5 │ monitoring``). Reading ``W1`` and attaching to the channel's session
+    is exactly the mistake #616/#618 came from — the window lives in
+    ``qiita-article``. Prefixing the *left* edge, where the sidebar never clips,
+    makes the name carry its own attach target.
+    """
+
+    def test_session_label_leads_the_window_number(self):
+        name = build_name(
+            "Qiita記事執筆",
+            "waiting",
+            1,
+            lamp=False,
+            issue_ref="#598",
+            origin_issue_ref="#598",
+            session_label="qiita-article",
+        )
+        assert name.startswith("qiita-article:W1 │ #598 ")
+
+    def test_no_label_renders_exactly_as_before(self):
+        without = build_name("pt-jp 調査", "waiting", 9, lamp=False, issue_ref="#612")
+        explicit_none = build_name(
+            "pt-jp 調査", "waiting", 9, lamp=False, issue_ref="#612", session_label=None
+        )
+        assert without == explicit_none == "W9 │ #612 pt-jp 調査"
+
+    def test_two_w5_threads_become_distinguishable(self):
+        a = build_name(
+            "2017.l2tp.org",
+            "waiting",
+            5,
+            lamp=False,
+            issue_ref="#540",
+            session_label="2017_l2tp_org",
+        )
+        b = build_name(
+            "monitoring 監視改修",
+            "waiting",
+            5,
+            lamp=False,
+            issue_ref="#577",
+            session_label="monitoring",
+        )
+        assert a != b
+        assert a.startswith("2017_l2tp_org:W5")
+        assert b.startswith("monitoring:W5")
+
+    def test_label_survives_a_long_topic_which_is_truncated_instead(self):
+        name = build_name(
+            "とても長いトピックがここに延々と続いていくのでいずれ上限に当たります",
+            "waiting",
+            1,
+            lamp=False,
+            issue_ref="#598",
+            session_label="qiita-article",
+        )
+        assert len(name) <= MAX_NAME_LEN
+        assert name.startswith("qiita-article:W1 │ #598 "), (
+            "the attach target must not be shed first"
+        )
+
+    def test_closed_thread_has_no_window_so_no_label(self):
+        name = build_name(
+            "Qiita記事執筆",
+            "dead",
+            None,
+            lamp=False,
+            issue_ref="#598",
+            session_label="qiita-article",
+            closed=True,
+        )
+        assert "qiita-article" not in name
+        assert name.startswith(CLOSED_MARK)
+
+    def test_topic_extraction_strips_the_label(self):
+        """A manual rename must not fold the prefix into the stored topic."""
+        name = build_name(
+            "Qiita記事執筆",
+            "waiting",
+            1,
+            lamp=False,
+            issue_ref="#598",
+            session_label="qiita-article",
+        )
+        assert parse_topic_from_name(name) == "Qiita記事執筆"

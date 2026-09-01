@@ -25,12 +25,12 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | 項目 | 内容 |
 |------|------|
 | **トリガ** | 初回起動 or 未信頼ディレクトリで `claude` を起動 |
-| **画面シグネチャ** | `Quick safety check: Is this a project you created?` / `❯ 1. Yes, I trust this folder` / `  2. No, exit` / `Enter to confirm` |
-| **操作** | Enter（選択肢 1 を選択）または `2` + Enter で終了 |
+| **画面シグネチャ** | `Quick safety check: Is this a project you created or one you trust?` / `Enter to confirm`。**選択肢は CLI のバージョンで2形ある**: **≤ 2.1.247** = `❯ 1. Yes, I trust this folder` / `  2. No, exit`（番号付き・**Yes が既定**）、**≥ 2.1.248** = `❯ No, exit` / `  Yes, I trust this folder`（番号なし・**No が既定**） |
+| **操作** | カーソルを `Yes, I trust this folder` の行まで Down で運んでから Enter。旧形は Down 0 回（＝素の Enter）、現行は Down 1 回。🔴 **現行形で素の Enter を送ると `No, exit` を選び、Claude は起動せずに終了する**（#602。2026-08-28 の 2.1.250 導入後、新規セッションが1本も起動しなくなった） |
 | **JSONL** | ❌ TUI-only（ハーネス起動前） |
-| **現在の c-lord 対応** | ✅ 自動処理（`_handle_startup_prompts` が Enter を送信） |
-| **検出パターン（現行）** | `_TRUST_PROMPT_MARKERS = ("Yes, I trust this folder", "Enter to confirm")` |
-| **課題** | 画面シグネチャが変わると検出漏れ。より安定なパターンは `❯ 1.` + 選択肢が並ぶ構造のみ |
+| **現在の c-lord 対応** | ✅ 自動処理。`_handle_startup_prompts` / `run()` → `_accept_trust_prompt(pane)` が `_trust_option_offset(pane)` で**カーソル位置をペインから読み取り**、`_navigate_menu(offset)` で Down×offset + Enter を送る |
+| **検出パターン（現行）** | 番号付き行は単独で成立（`_TRUST_PROMPT_NUMBERED_RE`）。番号なし行は prose が再現しうるので、`Enter to confirm` フッターの同時存在を要求する（`_TRUST_PROMPT_RE`） |
+| **課題** | 並び順や既定が変わっても効くよう、**固定の Enter／番号を前提にせずカーソル位置を読む**方式にした。ただし文言（`Yes, I trust this folder` 等）自体が変われば検出漏れは残る |
 
 ### 1-2. Resume Session Picker
 
@@ -99,7 +99,7 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **画面シグネチャ** | TUI に選択メニュー（`☐ header` / `❯ N. label` / `Type something.` / `Chat about this`） |
 | **操作** | ↑/↓ + Enter（TUI）/ Discord ボタン・セレクト（Discord） |
 | **JSONL** | ⚠️ `StreamEvent.ask_questions` は **SDK ストリーミング経路でのみ** 埋まる。jsonl/tmux モードの tmux runner は埋めない |
-| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。自由記入 ✏️Other は「Type something. 行に直接タイプ→Enter」で回答（#172） |
+| **現在の c-lord 対応** | ✅ jsonl/tmux モードは **ペイン解析** (`_parse_ask_from_pane`) で `AskView` 表示＋クリック→キーストロークで回答（#166）。説明文も併記（#169）、キー送信は1つずつ間隔送出（#171）。自由記入 ✏️Other は、そのメニューのレイアウトに合わせて回答（#172, #650）— 旧レイアウトは「Type something. 行に直接タイプ→Enter」、preview 付きレイアウト（`Type something.` 行が無い）は「`n` で Notes を開く→タイプ→Enter」 |
 | **詳細** | [`askuserquestion-bridge.md`](./askuserquestion-bridge.md)（変換表・画像・制限） |
 
 ### 2-4. Elicitation（MCP サーバーからの入力要求）
@@ -197,19 +197,38 @@ JSONL に出ない。`tmux capture-pane` でしか検出できない。誤検知
 
 | シグネチャ | 意味 |
 |-----------|------|
-| `-- INSERT ⏵⏵ bypass permissions on` | vim INSERT モード（入力可） |
-| ステータスバーに `-- INSERT` が**無い** | vim NORMAL モード。**現行 Claude Code (v2.1.150) は `-- NORMAL` を表示せず、`-- INSERT` プレフィックスが消えるだけ**（`⏵⏵ bypass permissions on …` だけが残る） |
+| `-- INSERT -- ⏵⏵ bypass permissions on …` | vim モード有効 かつ INSERT（入力可） |
+| `-- NORMAL -- ⏵⏵ bypass permissions on …` | vim モード有効 かつ NORMAL。**現行 Claude Code (v2.1.246) はこのマーカーを出さない**ので実機ではまず見ない（将来/過去ビルド用） |
+| `⏵⏵ bypass permissions on …` だけ（vim マーカー無し） | **判定不能**。vim 有効の NORMAL と、**vim 無効（既定）の通常入力可状態**が完全に同じ文字列になる。`⏵⏵` は permission mode の表示であって vim とは無関係 |
 | `Model: Sonnet 4.6 Style: default` | ccstatusline 行 1 |
 | `Cost: $0.05 Session: 7.0%` | ccstatusline 行 2（コンテキスト使用量） |
 | `⎇ main (+0,-0) cwd: /path` | ccstatusline 行 3（ブランチ） |
 
-> **vim NORMAL モードと `send_input`（#147）**: `editorMode: vim` のため入力欄に NORMAL
-> モードがあり、NORMAL のまま `send-keys -l`（literal）を送ると各文字が vim コマンドとして
-> 解釈されメッセージが壊れる（例: "melon" → `m`/`e`/`l` がカーソル移動、`o` が改行+INSERT 化で
-> `n` だけ入力）。`TmuxSessionManager.send_input` は送信前に `capture-pane` でモードを判定し、
-> INSERT でない（`-- INSERT` 不在）ときだけ `i` を送って INSERT に遷移してから literal を流す。
-> 判定不能なフレーム（生成中・再描画中で status bar 不在）は誤って `i` を混入させないよう無補正。
-> トリガ例: `cancel_menu()` 等が送る `Escape` 後の follow-up 送信。
+> **vim モードと `send_input`（#147 → #544）**
+>
+> `editorMode: vim` の環境では入力欄に NORMAL モードがあり、NORMAL のまま `send-keys -l`
+> （literal）を送ると各文字が vim コマンドとして解釈されメッセージが壊れる（例: "melon" →
+> `m`/`e`/`l` がカーソル移動、`o` が改行+INSERT 化で `n` だけ入力）。そこで `send_input` は
+> 送信前に `i` を送って INSERT に遷移させる。
+>
+> **ただし vim モードは Claude Code の既定ではない。** 上の表のとおり「vim 有効の NORMAL」と
+> 「vim 無効の通常状態」はステータスバーが同一なので、`⏵⏵` の存在だけを NORMAL の根拠にすると
+> **vim を使っていない利用者では毎回 `i` が本文の先頭に混入する**（#544。Discord から送った
+> `こんにちは` が `iこんにちは` として Claude に届く）。
+>
+> **あるべき動き**: `editorMode` の設定に関わらず、Discord から送ったメッセージが**そのまま**
+> 入力欄に入る。`TmuxSessionManager._ensure_insert_mode` は vim モードを**推測せず判定**する:
+>
+> | ペインの状態 | 動き |
+> |---|---|
+> | `-- INSERT` あり | vim 有効・INSERT。無操作 |
+> | `-- NORMAL` あり | vim 有効・NORMAL。`i` を送る |
+> | 入力プロンプト自体が無い（生成中・再描画中） | 無操作（盲打ちしない） |
+> | vim マーカー無し・`⏵⏵` あり（判定不能） | **プローブする**: `i` を送って再 capture し、`-- INSERT` が現れたら vim 有効の NORMAL だった（そのまま本文を送る）。現れなければ vim 無効で `i` はただの文字なので **BSpace で消してから**本文を送る |
+>
+> 判定結果は window 単位で記憶するので、プローブの追加 capture は各 window の初回のみ。
+> 記憶は毎回のマーカー観測で上書きされるため、再描画と競合した誤判定は次の送信で自己修復する。
+> トリガ例: `cancel_menu()` や #485 のメニュー解除が送る `Escape` 後の follow-up 送信。
 
 ### 4-2. 生成中インジケーター
 

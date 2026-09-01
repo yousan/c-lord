@@ -40,6 +40,20 @@ class TestSessionRepository:
         await repo.set_issue_ref(42, None)
         assert (await repo.get(42)).issue_ref is None
 
+    async def test_closed_at_defaults_none_and_roundtrips(self, repo):
+        # #512: an intentionally closed (/close-workspace'd) session is recorded so
+        # it can be told apart from a session whose pane merely crashed (#270).
+        await repo.save(thread_id=43, session_id="s2")
+        assert (await repo.get(43)).closed_at is None
+
+        await repo.set_closed(43, True)
+        record = await repo.get(43)
+        assert record.closed_at is not None
+        assert record.closed_at != ""
+
+        await repo.set_closed(43, False)
+        assert (await repo.get(43)).closed_at is None
+
     async def test_save_updates_existing(self, repo):
         await repo.save(thread_id=100, session_id="first")
         await repo.save(thread_id=100, session_id="second")
@@ -96,6 +110,40 @@ class TestSessionRepository:
         # Create a session (it will be "now")
         await repo.save(thread_id=400, session_id="recent")
 
-        # Cleanup with 0 days should delete everything
+        # Cleanup with 0 days should delete everything. #554: the deleted rows
+        # come back, not a count — the caller has to notify each of those threads.
         deleted = await repo.cleanup_old(days=0)
-        assert deleted == 1
+        assert [r.thread_id for r in deleted] == [400]
+
+
+class TestTouch:
+    """``touch`` — used by paths that wake a workspace without running a turn (#642)."""
+
+    async def test_moves_last_used_and_leaves_the_sleep_mark(self, repo):
+        await repo.save(thread_id=77, session_id="s")
+        await repo.set_slept(77, True)
+        before = await repo.get(77)
+        assert before is not None and before.slept_at is not None
+
+        # Backdate so the bump is observable regardless of clock resolution.
+        import aiosqlite
+
+        async with aiosqlite.connect(repo.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET last_used_at = '2020-01-01 00:00:00' WHERE thread_id = 77"
+            )
+            await db.commit()
+
+        await repo.touch(77)
+
+        after = await repo.get(77)
+        assert after is not None
+        # The sweeps key on this value: an un-bumped row is both killed mid-wake
+        # and never revisited afterwards.
+        assert after.last_used_at != "2020-01-01 00:00:00"
+        # ``slept_at`` words the next resume and is the caller's to clear once
+        # the pane is actually back up.
+        assert after.slept_at is not None
+
+    async def test_missing_row_is_not_an_error(self, repo):
+        await repo.touch(999999)

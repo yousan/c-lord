@@ -1,5 +1,7 @@
 # Command Reference
 
+> **#574 で改名**: 操作名は「終了」→「**停止**」、コマンドは `/close-workspace` → `/workspace-stop`、`/reopen-workspace` → `/workspace-start`、スレッド名のマーカーは `[終了]` → `[停止]` になりました。**旧コマンド名はエイリアスとして動き続けます**（利用者側の変更は不要）。既存スレッドに残る `[終了]` も引き続き正しく解釈されます。理由: 7日で自動発火するようになるため、何も失っていないのに「終了」と言われると誤解を招くから。詳細は [workspace-vocabulary.md](specs/workspace-vocabulary.md)。
+
 All commands available to Discord users and API consumers.
 
 > For a comprehensive guide with architecture diagrams, session lifecycle, and tips, see the **[User Guide](USER_GUIDE.md)**.
@@ -7,12 +9,18 @@ All commands available to Discord users and API consumers.
 ## Architecture Overview
 
 ```
-Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
+Bot → Channel (= 1 repo) → Thread (= 1 tmux window)
+                             └─ in the tmux session of the repo THAT THREAD is bound to
 ```
+
+The tmux session follows the **repository**, not the channel: a channel whose threads
+are bound to different repos spans several sessions, and two channels on the same repo
+share one. See [specs/tmux-layout.md](specs/tmux-layout.md).
 
 - **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
 - **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
-- **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding will return an error directing the user to configure the binding first.
+- **Unbound channels**: Running `/clord` in a channel without a `/clord-init` binding returns an error directing the user to configure the binding first — *unless* `repo:` names one explicitly (#514), which works with no binding at all.
+- **Channels another instance owns** (#522): the `!text` twins reach **every** c-lord instance that can read the channel, so an instance that is neither bound to the channel nor watching it as its `DISCORD_CHANNEL_ID` **says nothing at all** — no warning, no thread. Without this, every bystander bot in a shared server answers the same `!clord` with its own "not bound" warning. Slash commands are unaffected: their replies are ephemeral, so only the invoker sees them.
 - **Execution mode**: Claude Code runs exclusively in tmux TUI mode. The legacy subprocess mode was removed in v1.x.
 
 ## Slash Commands
@@ -21,13 +29,41 @@ Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/clord <prompt>` | Start a new Claude Code session | Channel or thread |
+| `/clord <prompt>` | Start a new Claude Code session | Channel; in a thread, **c-lord's own only** |
+| `/clord repo:<url> <prompt>` | Start a session on a **specific** repository | Channel only |
 | `/stop` | Stop the active session (session is preserved for resume) | Thread only |
 | `/clear` | Reset the session — next message starts fresh | Thread only |
 | `/compact [instructions]` | Compact (summarize) the session context to free the window | Thread only |
 | `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
+| `/clord-reattach` | Reconnect this thread to the Claude session still on disk (when its record was swept) | Thread only |
 
-**`/clord`** creates a new thread and sends your prompt to Claude Code. If used inside an existing thread, it continues the same session.
+**`/clord`** creates a new thread and sends your prompt to Claude Code. Inside a thread, what it does depends on whether that thread is c-lord's (#551):
+
+| The thread | `/clord` does |
+|---|---|
+| has a session | continues it, as before |
+| **was** c-lord's but lost its record (the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep)) | offers **🔗 再接続する** — reconnects to what is on disk, rather than starting over |
+| was never c-lord's | **refuses, and changes nothing** |
+
+```
+⚠️ このスレッドは c-lord のスレッドではないため、ここでセッションを開始できません。
+続けるには:
+・新しく始める → チャンネルで /clord prompt:<やること>
+```
+
+Before this, `/clord` checked only whether *a repository* was reachable from the thread — true of every thread under a bound channel, human conversations included — and then cloned a session dir, opened a tmux window and wrote the session record. From that point every message in that thread went to Claude, and only someone who knew `/close-workspace` could undo it.
+
+**There is deliberately no command that adopts an existing thread.** A c-lord thread is one c-lord created from a channel. To start work from an existing discussion, run `/clord` in the channel — it opens a fresh thread. Reconnecting (middle row) is not an exception to this: it only ever reattaches to a session dir that is already on disk, so a thread c-lord never touched has nothing for it to find.
+
+**`repo:` is optional** (#514). Leave it out and the thread uses the channel's `/clord-init` repository, as before. Give it and the new thread is cloned from *that* repository instead — no `/clord-init` needed, and no separate `/clord-thread-init` step:
+
+```
+/clord repo:git@github.com:yousan/dotclaude.git prompt:Claude 5 系に対応する
+```
+
+The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root. The thread's tmux session follows the chosen repository too (#427).
+
+`repo:` only applies when a thread is being **created**. Inside an existing thread it is refused with a pointer to `/clord-thread-init`, because that thread's working copy is already cloned and would not change.
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
 
@@ -51,10 +87,12 @@ Skills are predefined prompts stored in `~/.claude/skills/`. The `name` paramete
 | `/clord-init repo:<url>` | Bind this channel to a git repository | Any channel |
 | `/clord-init remove:True` | Remove the binding for this channel | Any channel |
 | `/clord-thread-init` | Show thread-level binding for this thread | Thread only |
-| `/clord-thread-init repo:<url>` | Bind this thread to a git repository (overrides channel binding) | Thread only |
+| `/clord-thread-init repo:<url>` | Change this thread's repository (overrides channel binding) | **c-lord threads only** |
 | `/clord-thread-init remove:True` | Remove the thread-level binding | Thread only |
 
 Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory. A thread-level binding set via `/clord-thread-init` takes precedence over the channel binding.
+
+`/clord-thread-init repo:<url>` **changes the repository of a thread that is already c-lord's** — it does not turn a thread into one (#551). Binding an ordinary conversation thread used to be step one of the takeover described under `/clord` above, so it is refused on the same test. To start on a different repository, use `/clord repo:<url> prompt:<...>` in the channel, which opens a new thread already bound to it. Showing the binding (no arguments) and `remove:True` still work anywhere — neither can turn a thread into a session.
 
 ### Model Management
 
@@ -72,7 +110,7 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `/clord-status` | List **this channel's** live sessions — size, attach, resume | Anywhere |
 | `/clord-status show_all:true` | Also include closed sessions (like `docker ps -a`) | Anywhere |
 
-**`/clord-status`** is the single per-channel status view. Each row shows the window number `#` (sorted ascending), the `status`, the thread `topic`, the directory `size`, and `used` (time since last activity). Above the table is a copyable `tmux attach -t <session>:work<#>` command (substitute the `#`). The Claude-Code session id (`cc-session`, for `claude --resume <id>` from a terminal) is shown only in the `all` view, at the right edge. By default it lists only **live** sessions (like `docker ps`); `show_all` adds **closed** ones (`/close-workspace`'d — tmux window gone, session dir kept, still using disk). Sessions whose working dir was deleted (`/workspace-delete`) are a footer count only. It **supersedes the removed `/sessions`, `/session-dirs`, and `/resume-info`** (#363).
+**`/clord-status`** is the single per-channel status view. Each row shows the `attach` target — the **measured** `session:window` that thread is actually in, copy-pasteable as-is — plus the `status`, the thread `topic`, the directory `size`, and `used` (time since last activity). Rows are still ordered by window number ascending. Since #615 a channel's threads can sit in **several** tmux sessions (one per bound repo), so the target is per row and there is no single channel-wide session to print; the old `<session>:work<#>` template pointed at windows that did not exist (#616). A `closed` session has no window, so its `attach` cell is `-`. The Claude-Code session id (`cc-session`, for `claude --resume <id>` from a terminal) is shown only in the `all` view, at the right edge. By default it lists only **live** sessions (like `docker ps`); `show_all` adds **closed** ones (`/close-workspace`'d — tmux window gone, session dir kept, still using disk). Sessions whose working dir was deleted (`/workspace-delete`) are a footer count only. It **supersedes the removed `/sessions`, `/session-dirs`, and `/resume-info`** (#363).
 
 **Status values** (observed live at call time, not the polled DB state):
 
@@ -81,7 +119,7 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `run` | tmux window exists and Claude is executing (🟢) |
 | `wait` | tmux window exists, turn done, waiting for your input (🟡) |
 | `err` | tmux window exists, an error is visible in the pane (🔴) |
-| `closed` | no tmux window but the session dir still exists (`/close-workspace`'d — still uses disk; resume by sending a message) (⚪) |
+| `closed` | no tmux window but the session dir still exists (still uses disk). Two ways to get here: `/close-workspace`'d (thread renamed `[終了] …`; a message is held and offers a 再開 button, #512) or the pane merely died (bot restart / tmux-server death — a message auto-resumes it via `--continue`, #270) (⚪) |
 
 ### Workspace Management
 
@@ -89,22 +127,88 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 |---------|-------------|-------|
 | `/session-cleanup [dry_run]` | Remove clean orphaned session directories | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
-| `/tmux-screenshot` | Post a PNG screenshot of this thread's current tmux pane (debug) | Thread only |
+| `/tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane — a stopped workspace is restored first (debug) | Thread only |
+| `/close-workspace` | **終了**: close the tmux window, keep the session (see below) | Thread only |
+| `/reopen-workspace` | Reopen a 終了 thread so messages run again | Thread only |
 | `/workspace-delete` | Delete the tmux window and session directory for this thread | Thread only |
+
+**`/close-workspace` = 終了 (#271, #512).** It kills the tmux window and archives
+the thread but **keeps** the session directory, transcript, and DB row, so the
+conversation can be picked up later. What you see:
+
+- the thread is renamed **`[終了] #<issue> <topic>`** — the `W<N> │` window prefix
+  is dropped because the window it named is exactly what was just killed
+- writing in the thread afterwards **does not run Claude**. c-lord replies with
+  「⏹️ このスレッドは終了しています」 plus a **▶️ 再開する** button; pressing it
+  reopens the session and then runs the message you just sent, so nothing has to
+  be retyped. `/reopen-workspace` does the same without the button (but does not
+  re-send your message).
+
+This is deliberately different from a session whose pane merely *died* (bot
+restart, `kill -9`, tmux-server death): that one is not "終了", carries no marker,
+and still auto-resumes on the next message via `--continue` (#270).
+
+Use `/workspace-delete` instead when you want the disk back — that one is not
+resumable.
 
 ### Mirror Recovery
 
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/resync` | Reconnect this thread's Discord mirror to its tmux pane | Thread only |
-| `/resync-channel` | Reconnect the mirror for every thread in this channel | Channel or thread |
 | `/restart-claude` | Restart the Claude process for this thread (keeps the conversation) | Thread only |
 
 **`/resync`** is a safety valve for when the tmux→Discord *mirror* feels out of sync — a selection menu's buttons never appeared, or a tool embed looks stale. It re-projects the **current** tmux state onto Discord: (1) re-bridges any stranded TUI menu so its buttons (re)appear, and (2) posts a fresh PNG snapshot of the pane so you can see the live state. It does this immediately, without waiting for the 60s menu-watchdog sweep or a bot restart.
 
-It does **not** touch the Claude process or the conversation — the session is untouched. `/resync-channel` runs the same reconnect for every thread in the channel's tmux session and reports how many it touched.
+It does **not** touch the Claude process or the conversation — the session is untouched.
 
-If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` and `/tmux-screenshot` no longer dead-end with a bare "No tmux window found." Instead they tell you the session is stopped and that **sending a message auto-restores it** (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
+There is **no channel-wide twin**. `/resync-channel` existed until #619 and was removed: it swept a single tmux session, so threads bound to another repo were silently skipped — while the 60s menu watchdog already re-bridges stranded menus across **every** session on its own. Reconnecting is therefore two things: the watchdog (automatic, all sessions) and `/resync` (manual, this thread, plus a pane snapshot the watchdog does not post).
+
+**`/tmux-screenshot` on a stopped workspace restores it and then takes the picture (#642).** No tmux window means no pixels to capture, and since [the 4-hour sleep](specs/workspace-sleep.md) any thread nobody touched for four hours is in exactly that state — so answering with "send a message and it will come back" made the command stop returning pictures at all. It now brings the workspace back the way a message would (`claude --continue`, but with **no prompt**, so no turn runs), captures the restored pane, and posts the PNG with a `-# 🔄 …復元してから撮影しました` line so the few seconds of waiting are accounted for. Two thread states are **not** restored, because a message would not restore them either: a `[終了]` thread (that state was your decision — it still offers **▶️ 再開する**) and a thread c-lord has no record of. If the restore itself fails, it says so instead of posting an empty screen.
+
+If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` (and `/tmux-screenshot`, for the two states above) no longer dead-ends with a bare "No tmux window found." It tells you what sending a message will *actually* do, which depends on the thread (#538):
+
+- **The thread has a session record** → sending a message auto-restores it (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
+- **The session was closed** (`[終了]` / `/close-workspace`) → the message is held and a **▶️ 再開する** button is offered instead (#512).
+- **c-lord has no record of the thread** (usually the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep); also a rebuilt DB, or a thread from another host) → the message did not run, and it is answered rather than dropped in silence: a ⚠️ reaction plus a one-time notice saying so. What the notice offers depends on **what is still on disk** (#538):
+
+| Still on disk | The notice offers |
+|---|---|
+| checkout + transcript | **🔗 再接続する** — reconnects, and the next message continues the real conversation |
+| checkout only (the common case) | **🔗 再接続する** — reconnects to the work; the thread's own history is written into the checkout so Claude can pick up where it left off |
+| neither | no button: says nothing is left to reconnect to, and points at `/clord` in the channel |
+
+  `/clord-reattach` does the same thing from a command, for when you already know what happened and would rather not send a message that will not run.
+
+  **Reattaching only ever reconnects.** It never clones, never creates a session dir, and refuses a thread with nothing on disk — so it cannot be used to turn an ordinary thread into a Claude session (the door #551 closes).
+
+The hint's wording and the rule that decides whether a message is accepted come from the same place, so they cannot drift apart again. See [specs/session-resume.md](specs/session-resume.md).
+
+### Why a thread loses its record (the 30-day sweep)
+
+The most common reason c-lord "has no record of the thread" is not a bug: **every startup deletes session records that have gone 30 days unused.** Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
+
+> 古い C-lord セッションを続けようとしたところセッションが無い、って言われちゃった。消した覚えは無いはず。Discord 上にそういう事も書いてないし
+
+The sweep still runs. What changed is that **each swept thread now gets a notice in the thread itself**, so the reason is where the question gets asked:
+
+```
+🧹 このスレッドは 30 日以上使われていなかったため、作業セッションの記録を整理しました。
+・作業ディレクトリ（clone した内容）は残っています — 書きかけの成果物はディスク上にそのままあります
+・会話の履歴は失われています（Claude Code 自身も既定 30 日で transcript を整理するため）
+```
+
+**The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
+
+**What is deleted is the record, not the work.** The row ties a Discord thread to its Claude session; the git clone under `c-lord-sessions/<channel>/<thread>/` is left alone. So a swept thread usually still has its checkout, half-finished edits included — which is why the notice inspects the disk instead of printing one fixed sentence. It reports three different situations:
+
+| On disk | Notice says |
+|---|---|
+| clone + transcript | both survived |
+| clone only (the common case) | the work is there, the conversation is not |
+| neither | nothing left to reconnect to |
+
+**Two cleaners run on the same schedule.** Claude Code expires its own transcripts under `~/.claude/projects/` via `cleanupPeriodDays` (default 30), independently of c-lord. That is why the middle row is the common one, and why c-lord cannot restore a conversation it never deleted — raise `cleanupPeriodDays` in your Claude Code settings if you want longer history.
 
 **Screenshot height (#471)**: `/tmux-screenshot` (and the `/resync` PNG snapshot) show **more history than the live ~40-row window**. Claude's TUI keeps no scrollback, so before capturing, c-lord transiently grows the window so Claude redraws more of the conversation, captures the taller screen, then restores the exact original size (the human's attached view is unchanged). The default height is **100 rows**; override it with `CLORD_TMUX_SCREENSHOT_ROWS` (rows), or set it to `0` to capture the current window as-is.
 
@@ -132,7 +236,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 
 | Command | Description | Example | Slash equivalent |
 |---------|-------------|---------|------------------|
-| `!clord <prompt>` | Start a new session (channel) / continue (thread) | `!clord build X` | `/clord` |
+| `!clord [repo:<url>] <prompt>` | Start a new session (channel) / continue (thread) | `!clord repo:git@github.com:yousan/dotclaude.git build X` | `/clord` |
 | `!attach <window>` | Attach this thread to a tmux window | `!attach w13` | `/clord-attach` |
 | `!skill <name> [args]` | Run a Claude Code skill | `!skill recall` | `/skill` |
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
@@ -141,14 +245,15 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
 | `!clord-status [all]` | List this channel's sessions (`all` = include closed) | `!clord-status all` | `/clord-status` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
-| `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane | `!tmux-screenshot` | `/tmux-screenshot` |
+| `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane (restores a stopped workspace first) | `!tmux-screenshot` | `/tmux-screenshot` |
 | `!resync` | Reconnect this thread's Discord mirror to tmux | `!resync` | `/resync` |
-| `!resync-channel` | Reconnect the mirror for every thread in the channel | `!resync-channel` | `/resync-channel` |
 | `!restart-claude` | Restart the Claude process (keeps the conversation) | `!restart-claude` | `/restart-claude` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
 | `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
 | `!session-cleanup [dry]` | Remove clean orphaned session dirs (`dry` = preview) | `!session-cleanup dry` | `/session-cleanup` |
+| `!close-workspace` | 終了: close the tmux window, keep the session | `!close-workspace` | `/close-workspace` |
+| `!reopen-workspace` | Reopen a 終了 thread | `!reopen-workspace` | `/reopen-workspace` |
 | `!workspace-delete` | Delete this thread's tmux window + session dir | `!workspace-delete` | `/workspace-delete` |
 
 > **Manage-Server note.** `/clord-init` and `/clord-thread-init` are gated by

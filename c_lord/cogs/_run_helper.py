@@ -28,13 +28,13 @@ from ..claude.context_usage import (
     format_context_line,
     read_latest_usage,
 )
-from ..claude.tmux_runner import TmuxClaudeRunner
+from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX, TmuxClaudeRunner
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
     bridge_pane_ask,
     collect_ask_answers,
 )
-from ..discord_ui.embeds import error_embed, timeout_embed
+from ..discord_ui.embeds import error_embed, no_response_embed, timeout_embed
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
@@ -73,10 +73,14 @@ _cli_version_fetched: bool = False
 
 
 def _make_error_embed(error: str) -> discord.Embed:
-    """Return a timeout_embed for timeout errors, error_embed otherwise."""
+    """Pick the embed that matches what actually went wrong."""
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))
+    # #562: "never started" is not "stopped responding" — a timeout embed here
+    # would send the reader looking for output that was never produced.
+    if error.startswith(NO_RESPONSE_ERROR_PREFIX):
+        return no_response_embed(error)
     return error_embed(error)
 
 
@@ -391,9 +395,14 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             await processor.process(event)
             if event.is_complete and event.error:
                 run_errored = True
+                # #621: hand the reason back to the caller. A scheduled/webhook
+                # turn has nobody reading the thread, so an error that only ever
+                # became an embed is an error nobody ever sees.
+                config.outcome.error = event.error
     except Exception:
         logger.exception("%s Error running Claude CLI", ctx)
         run_errored = True
+        config.outcome.error = "An unexpected error occurred."
         # Wrap Discord sends in suppress — the connection may already be closed
         # (e.g. ServerDisconnectedError on bot shutdown), and sending would fail too.
         with contextlib.suppress(Exception):
@@ -443,6 +452,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             runner,
             ask_repo=config.ask_repo,
             authorizer=config.authorizer,
+            notify_user_id=config.notify_user_id,
         )
     elif not run_errored and not processor.pending_ask and skills_enabled():
         # Issue #67: surface a fallback notice when the skill-reply path was
@@ -473,6 +483,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             processor.session_id,
             ask_repo=config.ask_repo,
             authorizer=config.authorizer,
+            notify_user_id=config.notify_user_id,
         )
         if answer_prompt:
             logger.info(

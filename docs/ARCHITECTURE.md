@@ -188,6 +188,9 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 ```
                     ┌──────────────────┐
                     │   Semaphore(N)   │  N = MAX_CONCURRENT_SESSIONS (default 3)
+                    │                  │  = turns running at once, NOT resident claude
+                    │                  │  processes (that is CLORD_MAX_RESIDENT_WORKSPACES,
+                    │                  │  #576 — released when the turn ends)
                     └────────┬─────────┘
                              │
           ┌──────────────────┼──────────────────┐

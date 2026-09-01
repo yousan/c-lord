@@ -632,7 +632,16 @@ class TestRunClaudeInThread:
 class TestNoReplyFallback:
     """Issue #67: when Claude finishes a turn without calling discord-reply,
     run_claude_with_config must surface a fallback notification so the user
-    isn't left staring at silence."""
+    isn't left staring at silence.
+
+    This fallback only exists in skill mode (#216/#492 made jsonl the
+    default), so pin CLORD_BRIDGE_MODE=skill here; test_no_fallback_in_jsonl_mode
+    below overrides it back to jsonl to test the opposite case.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _skill_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
 
     @pytest.fixture
     def thread(self) -> MagicMock:

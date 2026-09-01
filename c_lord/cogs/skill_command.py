@@ -118,22 +118,31 @@ class SkillCommandCog(commands.Cog):
         self._skills = _load_skills(self._skills_dir)
         self._last_loaded: float = time.monotonic()
 
-    async def _resolve_session_dir_manager(self, channel_id: int) -> SessionDirManager | None:
+    async def _resolve_session_dir_manager(
+        self, channel_id: int, thread_id: int | None = None
+    ) -> SessionDirManager | None:
         """Resolve a SessionDirManager for the given channel via ChannelRepoCog."""
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_manager(channel_id)
+            return await channel_cog.resolve_manager(channel_id, thread_id=thread_id)
         return None
 
-    async def _resolve_tmux_manager(self, channel_id: int) -> TmuxSessionManager | None:
-        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
+    async def _resolve_tmux_manager(
+        self, channel_id: int, *, thread_id: int | None
+    ) -> TmuxSessionManager | None:
+        """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog.
+
+        #427: pass ``thread_id`` whenever a thread is in scope so a
+        ``/clord-thread-init`` thread lands in its own repo's tmux session
+        rather than the parent channel's.
+        """
         from .channel_repo import ChannelRepoCog
 
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
-            return await channel_cog.resolve_tmux_manager(channel_id)
+            return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
     def _maybe_reload_skills(self) -> None:
@@ -251,8 +260,8 @@ class SkillCommandCog(commands.Cog):
         # In-thread mode: if invoked inside a thread under the claude channel, resume it
         if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
             parent_channel_id = channel.parent_id or self.claude_channel_id
-            sdm = await self._resolve_session_dir_manager(parent_channel_id)
-            tmux = await self._resolve_tmux_manager(parent_channel_id)
+            sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
+            tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=channel.id)
 
             if tmux is None:
                 await respond("⚠️ tmux is not configured for this channel.", ephemeral=True)
@@ -277,6 +286,8 @@ class SkillCommandCog(commands.Cog):
                     registry=self._registry,
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
+                    # #480: ping the invoking user if a question-mode pause blocks the skill.
+                    notify_user_id=user.id,
                 )
             )
             return
@@ -289,7 +300,8 @@ class SkillCommandCog(commands.Cog):
 
         # Resolve per-channel managers
         sdm = await self._resolve_session_dir_manager(claude_channel.id)
-        tmux = await self._resolve_tmux_manager(claude_channel.id)
+        # New-thread mode: no thread exists yet (#600 audit).
+        tmux = await self._resolve_tmux_manager(claude_channel.id, thread_id=None)
 
         # Unbound channel check
         if tmux is None:
@@ -325,6 +337,8 @@ class SkillCommandCog(commands.Cog):
                 registry=self._registry,
                 session_dir_manager=sdm,
                 tmux_manager=tmux,
+                # #480: ping the invoking user if a question-mode pause blocks the skill.
+                notify_user_id=user.id,
             )
         )
 

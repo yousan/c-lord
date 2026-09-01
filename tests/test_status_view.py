@@ -90,6 +90,7 @@ def _rows():
     return [
         StatusRow(
             window_number=1,
+            attach="c-lord:w1",
             status="run",
             topic="auth-bug-fix",
             size_bytes=412_000_000,
@@ -98,6 +99,7 @@ def _rows():
         ),
         StatusRow(
             window_number=2,
+            attach="c-lord:w2",
             status="wait",
             topic="readme-update",
             size_bytes=188_000_000,
@@ -106,6 +108,7 @@ def _rows():
         ),
         StatusRow(
             window_number=None,
+            attach=None,
             status="closed",
             topic="old-refactor",
             size_bytes=96_000_000,
@@ -132,7 +135,6 @@ def _render(show_all: bool, **kw):
         show_all=show_all,
         channel_name="dev-claude",
         repo="yousan/c-lord",
-        session_name="c-lord",
         deleted_count=2,
         now=NOW,
     )
@@ -152,8 +154,10 @@ def test_default_view_shows_only_live_rows():
     assert "old-refactor" not in out
     # legend was removed from the output (now lives in docs, #363 feedback)
     assert "legend" not in out
-    # attach pattern is attach-only (no resume hint) in a code block
-    assert "tmux attach -t c-lord:work<#>" in out
+    # attach pattern is attach-only (no resume hint) in a code block; #616 made
+    # it point at the measured column instead of naming one session.
+    assert "tmux attach -t" in out
+    assert "work<#>" not in out
     assert "claude --resume" not in out
     # cc-session column is NOT shown in the default view
     assert "cc-session" not in out
@@ -166,8 +170,9 @@ def test_default_view_shows_only_live_rows():
 
 def test_default_view_sorted_by_window_number_ascending():
     out = _render(show_all=False)
-    nums = [ln.split()[0] for ln in _table_rows(out)]
-    assert nums == ["1", "2"]  # #363 feedback: ascending by #
+    # #616: the first column is the measured attach target; the ordering key is
+    # still the window number behind it (#363 feedback: ascending by #).
+    assert [ln.split()[0] for ln in _table_rows(out)] == ["c-lord:w1", "c-lord:w2"]
 
 
 def test_all_view_shows_closed_rows_and_cc_session():
@@ -197,6 +202,7 @@ def test_topic_with_backticks_and_newline_cannot_break_the_table():
     rows = [
         StatusRow(
             window_number=1,
+            attach="c-lord:w1",
             status="run",
             topic="evil```\ntopic\nwith breaks",
             size_bytes=10_000_000,
@@ -209,7 +215,6 @@ def test_topic_with_backticks_and_newline_cannot_break_the_table():
         show_all=False,
         channel_name="dev",
         repo="yousan/c-lord",
-        session_name="c-lord",
         deleted_count=0,
         now=NOW,
     )
@@ -236,8 +241,8 @@ def test_cjk_and_ascii_topics_align_by_display_width():
     # Two topics of equal *display* width but different char count must produce
     # rows of equal display width (columns aligned by display width, not len()).
     rows = [
-        StatusRow(1, "run", "あ", 4_000_000, "2026-06-11 11:00:00", "x1"),
-        StatusRow(2, "run", "ab", 4_000_000, "2026-06-11 11:00:00", "x2"),
+        StatusRow(1, "c-lord:w1", "run", "あ", 4_000_000, "2026-06-11 11:00:00", "x1"),
+        StatusRow(2, "c-lord:w2", "run", "ab", 4_000_000, "2026-06-11 11:00:00", "x2"),
     ]
     out = _render(show_all=False, rows=rows)
     l0, l1 = _table_rows(out)
@@ -248,6 +253,7 @@ def test_row_cap_is_announced_not_silent():
     many = [
         StatusRow(
             window_number=i,
+            attach=f"c-lord:w{i}",
             status="run",
             topic=f"task-{i}",
             size_bytes=10_000_000,
@@ -261,10 +267,90 @@ def test_row_cap_is_announced_not_silent():
         show_all=False,
         channel_name="dev",
         repo="yousan/c-lord",
-        session_name="c-lord",
         deleted_count=0,
         now=NOW,
         max_rows=25,
     )
     # truncation must be visible, never silent
     assert "25" in out and "40" in out
+
+
+# ── #616: the attach target is measured, never derived ──────────────────────
+
+
+def _attach_rows():
+    """Rows whose windows live in three *different* tmux sessions.
+
+    That is the real shape after #615: sessions follow the repository, so one
+    channel's threads can sit in several sessions — and one of them still
+    carries a legacy ``work{N}`` window name.
+    """
+    return [
+        StatusRow(
+            window_number=1,
+            attach="qiita-article:w1",
+            status="wait",
+            topic="Qiita記事執筆",
+            size_bytes=412_000_000,
+            last_used="2026-06-11 10:00:00",
+            session_id="a1b2c3d4-1111",
+        ),
+        StatusRow(
+            window_number=5,
+            attach="claude_base:work5",
+            status="run",
+            topic="2017.l2tp.org",
+            size_bytes=120_000_000,
+            last_used="2026-06-11 11:55:00",
+            session_id="e5f6a7b8-2222",
+        ),
+        StatusRow(
+            window_number=None,
+            attach=None,
+            status="closed",
+            topic="old-refactor",
+            size_bytes=96_000_000,
+            last_used="2026-06-08 12:00:00",
+            session_id="c1d2e3f4-3333",
+        ),
+    ]
+
+
+class TestAttachColumn:
+    def test_each_row_carries_its_own_session_and_window(self):
+        out = _render(show_all=False, rows=_attach_rows())
+        body = "\n".join(_table_rows(out))
+        assert "qiita-article:w1" in body
+        assert "claude_base:work5" in body, "a legacy work{N} name must print verbatim"
+
+    def test_header_row_labels_the_column_attach(self):
+        out = _render(show_all=False, rows=_attach_rows())
+        table = next(
+            b
+            for i, b in enumerate(out.split("```"))
+            if i % 2 == 1 and "status" in b and "topic" in b
+        )
+        header = table.strip().splitlines()[0]
+        assert header.split()[0] == "attach"
+
+    def test_no_derived_attach_template_anywhere(self):
+        """The old header built ``<session>:work<#>`` by hand — that is the bug."""
+        out = _render(show_all=False, rows=_attach_rows())
+        assert "work<#>" not in out
+        assert "w<#>" not in out
+
+    def test_closed_row_offers_no_attach_target(self):
+        out = _render(show_all=True, rows=_attach_rows())
+        closed = [ln for ln in _table_rows(out) if "old-refactor" in ln]
+        assert len(closed) == 1
+        assert closed[0].split()[0] == "-"
+
+    def test_attach_block_points_at_the_column(self):
+        out = _render(show_all=False, rows=_attach_rows())
+        attach_block = next(
+            b for i, b in enumerate(out.split("```")) if i % 2 == 1 and "tmux attach" in b
+        )
+        assert "tmux attach -t" in attach_block
+        # ...and it must not name one session, because rows disagree.
+        assert "qiita-article" not in attach_block
+        assert "claude_base" not in attach_block

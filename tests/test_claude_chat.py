@@ -8,12 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from c_lord.cogs.claude_chat import (
-    _MAX_ATTACHMENT_BYTES,
-    _MAX_ATTACHMENTS,
-    _MAX_TOTAL_BYTES,
-    ClaudeChatCog,
-)
+from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.concurrency import SessionRegistry
 from c_lord.coordination.service import CoordinationService
 
@@ -169,7 +164,24 @@ class TestStopCommand:
         assert embed.color.value == 0xFFA500
 
 
-def _make_thread_ctx(thread_id: int = 12345, parent_id: int | None = None) -> MagicMock:
+def _attach_human_message(ctx: MagicMock, webhook_id: int | None = None) -> MagicMock:
+    """Give *ctx* a realistic ``ctx.message``.
+
+    Without this, ``ctx.message.webhook_id`` and ``ctx.author.bot`` are
+    auto-created (truthy) MagicMocks, so a context meant to represent a *human*
+    would be read as a webhook / bot by ``_is_message_authorized`` (#507).
+    A real human message has ``webhook_id is None`` and ``author.bot is False``.
+    """
+    ctx.author.bot = webhook_id is not None
+    ctx.message = MagicMock(spec=discord.Message)
+    ctx.message.webhook_id = webhook_id
+    ctx.message.author = ctx.author
+    return ctx
+
+
+def _make_thread_ctx(
+    thread_id: int = 12345, parent_id: int | None = None, webhook_id: int | None = None
+) -> MagicMock:
     """Return a mocked commands.Context whose channel is a discord.Thread."""
     ctx = MagicMock()
     thread = MagicMock(spec=discord.Thread)
@@ -179,17 +191,17 @@ def _make_thread_ctx(thread_id: int = 12345, parent_id: int | None = None) -> Ma
     ctx.send = AsyncMock()
     ctx.author = MagicMock()
     ctx.author.id = 1
-    return ctx
+    return _attach_human_message(ctx, webhook_id)
 
 
-def _make_channel_ctx() -> MagicMock:
+def _make_channel_ctx(webhook_id: int | None = None) -> MagicMock:
     """Return a mocked commands.Context whose channel is NOT a thread."""
     ctx = MagicMock()
     ctx.channel = MagicMock(spec=discord.TextChannel)
     ctx.send = AsyncMock()
     ctx.author = MagicMock()
     ctx.author.id = 1
-    return ctx
+    return _attach_human_message(ctx, webhook_id)
 
 
 class TestStopTextCommand:
@@ -377,7 +389,13 @@ class TestActiveCountAlias:
 
 
 class TestBuildPrompt:
-    """Tests for the _build_prompt method (attachment handling)."""
+    """_build_prompt now carries the message text only (#528).
+
+    Attachments used to be pasted in here (small ones) or dropped (large ones).
+    They are written to disk by ``_stage_attachments`` instead — covered in
+    tests/test_attachment_staging.py — so the only thing left to pin down is
+    that the prompt no longer grows with the file.
+    """
 
     @staticmethod
     def _make_attachment(
@@ -398,6 +416,7 @@ class TestBuildPrompt:
     @staticmethod
     def _make_message(content: str = "my message", attachments: list | None = None) -> MagicMock:
         msg = MagicMock(spec=discord.Message)
+        msg.id = 4242
         msg.content = content
         msg.attachments = attachments or []
         return msg
@@ -405,206 +424,32 @@ class TestBuildPrompt:
     @pytest.mark.asyncio
     async def test_no_attachments_returns_content(self) -> None:
         cog = _make_cog()
-        msg = self._make_message(content="hello")
-        result = await cog._build_prompt(msg)
-        assert result == "hello"
+        assert await cog._build_prompt(self._make_message(content="hello")) == "hello"
 
     @pytest.mark.asyncio
-    async def test_text_attachment_appended(self) -> None:
+    async def test_attachment_contents_are_not_inlined(self) -> None:
+        """Inlining is what pushed a 20KB .md past tmux's input cap (#527)."""
         cog = _make_cog()
         att = self._make_attachment(filename="notes.txt", content=b"file content here")
         msg = self._make_message(content="check this", attachments=[att])
 
         result = await cog._build_prompt(msg)
 
-        assert "check this" in result
-        assert "notes.txt" in result
-        assert "file content here" in result
+        assert result == "check this"
+        assert "file content here" not in result
+        att.read.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_image_attachment_url_embedded_in_prompt(self) -> None:
-        """Images are NOT downloaded; their CDN URL is embedded in the prompt."""
-        image_url = "https://cdn.discordapp.com/attachments/1/2/image.png?ex=abc&is=def&hm=xyz"
+    async def test_image_url_is_not_embedded(self) -> None:
+        """Images are saved as files too — no signed CDN URL to expire (#529)."""
         cog = _make_cog()
-        att = self._make_attachment(
-            filename="image.png",
-            content_type="image/png",
-            size=100,
-            content=b"\x89PNG...",
-            url=image_url,
-        )
+        att = self._make_attachment(filename="image.png", content_type="image/png")
         msg = self._make_message(content="see image", attachments=[att])
 
         prompt, image_paths = await cog._build_prompt_and_images(msg)
 
-        # URL is embedded in the prompt text.
-        assert image_url in prompt
-        assert "image.png" in prompt
-        # No tempfiles — images are not downloaded.
+        assert "cdn.discordapp.com" not in prompt
         assert image_paths == []
-        att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_binary_non_image_url_embedded(self) -> None:
-        """Non-image binary files (e.g. zip, PDF) have their URL embedded."""
-        file_url = "https://cdn.discordapp.com/attachments/1/2/archive.zip?ex=abc&is=def&hm=xyz"
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="archive.zip",
-            content_type="application/zip",
-            content=b"PK...",
-            url=file_url,
-        )
-        msg = self._make_message(content="see zip", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert file_url in result
-        assert "archive.zip" in result
-        att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_multiple_images_all_urls_embedded(self) -> None:
-        """Multiple image attachments all get their URLs embedded."""
-        cog = _make_cog()
-        images = [
-            self._make_attachment(
-                filename=f"img{i}.png",
-                content_type="image/png",
-                url=f"https://cdn.discordapp.com/attachments/1/2/img{i}.png?ex=abc",
-            )
-            for i in range(3)
-        ]
-        msg = self._make_message(content="three images", attachments=images)
-
-        prompt, image_paths = await cog._build_prompt_and_images(msg)
-
-        for i in range(3):
-            assert f"img{i}.png" in prompt
-            assert f"img{i}.png?ex=abc" in prompt
-        assert image_paths == []
-        for att in images:
-            att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_image_and_text_attachment_combined(self) -> None:
-        """Image URL + text file content both appear in the prompt."""
-        image_url = "https://cdn.discordapp.com/attachments/1/2/photo.jpg?ex=abc"
-        cog = _make_cog()
-        img_att = self._make_attachment(
-            filename="photo.jpg",
-            content_type="image/jpeg",
-            url=image_url,
-        )
-        txt_att = self._make_attachment(filename="notes.txt", content=b"my notes")
-        msg = self._make_message(content="check these", attachments=[img_att, txt_att])
-
-        prompt, image_paths = await cog._build_prompt_and_images(msg)
-
-        assert image_url in prompt
-        assert "my notes" in prompt
-        assert image_paths == []
-
-    @pytest.mark.asyncio
-    async def test_oversized_attachment_skipped(self) -> None:
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="huge.txt",
-            content_type="text/plain",
-            size=_MAX_ATTACHMENT_BYTES + 1,
-        )
-        msg = self._make_message(content="big file", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert result == "big file"
-        att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_empty_content_with_attachment(self) -> None:
-        """Message with only an attachment (no text) should still work."""
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="code.py", content_type="text/x-python", content=b"print('hi')"
-        )
-        msg = self._make_message(content="", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert "code.py" in result
-        assert "print('hi')" in result
-
-    @pytest.mark.asyncio
-    async def test_max_attachments_limit(self) -> None:
-        """Only the first _MAX_ATTACHMENTS files should be processed."""
-        cog = _make_cog()
-        attachments = [
-            self._make_attachment(filename=f"file{i}.txt", content=f"content{i}".encode())
-            for i in range(_MAX_ATTACHMENTS + 2)
-        ]
-        msg = self._make_message(attachments=attachments)
-
-        await cog._build_prompt(msg)
-
-        # Extra attachments beyond the limit should not be read
-        for att in attachments[_MAX_ATTACHMENTS:]:
-            att.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_total_size_limit_stops_processing(self) -> None:
-        """Processing stops when cumulative size exceeds _MAX_TOTAL_BYTES."""
-        cog = _make_cog()
-        # Each file is just under the per-file limit but together they exceed total
-        chunk = _MAX_ATTACHMENT_BYTES - 100  # 49.9 KB
-        attachments = [
-            self._make_attachment(
-                filename=f"file{i}.txt",
-                size=chunk,
-                content=b"x" * chunk,
-            )
-            for i in range(10)
-        ]
-        msg = self._make_message(attachments=attachments)
-
-        await cog._build_prompt(msg)
-
-        # Should stop after total exceeds _MAX_TOTAL_BYTES (~2 files)
-        read_count = sum(1 for att in attachments if att.read.called)
-        expected_max = (_MAX_TOTAL_BYTES // chunk) + 1
-        assert read_count <= expected_max
-
-    @pytest.mark.asyncio
-    async def test_json_attachment_included(self) -> None:
-        """application/json is in the allowed types."""
-        cog = _make_cog()
-        att = self._make_attachment(
-            filename="config.json",
-            content_type="application/json",
-            content=b'{"key": "value"}',
-        )
-        msg = self._make_message(content="here is config", attachments=[att])
-
-        result = await cog._build_prompt(msg)
-
-        assert "config.json" in result
-        assert '{"key": "value"}' in result
-
-    @pytest.mark.asyncio
-    async def test_multiple_text_attachments(self) -> None:
-        """Multiple allowed attachments should all be included."""
-        cog = _make_cog()
-        attachments = [
-            self._make_attachment(filename="a.txt", content=b"alpha"),
-            self._make_attachment(filename="b.md", content_type="text/markdown", content=b"beta"),
-        ]
-        msg = self._make_message(content="two files", attachments=attachments)
-
-        result = await cog._build_prompt(msg)
-
-        assert "a.txt" in result
-        assert "alpha" in result
-        assert "b.md" in result
-        assert "beta" in result
 
 
 class TestRegistryAutoDiscovery:
@@ -895,6 +740,20 @@ class TestResumeAfterPaneDeath:
         msg.author.bot = False
         return msg
 
+    @staticmethod
+    def _record(session_id: str) -> MagicMock:
+        """A session row for this thread.
+
+        ``slept_at`` is spelled out because a bare ``MagicMock`` attribute is
+        truthy, and the reply path reads that field to decide whether to
+        announce the recovery (#572): an unset mock would silently claim every
+        one of these threads had been put to sleep.
+        """
+        record = MagicMock()
+        record.session_id = session_id
+        record.slept_at = None
+        return record
+
     def _cog_with_pane(self, *, running: bool) -> ClaudeChatCog:
         """Cog whose tmux pane for the thread is alive (running) or dead."""
         cog = _make_cog()
@@ -908,8 +767,7 @@ class TestResumeAfterPaneDeath:
     async def test_resumes_with_continue_when_pane_dead_and_prior_session(self) -> None:
         """RED (#270): pane died but a prior session exists → must pass try_continue=True."""
         cog = self._cog_with_pane(running=False)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
 
         await cog._handle_thread_reply(self._make_thread_message())
@@ -928,8 +786,7 @@ class TestResumeAfterPaneDeath:
         notice makes the recovery legible instead of confusing.
         """
         cog = self._cog_with_pane(running=False)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
         msg = self._make_thread_message()
 
@@ -942,8 +799,7 @@ class TestResumeAfterPaneDeath:
     async def test_no_recovery_notice_when_pane_alive(self) -> None:
         """Pane alive → normal live continuation; must NOT post a recovery notice."""
         cog = self._cog_with_pane(running=True)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
         msg = self._make_thread_message()
 
@@ -956,8 +812,7 @@ class TestResumeAfterPaneDeath:
     async def test_no_continue_when_session_cleared(self) -> None:
         """/clear invariant (#123 Part 1): session was reset → stay fresh, never --continue."""
         cog = self._cog_with_pane(running=False)
-        record = MagicMock()
-        record.session_id = ""  # /clear resets session_id to empty
+        record = self._record("")  # /clear resets session_id to empty
         cog.repo.get = AsyncMock(return_value=record)
 
         await cog._handle_thread_reply(self._make_thread_message())
@@ -970,8 +825,7 @@ class TestResumeAfterPaneDeath:
     async def test_no_continue_when_pane_alive(self) -> None:
         """Pane still alive → live send_input continues context; must not force --continue."""
         cog = self._cog_with_pane(running=True)
-        record = MagicMock()
-        record.session_id = "abc-123"
+        record = self._record("abc-123")
         cog.repo.get = AsyncMock(return_value=record)
 
         await cog._handle_thread_reply(self._make_thread_message())
@@ -1444,7 +1298,9 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="build a feature")
 
         interaction.response.defer.assert_called_once()
-        cog.spawn_session.assert_called_once_with(channel, "build a feature")
+        cog.spawn_session.assert_called_once_with(
+            channel, "build a feature", repo=None, requester=interaction.user
+        )
         interaction.followup.send.assert_called_once()
         sent_text = interaction.followup.send.call_args.args[0]
         assert "<#12345>" in sent_text
@@ -1481,8 +1337,15 @@ class TestStartSessionCommand:
         assert kwargs["prompt"] == "continue this"
 
     @pytest.mark.asyncio
-    async def test_thread_execution_no_existing_session(self) -> None:
-        """Running /claude in a thread with no DB record passes session_id=None."""
+    async def test_thread_with_no_trace_of_clord_is_refused(self) -> None:
+        """#551: a thread with no session row *and* no sign it was ever c-lord's
+        is not ours, so /clord refuses instead of taking it over.
+
+        This used to run with ``session_id=None`` — which is how an ordinary
+        human conversation thread became a Claude session, after which every
+        message in it went to Claude. (A thread that merely lost its row to the
+        30-day sweep takes the other branch and is offered a reconnect.)
+        """
         cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
         cog = _make_cog(channel_cog=cc)
         interaction = MagicMock(spec=discord.Interaction)
@@ -1498,13 +1361,19 @@ class TestStartSessionCommand:
         interaction.followup = MagicMock()
         interaction.followup.send = AsyncMock()
 
+        # The refusal lands before the defer, so it comes back through
+        # ``interaction.response`` rather than a followup.
+        interaction.response.send_message = AsyncMock()
         cog.repo.get = AsyncMock(return_value=None)
         cog._run_claude = AsyncMock()
+        cog._was_ever_our_thread = AsyncMock(return_value=False)
 
         await cog.start_session.callback(cog, interaction, prompt="start fresh")
 
-        _, kwargs = cog._run_claude.call_args
-        assert kwargs["session_id"] is None
+        cog._run_claude.assert_not_called()
+        thread.send.assert_not_called()
+        said = str(interaction.response.send_message.call_args.args[0])
+        assert "c-lord のスレッドではない" in said, said
 
     @pytest.mark.asyncio
     async def test_any_channel_allowed(self) -> None:
@@ -1529,7 +1398,9 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="hello")
 
         interaction.response.defer.assert_called_once()
-        cog.spawn_session.assert_called_once_with(channel, "hello")
+        cog.spawn_session.assert_called_once_with(
+            channel, "hello", repo=None, requester=interaction.user
+        )
 
 
 class TestClordTextCommand:
@@ -1565,7 +1436,9 @@ class TestClordTextCommand:
 
         await cog.clord_text.callback(cog, ctx, prompt="build a feature")
 
-        cog.spawn_session.assert_called_once_with(ctx.channel, "build a feature")
+        cog.spawn_session.assert_called_once_with(
+            ctx.channel, "build a feature", repo=None, requester=ctx.author
+        )
         assert "<#12345>" in ctx.send.call_args.args[0]
 
     @pytest.mark.asyncio
@@ -1591,7 +1464,9 @@ class TestClordTextCommand:
         cc = _make_channel_cog_mock()  # both managers None
         cog = _make_cog(channel_cog=cc)
         ctx = _make_channel_ctx()
-        ctx.channel.id = 4242
+        # This instance's own channel (== bot.channel_id): #522 keeps the
+        # guidance here and only silences channels belonging to other instances.
+        ctx.channel.id = 999
         cog.spawn_session = AsyncMock()
 
         await cog.clord_text.callback(cog, ctx, prompt="hello")
@@ -1699,6 +1574,7 @@ class TestAttachTextCommand:
         thread_id: int = 12345,
         in_thread: bool = True,
         author_id: int = 42,
+        webhook_id: int | None = None,
     ) -> MagicMock:
         """Return a commands.Context with a thread channel."""
         ctx = MagicMock()
@@ -1711,7 +1587,7 @@ class TestAttachTextCommand:
             ctx.channel = thread
         else:
             ctx.channel = MagicMock(spec=discord.TextChannel)
-        return ctx
+        return _attach_human_message(ctx, webhook_id)
 
     @pytest.mark.asyncio
     async def test_attach_text_success(self) -> None:
@@ -2290,13 +2166,16 @@ class TestApplyThreadNamingRetitle:
 
         return cog, thread, tmux_manager
 
-    def _make_record(self, *, topic, locked=0, state="running", issue_ref=None):
+    def _make_record(
+        self, *, topic, locked=0, state="running", issue_ref=None, origin_issue_ref=None
+    ):
         record = MagicMock()
         record.topic = topic
         record.auto_topic_locked = locked
         record.state = state
         record.tmux_window_id = "@1"
         record.issue_ref = issue_ref
+        record.origin_issue_ref = origin_issue_ref
         return record
 
     @pytest.mark.asyncio
@@ -2535,13 +2414,14 @@ class TestApplyThreadNamingIssueRef:
         tmux_manager.get_window_info = MagicMock(return_value=("@1", 1))
         return cog, thread, tmux_manager
 
-    def _make_record(self, *, topic="認証リファクタ", issue_ref=None):
+    def _make_record(self, *, topic="認証リファクタ", issue_ref=None, origin_issue_ref=None):
         record = MagicMock()
         record.topic = topic
         record.auto_topic_locked = 0
         record.state = "running"
         record.tmux_window_id = "@1"
         record.issue_ref = issue_ref
+        record.origin_issue_ref = origin_issue_ref
         return record
 
     @pytest.mark.asyncio

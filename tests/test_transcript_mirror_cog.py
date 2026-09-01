@@ -13,6 +13,8 @@ import pytest
 
 from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
 
+from .transcript.helpers import clord_marker_event, clord_transcript
+
 
 def _make_repo(rows: list) -> MagicMock:
     repo = MagicMock()
@@ -20,17 +22,19 @@ def _make_repo(rows: list) -> MagicMock:
     return repo
 
 
-def _row(thread_id: int, working_dir: str | None) -> MagicMock:
+def _row(thread_id: int, working_dir: str | None, *, closed_at: str | None = None) -> MagicMock:
     r = MagicMock()
     r.thread_id = thread_id
     r.working_dir = working_dir
+    r.closed_at = closed_at
     return r
 
 
 async def test_cog_stays_idle_when_bridge_mode_not_jsonl(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
+    # #492: jsonl is now the default, so "not jsonl" must be pinned explicitly.
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
     bot = MagicMock()
     repo = _make_repo([_row(1, str(tmp_path))])
     cog = TranscriptMirrorCog(bot, session_repo=repo)
@@ -78,7 +82,8 @@ async def test_start_for_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path
 async def test_start_for_noop_when_not_jsonl_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
+    # #492: jsonl is now the default, so "not jsonl" must be pinned explicitly.
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
     bot = MagicMock()
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
     assert cog.start_for(1, str(tmp_path)) is False
@@ -223,8 +228,7 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
-    jsonl = project / "s.jsonl"
-    jsonl.write_text("")
+    jsonl = clord_transcript(project / "s.jsonl")
     os.utime(jsonl, (1, 1))
 
     bot = MagicMock()
@@ -239,18 +243,19 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     cog._mirrors[123]._poll_interval = 0.05
     try:
         await _asyncio.sleep(0.15)
-        jsonl.write_text(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "via cog"}],
-                    },
-                }
+        with jsonl.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "via cog"}],
+                        },
+                    }
+                )
+                + "\n"
             )
-            + "\n"
-        )
         await _asyncio.sleep(0.3)
     finally:
         await cog.cog_unload()
@@ -821,11 +826,12 @@ def _recovery_repo(rows: list, *, trigger_message_id=None) -> MagicMock:
     return repo
 
 
-def _session_row(thread_id: int, working_dir: str, replied_uuid):
+def _session_row(thread_id: int, working_dir: str, replied_uuid, *, closed_at: str | None = None):
     r = MagicMock()
     r.thread_id = thread_id
     r.working_dir = working_dir
     r.mirror_replied_uuid = replied_uuid
+    r.closed_at = closed_at
     return r
 
 
@@ -840,8 +846,10 @@ async def test_on_ready_recovers_undelivered_final_answer(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 # Previous turn, already delivered (cursor points here).
                 {
                     "type": "assistant",
@@ -897,8 +905,10 @@ async def test_on_ready_seeds_cursor_silently_when_null(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 {
                     "type": "assistant",
                     "uuid": "u-final",
@@ -941,8 +951,10 @@ async def test_on_ready_does_not_redeliver_when_uuid_matches(
     project.mkdir(parents=True)
     (project / "s.jsonl").write_text(
         "\n".join(
-            json.dumps(e)
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
             for e in [
+                clord_marker_event(),
                 {
                     "type": "assistant",
                     "uuid": "u-final",
@@ -972,3 +984,218 @@ async def test_on_ready_does_not_redeliver_when_uuid_matches(
     ]
     assert not any("already delivered" in b for b in sent_bodies), sent_bodies
     repo.set_mirror_replied_uuid.assert_not_awaited()
+
+
+# ----------------------------------------------------------------------
+# #553: the #215 rescue must fire ONLY for answers that were really dropped.
+# ----------------------------------------------------------------------
+
+
+def _write_transcript(project: Path, events: list[dict]) -> None:
+    project.mkdir(parents=True, exist_ok=True)
+    # #627: the rescue only reads a transcript c-lord itself drove, so the
+    # fixture opens with one of c-lord's marked prompts as a real one does.
+    # ensure_ascii=False because Claude Code writes non-ASCII raw.
+    (project / "s.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in [clord_marker_event(), *events])
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _assistant_ev(uuid: str, text: str) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"content": [{"type": "text", "text": text}]},
+    }
+
+
+def _cog_with_recovery(monkeypatch: pytest.MonkeyPatch, project: Path, posted: list[str]):
+    """A cog whose recovery reads *project* and records reply-sink posts."""
+    monkeypatch.setattr("c_lord.cogs.transcript_mirror.derive_project_dir", lambda _wd: project)
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=MagicMock())
+    cog._session_repo.set_mirror_replied_uuid = AsyncMock()
+
+    async def _reply(text: str) -> None:
+        posted.append(text)
+
+    monkeypatch.setattr(cog, "_make_reply_sink", lambda _tid: _reply)
+    return cog
+
+
+async def test_no_recovery_after_a_restart_mid_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC3: the #553 shape end-to-end — nothing is re-posted.
+
+    The cursor is on an intermediate message of the turn that was interrupted,
+    which sits AFTER the last completed turn's (already delivered) final answer.
+    """
+    project = tmp_path / "proj"
+    _write_transcript(
+        project,
+        [
+            _assistant_ev("u-final", "4点とも答えます。"),
+            {"type": "system", "subtype": "turn_duration"},
+            {"type": "user", "uuid": "u-task", "message": {"content": "task-notification"}},
+            _assistant_ev("u-mid", "#534 も CI 全 pass。"),
+        ],
+    )
+    posted: list[str] = []
+    cog = _cog_with_recovery(monkeypatch, project, posted)
+    row = _row(1, str(tmp_path))
+    row.mirror_replied_uuid = "u-mid"
+
+    recovered = await cog._recover_final_answer(1, str(tmp_path), row)
+
+    assert recovered is False
+    assert posted == [], f"re-posted an already-delivered answer: {posted!r}"
+
+
+async def test_still_recovers_a_genuinely_dropped_answer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC4: killing the false positive must not kill the rescue.
+
+    A whole turn completed while the mirror was down: its final answer is newer
+    than the cursor and was never posted.
+    """
+    project = tmp_path / "proj"
+    _write_transcript(
+        project,
+        [
+            _assistant_ev("u-old", "first turn answer"),
+            {"type": "system", "subtype": "turn_duration"},
+            {"type": "user", "uuid": "u-ask", "message": {"content": "next please"}},
+            _assistant_ev("u-new", "second turn answer — never delivered"),
+            {"type": "system", "subtype": "turn_duration"},
+        ],
+    )
+    posted: list[str] = []
+    cog = _cog_with_recovery(monkeypatch, project, posted)
+    row = _row(2, str(tmp_path))
+    row.mirror_replied_uuid = "u-old"
+
+    recovered = await cog._recover_final_answer(2, str(tmp_path), row)
+
+    assert recovered is True
+    assert posted == ["second turn answer — never delivered"]
+    cog._session_repo.set_mirror_replied_uuid.assert_awaited_with(2, "u-new")
+
+
+# ── Issue #537: closed sessions are not mirrored on startup ──────────────
+
+
+async def test_on_ready_skips_closed_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #537: a session closed with ``!close-workspace`` keeps its row and
+    its (often huge) transcript forever.  Startup must not mirror it — and must
+    not pay the Issue #215 recovery scan for it either, which is what made the
+    on_ready walk cost ~1 GB of parsing on the production host."""
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+    (project / "s.jsonl").write_text(
+        "\n".join(
+            json.dumps(e, ensure_ascii=False)
+            # #627: the mirror only follows a transcript c-lord itself drove.
+            for e in [
+                clord_marker_event(),
+                {
+                    "type": "assistant",
+                    "uuid": "u-final",
+                    "message": {"content": [{"type": "text", "text": "answer in a closed thread"}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+        )
+        + "\n"
+    )
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _recovery_repo(
+        [
+            _session_row(11, "/some/cwd", "u-old"),
+            _session_row(22, "/some/cwd", "u-old", closed_at="2026-08-01 10:00:00"),
+        ]
+    )
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    with caplog.at_level(logging.INFO, logger="c_lord.cogs.transcript_mirror"):
+        try:
+            await cog.on_ready()
+            mirrored = set(cog._mirrors)
+        finally:
+            await cog.cog_unload()
+
+    assert 11 in mirrored  # open session still mirrored
+    assert 22 not in mirrored  # closed session skipped
+    # The closed row was not scanned for recovery either.
+    assert [c.args for c in repo.set_mirror_replied_uuid.await_args_list] == [(11, "u-final")]
+    # AC3: the row counts are visible in the log.
+    startup_lines = [r.getMessage() for r in caplog.records if "session row(s)" in r.getMessage()]
+    assert startup_lines, caplog.text
+    assert "1 closed" in startup_lines[-1], startup_lines[-1]
+
+
+# -- #539: the silence filler is on by default and opt-out ------------------
+
+
+async def test_progress_line_is_wired_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Zero-Config: upgrading the package alone must turn #539 on."""
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+
+    assert cog._make_progress(123) is not None
+
+
+async def test_progress_line_can_be_opted_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLORD_TURN_PROGRESS", "0")
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+
+    assert cog._make_progress(123) is None
+
+
+async def test_progress_line_posts_silently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It is a hint, not a notification — it must never ping the thread."""
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    channel = MagicMock()
+    channel.send = AsyncMock(return_value=MagicMock())
+    bot = MagicMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    progress = cog._make_progress(123)
+    assert progress is not None
+    progress.begin_turn()
+    progress._last_output -= 10_000  # pretend the thread has been quiet
+    await progress.tick()
+
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs.get("silent") is True
+
+
+async def test_progress_quiet_threshold_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    monkeypatch.setenv("CLORD_TURN_PROGRESS_QUIET_SECONDS", "45")
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+
+    progress = cog._make_progress(123)
+    assert progress is not None
+    assert progress._quiet_seconds == 45.0

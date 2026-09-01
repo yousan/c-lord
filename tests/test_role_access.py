@@ -228,6 +228,169 @@ class TestMessageAuthorization:
 
 
 # ===========================================================================
+# Tests — text commands (!clord / !attach) must use the *actor* rule (#507)
+#
+# `ClaudeDiscordBot.process_commands` deliberately lets webhook messages reach
+# text commands (E2E / CI-CD triggers), but the commands themselves used the
+# human-only allowlist (`_is_allowed`).  With `DISCORD_OWNER_ID` set, the
+# webhook's pseudo-author never matches the owner id, so every webhook-driven
+# `!clord` was answered with "You are not authorized to use this command."
+#
+# Auth passing is asserted via the *next* check the command reaches (unbound
+# repo / tmux not configured) — the same message the owner-less staging bot
+# returned for the very webhook that prod rejected.
+# ===========================================================================
+
+UNAUTHORIZED = "You are not authorized to use this command."
+
+
+def _sent_text(ctx: MagicMock) -> str:
+    """Concatenate everything the command sent back through ``ctx.send``."""
+    return " ".join(str(c.args[0]) for c in ctx.send.await_args_list if c.args)
+
+
+def _make_text_ctx(
+    author: MagicMock,
+    *,
+    webhook_id: int | None = None,
+    channel_spec: type = discord.TextChannel,
+) -> MagicMock:
+    """A ``commands.Context`` double for a text command invocation."""
+    ctx = MagicMock()
+    ctx.author = author
+    ctx.channel = MagicMock(spec=channel_spec)
+    # 999 == bot.channel_id: this instance's own channel, so an unbound channel
+    # still answers with guidance (#522 only silences other instances' channels).
+    ctx.channel.id = 999
+    ctx.channel.parent_id = None
+    ctx.message = MagicMock(spec=discord.Message)
+    ctx.message.webhook_id = webhook_id
+    ctx.message.author = author
+    ctx.send = AsyncMock()
+    return ctx
+
+
+def _unbound(cog: ClaudeChatCog) -> ClaudeChatCog:
+    """Make both resolvers return None so an authorized command stops early."""
+    cog._resolve_session_dir_manager = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    cog._resolve_tmux_manager = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    return cog
+
+
+class TestClordTextAuthorization:
+    """`!clord` — webhooks and trusted bots must not be locked out by an owner."""
+
+    async def test_webhook_not_rejected(self) -> None:
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(TestMessageAuthorization._bot_author(999), webhook_id=12345)
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        sent = _sent_text(ctx)
+        assert UNAUTHORIZED not in sent
+        # Reached the next gate — exactly what the owner-less staging bot replied.
+        assert "リポジトリが紐づけられていません" in sent
+
+    async def test_trusted_bot_not_rejected(self, monkeypatch) -> None:
+        monkeypatch.setenv("CLORD_TRUSTED_BOT_IDS", "777")
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(TestMessageAuthorization._bot_author(777))
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        assert UNAUTHORIZED not in _sent_text(ctx)
+
+    async def test_untrusted_bot_still_rejected(self, monkeypatch) -> None:
+        # The bypass must not widen to *any* bot.
+        monkeypatch.setenv("CLORD_TRUSTED_BOT_IDS", "777")
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(TestMessageAuthorization._bot_author(888))
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        assert UNAUTHORIZED in _sent_text(ctx)
+
+    async def test_non_owner_human_still_rejected(self) -> None:
+        # The human allowlist itself is unchanged.
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(TestMessageAuthorization._human(7))
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        assert UNAUTHORIZED in _sent_text(ctx)
+
+    async def test_owner_human_allowed(self) -> None:
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(TestMessageAuthorization._human(42))
+
+        await cog.clord_text.callback(cog, ctx, prompt="hello")
+
+        assert UNAUTHORIZED not in _sent_text(ctx)
+
+
+class TestAttachTextAuthorization:
+    """`!attach` — same defect, same call site shape (#507 AC2)."""
+
+    async def test_webhook_not_rejected(self) -> None:
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(
+            TestMessageAuthorization._bot_author(999),
+            webhook_id=12345,
+            channel_spec=discord.Thread,
+        )
+
+        await cog.attach_text.callback(cog, ctx, window="w1")
+
+        sent = _sent_text(ctx)
+        assert UNAUTHORIZED not in sent
+        assert "tmux is not configured" in sent
+
+    async def test_non_owner_human_still_rejected(self) -> None:
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        ctx = _make_text_ctx(TestMessageAuthorization._human(7), channel_spec=discord.Thread)
+
+        await cog.attach_text.callback(cog, ctx, window="w1")
+
+        assert UNAUTHORIZED in _sent_text(ctx)
+
+
+class TestSlashClordAuthorizationUnchanged:
+    """`/clord` has no message behind it — the human allowlist still governs (#507 AC6)."""
+
+    @staticmethod
+    def _interaction(user: MagicMock) -> MagicMock:
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = user
+        interaction.channel = MagicMock(spec=discord.TextChannel)
+        interaction.channel.id = 555
+        interaction.channel_id = 555
+        interaction.response = MagicMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    async def test_non_owner_human_rejected(self) -> None:
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        interaction = self._interaction(TestMessageAuthorization._human(7))
+
+        await cog.start_session.callback(cog, interaction, "hello")
+
+        interaction.response.send_message.assert_awaited_once()
+        assert UNAUTHORIZED in interaction.response.send_message.await_args.args[0]
+
+    async def test_owner_human_allowed(self) -> None:
+        cog = _unbound(_make_chat_cog(allowed_user_ids={42}))
+        interaction = self._interaction(TestMessageAuthorization._human(42))
+
+        await cog.start_session.callback(cog, interaction, "hello")
+
+        sent = interaction.response.send_message.await_args.args[0]
+        assert UNAUTHORIZED not in sent
+
+
+# ===========================================================================
 # Tests — SkillCommandCog._is_authorized
 # ===========================================================================
 
