@@ -277,7 +277,7 @@ class TestClearTextCommand:
 
 
 class TestRestartClaudeCommand:
-    """/restart-claude restarts the Claude process while KEEPING the conversation.
+    """/claude-restart restarts the Claude process while KEEPING the conversation.
 
     The defining property vs /clear: it must NOT reset the session row. Killing
     the tmux window leaves a live session_id on disk, so the next message
@@ -288,7 +288,7 @@ class TestRestartClaudeCommand:
     async def test_outside_thread_sends_ephemeral(self) -> None:
         cog = _make_cog()
         interaction = _make_channel_interaction()
-        await cog.restart_claude.callback(cog, interaction)
+        await cog.claude_restart.callback(cog, interaction)
         kwargs = interaction.response.send_message.call_args.kwargs
         assert kwargs.get("ephemeral") is True
 
@@ -302,7 +302,7 @@ class TestRestartClaudeCommand:
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
         interaction = _make_thread_interaction(12345)
 
-        await cog.restart_claude.callback(cog, interaction)
+        await cog.claude_restart.callback(cog, interaction)
 
         tmux.kill_session.assert_called_once_with(12345)
         # KEY: the session row must survive so --continue can resume it.
@@ -319,7 +319,7 @@ class TestRestartClaudeCommand:
         cog._active_runners[12345] = mock_runner
         interaction = _make_thread_interaction(12345)
 
-        await cog.restart_claude.callback(cog, interaction)
+        await cog.claude_restart.callback(cog, interaction)
 
         mock_runner.kill.assert_called_once()
         assert 12345 not in cog._active_runners
@@ -334,7 +334,7 @@ class TestRestartClaudeCommand:
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
         interaction = _make_thread_interaction(12345)
 
-        await cog.restart_claude.callback(cog, interaction)
+        await cog.claude_restart.callback(cog, interaction)
 
         kwargs = interaction.response.send_message.call_args.kwargs
         assert kwargs.get("ephemeral") is True
@@ -342,14 +342,52 @@ class TestRestartClaudeCommand:
         tmux.kill_session.assert_not_called()
 
 
+class TestRestartClaimAliasKeepsWorking:
+    """旧名 `/restart-claude` は #578 の改名後も同じことをする。
+
+    指が覚えているコマンドを壊さないのが Zero-Config Principle。エイリアスは
+    新しい実装をそのまま呼ぶので、ここで見るのは「同じ副作用が出るか」だけ。
+    """
+
+    @pytest.mark.asyncio
+    async def test_slash_alias_kills_window_but_keeps_session(self) -> None:
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=MagicMock())
+        cog.repo.reset = AsyncMock()
+        tmux = MagicMock()
+        tmux.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
+        interaction = _make_thread_interaction(12345)
+
+        await cog.restart_claude.callback(cog, interaction)
+
+        tmux.kill_session.assert_called_once_with(12345)
+        cog.repo.reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_text_alias_kills_window_but_keeps_session(self) -> None:
+        cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=MagicMock())
+        cog.repo.reset = AsyncMock()
+        tmux = MagicMock()
+        tmux.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
+        ctx = _make_thread_ctx(thread_id=12345)
+
+        await cog.restart_claude_text.callback(cog, ctx)
+
+        tmux.kill_session.assert_called_once_with(12345)
+        cog.repo.reset.assert_not_called()
+
+
 class TestRestartClaudeTextCommand:
-    """!restart-claude mirrors /restart-claude but is invokable from webhooks."""
+    """!claude-restart mirrors /claude-restart but is invokable from webhooks."""
 
     @pytest.mark.asyncio
     async def test_outside_thread(self) -> None:
         cog = _make_cog()
         ctx = _make_channel_ctx()
-        await cog.restart_claude_text.callback(cog, ctx)
+        await cog.claude_restart_text.callback(cog, ctx)
         ctx.send.assert_called_once()
 
     @pytest.mark.asyncio
@@ -362,7 +400,7 @@ class TestRestartClaudeTextCommand:
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
         ctx = _make_thread_ctx(thread_id=12345)
 
-        await cog.restart_claude_text.callback(cog, ctx)
+        await cog.claude_restart_text.callback(cog, ctx)
 
         tmux.kill_session.assert_called_once_with(12345)
         cog.repo.reset.assert_not_called()

@@ -192,4 +192,4 @@ class TestRestoreFailureIsNeverSilent:
         assert errors, "復元に失敗したのに何も返っていない"
         # 「失敗した」で終わらせず、次の手まで書く。利用者は何も操作していないので
         # 「どうすればいいか」が分からないまま置き去りにされるのが最悪。
-        assert "/restart-claude" in (errors[-1].error or "")
+        assert "/claude-restart" in (errors[-1].error or "")

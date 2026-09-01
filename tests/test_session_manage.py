@@ -220,14 +220,34 @@ class TestModelSetTextTwin:
 
 
 class TestOpsTextTwins:
-    """!session-cleanup / !workspace-delete (destructive, E2E-invokable, #209)."""
+    """!workspace-cleanup / !workspace-delete (destructive, E2E-invokable, #209)."""
 
-    async def test_session_cleanup_text_no_bindings(self):
+    async def test_workspace_cleanup_text_no_bindings(self):
         cog = _make_cog()  # bot.get_cog → non-ChannelRepoCog ⇒ no bindings
+        ctx = _make_ctx()
+        await cog.workspace_cleanup_text.callback(cog, ctx, arg=None)
+        ctx.send.assert_called_once()
+        assert "clord-init" in ctx.send.call_args.args[0]
+
+    async def test_session_cleanup_alias_still_works(self):
+        """旧名 `!session-cleanup` は #578 の改名後も同じ実装を呼ぶ。"""
+        cog = _make_cog()
         ctx = _make_ctx()
         await cog.session_cleanup_text.callback(cog, ctx, arg=None)
         ctx.send.assert_called_once()
         assert "clord-init" in ctx.send.call_args.args[0]
+
+    async def test_dry_run_arg_accepts_the_documented_spellings(self):
+        """`dry` を渡したのに実際に消える、が起きないこと。"""
+        from c_lord.cogs.session_manage import SessionManageCog
+
+        parse = SessionManageCog._dry_run_arg
+        assert parse("dry") is True
+        assert parse("dry-run") is True
+        assert parse("DRY") is True
+        assert parse(None) is False
+        assert parse("") is False
+        assert parse("yes") is False
 
     async def test_workspace_delete_text_outside_thread(self):
         cog = _make_cog()

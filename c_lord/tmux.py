@@ -2192,7 +2192,7 @@ class TmuxSessionManager:
 
         Used on the delivery-failure path to tell the two failure modes apart:
         a pane that never took the input at all (#527 — the advice there is
-        ``/restart-claude``) versus a message that is typed in and just will not
+        ``/claude-restart``) versus a message that is typed in and just will not
         submit, where restarting would **throw the user's message away**.
 
         ``None`` when it cannot be determined.

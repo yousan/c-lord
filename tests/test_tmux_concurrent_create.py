@@ -272,7 +272,7 @@ def test_duplicate_window_names_reports_only_shared_names() -> None:
 def test_ambiguous_window_text_does_not_send_the_user_to_restart_claude() -> None:
     """AC6: the advice must match the failure.
 
-    ``/restart-claude`` restarts Claude *inside* a window; it cannot remove a
+    ``/claude-restart`` restarts Claude *inside* a window; it cannot remove a
     duplicate name. Two threads followed that advice for a day and stayed dead.
     """
     from c_lord.claude.tmux_runner import _ambiguous_window, _delivery_failure, _missing_window
@@ -284,10 +284,10 @@ def test_ambiguous_window_text_does_not_send_the_user_to_restart_claude() -> Non
     assert "tmux list-windows" in text, "give the command that actually shows the problem"
     # The pane is alive, so the message must deny that diagnosis rather than make it.
     assert "ペインが落ちているのではなく" in text, "correct the diagnosis the old wording made"
-    assert "`/restart-claude` では直りません" in text, (
+    assert "`/claude-restart` では直りません" in text, (
         "say plainly that the old advice will not work"
     )
-    assert "`/restart-claude` でセッションを立て直して" not in text, "never send them there"
+    assert "`/claude-restart` でセッションを立て直して" not in text, "never send them there"
     # A distinct diagnosis, not a re-skin of either neighbouring message.
     assert text != _delivery_failure("Claude の起動", "hello")
     assert text != _missing_window("Claude の起動", _THREAD_B)
