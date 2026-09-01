@@ -541,3 +541,150 @@ class TestTmuxScreenshot:
         assert all(s["file"] is None for s in sent)
         # Hint at the optional extra so consumers know how to enable it.
         assert "c-lord[table]" in (sent[-1]["content"] or "")
+
+
+class TestScreenshotWakesStoppedWorkspace:
+    """#642: a stopped workspace is restored and *then* captured.
+
+    #572 made "stopped" the ordinary state of any thread nobody touched for four
+    hours, so answering `/tmux-screenshot` with 「メッセージを送れば復元します」
+    turned the command into one that usually returns no picture at all.
+    """
+
+    @staticmethod
+    def _thread(thread_id: int = 123):
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.parent_id = 456
+        return thread
+
+    @staticmethod
+    def _stopped_tmux(window_after_wake: str | None = "work3"):
+        """A manager whose window is missing until the workspace is woken."""
+        tmux_mgr = MagicMock()
+        tmux_mgr.session_name = "c-lord"
+        tmux_mgr._find_window_for_thread = MagicMock(side_effect=[None, window_after_wake])
+        tmux_mgr.capture_screen = MagicMock(return_value="restored pane")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(3, "work3", True)])
+        return tmux_mgr
+
+    def _cog_with_chat(self, wake_result: bool | None):
+        """Cog whose ClaudeChatCog exposes ``wake_workspace`` (None = no cog)."""
+        cog = _make_cog()
+        if wake_result is None:
+            cog.bot.get_cog = MagicMock(return_value=None)
+            return cog, None
+        chat = MagicMock()
+        chat.wake_workspace = AsyncMock(return_value=wake_result)
+        cog.bot.get_cog = MagicMock(return_value=chat)
+        return cog, chat
+
+    async def test_stopped_workspace_is_restored_then_captured(self, monkeypatch):
+        import c_lord.cogs.session_manage as sm
+
+        cog, chat = self._cog_with_chat(True)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        thread = self._thread()
+        tmux_mgr = self._stopped_tmux()
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        monkeypatch.setattr(sm, "render_pane_png", lambda text, status_bar=None: b"PNG")
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_awaited_once_with(thread)
+        files = [s["file"] for s in sent if s["file"] is not None]
+        assert len(files) == 1, sent
+        assert files[0].filename == "tmux-c-lord-work3.png"
+        # The user waited several seconds for a restore they did not ask for —
+        # say so rather than leaving the delay unexplained.
+        assert "復元" in (sent[-1]["content"] or "")
+
+    async def test_live_workspace_is_not_woken(self, monkeypatch):
+        """The wake is for stopped workspaces only — an awake one is captured
+        as-is, with no restart and no notice."""
+        import c_lord.cogs.session_manage as sm
+
+        cog, chat = self._cog_with_chat(True)
+        thread = self._thread()
+        tmux_mgr = MagicMock()
+        tmux_mgr.session_name = "c-lord"
+        tmux_mgr._find_window_for_thread = MagicMock(return_value="work1")
+        tmux_mgr.capture_screen = MagicMock(return_value="live pane")
+        tmux_mgr.list_window_tabs = MagicMock(return_value=[(1, "work1", True)])
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        monkeypatch.setattr(sm, "render_pane_png", lambda text, status_bar=None: b"PNG")
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_not_awaited()
+        assert "復元" not in (sent[-1]["content"] or "")
+
+    async def test_closed_workspace_is_not_woken(self):
+        """`[終了]` is a state the user chose. Taking a picture must not undo it."""
+        cog, chat = self._cog_with_chat(True)
+        record = _make_record(thread_id=123)
+        record.closed_at = "2026-08-31 10:00:00"
+        cog.repo.get = AsyncMock(return_value=record)
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_not_awaited()
+        assert all(s["file"] is None for s in sent)
+        assert "再開する" in (sent[-1]["content"] or "")
+
+    async def test_untracked_thread_is_not_woken(self):
+        """No ``sessions`` row means there is no conversation to restore — the
+        same rule a plain message follows (#538)."""
+        cog, chat = self._cog_with_chat(True)
+        cog.repo.get = AsyncMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        chat.wake_workspace.assert_not_awaited()
+        assert all(s["file"] is None for s in sent)
+        assert "記録が見つかりません" in (sent[-1]["content"] or "")
+
+    async def test_failed_wake_says_so(self):
+        """A restore that did not work must not be reported as one that did."""
+        cog, _chat = self._cog_with_chat(False)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        assert all(s["file"] is None for s in sent)
+        assert "復元" in (sent[-1]["content"] or "")
+        assert "失敗" in (sent[-1]["content"] or "")
+
+    async def test_window_still_missing_after_a_wake_says_so(self, monkeypatch):
+        """``wake`` said yes but the window is not there — report the failure
+        rather than rendering an empty pane."""
+        cog, _chat = self._cog_with_chat(True)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux(None))
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        assert all(s["file"] is None for s in sent)
+        assert "失敗" in (sent[-1]["content"] or "")
+
+    async def test_without_the_chat_cog_it_says_it_could_not_restore(self):
+        """c-lord is a framework: a consumer may not have loaded ClaudeChatCog.
+        Nothing can be woken then — say so, and name the path that still works."""
+        cog, _ = self._cog_with_chat(None)
+        cog.repo.get = AsyncMock(return_value=_make_record(thread_id=123))
+        cog._resolve_tmux_manager = AsyncMock(return_value=self._stopped_tmux())
+
+        respond, ack, sent = _capture_responder()
+        await cog._screenshot_impl(channel=self._thread(), respond=respond, ack=ack)
+
+        assert all(s["file"] is None for s in sent)
+        assert "メッセージを送れば" in (sent[-1]["content"] or "")

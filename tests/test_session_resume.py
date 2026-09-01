@@ -335,7 +335,17 @@ class TestCommandsCheckResumability:
         assert _said(respond) == stopped_hint(ThreadResume.UNTRACKED)
 
     @pytest.mark.asyncio
-    async def test_screenshot_resumable_thread_keeps_the_resume_hint(self) -> None:
+    async def test_screenshot_resumable_thread_is_restored_instead_of_hinted(self) -> None:
+        """#642 supersedes the #538 hint for this one verdict.
+
+        A thread a plain message would have restored is now restored by the
+        command itself — telling the user to send a message became the *usual*
+        answer once #572 made "stopped" the normal state of an idle thread. The
+        two sides still agree: this cog has no ClaudeChatCog to do the waking, so
+        what comes back is the failure, and it names the message path.
+        """
+        from c_lord.cogs.session_manage import _WAKE_FAILED
+
         cog = _manage_cog()
         cog.repo.get = AsyncMock(return_value=_record())
         tmux = MagicMock()
@@ -348,7 +358,9 @@ class TestCommandsCheckResumability:
 
         await cog._screenshot_impl(channel=thread, respond=respond, ack=ack)
 
-        assert _said(respond) == stopped_hint(ThreadResume.RESUMES)
+        assert _said(respond) != stopped_hint(ThreadResume.RESUMES)
+        assert _said(respond) == _WAKE_FAILED
+        assert "メッセージを送れば" in _WAKE_FAILED
 
     @pytest.mark.asyncio
     async def test_resync_untracked_thread_gets_the_honest_hint(self) -> None:

@@ -85,6 +85,14 @@ _POST_STARTUP_DELAY = 1.0
 # back to a plain fresh start.
 _CONTINUE_CHECK_DELAY = 3.0
 
+#: How long :meth:`TmuxClaudeRunner.wake` waits for a restored pane to reach its
+#: input box. Generous on purpose: a cold ``claude --continue`` re-renders the
+#: whole conversation on a host that may already be running a dozen of them, and
+#: the caller (``/tmux-screenshot``) has deferred its Discord response, which
+#: buys 15 minutes. Reporting failure while the pane is in fact still coming up
+#: is the worse error: it leaves a Claude nobody photographed.
+_WAKE_TIMEOUT = 120.0
+
 
 # #560: how many Enter presses send_input tries before giving up. Mirrors
 # c_lord.tmux._SUBMIT_ATTEMPTS; kept as a literal here so the user-facing
@@ -1495,6 +1503,93 @@ class TmuxClaudeRunner:
             is_complete=True,
             error=error,
         )
+
+    async def wake(self, *, timeout: float = _WAKE_TIMEOUT) -> bool:
+        """Bring a stopped workspace back up **without running a turn** (#642).
+
+        Same startup as :meth:`run` — ``--continue`` first so the conversation
+        comes back, a fresh start when there is nothing to continue (#123 Part 2)
+        — but with no prompt, so Claude opens its TUI and waits. That matters
+        twice: the pane can be photographed (``/tmux-screenshot``), and the
+        process left behind is the one the user's *next* message talks to, so
+        nothing spawns twice.
+
+        Readiness is "the input box is on screen **and** the process is alive".
+        The pane text alone cannot decide it: a zsh theme renders the very same
+        ``❯`` glyph, so a claude that exited on startup would otherwise read as
+        a ready prompt.
+
+        Returns True only when the pane really came back.
+        """
+        if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            return True  # already awake — restarting would kill a live turn
+
+        started = await asyncio.to_thread(
+            self._tmux.start_claude,
+            self._thread_id,
+            None,
+            self.model,
+            permission_mode=self._permission_mode,
+            dangerously_skip_permissions=self._dangerously_skip_permissions,
+            try_continue=True,
+            effort=self._effort,
+        )
+        if not started:
+            logger.warning("wake: start_claude --continue failed (thread=%d)", self._thread_id)
+            return False
+
+        await asyncio.sleep(_CONTINUE_CHECK_DELAY)
+        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            logger.info(
+                "wake: --continue found no conversation for thread %d; starting fresh",
+                self._thread_id,
+            )
+            started = await asyncio.to_thread(
+                self._tmux.start_claude,
+                self._thread_id,
+                None,
+                self.model,
+                permission_mode=self._permission_mode,
+                dangerously_skip_permissions=self._dangerously_skip_permissions,
+                try_continue=False,
+                effort=self._effort,
+            )
+            if not started:
+                logger.warning("wake: fresh start_claude failed (thread=%d)", self._thread_id)
+                return False
+
+        # One loop for both jobs: a recreated window can land on the folder-trust
+        # dialog, and an unanswered dialog never reaches an input box — so the
+        # wait for readiness has to be able to answer it.
+        elapsed = 0.0
+        trust_handled = False
+        while elapsed < timeout:
+            await asyncio.sleep(_POLL_INTERVAL)
+            elapsed += _POLL_INTERVAL
+            # ``capture_pane`` keeps the escape sequences (``-e``), so the input
+            # box arrives as ``\x1b[39m❯\xa0`` and every text check below would
+            # miss it. The turn loop normalises before it looks; staging proved
+            # what happens when this one does not — a restored, idle pane read as
+            # "never came up" and the wake reported a failure (#642).
+            pane = _normalize_capture(
+                await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            )
+            if not trust_handled and self._has_trust_prompt(pane):
+                await self._accept_trust_prompt(pane)
+                trust_handled = True
+                continue
+            if not self._is_idle_at_prompt(pane):
+                continue
+            if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+                logger.info(
+                    "wake: workspace restored in %.1fs (thread=%d)", elapsed, self._thread_id
+                )
+                return True
+
+        logger.warning(
+            "wake: pane never reached an idle prompt in %.0fs (thread=%d)", timeout, self._thread_id
+        )
+        return False
 
     @property
     def effort(self) -> str | None:

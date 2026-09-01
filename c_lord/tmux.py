@@ -1654,7 +1654,7 @@ class TmuxSessionManager:
     def start_claude(
         self,
         thread_id: int,
-        prompt: str,
+        prompt: str | None,
         model: str = "sonnet",
         *,
         permission_mode: str = "acceptEdits",
@@ -1670,6 +1670,11 @@ class TmuxSessionManager:
         The prompt is passed as a CLI argument so Claude starts a new
         conversation immediately (without a prompt, ``claude`` tries to
         resume and exits with "No conversation found to continue").
+
+        ``prompt=None`` starts the TUI with **no turn to run** — used by
+        :meth:`TmuxClaudeRunner.wake` to bring a stopped workspace back so it
+        can be looked at (#642). Pair it with ``try_continue=True`` to reopen on
+        the existing conversation; on its own it opens an empty session.
 
         The command is prefixed with ``unalias claude`` and
         ``env -u CLAUDECODE`` to bypass any shell aliases (e.g.
@@ -1725,37 +1730,41 @@ class TmuxSessionManager:
                     ", ".join(sorted(_VALID_EFFORT_LEVELS)),
                 )
 
-        # #530: mark the prompt as c-lord-originated, exactly as send_input
-        # does. Without it the jsonl mirror reads the ``user`` event Claude
-        # writes for this prompt as "a human typed into the pane" and posts the
-        # whole thing back to the thread — one duplicated line for a short
-        # message, a dozen messages burying the answer for a big one.
-        from .transcript.formatter import ZWSP_MARKER
-        from .transcript.mirror import bridge_mode_jsonl
-
-        marked_prompt = f"{ZWSP_MARKER}{prompt}" if bridge_mode_jsonl() else prompt
-
-        # #529: hand the prompt over in a file rather than typing it. Anything
-        # typed at the pane's prompt goes through zsh's line editor, and
-        # oh-my-zsh's url-quote-magic rewrites URLs on the way in.
         prelude = ""
-        try:
-            prompt_path = _write_prompt_file(marked_prompt)
-        except OSError as exc:
-            # A mangled URL is bad; losing the turn is worse — fall back to the
-            # inline command line.
-            logger.warning(
-                "start_claude: could not stage the prompt in a file (%s); falling back "
-                "to an inline command line — URLs may be mangled by the shell (#529)",
-                exc,
-            )
-            safe_prompt = marked_prompt.replace("'", "'\\''")
-            cmd_parts.append(f"'{safe_prompt}'")
-        else:
-            # Read it into a variable and delete the file *before* claude runs,
-            # so no prompt text sits on disk for the life of the session.
-            prelude = f'CLORD_PROMPT="$(cat {prompt_path})"; rm -f {prompt_path}; '
-            cmd_parts.append('"$CLORD_PROMPT"')
+        # #642: a wake passes ``prompt=None`` — no positional argument at all,
+        # so claude opens its TUI on the restored conversation and waits.
+        # Staging an empty prompt file here would submit an empty turn instead.
+        if prompt is not None:
+            # #530: mark the prompt as c-lord-originated, exactly as send_input
+            # does. Without it the jsonl mirror reads the ``user`` event Claude
+            # writes for this prompt as "a human typed into the pane" and posts
+            # the whole thing back to the thread — one duplicated line for a
+            # short message, a dozen messages burying the answer for a big one.
+            from .transcript.formatter import ZWSP_MARKER
+            from .transcript.mirror import bridge_mode_jsonl
+
+            marked_prompt = f"{ZWSP_MARKER}{prompt}" if bridge_mode_jsonl() else prompt
+
+            # #529: hand the prompt over in a file rather than typing it. Anything
+            # typed at the pane's prompt goes through zsh's line editor, and
+            # oh-my-zsh's url-quote-magic rewrites URLs on the way in.
+            try:
+                prompt_path = _write_prompt_file(marked_prompt)
+            except OSError as exc:
+                # A mangled URL is bad; losing the turn is worse — fall back to the
+                # inline command line.
+                logger.warning(
+                    "start_claude: could not stage the prompt in a file (%s); falling back "
+                    "to an inline command line — URLs may be mangled by the shell (#529)",
+                    exc,
+                )
+                safe_prompt = marked_prompt.replace("'", "'\\''")
+                cmd_parts.append(f"'{safe_prompt}'")
+            else:
+                # Read it into a variable and delete the file *before* claude runs,
+                # so no prompt text sits on disk for the life of the session.
+                prelude = f'CLORD_PROMPT="$(cat {prompt_path})"; rm -f {prompt_path}; '
+                cmd_parts.append('"$CLORD_PROMPT"')
 
         # Prefix with unalias to bypass any shell alias (e.g. --continue).
         cmd = f"unalias claude 2>/dev/null; {prelude}{' '.join(cmd_parts)}"

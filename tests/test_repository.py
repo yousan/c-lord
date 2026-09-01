@@ -114,3 +114,36 @@ class TestSessionRepository:
         # come back, not a count — the caller has to notify each of those threads.
         deleted = await repo.cleanup_old(days=0)
         assert [r.thread_id for r in deleted] == [400]
+
+
+class TestTouch:
+    """``touch`` — used by paths that wake a workspace without running a turn (#642)."""
+
+    async def test_moves_last_used_and_leaves_the_sleep_mark(self, repo):
+        await repo.save(thread_id=77, session_id="s")
+        await repo.set_slept(77, True)
+        before = await repo.get(77)
+        assert before is not None and before.slept_at is not None
+
+        # Backdate so the bump is observable regardless of clock resolution.
+        import aiosqlite
+
+        async with aiosqlite.connect(repo.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET last_used_at = '2020-01-01 00:00:00' WHERE thread_id = 77"
+            )
+            await db.commit()
+
+        await repo.touch(77)
+
+        after = await repo.get(77)
+        assert after is not None
+        # The sweeps key on this value: an un-bumped row is both killed mid-wake
+        # and never revisited afterwards.
+        assert after.last_used_at != "2020-01-01 00:00:00"
+        # ``slept_at`` words the next resume and is the caller's to clear once
+        # the pane is actually back up.
+        assert after.slept_at is not None
+
+    async def test_missing_row_is_not_an_error(self, repo):
+        await repo.touch(999999)

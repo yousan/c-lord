@@ -32,7 +32,7 @@ from ..session_close import (
     reopen_rename_notice,
 )
 from ..session_dir import SessionDirManager
-from ..session_resume import hint_for_thread
+from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
 from ..status_view import StatusRow, classify_status, render_status
 from ..thread_settings import (
     SETTING_THREAD_AUTO_ARCHIVE,
@@ -83,6 +83,18 @@ _MODEL_CHOICES = [
 # (flag injection). Whether the model actually *exists* is left to the CLI to
 # decide; c-lord keeps no model registry (security-audit, #478).
 _MODEL_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+
+#: Posted with the PNG when the capture had to restore the workspace first (#642).
+#: Small text: it explains the wait, it is not the answer the user asked for.
+_RESTORED_NOTICE = "-# 🔄 停止していたワークスペースを復元してから撮影しました。"
+
+#: The restore itself failed. Says so plainly and points at the path that has the
+#: rest of the recovery machinery behind it (announcements, reopen buttons, the
+#: untracked-thread notice) rather than leaving the user with a dead command.
+_WAKE_FAILED = (
+    "⚠️ 停止していたワークスペースの復元に失敗したため、スクリーンショットを撮れませんでした。\n"
+    "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
+)
 
 
 def _is_valid_model_id(model: str) -> bool:
@@ -903,11 +915,31 @@ class SessionManageCog(commands.Cog):
             return
 
         window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
+        restored = False
         if window is None:
-            # Stopped session: which sentence is true depends on what a message would
-            # actually do in this thread, which session_resume owns (#464 ②-2, #538).
-            await respond(await hint_for_thread(self.repo, thread_id), ephemeral=True)
-            return
+            # #642: a stopped workspace used to end here with a sentence telling
+            # the user to send a message. #572 then made "stopped" the ordinary
+            # state of anything untouched for four hours, so that sentence became
+            # the usual answer and the command stopped returning pictures. Bring
+            # the workspace back and photograph it — but only where a message
+            # would have restored it too: 終了 is a state the user chose, and an
+            # untracked thread has no conversation to restore (#538).
+            verdict = classify(await self.repo.get(thread_id))
+            if verdict is not ThreadResume.RESUMES:
+                await respond(stopped_hint(verdict), ephemeral=True)
+                return
+            if not await self._wake_workspace(channel):
+                await respond(_WAKE_FAILED, ephemeral=True)
+                return
+            window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
+            if window is None:
+                logger.warning(
+                    "%s wake reported success but no tmux window exists",
+                    log_ctx(thread_id=thread_id),
+                )
+                await respond(_WAKE_FAILED, ephemeral=True)
+                return
+            restored = True
 
         ansi = await asyncio.to_thread(tmux_mgr.capture_screen, thread_id)
         if not ansi.strip():
@@ -929,7 +961,33 @@ class SessionManageCog(commands.Cog):
 
         filename = f"tmux-{tmux_mgr.session_name}-{window}.png"
         file = discord.File(BytesIO(png), filename=filename)
-        await respond(file=file)
+        # Say when the picture cost a restore: the user waited several seconds
+        # for something they did not ask for, and the pane they are looking at
+        # is a Claude that was not running a moment ago.
+        await respond(_RESTORED_NOTICE if restored else None, file=file)
+
+    async def _wake_workspace(self, channel: discord.Thread) -> bool:
+        """Restore this thread's stopped workspace, via ClaudeChatCog (#642).
+
+        Loose-coupled through ``bot.get_cog`` (as ``/reopen-workspace`` is): the
+        spawn conditions — checkout, tmux window, model, effort, permission flags
+        — live with the turn path, and a copy of them here would drift into
+        starting a *different* Claude than the next message expects. A consumer
+        that never loaded ClaudeChatCog simply cannot wake anything, which is a
+        False, not a crash.
+        """
+        wake = getattr(self.bot.get_cog("ClaudeChatCog"), "wake_workspace", None)
+        if wake is None:
+            logger.info(
+                "%s no ClaudeChatCog — cannot wake this workspace",
+                log_ctx(thread_id=channel.id),
+            )
+            return False
+        try:
+            return bool(await wake(channel))
+        except Exception:
+            logger.warning("%s wake failed", log_ctx(thread_id=channel.id), exc_info=True)
+            return False
 
     @app_commands.command(
         name="tmux-screenshot",
