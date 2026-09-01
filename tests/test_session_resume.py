@@ -323,7 +323,7 @@ class TestCommandsCheckResumability:
     async def test_screenshot_untracked_thread_gets_the_honest_hint(self) -> None:
         cog = _manage_cog()
         tmux = MagicMock()
-        tmux._find_window_for_thread = MagicMock(return_value=None)
+        tmux.window_name = MagicMock(return_value=None)
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
         thread = MagicMock(spec=discord.Thread)
         thread.id = 42
@@ -349,7 +349,7 @@ class TestCommandsCheckResumability:
         cog = _manage_cog()
         cog.repo.get = AsyncMock(return_value=_record())
         tmux = MagicMock()
-        tmux._find_window_for_thread = MagicMock(return_value=None)
+        tmux.window_name = MagicMock(return_value=None)
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
         thread = MagicMock(spec=discord.Thread)
         thread.id = 42

@@ -927,7 +927,7 @@ class SessionManageCog(commands.Cog):
             )
             return
 
-        window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
+        window = await asyncio.to_thread(tmux_mgr.window_name, thread_id)
         restored = False
         if window is None:
             # #642: a stopped workspace used to end here with a sentence telling
@@ -944,7 +944,7 @@ class SessionManageCog(commands.Cog):
             if not await self._wake_workspace(channel):
                 await respond(_WAKE_FAILED, ephemeral=True)
                 return
-            window = await asyncio.to_thread(tmux_mgr._find_window_for_thread, thread_id)
+            window = await asyncio.to_thread(tmux_mgr.window_name, thread_id)
             if window is None:
                 logger.warning(
                     "%s wake reported success but no tmux window exists",

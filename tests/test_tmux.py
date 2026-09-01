@@ -46,6 +46,30 @@ def _staged_prompt(mock_run: MagicMock) -> str:
         path.unlink(missing_ok=True)
 
 
+def _render_windows(fmt: str, rows: list[dict[str, str]]) -> str:
+    """Render ``tmux list-windows -F <fmt>`` output for *rows*.
+
+    Keys: ``id`` / ``name`` / ``tid`` / ``path``. Faking by format rather than by
+    a fixed string keeps these tests honest about *which* window a row is: #649
+    added ``#{window_id}`` to several call sites precisely because the name alone
+    does not identify one.
+    """
+    out = []
+    for row in rows:
+        line = fmt
+        for token, key in (
+            ("#{window_id}", "id"),
+            ("#{window_name}", "name"),
+            ("#{@thread_id}", "tid"),
+            ("#{pane_current_path}", "path"),
+            ("#{window_index}", "index"),
+            ("#{window_active}", "active"),
+        ):
+            line = line.replace(token, row.get(key, ""))
+        out.append(line + "\n")
+    return "".join(out)
+
+
 class TestTmuxSessionManager:
     """Tests for the window-based TmuxSessionManager."""
 
@@ -71,19 +95,25 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
+                # #649: re-check under the session lock → _rebuild_mapping → list-windows
+                MagicMock(returncode=1, stdout=""),
                 # _find_window_by_working_dir → list-windows (no windows yet)
                 MagicMock(returncode=1, stdout=""),
                 # #427: _adopt_window_from_other_session → list-windows -a (nothing elsewhere)
                 MagicMock(returncode=1, stdout=""),
-                # new-window
-                MagicMock(returncode=0),
+                # #649: _next_window_name → list-windows (empty session → w1)
+                MagicMock(returncode=0, stdout=""),
+                # new-window -P -F '#{window_id}' → the new window's id
+                MagicMock(returncode=0, stdout="@1\n"),
                 # set-option @thread_id
                 MagicMock(returncode=0),
             ]
             name = mgr.create_session(12345, "/work/dir")
 
         assert name == "w1"
-        assert mgr._thread_to_window[12345] == "w1"
+        # #649: the mapping keys on the unique window_id, not the name — a name
+        # can be shared by two windows, and then every target is ambiguous.
+        assert mgr._thread_to_window[12345] == "@1"
 
         # Look calls up by subcommand rather than by position: any new probe on
         # the bootstrap path (e.g. #503's list-sessions) shifts every index and
@@ -146,26 +176,32 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
+                MagicMock(returncode=1, stdout=""),  # #649 re-check under lock: list-windows
                 MagicMock(
                     returncode=0, stdout=""
                 ),  # _find_window_by_working_dir: no match for "/a"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
-                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=0, stdout=""),  # #649 _next_window_name: empty → w1
+                MagicMock(returncode=0, stdout="@1\n"),  # new-window -P -F
                 MagicMock(returncode=0),  # set-option
             ]
             name1 = mgr.create_session(111, "/a")
 
-            # Second thread
+            # Second thread. #649: the number now comes from live tmux state, so
+            # ``w2`` follows from the session already holding ``w1`` — not from an
+            # instance counter that a second manager would not share.
+            rows = "@1\tw1\t111\t/a\n"
             mock_run.side_effect = [
                 # _find_window_for_thread cache miss → _rebuild_mapping
-                MagicMock(returncode=0, stdout="w1\n"),  # list-windows
-                MagicMock(returncode=0, stdout="111\n"),  # show-option w1
+                MagicMock(returncode=0, stdout=rows),  # list-windows
                 MagicMock(returncode=0),  # has-session (exists)
+                MagicMock(returncode=0, stdout=rows),  # #649 re-check under lock
                 MagicMock(
-                    returncode=0, stdout="w1\t/a\n"
+                    returncode=0, stdout="@1\t/a\n"
                 ),  # _find_window_by_working_dir: no match for "/b"
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
-                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=0, stdout="w1\n"),  # #649 _next_window_name: w1 live → w2
+                MagicMock(returncode=0, stdout="@2\n"),  # new-window -P -F
                 MagicMock(returncode=0),  # set-option
             ]
             name2 = mgr.create_session(222, "/b")
@@ -225,26 +261,28 @@ class TestTmuxSessionManager:
         mgr._available = True
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows
-                MagicMock(
-                    returncode=0,
-                    stdout="work1:/work/a\nwork2:/work/b\n",
-                ),
-                # show-option for work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option for work2
-                MagicMock(returncode=0, stdout="222\n"),
-            ]
+            # #649: one list-windows carries name, path, tag and id together. The
+            # old per-row ``show-option -t session:NAME`` follow-up re-resolved
+            # the name, so with duplicate names every duplicate reported the
+            # first one's tag.
+            # name / @thread_id / window_id / path — the path goes LAST so a tab
+            # inside it cannot shift the other columns.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="work1\t111\t@1\t/work/a\nwork2\t222\t@2\t/work/b\n",
+            )
             windows = mgr.list_sessions()
 
+        assert mock_run.call_count == 1
         assert len(windows) == 2
         assert windows[0]["window_name"] == "work1"
         assert windows[0]["working_dir"] == "/work/a"
         assert windows[0]["thread_id"] == "111"
+        assert windows[0]["window_id"] == "@1"
         assert windows[1]["window_name"] == "work2"
         assert windows[1]["working_dir"] == "/work/b"
         assert windows[1]["thread_id"] == "222"
+        assert windows[1]["window_id"] == "@2"
 
     def test_list_sessions_empty(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -266,20 +304,32 @@ class TestTmuxSessionManager:
         pane, a window with no ``@thread_id``) live in
         ``tests/test_tmux_reaper.py``.
         """
-        windows = {"work1": "111", "work2": "222", "work3": "333"}
+        windows = {"@1": ("work1", "111"), "@2": ("work2", "222"), "@3": ("work3", "333")}
         killed_targets: list[str] = []
 
         def fake_run(argv: list[str], **_: object) -> MagicMock:
             if "list-windows" in argv:
-                sep = "\t" if "\t" in argv[-1] else ":"
-                body = "".join(f"{n}{sep}/work/{n}\n" for n in windows)
-                return MagicMock(returncode=0, stdout=body)
+                # Render whatever format the caller asked for — #649 added the
+                # window_id to several of them.
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                rows = []
+                for wid, (name, tid) in windows.items():
+                    row = fmt
+                    for token, value in (
+                        ("#{window_id}", wid),
+                        ("#{window_name}", name),
+                        ("#{@thread_id}", tid),
+                        ("#{pane_current_path}", f"/work/{name}"),
+                    ):
+                        row = row.replace(token, value)
+                    rows.append(row + "\n")
+                return MagicMock(returncode=0, stdout="".join(rows))
             if "show-option" in argv:
-                name = argv[argv.index("-t") + 1].split(":", 1)[1]
-                tid = windows.get(name)
-                if tid is None:
+                target = argv[argv.index("-t") + 1]
+                entry = windows.get(target)
+                if entry is None:
                     return MagicMock(returncode=1, stdout="")
-                return MagicMock(returncode=0, stdout=f"{tid}\n")
+                return MagicMock(returncode=0, stdout=f"{entry[1]}\n")
             if "list-panes" in argv:
                 return MagicMock(returncode=0, stdout="zsh\n")
             if "kill-window" in argv:
@@ -294,10 +344,9 @@ class TestTmuxSessionManager:
             killed = mgr.cleanup_orphaned(active_thread_ids={222})
 
         assert killed == 2
-        assert sorted(killed_targets) == [
-            f"{SESSION_NAME}:work1",
-            f"{SESSION_NAME}:work3",
-        ]
+        # #649: the reaper kills the window it actually inspected, by id. A
+        # ``session:name`` target could resolve to a live twin.
+        assert sorted(killed_targets) == ["@1", "@3"]
 
     def test_cleanup_orphaned_tmux_unavailable(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -328,32 +377,30 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 # show-option verify → wrong thread (stale)
                 MagicMock(returncode=0, stdout="99999\n"),
-                # rebuild: list-windows
-                MagicMock(returncode=0, stdout="work2\n"),
-                # rebuild: show-option for work2
-                MagicMock(returncode=0, stdout="12345\n"),
+                # rebuild: list-windows (id / name / @thread_id / path — #649)
+                MagicMock(returncode=0, stdout="@2\twork2\t12345\t/work/b\n"),
             ]
             result = mgr._find_window_for_thread(12345)
 
-        assert result == "work2"
-        assert mgr._thread_to_window[12345] == "work2"
+        # #649: lookups resolve to the unique window_id, never the name.
+        assert result == "@2"
+        assert mgr._thread_to_window[12345] == "@2"
 
     def test_rebuild_mapping(self) -> None:
         """_rebuild_mapping populates _thread_to_window and updates _next_work_id."""
         mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows
-                MagicMock(returncode=0, stdout="work1\nwork3\n"),
-                # show-option work1
-                MagicMock(returncode=0, stdout="111\n"),
-                # show-option work3
-                MagicMock(returncode=0, stdout="333\n"),
-            ]
+            # #649: one list-windows carries all four fields, so a row's tag can
+            # no longer be read off a same-named sibling.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="@1\twork1\t111\t/work/a\n@3\twork3\t333\t/work/c\n",
+            )
             mgr._rebuild_mapping()
 
-        assert mgr._thread_to_window == {111: "work1", 333: "work3"}
+        assert mgr._thread_to_window == {111: "@1", 333: "@3"}
+        assert mock_run.call_count == 1
         assert mgr._next_work_id == 4  # one past highest (3)
 
     def test_rebuild_mapping_recovers_from_pane_path(self) -> None:
@@ -372,11 +419,12 @@ class TestTmuxSessionManager:
         # list silently hands a set-option's reply to the next show-option.
         def fake_run(args: list[str]) -> MagicMock:
             if "list-windows" in args:
+                # @thread_id column empty == the option is unset.
                 return MagicMock(
                     returncode=0,
                     stdout=(
-                        "work1\t/home/u/c-lord-sessions/999/1501841644457300038\n"
-                        "work2\t/home/u/other\n"
+                        "@1\twork1\t\t/home/u/c-lord-sessions/999/1501841644457300038\n"
+                        "@2\twork2\t\t/home/u/other\n"
                     ),
                 )
             if "show-option" in args:
@@ -387,7 +435,7 @@ class TestTmuxSessionManager:
             mgr._rebuild_mapping()
 
         # Recovered from path
-        assert mgr._thread_to_window == {1501841644457300038: "work1"}
+        assert mgr._thread_to_window == {1501841644457300038: "@1"}
         # work2 has no recoverable thread_id → not mapped
         assert 2 not in mgr._thread_to_window
         # …and the option was repaired on work1 so later lookups stay cheap.
@@ -401,17 +449,15 @@ class TestTmuxSessionManager:
         mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                MagicMock(
-                    returncode=0,
-                    stdout="work1\t/home/u/c-lord-sessions/999/1501841644457300038\n",
-                ),
-                # show-option returns the authoritative thread_id
-                MagicMock(returncode=0, stdout="42\n"),
-            ]
+            # The @thread_id column (42) disagrees with the path (…038); the
+            # option is authoritative.
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="@1\twork1\t42\t/home/u/c-lord-sessions/999/1501841644457300038\n",
+            )
             mgr._rebuild_mapping()
 
-        assert mgr._thread_to_window == {42: "work1"}
+        assert mgr._thread_to_window == {42: "@1"}
 
     def test_rebuild_mapping_empty(self) -> None:
         """_rebuild_mapping with no windows results in empty state."""
@@ -1150,22 +1196,37 @@ class TestTmuxSessionManager:
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
-                # list-windows → window exists
-                MagicMock(returncode=0, stdout="work1\n"),
+                # list-windows → window exists (id\tname — #649)
+                MagicMock(returncode=0, stdout="@1\twork1\n"),
                 # set-option @thread_id
                 MagicMock(returncode=0),
             ]
             result = mgr.remap_window(99999, "work1")
 
         assert result is True
-        assert mgr._thread_to_window[99999] == "work1"
+        # #649: the operator names a window; the mapping stores its unique id.
+        assert mgr._thread_to_window[99999] == "@1"
 
-        # Verify set-option was called with new thread_id
+        # Verify set-option was called with new thread_id, targeting the id
         set_call = mock_run.call_args_list[1]
         args = set_call[0][0]
         assert "set-option" in args
         assert "@thread_id" in args
         assert "99999" in args
+        assert args[args.index("-t") + 1] == "@1"
+
+    def test_remap_window_refuses_an_ambiguous_name(self) -> None:
+        """#649: two windows named ``w134`` — remap must not guess which is meant."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="@1\tw134\n@2\tw134\n")
+            result = mgr.remap_window(99999, "w134")
+
+        assert result is False
+        assert 99999 not in mgr._thread_to_window
+        assert not [c for c in mock_run.call_args_list if "set-option" in c[0][0]]
 
     def test_remap_window_not_found(self) -> None:
         """remap_window returns False when the window does not exist."""
@@ -1184,12 +1245,12 @@ class TestTmuxSessionManager:
         """remap_window removes old mapping and adds new one."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
-        # Pre-existing mapping: thread 11111 → work1
-        mgr._thread_to_window[11111] = "work1"
+        # Pre-existing mapping: thread 11111 → the window named work1
+        mgr._thread_to_window[11111] = "@1"
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="work1\n"),  # list-windows → exists
+                MagicMock(returncode=0, stdout="@1\twork1\n"),  # list-windows → exists
                 MagicMock(returncode=0),  # set-option
             ]
             result = mgr.remap_window(22222, "work1")
@@ -1198,7 +1259,7 @@ class TestTmuxSessionManager:
         # Old thread removed from cache
         assert 11111 not in mgr._thread_to_window
         # New thread mapped
-        assert mgr._thread_to_window[22222] == "work1"
+        assert mgr._thread_to_window[22222] == "@1"
 
     def test_remap_window_tmux_unavailable(self) -> None:
         """remap_window returns False when tmux is not installed."""
@@ -1224,9 +1285,9 @@ class TestTmuxSessionManager:
             # show-option for @thread_id on a manually-created window → rc=1
             if "show-option" in argv and "@thread_id" in argv:
                 return MagicMock(returncode=1, stdout="")
-            # list-windows → window exists in session
+            # list-windows → window exists in session (id\tname — #649)
             if "list-windows" in argv:
-                return MagicMock(returncode=0, stdout="work1\nproj34\nwork2\n")
+                return MagicMock(returncode=0, stdout="@1\twork1\n@2\tproj34\n@3\twork2\n")
             # set-option succeeds
             if "set-option" in argv:
                 return MagicMock(returncode=0, stdout="")
@@ -1236,7 +1297,7 @@ class TestTmuxSessionManager:
             result = mgr.remap_window(77777, "proj34")
 
         assert result is True
-        assert mgr._thread_to_window[77777] == "proj34"
+        assert mgr._thread_to_window[77777] == "@2"  # #649: id, not name
 
     def test_remap_window_truly_missing(self) -> None:
         """remap_window returns False when window genuinely does not exist."""
@@ -1307,11 +1368,15 @@ class TestTmuxSessionManager:
             cmd = argv[1] if len(argv) > 1 else ""
             if cmd == "list-windows":
                 # pane is at a completely unrelated path
-                return MagicMock(returncode=0, stdout="work1\t/home/user/other-project\n")
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                rows = [{"id": "@1", "name": "work1", "path": "/home/user/other-project"}]
+                return MagicMock(returncode=0, stdout=_render_windows(fmt, rows))
             if cmd == "show-option":
                 return MagicMock(returncode=1, stdout="")
             if cmd == "has-session":
                 return MagicMock(returncode=0, stdout="")
+            if cmd == "new-window":
+                return MagicMock(returncode=0, stdout="@2\n")
             return MagicMock(returncode=0, stdout="")
 
         with patch("c_lord.tmux._run", side_effect=fake_run):
@@ -1352,8 +1417,18 @@ class TestTmuxSessionManager:
             recorded_calls.append(list(argv))
             cmd = argv[1] if len(argv) > 1 else ""
             if cmd == "list-windows":
-                # pane is at /tmp (totally different from session dir)
-                return MagicMock(returncode=0, stdout="work1\t/tmp\n")
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                # pane is at /tmp (totally different from session dir), and
+                # @thread_id is unset — an empty column (#649 format).
+                row = fmt
+                for token, value in (
+                    ("#{window_id}", "@1"),
+                    ("#{window_name}", "work1"),
+                    ("#{@thread_id}", ""),
+                    ("#{pane_current_path}", "/tmp"),
+                ):
+                    row = row.replace(token, value)
+                return MagicMock(returncode=0, stdout=row + "\n")
             if cmd == "show-option":
                 return MagicMock(returncode=1, stdout="")
             if cmd == "set-option":
@@ -1363,10 +1438,13 @@ class TestTmuxSessionManager:
         with patch("c_lord.tmux._run", side_effect=fake_run):
             mgr._rebuild_mapping()
 
-        # thread_id 22222 must have been restored from file
-        assert mgr._thread_to_window.get(22222) == "work1"
+        # thread_id 22222 must have been restored from file. #649: the file
+        # stores the NAME (ids are reassigned by a tmux restart, which is the
+        # very case this file exists for), resolved to the id on load.
+        assert mgr._thread_to_window.get(22222) == "@1"
         set_calls = [c for c in recorded_calls if "set-option" in c and "@thread_id" in c]
         assert any("22222" in c for c in set_calls), "@thread_id not restored from file"
+        assert all("@1" in c for c in set_calls), "repair must target the unique window_id"
 
         import os
 
@@ -1399,11 +1477,17 @@ class TestTmuxSessionManager:
             cmd = argv[1] if len(argv) > 1 else ""
             if cmd == "list-windows":
                 # pane at /tmp, not WORKING_DIR (cd'd away) — but file has the mapping
-                return MagicMock(returncode=0, stdout="work1\t/tmp\n")
+                fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
+                return MagicMock(
+                    returncode=0,
+                    stdout=_render_windows(fmt, [{"id": "@1", "name": "work1", "path": "/tmp"}]),
+                )
             if cmd == "show-option":
                 return MagicMock(returncode=1, stdout="")
             if cmd == "has-session":
                 return MagicMock(returncode=0, stdout="")
+            if cmd == "display-message":
+                return MagicMock(returncode=0, stdout="work1\n")
             return MagicMock(returncode=0, stdout="")
 
         with patch("c_lord.tmux._run", side_effect=fake_run):
@@ -1682,28 +1766,56 @@ class TestWindowNameGeneration:
 
     def test_next_window_name_uses_short_prefix(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
-        assert mgr._next_window_name() == "w1"
-        assert mgr._next_window_name() == "w2"
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")  # empty session
+            assert mgr._next_window_name() == "w1"
+            mock_run.return_value = MagicMock(returncode=0, stdout="w1\n")
+            assert mgr._next_window_name() == "w2"
+
+    def test_next_window_name_reads_live_tmux_not_an_instance_counter(self) -> None:
+        """#649: the number comes from tmux, so a second manager sees the first's window.
+
+        Two managers pointing at one session each had their own counter, so both
+        handed out the same ``w{N}`` and tmux — which does not enforce unique
+        window names — created two windows answering to it.
+        """
+        first = TmuxSessionManager(mapping_path="")
+        second = TmuxSessionManager(mapping_path="")
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="w1\nw2\n")
+            # A manager that has never created anything still picks the next
+            # free number, because it asks tmux rather than its own counter.
+            assert second._next_window_name() == "w3"
+            assert first._next_window_name() == "w3"
+
+    def test_next_window_name_falls_back_to_the_counter_when_tmux_is_unreadable(self) -> None:
+        """A failed ``list-windows`` must not stop the window from being created."""
+        mgr = TmuxSessionManager(mapping_path="")
+
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert mgr._next_window_name() == "w1"
+            assert mgr._next_window_name() == "w2"
 
     def test_rebuild_continues_sequence_after_legacy_work_window(self) -> None:
         """A legacy ``work{N}`` window left over from before the rename still
-        counts toward ``_next_work_id`` so the next new window is ``w{N+1}`` —
+        counts toward the high-water mark, so the next new window is ``w{N+1}`` —
         the numbering stays monotonic across the transition (no w1 colliding
         with an existing work3)."""
         mgr = TmuxSessionManager(mapping_path="")
 
         with patch("c_lord.tmux._run") as mock_run:
-            mock_run.side_effect = [
-                # list-windows: one legacy work3 window survives
-                MagicMock(returncode=0, stdout="work3\n"),
-                # show-option @thread_id for work3
-                MagicMock(returncode=0, stdout="333\n"),
-            ]
+            # list-windows: one legacy work3 window survives (#649 format)
+            mock_run.return_value = MagicMock(returncode=0, stdout="@3\twork3\t333\t/work/c\n")
             mgr._rebuild_mapping()
 
-        assert mgr._thread_to_window == {333: "work3"}
-        assert mgr._next_work_id == 4
-        assert mgr._next_window_name() == "w4"
+            assert mgr._thread_to_window == {333: "@3"}
+            assert mgr._next_work_id == 4
+
+            mock_run.return_value = MagicMock(returncode=0, stdout="work3\n")
+            assert mgr._next_window_name() == "w4"
 
 
 class TestSortWindows:
@@ -1840,9 +1952,11 @@ class TestSortWindows:
                 MagicMock(returncode=1),  # has-session (no)
                 MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session
+                MagicMock(returncode=1, stdout=""),  # #649 re-check under the lock
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
-                MagicMock(returncode=0),  # new-window
+                MagicMock(returncode=0, stdout=""),  # #649 _next_window_name
+                MagicMock(returncode=0, stdout="@1\n"),  # new-window -P -F
                 MagicMock(returncode=0),  # set-option
             ]
             mgr.create_session(12345, "/work/dir")
@@ -1855,14 +1969,15 @@ class TestGetWindowInfo:
     def test_returns_work_number_not_window_index(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
-        mgr._thread_to_window[12345] = "work3"
+        mgr._thread_to_window[12345] = "@7"
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 # _find_window_for_thread cache hit → show-option verify
                 MagicMock(returncode=0, stdout="12345\n"),
-                # list-windows for window_id lookup — index 0 diverges from work3
-                MagicMock(returncode=0, stdout="work3\t@7\n"),
+                # #649: the id is already known; list-windows resolves its NAME,
+                # whose number (3) is the stable label — never the window index.
+                MagicMock(returncode=0, stdout="@7\twork3\n"),
             ]
             info = mgr.get_window_info(12345)
 
@@ -1871,12 +1986,12 @@ class TestGetWindowInfo:
     def test_returns_none_work_number_for_non_work_window(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
-        mgr._thread_to_window[12345] = "adopted-window"
+        mgr._thread_to_window[12345] = "@2"
 
         with patch("c_lord.tmux._run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="12345\n"),
-                MagicMock(returncode=0, stdout="adopted-window\t@2\n"),
+                MagicMock(returncode=0, stdout="@2\tadopted-window\n"),
             ]
             info = mgr.get_window_info(12345)
 
