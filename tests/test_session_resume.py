@@ -371,7 +371,7 @@ class TestCommandsCheckResumability:
         thread.parent_id = 999
         respond, ack = AsyncMock(), AsyncMock()
 
-        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=thread, respond=respond, ack=ack)
 
         assert _said(respond) == stopped_hint(ThreadResume.UNTRACKED)
 
@@ -385,6 +385,6 @@ class TestCommandsCheckResumability:
         thread.parent_id = 999
         respond, ack = AsyncMock(), AsyncMock()
 
-        await cog._resync_impl(channel=thread, scope="thread", respond=respond, ack=ack)
+        await cog._resync_impl(channel=thread, respond=respond, ack=ack)
 
         assert _said(respond) == stopped_hint(ThreadResume.CLOSED)
