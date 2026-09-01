@@ -1,0 +1,36 @@
+
+╭─── Claude Code v2.1.159 ──────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                     │
+│                Welcome back Yousan!                │ Run /init to create a CLAUDE.md file with instructions for … │
+│                                                    │ ──────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                   │
+│                      ▝▜█████▛▘                     │ Fixed Bash commands failing with "task output swap refused … │
+│                        ▘▘ ▝▝                       │ Fixed "always allow" not saving in a project that has no .c… │
+│   Opus 4.8 (1M context) with xh… · Claude Max ·    │ Fixed Remote Control sessions hosted by Claude Desktop or V… │
+│   billing@kater.jp's Organization                  │ /release-notes for more                                      │
+│                  ~/tmp-i631-mock                   │                                                              │
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   Opus 4.8 is here! Now defaults to high effort · /effort xhigh for your hardest tasks
+
+❯ hello, please summarise this repo
+  ⎿  You've hit your weekly limit · resets Sep 4, 6:10pm (Asia/Tokyo)
+
+✻ Churned for 0s
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Switch to Team plan
+
+   Enter to confirm · Esc to cancel

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import discord
 
 from ..claude.tmux_runner import TmuxClaudeRunner
+from ..claude.types import UsageLimit
 from ..concurrency import SessionRegistry
 from ..database.ask_repo import PendingAskRepository
 from ..database.lounge_repo import LoungeRepository
@@ -45,6 +46,10 @@ class RunOutcome:
 
     no_response: bool = False
     error: str | None = None
+    # #631: the plan limit that ended this turn, when one did. The turn-end ping
+    # needs it because "もう一度送ってください" is the wrong thing to say to
+    # someone who is rate limited — it cannot work until the limit resets.
+    usage_limit: UsageLimit | None = None
 
 
 @dataclass

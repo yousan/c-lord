@@ -273,6 +273,7 @@ c_lord/          # Installable Python package
   bot.py                 # Discord Bot class
   session_dir.py         # Git clone based session directory management
   coauthor.py            # prepare-commit-msg hook: Co-authored-by trailers (#518)
+  command_gate.py        # 担当 (#596) / 認可 (#508) — text-command gate
   tmux.py                # Tmux session management wrapper
   cogs/
     claude_chat.py       # Main chat Cog (thread creation, message handling)

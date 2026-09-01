@@ -311,7 +311,16 @@ class EventProcessor:
             # specific cause; this flag only stops the "終わりました" summons.
             if event.error.startswith((NO_RESPONSE_ERROR_PREFIX, TRUST_STUCK_ERROR_PREFIX)):
                 self._config.outcome.no_response = True
-            err_msg = await self._config.thread.send(embed=_make_error_embed(event.error))
+            # #631: a rate-limited turn also produced nothing, but it knows why.
+            # ``no_response`` is set too so no caller reads it as a completed
+            # turn; ``usage_limit`` is what upgrades the wording from "send it
+            # again" to "it resets at ...".
+            if event.usage_limit is not None:
+                self._config.outcome.no_response = True
+                self._config.outcome.usage_limit = event.usage_limit
+            err_msg = await self._config.thread.send(
+                embed=_make_error_embed(event.error, usage_limit=event.usage_limit)
+            )
             if err_msg is not None:
                 self._last_response_msg = err_msg
             if self._config.status:

@@ -489,3 +489,70 @@ class TestNoResponseMention:
         assert "Claude has finished" not in body, body
         assert "応答がありません" in body, body
         assert "<@7>" in body, "the waiting user must still be told"
+
+
+class TestUsageLimitMention:
+    """#631 AC1/AC2: a rate-limited turn reports the limit, not "send it again"."""
+
+    @staticmethod
+    def _dash():
+        from c_lord.discord_ui.thread_dashboard import ThreadStatusDashboard
+
+        d = ThreadStatusDashboard(MagicMock(), owner_id=999)
+        d._refresh_dashboard = AsyncMock()  # type: ignore[method-assign]
+        return d
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_ping_names_the_reset_time(self) -> None:
+        """AC1: the ping carries the recovery time so the reader can just wait."""
+        from c_lord.claude.types import UsageLimit
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        thread = MagicMock()
+        thread.send = AsyncMock()
+        d = self._dash()
+
+        await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=7)
+        await d.set_state(
+            1,
+            ThreadState.WAITING_INPUT,
+            "x",
+            thread=thread,
+            notify_user_id=7,
+            no_response=True,
+            usage_limit=UsageLimit("weekly limit", "Aug 29, 4pm (Asia/Tokyo)", ""),
+        )
+
+        thread.send.assert_awaited_once()
+        body = thread.send.await_args.args[0]
+        assert "Aug 29, 4pm (Asia/Tokyo)" in body, body
+        assert "上限" in body, body
+        # AC2: sending it again cannot work until the limit resets.
+        assert "もう一度送る" not in body, body
+        assert "Claude has finished" not in body, body
+        assert "<@7>" in body
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_without_reset_time_still_says_limit(self) -> None:
+        """``resetsAt`` can be absent; the ping must not invent one."""
+        from c_lord.claude.types import UsageLimit
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        thread = MagicMock()
+        thread.send = AsyncMock()
+        d = self._dash()
+
+        await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=7)
+        await d.set_state(
+            1,
+            ThreadState.WAITING_INPUT,
+            "x",
+            thread=thread,
+            notify_user_id=7,
+            no_response=True,
+            usage_limit=UsageLimit("session limit", None, ""),
+        )
+
+        body = thread.send.await_args.args[0]
+        assert "上限" in body, body
+        assert "もう一度送る" not in body, body

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 if TYPE_CHECKING:
     import discord
@@ -184,6 +184,22 @@ class ToolUseEvent:
         return f"Using: {name}"
 
 
+class UsageLimit(NamedTuple):
+    """A plan limit Claude reported instead of answering (#631).
+
+    ``scope`` is the limit's own name as the CLI printed it ("weekly limit",
+    "session limit", "Opus limit", ...) and ``resets_at`` the recovery time it
+    printed alongside, verbatim ("Aug 29, 4pm (Asia/Tokyo)"), or None when the
+    banner carried none.  Kept verbatim on purpose: re-deriving a local time
+    from a string the CLI already localised is a way to be confidently wrong
+    about the one fact the user actually needs.
+    """
+
+    scope: str
+    resets_at: str | None
+    line: str
+
+
 @dataclass
 class StreamEvent:
     """A parsed event from the Claude Code stream-json output."""
@@ -212,6 +228,10 @@ class StreamEvent:
     compact_pre_tokens: int | None = None
     is_complete: bool = False
     is_partial: bool = False
+    # #631: the plan limit that ended this turn, when one did. Structured
+    # rather than sniffed back out of ``error`` — the reset time is the one
+    # fact the reader needs and it must survive to the embed intact.
+    usage_limit: UsageLimit | None = None
     cost_usd: float | None = None
     duration_ms: int | None = None
     input_tokens: int | None = None

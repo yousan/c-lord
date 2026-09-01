@@ -28,6 +28,7 @@ from discord.ext import commands
 
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
+from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
 from ..thread_settings import resolve_auto_archive_duration
@@ -223,6 +224,7 @@ class SkillCommandCog(commands.Cog):
         args: str | None,
         respond: Responder,
         ack: Acknowledger,
+        message: discord.Message | None = None,
     ) -> None:
         """Shared core for the ``/skill`` slash command and the ``!skill`` text twin.
 
@@ -231,8 +233,18 @@ class SkillCommandCog(commands.Cog):
         operation (defer for the slash command, no-op for text).  Keeping the
         logic here means the slash and text entry points stay behaviourally
         identical without copy-paste (see #209).
+
+        ``message`` is the invoking message for the text twin, ``None`` for
+        slash.  When present, authorization uses the shared message-backed rule
+        so a configured ``DISCORD_OWNER_ID`` does not lock out the webhooks this
+        command advertises itself as supporting (#508).
         """
-        if not self._is_authorized(user):
+        authorized = (
+            is_message_authorized(message, self._is_authorized)
+            if message is not None
+            else self._is_authorized(user)
+        )
+        if not authorized:
             await respond("You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -426,4 +438,5 @@ class SkillCommandCog(commands.Cog):
             args=args,
             respond=respond,
             ack=ack,
+            message=ctx.message,
         )

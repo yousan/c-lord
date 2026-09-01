@@ -29,6 +29,7 @@ from .types import (
     FreeTextMode,
     MessageType,
     StreamEvent,
+    UsageLimit,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ _TRUST_ACCEPT_MAX_ATTEMPTS = 3
 # deciding it is still up (seconds).  Without a settle the poll interval
 # alone (0.5s) would count normal redraw latency as a failed accept.
 _TRUST_ACCEPT_SETTLE = 2.0
+# Prefix of the RESULT error for "Claude is rate limited" (#631).  A separate
+# outcome from NO_RESPONSE on purpose: both produce an empty turn, but only
+# one of them gets better if you send the message again.
+USAGE_LIMIT_ERROR_PREFIX = "Usage limit —"
 
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
@@ -347,6 +352,193 @@ def _extract_startup_error(pane: str) -> str | None:
         if any(marker in stripped.lower() for marker in _STARTUP_ERROR_MARKERS):
             return stripped[:300]
     return None
+
+
+# -- Claude plan/usage limits (#631) --------------------------------------------
+#
+# When an account hits a plan limit the API answers 429 and Claude Code renders
+# the refusal as the assistant's message, then goes idle.  c-lord saw a turn
+# that produced nothing and told the user to send it again — advice that can
+# never work, because the limit holds until it resets.  So the banner has to be
+# recognised, and its reset time reported instead.
+#
+# The wording comes from the CLI's own builders (verified against the shipped
+# 2.1.252 binary): ``"You've hit your ${label}${suffix}"`` where ``suffix`` is
+# ``" · resets ${when}"`` and ``label`` is one of "weekly limit" (seven_day),
+# "session limit" (five_hour), "Opus limit" / "Sonnet limit" (seven_day_opus /
+# seven_day_sonnet), "usage limit" (overage), "org's monthly usage limit", or a
+# bare "limit"; plus ``"You're out of usage credits${suffix}"``.  ``when`` is
+# rendered as ``"Aug 29, 4pm (Asia/Tokyo)"`` more than a day out and as a bare
+# ``"4pm (Asia/Tokyo)"`` within the day, and the whole clause is absent when the
+# API sent no ``resetsAt``.
+#
+# What must NOT match is just as important: the same screen also carries the
+# *warning* banners ("You've used 79% of your weekly limit · resets ...",
+# "Approaching weekly limit · ...", "You're close to your usage limit"), which
+# render while Claude is working perfectly well.  Treating one of those as a
+# stop would strand a healthy session.
+
+# Leading TUI chrome allowed before the banner: indentation plus the gutter
+# glyphs Claude Code draws beside message and tool-result lines.  Anchoring to
+# a line that holds NOTHING but chrome + banner is what keeps the phrase from
+# matching when it merely appears inside Claude's own prose — the same
+# false-positive class as #156 / #184, and a live one here because c-lord
+# threads discuss this very banner.
+_LIMIT_GUTTER = r"^[^\S\n]*(?:[●⏺⎿╰│┃|>*•-]+[^\S\n]*)*"
+
+# The blocking banners, and the reset clause that may follow them.
+_USAGE_LIMIT_RE = re.compile(
+    _LIMIT_GUTTER
+    + r"(?:You've hit your (?P<scope>[^·\n]+?)"
+    + r"|You(?:'|’)re out of (?P<credits>usage credits))"
+    + r"[^\S\n]*"
+    + r"(?:·[^\S\n]*resets[^\S\n]+(?P<reset>[^·\n]+?)[^\S\n]*)?"
+    + r"(?:·[^\n]*)?$",
+    re.MULTILINE,
+)
+
+
+# The banner's two variable parts end up in Discord — the reset time inside an
+# embed, and the scope inside a PLAIN thread message, which pings.  Both are
+# scraped from a pane whose contents Claude (and therefore any file or web page
+# Claude echoed) can influence, so an ``@everyone`` smuggled through the banner
+# would mass-ping the guild.  The CLI's label vocabulary is small and closed
+# ("weekly limit", "session limit", "Opus limit", "Sonnet limit", "usage limit",
+# "usage credit limit", "org's monthly usage limit", "monthly spend limit",
+# "fast limit", bare "limit"), and its reset rendering is a localised date/time,
+# so anything outside these shapes is not a banner worth acting on: reject it
+# rather than sanitise it, which also keeps false positives down.
+_LIMIT_SCOPE_RE = re.compile(r"^[A-Za-z][A-Za-z' ]{0,39}$")
+_LIMIT_RESET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:,()/_. +-]{0,49}$")
+
+
+# The choice menu Claude Code opens under the banner (2.1.252):
+#
+#     What do you want to do?
+#     ❯ 1. Stop and wait for limit to reset
+#       2. Switch to usage credits
+#       3. Switch to Team plan
+#
+# It has to be closed — a menu left open swallows the NEXT message in the thread
+# instead of letting it reach the prompt.  But two of its three answers change
+# the account's billing, so the option is located by NAME and c-lord presses
+# nothing at all when it cannot find the one that spends nothing.  Matching on
+# position would make a future reordering buy a Team plan.
+_LIMIT_MENU_OPTION_RE = re.compile(
+    r"^[^\S\n]*❯?[^\S\n]*(?P<index>\d+)\.[^\S\n]+(?P<label>\S.*?)[^\S\n]*$"
+)
+
+# The one answer that costs nothing and changes no setting.
+_LIMIT_MENU_WAIT_MARKERS = ("stop and wait", "wait for limit")
+
+
+# Header of the limit's choice menu, and the options only IT offers.  Both are
+# required: "What do you want to do?" alone is too plain to key on, and the
+# option labels alone could appear in prose about this very feature.
+_LIMIT_MENU_HEADER = "What do you want to do?"
+_LIMIT_MENU_SIGNATURE_MARKERS = (
+    "stop and wait",
+    "wait for limit",
+    "switch to usage credits",
+    "switch to team plan",
+    "continue automatically",
+)
+
+
+def _usage_limit_menu_open(pane: str) -> bool:
+    """True when the limit's choice menu is on screen and unanswered (#631).
+
+    This is the strongest "the turn is blocked right now" signal there is: the
+    menu closes as soon as it is answered, and while it is open the next message
+    typed into the pane lands in the menu instead of the prompt.  It is what
+    tells a fresh refusal apart from a re-rendered old banner — including the
+    case the reporter actually hit, where the SAME request was sent three times
+    and every refusal printed the identical line.
+    """
+    if not pane or _LIMIT_MENU_HEADER not in pane:
+        return False
+    for line in pane.splitlines():
+        match = _LIMIT_MENU_OPTION_RE.match(line)
+        if match is None:
+            continue
+        label = match.group("label").lower()
+        if any(marker in label for marker in _LIMIT_MENU_SIGNATURE_MARKERS):
+            return True
+    return False
+
+
+def _count_usage_limit(pane: str) -> int:
+    """How many blocking limit banners are on *pane*.
+
+    A rising count means this turn added one.  Comparing counts rather than the
+    banner text is what makes a repeat of the *same* limit detectable — the text
+    is identical every time.
+    """
+    if not pane:
+        return 0
+    return sum(1 for _ in _USAGE_LIMIT_RE.finditer(pane))
+
+
+def _usage_limit_wait_option(pane: str) -> int | None:
+    """0-based index of the limit menu's "keep waiting" option, else None.
+
+    None means "press nothing": either there is no menu, or none of its options
+    could be identified as the free one.  Silence is the safe failure here —
+    a stuck menu costs a turn, a wrong keystroke costs money.
+    """
+    if not pane:
+        return None
+    options: list[str] = []
+    for line in pane.splitlines():
+        match = _LIMIT_MENU_OPTION_RE.match(line)
+        if match is None:
+            if options:
+                break
+            continue
+        # Options are numbered from 1 and contiguous; anything else is not the
+        # menu (a numbered list in Claude's prose, say).
+        if int(match.group("index")) != len(options) + 1:
+            options = []
+            continue
+        options.append(match.group("label").lower())
+    for i, label in enumerate(options):
+        if any(marker in label for marker in _LIMIT_MENU_WAIT_MARKERS):
+            return i
+    return None
+
+
+def _extract_usage_limit(pane: str) -> UsageLimit | None:
+    """Return the plan limit shown on *pane*, or None when there is none.
+
+    Only the *blocking* banners count.  The percentage / "Approaching" warnings
+    are deliberately excluded: they share the vocabulary but mean the opposite
+    (Claude is still answering), and stopping a turn on one of those would be
+    the same class of lie this function exists to remove.
+
+    Callers gate this on "no response text yet this turn", the way
+    :func:`_extract_startup_error` is gated — a banner Claude *quotes* inside a
+    real answer must not end that answer's turn (#631).
+    """
+    if not pane:
+        return None
+    match = _USAGE_LIMIT_RE.search(pane)
+    if match is None:
+        return None
+    scope = (match.group("scope") or match.group("credits") or "").strip()
+    if not _LIMIT_SCOPE_RE.match(scope):
+        return None
+    reset = match.group("reset")
+    reset = reset.strip() if reset else None
+    if reset is not None and not _LIMIT_RESET_RE.match(reset):
+        # A banner whose reset clause is not a plain localised time is not one
+        # we will quote at a user.  Keep the limit (it is real) but drop the
+        # part we cannot vouch for, rather than passing it through.
+        reset = None
+    return UsageLimit(
+        scope=scope,
+        resets_at=reset,
+        line=match.group(0).strip()[:300],
+    )
 
 
 # Regex matching [y/N] or [Y/n] inline yes/no prompts (Claude Code v2.1+).
@@ -1325,6 +1517,25 @@ class TmuxClaudeRunner:
         trust_accepts = 0
         trust_signature: str | None = None
         trust_stuck = False
+        # Plan limit scraped from the pane (#631).  Set when Claude refuses the
+        # turn because the account is rate limited; surfaced as the RESULT
+        # outcome so Discord reports the reset time instead of telling the user
+        # to send the same message again (which can only fail again).
+        usage_limit: UsageLimit | None = None
+        # How many limit banners were ALREADY on the pane when this turn started
+        # (#631).  Claude Code re-renders the conversation tail on ``--resume``,
+        # so a thread that hit the limit yesterday opens today's turn with
+        # yesterday's banner on screen.  Treating that as today's outcome would
+        # refuse a turn that is about to work — the opposite mistake, and the
+        # worse one, because it leaves the session with no way forward.
+        #
+        # Counting rather than comparing the text is deliberate: a repeat of the
+        # same limit prints the IDENTICAL line, so a text comparison misses every
+        # attempt after the first — which is precisely what the reporter did,
+        # three times.  An open choice menu says the same thing more directly and
+        # is checked alongside it.
+        baseline_limit_count = 0
+        baseline_limit_captured = False
 
         # #365: Gate completion on the NEW turn actually having started. When a
         # follow-up message is delivered to an already-running Claude
@@ -1390,6 +1601,29 @@ class TmuxClaudeRunner:
                         self._thread_id,
                         startup_error,
                     )
+                    break
+
+                # #631: the account is rate limited.  Claude printed the banner
+                # instead of an answer and is now idle, so there is nothing left
+                # to wait for — waiting only delays the notice by the whole
+                # _TURN_START_GRACE window.  Gated on ``not last_response`` for
+                # the same reason as the startup error above: the phrase can
+                # legitimately appear inside Claude's own answer.
+                found_limit = _extract_usage_limit(current)
+                limit_count = _count_usage_limit(current)
+                if not baseline_limit_captured:
+                    baseline_limit_captured = True
+                    baseline_limit_count = limit_count
+                if found_limit is not None and (
+                    _usage_limit_menu_open(current) or limit_count > baseline_limit_count
+                ):
+                    usage_limit = found_limit
+                    logger.warning(
+                        "Usage limit detected, aborting poll (thread=%d): %s",
+                        self._thread_id,
+                        usage_limit.line,
+                    )
+                    await self._dismiss_usage_limit_menu(current)
                     break
 
             # Auto-accept the folder-trust dialog ("Quick safety check…").  Every
@@ -1678,6 +1912,15 @@ class TmuxClaudeRunner:
             pane_error = startup_error
             if pane_error is None and not last_response:
                 pane_error = _extract_startup_error(current)
+            if usage_limit is None and not last_response:
+                # Same baseline rule as the poll loop: a banner that was already
+                # there when the turn started belongs to an earlier turn.
+                found_limit = _extract_usage_limit(current)
+                if found_limit is not None and (
+                    _usage_limit_menu_open(current)
+                    or _count_usage_limit(current) > baseline_limit_count
+                ):
+                    usage_limit = found_limit
             if trust_stuck:
                 # #630 sits above the rungs below because it is the only one that
                 # knows what blocked the turn. The others would report a timeout
@@ -1690,6 +1933,21 @@ class TmuxClaudeRunner:
                 )
             elif pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
+            elif usage_limit is not None:
+                # #631 sits ABOVE the "never started" rung deliberately. Both
+                # describe an empty turn, but only this one knows why — and the
+                # other one's advice ("send the message again") is advice that
+                # cannot work until the limit resets, which is what made the
+                # reporter send the same request three times.
+                resets = (
+                    f" Resets {usage_limit.resets_at}."
+                    if usage_limit.resets_at
+                    else " No reset time was reported."
+                )
+                error = (
+                    f"{USAGE_LIMIT_ERROR_PREFIX} Claude hit your "
+                    f"{usage_limit.scope} and did not run this turn.{resets}"
+                )
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
                 error = (
                     "Claude exited without producing a response "
@@ -1735,6 +1993,7 @@ class TmuxClaudeRunner:
             message_type=MessageType.RESULT,
             is_complete=True,
             error=error,
+            usage_limit=usage_limit,
         )
 
     async def wake(self, *, timeout: float = _WAKE_TIMEOUT) -> bool:
@@ -2143,6 +2402,30 @@ class TmuxClaudeRunner:
             "Trust prompt detected, accepting (down=%d, thread=%d)", offset, self._thread_id
         )
         await self._navigate_menu(offset)
+
+    async def _dismiss_usage_limit_menu(self, pane_text: str) -> None:
+        """Close the limit's "What do you want to do?" menu, if it is open (#631).
+
+        Only ever selects the option that keeps waiting.  The other two switch
+        the account to usage credits or a Team plan — real money, and not a
+        decision c-lord gets to make on someone's behalf.  When that option
+        cannot be identified the menu is left alone and reported as-is; a stuck
+        menu is recoverable by a human, an unasked-for plan change is not.
+        """
+        index = _usage_limit_wait_option(pane_text)
+        if index is None:
+            logger.info(
+                "Usage-limit menu: no 'keep waiting' option found, leaving it "
+                "untouched (thread=%d)",
+                self._thread_id,
+            )
+            return
+        logger.info(
+            "Usage-limit menu: selecting the wait option (index=%d, thread=%d)",
+            index,
+            self._thread_id,
+        )
+        await self._navigate_menu(index)
 
     async def _accept_permission_prompt(self, pane_text: str = "") -> None:
         """Auto-accept a permission prompt.

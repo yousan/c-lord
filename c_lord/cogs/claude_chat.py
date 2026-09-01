@@ -28,6 +28,7 @@ from .. import topic as topic_module
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
+from ..command_gate import is_message_authorized, owns
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
 from ..database.ask_repo import PendingAskRepository
@@ -325,30 +326,12 @@ class ClaudeChatCog(commands.Cog):
     def _is_message_authorized(self, message: discord.Message) -> bool:
         """Whether *message* is allowed to drive Claude.
 
-        Infrastructure bypasses the human allowlist so that configuring an
-        owner does not break it:
-
-        - **Webhook** messages (``webhook_id`` set): possession of the webhook
-          URL is itself authorization (CI/CD triggers, E2E).
-        - **Trusted bots** (``CLORD_TRUSTED_BOT_IDS``): companion bots treated
-          like humans; pre-authorized.
-
-        Any other bot is rejected. Human users must satisfy :meth:`_is_allowed`
-        (owner / role), so a configured ``DISCORD_OWNER_ID`` restricts access to
-        the owner **without** locking out webhooks or trusted bots.
-
-        Applies to every request that has a message behind it: ``on_message``
-        and the text commands ``!clord`` / ``!attach`` (#507). Slash commands
-        have no message and can never be webhook-driven, so they gate on
-        :meth:`_is_allowed` directly.
+        Delegates to :func:`c_lord.command_gate.is_message_authorized` so that
+        the rule this cog applies to ``on_message`` / ``!clord`` / ``!attach``
+        (#507) and the one ``!skill`` / ``!clord-init`` / ``!clord-thread-init``
+        apply (#508) are the same rule, not two copies of it.
         """
-        if message.webhook_id:
-            return True
-        if message.author.bot:
-            trusted_raw = os.getenv("CLORD_TRUSTED_BOT_IDS", "")
-            trusted_ids = {int(x.strip()) for x in trusted_raw.split(",") if x.strip().isdigit()}
-            return message.author.id in trusted_ids
-        return self._is_allowed(message.author)
+        return is_message_authorized(message, self._is_allowed)
 
     def is_processing(self, thread_id: int) -> bool:
         """True while a Claude turn is actively running for ``thread_id``.
@@ -808,7 +791,7 @@ class ClaudeChatCog(commands.Cog):
             # here would be wrong, and would be the first thing a new user sees.
             logger.info("%s message not run — the first turn is still starting (#538)", ctx)
             return
-        if not await self._is_our_thread(parent_channel_id, thread.id, message):
+        if not await self._is_our_thread(parent_channel_id, thread.id):
             # Another instance's thread: DEBUG, so a shared guild's traffic does
             # not drown the log — the INFO line below is for threads we own.
             logger.debug("%s message ignored — not this instance's thread (#538)", ctx)
@@ -859,22 +842,24 @@ class ClaudeChatCog(commands.Cog):
         with contextlib.suppress(discord.HTTPException):
             await thread.send(recoverable_notice(plan), view=view)
 
-    async def _is_our_thread(
-        self, parent_channel_id: int, thread_id: int, message: discord.Message
-    ) -> bool:
+    async def _is_our_thread(self, parent_channel_id: int, thread_id: int) -> bool:
         """Whether this instance should speak up in this thread (#522).
 
-        Ours when the parent channel is the configured ``DISCORD_CHANNEL_ID``, or
+        Ours when the parent channel is the configured ``DISCORD_CHANNEL_ID``,
         when either resolver finds a ``/clord-init`` / ``/clord-thread-init``
-        binding for it. Everything else belongs to another bot in the same guild.
+        binding for it, or when our own ``sessions`` table still holds the
+        thread. Everything else belongs to another bot in the same guild.
+
+        The rule itself is :func:`c_lord.command_gate.owns` — the same one
+        ``process_commands`` applies to every text command (#596) — given this
+        cog's own resolvers and repository. One rule, two callers, no copy.
         """
-        if not self._is_someone_elses_channel(parent_channel_id, message):
-            return True
-        if await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id) is not None:
-            return True
-        return (
-            await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread_id)
-            is not None
+        return await owns(
+            home_channel_id=getattr(self.bot, "channel_id", None),
+            channel_id=parent_channel_id,
+            thread_id=thread_id,
+            resolvers=(self._resolve_tmux_manager, self._resolve_session_dir_manager),
+            session_get=self.repo.get,
         )
 
     async def _was_ever_our_thread(self, thread: discord.Thread, parent_channel_id: int) -> bool:
@@ -2621,13 +2606,9 @@ class ClaudeChatCog(commands.Cog):
                     thread=thread,
                 )
 
-            async def _notify_stall() -> None:
-                await thread.send(
-                    "-# \u26a0\ufe0f No activity for 30s — could be extended thinking "
-                    "or context compression. Will resume automatically."
-                )
-
-            status = StatusManager(user_message, on_hard_stall=_notify_stall)
+            # #473: a hard stall shows the ⚠️ lamp on the trigger message and
+            # nothing else — no prose line in the thread.
+            status = StatusManager(user_message)
             await status.set_running()
 
             model_override = await self._get_current_model()
@@ -2813,4 +2794,8 @@ class ClaudeChatCog(commands.Cog):
                         # when nothing was produced it is a lie, and a
                         # notification that lies stops being worth reading.
                         no_response=run_config.outcome.no_response,
+                        # #631: and when it was a plan limit, say so with the
+                        # reset time instead of asking for a resend that cannot
+                        # work until the limit resets.
+                        usage_limit=run_config.outcome.usage_limit,
                     )

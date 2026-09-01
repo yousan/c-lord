@@ -13,14 +13,19 @@ from c_lord.claude.tmux_runner import (
     _TRUST_ACCEPT_MAX_ATTEMPTS,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
+    USAGE_LIMIT_ERROR_PREFIX,
     TmuxClaudeRunner,
     _clean_tui_lines,
+    _count_usage_limit,
     _extract_startup_error,
+    _extract_usage_limit,
     _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
     _parse_plan_from_pane,
     _unknown_prompt_signature,
+    _usage_limit_menu_open,
+    _usage_limit_wait_option,
 )
 from c_lord.claude.types import (
     FREE_TEXT_NONE,
@@ -3993,6 +3998,553 @@ class TestPlanContextGate:
         assert q.context == ""
 
 
+# -- #631: Claude usage-limit detection -----------------------------------------
+#
+# When Claude hits a plan limit it answers nothing and prints a banner instead.
+# c-lord used to read that as "the turn never started" and tell the user to send
+# the message again — advice that can never work, because the limit holds until
+# it resets.  Detection has to tell the *blocking* banners ("You've hit your …")
+# apart from the *warning* ones ("You've used 91% of …", "Approaching …"), which
+# appear while Claude is working perfectly well.
+#
+# The variants below are taken from the CLI's own message builders (Claude Code
+# 2.1.252): ``F1H(label, suffix) -> "You've hit your ${label}${suffix}"`` with
+# ``suffix = " · resets ${when}"``, and ``label`` one of weekly / session / Opus
+# / Sonnet / usage / org's monthly usage / (bare) limit.
+
+
+class TestUsageLimitDetection:
+    """#631: a plan limit must be recognised, with its reset time."""
+
+    def test_real_pane_weekly_limit_is_detected(self) -> None:
+        """The captured pane of a real weekly-limit hit must be recognised.
+
+        Fixture is a real ``tmux capture-pane`` of Claude Code replaying the
+        transcript that produced the incident in #631 (thread 1515873566166483074,
+        2026-08-28): ``"You've hit your weekly limit · resets Aug 29, 4pm
+        (Asia/Tokyo)"``.  Before the fix nothing in c-lord looked for this, so
+        the turn fell through to "No response — … Send the message again".
+        """
+        pane = _load_fixture("usage_limit_weekly_hit.txt")
+        limit = _extract_usage_limit(pane)
+        assert limit is not None
+        assert limit.scope == "weekly limit"
+        assert limit.resets_at == "Aug 29, 4pm (Asia/Tokyo)"
+
+    @pytest.mark.parametrize(
+        ("line", "scope", "resets_at"),
+        [
+            # seven_day
+            (
+                "You've hit your weekly limit · resets Aug 29, 4pm (Asia/Tokyo)",
+                "weekly limit",
+                "Aug 29, 4pm (Asia/Tokyo)",
+            ),
+            # five_hour — the reset renders as a bare time when it is <24h away
+            (
+                "You've hit your session limit · resets 4pm (Asia/Tokyo)",
+                "session limit",
+                "4pm (Asia/Tokyo)",
+            ),
+            # seven_day_opus / seven_day_sonnet
+            (
+                "You've hit your Opus limit · resets Sep 4, 5:30pm (Asia/Tokyo)",
+                "Opus limit",
+                "Sep 4, 5:30pm (Asia/Tokyo)",
+            ),
+            (
+                "You've hit your Sonnet limit · resets Sep 4, 5pm (Asia/Tokyo)",
+                "Sonnet limit",
+                "Sep 4, 5pm (Asia/Tokyo)",
+            ),
+            # overage
+            (
+                "You've hit your usage limit · resets Sep 4, 5pm (Asia/Tokyo)",
+                "usage limit",
+                "Sep 4, 5pm (Asia/Tokyo)",
+            ),
+            (
+                "You've hit your org's monthly usage limit · resets Oct 1, 9am (Asia/Tokyo)",
+                "org's monthly usage limit",
+                "Oct 1, 9am (Asia/Tokyo)",
+            ),
+            # bare fallback label
+            (
+                "You've hit your limit · resets Sep 4, 5pm (Asia/Tokyo)",
+                "limit",
+                "Sep 4, 5pm (Asia/Tokyo)",
+            ),
+            # out of credits
+            (
+                "You're out of usage credits · resets Sep 4, 5pm (Asia/Tokyo)",
+                "usage credits",
+                "Sep 4, 5pm (Asia/Tokyo)",
+            ),
+            # the reset clause is optional (``resetsAt`` may be absent)
+            ("You've hit your weekly limit", "weekly limit", None),
+        ],
+    )
+    def test_blocking_variants(self, line: str, scope: str, resets_at: str | None) -> None:
+        """Every blocking banner the CLI can print must be recognised (AC4)."""
+        pane = f"● Some earlier output\n\n  ⎿  {line}\n\n❯ \n"
+        limit = _extract_usage_limit(pane)
+        assert limit is not None, line
+        assert limit.scope == scope
+        assert limit.resets_at == resets_at
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # These render while Claude is working FINE — they must never block.
+            "You've used 79% of your weekly limit · resets Sep 4, 5pm (Asia/Tokyo)",
+            "You've used 91% of your session limit · resets 4pm (Asia/Tokyo)",
+            "Approaching weekly limit · resets Sep 4, 5pm (Asia/Tokyo)",
+            "Approaching usage limit · resets Sep 4, 5pm (Asia/Tokyo) · "
+            "/upgrade to keep using Claude Code",
+            "You're close to your usage limit",
+            "You're now using usage credits · Your weekly limit resets Sep 4, 5pm",
+        ],
+    )
+    def test_warning_variants_are_not_a_limit(self, line: str) -> None:
+        """Approaching/percentage banners are warnings, not a stop (AC4)."""
+        pane = f"● Some earlier output\n\n  ⎿  {line}\n\n❯ \n"
+        assert _extract_usage_limit(pane) is None
+
+    def test_prose_quoting_the_banner_is_not_a_limit(self) -> None:
+        """The phrase inside a sentence must not trip detection.
+
+        This very issue is discussed in c-lord threads, so the pane routinely
+        contains the words.  Same false-positive class as #156 / #184.
+        """
+        pane = (
+            "● Claude が週次上限に当たると You've hit your weekly limit · resets ... と出ます。\n"
+            "  それを c-lord が検知していないのが #631 です。\n"
+            "\n❯ \n"
+        )
+        assert _extract_usage_limit(pane) is None
+
+    def test_clean_pane_is_not_a_limit(self) -> None:
+        """An ordinary working pane must not be read as limited."""
+        assert _extract_usage_limit(_load_fixture("running_spinner_above_footer.txt")) is None
+
+
+def _stub_limit_appearing(tmux_manager) -> None:
+    """Pane that starts clean and then shows the limit banner.
+
+    A banner that was on the pane before the turn began is a re-render of an
+    earlier turn (``--resume`` redraws the conversation tail), so the runner
+    only acts on one that *appears*. Tests have to reproduce that shape or they
+    are testing history, not a refusal.
+    """
+    clean = _load_fixture("running_spinner_above_footer.txt")
+    limited = _load_fixture("usage_limit_weekly_hit.txt")
+    captures = [clean, clean]
+
+    def _capture(*_a, **_k):
+        return captures.pop(0) if captures else limited
+
+    tmux_manager.capture_pane.side_effect = _capture
+
+
+class TestRunUsageLimitSurfacing:
+    """#631: a limited turn must say so — never "send it again"."""
+
+    @pytest.mark.asyncio
+    async def test_limit_pane_yields_usage_limit_result(self, runner, tmux_manager) -> None:
+        """Pane shows the weekly-limit banner → RESULT carries the limit + reset time.
+
+        RED before the fix: the run fell through to the #562 rung and produced
+        ``"No response — Claude never started this turn … Send the message
+        again"``, which is the advice that made the reporter send the same
+        request three times.
+        """
+        _stub_limit_appearing(tmux_manager)
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("do the thing"):
+                events.append(event)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].usage_limit is not None
+        assert result[0].usage_limit.scope == "weekly limit"
+        assert result[0].usage_limit.resets_at == "Aug 29, 4pm (Asia/Tokyo)"
+        assert result[0].error is not None
+        assert result[0].error.startswith(USAGE_LIMIT_ERROR_PREFIX)
+        # AC2: the "just send it again" advice must be gone.
+        assert not result[0].error.startswith(NO_RESPONSE_ERROR_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_limit_does_not_wait_out_the_turn_start_grace(self, runner, tmux_manager) -> None:
+        """The limit is fatal, so the turn ends at once rather than idling.
+
+        The #562 rung waits ``_TURN_START_GRACE`` (120s in production) before it
+        will call a turn dead. Sitting on a limit for two minutes buys nothing —
+        the banner is already the final answer.
+        """
+        _stub_limit_appearing(tmux_manager)
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 30.0),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 30.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+
+            async def _drain() -> list:
+                return [e async for e in runner.run("x")]
+
+            events = await asyncio.wait_for(_drain(), timeout=10)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].usage_limit is not None
+
+
+class TestUsageLimitEmbed:
+    """#631 AC1/AC2: the Discord embed states the limit and its reset time."""
+
+    def test_embed_names_limit_and_reset(self) -> None:
+        from c_lord.claude.types import UsageLimit
+        from c_lord.discord_ui.embeds import usage_limit_embed
+
+        embed = usage_limit_embed(UsageLimit("weekly limit", "Aug 29, 4pm (Asia/Tokyo)", ""))
+        body = f"{embed.title}\n{embed.description}"
+        assert "Aug 29, 4pm (Asia/Tokyo)" in body
+        assert "weekly limit" in body
+        # AC2: never advise a retry that cannot succeed.
+        assert "もう一度送る" not in body, body
+        assert "Send the message again" not in body, body
+
+    def test_embed_without_reset_time(self) -> None:
+        from c_lord.claude.types import UsageLimit
+        from c_lord.discord_ui.embeds import usage_limit_embed
+
+        embed = usage_limit_embed(UsageLimit("session limit", None, ""))
+        body = f"{embed.title}\n{embed.description}"
+        assert "session limit" in body
+        assert "もう一度送る" not in body
+
+    def test_error_router_prefers_the_limit_embed(self) -> None:
+        """A ``Usage limit —`` error must not be rendered as a generic ❌ Error."""
+        from c_lord.claude.types import UsageLimit
+        from c_lord.cogs._run_helper import _make_error_embed
+
+        embed = _make_error_embed(
+            f"{USAGE_LIMIT_ERROR_PREFIX} Claude hit your weekly limit and did not run "
+            "this turn. Resets Aug 29, 4pm (Asia/Tokyo).",
+            usage_limit=UsageLimit("weekly limit", "Aug 29, 4pm (Asia/Tokyo)", ""),
+        )
+        body = f"{embed.title}\n{embed.description}"
+        assert "Aug 29, 4pm (Asia/Tokyo)" in body
+        assert "❌ Error" not in embed.title
+        assert "応答がありませんでした" not in embed.title
+
+
+class TestUsageLimitInjectionSafety:
+    """Security: pane text reaches a *plain* thread.send(), which pings.
+
+    ``_completion_text`` interpolates the limit's scope into an ordinary Discord
+    message (not an embed), so an ``@everyone`` smuggled through the banner would
+    mass-ping the guild. The CLI's own label vocabulary is small and closed, so
+    anything outside it is not a banner c-lord should act on at all.
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "You've hit your @everyone · resets Aug 29, 4pm",
+            "You've hit your @here limit · resets Aug 29, 4pm",
+            "You've hit your <@&12345> limit · resets Aug 29, 4pm",
+            "You've hit your weekly limit · resets @everyone",
+            "You've hit your weekly limit · resets <@&12345>",
+            "You've hit your `weekly` limit · resets Aug 29, 4pm",
+        ],
+    )
+    def test_mention_bearing_banner_is_rejected(self, line: str) -> None:
+        limit = _extract_usage_limit(f"  ⎿  {line}\n\n❯ \n")
+        if limit is not None:
+            rendered = f"{limit.scope} {limit.resets_at or ''}"
+            assert "@everyone" not in rendered, rendered
+            assert "@here" not in rendered, rendered
+            assert "<@" not in rendered, rendered
+
+    def test_every_real_label_still_passes_the_filter(self) -> None:
+        """The tightening must not reject any label the CLI actually prints."""
+        for scope in (
+            "weekly limit",
+            "session limit",
+            "Opus limit",
+            "Sonnet limit",
+            "usage limit",
+            "usage credit limit",
+            "org's monthly usage limit",
+            "monthly spend limit",
+            "fast limit",
+            "limit",
+        ):
+            pane = f"  ⎿  You've hit your {scope} · resets Sep 4, 5pm (Asia/Tokyo)\n\n❯ \n"
+            limit = _extract_usage_limit(pane)
+            assert limit is not None, scope
+            assert limit.scope == scope
+
+    def test_real_reset_formats_still_pass_the_filter(self) -> None:
+        """Both reset renderings the CLI can produce must survive."""
+        for reset in (
+            "Aug 29, 4pm (Asia/Tokyo)",
+            "4pm (Asia/Tokyo)",
+            "4:30pm (Asia/Tokyo)",
+            "Sep 4, 2027, 5pm (America/New_York)",
+            "Oct 1, 9am (UTC)",
+        ):
+            pane = f"  ⎿  You've hit your weekly limit · resets {reset}\n\n❯ \n"
+            limit = _extract_usage_limit(pane)
+            assert limit is not None, reset
+            assert limit.resets_at == reset
+
+
+class TestUsageLimitBaselineGuard:
+    """A limit banner already on screen is HISTORY, not this turn's outcome.
+
+    Claude Code re-renders the conversation tail on ``--resume``. A thread that
+    hit the weekly limit yesterday therefore starts today's turn with yesterday's
+    banner on the pane. Reading that as "you are limited" would refuse a turn
+    that is about to work perfectly well — the exact opposite mistake to #631,
+    and a worse one, because it would strand the session with no way forward.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_banner_from_resume_is_not_this_turns_outcome(
+        self, runner, tmux_manager
+    ) -> None:
+        """Banner present from the first capture and never changing → not a limit."""
+        pane = _load_fixture("usage_limit_weekly_hit.txt")
+        tmux_manager.capture_pane.return_value = pane
+        tmux_manager.is_claude_running.return_value = True
+
+        # The pane never changes, so nothing else can end this turn — bound it
+        # on the inactivity backstop instead of the 60s production value.
+        runner.timeout_seconds = 1
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 0.1),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("do the thing")]
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].usage_limit is None, "a pre-existing banner is history"
+
+    @pytest.mark.asyncio
+    async def test_banner_that_appears_during_the_turn_is_a_limit(
+        self, runner, tmux_manager
+    ) -> None:
+        """Banner absent at the start, present later → this turn was refused."""
+        clean = _load_fixture("running_spinner_above_footer.txt")
+        limited = _load_fixture("usage_limit_weekly_hit.txt")
+        captures = [clean, clean, limited, limited, limited, limited]
+
+        def _capture(*_a, **_k):
+            return captures.pop(0) if captures else limited
+
+        tmux_manager.capture_pane.side_effect = _capture
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._TURN_START_GRACE", 0.1),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("do the thing")]
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].usage_limit is not None
+        assert result[0].usage_limit.scope == "weekly limit"
+
+
+class TestUsageLimitChoiceMenu:
+    """#631: the current CLI asks what to do — and two of the answers cost money.
+
+    Claude Code 2.1.252 does not just print the banner; it opens a menu:
+
+        What do you want to do?
+        ❯ 1. Stop and wait for limit to reset
+          2. Switch to usage credits
+          3. Switch to Team plan
+
+    Leaving it open would make the NEXT message in the thread land in a menu
+    instead of the prompt. But answering it blindly is worse: options 2 and 3
+    change the account's billing. c-lord may only ever pick the one that spends
+    nothing, and only when it can identify it by name.
+
+    Fixture is a real capture: the shipped CLI driven against a stand-in API
+    that answers 429 with the unified rate-limit headers (a weekly limit cannot
+    be hit on demand).
+    """
+
+    def test_real_menu_pane_is_detected_as_a_limit(self) -> None:
+        pane = _normalize_capture(_load_fixture("usage_limit_choice_menu_v2_1_252.txt"))
+        limit = _extract_usage_limit(pane)
+        assert limit is not None
+        assert limit.scope == "weekly limit"
+        assert limit.resets_at == "Sep 4, 6:10pm (Asia/Tokyo)"
+
+    def test_wait_option_is_found_by_name(self) -> None:
+        pane = _normalize_capture(_load_fixture("usage_limit_choice_menu_v2_1_252.txt"))
+        assert _usage_limit_wait_option(pane) == 0
+
+    def test_menu_without_a_wait_option_is_not_answered(self) -> None:
+        """No identifiable no-spend option → press nothing, ever."""
+        pane = (
+            "  ⎿  You've hit your weekly limit · resets Sep 4, 5pm (Asia/Tokyo)\n"
+            "\n"
+            "   What do you want to do?\n"
+            "\n"
+            "   ❯ 1. Switch to usage credits\n"
+            "     2. Switch to Team plan\n"
+            "\n"
+            "   Enter to confirm · Esc to cancel\n"
+        )
+        assert _usage_limit_wait_option(pane) is None
+
+    def test_reordered_menu_finds_the_wait_option_by_position(self) -> None:
+        """The index must come from the label, never from a fixed number."""
+        pane = (
+            "  ⎿  You've hit your weekly limit · resets Sep 4, 5pm (Asia/Tokyo)\n"
+            "\n"
+            "   What do you want to do?\n"
+            "\n"
+            "   ❯ 1. Switch to usage credits\n"
+            "     2. Stop and wait for limit to reset\n"
+            "\n"
+            "   Enter to confirm · Esc to cancel\n"
+        )
+        assert _usage_limit_wait_option(pane) == 1
+
+    def test_pane_without_a_menu_has_no_option(self) -> None:
+        pane = _load_fixture("usage_limit_weekly_hit.txt")
+        assert _usage_limit_wait_option(pane) is None
+
+    @pytest.mark.asyncio
+    async def test_runner_dismisses_the_menu_with_the_wait_option(
+        self, runner, tmux_manager
+    ) -> None:
+        """The turn ends with the menu closed, and nothing paid for."""
+        clean = _load_fixture("running_spinner_above_footer.txt")
+        limited = _normalize_capture(_load_fixture("usage_limit_choice_menu_v2_1_252.txt"))
+        captures = [clean, clean]
+
+        def _capture(*_a, **_k):
+            return captures.pop(0) if captures else limited
+
+        tmux_manager.capture_pane.side_effect = _capture
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_keys.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("do the thing")]
+
+        result = [e for e in events if e.is_complete]
+        assert result[0].usage_limit is not None
+
+        keys = [c.args[1:] for c in tmux_manager.send_keys.call_args_list]
+        flat = [k for call in keys for k in call]
+        # Option 1 is already under the cursor: confirm it, and send no Downs
+        # that could walk onto "Switch to usage credits".
+        assert flat == ["Enter"], flat
+
+
+class TestUsageLimitRepeatDetection:
+    """#631: hitting the SAME limit twice in one thread must be caught too.
+
+    The reporter sent the identical request three times. Each refusal prints the
+    identical banner, so "is this line different from the one already on the
+    pane?" silently misses every attempt after the first — the exact case the
+    issue is about. Reproduced on staging: the second turn's banner was
+    suppressed and the turn fell back to "No response".
+
+    Two signals separate a fresh refusal from a re-rendered old one:
+      * the limit's choice menu is OPEN — it only stays open until answered, and
+        while it is open the next message goes into the menu, so the turn is
+        blocked whatever the banner says;
+      * the number of banners on the pane went UP.
+    """
+
+    def test_repeat_pane_has_two_banners_and_an_open_menu(self) -> None:
+        """The staging capture of a second consecutive refusal."""
+        pane = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
+        assert _count_usage_limit(pane) == 2
+        assert _usage_limit_menu_open(pane) is True
+        # 4 options here, not 3 — the menu shape varies, so the wait option must
+        # still be found by name.
+        assert _usage_limit_wait_option(pane) == 0
+
+    def test_menu_is_not_open_on_a_plain_banner_pane(self) -> None:
+        pane = _load_fixture("usage_limit_weekly_hit.txt")
+        assert _usage_limit_menu_open(pane) is False
+        assert _count_usage_limit(pane) == 1
+
+    def test_an_unrelated_menu_is_not_the_limit_menu(self) -> None:
+        """Only the limit's own menu counts — not every numbered TUI menu."""
+        pane = _load_fixture("plan_approval_menu.txt")
+        assert _usage_limit_menu_open(pane) is False
+
+    @pytest.mark.asyncio
+    async def test_identical_banner_repeat_is_still_reported(
+        self, runner, tmux_manager
+    ) -> None:
+        """RED: the same banner twice was suppressed as 'history' and lost."""
+        before = _normalize_capture(_load_fixture("usage_limit_weekly_hit.txt"))
+        after = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
+        captures = [before, before]
+
+        def _capture(*_a, **_k):
+            return captures.pop(0) if captures else after
+
+        tmux_manager.capture_pane.side_effect = _capture
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_keys.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("same request, third time")]
+
+        result = [e for e in events if e.is_complete]
+        assert result[0].usage_limit is not None
+        assert result[0].usage_limit.scope == "weekly limit"
+
+
 # -- #630: the trust dialog must be accepted once, not 178 times ----------------
 
 
@@ -4159,25 +4711,24 @@ class TestTrustStuckEmbed:
     @pytest.mark.asyncio
     async def test_stuck_turn_is_not_announced_as_finished(self) -> None:
         """A turn blocked on the dialog produced nothing — do not ping "finished"."""
-        from unittest.mock import AsyncMock as _AsyncMock
+        from unittest.mock import AsyncMock
 
-        from c_lord.claude.types import MessageType as _MT
-        from c_lord.claude.types import StreamEvent as _SE
-        from c_lord.cogs.event_processor import EventProcessor as _EP
+        from c_lord.claude.types import StreamEvent
+        from c_lord.cogs.event_processor import EventProcessor
 
         thread = MagicMock()
-        thread.send = _AsyncMock(return_value=MagicMock())
+        thread.send = AsyncMock(return_value=MagicMock())
         config = MagicMock()
         config.thread = thread
         config.status = None
         config.repo = None
         config.outcome.no_response = False
-        p = _EP(config)
-        p._fold_progress = _AsyncMock()  # type: ignore[method-assign]
+        processor = EventProcessor(config)
+        processor._fold_progress = AsyncMock()  # type: ignore[method-assign]
 
-        await p.process(
-            _SE(
-                message_type=_MT.RESULT,
+        await processor.process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
                 is_complete=True,
                 error=f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog did not close.",
             )
