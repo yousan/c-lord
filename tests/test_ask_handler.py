@@ -56,6 +56,8 @@ async def test_tui_resolution_unblocks_bridge(monkeypatch):
     """
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, msg = _thread(359_0001)
     runner = MagicMock()
     # Menu is open on the first peek, then gone (answered/cancelled in the TUI).
@@ -89,6 +91,8 @@ async def test_discord_click_still_answers_menu(monkeypatch):
     """Regression: a real Discord click still drives the TUI menu via answer_menu."""
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(359_0002)
     runner = MagicMock()
     # Menu stays open throughout — the click should win the race.
@@ -119,6 +123,8 @@ async def test_multi_select_click_toggles_all_options(monkeypatch):
     """
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(418_0001)
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=_multi_question())
@@ -149,6 +155,8 @@ async def test_multi_select_other_freetext_uses_text_path(monkeypatch):
     the single free-text path (Other yields one typed string, not options)."""
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(418_0002)
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=_multi_question())
@@ -192,6 +200,8 @@ async def test_preview_layout_freetext_uses_the_notes_keystrokes(monkeypatch):
     """
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(650_0001)
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=_preview_question())
@@ -212,6 +222,184 @@ async def test_preview_layout_freetext_uses_the_notes_keystrokes(monkeypatch):
         3, "stable に上げて全部あげてOK", mode=FREE_TEXT_NOTES
     )
     runner.answer_menu.assert_not_called()
+
+
+
+# -- #651: ✅ only when the answer actually reached Claude ---------------------
+
+
+_ANSWERED_RESULT = (
+    'The user answered: "repro?"=(no option selected) notes: どれでもいい. '
+    "Read the answers carefully."
+)
+_REJECTED_RESULT = (
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. "
+    "To tell you how to proceed, the user said:\n"
+    "The user wants to clarify these questions.\n"
+    "    Questions asked:\n"
+    '- "repro?"\n'
+    "  (No answer provided)"
+)
+
+
+def _transcript(project_dir, result_text: str | None) -> None:
+    """A project dir holding one AskUserQuestion and (optionally) its outcome."""
+    import json as _json
+
+    events = [
+        {
+            "timestamp": "2026-09-01T03:50:00.000Z",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "AskUserQuestion", "input": {}}
+                ]
+            },
+        }
+    ]
+    if result_text is not None:
+        events.append(
+            {
+                "timestamp": "2026-09-01T03:50:05.000Z",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": result_text}
+                    ]
+                },
+            }
+        )
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "s.jsonl").write_text(
+        "\n".join(_json.dumps(e, ensure_ascii=False) for e in events) + "\n", encoding="utf-8"
+    )
+
+
+def _verifying_runner(project_dir, *, closes_on_answer: bool = True) -> MagicMock:
+    """A runner whose menu stays open until answered, reading *project_dir*.
+
+    The menu must stay open until the click lands, or the bridge takes the
+    "answered in the pane" path and never sends keystrokes at all.
+    """
+    runner = MagicMock()
+    state = {"answered": False}
+
+    async def _peek():
+        return None if (state["answered"] and closes_on_answer) else _question()
+
+    async def _peek_state():
+        return (await _peek(), True)
+
+    async def _answer(*_args, **_kwargs):
+        state["answered"] = True
+        return True
+
+    runner.peek_pending_ask = _peek
+    runner.peek_menu_state = _peek_state
+    runner.answer_menu = _answer
+    runner.answer_menu_multi = _answer
+    runner.answer_menu_text = _answer
+    runner.cancel_menu = AsyncMock()
+    runner.transcript_project_dir = AsyncMock(return_value=project_dir)
+    return runner
+
+
+def _final_text(msg: MagicMock) -> str:
+    """Every user-visible string of the LAST edit made to the menu message."""
+    assert msg.edit.await_args is not None, "the menu message was never finalised"
+    kwargs = msg.edit.await_args.kwargs
+    parts = [str(kwargs.get("content") or "")]
+    embed = kwargs.get("embed")
+    if embed is not None:
+        parts += [str(embed.title or ""), str(embed.description or "")]
+    return "\n".join(parts)
+
+
+async def _answer_via_bridge(monkeypatch, thread, msg, runner, answer: str) -> None:
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.2)
+
+    async def _click_soon():
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, [answer])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, _question(), runner), timeout=5.0),
+        _click_soon(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_answer_that_never_reached_claude_is_not_reported_as_answered(
+    monkeypatch, tmp_path
+):
+    """#651 AC1/AC3: the keys were accepted and the menu closed — and Claude
+    still recorded "(No answer provided)".
+
+    This is #650's exact shape. Judging success by "did tmux take the keys"
+    (or even "did the menu close") calls it ✅ and the user is left thinking
+    they were ignored.
+    """
+    _transcript(tmp_path, _REJECTED_RESULT)
+    thread, msg = _thread(651_0001)
+    runner = _verifying_runner(tmp_path)
+
+    await _answer_via_bridge(monkeypatch, thread, msg, runner, "A1")
+
+    text = _final_text(msg)
+    assert "✅" not in text, f"claimed success over an answer Claude never got: {text!r}"
+    assert "伝わっていません" in text, f"should say the answer did not reach Claude: {text!r}"
+    assert "A1" in text, f"the user's choice must still be readable: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_answer_confirmed_in_the_transcript_is_reported_as_answered(monkeypatch, tmp_path):
+    """#651 AC2: ✅ is earned by the transcript, not by the keystrokes."""
+    _transcript(tmp_path, _ANSWERED_RESULT)
+    thread, msg = _thread(651_0002)
+    runner = _verifying_runner(tmp_path)
+
+    await _answer_via_bridge(monkeypatch, thread, msg, runner, "A1")
+
+    text = _final_text(msg)
+    assert "✅" in text, f"a confirmed answer should read as answered: {text!r}"
+    assert "repro?" in text, f"the question must survive: {text!r}"
+    assert "A1" in text
+
+
+@pytest.mark.asyncio
+async def test_no_outcome_within_the_bound_says_unconfirmed_not_answered(monkeypatch, tmp_path):
+    """#651 AC3: the confirmation timed out — say that, do not claim either way.
+
+    Silence is not evidence of success; it is also not evidence of failure, and
+    telling the user "it did not arrive" when it may well have is its own bug.
+    """
+    _transcript(tmp_path, None)  # menu written, no result yet
+    thread, msg = _thread(651_0003)
+    runner = _verifying_runner(tmp_path)
+
+    await _answer_via_bridge(monkeypatch, thread, msg, runner, "A1")
+
+    text = _final_text(msg)
+    assert "✅" not in text, f"unconfirmed is not confirmed: {text!r}"
+    assert "確認" in text, f"should say the outcome could not be confirmed: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_without_a_transcript_the_menu_closing_is_the_best_evidence(monkeypatch):
+    """No project dir (e.g. no tmux pane path) — fall back to the pane check.
+
+    Degrading to the old, weaker evidence is fine; degrading to *no* check is
+    what #651 is about.
+    """
+    thread, msg = _thread(651_0004)
+    runner = _verifying_runner(None)
+
+    await _answer_via_bridge(monkeypatch, thread, msg, runner, "A1")
+
+    assert "✅" in _final_text(msg)
 
 
 # -- #399: prose context above the menu -------------------------------------
@@ -251,6 +439,8 @@ async def test_context_posted_as_silent_message_before_embed(monkeypatch):
     (the embed message is edited to nothing when the menu resolves)."""
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(399_0001)
     q = _question()
     q.context = _CONTEXT
@@ -275,6 +465,8 @@ async def test_context_registered_for_mirror_dedup(monkeypatch):
 
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(399_0002)
     q = _question()
     q.context = _CONTEXT
@@ -288,6 +480,8 @@ async def test_context_registered_for_mirror_dedup(monkeypatch):
 async def test_no_context_message_when_context_empty(monkeypatch):
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(399_0003)
 
     await asyncio.wait_for(bridge_pane_ask(thread, _question(), _resolved_runner()), timeout=3.0)
@@ -305,6 +499,8 @@ async def test_long_context_fully_delivered_in_chunks(monkeypatch):
 
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(399_0004)
     q = _question()
     q.context = ("経緯です。" * 500) + "私の推しは (A) です。"  # ~2510 chars
@@ -331,6 +527,8 @@ async def test_oversized_context_keeps_tail_and_skips_registration(monkeypatch):
 
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(399_0006)
     q = _question()
     q.context = "あ" * 6500  # > 3 * 1900
@@ -357,6 +555,8 @@ async def test_context_send_failure_does_not_break_bridge(monkeypatch):
 
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, msg = _thread(399_0005)
     q = _question()
     q.context = _CONTEXT
@@ -386,6 +586,8 @@ async def test_pane_skips_context_when_mirror_already_posted(monkeypatch):
 
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(399_0007)
     q = _question()
     q.context = _CONTEXT
@@ -407,6 +609,8 @@ async def test_bridge_pane_ask_pings_notify_user(monkeypatch):
     blocked turn pushes a notification (an embed alone never pings)."""
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(480_0001)
 
     await asyncio.wait_for(
@@ -425,12 +629,37 @@ async def test_bridge_pane_ask_pings_notify_user(monkeypatch):
 async def test_bridge_pane_ask_no_mention_when_notify_user_unset(monkeypatch):
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _msg = _thread(480_0002)
 
     await asyncio.wait_for(bridge_pane_ask(thread, _question(), _resolved_runner()), timeout=3.0)
 
     embed_sends = [s for s in thread.send.await_args_list if "embed" in s.kwargs]
     assert all(not (s.kwargs.get("content") or "").startswith("<@") for s in embed_sends)
+
+
+@pytest.mark.asyncio
+async def test_collect_ask_answers_still_ends_at_answered(monkeypatch):
+    """#651: on the non-tmux path the answer IS the next prompt, so ✅ is earned.
+
+    The click now leaves an interim ⏳ that some later step has to resolve. Here
+    that step is this function: nothing can swallow the answer, because it is
+    returned from here and injected as Claude's next turn. Leaving ⏳ standing
+    forever would be the new way to look broken.
+    """
+    thread, msg = _thread(651_0020)
+
+    async def _click_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["A1"])
+
+    await asyncio.gather(
+        asyncio.wait_for(collect_ask_answers(thread, [_question()], "sess-1"), timeout=3.0),
+        _click_soon(),
+    )
+
+    assert "✅" in _final_text(msg)
 
 
 @pytest.mark.asyncio
@@ -575,6 +804,8 @@ async def test_bridge_records_click_answer(monkeypatch):
     from c_lord.discord_ui.ask_bus import CLOSE_ANSWERED
 
     monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
     thread, _ = _thread(536_1002)
     runner = MagicMock()
     runner.peek_pending_ask = AsyncMock(return_value=_question())

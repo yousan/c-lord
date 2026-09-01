@@ -300,6 +300,48 @@ def ask_answered_embed(
     )
 
 
+def ask_sending_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+) -> discord.Embed:
+    """Interim state: the answer was taken, the outcome is not known yet (#651).
+
+    The buttons are already gone at this point, so something has to stand in
+    their place — and it must not be ✅. ✅ used to be printed the instant the
+    click was accepted, which is one step too early: the keystrokes had not been
+    sent, let alone accepted by the menu, and on 2026-09-01 a menu resolved with
+    the answer thrown away under a ✅ (#650). This says what is actually true —
+    "we sent it, we are checking" — for the second or so it takes to confirm.
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"⏳ {header}" if header else "⏳ 回答を送信中"
+    body = f"{question}\n\n**送信中:** {answer}\n-# Claude に届いたか確認しています…"
+    return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
+
+
+def ask_unconfirmed_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+) -> discord.Embed:
+    """The outcome could not be confirmed either way within the bound (#651).
+
+    Deliberately neither ✅ nor "届きませんでした": silence is not evidence of
+    success, and telling someone their answer was lost when it may well have
+    landed is its own way of being wrong. Say what is known.
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"❔ {header}" if header else "❔ 回答の結果を確認できませんでした"
+    body = (
+        f"{question}\n\n"
+        f"**送った答え:** {answer}\n\n"
+        "回答は送りましたが、Claude が受け取ったかどうかを確認できませんでした。"
+        "続きが返ってこないときは、同じ内容をスレッドにもう一度送ってください。"
+    )
+    return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_TODO)
+
+
 def ask_undelivered_embed(
     question: str,
     header: str = "",

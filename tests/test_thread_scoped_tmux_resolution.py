@@ -90,6 +90,12 @@ class TestNoCallerOmitsThreadId:
             for i, line in enumerate(lines, 1):
                 if "resolve_tmux_manager(" not in line or "def " in line:
                     continue
+                # Prose is not a call site: a comment explaining what
+                # resolve_tmux_manager() does has no thread_id to state, and
+                # flagging it would push authors toward vaguer comments.
+                hash_at = line.find("#")
+                if 0 <= hash_at < line.index("resolve_tmux_manager("):
+                    continue
                 call = line.strip()
                 # Fold following lines until the call's parentheses balance.
                 j = i

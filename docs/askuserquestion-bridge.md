@@ -357,7 +357,7 @@ thread has to say what happened to it. It used to say almost nothing:
 
 | | before | now |
 |---|---|---|
-| delivered | the embed was wiped and replaced by a grey `-# ✅ Selected: X` | an embed keeping **the question and the answer** |
+| delivered | the embed was wiped and replaced by a grey `-# ✅ Selected: X` | an interim `⏳ 送信中`, then an embed keeping **the question and the answer** once the answer is *confirmed* (#651) |
 | not delivered | an **ephemeral** "⚠️ The bot was restarted…" — only the clicker saw it, gone on refresh | a normal message in the thread naming the **actual** cause |
 | buttons on failure | **stayed live** | removed |
 | other copies of the menu | stayed live | blanked out |
@@ -386,6 +386,49 @@ registered while answerable, and resolving one blanks the rest. A copy from a
 *previous* process is out of reach of an in-memory registry by construction — it
 is handled where it is reachable: its click lands on the honest "already closed"
 path above, which disables it.
+
+## What ✅ means — confirming the answer reached Claude (#651)
+
+**c-lord used to never check that an answer arrived.** ✅ was printed the moment
+`post_answer` returned True — before a keystroke had been sent, let alone
+accepted. #536 and #600 added feedback around that decision, but both ask about
+the *machinery* ("is a waiter registered", "did tmux take the keys"), not about
+the answer. So on 2026-09-01 the keys went out perfectly, the menu closed, and
+Claude recorded `(No answer provided)` — under a ✅ (#650).
+
+Three questions, only the last of which is the one that matters:
+
+| question | who answers it | what it proves |
+|---|---|---|
+| is a waiter registered? | `ask_bus.post_answer` | the click was not orphaned |
+| did tmux take the keystrokes? | `TmuxSessionManager.send_keys` (#600) | the pane exists |
+| **did Claude receive the answer?** | **Claude Code's transcript** | the actual thing |
+
+So the click now leaves an interim **`⏳ 送信中`** state, and the bridge decides
+the final state after the keystrokes, from the best evidence available:
+
+1. **The transcript** (`transcript/ask_result.py`). Claude Code writes the
+   menu's `tool_result`, and its wording is unambiguous — `The user answered: …`
+   versus `(No answer provided)` / `The user wants to clarify these questions`.
+   The menu's `tool_use` id is looked up **before** answering (afterwards a newer
+   menu may already exist), and the pane's cwd gives the project dir
+   (`TmuxClaudeRunner.transcript_project_dir`).
+2. **The pane**, when there is no transcript to read: "the menu is gone". Weaker
+   — it cannot tell a real answer from a discarded one — but far better than the
+   pre-#651 answer of not looking at all.
+
+| verified outcome | what the thread shows |
+|---|---|
+| answered | `✅` with the question and the answer (as before) |
+| not answered | `⚠️` naming it: 「キーは送れましたが、Claude 側には『回答なし』として渡りました」 |
+| not confirmed within the bound | `❔ 回答の結果を確認できませんでした` — neither claim is made |
+
+**The bound is deliberate.** `_ANSWER_CONFIRM_TIMEOUT = 12s`, polled every
+`_ANSWER_CONFIRM_POLL = 0.5s`. The ✅ waits on this, so it is latency the user
+sees; measured on staging the `tool_result` lands about a second after the keys,
+so 12s is slack for a busy host rather than an expected wait. Timing out is
+reported as ❔, never as ✅: silence is not evidence of success — and it is not
+evidence of failure either, so it is not reported as ⚠️.
 
 ## Answering by typing (#536 AC7)
 
@@ -550,6 +593,8 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | One-owner-per-thread menu arbitration (#535) | `c_lord/discord_ui/ask_bus.py::AskAnswerBus.register` |
 | Why a menu closed / what a late click is told (#536) | `ask_bus.py::note_closed`, `ask_view.py::_undeliverable_reason` |
 | Answered / undelivered embeds (#536) | `embeds.py::ask_answered_embed`, `ask_undelivered_embed` |
+| Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
+| Interim / unconfirmed embeds (#651) | `embeds.py::ask_sending_embed`, `ask_unconfirmed_embed` |
 | Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |
 | 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |

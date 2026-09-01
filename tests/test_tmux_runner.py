@@ -36,6 +36,11 @@ def tmux_manager():
     mgr.send_input.return_value = True
     mgr.send_interrupt.return_value = True
     mgr.kill_session.return_value = True
+    # #649: the healthy default — no window name is duplicated, so failure
+    # messages fall through to the pane-level diagnosis. A bare MagicMock would
+    # be truthy here and claim an ambiguous target in every test.
+    mgr.duplicate_window_names.return_value = []
+    mgr.session_name = "clord"
     return mgr
 
 
