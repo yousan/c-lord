@@ -381,7 +381,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | Model to use | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | Permission mode for CLI | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Working directory for Claude | current dir |
-| `MAX_CONCURRENT_SESSIONS` | Max parallel sessions | `3` |
+| `MAX_CONCURRENT_SESSIONS` | Max **turns running at once**. Not a cap on resident `claude` processes — the semaphore wraps turn execution only and is released when the turn ends, while the tmux pane lives on. For the resident cap see `CLORD_MAX_RESIDENT_WORKSPACES` (#576). | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | Max workspaces holding a live `claude` at once. Over the cap, the longest-idle ones are put to sleep; creating a new workspace is never blocked. Unlike the idle TTLs this default **is** host-dependent, so it is computed from `MemTotal` (cgroup limit first) rather than shipped as a constant. `0` disables. See `docs/specs/resident-cap.md`. | auto (`max(2, MemTotal_GiB × 0.4 / 0.45)`) |
 | `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout | `300` |
 | `DISCORD_OWNER_ID` | User ID to @-mention when Claude needs input | (optional) |
 | `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end + pauses), `blocked` (pauses only), `off` (never) | `blocked` |
@@ -598,6 +599,8 @@ curl -X POST http://localhost:8080/api/tasks \
 ```
 
 The 30-second master loop picks up due tasks and spawns Claude Code sessions automatically.
+
+Each run posts a `🔄 **[Scheduled]** <task name>` message, opens a thread on it, creates a tmux window in the task's `working_dir`, and runs Claude there — the answer lands in the thread like any other turn. What a scheduled run should look like (and what counts as a bug) is written up in [docs/specs/scheduled-tasks.md](docs/specs/scheduled-tasks.md).
 
 ---
 

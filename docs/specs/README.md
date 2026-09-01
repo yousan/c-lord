@@ -21,6 +21,9 @@
 | [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | トピックは初回固定（自動付け替えは既定オフ）。作業中の `#<Issue/PR番号>` をブランチ/本文から自動表示 |
 | [thread-lamp.md](./thread-lamp.md) | スレッド名のランプ 🟢/🟡 | 既定オフ（rename レート制限のため）。`CLORD_THREAD_LAMP=1` で有効化すると受信で 🟢・完了で 🟡 |
 | [session-close.md](./session-close.md) | セッションの終了と再開 | `/close-workspace` はスレッド名を `[終了] …` にし、以後の投稿は実行せず再開ボタン付きの案内を出す（落ちただけのペインの自動復元とは別物） |
+| [workspace-vocabulary.md](./workspace-vocabulary.md) | ワークスペースの用語と3操作 | スリープ ⊂ 停止 ⊂ 削除。通知は毎回「止まったもの」と「まだ残っているもの」を並べる棚卸し |
+| [workspace-sleep.md](./workspace-sleep.md) | スリープ（4時間） | 4時間 無操作で claude だけ止まる。docker は止めない。次の投稿で無言復元し、手動コマンドは無い |
+| [resident-cap.md](./resident-cap.md) | 常駐ワークスペース数の上限 | TTL のバックストップ。上限は MemTotal から自動算出し、超えたら LRU でスリープ。新規は待たせない／緊急ブレーキは上げる方向に動かない |
 | [session-resume.md](./session-resume.md) | 止まったセッションの復元案内 | 「送れば復元します」と言うのは本当に復元できるときだけ。復元できないスレッドの投稿も黙って捨てず、理由と次の一手を出す |
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
@@ -29,6 +32,7 @@
 | [turn-progress.md](./turn-progress.md) | ターン中の進捗表示 | スレッドが90秒黙ったときだけ1行出て、15秒ごとに書き換わり、実出力が戻ると消える（常時は出さない） |
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
 | [mirrored-events.md](./mirrored-events.md) | スレッドに流れるイベントの選別 | 👤 はその人が実際に打ったものだけ。ハーネス内部の通知は progress.txt に畳み、内部パスは出さない |
+| [scheduled-tasks.md](./scheduled-tasks.md) | スケジュール実行（定期タスク） | 時間になるとスレッドが立ち、Claude が実際に起動して応答が投稿される。失敗したら本当の理由が出てログにも残る |
 | [tmux-layout.md](./tmux-layout.md) | tmux のセッションとウィンドウの割り当て | セッションは**リポジトリ**ごと（チャンネルごとではない）。スレッドは紐づくリポジトリのセッションのウィンドウに入る |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。

@@ -272,7 +272,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | 使用するモデル | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | CLI のパーミッションモード | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Claude の作業ディレクトリ | カレントディレクトリ |
-| `MAX_CONCURRENT_SESSIONS` | 最大並行セッション数 | `3` |
+| `MAX_CONCURRENT_SESSIONS` | **同時に走るターン数**の上限。常駐する `claude` の本数の上限ではありません（セマフォはターンの実行だけを包み、ターンが終われば解放されます。tmux の claude はその後も生き続けます）。常駐上限は `CLORD_MAX_RESIDENT_WORKSPACES` のほう (#576) | `3` |
+| `CLORD_MAX_RESIDENT_WORKSPACES` | 同時に claude を抱えていられるワークスペース数の上限。超えたら「いちばん長く使われていないもの」からスリープし、**新規の作成は待たせません**。TTL と違いこの値だけはホスト規模に依存するので、既定は固定値ではなく `MemTotal`（コンテナなら cgroup の制限を優先）からの自動算出。`0` で無効。詳細は `docs/specs/resident-cap.md` | 自動算出 |
 | `SESSION_TIMEOUT_SECONDS` | セッション非アクティブタイムアウト | `300` |
 | `DISCORD_OWNER_ID` | Claude が入力待ちのとき @mention する Discord ユーザー ID | （オプション） |
 | `COORDINATION_CHANNEL_ID` | セッション間イベントブロードキャスト用チャンネル ID | （オプション） |

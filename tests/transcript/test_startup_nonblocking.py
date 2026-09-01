@@ -28,6 +28,8 @@ import pytest
 from c_lord.transcript import recovery as recovery_mod
 from c_lord.transcript import tail as tail_mod
 
+from .helpers import clord_marker_event, clord_transcript
+
 # A line shaped like a real transcript assistant event: big enough that a
 # few tens of thousands of them cost measurable CPU to parse.
 _LINE_TEXT = "x" * 400
@@ -51,7 +53,9 @@ def _write_big_transcript(project_dir: Path, *, lines: int = 30_000) -> Path:
     """Write a ~20 MB transcript ending in a completed turn."""
     project_dir.mkdir(parents=True, exist_ok=True)
     jsonl = project_dir / "session.jsonl"
-    body = [_assistant_line(i) for i in range(lines)]
+    # #627: the mirror only follows a transcript c-lord itself drove.
+    body = [json.dumps(clord_marker_event(), ensure_ascii=False)]
+    body += [_assistant_line(i) for i in range(lines)]
     body.append(json.dumps({"type": "system", "subtype": "turn_duration"}))
     jsonl.write_text("\n".join(body) + "\n", encoding="utf-8")
     return jsonl
@@ -96,13 +100,13 @@ async def test_recovery_scan_runs_in_a_worker_thread(
 
     loop_thread = threading.get_ident()
     ran_on: list[int] = []
-    real = recovery_mod.latest_session_jsonl
+    real = recovery_mod.ThreadSessionResolver.resolve
 
-    def spy(project_dir: Path):
+    def spy(self):
         ran_on.append(threading.get_ident())
-        return real(project_dir)
+        return real(self)
 
-    monkeypatch.setattr(recovery_mod, "latest_session_jsonl", spy)
+    monkeypatch.setattr(recovery_mod.ThreadSessionResolver, "resolve", spy)
 
     fa = await recovery_mod.last_completed_final_answer_async(project)
 
@@ -120,8 +124,10 @@ async def test_seed_seen_uuids_runs_in_a_worker_thread(
     """AC2: ``_seed_seen_uuids`` I/O + parse go through ``asyncio.to_thread``."""
     project = tmp_path / "proj"
     project.mkdir()
-    jsonl = project / "s.jsonl"
-    jsonl.write_text(_assistant_line(1) + "\n", encoding="utf-8")
+    # #627: only a transcript c-lord drove is followed, so mark it as one.
+    jsonl = clord_transcript(project / "s.jsonl")
+    with jsonl.open("a", encoding="utf-8") as f:
+        f.write(_assistant_line(1) + "\n")
 
     loop_thread = threading.get_ident()
     ran_on: list[int] = []

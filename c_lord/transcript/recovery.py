@@ -19,6 +19,11 @@ cursor can sit *past* the last completed turn's answer, and comparing the two
 for equality then reported a delivered answer as dropped and re-posted it.
 :func:`final_answer_needs_recovery` asks the ordering question instead, in the
 same single streaming pass.
+
+Issue #627: which transcript to scan is decided the same way the mirror decides
+it — the newest one **c-lord itself drove**.  Scanning the mtime-latest file
+would let a ``claude -p`` sub-invocation's last answer be "recovered" into a
+user's thread as if Claude had said it to them.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .formatter import render_event
-from .resolver import latest_session_jsonl
+from .resolver import ThreadSessionResolver
 
 
 @dataclass(frozen=True)
@@ -73,13 +78,14 @@ def last_completed_final_answer(project_dir: Path) -> FinalAnswer | None:
 
     The "final answer" is the last assistant event that renders as plain
     ``assistant_text`` (the rendering the mirror would post as the reply) at or
-    before the last turn-end marker in the most recent ``*.jsonl``.  Returns
+    before the last turn-end marker in the newest transcript **this thread's own
+    Claude session** wrote (#627).  Returns
     ``None`` when there is no completed turn carrying a final text answer.
 
     Blocking: reads and parses the whole file.  Callers on the event loop must
     use :func:`last_completed_final_answer_async` (Issue #537).
     """
-    jsonl = latest_session_jsonl(project_dir)
+    jsonl = ThreadSessionResolver(project_dir).resolve()
     if jsonl is None:
         return None
 
@@ -153,7 +159,7 @@ def final_answer_needs_recovery(project_dir: Path, cursor_uuid: str | None) -> F
     Blocking: callers on the event loop must use
     :func:`final_answer_needs_recovery_async`.
     """
-    jsonl = latest_session_jsonl(project_dir)
+    jsonl = ThreadSessionResolver(project_dir).resolve()
     if jsonl is None:
         return None
 
