@@ -915,7 +915,9 @@ class TmuxSessionManager:
                 continue
             window_id, window_name = parts[0], parts[1]
             tag = parts[2] if len(parts) > 2 else ""
-            pane_path = parts[3] if len(parts) > 3 else ""
+            # The path is the last field, so re-join anything past it: a tab in
+            # a path would otherwise truncate the tail the thread-id regex reads.
+            pane_path = "\t".join(parts[3:])
             if not window_id:
                 continue
             names[window_id] = window_name
@@ -1819,7 +1821,7 @@ class TmuxSessionManager:
                 "-t",
                 self.session_name,
                 "-F",
-                "#{window_name}\t#{pane_current_path}\t#{@thread_id}\t#{window_id}",
+                "#{window_name}\t#{@thread_id}\t#{window_id}\t#{pane_current_path}",
             ]
         )
         if result.returncode != 0:
@@ -1833,11 +1835,12 @@ class TmuxSessionManager:
             windows.append(
                 {
                     "window_name": parts[0],
-                    "working_dir": parts[1] if len(parts) > 1 else "",
-                    "thread_id": parts[2] if len(parts) > 2 else "",
+                    "thread_id": parts[1] if len(parts) > 1 else "",
                     # #649: callers that go on to *act* on a row need the unique
                     # id — the name may be shared with another window.
-                    "window_id": parts[3] if len(parts) > 3 else "",
+                    "window_id": parts[2] if len(parts) > 2 else "",
+                    # Last field, so it absorbs any tab a path might contain.
+                    "working_dir": "\t".join(parts[3:]),
                 }
             )
 

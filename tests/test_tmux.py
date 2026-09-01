@@ -266,9 +266,11 @@ class TestTmuxSessionManager:
             # old per-row ``show-option -t session:NAME`` follow-up re-resolved
             # the name, so with duplicate names every duplicate reported the
             # first one's tag.
+            # name / @thread_id / window_id / path — the path goes LAST so a tab
+            # inside it cannot shift the other columns.
             mock_run.return_value = MagicMock(
                 returncode=0,
-                stdout="work1\t/work/a\t111\t@1\nwork2\t/work/b\t222\t@2\n",
+                stdout="work1\t111\t@1\t/work/a\nwork2\t222\t@2\t/work/b\n",
             )
             windows = mgr.list_sessions()
 
