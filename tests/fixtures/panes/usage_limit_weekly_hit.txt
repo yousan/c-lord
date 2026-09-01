@@ -1,0 +1,36 @@
+
+  ■ 根の修正が半分しか入っていない（次の【2】）
+  PR #233 の変更ファイルは event.php / publish_*.php 4本 / refresh_event_lifecycle.php だけ。**抽出側が
+  `_event_apply_deadline`
+  を採らない**ので、値が入っているのは手で埋めた7件のみ。次の巡回で入る新規は締切を持たず、#2540
+  と同じ「会期は未来だが申し込めないのに募集中」がまた溜まる。
+
+  ■ 記録の訂正（実害なし）
+  PR #233 本文の「申し込める（PM定義）は 62 → 61 に減る」は誤り。#2540 は開始日 8/17
+  が過去でPM定義に元から入っていない。実測62・Discordの着地報告の 62→62 が正しい。
+
+  ■ 次の発注
+  【1】**本題・最優先＝新経路の横展開。** 検索発掘で「団体DBに無い」を理由に見送った候補を**全部棚卸しして、今回の4
+  条件の門にかけ直す**。朔日は1件目。何件あって何件通ったか・落ちた理由を1行ずつ。成果の単位は**公開eventの増加**。
+  【2】`_event_apply_deadline` を**抽出の常設項目に**（出典に締切の記載があるときだけ入れる。#138
+  の根拠文字列ゲートに乗せる。捏造は不可）。
+  ※ #4699 は締切が今日なので明日 03:20 の daily で終了に落ちる＝申し込める 62→61
+  は**想定どおり**。回帰ではない。門据え置き・#173 不可触・京田辺404 不可触・#219 決着済み。
+
+● Fetch(https://www.town.sera.hiroshima.jp/site/hukushi-kaigo/15191.html)
+  ⎿  Received 27.5KB (200 OK)
+
+● Fetch(https://www.mugigumi.com/flos/pt/)
+  ⎿  Received 85.2KB (200 OK)
+
+  Ran 1 shell command
+  ⎿  You've hit your weekly limit · resets Aug 29, 4pm (Asia/Tokyo)
+     /usage-credits to finish what you’re working on.
+                tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 4.8  v2.1.159  Style: default  Ctx: 699.4k  Context: [███████████░░░░░] 699k/1.0M (70%)  Ctx Us...
+   Cost: $0.00  Session: 19.0%  Weekly: 79.0%  Session: <1m  Reset: 1hr 33m  Weekly Reset: 3d 1hr 33m  Block: ...
+   ⎇ no git  (no git)  (no git)  (no git)  no git  𖠰 no git  cwd: /home/yousan/tmp-i631-repro  Skill: none 
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

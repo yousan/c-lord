@@ -703,3 +703,37 @@ class TestInteractivePromptNotification:
         )
 
         assert _mention_contents(thread) == []
+
+
+class TestUsageLimitOutcome:
+    """#631: a rate-limited RESULT reports the limit, not "send it again"."""
+
+    @pytest.mark.asyncio
+    async def test_limit_event_posts_limit_embed_and_sets_outcome(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        from c_lord.claude.tmux_runner import USAGE_LIMIT_ERROR_PREFIX
+        from c_lord.claude.types import UsageLimit
+
+        config = _make_config(thread, runner)
+        p = EventProcessor(config)
+
+        limit = UsageLimit("weekly limit", "Aug 29, 4pm (Asia/Tokyo)", "")
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                error=f"{USAGE_LIMIT_ERROR_PREFIX} Claude hit your weekly limit.",
+                usage_limit=limit,
+            )
+        )
+
+        embed_sends = [c for c in thread.send.call_args_list if "embed" in c.kwargs]
+        assert len(embed_sends) == 1
+        embed = embed_sends[0].kwargs["embed"]
+        assert "Aug 29, 4pm (Asia/Tokyo)" in embed.description
+        assert "もう一度送る" not in embed.description
+
+        # The turn produced nothing, and the caller must know *why*.
+        assert config.outcome.no_response is True
+        assert config.outcome.usage_limit == limit
