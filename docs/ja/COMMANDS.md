@@ -9,8 +9,13 @@ Discord ユーザーおよび API 利用者が使えるすべてのコマンド�
 ## アーキテクチャ概要
 
 ```
-Bot → Channel (= 1 リポジトリ + 1 tmux session) → Thread (= 1 tmux window)
+Bot → Channel (= 1 リポジトリ) → Thread (= 1 tmux window)
+                                   └─ そのスレッドが紐づくリポジトリの tmux session の中
 ```
+
+tmux セッションはチャンネルではなく**リポジトリ**に従います。スレッドごとに別リポジトリを
+紐づけたチャンネルは複数セッションに散り、同じリポジトリの2チャンネルは1セッションを
+共有します。詳しくは [specs/tmux-layout.md](../specs/tmux-layout.md)。
 
 - **Channel ↔ リポジトリ**: 各 Discord チャンネルは `/clord-init` で git リポジトリに紐づけます。紐づけはデータベースに保存されます。
 - **Thread ↔ セッション**: 各 Discord スレッドは Claude Code セッションと 1:1 で対応します。スレッド内の返信は `--resume` で同じセッションを継続します。

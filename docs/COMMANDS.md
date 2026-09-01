@@ -9,8 +9,13 @@ All commands available to Discord users and API consumers.
 ## Architecture Overview
 
 ```
-Bot → Channel (= 1 repo + 1 tmux session) → Thread (= 1 tmux window)
+Bot → Channel (= 1 repo) → Thread (= 1 tmux window)
+                             └─ in the tmux session of the repo THAT THREAD is bound to
 ```
+
+The tmux session follows the **repository**, not the channel: a channel whose threads
+are bound to different repos spans several sessions, and two channels on the same repo
+share one. See [specs/tmux-layout.md](specs/tmux-layout.md).
 
 - **Channel ↔ Repository**: Each Discord channel is bound to a git repository via `/clord-init`. This binding is stored in the database.
 - **Thread ↔ Session**: Each Discord thread maps 1:1 to a Claude Code session. Replies in a thread continue the same session via `--resume`.
