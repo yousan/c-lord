@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from ..database.repository import SessionRepository
     from ..database.thread_repo import ThreadRepository
 
+from ..command_gate import is_message_authorized
 from ..database.channel_repo import (
     derive_session_name,
     normalize_repo_url,
@@ -342,6 +343,19 @@ class ChannelRepoCog(commands.Cog):
             return False  # DM — no role info
         return self._allowed_user_ids is None
 
+    def _authorize(
+        self, user: discord.Member | discord.User, message: discord.Message | None
+    ) -> bool:
+        """Allowlist for slash, the shared message-backed rule for text (#508).
+
+        A text command can be driven by a webhook or a trusted bot, whose
+        pseudo-user is in no allowlist — gating those on :meth:`_is_allowed` is
+        what #507 fixed for ``!clord`` and what this fixes here.
+        """
+        if message is None:
+            return self._is_allowed(user)
+        return is_message_authorized(message, self._is_allowed)
+
     # Lets clord-init / clord-thread-init run from a slash interaction or a
     # !text twin without duplicating the body (#209 follow-up).
     @staticmethod
@@ -370,9 +384,16 @@ class ChannelRepoCog(commands.Cog):
         repo: str | None,
         remove: bool,
         respond: _Responder,
+        message: discord.Message | None = None,
     ) -> None:
-        """Shared core for /clord-init and !clord-init (#209 follow-up)."""
-        if not self._is_allowed(user):
+        """Shared core for /clord-init and !clord-init (#209 follow-up).
+
+        ``message`` is the invoking message for the text twin, ``None`` for
+        slash.  When present, authorization goes through the shared
+        message-backed rule so a configured ``DISCORD_OWNER_ID`` does not lock
+        out the webhooks this command advertises itself as supporting (#508).
+        """
+        if not self._authorize(user, message):
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
@@ -465,6 +486,7 @@ class ChannelRepoCog(commands.Cog):
             repo=repo,
             remove=remove,
             respond=self._ctx_respond(ctx),
+            message=ctx.message,
         )
 
     async def _clord_thread_init_impl(
@@ -477,9 +499,13 @@ class ChannelRepoCog(commands.Cog):
         repo: str | None,
         remove: bool,
         respond: _Responder,
+        message: discord.Message | None = None,
     ) -> None:
-        """Shared core for /clord-thread-init and !clord-thread-init (#209 follow-up)."""
-        if not self._is_allowed(user):
+        """Shared core for /clord-thread-init and !clord-thread-init (#209 follow-up).
+
+        ``message`` carries the same meaning as in :meth:`_clord_init_impl` (#508).
+        """
+        if not self._authorize(user, message):
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
@@ -597,4 +623,5 @@ class ChannelRepoCog(commands.Cog):
             repo=repo,
             remove=remove,
             respond=self._ctx_respond(ctx),
+            message=ctx.message,
         )

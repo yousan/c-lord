@@ -38,6 +38,7 @@
 | [tmux-layout.md](./tmux-layout.md) | tmux のセッションとウィンドウの割り当て | セッションは**リポジトリ**ごと（チャンネルごとではない）。スレッドは紐づくリポジトリのセッションのウィンドウに入る |
 | [tmux-window-identity.md](./tmux-window-identity.md) | 1 スレッド = 1 ウィンドウ | 同時に何本立てても全部そのまま起動し、あるスレッド宛のキーが別スレッドの作業ディレクトリに入ることはない |
 | [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
+| [command-ownership.md](./command-ownership.md) | テキストコマンドの担当と認可 | 同居する c-lord のうち担当1台だけが `!コマンド` に応じ、他は黙る。webhook は owner 設定でも弾かれない |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
 
