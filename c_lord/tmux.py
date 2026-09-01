@@ -1143,6 +1143,10 @@ class TmuxSessionManager:
         except (FileNotFoundError, json.JSONDecodeError):
             return
 
+        # One snapshot for the whole file: the old loop ran a ``list-windows``
+        # per entry, and the map holds one entry per live thread.
+        live_names = self._window_names()
+
         for tid_str, window_name in data.items():
             if not tid_str.isdigit():
                 continue
@@ -1155,7 +1159,7 @@ class TmuxSessionManager:
             # must address the unique id (#649). A name shared by several windows
             # is not a mapping we can trust — skip it and let the @thread_id /
             # pane-path passes decide, rather than guessing at the first match.
-            candidates = [wid for wid, name in self._window_names().items() if name == window_name]
+            candidates = [wid for wid, name in live_names.items() if name == window_name]
             if len(candidates) != 1:
                 if candidates:
                     logger.warning(
