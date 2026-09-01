@@ -18,7 +18,16 @@ from collections.abc import AsyncGenerator
 
 from ..tmux import TmuxSessionManager, pane_command_is_dead
 from .context_usage import parse_context_total, parse_cost_from_pane
-from .types import AskOption, AskQuestion, MessageType, StreamEvent
+from .types import (
+    FREE_TEXT_NONE,
+    FREE_TEXT_NOTES,
+    FREE_TEXT_ROW,
+    AskOption,
+    AskQuestion,
+    FreeTextMode,
+    MessageType,
+    StreamEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +370,34 @@ def _join_wrapped(label: str, tail: str) -> str:
     return f"{label}{tail}"
 
 
+# #650: the two ways an open menu accepts free text.  The classic layout has a
+# "Type something." row to type onto; the preview layout (drawn as soon as any
+# option carries a ``preview``) replaces it with a ``Notes:`` field opened by
+# ``n``.  Both footers advertise "n to add notes", so that substring matches the
+# hint line and the "press n to add notes" placeholder alike.
+_ASK_NOTES_AFFORDANCE = "n to add notes"
+
+
+def _free_text_mode(menu_text: str) -> FreeTextMode:
+    """Which keystrokes this menu takes for a typed answer (#650).
+
+    Read off the pane rather than assumed, because guessing is not survivable:
+    on a preview menu the classic sequence (``Down`` × option_count → type →
+    ``Enter``) parks the cursor on "Chat about this", where printable keys are
+    ignored and ``Enter`` returns "(No answer provided)" — the user's sentence
+    is silently dropped (production incident, 2026-09-01).
+
+    *menu_text* must cover the ACTIVE menu and the hint line below it, not the
+    whole scrollback: an older menu's affordance would otherwise decide how the
+    current one is answered.
+    """
+    if "Type something" in menu_text:
+        return FREE_TEXT_ROW
+    if _ASK_NOTES_AFFORDANCE in menu_text:
+        return FREE_TEXT_NOTES
+    return FREE_TEXT_NONE
+
+
 def _is_ask_meta_label(label: str) -> bool:
     """True for TUI affordance rows that must not become Discord buttons.
 
@@ -547,12 +584,21 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     # gives no reliable upper bound, so guessing there risks chrome leaks.
     context = _extract_pane_context(lines, header_idx) if header_idx >= 0 else ""
 
+    # #650: the free-text affordance sits at the very bottom of the menu — the
+    # "Type something." row just above "Chat about this", or the ``Notes:``
+    # field plus the "n to add notes" hint printed *below* it.  Scan from the
+    # menu's own start to the end of the capture so the hint line is included
+    # and an older menu higher up in the scrollback is not.
+    free_text_mode = _free_text_mode("\n".join(lines[scan_from:]))
+
     return AskQuestion(
         question=question,
         header=header,
         options=options,
         multi_select=multi_select,
         context=context,
+        allow_other=free_text_mode != FREE_TEXT_NONE,
+        free_text_mode=free_text_mode,
     )
 
 
@@ -1958,10 +2004,21 @@ class TmuxClaudeRunner:
             )
         return _delivered
 
-    async def answer_menu_text(self, text_option_index: int, text: str) -> bool:
-        """Answer via the free-text ("Type something.") affordance (#172).
+    async def answer_menu_text(
+        self,
+        text_option_index: int,
+        text: str,
+        *,
+        mode: FreeTextMode = FREE_TEXT_ROW,
+    ) -> bool:
+        """Answer with free text, the way *this* menu's layout accepts it (#172, #650).
 
-        Verified on a live Claude Code v2.1.150 TUI, the correct interaction is:
+        The two layouts Claude Code draws take different keystrokes, and the
+        wrong ones do not fail loudly — they answer the tool with "(No answer
+        provided)" and throw the typed sentence away.  *mode* therefore comes
+        from the pane (:func:`_free_text_mode`), never from an assumption.
+
+        ``row`` — classic layout, verified on a live Claude Code v2.1.150 TUI:
 
         1. Navigate to the "Type something." row with ``Down`` × *text_option_index*
            — **without** pressing Enter.  (Pressing Enter on that row registers a
@@ -1972,6 +2029,18 @@ class TmuxClaudeRunner:
            :meth:`send_input`, which would append Enter and post the text as a
            separate message instead of the answer.
         3. Press ``Enter`` once to record the typed text as the menu answer.
+
+        ``notes`` — preview layout (any option carries a ``preview``), verified
+        on a live Claude Code v2.1.252 TUI in an isolated tmux (2026-09-01):
+
+        1. Press ``n`` from the option list.  There is no "Type something." row
+           here; ``n`` opens the ``Notes:`` field beside the preview box.
+           *text_option_index* is unused — walking down that far would land on
+           "Chat about this", which ignores typed characters and answers
+           "(No answer provided)" on Enter (#650).
+        2. Type *text* literally into the field.
+        3. Press ``Enter`` once — with no option selected the notes become the
+           answer (``"…"=(no option selected) notes: <text>``).
 
         Keystrokes are spaced by ``_MENU_NAV_DELAY`` for the same reason as
         :meth:`answer_menu` (#171): the TUI drops keys sent too fast.
@@ -1986,13 +2055,19 @@ class TmuxClaudeRunner:
                 _delivered = False
 
         logger.info(
-            "Answering AskUserQuestion with free text (thread=%d)",
+            "Answering AskUserQuestion with free text (thread=%d, mode=%s)",
             self._thread_id,
+            mode,
         )
-        for _ in range(max(0, text_option_index)):
-            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
+        if mode == FREE_TEXT_NOTES:
+            # Open the Notes field — the preview layout's only free-text input.
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "n"))
             await asyncio.sleep(_MENU_NAV_DELAY)
-        # Type the free text directly onto the highlighted "Type something." row.
+        else:
+            for _ in range(max(0, text_option_index)):
+                _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
+                await asyncio.sleep(_MENU_NAV_DELAY)
+        # Type the free text onto the highlighted row / into the notes field.
         _ok(await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text))
         await asyncio.sleep(_MENU_NAV_DELAY)
         # Confirm — records the typed text as the AskUserQuestion answer.

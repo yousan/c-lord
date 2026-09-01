@@ -107,8 +107,14 @@ def _sdir(thread_id: int, path: str = "/x"):
     )
 
 
-def _status_cog(*, dirs, windows, records):
-    """A cog wired with mocked per-channel managers for /clord-status (#363)."""
+def _status_cog(*, dirs, windows, records, monkeypatch=None):
+    """A cog wired with mocked per-channel managers for /clord-status (#363).
+
+    #616: the window list now comes from ``thread_state_sync._list_all_windows``
+    (every tmux session, so a thread bound to another repo is still found), not
+    from one channel manager's ``list_sessions``. Callers that assert on rows
+    must pass ``monkeypatch`` so the sweep can be stubbed.
+    """
     cog = _make_cog()
     sdm = MagicMock()
     sdm.find_session_dirs = MagicMock(return_value=dirs)
@@ -119,6 +125,11 @@ def _status_cog(*, dirs, windows, records):
     cog._resolve_tmux_manager = AsyncMock(return_value=tmux)
     cog.repo.get = AsyncMock(side_effect=lambda tid: records.get(tid))
     cog.repo.list_all = AsyncMock(return_value=list(records.values()))
+    if monkeypatch is not None:
+        import c_lord.thread_state_sync as _tss
+
+        stamped = [{"session_name": "c-lord", **w} for w in windows]
+        monkeypatch.setattr(_tss, "_list_all_windows", lambda: stamped)
     return cog
 
 
@@ -143,6 +154,7 @@ class TestClordStatus:
             dirs=[_sdir(100)],
             windows=[{"window_name": "work1", "working_dir": "/x/100", "thread_id": "100"}],
             records={100: _make_record(thread_id=100, session_id="tmux-x", summary="auth-bug")},
+            monkeypatch=monkeypatch,
         )
         ctx = _make_ctx()
         ctx.channel.id = 777
@@ -152,7 +164,9 @@ class TestClordStatus:
         assert "c-lord status" in sent
         assert "auth-bug" in sent
         assert "1 active" in sent
-        assert "tmux attach -t c-lord:work<#>" in sent
+        # #616: the target is measured per row, not built from a template.
+        assert "c-lord:work1" in sent
+        assert "work<#>" not in sent
 
     async def test_closed_session_hidden_by_default_shown_in_all(self, monkeypatch):
         import c_lord.cogs.session_manage as sm
@@ -161,7 +175,7 @@ class TestClordStatus:
         # dir exists but no tmux window -> closed
         records = {200: _make_record(thread_id=200, session_id="tmux-y", summary="old-refactor")}
 
-        cog = _status_cog(dirs=[_sdir(200)], windows=[], records=records)
+        cog = _status_cog(dirs=[_sdir(200)], windows=[], records=records, monkeypatch=monkeypatch)
         ctx = _make_ctx()
         ctx.channel.id = 777
         await cog.clord_status_text.callback(cog, ctx, None)  # default
@@ -169,7 +183,7 @@ class TestClordStatus:
         assert "old-refactor" not in default_out  # hidden by default
         assert "1 closed" in default_out  # but surfaced in the footer
 
-        cog2 = _status_cog(dirs=[_sdir(200)], windows=[], records=records)
+        cog2 = _status_cog(dirs=[_sdir(200)], windows=[], records=records, monkeypatch=monkeypatch)
         ctx2 = _make_ctx()
         ctx2.channel.id = 777
         await cog2.clord_status_text.callback(cog2, ctx2, "all")  # !clord-status all
