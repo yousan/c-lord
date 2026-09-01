@@ -565,14 +565,90 @@ waited out the 24 h `ASK_ANSWER_TIMEOUT`, sent its cancelling Esc into a shell
 (a no-op, so the "menu" never went away), and the watchdog bridged the same dead
 question again — one `@mention` per day for a question answered weeks earlier.
 
+## The same menu is posted once (#633)
+
+The sweep sees an open menu again on every 60-second tick, so "have I already
+posted this?" has to be answered somewhere. #600 answered it with an in-memory
+counter — and **the counter died with the process.** Production restarts the bot
+several times a day, so each new process started every stranded menu over at
+`attempt=1/3`:
+
+```
+Aug 31 17:28:03  Started menu watchdog loop (interval=60s)
+Aug 31 17:28:08  menu watchdog: bridging unwatched TUI menu (… header='改名先' attempt=1/3)
+Aug 31 17:49:46  Started menu watchdog loop (interval=60s)
+Aug 31 17:49:51  menu watchdog: bridging unwatched TUI menu (… header='改名先' attempt=1/3)
+Aug 31 18:02:57  Started menu watchdog loop (interval=60s)
+Aug 31 18:03:03  menu watchdog: bridging unwatched TUI menu (… header='改名先' attempt=1/3)
+```
+
+188 re-bridges in one thread; the same `❓ 切り口` embed reached Discord six times
+over three days. The second reset was `MenuRebridgeLedger.clear()` on a
+*successful* bridge: `bridge_pane_ask` returns as soon as it stops waiting —
+including when the answer went out but never took effect — so a menu whose
+answer could not reach the TUI got a fresh budget every time.
+
+The rule now:
+
+- **Identity** — `thread_state_sync.py::menu_fingerprint` hashes the menu's
+  header, its question line and its option labels in order. Descriptions and the
+  pre-menu 経緯 are excluded: they are re-wrapped by every redraw and by every
+  window resize, so including them would make one stranded menu look like a new
+  question on each tick.
+- **Budget** — one post per `(thread, fingerprint)`, held in the `menu_bridges`
+  SQLite table (`c_lord/database/menu_bridge_repo.py`), so a restart cannot
+  forget it.
+- **Release** — only a sweep that sees the thread's pane with **no menu on it**
+  clears the thread's rows. Observation ends the episode, never a bridge
+  completing. A genuinely new question — even one worded identically — is posted
+  again, because the pane went menu-free in between. An **empty** capture is
+  "could not read", not "no menu" (#485), so it releases nothing.
+- **A failed post keeps its budget** — the row is rolled back when
+  `bridge_pane_ask` raises, so #579's retry of a menu Discord rejected still
+  works. The budget is spent by a menu the user can *see*, never by an attempt
+  that never reached the thread; `_ASK_BRIDGE_MAX_FAILURES` still bounds those
+  retries at 3.
+
+## The 経緯 stops at a tool block (#633)
+
+`_extract_pane_context` walks up from the menu to the `●` block above it. A
+finished tool block folds, on every redraw, into a single **indented** summary
+line — `Ran 2 shell commands`, `Searched for 3 patterns, read 1 file, ran 6
+shell commands` — which looks exactly like a prose continuation, so the walk
+stepped straight over it and attached the block from *before* the tool call:
+
+```
+● ロールバック方針は、…                 ← already delivered by the mirror
+  …
+  Ran 1 shell command                   ← folded tool block (indented!)
+──────────────────────────────
+ ☐ ロールバック                          ← the menu being bridged
+```
+
+That block is not the menu's 経緯. The CLI only buffers the jsonl chunk that
+carries the menu, so anything separated from the menu by a completed tool block
+has **already** been posted by the transcript mirror. Carrying it re-posted a
+two-day-old answer as new: in thread `1508626302813601843` the same 1900-char
+message was delivered on 2026-08-26 (`1542012051361239073`) and again on
+2026-08-28 (`1542810482526658591`).
+
+`_FOLDED_TOOL_SUMMARY_RE` therefore ends the walk. It matches on *shape*, not
+vocabulary — a comma-joined list of `<verb> [for] <N> <noun…>` clauses and
+nothing else — so ordinary prose that happens to start with an English verb is
+untouched, and an unknown wording only costs a fail-closed `context=""` (the
+mirror still delivers it, late). The pane above is
+`tests/fixtures/panes/i633_stale_prose_above_folded_tool.txt`, captured live
+from Claude Code v2.1.252.
+
 ## Limitations
 
 - **Free text on the Submit screen is not re-editable from Discord.** The review
   screen is auto-submitted as-is; to change an answer, use `/attach`.
-- **Pre-menu prose extraction is best-effort and fail-closed** (#399): if the
-  block above the menu isn't a clean `●` prose block (tool output, chrome), no
-  context is carried rather than risk leaking chrome. The mirror still delivers
-  it (late) in that case.
+- **Pre-menu prose extraction is best-effort and fail-closed** (#399, #633): if
+  the block above the menu isn't a clean `●` prose block (tool output, chrome,
+  or anything on the far side of a folded tool summary), no context is carried
+  rather than risk leaking chrome or re-posting text the mirror already sent.
+  The mirror still delivers it (late) in that case.
 - **Prose taller than the transient capture height is still truncated** (#468):
   the tall re-capture recovers prose up to `capture_pane_tall`'s height
   (240 rows). Prose longer than that still loses its head and falls back to the
@@ -601,6 +677,8 @@ question again — one `@mention` per day for a question answered weeks earlier.
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
 | Empty-label backstop / watchdog retry cap (#579) | `ask_view.py::_button_label`, `thread_state_sync.py::_ASK_BRIDGE_MAX_FAILURES` |
+| One post per menu, across restarts (#633) | `thread_state_sync.py::menu_fingerprint` / `MenuRebridgeLedger`, `c_lord/database/menu_bridge_repo.py::MenuBridgeRepository`, `menu_bridges` table |
+| 経緯 stops at a folded tool block (#633) | `tmux_runner.py::_FOLDED_TOOL_SUMMARY_RE`, fixture `tests/fixtures/panes/i633_stale_prose_above_folded_tool.txt` |
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |

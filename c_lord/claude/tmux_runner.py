@@ -753,6 +753,23 @@ _CONTEXT_CHROME_BLOCKS = ("Updated plan", "User answered Claude's questions")
 # Upper bound on the upward scan for the block start — a prose block before a
 # menu is short; anything larger is a runaway and must not be carried.
 _CONTEXT_SCAN_LIMIT = 120
+# #633: a finished tool block folds, on every redraw, into ONE indented summary
+# line — "Ran 2 shell commands", "Read 4 files", "Searched for 3 patterns, read
+# 1 file, ran 6 shell commands".  It is indented exactly like a prose
+# continuation, so the upward walk used to step straight over it and attach the
+# ``●`` block from *before* the tool call to this menu.  That block is not the
+# menu's 経緯: the CLI only buffers the jsonl chunk that carries the menu, so
+# anything separated from the menu by a completed tool block has already been
+# delivered by the transcript mirror.  Carrying it re-posted a two-day-old
+# answer as "new" (thread 1508626302813601843: the same 1900-character message
+# posted on 2026-08-26 and again on 2026-08-28).  Treat it as a block boundary.
+#
+# Shape, not vocabulary: a comma-joined list of "<verb> [for] <N> <noun…>"
+# clauses and nothing else. Prose that happens to start with an English verb
+# does not match, because the whole line has to be that list.
+_FOLDED_CLAUSE = r"[A-Za-z][a-z]+(?:\s+for)?\s+\d+\s+[a-z][a-z ]*"
+_FOLDED_TOOL_SUMMARY_RE = re.compile(rf"^{_FOLDED_CLAUSE}(?:,\s*{_FOLDED_CLAUSE})*$")
+
 # Chrome that can be painted INSIDE the walked-up region during a mid-redraw
 # ghost frame (#32 class). Any hit kills the whole extraction — fail closed.
 _CONTEXT_INTERIOR_BAIL = (
@@ -800,6 +817,10 @@ def _extract_pane_context(lines: list[str], boundary_idx: int) -> str:
             start = j
             break
         if s.startswith(("❯", "⎿", "●")) or "☐" in s or _ASK_SIGNATURE in s or _PLAN_SIGNATURE in s:
+            return ""
+        # A folded tool block ends this menu's own block: everything above it
+        # has already reached Discord through the mirror (#633).
+        if _FOLDED_TOOL_SUMMARY_RE.match(s):
             return ""
     if start < 0:
         return ""

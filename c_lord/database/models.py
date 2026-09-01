@@ -84,10 +84,33 @@ CREATE TABLE IF NOT EXISTS thread_repo_bindings (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+-- #633: menus the #359 watchdog has already posted to a thread. In memory this
+-- ledger was wiped by every bot restart, so a stranded menu was re-posted on
+-- each new process (188 re-bridges of one thread; the same embed six times over
+-- three days). A row is deleted only when a sweep sees the pane with no menu.
+CREATE TABLE IF NOT EXISTS menu_bridges (
+    thread_id        INTEGER NOT NULL,
+    fingerprint      TEXT    NOT NULL,
+    posts            INTEGER NOT NULL DEFAULT 0,
+    first_bridged_at TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    last_bridged_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    PRIMARY KEY (thread_id, fingerprint)
+);
 """
 
 # Migrations for existing databases that lack new columns.
 _MIGRATIONS = [
+    # #633: durable "already bridged" ledger for the menu watchdog.
+    (
+        "CREATE TABLE IF NOT EXISTS menu_bridges ("
+        "thread_id INTEGER NOT NULL, "
+        "fingerprint TEXT NOT NULL, "
+        "posts INTEGER NOT NULL DEFAULT 0, "
+        "first_bridged_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
+        "last_bridged_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
+        "PRIMARY KEY (thread_id, fingerprint))"
+    ),
     "ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'discord'",
     "ALTER TABLE sessions ADD COLUMN summary TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id)",
