@@ -28,7 +28,11 @@ from ..claude.context_usage import (
     format_context_line,
     read_latest_usage,
 )
-from ..claude.tmux_runner import NO_RESPONSE_ERROR_PREFIX, TmuxClaudeRunner
+from ..claude.tmux_runner import (
+    NO_RESPONSE_ERROR_PREFIX,
+    TRUST_STUCK_ERROR_PREFIX,
+    TmuxClaudeRunner,
+)
 from ..claude.types import UsageLimit
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
@@ -39,6 +43,7 @@ from ..discord_ui.embeds import (
     error_embed,
     no_response_embed,
     timeout_embed,
+    trust_stuck_embed,
     usage_limit_embed,
 )
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
@@ -85,6 +90,11 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # retry something that cannot succeed until the limit resets.
     if usage_limit is not None:
         return usage_limit_embed(usage_limit)
+    # #630: checked before the timeout/no-response embeds because it is the one
+    # outcome that knows what blocked the turn — the others would send the
+    # reader looking anywhere but the pane the dialog is still open in.
+    if error.startswith(TRUST_STUCK_ERROR_PREFIX):
+        return trust_stuck_embed(error)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))

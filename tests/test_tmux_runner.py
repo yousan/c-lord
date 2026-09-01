@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from c_lord.claude.tmux_runner import (
+    _TRUST_ACCEPT_MAX_ATTEMPTS,
     NO_RESPONSE_ERROR_PREFIX,
+    TRUST_STUCK_ERROR_PREFIX,
     USAGE_LIMIT_ERROR_PREFIX,
     TmuxClaudeRunner,
     _clean_tui_lines,
@@ -4541,3 +4543,194 @@ class TestUsageLimitRepeatDetection:
         result = [e for e in events if e.is_complete]
         assert result[0].usage_limit is not None
         assert result[0].usage_limit.scope == "weekly limit"
+
+
+# -- #630: the trust dialog must be accepted once, not 178 times ----------------
+
+
+class TestTrustPromptResidue:
+    """#630: a dialog left on a pane where ``claude`` already exited is DEAD.
+
+    Reported as "the 500-line scrollback keeps the accepted dialog matchable".
+    Measured on the shipped CLI, that is not what happens — the TUI redraws in
+    place and an accepted dialog leaves no trace at all. What does happen:
+
+    ``_navigate_menu`` lands the cursor on "No, exit", Enter quits ``claude``,
+    and because the CLI does not use the alternate screen the dialog stays
+    *printed* on the terminal with a shell prompt under it. Detection then
+    matches forever, and every Enter into the dead shell prints a new prompt —
+    which counts as pane activity, so the ``timeout_seconds`` backstop can never
+    fire either. The storm ends only when the text scrolls off the top, after
+    which the pane finally freezes and the turn dies on the idle timeout. That
+    is the reported 178 accepts in 2m20s followed by ``Idle timeout (60.5s)``.
+
+    Both fixtures are real captures of Claude Code 2.1.252.
+    """
+
+    def test_residue_after_claude_exited_is_not_a_live_prompt(self) -> None:
+        """RED before the fix: returns True and the loop hammers Enter forever."""
+        pane = _load_fixture("trust_prompt_residue_after_exit.txt")
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is False
+
+    def test_live_dialog_is_still_detected(self) -> None:
+        """The fix must not cost us the real dialog — that would strand every turn.
+
+        Note this capture also has a shell prompt in it (the command line that
+        launched claude, above the dialog), so the rule cannot be "no shell
+        prompt anywhere" — only what sits BELOW the dialog decides.
+        """
+        pane = _load_fixture("trust_prompt_live_v2_1_252.txt")
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is True
+
+    def test_legacy_top_anchored_fixture_still_detected(self) -> None:
+        pane = _load_fixture("trust_prompt_at_top.txt")
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is True
+
+
+class TestTrustPromptResendGuard:
+    """#630 AC1/AC4: accept a dialog once, and say so when it will not close."""
+
+    @staticmethod
+    def _live_dialog() -> str:
+        return _load_fixture("trust_prompt_live_v2_1_252.txt")
+
+    @pytest.mark.asyncio
+    async def test_a_dialog_that_never_closes_is_accepted_a_bounded_number_of_times(
+        self, runner, tmux_manager
+    ) -> None:
+        """RED: unbounded — the reporter's journal shows 178 accepts in 140s."""
+        tmux_manager.capture_pane.return_value = self._live_dialog()
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_keys.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._TRUST_ACCEPT_SETTLE", 0.0),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            _ = [e async for e in runner.run("do the thing")]
+
+        enters = [
+            c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]
+        ]
+        assert len(enters) <= _TRUST_ACCEPT_MAX_ATTEMPTS, (
+            f"accepted {len(enters)} times — this is the #630 keystroke storm"
+        )
+
+    @pytest.mark.asyncio
+    async def test_giving_up_tells_discord_instead_of_idling_out(
+        self, runner, tmux_manager
+    ) -> None:
+        """AC4: the turn must not die as a silent 'no response'."""
+        tmux_manager.capture_pane.return_value = self._live_dialog()
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_keys.return_value = True
+
+        runner.timeout_seconds = 60
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._TRUST_ACCEPT_SETTLE", 0.0),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("do the thing")]
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is not None
+        assert result[0].error.startswith(TRUST_STUCK_ERROR_PREFIX), result[0].error
+        # It must NOT be reported as "nothing happened, send it again".
+        assert not result[0].error.startswith(NO_RESPONSE_ERROR_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_a_dialog_that_closes_is_accepted_once(
+        self, runner, tmux_manager
+    ) -> None:
+        """The normal path must stay a single Enter — no regression."""
+        dialog = self._live_dialog()
+        idle = _load_fixture("input_box_empty.txt")
+        captures = [dialog, dialog]
+
+        def _capture(*_a, **_k):
+            return captures.pop(0) if captures else idle
+
+        tmux_manager.capture_pane.side_effect = _capture
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_keys.return_value = True
+
+        # The idle pane never changes again, so only the inactivity backstop can
+        # end this turn — keep it short rather than burning the production 60s.
+        runner.timeout_seconds = 1
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._TRUST_ACCEPT_SETTLE", 0.0),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            events = [e async for e in runner.run("do the thing")]
+
+        enters = [
+            c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]
+        ]
+        assert len(enters) == 1, enters
+        result = [e for e in events if e.is_complete]
+        assert not (result[0].error or "").startswith(TRUST_STUCK_ERROR_PREFIX)
+
+
+class TestTrustStuckEmbed:
+    """#630 AC4: the abort has to be visible, and say what to do about it."""
+
+    def test_embed_names_the_dialog_and_the_next_step(self) -> None:
+        from c_lord.discord_ui.embeds import trust_stuck_embed
+
+        embed = trust_stuck_embed(
+            f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog did not close."
+        )
+        body = f"{embed.title}\n{embed.description}"
+        assert "信頼" in body, body
+        # The pane is where the stuck dialog is, so point the reader at it.
+        assert "/clord-attach" in body or "tmux" in body, body
+
+    def test_error_router_prefers_the_trust_embed(self) -> None:
+        from c_lord.cogs._run_helper import _make_error_embed
+
+        embed = _make_error_embed(
+            f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog did not close."
+        )
+        assert "❌ Error" not in (embed.title or ""), embed.title
+        assert "応答がありませんでした" not in (embed.title or "")
+
+    @pytest.mark.asyncio
+    async def test_stuck_turn_is_not_announced_as_finished(self) -> None:
+        """A turn blocked on the dialog produced nothing — do not ping "finished"."""
+        from unittest.mock import AsyncMock
+
+        from c_lord.claude.types import StreamEvent
+        from c_lord.cogs.event_processor import EventProcessor
+
+        thread = MagicMock()
+        thread.send = AsyncMock(return_value=MagicMock())
+        config = MagicMock()
+        config.thread = thread
+        config.status = None
+        config.repo = None
+        config.outcome.no_response = False
+        processor = EventProcessor(config)
+        processor._fold_progress = AsyncMock()  # type: ignore[method-assign]
+
+        await processor.process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                error=f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog did not close.",
+            )
+        )
+        assert config.outcome.no_response is True
