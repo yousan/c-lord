@@ -132,6 +132,9 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # ✅ confirm button (#418); single-select delivers immediately.
         self._multi_select = question.multi_select
         self._selected_values: list[str] = []
+        # #672: the Select is kept so a recorded choice can be written back into
+        # it as ``default=True`` — see _multi_select_record.
+        self._select: discord.ui.Select | None = None
 
         options = question.options
         use_select = question.multi_select or len(options) > 4
@@ -155,6 +158,7 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             select.callback = (
                 self._multi_select_record if question.multi_select else self._select_callback
             )
+            self._select = select
             self.add_item(select)
         elif options:
             for i, opt in enumerate(options[:4]):
@@ -260,28 +264,109 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
 
     async def _multi_select_record(self, interaction: discord.Interaction) -> None:
         """Record a multiSelect choice WITHOUT delivering — the user submits via
-        the ✅ confirm button (#418).  Echo the running selection so it is clear
-        what will be sent."""
-        self._selected_values = interaction.data.get("values", [])  # type: ignore[union-attr]
+        the ✅ confirm button (#418).
+
+        The choice is written **into the message** as ``default=True`` on the
+        chosen options, not just into ``self._selected_values`` (#672).  An
+        instance attribute is reachable only from the one View object in the one
+        process that rendered the menu, and three ordinary routes reach ✅ 確定
+        without it: a dropdown whose interaction never fired (a mobile sheet
+        dismissed without submitting), a confirm processed before the record,
+        and a *different* View instance entirely (the restart-restored view of
+        #671, a watchdog re-bridge of #633).  All three produced the same
+        silence — press ✅ 確定, nothing happens, not one line in the log.
+
+        Marking the options also fixes what the user sees: Discord re-renders
+        the Select on every edit, so a recorded choice used to disappear from
+        the dropdown and read as "my selection did not take".
+        """
+        self._selected_values = list(interaction.data.get("values", []))  # type: ignore[union-attr]
+        self._mark_selected(self._selected_values)
         chosen = ", ".join(self._selected_values) or "（未選択）"
+        logger.info(
+            "AskView: recorded multiSelect choice %r for thread %d (#672)",
+            self._selected_values,
+            self._thread_id,
+        )
         # Full-size, not Discord's grey ``-#`` small text (#536): "picked but not
         # submitted" is the state users mistook for "submitted and ignored", so
         # it has to be the loudest thing on the message, not the quietest.
+        #
+        # ``view=self`` is load-bearing: without it the default marks above are
+        # never sent to Discord and the selection stays process-local (#672).
         await interaction.response.edit_message(
             content=(
                 f"🔲 **選択中:** {chosen}\n"
                 "**まだ送信されていません** — 下の「✅ 確定」を押すと Claude に届きます。"
             ),
+            view=self,
         )
 
+    def _mark_selected(self, values: list[str]) -> None:
+        """Mark exactly *values* as ``default`` on this View's Select (#672)."""
+        if self._select is None:
+            return
+        chosen = set(values)
+        for option in self._select.options:
+            option.default = option.value in chosen
+
+    def _recover_selection(self, interaction: discord.Interaction) -> list[str]:
+        """The choice recorded on the message, when this View does not hold it (#672).
+
+        Discord echoes a message's components back on every interaction it
+        carries, so the ``default=True`` marks written by
+        :meth:`_multi_select_record` are readable here even when the recording
+        happened in another View instance — or another process.
+        """
+        if self._select is None:
+            return []
+        message = getattr(interaction, "message", None)
+        # Only ever deliver something this question actually offers.  The marks
+        # are bot-authored (a user cannot edit a bot message's components), but
+        # the answer they feed becomes keystrokes in a live pane, so the option
+        # set stays the authority rather than whatever the message happens to
+        # carry.
+        offered = {option.value for option in self._select.options}
+        for row in getattr(message, "components", None) or ():
+            for child in getattr(row, "children", None) or ():
+                if getattr(child, "custom_id", None) != self._select.custom_id:
+                    continue
+                return [
+                    option.value
+                    for option in getattr(child, "options", None) or ()
+                    if getattr(option, "default", False) and option.value in offered
+                ]
+        return []
+
     async def _confirm_callback(self, interaction: discord.Interaction) -> None:
-        """Deliver the recorded multiSelect choice when ✅ 確定 is pressed (#418)."""
-        if not self._selected_values:
+        """Deliver the recorded multiSelect choice when ✅ 確定 is pressed (#418).
+
+        Falls back to the selection stored on the message when this View has
+        none of its own (#672) — see :meth:`_recover_selection`.  Every outcome
+        is logged: the silence of this path is what hid the incident, because
+        the only trace was the *absence* of a keystroke log downstream (#585).
+        """
+        values = self._selected_values or self._recover_selection(interaction)
+        if not values:
+            logger.info(
+                "AskView: ✅ confirm pressed with nothing selected for thread %d "
+                "— nothing delivered (#672)",
+                self._thread_id,
+            )
             await interaction.response.send_message(
-                "1つ以上選択してから「✅ 確定」を押してください。", ephemeral=True
+                "1つ以上選択してから「✅ 確定」を押してください。"
+                "（プルダウンで選び、選択が「🔲 選択中:」に出てから押してください）",
+                ephemeral=True,
             )
             return
-        await self._deliver(interaction, self._selected_values)
+        recovered = not self._selected_values
+        logger.info(
+            "AskView: ✅ confirm pressed for thread %d — delivering %r%s (#672)",
+            self._thread_id,
+            values,
+            " (recovered from the message)" if recovered else "",
+        )
+        await self._deliver(interaction, values)
 
     async def _other_callback(self, interaction: discord.Interaction) -> None:
         modal = AskModal(title="Your answer")

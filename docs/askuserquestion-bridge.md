@@ -82,7 +82,10 @@ C案 — いったん保留
   (#418): the select only *records* the choice, the button *submits* it. Without
   it the only way to submit was Discord's dismiss-the-dropdown gesture, which is
   undiscoverable — users reported "no way to confirm after picking". Single-select
-  keeps immediate delivery (one pick = done, no confirm button).
+  keeps immediate delivery (one pick = done, no confirm button). The recorded
+  choice is stored **on the message** so the button can submit it even when the
+  View that receives the press never saw the dropdown — see
+  [Where the pending choice is kept](#where-the-pending-choice-is-kept-672).
 
 ## How a click is answered
 
@@ -125,6 +128,41 @@ defaults to submit, so a final `Enter` records **every** toggled value. Keys are
 spaced by `_MENU_NAV_DELAY` (#171). Free text from `✏️ Other` in a multi-select
 question still goes through the single free-text path below (Other yields one
 typed string, not toggled options).
+
+### Where the pending choice is kept (#672)
+
+**The choice lives on the Discord message, not in the bot's memory.** When the
+dropdown fires, `_multi_select_record` marks the chosen options `default=True`
+on the Select and re-sends the view (`edit_message(..., view=self)`), so Discord
+itself stores what was picked. `_confirm_callback` prefers its in-memory copy
+and falls back to reading those marks back off `interaction.message.components`.
+
+It used to keep the choice **only** in `AskView._selected_values` — an attribute
+of the one View object in the one process that rendered the menu — and `✅ 確定`
+returned silently when that was empty. Three ordinary routes reach the button
+with it empty, and all three looked identical to the user (press it, nothing
+happens, not one line in the bot log):
+
+| route | why the attribute is empty |
+|---|---|
+| the dropdown's interaction never fired | a mobile select sheet dismissed without submitting — nothing was ever recorded |
+| confirm is processed before the record | picking and pressing `✅ 確定` immediately races |
+| a **different** View instance receives the confirm | the restart-restored view (#671), a watchdog re-bridge (#633) |
+
+Routes 2 and 3 are now recovered from the message. Route 1 cannot be — the bot
+never learned the selection — so it gets the one honest outcome: an ephemeral
+saying to pick until `🔲 選択中:` appears, **and a log line**. Every confirm
+press now logs what it delivered, or why it delivered nothing (#585); the
+incident that motivated this was invisible precisely because the only trace was
+the *absence* of a keystroke log downstream.
+
+Marking the options also fixes what the user sees. Discord re-renders a Select
+on every message edit, so a recorded choice used to vanish from the dropdown and
+read as "my selection did not take" — now it stays checked.
+
+> Interaction with #671: a restored view starts with an empty
+> `_selected_values`, so this fallback is what lets it confirm correctly. The
+> selection needs no DB column — it is already on the message.
 
 ## How free text (`✏️ Other`) is answered (#172, #650)
 
@@ -361,7 +399,8 @@ thread has to say what happened to it. It used to say almost nothing:
 | not delivered | an **ephemeral** "⚠️ The bot was restarted…" — only the clicker saw it, gone on refresh | a normal message in the thread naming the **actual** cause |
 | buttons on failure | **stayed live** | removed |
 | other copies of the menu | stayed live | blanked out |
-| multiSelect, chosen but not submitted | grey `-# 🔲 選択中: …` | full-size **まだ送信されていません** |
+| multiSelect, chosen but not submitted | grey `-# 🔲 選択中: …` | full-size **まだ送信されていません**, and the picks stay checked in the dropdown (#672) |
+| multiSelect `✅ 確定` pressed | delivered only if *this* View object held the choice, else silence | delivered from the choice stored on the message; every outcome logged (#672) |
 
 **Why the old failure notice was worse than nothing.** `post_answer` returning
 False only means "no waiter is registered right now". The view treated that as
@@ -681,4 +720,5 @@ from Claude Code v2.1.252.
 | 経緯 stops at a folded tool block (#633) | `tmux_runner.py::_FOLDED_TOOL_SUMMARY_RE`, fixture `tests/fixtures/panes/i633_stale_prose_above_folded_tool.txt` |
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
+| Multi-select choice stored on the message | `ask_view.py::AskView._mark_selected` / `_recover_selection` (#672) |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |
