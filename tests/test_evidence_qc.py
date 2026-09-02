@@ -72,10 +72,16 @@ def _modal_frame(size: tuple[int, int] = (1600, 1500)) -> Image.Image:
     """The good frame under Discord's modal backdrop, with a centred card."""
     w, h = size
     base = _good_frame(size)
-    # Discord's backdrop is ~85% black composited over the app.
-    dimmed = base.point(lambda v: int(v * 0.15))
+    # Discord's own dark-theme scrim, read out of the shipped stylesheet on
+    # 2026-09-01: `--background-scrim: hsl(var(--opacity-black-72-hsl)/0.72)`,
+    # i.e. 72% black composited over the app — so 28% of each channel gets
+    # through. Keep this tied to the measured value, not to a round number:
+    # the whole modal check rests on it (#559).
+    dimmed = base.point(lambda v: int(v * 0.28))
     d = ImageDraw.Draw(dimmed)
-    cw, ch = 600, 825
+    # .sizeMedium_ab9bdf{width:600px} / .medium__49fc1{max-height:800px} —
+    # fixed px, which is why a taller window shows more of the page around it.
+    cw, ch = 600, 800
     x0, y0 = (w - cw) // 2, (h - ch) // 2
     d.rounded_rectangle((x0, y0, x0 + cw, y0 + ch), radius=12, fill=_COMPOSER_BG)
     _text_rows(d, x0 + 40, x0 + cw - 40, y0 + 40, y0 + ch - 40, seed=4)
@@ -151,6 +157,24 @@ def test_findings_carry_a_human_readable_reason(tmp_path: Path) -> None:
     # The operator has to learn that a human closes it once, for everyone.
     assert "モーダル" in finding.summary
     assert finding.detail  # measured numbers, so a threshold can be argued with
+
+
+def test_modal_backdrop_separation_matches_the_measurement(tmp_path: Path) -> None:
+    """The modal check rests on one number — pin it so a drift is visible.
+
+    Real captures taken 2026-09-01 put ``luma<16`` at 0.0019-0.0041 on usable
+    frames; under Discord's 72% scrim it is 0.75. The threshold sits at 0.35,
+    two orders of magnitude away from a clean frame either way.
+    """
+    qc = _load_qc()
+    from PIL import Image
+
+    clean = Image.open(_save(_good_frame(), tmp_path / "clean.png")).convert("L")
+    modal = Image.open(_save(_modal_frame(), tmp_path / "modal.png")).convert("L")
+
+    assert qc._dim_ratio(clean) < 0.01
+    assert qc._dim_ratio(modal) > 0.5
+    assert qc._MODAL_DIM_RATIO == 0.35
 
 
 def test_checks_survive_a_tall_window(tmp_path: Path) -> None:
