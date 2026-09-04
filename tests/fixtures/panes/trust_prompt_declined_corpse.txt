@@ -1,0 +1,26 @@
+env -u CLAUDECODE CLAUDE_CONFIG_DIR=/tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1545299182972051486/77bac50f-6c8f-4b3e-b771-d02e97bb496c/scratchpad/i684/cfg260 /home/yousan/.local/bin/claude --model sonnet --permission-mode acceptEdits 'Reply with exactly: OK'
+
+yousan @ tachikoma1.l2tporg in ~/tmp-i684/noexit-1788505573 
+$ env -u CLAUDECODE CLAUDE_CONFIG_DIR=/tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1545299182972051486/77bac50f-6c8f-4b3e-b771-d02e97bb496c/scratchpad/i684/cfg260 /home/yousan/.local/bin/claude --model sonnet --permissi
+on-mode acceptEdits 'Reply with exactly: OK'
+
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /home/yousan/tmp-i684/noexit-1788505573
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide (https://code.claude.com/docs/en/security)
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+yousan @ tachikoma1.l2tporg in ~/tmp-i684/noexit-1788505573 
+$ 

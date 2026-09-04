@@ -264,6 +264,34 @@ def trust_stuck_embed(detail: str) -> discord.Embed:
     )
 
 
+def trust_start_failed_embed(detail: str) -> discord.Embed:
+    """Embed for a trust dialog that was answered but left no ``claude`` (#684).
+
+    Deliberately NOT :func:`trust_stuck_embed`: that one tells the reader a
+    dialog is sitting open in the pane, and here it is not — it was answered and
+    the process is gone. Sending someone to look for an open dialog that closed
+    two minutes ago is the same class of misdirection #630 fixed. The generic
+    "possible startup failure or crash" is no better: seven production threads
+    ended on it and every reader went looking for a crash that never happened.
+    """
+    return discord.Embed(
+        title="\u26a0\ufe0f 信頼ダイアログの応答に失敗しました",
+        description=(
+            f"{detail}\n\n"
+            "作業ディレクトリを信頼するダイアログ（`Yes, I trust this folder`）に答えたあと、"
+            "`claude` が起動していませんでした。起動し直しても同じだったので、"
+            "このターンは走っていません。\n\n"
+            "**確認すること:**\n"
+            "\u2022 `/clord-attach` (または tmux) でペインを開き、ダイアログが残っていないか／"
+            "シェルに戻っていないかを見る\n"
+            "\u2022 Claude Code の版が上がってダイアログの形が変わっていないか"
+            " (`claude --version`)\n"
+            "\u2022 復旧したらもう一度送る"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def usage_limit_embed(limit: UsageLimit) -> discord.Embed:
     """Embed for a turn Claude refused because the account is rate limited (#631).
 

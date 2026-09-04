@@ -83,6 +83,25 @@ _TRUST_ACCEPT_MAX_ATTEMPTS = 3
 # deciding it is still up (seconds).  Without a settle the poll interval
 # alone (0.5s) would count normal redraw latency as a failed accept.
 _TRUST_ACCEPT_SETTLE = 2.0
+
+# Prefix of the RESULT error for "the folder-trust dialog was answered but left
+# no running claude" (#684).  Distinct from TRUST_STUCK (the dialog never
+# closed) and from the generic "Claude exited without producing a response":
+# both of those send the reader looking for a crash, when what actually
+# happened is that the dialog swallowed the turn.
+TRUST_START_FAILED_ERROR_PREFIX = "Trust prompt not accepted —"
+
+# How many times a thread may be restarted when answering the folder-trust
+# dialog leaves nothing running (#684).  A restart costs seconds, not a
+# keystroke, so this is deliberately smaller than the accept budget; two tries
+# cover a transient loss and stop well short of a restart loop.
+_TRUST_RESTART_MAX_ATTEMPTS = 2
+
+# How many Downs may be sent while steering the trust dialog's cursor onto
+# "Yes, I trust this folder" (#684).  Each one is re-read off the pane before
+# the next, so this is a ceiling on a loop that normally runs once — not a
+# blind repeat count.
+_TRUST_NAV_MAX_DOWNS = 3
 # Prefix of the RESULT error for "Claude is rate limited" (#631).  A separate
 # outcome from NO_RESPONSE on purpose: both produce an empty turn, but only
 # one of them gets better if you send the message again.
@@ -1517,6 +1536,14 @@ class TmuxClaudeRunner:
         trust_accepts = 0
         trust_signature: str | None = None
         trust_stuck = False
+        # #684: whether a folder-trust dialog was answered on this turn but the
+        # resulting claude has not been confirmed alive yet, and how many times
+        # it has been restarted because it was not.  Answering the dialog "No"
+        # exits claude silently, and the corpse pane stops matching the dialog —
+        # so "the dialog is gone" is not evidence that anything is running.
+        trust_answered = False
+        trust_restarts = 0
+        trust_start_failed = False
         # Plan limit scraped from the pane (#631).  Set when Claude refuses the
         # turn because the account is rate limited; surfaced as the RESULT
         # outcome so Discord reports the reset time instead of telling the user
@@ -1655,13 +1682,68 @@ class TmuxClaudeRunner:
                     trust_stuck = True
                     break
                 trust_accepts += 1
-                await self._accept_trust_prompt(current)
+                if await self._accept_trust_prompt(current):
+                    trust_answered = True
                 # Give the TUI time to redraw before judging the accept failed;
                 # the poll interval alone is shorter than a normal redraw.
                 await asyncio.sleep(_TRUST_ACCEPT_SETTLE)
                 continue
             trust_signature = None
             trust_accepts = 0
+
+            # #684: the dialog is off the pane — but did answering it leave a
+            # claude behind?  A declined dialog exits claude and leaves a corpse
+            # that no longer matches ``_has_trust_prompt``, so the loop used to
+            # sail past here and wait out the whole ``_TURN_START_GRACE`` before
+            # reporting "possible startup failure or crash".  Ask instead of
+            # assuming, and restart rather than wait.  Gated on
+            # ``not new_turn_started`` so this can only fire in the startup
+            # window — a claude that exits *after* answering is the normal
+            # end-of-turn case the final verdict already handles.
+            if trust_answered and not new_turn_started:
+                # ``pane_command_is_dead`` rather than ``not is_claude_running``
+                # (#510's asymmetry): the latter folds "no window" and "tmux
+                # hiccup" into False, and acting on *don't know* here would type
+                # a fresh ``claude`` command line into a claude that is in fact
+                # alive — i.e. send the start-up command to it as a message.
+                # Only a positively-read non-claude foreground process restarts.
+                command = await asyncio.to_thread(
+                    self._tmux.pane_foreground_command, self._thread_id
+                )
+                if not pane_command_is_dead(command):
+                    trust_answered = False
+                elif trust_restarts >= _TRUST_RESTART_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Trust dialog answered but the pane runs %r after %d "
+                        "restart(s), giving up (thread=%d)",
+                        command,
+                        trust_restarts,
+                        self._thread_id,
+                    )
+                    trust_start_failed = True
+                    break
+                else:
+                    trust_restarts += 1
+                    logger.warning(
+                        "Trust dialog answered but the pane runs %r, not claude — "
+                        "restarting it (attempt %d/%d, thread=%d) (#684)",
+                        command,
+                        trust_restarts,
+                        _TRUST_RESTART_MAX_ATTEMPTS,
+                        self._thread_id,
+                    )
+                    await asyncio.to_thread(
+                        self._tmux.start_claude,
+                        self._thread_id,
+                        prompt,
+                        self.model,
+                        permission_mode=self._permission_mode,
+                        dangerously_skip_permissions=self._dangerously_skip_permissions,
+                        try_continue=False,
+                        effort=self._effort,
+                    )
+                    trust_answered = False
+                    continue
 
             # Auto-accept permission prompts so the bot doesn't stall.
             if self._has_permission_prompt(current):
@@ -1930,6 +2012,17 @@ class TmuxClaudeRunner:
                     f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog "
                     f'("Yes, I trust this folder") did not close after '
                     f"{_TRUST_ACCEPT_MAX_ATTEMPTS} attempts, so this turn never ran."
+                )
+            elif trust_start_failed:
+                # #684: sits with #630 above the generic rungs for the same
+                # reason — this one knows what swallowed the turn. "Claude
+                # exited without producing a response" sent seven readers
+                # looking for a crash that never happened.
+                error = (
+                    f"{TRUST_START_FAILED_ERROR_PREFIX} the folder-trust dialog "
+                    f'("Yes, I trust this folder") was answered, but no claude was '
+                    f"running afterwards and {_TRUST_RESTART_MAX_ATTEMPTS} restart(s) "
+                    "did not change that, so this turn never ran."
                 )
             elif pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
@@ -2294,16 +2387,12 @@ class TmuxClaudeRunner:
         return bool(_TRUST_PROMPT_RE.search(text))
 
     @staticmethod
-    def _trust_option_offset(text: str) -> int:
-        """Downs needed to move the cursor onto "Yes, I trust this folder".
-
-        Returns 0 for the pre-2.1.248 dialog (the cursor already starts on
-        "1. Yes, I trust this folder") and 1 for the current one, whose options
-        are unnumbered with "❯ No, exit" selected by default.
+    def _trust_option_block(text: str) -> list[tuple[bool, str]]:
+        """The live dialog's option lines as ``(is_selected, label)``.
 
         Only the LAST contiguous run of option lines counts: the runner captures
         ~500 lines of scrollback, which may hold an older copy of the dialog
-        above the live one.
+        above the live one.  Empty when nothing parses.
         """
         block: list[tuple[bool, str]] = []
         run: list[tuple[bool, str]] = []
@@ -2321,6 +2410,30 @@ class TmuxClaudeRunner:
                 run = []
         if run:
             block = run
+        return block
+
+    @classmethod
+    def _trust_cursor_label(cls, text: str) -> str | None:
+        """Which trust option the cursor sits on, or ``None`` when unreadable.
+
+        ``None`` is a real answer and not an error: it means the pane could not
+        be parsed, which must never be treated as "the cursor is on No" — see
+        :meth:`_accept_trust_prompt`.
+        """
+        block = cls._trust_option_block(text)
+        if not block:
+            return None
+        return next((label for selected, label in block if selected), None)
+
+    @classmethod
+    def _trust_option_offset(cls, text: str) -> int:
+        """Downs needed to move the cursor onto "Yes, I trust this folder".
+
+        Returns 0 for the pre-2.1.248 dialog (the cursor already starts on
+        "1. Yes, I trust this folder") and 1 for the current one, whose options
+        are unnumbered with "❯ No, exit" selected by default.
+        """
+        block = cls._trust_option_block(text)
         if not block:
             return 0
         cursor_idx = next((i for i, (sel, _) in enumerate(block) if sel), 0)
@@ -2388,7 +2501,7 @@ class TmuxClaudeRunner:
         # confuse users with a duplicate warning alongside the real Discord UI.
         return not any(marker in zone for marker in _KNOWN_INTERACTIVE_MARKERS)
 
-    async def _accept_trust_prompt(self, pane_text: str = "") -> None:
+    async def _accept_trust_prompt(self, pane_text: str = "") -> bool:
         """Accept the folder-trust dialog by selecting "Yes, I trust this folder".
 
         Which keys do that depends on the Claude Code version: the older dialog
@@ -2396,12 +2509,57 @@ class TmuxClaudeRunner:
         starts on "No, exit" (Down, then Enter).  Passing the pane text lets the
         offset be read off the live dialog instead of assumed — confirming the
         wrong default makes Claude exit without ever starting the turn.
+
+        #684: when a Down is needed, the cursor is **re-read off the pane before
+        Enter is pressed** rather than assumed to have moved.  On the current
+        dialog an Enter that arrives with the cursor still on "No, exit" does not
+        merely fail — it answers *No*, and claude exits without writing a line,
+        leaving a pane that no longer matches the dialog and a turn that waits
+        out the whole start grace before reporting a generic crash.  Seven
+        production threads died that way.  ``_navigate_menu``'s docstring already
+        records that this TUI drops navigation keystrokes (#171); this is the
+        place where dropping one is expensive, so it is the place that checks.
+
+        The guard fires **only on a positive reading of "No, exit"**. An
+        unreadable menu falls through to Enter exactly as before: refusing to
+        confirm whenever the parser is unsure would turn every future dialog
+        shape it cannot read into a permanent stall, which is a worse failure
+        than the one being fixed.
+
+        Returns True when Enter was sent, False when it was deliberately
+        withheld (the caller's accept budget still counts the attempt, so a
+        dialog that can never be steered still ends in the #630 abort).
         """
         offset = self._trust_option_offset(pane_text)
         logger.info(
             "Trust prompt detected, accepting (down=%d, thread=%d)", offset, self._thread_id
         )
-        await self._navigate_menu(offset)
+        if offset <= 0:
+            # Cursor already on "Yes" (the numbered dialog): a bare Enter, and
+            # nothing to verify — there is no navigation that could be lost.
+            await self._navigate_menu(0)
+            return True
+
+        label: str | None = None
+        for _ in range(_TRUST_NAV_MAX_DOWNS):
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.sleep(_MENU_NAV_DELAY)
+            pane = _normalize_capture(
+                await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            )
+            label = self._trust_cursor_label(pane)
+            if label is None or label.startswith("Yes"):
+                await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
+                return True
+
+        logger.warning(
+            "Trust prompt: cursor still on %r after %d Down(s) — withholding Enter, "
+            "which would decline trust and exit claude (#684) (thread=%d)",
+            label,
+            _TRUST_NAV_MAX_DOWNS,
+            self._thread_id,
+        )
+        return False
 
     async def _dismiss_usage_limit_menu(self, pane_text: str) -> None:
         """Close the limit's "What do you want to do?" menu, if it is open (#631).
