@@ -12,13 +12,26 @@ deployment, not on the code:
 
 ``CLORD_OWNER_FALLBACK`` picks the policy:
 
-===========  ==========================  ==============================
-value        turn-end 🟡 (``completion``)  interactive pause (``blocked``)
-===========  ==========================  ==============================
-``all``      owner                       owner
-``blocked``  — (silent)                  owner            ← default
-``off``      — (silent)                  — (silent)
-===========  ==========================  ==============================
+===========  ==============  =============  =============
+value        turn-end 🟡      parked turn    broken turn
+             ``completion``  ``blocked``    ``failure``
+===========  ==============  =============  =============
+``all``      owner           owner          owner
+``blocked``  — (silent)      owner          owner          ← default
+``off``      — (silent)      — (silent)     — (silent)
+===========  ==============  =============  =============
+
+``failure`` is its own rung (#681). Before it existed, a turn that never ran
+was reported as a ``completion``, so the default mode — the one chosen to mute
+routine "Claude has finished" pings — muted the one outcome nobody else would
+notice. #677 and #678 were each dispatched, died at startup, and sat unread for
+two days under exactly this setting. "Quiet when it works, loud when it breaks"
+was not expressible in the old two-kind table; it is the default now.
+
+``off`` still means off, failures included: it is the bottom rung of a ladder
+and the only setting that promises silence, so a failure ping that ignored it
+would leave no way to turn the fallback off at all. A deployment that set
+``off`` to escape the 🟡 flood wants ``blocked`` instead.
 
 This governs the **fallback only**. A turn a person actually asked for always
 mentions that person, in every mode (#481).
@@ -31,8 +44,9 @@ from typing import Literal
 
 #: Kinds of mention this policy governs. ``completion`` is the turn-end 🟡
 #: message; ``blocked`` is a permission / plan / elicitation / AskUserQuestion
-#: prompt that has the turn parked until someone answers.
-Kind = Literal["completion", "blocked"]
+#: prompt that has the turn parked until someone answers; ``failure`` is a turn
+#: that ended in an error — it never started, it crashed, it timed out (#681).
+Kind = Literal["completion", "blocked", "failure"]
 
 ENV_VAR = "CLORD_OWNER_FALLBACK"
 DEFAULT_MODE = "blocked"
@@ -57,7 +71,9 @@ def owner_fallback_allowed(kind: Kind) -> bool:
         return False
     if mode == "all":
         return True
-    return kind == "blocked"
+    # ``blocked``: everything that needs a human *now* — a parked turn and a
+    # broken one. Only the routine turn-end 🟡 is dropped.
+    return kind in ("blocked", "failure")
 
 
 def owner_notify_id(bot: object, *, kind: Kind) -> int | None:

@@ -436,6 +436,55 @@ class TestOnComplete:
         assert len(embed_sends) >= 1
 
     @pytest.mark.asyncio
+    async def test_error_embed_mentions_the_failure_notify_user(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """#681: an ❌ nobody is @-mentioned about is a silent death.
+
+        Discord only pushes reliably when the *message content* carries
+        ``<@id>``; an embed alone never pings. #677/#678 each got exactly this
+        embed and sat unnoticed for two days.
+        """
+        config = _make_config(thread, runner, failure_notify_id=4242)
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                error="Claude exited without producing a response",
+            )
+        )
+
+        err = [c for c in thread.send.call_args_list if "embed" in c.kwargs][-1]
+        assert err.kwargs.get("content") == "<@4242>"
+
+    @pytest.mark.asyncio
+    async def test_error_embed_stays_silent_without_a_notify_user(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """#681 AC3: no one to ping ⇒ the embed is posted with no content."""
+        config = _make_config(thread, runner, failure_notify_id=None)
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(message_type=MessageType.RESULT, is_complete=True, error="boom")
+        )
+
+        err = [c for c in thread.send.call_args_list if "embed" in c.kwargs][-1]
+        assert err.kwargs.get("content") is None
+
+    @pytest.mark.asyncio
+    async def test_a_clean_turn_never_pings(self, thread: MagicMock, runner: MagicMock) -> None:
+        """#681 AC4: the failure ping must not leak into normal completions."""
+        config = _make_config(thread, runner, failure_notify_id=4242)
+        p = EventProcessor(config)
+
+        await p.process(_make_result_event(session_id="s1"))
+
+        assert not [c for c in thread.send.call_args_list if c.kwargs.get("content")]
+
+    @pytest.mark.asyncio
     async def test_result_text_not_posted(self, thread: MagicMock, runner: MagicMock) -> None:
         """Issue #53: RESULT.text is dropped — never posted to Discord."""
         config = _make_config(thread, runner)

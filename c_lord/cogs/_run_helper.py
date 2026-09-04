@@ -77,11 +77,6 @@ TOOL_RESULT_MAX_CHARS = 3000
 
 _TIMEOUT_PATTERN = re.compile(r"Timed out after (\d+) seconds")
 
-# CLI version: fetched once per process via ``claude --version``, then cached.
-# ``None`` before the first fetch; empty string on failure (so we skip retrying).
-_cli_version: str | None = None
-_cli_version_fetched: bool = False
-
 
 def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> discord.Embed:
     """Pick the embed that matches what actually went wrong."""
@@ -282,32 +277,6 @@ async def _resolve_context_window(
     return fallback_window(model or getattr(config.runner, "model", None), used)
 
 
-async def _get_cli_version() -> str | None:
-    """Return the ``claude`` CLI version string, fetched once and cached.
-
-    Runs ``claude --version`` on the first call; subsequent calls return the
-    cached value without spawning a subprocess.  Returns ``None`` on failure.
-    """
-    global _cli_version, _cli_version_fetched
-    if _cli_version_fetched:
-        return _cli_version
-    _cli_version_fetched = True
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "claude",
-            "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        # ``claude --version`` outputs ``2.1.181 (Claude Code)`` — version is parts[0]
-        parts = stdout.decode().strip().split()
-        _cli_version = parts[0] if parts else None
-    except Exception:
-        _cli_version = None
-    return _cli_version
-
-
 async def _context_footer_enabled(settings_repo: object | None, field: str) -> bool:
     """Return True unless ``context_footer.<field>`` is explicitly set to ``"0"``."""
     if settings_repo is None:
@@ -354,8 +323,17 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
 
     cli_version: str | None = None
     if await _context_footer_enabled(settings_repo, "cli_version"):
-        with contextlib.suppress(Exception):
-            cli_version = await _get_cli_version()
+        # #693: from the transcript entry this footer is already describing —
+        # never from ``claude --version``. That was run once per process and
+        # cached for the bot's lifetime, so a bot up for two days kept printing
+        # the version it saw at boot while the CLI had auto-updated underneath
+        # it. Version is the first value anyone checks when triaging, and a
+        # stale one sent a #684 investigation the wrong way. Reading it here
+        # also costs nothing: no subprocess per turn (#693 AC4), because the
+        # line was parsed for the token counts anyway. ``None`` when the
+        # transcript records no version — the footer then omits the item
+        # rather than showing a guess (#693 AC3).
+        cli_version = usage.cli_version
 
     cost_usd: float | None = None
     if await _context_footer_enabled(settings_repo, "cost"):
