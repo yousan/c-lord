@@ -1,0 +1,24 @@
+env -u CLAUDECODE /home/yousan/.local/bin/claude --model sonnet --dangerously-skip-permissions
+
+yousan @ tachikoma1.l2tporg in ~/tmp-i684/1788498753-t01 
+$ env -u CLAUDECODE /home/yousan/.local/bin/claude --model sonnet --dangerously-
+skip-permissions
+
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /home/yousan/tmp-i684/1788498753-t01
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide (https://code.claude.com/docs/en/security)
+
+   No, exit
+ ❯ Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
