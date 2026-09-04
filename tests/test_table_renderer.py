@@ -467,3 +467,46 @@ class TestRenderStrikethrough:
         # AC5 — tables without strikethrough render byte-identically to before.
         assert render_table_image(SIMPLE_TABLE) == render_table_image(SIMPLE_TABLE)
         assert render_table_image(JAPANESE_TABLE)[:4] == b"\x89PNG"
+
+
+# ---------------------------------------------------------------------------
+# get_table_images — Discord's attachment budget (#683)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTableImagesLimit:
+    """A message may carry at most 10 attachments; an 11th loses the whole send."""
+
+    @staticmethod
+    def _body(n: int) -> str:
+        return "\n".join(f"| a{i} | b{i} |\n|---|---|\n| 1 | 2 |\n" for i in range(n))
+
+    @staticmethod
+    def _enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    def test_caps_at_max_table_images(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import MAX_TABLE_IMAGES, get_table_images
+
+        self._enabled(monkeypatch)
+        with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+            images = get_table_images(self._body(14))
+        assert len(images) == MAX_TABLE_IMAGES
+
+    def test_reserved_slots_shrink_the_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import get_table_images
+
+        self._enabled(monkeypatch)
+        with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+            images = get_table_images(self._body(14), limit=9)
+        assert len(images) == 9
+
+    def test_disabled_flag_still_wins_over_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from c_lord.discord_ui.table_renderer import get_table_images
+
+        monkeypatch.delenv("CLORD_RENDER_TABLE_IMAGES", raising=False)
+        assert get_table_images(self._body(3)) == []
