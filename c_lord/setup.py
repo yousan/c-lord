@@ -333,6 +333,26 @@ async def setup_bridge(
     else:
         logger.info("Idle-stop disabled (CLORD_IDLE_STOP_DAYS=0)")
 
+    # --- Stopped-thread sweep (#685) ---
+    # Always-on (zero-config): archives threads whose name already says
+    # ``[停止]``/``[終了]`` but which Discord still shows as open. #609 fixed the
+    # archive that runs *at* stop time; nothing ever went back for the ones
+    # stopped before it, and 186 of them (58% of every open thread the bot could
+    # see) had piled up in the sidebar by 2026-09-04. The idle sweeps above
+    # cannot pick them up — they look for workspaces that are still running.
+    # ``session_repo`` is the live-workspace guard, not the candidate source:
+    # candidates come from the thread name, and a row that says the workspace
+    # is *not* stopped holds the sweep back (see the module docstring).
+    # Set CLORD_STOPPED_SWEEP=0 to disable.
+    if os.getenv("CLORD_STOPPED_SWEEP", "1") not in ("0", "false", "no"):
+        from .stopped_sweep import StoppedThreadSweepLoop
+
+        stopped_loop = StoppedThreadSweepLoop(bot, session_repo)
+        stopped_loop.start()
+        bot.stopped_sweep_loop = stopped_loop  # type: ignore[attr-defined]
+    else:
+        logger.info("Stopped-thread sweep disabled (CLORD_STOPPED_SWEEP=0)")
+
     # --- Idle sleep (#572) ---
     # Always-on (zero-config): stops just the *claude process* of workspaces
     # nobody has touched for CLORD_IDLE_SLEEP_HOURS (default 4). docker keeps
