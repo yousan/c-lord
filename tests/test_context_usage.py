@@ -371,3 +371,89 @@ def test_context_usage_used_property() -> None:
         cache_creation_tokens=20,
     )
     assert u.used == 125
+
+
+# ---------------------------------------------------------------------------
+# #693: the footer's CLI version must be the one that ran THIS turn
+# ---------------------------------------------------------------------------
+
+
+class TestCliVersionFromTranscript:
+    """``claude --version`` cached for the bot's lifetime goes stale (#693).
+
+    Claude Code updates itself, so a bot running for days kept reporting the
+    version it saw at startup — a lie in the first value anyone checks when
+    triaging. The transcript records the version that wrote each entry, so the
+    turn's own record is the honest source.
+    """
+
+    @staticmethod
+    def _write(path: Path, lines: list[dict]) -> None:
+        path.write_text("\n".join(json.dumps(d) for d in lines) + "\n")
+
+    @staticmethod
+    def _assistant(version: str | None = None, **usage: int) -> dict:
+        record: dict = {"type": "assistant", "message": {"role": "assistant", "usage": usage}}
+        if version is not None:
+            record["version"] = version
+        return record
+
+    def test_reads_version_of_the_latest_real_turn(self, tmp_path: Path) -> None:
+        """A session that spans an upgrade reports the NEW version."""
+        f = tmp_path / "s.jsonl"
+        self._write(
+            f,
+            [
+                self._assistant("2.1.258", input_tokens=1, cache_read_input_tokens=100),
+                self._assistant("2.1.260", input_tokens=2, cache_read_input_tokens=200),
+            ],
+        )
+        usage = read_latest_usage(f)
+        assert usage is not None
+        assert usage.cli_version == "2.1.260"
+
+    def test_version_is_none_when_the_transcript_has_none(self, tmp_path: Path) -> None:
+        """AC3: no version recorded → the footer drops the ``CLI …`` item."""
+        f = tmp_path / "s.jsonl"
+        self._write(f, [self._assistant(None, input_tokens=1, cache_read_input_tokens=100)])
+        usage = read_latest_usage(f)
+        assert usage is not None
+        assert usage.cli_version is None
+        assert "CLI" not in format_context_line(usage.used, 200_000, cli_version=usage.cli_version)
+
+    def test_synthetic_entries_do_not_supply_the_version(self, tmp_path: Path) -> None:
+        """The synthetic no-op entry is skipped for the version too (#425)."""
+        f = tmp_path / "s.jsonl"
+        self._write(
+            f,
+            [
+                self._assistant("2.1.260", input_tokens=2, cache_read_input_tokens=200),
+                {
+                    "type": "assistant",
+                    "version": "9.9.9",
+                    "message": {"role": "assistant", "model": "<synthetic>", "usage": {}},
+                },
+            ],
+        )
+        usage = read_latest_usage(f)
+        assert usage is not None
+        assert usage.cli_version == "2.1.260"
+
+    def test_non_string_version_is_ignored(self, tmp_path: Path) -> None:
+        f = tmp_path / "s.jsonl"
+        self._write(
+            f,
+            [
+                {
+                    "type": "assistant",
+                    "version": 260,
+                    "message": {
+                        "role": "assistant",
+                        "usage": {"input_tokens": 1, "cache_read_input_tokens": 100},
+                    },
+                }
+            ],
+        )
+        usage = read_latest_usage(f)
+        assert usage is not None
+        assert usage.cli_version is None

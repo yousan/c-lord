@@ -1297,55 +1297,79 @@ class TestLiveToolTimer:
         # (verified indirectly: no ghost tasks, session finishes cleanly)
 
 
-class TestGetCliVersion:
-    """_get_cli_version() must parse the first token from ``claude --version``."""
+class TestFooterCliVersion:
+    """#693: the footer's CLI version must track the CLI's own auto-updates."""
 
-    def _make_proc(self, output: str):
-        proc = AsyncMock()
-        proc.communicate = AsyncMock(return_value=(output.encode(), b""))
-        return proc
+    @staticmethod
+    def _config():
+        cfg = MagicMock()
+        cfg.thread.id = 1
+        cfg.thread.send = AsyncMock()
+        cfg.runner.working_dir = "/tmp/x"
+        cfg.runner.model = "opus"
+        cfg.runner.probe_context_window = AsyncMock(return_value=200_000)
+        cfg.settings_repo = None
+        return cfg
 
-    @pytest.mark.asyncio
-    async def test_parses_version_from_first_token(self, monkeypatch) -> None:
-        """``2.1.181 (Claude Code)`` → ``"2.1.181"`` (parts[0], not parts[-1])."""
+    @staticmethod
+    def _patch(monkeypatch, usage):
+        from pathlib import Path
+
         from c_lord.cogs import _run_helper
 
-        _run_helper._cli_version_fetched = False
-        _run_helper._cli_version = None
+        _run_helper._context_window_cache.clear()
+        monkeypatch.setattr(_run_helper, "read_latest_usage", lambda _p: usage)
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/f.jsonl"))
+        return _run_helper
 
+    def test_footer_uses_the_version_of_this_turn(self, monkeypatch) -> None:
+        from c_lord.claude.context_usage import ContextUsage
+
+        rh = self._patch(monkeypatch, ContextUsage(input_tokens=20_000, cli_version="2.1.260"))
+        cfg = self._config()
+        asyncio.run(rh._post_context_usage(cfg, "s"))
+        assert "CLI 2.1.260" in cfg.thread.send.await_args.args[0]
+
+    def test_footer_follows_an_upgrade_without_a_bot_restart(self, monkeypatch) -> None:
+        """The bug: the first turn's version was cached for the process's life."""
+        from c_lord.claude.context_usage import ContextUsage
+
+        from c_lord.cogs import _run_helper
+
+        versions = iter(["2.1.258", "2.1.260"])
+        self._patch(monkeypatch, None)
         monkeypatch.setattr(
-            asyncio,
-            "create_subprocess_exec",
-            AsyncMock(return_value=self._make_proc("2.1.181 (Claude Code)\n")),
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=20_000, cli_version=next(versions)),
         )
-        version = await _run_helper._get_cli_version()
-        assert version == "2.1.181"
+        cfg = self._config()
+        asyncio.run(_run_helper._post_context_usage(cfg, "s"))
+        first = cfg.thread.send.await_args.args[0]
+        asyncio.run(_run_helper._post_context_usage(cfg, "s"))
+        second = cfg.thread.send.await_args.args[0]
+        assert "CLI 2.1.258" in first
+        assert "CLI 2.1.260" in second, "footer kept the version it saw first"
 
-    @pytest.mark.asyncio
-    async def test_returns_none_on_failure(self, monkeypatch) -> None:
-        from c_lord.cogs import _run_helper
+    def test_footer_omits_the_item_when_no_version_is_recorded(self, monkeypatch) -> None:
+        """AC3: never print ``None`` or a stale value."""
+        from c_lord.claude.context_usage import ContextUsage
 
-        _run_helper._cli_version_fetched = False
-        _run_helper._cli_version = None
+        rh = self._patch(monkeypatch, ContextUsage(input_tokens=20_000, cli_version=None))
+        cfg = self._config()
+        asyncio.run(rh._post_context_usage(cfg, "s"))
+        assert "CLI" not in cfg.thread.send.await_args.args[0]
 
-        monkeypatch.setattr(
-            asyncio,
-            "create_subprocess_exec",
-            AsyncMock(side_effect=FileNotFoundError("claude not found")),
-        )
-        version = await _run_helper._get_cli_version()
-        assert version is None
+    def test_footer_spawns_no_subprocess(self, monkeypatch) -> None:
+        """AC4: the version must not cost a ``claude --version`` per turn."""
+        from c_lord.claude.context_usage import ContextUsage
 
-    @pytest.mark.asyncio
-    async def test_caches_after_first_call(self, monkeypatch) -> None:
-        from c_lord.cogs import _run_helper
+        rh = self._patch(monkeypatch, ContextUsage(input_tokens=20_000, cli_version="2.1.260"))
 
-        _run_helper._cli_version_fetched = False
-        _run_helper._cli_version = None
+        async def _boom(*_a, **_kw):  # pragma: no cover - must never run
+            raise AssertionError("the footer spawned a subprocess")
 
-        exec_mock = AsyncMock(return_value=self._make_proc("1.0.0 (Claude Code)\n"))
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_mock)
-
-        await _run_helper._get_cli_version()
-        await _run_helper._get_cli_version()
-        exec_mock.assert_awaited_once()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _boom)
+        cfg = self._config()
+        asyncio.run(rh._post_context_usage(cfg, "s"))
+        assert "CLI 2.1.260" in cfg.thread.send.await_args.args[0]
