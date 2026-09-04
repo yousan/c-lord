@@ -2373,6 +2373,14 @@ class TmuxSessionManager:
         - the answer is not a c-lord-originated *user* turn, so the dedup ZWSP
           would only corrupt the recorded answer.
 
+        That last point is only true of the *answer string*, not of Discord:
+        the CLI may still record the answer as a plain ``user`` event, and
+        without the marker the jsonl mirror reads it as human pane input and
+        posts the user's own sentence back at them with a 👤 (#682).  So the
+        text is registered with :data:`~c_lord.transcript.pane_echo.pane_echo`
+        instead — the dedup the marker would have provided, without touching
+        what reaches the TUI.
+
         Returns True on success.
         """
         if not self._check_available():
@@ -2384,7 +2392,14 @@ class TmuxSessionManager:
             return False
 
         target = self._target(window)
-        return self._type_literal(target, text, what="send_literal")
+        ok = self._type_literal(target, text, what="send_literal")
+        if ok:
+            # After the keystrokes land, so nothing is registered for text that
+            # never reached the pane and could not produce an echo.
+            from .transcript.pane_echo import pane_echo
+
+            pane_echo.register(thread_id, text)
+        return ok
 
     def pane_working_dir(self, thread_id: int) -> str | None:
         """The cwd of the thread's tmux pane, or None when it cannot be read (#651).

@@ -240,7 +240,9 @@ button whose keystrokes have nowhere to land.
 ## Multi-question Submit screen
 
 A multi-question AskUserQuestion is handled one menu at a time as each renders in
-the pane (each question → its own Discord buttons). After the last question is
+the pane (each question → its own Discord buttons). The prose above the ask is
+**not** repeated per menu — it is delivered once for the whole turn (#680, see
+[Pre-menu prose](#pre-menu-prose-経緯推し-399)). After the last question is
 answered, the TUI shows a **"Review your answers" / "Submit answers" / "Cancel"**
 confirmation. That screen carries **no `Chat about this` marker**, so
 `_parse_ask_from_pane` does not match it; without explicit handling it fell
@@ -328,7 +330,35 @@ source:
 - **ExitPlanMode**: the CLI flushes the prose as a normal text event *before*
   the menu, so the mirror posts first and the pane-bridge then skips.
 
-Either way the prose appears **exactly once**, before the menu.
+**One delivery per turn, however many questions (#680).** That dedup is
+cross-source *and* one-shot by design — each side ignores its own entries so a
+legitimate repeat is never swallowed, and an entry is consumed the first time it
+matches. A multi-question AskUserQuestion is where both properties break: the
+CLI draws one menu per question, c-lord bridges each of them, and every bridge
+re-reads the **same** prose from the pane. So the prose got a second copy two
+different ways:
+
+- the pane could not see its own entries, so it re-posted its own text once per
+  question — production 2026-09-01: the same 1,525-char report **four times**,
+  md5-identical, one copy per question;
+- the mirror's entry is consumed by the first bridge that matches it, so from
+  the second question on there was nothing left to match either — staging
+  2026-09-04: the mirror posted the prose, question 2's bridge consumed the
+  entry and skipped, and question 3's bridge posted the pane's copy on top.
+
+`bridged_context` therefore also keeps a **delivered ledger** (`note_delivered`
+/ `already_delivered`), which answers the question both cases actually ask: *is
+this text already in the thread?* It is deliberately unlike the entries above —
+no source (a copy is a copy, whoever posted it), not consumed by reading it
+(every later question must see it), and written even when the text was too long
+to `register` (a truncated delivery is still a delivery). It is cleared at the
+same turn boundary, because across turns the same words are a new statement.
+Over-suppression would cost a menu its 経緯 (#549's pain), so it is bounded: a
+skipped post registers nothing, so the CLI's later flush still delivers the
+prose — degraded mode is late, never lost.
+
+So the prose appears **exactly once per turn**, before the menu — for a
+one-question ask and an N-question ask alike.
 
 ## Concurrency & stuck-menu safety (#485)
 
