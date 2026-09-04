@@ -233,7 +233,16 @@ class SchedulerCog(commands.Cog):
             run_config = RunConfig(
                 thread=thread,
                 runner=runner,
-                repo=None,  # scheduled tasks don't persist session state
+                # #687: persist the session row. Without it the thread is
+                # UNTRACKED to :mod:`c_lord.session_resume`, so every reply to a
+                # scheduled run's report was dropped with 「復元できるワークスペース
+                # がありません」 — while its tmux window sat there alive. The
+                # thread a scheduled run creates is a place people answer, so it
+                # has to be a session like any other. ``working_dir`` goes with
+                # it because that is the checkout the run really used, and both
+                # the reply path (#687) and the mirror restore (#71) read it back.
+                repo=getattr(self.bot, "session_repo", None),
+                working_dir=working_dir,
                 prompt=task["prompt"],
                 session_id=None,
                 registry=registry,

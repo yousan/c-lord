@@ -290,7 +290,14 @@ class TranscriptMirrorCog(commands.Cog):
         return ask_bridge
 
     def _make_sink(self, thread_id: int):
-        """Return an awaitable callable that posts intermediate messages silently."""
+        """Return an awaitable callable that posts intermediate messages silently.
+
+        Silent, but not second-class: a GFM table here is rendered to a PNG just
+        as it is on the final answer (#683).  Discord draws no markdown tables,
+        so skipping this left an intermediate table as a column of raw pipes —
+        and those messages stay in the thread after the turn ends, so the
+        unreadable version is what the reader is left with.
+        """
         bot = self.bot
 
         async def sink(text: str) -> None:
@@ -306,7 +313,12 @@ class TranscriptMirrorCog(commands.Cog):
                 )
                 return
             try:
-                await self._send_chunks(send, text, silent=silent_posts_enabled())
+                await self._send_chunks(
+                    send,
+                    text,
+                    silent=silent_posts_enabled(),
+                    files=self._table_files(text) or None,
+                )
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror sink failed: thread=%d body_len=%d status=%s — %s",
@@ -334,13 +346,7 @@ class TranscriptMirrorCog(commands.Cog):
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            from io import BytesIO
-
-            from ..discord_ui.table_renderer import get_table_images
-
-            table_files = [
-                discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
-            ]
+            table_files = self._table_files(text)
             reference = await self._build_trigger_reference(thread_id)
             try:
                 last_msg = await self._send_chunks(
@@ -378,13 +384,9 @@ class TranscriptMirrorCog(commands.Cog):
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            from io import BytesIO
-
-            from ..discord_ui.table_renderer import get_table_images
-
-            table_files = [
-                discord.File(BytesIO(img), filename=fname) for fname, img in get_table_images(text)
-            ]
+            # progress.txt takes one of the 10 attachment slots, so the tables
+            # get one fewer — the turn log must never be the thing dropped (#683).
+            table_files = self._table_files(text, reserved=1)
             files = [discord.File(file_path, filename="progress.txt")] + table_files
             reference = await self._build_trigger_reference(thread_id)
 
@@ -422,6 +424,24 @@ class TranscriptMirrorCog(commands.Cog):
                 )
 
         return file_sink
+
+    @staticmethod
+    def _table_files(text: str, *, reserved: int = 0) -> list[discord.File]:
+        """Render every GFM table in *text* to a ``discord.File``, capped (#683).
+
+        Shared by all three sinks so that whether a table becomes an image never
+        depends on which sink happened to post it. *reserved* is the number of
+        attachment slots the caller needs for files of its own (``progress.txt``);
+        the tables get what is left of Discord's 10-per-message allowance.
+        """
+        from io import BytesIO
+
+        from ..discord_ui.table_renderer import MAX_TABLE_IMAGES, get_table_images
+
+        return [
+            discord.File(BytesIO(img), filename=fname)
+            for fname, img in get_table_images(text, limit=MAX_TABLE_IMAGES - reserved)
+        ]
 
     async def _build_trigger_reference(self, thread_id: int) -> discord.MessageReference | None:
         """Resolve the trigger message for ``thread_id`` into a reply reference.

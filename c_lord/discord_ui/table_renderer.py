@@ -11,6 +11,7 @@ Controlled by the ``CLORD_RENDER_TABLE_IMAGES`` environment variable.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import unicodedata
@@ -27,6 +28,14 @@ from .fonts import first_existing as _first_existing
 
 if TYPE_CHECKING:
     from PIL import ImageFont
+
+logger = logging.getLogger(__name__)
+
+# Discord accepts at most 10 attachments on a single message; an 11th makes the
+# whole send fail, taking the message text with it.  This is the ceiling for
+# table images on one message (#683) — not a per-turn budget, since every
+# intermediate message is its own send with its own allowance.
+MAX_TABLE_IMAGES = 10
 
 # GFM pipe table pattern. Kept deliberately permissive so real-world tables
 # still render instead of leaking as raw pipe text:
@@ -480,17 +489,36 @@ def render_table_image(table_md: str) -> bytes | None:
     return buf.read()
 
 
-def get_table_images(content: str) -> list[tuple[str, bytes]]:
-    """Return (filename, png_bytes) pairs for all tables in *content*.
+def get_table_images(content: str, *, limit: int = MAX_TABLE_IMAGES) -> list[tuple[str, bytes]]:
+    """Return (filename, png_bytes) pairs for the tables in *content*.
 
     Returns an empty list when ``CLORD_RENDER_TABLE_IMAGES`` is not enabled
     or rendering is unavailable.  Callers wrap each pair into a
     ``discord.File(BytesIO(png_bytes), filename=filename)``.
+
+    At most *limit* images are returned (#683).  Discord rejects a message
+    carrying more than :data:`MAX_TABLE_IMAGES` attachments, and that rejection
+    would lose the **whole message**, text included — so a body with more tables
+    than that keeps its extra tables as raw markdown instead.  Callers that
+    attach a file of their own (``progress.txt``) pass a smaller limit to leave
+    room for it.
     """
     if os.getenv("CLORD_RENDER_TABLE_IMAGES", "").lower() not in ("1", "true", "yes"):
         return []
+    if limit <= 0:
+        return []
     result = []
-    for i, table_md in enumerate(detect_tables(content), start=1):
+    tables = detect_tables(content)
+    for i, table_md in enumerate(tables, start=1):
+        if len(result) >= limit:
+            logger.info(
+                "table_renderer: %d table(s) in a %d-char body exceed the "
+                "%d-attachment budget — the rest stay as raw markdown (#683)",
+                len(tables),
+                len(content),
+                limit,
+            )
+            break
         img_bytes = render_table_image(table_md)
         if img_bytes:
             result.append((f"table_{i}.png", img_bytes))

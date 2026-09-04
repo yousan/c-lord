@@ -1199,3 +1199,135 @@ async def test_progress_quiet_threshold_is_configurable(
     progress = cog._make_progress(123)
     assert progress is not None
     assert progress._quiet_seconds == 45.0
+
+
+# ---------------------------------------------------------------------------
+# Issue #683: intermediate (progress) messages must render tables too
+# ---------------------------------------------------------------------------
+
+
+def _many_tables(n: int) -> str:
+    """Body containing *n* distinct GFM tables separated by prose."""
+    blocks = []
+    for i in range(n):
+        blocks.append(f"Table {i}:\n\n| a{i} | b{i} |\n|---|---|\n| 1 | 2 |\n")
+    return "\n".join(blocks)
+
+
+async def test_sink_attaches_table_image_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#683 AC1/AC2: a table in an *intermediate* message is attached as a PNG.
+
+    Whether a table becomes an image must not depend on the message being the
+    turn's final answer — the reader sees the same raw pipes either way.
+    """
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(42)
+
+    with patch(
+        "c_lord.discord_ui.table_renderer.render_table_image",
+        return_value=b"\x89PNG\r\n",
+    ):
+        await sink(TABLE_CONTENT)
+
+    channel.send.assert_called_once()
+    files = channel.send.call_args.kwargs.get("files") or []
+    filenames = [getattr(f, "filename", "") for f in files]
+    assert any(n.startswith("table_") for n in filenames), f"no table image in {filenames}"
+
+
+async def test_sink_table_images_capped_at_discord_attachment_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#683 AC4: never exceed Discord's 10-attachments-per-message limit."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    sink = cog._make_sink(42)
+
+    with patch(
+        "c_lord.discord_ui.table_renderer.render_table_image",
+        return_value=b"\x89PNG\r\n",
+    ):
+        await sink(_many_tables(14))
+
+    for call in channel.send.call_args_list:
+        assert len(call.kwargs.get("files") or []) <= 10
+
+
+async def test_reply_sink_table_images_capped_at_discord_attachment_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#683 AC4: the final-answer path is capped too (it never was)."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    reply_sink = cog._make_reply_sink(42)
+
+    with patch(
+        "c_lord.discord_ui.table_renderer.render_table_image",
+        return_value=b"\x89PNG\r\n",
+    ):
+        await reply_sink(_many_tables(14))
+
+    for call in channel.send.call_args_list:
+        assert len(call.kwargs.get("files") or []) <= 10
+
+
+async def test_file_sink_reserves_an_attachment_slot_for_progress_txt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#683 AC4: progress.txt keeps its slot — tables give way, never the log."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    file_sink = cog._make_file_sink(42)
+
+    with patch(
+        "c_lord.discord_ui.table_renderer.render_table_image",
+        return_value=b"\x89PNG\r\n",
+    ):
+        await file_sink(_many_tables(14), str(progress_file))
+
+    sent_with_files = [c for c in channel.send.call_args_list if c.kwargs.get("files")]
+    assert sent_with_files, "nothing was sent with attachments"
+    for call in sent_with_files:
+        files = call.kwargs["files"]
+        assert len(files) <= 10
+    filenames = [getattr(f, "filename", "") for f in sent_with_files[-1].kwargs["files"]]
+    assert "progress.txt" in filenames
