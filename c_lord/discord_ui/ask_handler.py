@@ -351,22 +351,44 @@ async def _bridge_claimed_menu(
     # text event BEFORE the menu, so the mirror may have already posted it. Skip
     # our own post when a mirror-sourced delivery of the same text exists, else
     # we double-post (the dedup is bidirectional — see bridged_context).
-    if question.context and not _bridged_context.consume_match(
-        thread.id, question.context, source="mirror"
-    ):
-        chunks, truncated = _context_chunks(question.context)
-        try:
-            for chunk in chunks:
-                await thread.send(content=chunk, silent=True)
-        except discord.HTTPException:
-            logger.warning(
-                "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
-            )
+    #
+    # #680: one AskUserQuestion may carry several questions. The CLI draws them
+    # one menu at a time, so this runs once per question — each time re-reading
+    # the SAME prose from the pane. The cross-source dedup above cannot catch
+    # that (it ignores our own entries by design), so ask the pane-side ledger
+    # whether this text is already in the thread.
+    if question.context and _bridged_context.already_delivered(thread.id, question.context):
+        logger.info(
+            "bridge_pane_ask: pre-menu prose already in the thread — skipping "
+            "duplicate (thread=%d context_chars=%d) (#680)",
+            thread.id,
+            len(question.context),
+        )
+    elif question.context:
+        if _bridged_context.consume_match(thread.id, question.context, source="mirror"):
+            # The mirror delivered it. That entry is one-shot, so without the
+            # ledger the NEXT question of this same ask would find nothing to
+            # match and post the pane's copy on top of the mirror's (#680).
+            _bridged_context.note_delivered(thread.id, question.context)
         else:
-            # Register only when the FULL text was delivered: suppressing the
-            # flush twin of a partially-posted text would lose the rest.
-            if not truncated:
-                _bridged_context.register(thread.id, question.context, source="pane")
+            chunks, truncated = _context_chunks(question.context)
+            try:
+                for chunk in chunks:
+                    await thread.send(content=chunk, silent=True)
+            except discord.HTTPException:
+                logger.warning(
+                    "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
+                )
+            else:
+                # It is in the thread now — later questions of this same ask
+                # must not post it again (#680). Recorded even when truncated:
+                # a partial delivery is still a delivery, and re-posting it is
+                # still a copy.
+                _bridged_context.note_delivered(thread.id, question.context)
+                # Register only when the FULL text was delivered: suppressing
+                # the flush twin of a partially-posted text would lose the rest.
+                if not truncated:
+                    _bridged_context.register(thread.id, question.context, source="pane")
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)
     embed = ask_embed(question.question, question.header, question.options, question.multi_select)
