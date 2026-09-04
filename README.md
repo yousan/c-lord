@@ -385,7 +385,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_MAX_RESIDENT_WORKSPACES` | Max workspaces holding a live `claude` at once. Over the cap, the longest-idle ones are put to sleep; creating a new workspace is never blocked. Unlike the idle TTLs this default **is** host-dependent, so it is computed from `MemTotal` (cgroup limit first) rather than shipped as a constant. `0` disables. See `docs/specs/resident-cap.md`. | auto (`max(2, MemTotal_GiB × 0.4 / 0.45)`) |
 | `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout | `300` |
 | `DISCORD_OWNER_ID` | User ID to @-mention when Claude needs input | (optional) |
-| `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end + pauses), `blocked` (pauses only), `off` (never) | `blocked` |
+| `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end 🟡 + pauses + failures), `blocked` (pauses + failures — quiet when it works, loud when it breaks), `off` (never, failures included) | `blocked` |
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |

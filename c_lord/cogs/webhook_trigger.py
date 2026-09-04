@@ -193,6 +193,10 @@ class WebhookTriggerCog(commands.Cog):
                     # to the bot owner so a question-mode pause still pings someone
                     # (#525: unless this deployment turned that fallback off).
                     notify_user_id=owner_notify_id(self.bot, kind="blocked"),
+                    # #681: a webhook turn that dies at startup is the case
+                    # nobody notices — there is no human in the thread to see
+                    # the red embed. This is the ping that makes it visible.
+                    failure_notify_id=owner_notify_id(self.bot, kind="failure"),
                 )
             )
 

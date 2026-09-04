@@ -147,6 +147,22 @@ class EventProcessor:
         uid = self._config.notify_user_id
         return f"<@{uid}>" if uid is not None else None
 
+    @property
+    def _failure_mention(self) -> str | None:
+        """Message content that pings whoever is waiting on a broken turn (#681).
+
+        The ❌ embed used to be posted bare. An embed never pushes, so a turn
+        that died at startup reached nobody — #677 and #678 each ended on this
+        exact message and were not noticed for two days. Falls back to
+        ``notify_user_id`` so a caller that has not been taught the new field
+        still pings the same person it would have pinged for a parked turn,
+        rather than silently regressing to no mention at all.
+        """
+        uid = self._config.failure_notify_id
+        if uid is None:
+            uid = self._config.notify_user_id
+        return f"<@{uid}>" if uid is not None else None
+
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
         if event.message_type == MessageType.SYSTEM:
@@ -318,8 +334,11 @@ class EventProcessor:
             if event.usage_limit is not None:
                 self._config.outcome.no_response = True
                 self._config.outcome.usage_limit = event.usage_limit
+            # #681: the mention rides in the *content* — an embed alone never
+            # pushes, which is exactly how a dead turn goes unnoticed.
             err_msg = await self._config.thread.send(
-                embed=_make_error_embed(event.error, usage_limit=event.usage_limit)
+                content=self._failure_mention,
+                embed=_make_error_embed(event.error, usage_limit=event.usage_limit),
             )
             if err_msg is not None:
                 self._last_response_msg = err_msg

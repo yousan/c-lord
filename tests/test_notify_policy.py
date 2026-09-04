@@ -46,20 +46,39 @@ class TestMode:
 class TestAllowedMatrix:
     """AC2 / AC3 / AC4 — the whole table, one assert per cell."""
 
-    def test_all_pings_both(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_all_pings_everything(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CLORD_OWNER_FALLBACK", "all")
         assert owner_fallback_allowed("completion") is True
         assert owner_fallback_allowed("blocked") is True
+        assert owner_fallback_allowed("failure") is True
 
-    def test_blocked_pings_only_a_stuck_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_blocked_pings_a_stuck_turn_and_a_broken_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#681 AC1/AC2: a turn that never ran is not a completion.
+
+        The default mode drops the turn-end 🟡 precisely because it is routine.
+        A turn that failed to start is not routine, and it is the one outcome
+        nobody else will notice — #677/#678 sat dead for two days under this
+        very mode.
+        """
         monkeypatch.setenv("CLORD_OWNER_FALLBACK", "blocked")
         assert owner_fallback_allowed("completion") is False
         assert owner_fallback_allowed("blocked") is True
+        assert owner_fallback_allowed("failure") is True
 
     def test_off_pings_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#681 AC3: ``off`` means off — failures included.
+
+        The three modes are a ladder, and ``off`` is its bottom rung: the one
+        setting that promises silence. A failure ping that ignored it would
+        leave no way to turn the fallback off at all. The escape hatch is the
+        default (``blocked``), which now covers failures.
+        """
         monkeypatch.setenv("CLORD_OWNER_FALLBACK", "off")
         assert owner_fallback_allowed("completion") is False
         assert owner_fallback_allowed("blocked") is False
+        assert owner_fallback_allowed("failure") is False
 
 
 class TestOwnerNotifyId:
@@ -172,6 +191,7 @@ async def _run_turn(cog: ClaudeChatCog, message: MagicMock) -> dict:
     return {
         "blocked_mention": call.args[0].notify_user_id,
         "completion_mention": waiting.kwargs["notify_user_id"],
+        "failure_mention": call.args[0].failure_notify_id,
     }
 
 
@@ -184,6 +204,7 @@ class TestPolicyReachesTheTurn:
         seen = await _run_turn(_make_cog(), _message(_webhook_user()))
         assert seen["blocked_mention"] is None
         assert seen["completion_mention"] is None
+        assert seen["failure_mention"] is None
 
     async def test_blocked_pings_only_when_the_turn_is_stuck(
         self, monkeypatch: pytest.MonkeyPatch
@@ -193,6 +214,9 @@ class TestPolicyReachesTheTurn:
         seen = await _run_turn(_make_cog(), _message(_webhook_user()))
         assert seen["blocked_mention"] == OWNER_ID
         assert seen["completion_mention"] is None
+        # #681 AC2: the whole point — the default mode must not let a webhook
+        # turn die in silence.
+        assert seen["failure_mention"] == OWNER_ID
 
     async def test_all_keeps_the_previous_behaviour(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AC4."""
@@ -200,6 +224,7 @@ class TestPolicyReachesTheTurn:
         seen = await _run_turn(_make_cog(), _message(_webhook_user()))
         assert seen["blocked_mention"] == OWNER_ID
         assert seen["completion_mention"] == OWNER_ID
+        assert seen["failure_mention"] == OWNER_ID
 
     @pytest.mark.parametrize("mode", ["all", "blocked", "off"])
     async def test_a_human_turn_always_reaches_that_human(
@@ -211,3 +236,4 @@ class TestPolicyReachesTheTurn:
         seen = await _run_turn(_make_cog(), _message(human))
         assert seen["blocked_mention"] == human.id
         assert seen["completion_mention"] == human.id
+        assert seen["failure_mention"] == human.id

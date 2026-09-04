@@ -2546,6 +2546,10 @@ class ClaudeChatCog(commands.Cog):
         # keep the first and drop the second for turns nobody human asked for.
         notify_user_id = _notify_target(requester, self.bot, kind="blocked")
         completion_notify_id = _notify_target(requester, self.bot, kind="completion")
+        # #681: and a third question — "your turn broke before it produced
+        # anything". Muting the routine 🟡 must not mute this one: #677/#678
+        # each died at startup under the default policy and nobody was told.
+        failure_notify_id = _notify_target(requester, self.bot, kind="failure")
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
@@ -2785,6 +2789,9 @@ class ClaudeChatCog(commands.Cog):
                 # blocks it — a mid-turn pause never reaches the
                 # turn-end mention.
                 notify_user_id=notify_user_id,
+                # #681: who hears about a turn that ended in an error. The ❌
+                # embed carries the cause; this is what makes it push.
+                failure_notify_id=failure_notify_id,
             )
             try:
                 await run_claude_with_config(run_config)
