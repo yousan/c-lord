@@ -31,6 +31,7 @@ from pathlib import Path
 from ..claude.types import AskQuestion, _parse_ask_questions
 from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
+from ..discord_ui.pane_context import replace_pane_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
 from .formatter import RenderedEvent, render_event
 from .pane_echo import pane_echo
@@ -586,14 +587,28 @@ class TranscriptMirror:
                         # it as the menu's context message, re-posting it here
                         # would duplicate it. Still record its uuid (#215) so
                         # a restart does not re-post it as a missed final.
-                        if bridged_context.consume_match(self.thread_id, body, source="pane"):
+                        bridged = bridged_context.take_match(self.thread_id, body, source="pane")
+                        if bridged is not None:
                             await _flush_pending_silently()
+                            # #686: what the pane could deliver is the TUI
+                            # *rendering* — box-drawn tables, hard wraps, no
+                            # markdown — because while the menu was open the
+                            # jsonl held nothing to read. THIS is the readable
+                            # version of the same words, and dropping it left
+                            # the thread with only the unreadable one. Rewrite
+                            # the messages already posted instead; on any
+                            # failure they stay exactly as they are.
+                            replaced = False
+                            if bridged.messages:
+                                replaced = await replace_pane_context(bridged.messages, body)
                             # The pane bridge already delivered this text, so it
                             # counts as delivered for cursor purposes (#215).
                             _delivered_uuid = event.get("uuid") or _delivered_uuid
                             logger.info(
-                                "TranscriptMirror: suppressed pane-bridged ask context thread=%d",
+                                "TranscriptMirror: suppressed pane-bridged ask context "
+                                "thread=%d (markdown replacement: %s)",
                                 self.thread_id,
+                                "applied" if replaced else "not applied",
                             )
                             # Commit immediately: the text IS delivered, and a
                             # turn-end marker may never arrive — without this a

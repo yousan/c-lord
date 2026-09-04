@@ -360,6 +360,34 @@ prose — degraded mode is late, never lost.
 So the prose appears **exactly once per turn**, before the menu — for a
 one-question ask and an N-question ask alike.
 
+**What the reader ends up with is the markdown, not the pane rendering (#686).**
+The pane can only give us the TUI *rendering* of the prose: box-drawn tables,
+hard wraps at the terminal width, markdown stripped, and — because Discord is
+not monospaced — a table that does not line up. It is also ~3x longer than the
+markdown, so it eats into the chunk budget and can be cut mid-word. Until #686
+that was the reader's only copy: the CLI's own markdown arrived after the menu
+resolved and `bridged_context` dropped it as a duplicate, by design.
+
+Now the drop is a **replacement**. The registry entry carries the messages the
+pane-bridge posted, and when the flush matches, the mirror rewrites those
+messages in place (`c_lord/discord_ui/pane_context.py`) instead of discarding
+the better copy. The question still gets its 経緯 immediately (#399/#549 — the
+pane copy is posted first, unchanged); it just stops being the version anyone
+has to read. Tables become `table_*.png` at that point too, because the renderer
+now has real markdown to look at.
+
+Two rules bound it, and both exist so a failed replacement is never worse than
+no replacement:
+
+- **it never posts a new message** — if the markdown needs more messages than
+  the pane copy took, the replacement is declined and the pane rendering stays
+  (posting the remainder would be #680 again);
+- **it never deletes before every edit has landed** — a failed edit leaves the
+  thread exactly as it was, and leftover messages (markdown is usually shorter,
+  so a 3-message prose can collapse into 1) are removed only after the rewrite
+  has fully succeeded. If the flush never comes — the turn is killed, the bot
+  restarts — the pane copy simply stays.
+
 ## Concurrency & stuck-menu safety (#485)
 
 A concurrent second session starting in the same tmux session used to desync the
@@ -744,6 +772,8 @@ from Claude Code v2.1.252.
 | 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
+| One delivery per turn across N questions (#680) | `bridged_context.py::note_delivered` / `already_delivered` |
+| Replace the pane rendering with the flushed markdown (#686) | `c_lord/discord_ui/pane_context.py::replace_pane_context` |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
 | Empty-label backstop / watchdog retry cap (#579) | `ask_view.py::_button_label`, `thread_state_sync.py::_ASK_BRIDGE_MAX_FAILURES` |
 | One post per menu, across restarts (#633) | `thread_state_sync.py::menu_fingerprint` / `MenuRebridgeLedger`, `c_lord/database/menu_bridge_repo.py::MenuBridgeRepository`, `menu_bridges` table |

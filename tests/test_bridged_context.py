@@ -262,3 +262,41 @@ def test_clear_drops_the_ledger() -> None:
     reg.note_delivered(680, _pane_context())
     reg.clear()
     assert reg.already_delivered(680, _pane_context()) is False
+
+
+# -- #686: the entry carries the messages the pane posted --------------------
+# The pane copy is the TUI rendering (box-drawn, hard-wrapped). The readable
+# markdown arrives later and used to be dropped here as a duplicate. Keeping the
+# posted messages ON the entry is what lets the consumer edit them instead.
+
+
+def test_the_entry_carries_the_posted_messages() -> None:
+    reg = BridgedContextRegistry()
+    m1, m2 = object(), object()
+    reg.register(686, _pane_context(), source="pane", messages=[m1, m2])
+
+    entry = reg.take_match(686, _flushed_markdown(), source="pane")
+
+    assert entry is not None
+    assert list(entry.messages) == [m1, m2]
+
+
+def test_take_match_is_one_shot_like_consume_match() -> None:
+    reg = BridgedContextRegistry()
+    reg.register(686, _pane_context(), source="pane", messages=[object()])
+    assert reg.take_match(686, _flushed_markdown(), source="pane") is not None
+    assert reg.take_match(686, _flushed_markdown(), source="pane") is None
+
+
+def test_take_match_returns_none_when_nothing_matches() -> None:
+    reg = BridgedContextRegistry()
+    reg.register(686, _pane_context(), source="pane")
+    assert reg.take_match(686, "全く別の最終回答です。" * 20, source="pane") is None
+
+
+def test_an_entry_without_messages_still_matches() -> None:
+    """Callers that never posted anything (the plan path) keep working."""
+    reg = BridgedContextRegistry()
+    reg.register(686, _pane_context(), source="pane")
+    entry = reg.take_match(686, _flushed_markdown(), source="pane")
+    assert entry is not None and list(entry.messages) == []

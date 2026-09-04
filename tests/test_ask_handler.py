@@ -599,6 +599,31 @@ async def test_pane_skips_context_when_mirror_already_posted(monkeypatch):
     assert len(embed_sends) == 1  # menu still shown
 
 
+# -- #686: the pane copy must be replaceable --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_posted_context_messages_are_kept_for_later_replacement(monkeypatch):
+    """#686: the pane copy is the TUI rendering (box-drawn, hard-wrapped). The
+    readable markdown arrives later, so the messages it went into must be
+    reachable from the registry — otherwise the mirror can only drop it."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
+    thread, msg = _thread(686_0001)
+    q = _question()
+    q.context = _CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    entry = bridged_context.take_match(thread.id, _CONTEXT, source="pane")
+    assert entry is not None
+    assert list(entry.messages) == [msg]  # the context post, not the menu embed
+
+
 # -- #680: one prose delivery per turn, however many questions --------------
 
 

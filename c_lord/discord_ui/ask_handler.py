@@ -372,9 +372,10 @@ async def _bridge_claimed_menu(
             _bridged_context.note_delivered(thread.id, question.context)
         else:
             chunks, truncated = _context_chunks(question.context)
+            posted: list[discord.Message] = []
             try:
                 for chunk in chunks:
-                    await thread.send(content=chunk, silent=True)
+                    posted.append(await thread.send(content=chunk, silent=True))
             except discord.HTTPException:
                 logger.warning(
                     "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
@@ -387,8 +388,13 @@ async def _bridge_claimed_menu(
                 _bridged_context.note_delivered(thread.id, question.context)
                 # Register only when the FULL text was delivered: suppressing
                 # the flush twin of a partially-posted text would lose the rest.
+                # #686: the messages ride along, so the side that suppresses the
+                # flush can rewrite this TUI rendering into the CLI's markdown
+                # instead of dropping the only readable copy.
                 if not truncated:
-                    _bridged_context.register(thread.id, question.context, source="pane")
+                    _bridged_context.register(
+                        thread.id, question.context, source="pane", messages=posted
+                    )
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)
     embed = ask_embed(question.question, question.header, question.options, question.multi_select)
