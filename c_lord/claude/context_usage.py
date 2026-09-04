@@ -48,13 +48,19 @@ _COST_RE = re.compile(r"Cost:\s+\$([\d.]+)")
 
 @dataclass(frozen=True)
 class ContextUsage:
-    """Token usage from a single assistant turn's ``usage`` block."""
+    """Token usage from a single assistant turn's ``usage`` block.
+
+    ``cli_version`` rides along because the transcript entry carries it (#693)
+    and the footer wants it: it is the version of Claude Code that actually
+    wrote this turn, so it stays true across the CLI's own auto-updates.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     model: str | None = None
+    cli_version: str | None = None
 
     @property
     def used(self) -> int:
@@ -84,6 +90,10 @@ def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
 
     Returns ``None`` when the file is missing or contains no assistant message
     with real ``usage``.  Malformed lines are skipped.
+
+    The chosen entry also supplies ``cli_version`` (#693) — a session that spans
+    a Claude Code auto-update holds both versions, and the latest real turn is
+    the one the reader is being told about.
     """
     if not jsonl_path.is_file():
         return None
@@ -104,12 +114,17 @@ def read_latest_usage(jsonl_path: Path) -> ContextUsage | None:
             usage = message.get("usage")
             if not isinstance(usage, dict):
                 continue
+            # The CLI stamps every entry with the version that wrote it (#693).
+            # Anything else (absent, or a non-string from a future format) means
+            # "unknown", and the footer then omits the item rather than guess.
+            version = record.get("version")
             candidate = ContextUsage(
                 input_tokens=int(usage.get("input_tokens", 0) or 0),
                 output_tokens=int(usage.get("output_tokens", 0) or 0),
                 cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
                 cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
                 model=message.get("model"),
+                cli_version=version if isinstance(version, str) else None,
             )
             # Skip synthetic / no-op entries (#425): they carry no real context
             # tokens, so the last entry with real usage is the true window state.
