@@ -178,7 +178,6 @@ async def test_multi_select_other_freetext_uses_text_path(monkeypatch):
     runner.answer_menu_multi.assert_not_called()
 
 
-
 def _preview_question() -> AskQuestion:
     """A menu drawn in the preview layout — free text goes through Notes (#650)."""
     return AskQuestion(
@@ -222,7 +221,6 @@ async def test_preview_layout_freetext_uses_the_notes_keystrokes(monkeypatch):
         3, "stable に上げて全部あげてOK", mode=FREE_TEXT_NOTES
     )
     runner.answer_menu.assert_not_called()
-
 
 
 # -- #651: ✅ only when the answer actually reached Claude ---------------------
@@ -332,9 +330,7 @@ async def _answer_via_bridge(monkeypatch, thread, msg, runner, answer: str) -> N
 
 
 @pytest.mark.asyncio
-async def test_answer_that_never_reached_claude_is_not_reported_as_answered(
-    monkeypatch, tmp_path
-):
+async def test_answer_that_never_reached_claude_is_not_reported_as_answered(monkeypatch, tmp_path):
     """#651 AC1/AC3: the keys were accepted and the menu closed — and Claude
     still recorded "(No answer provided)".
 
@@ -601,6 +597,161 @@ async def test_pane_skips_context_when_mirror_already_posted(monkeypatch):
     assert context_sends == []  # no duplicate context post
     embed_sends = [s for s in sends if "embed" in s.kwargs]
     assert len(embed_sends) == 1  # menu still shown
+
+
+# -- #680: one prose delivery per turn, however many questions --------------
+
+
+def _fast_menu(monkeypatch) -> None:
+    """Make the bridge resolve immediately (the menu itself is not under test)."""
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
+
+
+def _context_sends(thread) -> list:
+    return [s for s in thread.send.await_args_list if "embed" not in s.kwargs]
+
+
+def _embed_sends(thread) -> list:
+    return [s for s in thread.send.await_args_list if "embed" in s.kwargs]
+
+
+@pytest.mark.asyncio
+async def test_multi_question_ask_posts_the_prose_once(monkeypatch):
+    """#680 AC1: one AskUserQuestion with N questions bridges N menus, and each
+    one re-reads the SAME prose from the pane. The reader must get that prose
+    once — not once per question (production: the same 1,525-char report four
+    times, md5-identical)."""
+    _fast_menu(monkeypatch)
+    thread, _msg = _thread(680_0001)
+
+    for _ in range(3):  # Q1..Q3 of a single AskUserQuestion call
+        q = _question()
+        q.context = _CONTEXT
+        await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    posted = _context_sends(thread)
+    assert len(posted) == 1, f"prose delivered {len(posted)}x; sends={thread.send.await_args_list}"
+    assert _CONTEXT in posted[0].kwargs["content"]
+    # Every question still gets its own buttons.
+    assert len(_embed_sends(thread)) == 3
+
+
+@pytest.mark.asyncio
+async def test_watchdog_rebridge_does_not_repost_the_prose(monkeypatch):
+    """#680 AC5: the #633 watchdog re-bridges a menu it finds still open. The
+    prose above it is the text already in the thread."""
+    _fast_menu(monkeypatch)
+    thread, _msg = _thread(680_0002)
+    q = _question()
+    q.context = _CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert len(_context_sends(thread)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_different_prose_is_still_posted(monkeypatch):
+    """Over-suppression here costs a menu its 経緯 (#549's pain), so only the
+    SAME text is skipped."""
+    _fast_menu(monkeypatch)
+    thread, _msg = _thread(680_0003)
+
+    q1 = _question()
+    q1.context = _CONTEXT
+    q2 = _question()
+    q2.context = "別の話題です。こちらは全く違う経緯で、比較検討の内容も違います。" * 3
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q1, _resolved_runner()), timeout=3.0)
+    await asyncio.wait_for(bridge_pane_ask(thread, q2, _resolved_runner()), timeout=3.0)
+
+    assert len(_context_sends(thread)) == 2
+
+
+@pytest.mark.asyncio
+async def test_next_turn_may_repeat_the_same_prose(monkeypatch):
+    """The ledger is turn-scoped: after the turn boundary the same words are a
+    new statement, not a duplicate."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    _fast_menu(monkeypatch)
+    thread, _msg = _thread(680_0004)
+    q = _question()
+    q.context = _CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+    bridged_context.clear_thread(thread.id)  # mirror does this at turn end
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert len(_context_sends(thread)) == 2
+
+
+@pytest.mark.asyncio
+async def test_pane_does_not_add_a_copy_after_the_mirror_delivered_it(monkeypatch):
+    """#680, staging 2026-09-04: the mirror posted the prose and the FIRST pane
+    bridge matched its (one-shot) entry and skipped — leaving the next question
+    nothing to match, so it posted the pane's copy on top of the mirror's."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    _fast_menu(monkeypatch)
+    thread, _msg = _thread(680_0007)
+    q = _question()
+    q.context = _CONTEXT
+    bridged_context.register(thread.id, _CONTEXT, source="mirror")  # mirror posted it
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert _context_sends(thread) == []
+    assert len(_embed_sends(thread)) == 2
+
+
+@pytest.mark.asyncio
+async def test_skipped_prose_is_not_registered_twice(monkeypatch):
+    """The skip must not register a second pane entry — one flush, one entry."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    _fast_menu(monkeypatch)
+    thread, _msg = _thread(680_0005)
+    q = _question()
+    q.context = _CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert bridged_context.consume_match(thread.id, _CONTEXT, source="pane") is True
+    assert bridged_context.consume_match(thread.id, _CONTEXT, source="pane") is False
+
+
+@pytest.mark.asyncio
+async def test_undelivered_prose_is_retried_on_the_next_question(monkeypatch):
+    """A failed send puts nothing in the thread, so the next question must try
+    again rather than inherit a delivery that never happened."""
+    import discord
+
+    _fast_menu(monkeypatch)
+    thread, msg = _thread(680_0006)
+    q = _question()
+    q.context = _CONTEXT
+
+    calls = {"n": 0}
+
+    async def _send(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the first context post fails
+            raise discord.HTTPException(MagicMock(status=500), "boom")
+        return msg
+
+    thread.send = AsyncMock(side_effect=_send)
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    assert len(_context_sends(thread)) == 2  # first attempt failed, second delivered
 
 
 @pytest.mark.asyncio

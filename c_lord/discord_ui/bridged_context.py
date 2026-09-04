@@ -104,6 +104,9 @@ class BridgedContextRegistry:
     def __init__(self) -> None:
         # thread_id -> [(registered_at_monotonic, normalized_text, source), ...]
         self._entries: dict[int, list[tuple[float, str, str]]] = {}
+        # #680: thread_id -> [(delivered_at_monotonic, normalized_text), ...]
+        # — what is already in the thread. See ``note_delivered``.
+        self._delivered: dict[int, list[tuple[float, str]]] = {}
 
     def register(self, thread_id: int, text: str, source: str = "pane") -> None:
         """Record *text* as delivered to Discord by *source* for *thread_id*."""
@@ -159,6 +162,69 @@ class BridgedContextRegistry:
             self._entries.pop(thread_id, None)
         return False
 
+    # -- #680: what is already in the thread -------------------------------
+    #
+    # ``register``/``consume_match`` above are cross-source *and* one-shot: they
+    # exist so the two paths do not double-post each other's text, and each side
+    # ignores its own entries so a legitimate repeat is never swallowed.
+    #
+    # One AskUserQuestion carrying N questions is the case that gets wrong. The
+    # CLI draws one menu per question, c-lord bridges each of them, and every
+    # bridge re-reads the SAME prose from the pane. Nothing there is a repeat
+    # Claude made — it is one delivery being re-attempted — but:
+    #
+    # - the pane cannot see its own entries (cross-source), so it re-posted its
+    #   own text once per question (production 2026-09-01: the same 1,525-char
+    #   report four times, md5-identical); and
+    # - the mirror's entry is consumed by the FIRST bridge that matches it, so
+    #   from the second question on there is nothing left to match either
+    #   (staging 2026-09-04: mirror copy, then a pane copy on question 3).
+    #
+    # The ledger below answers the question both cases actually ask — "is this
+    # text already in the thread?" — so it is deliberately unlike the entries
+    # above: no source (a copy is a copy, whoever posted it), not consumed by
+    # reading it (every later question must see it), and written even when the
+    # text was too long to ``register`` (a truncated delivery is still a
+    # delivery). It is cleared at the same turn boundary, because across turns
+    # the same words are a new statement.
+    #
+    # Over-suppression costs a menu its 経緯 (#549's pain), so it is bounded: a
+    # skipped post registers nothing, so the CLI's later flush still delivers
+    # the prose — degraded mode is late, never lost.
+
+    def note_delivered(self, thread_id: int, text: str) -> None:
+        """Record that *text* is now in *thread_id* (#680)."""
+        norm = _normalize(text)
+        if len(norm) < _MIN_NORM_LEN:
+            return
+        now = time.monotonic()
+        for tid in list(self._delivered):
+            bucket = self._delivered[tid]
+            bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
+            if not bucket:
+                del self._delivered[tid]
+        bucket = self._delivered.setdefault(thread_id, [])
+        bucket.append((now, norm))
+        del bucket[:-_MAX_PER_THREAD]
+
+    def already_delivered(self, thread_id: int, text: str) -> bool:
+        """True iff matching *text* was already delivered this turn (#680).
+
+        Non-consuming: every later question of the same ask must see it.
+        """
+        bucket = self._delivered.get(thread_id)
+        if not bucket:
+            return False
+        now = time.monotonic()
+        bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
+        if not bucket:
+            self._delivered.pop(thread_id, None)
+            return False
+        norm = _normalize(text)
+        if len(norm) < _MIN_NORM_LEN:
+            return False
+        return any(_match_kind(cand, norm) is not None for _, cand in bucket)
+
     def clear_thread(self, thread_id: int) -> None:
         """Disarm all entries for *thread_id* (called at turn boundaries).
 
@@ -167,10 +233,12 @@ class BridgedContextRegistry:
         later, genuinely new message being swallowed.
         """
         self._entries.pop(thread_id, None)
+        self._delivered.pop(thread_id, None)
 
     def clear(self) -> None:
         """Drop all entries (test isolation)."""
         self._entries.clear()
+        self._delivered.clear()
 
 
 # Process-wide singleton shared by the pane-ask bridge (producer) and the

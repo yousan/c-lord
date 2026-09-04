@@ -171,3 +171,94 @@ def test_default_source_is_pane_backward_compatible() -> None:
     reg = BridgedContextRegistry()
     reg.register(399, _pane_context())  # defaults to source='pane'
     assert reg.consume_match(399, _flushed_markdown()) is True  # defaults to matching 'pane'
+
+
+# -- #680: what is already in the thread ------------------------------------
+# The dedup above is cross-source AND one-shot: the pane cannot see its own
+# entries, and the mirror's entry is gone after the first bridge matches it. One
+# AskUserQuestion with N questions bridges N menus off the SAME pane prose, so
+# both holes put a second copy of it in the thread. The ledger below answers the
+# question both cases actually ask — is this text already in the thread?
+
+
+def test_a_delivered_text_is_recognised() -> None:
+    """#680 AC2: a second delivery of the same prose is recognised."""
+    reg = BridgedContextRegistry()
+    ctx = _pane_context()
+    assert reg.already_delivered(680, ctx) is False
+    reg.note_delivered(680, ctx)
+    assert reg.already_delivered(680, ctx) is True
+
+
+def test_already_delivered_is_not_one_shot() -> None:
+    """Q2, Q3, Q4 of the same ask must all see the Q1 delivery."""
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _pane_context())
+    assert [reg.already_delivered(680, _pane_context()) for _ in range(3)] == [True] * 3
+
+
+def test_ledger_survives_the_mirror_consuming_the_dedup_entry() -> None:
+    """The flush may land between two questions and consume the pane entry; the
+    ledger must still remember that the prose is in the thread."""
+    reg = BridgedContextRegistry()
+    ctx = _pane_context()
+    reg.register(680, ctx, source="pane")
+    reg.note_delivered(680, ctx)
+    assert reg.consume_match(680, _flushed_markdown(), source="pane") is True
+    assert reg.already_delivered(680, ctx) is True
+
+
+def test_ledger_is_source_blind() -> None:
+    """A copy is a copy: the mirror's delivery must silence the pane's copy of
+    the same prose (staging 2026-09-04: mirror posted it, then question 3's
+    pane bridge posted it again once the one-shot entry was gone)."""
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _flushed_markdown())  # delivered by the mirror
+    assert reg.already_delivered(680, _pane_context()) is True  # pane's copy
+
+
+def test_ledger_is_per_thread() -> None:
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _pane_context())
+    assert reg.already_delivered(681, _pane_context()) is False
+
+
+def test_unrelated_prose_is_still_posted() -> None:
+    """Over-suppression here means a menu with no 経緯 — only the SAME text is
+    suppressed."""
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _pane_context())
+    assert reg.already_delivered(680, "全く別の経緯です。" * 20) is False
+
+
+def test_short_text_is_never_ledgered() -> None:
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, "了解です。")
+    assert reg.already_delivered(680, "了解です。") is False
+
+
+def test_turn_boundary_clears_the_ledger() -> None:
+    """A later turn may legitimately repeat the same prose — the ledger is
+    scoped to the turn, like the dedup entries."""
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _pane_context())
+    reg.clear_thread(680)
+    assert reg.already_delivered(680, _pane_context()) is False
+
+
+def test_ledger_entry_expires(monkeypatch) -> None:
+    from c_lord.discord_ui import bridged_context as mod
+
+    now = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _pane_context())
+    now[0] += mod._TTL_SECONDS + 1
+    assert reg.already_delivered(680, _pane_context()) is False
+
+
+def test_clear_drops_the_ledger() -> None:
+    reg = BridgedContextRegistry()
+    reg.note_delivered(680, _pane_context())
+    reg.clear()
+    assert reg.already_delivered(680, _pane_context()) is False
