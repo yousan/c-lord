@@ -119,6 +119,13 @@ class RunConfig:
     # poster (its author); automated/terminal-driven turns fall back to the
     # bot owner. None ⇒ no one to ping ⇒ posted without a mention (silent-safe).
     notify_user_id: int | None = None
+    # #681: Discord user to @-mention when the turn ends in an error — it never
+    # started, it crashed, it timed out. A separate field from
+    # ``notify_user_id`` because the two answer to different policy rungs: a
+    # deployment may mute routine turn-end pings and still need to hear that a
+    # dispatched turn is dead (see :mod:`c_lord.notify_policy`). ``None`` ⇒ no
+    # one to ping ⇒ the ❌ embed is posted with no content, as before.
+    failure_notify_id: int | None = None
 
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is
