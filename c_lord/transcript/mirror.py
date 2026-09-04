@@ -33,6 +33,7 @@ from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
 from .formatter import RenderedEvent, render_event
+from .pane_echo import pane_echo
 from .tail import tail_events
 
 logger = logging.getLogger(__name__)
@@ -535,6 +536,23 @@ class TranscriptMirror:
                     continue
 
                 rendered = render_event(event)
+
+                # #682: the other half of the ZWSP echo test. A menu answer is
+                # typed with ``send_literal``, which leaves the marker off on
+                # purpose (#172/#650), so the formatter cannot tell this event
+                # from human pane input — but c-lord recorded what it typed, so
+                # ask. Dropped exactly like a marked echo (no turn bookkeeping):
+                # Discord already has the sentence the user wrote.
+                if (
+                    rendered is not None
+                    and rendered.kind == "user_input"
+                    and pane_echo.consume_match(self.thread_id, rendered.body)
+                ):
+                    logger.info(
+                        "TranscriptMirror: suppressed unmarked c-lord pane echo thread=%d",
+                        self.thread_id,
+                    )
+                    rendered = None
 
                 # #539: record this event's activity BEFORE ticking, so the line
                 # reflects what we just read rather than the state before it —
