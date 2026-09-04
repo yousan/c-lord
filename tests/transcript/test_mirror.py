@@ -1721,3 +1721,103 @@ async def test_pane_typed_input_is_still_mirrored(tmp_path: Path) -> None:
         pane_echo.clear()
 
     assert any("人がペインで打った別の文" in p for p in posted), posted
+
+
+# -- #686: the suppressed flush replaces the pane copy instead of vanishing ---
+
+
+async def test_mirror_rewrites_the_pane_copy_with_the_flushed_markdown(tmp_path: Path) -> None:
+    """The pane copy is the TUI rendering — box-drawn, hard-wrapped, unreadable
+    on Discord. The CLI's markdown lands after the menu resolves and used to be
+    thrown away as a duplicate; now it replaces the copy already in the thread
+    (same message — nothing new is posted)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    pane_msg = MagicMock()
+    pane_msg.edit = AsyncMock()
+    pane_msg.delete = AsyncMock()
+
+    bridged_context.clear()
+    bridged_context.register(99686, pane_ctx, source="pane", messages=[pane_msg])
+    mirror = TranscriptMirror(
+        thread_id=99686,
+        project_dir=project,
+        sink=sink,
+        reply_sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_text(flushed_md))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    pane_msg.edit.assert_awaited()
+    assert "楽観ロック" in pane_msg.edit.await_args.kwargs["content"]
+    # Still suppressed as a post — the replacement must not add a message.
+    assert not any("楽観ロック" in p for p in posted)
+
+
+async def test_mirror_still_suppresses_when_there_is_nothing_to_rewrite(
+    tmp_path: Path,
+) -> None:
+    """An entry with no messages (a caller that posted nothing) keeps the old
+    behaviour: suppress, and do not fall over looking for handles."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    pane_ctx, flushed_md = _pane_bridged_pair()
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    bridged_context.clear()
+    bridged_context.register(99687, pane_ctx, source="pane")
+    mirror = TranscriptMirror(
+        thread_id=99687,
+        project_dir=project,
+        sink=sink,
+        reply_sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_text(flushed_md))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    assert not any("楽観ロック" in p for p in posted)

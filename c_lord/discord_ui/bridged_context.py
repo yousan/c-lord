@@ -47,6 +47,9 @@ import difflib
 import logging
 import re
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,24 @@ def _match_kind(a: str, b: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class BridgedEntry:
+    """One delivered text, plus what the delivering side put in the thread.
+
+    ``messages`` carries the Discord messages the pane-bridge posted (#686). The
+    pane copy is the TUI *rendering* — box-drawn, hard-wrapped, markdown
+    stripped — and the readable markdown only arrives later, as the flush this
+    registry suppresses. Holding the messages here is what lets the suppressing
+    side **edit** them into the markdown instead of dropping it (see
+    ``c_lord.discord_ui.pane_context``). Empty for callers that posted nothing.
+    """
+
+    at: float
+    norm: str
+    source: str
+    messages: tuple[Any, ...] = field(default=())
+
+
 class BridgedContextRegistry:
     """Per-thread, one-shot, TTL-bound store of already-delivered texts.
 
@@ -102,14 +123,25 @@ class BridgedContextRegistry:
     """
 
     def __init__(self) -> None:
-        # thread_id -> [(registered_at_monotonic, normalized_text, source), ...]
-        self._entries: dict[int, list[tuple[float, str, str]]] = {}
+        # thread_id -> [BridgedEntry, ...]
+        self._entries: dict[int, list[BridgedEntry]] = {}
         # #680: thread_id -> [(delivered_at_monotonic, normalized_text), ...]
         # — what is already in the thread. See ``note_delivered``.
         self._delivered: dict[int, list[tuple[float, str]]] = {}
 
-    def register(self, thread_id: int, text: str, source: str = "pane") -> None:
-        """Record *text* as delivered to Discord by *source* for *thread_id*."""
+    def register(
+        self,
+        thread_id: int,
+        text: str,
+        source: str = "pane",
+        messages: Sequence[Any] | None = None,
+    ) -> None:
+        """Record *text* as delivered to Discord by *source* for *thread_id*.
+
+        *messages* are the Discord messages that delivery went into, kept so the
+        suppressing side can rewrite them rather than drop the better copy
+        (#686). Omit them and the entry behaves exactly as before.
+        """
         norm = _normalize(text)
         if len(norm) < _MIN_NORM_LEN:
             return
@@ -118,11 +150,11 @@ class BridgedContextRegistry:
         # calls consume_match, so without this the registry grows forever.
         for tid in list(self._entries):
             bucket = self._entries[tid]
-            bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
+            bucket[:] = [e for e in bucket if now - e.at < _TTL_SECONDS]
             if not bucket:
                 del self._entries[tid]
         bucket = self._entries.setdefault(thread_id, [])
-        bucket.append((now, norm, source))
+        bucket.append(BridgedEntry(now, norm, source, tuple(messages or ())))
         del bucket[:-_MAX_PER_THREAD]
 
     def consume_match(self, thread_id: int, text: str, source: str = "pane") -> bool:
@@ -133,17 +165,26 @@ class BridgedContextRegistry:
         ``source="mirror"``. Entries from the caller's own source are ignored,
         so a legitimate same-source repeat is never swallowed.
         """
+        return self.take_match(thread_id, text, source=source) is not None
+
+    def take_match(self, thread_id: int, text: str, source: str = "pane") -> BridgedEntry | None:
+        """The matching live entry from *source*, removed — or None (#686).
+
+        Same one-shot semantics as :meth:`consume_match`; this form also hands
+        back what the delivering side posted, so the caller can rewrite those
+        messages instead of silently dropping its own (better) copy.
+        """
         bucket = self._entries.get(thread_id)
         if not bucket:
-            return False
+            return None
         now = time.monotonic()
-        bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
+        bucket[:] = [e for e in bucket if now - e.at < _TTL_SECONDS]
         norm = _normalize(text)
         if len(norm) >= _MIN_NORM_LEN:
-            for i, (_, cand, cand_source) in enumerate(bucket):
-                if cand_source != source:
+            for i, entry in enumerate(bucket):
+                if entry.source != source:
                     continue
-                kind = _match_kind(cand, norm)
+                kind = _match_kind(entry.norm, norm)
                 if kind is not None:
                     del bucket[i]
                     if not bucket:
@@ -157,10 +198,10 @@ class BridgedContextRegistry:
                             thread_id,
                             len(norm),
                         )
-                    return True
+                    return entry
         if not bucket:
             self._entries.pop(thread_id, None)
-        return False
+        return None
 
     # -- #680: what is already in the thread -------------------------------
     #
