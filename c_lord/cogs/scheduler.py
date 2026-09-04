@@ -241,6 +241,10 @@ class SchedulerCog(commands.Cog):
                 # the bot owner so a question-mode pause still pings someone
                 # (#525: unless this deployment turned that fallback off).
                 notify_user_id=owner_notify_id(self.bot, kind="blocked"),
+                # #681: same for a turn that never ran. Nobody is watching a
+                # scheduled thread, so silence here is indistinguishable from
+                # success.
+                failure_notify_id=owner_notify_id(self.bot, kind="failure"),
             )
             await run_claude_with_config(run_config)
 
