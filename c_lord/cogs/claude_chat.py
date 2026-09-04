@@ -72,6 +72,7 @@ from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
 from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
+from ..workspace_dir import external_workspace
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -2618,7 +2619,42 @@ class ClaudeChatCog(commands.Cog):
 
             # session_dir_manager and tmux_manager already resolved above
             working_dir = self.runner.working_dir  # default
-            if session_dir_manager is not None:
+
+            # #687: a thread whose workspace is a **fixed checkout** keeps it.
+            # Scheduled runs work in ``scheduled_tasks.working_dir`` (e.g.
+            # /home/yousan/c-lord-audit), which no session dir ever cloned; the
+            # reply path used to clone one anyway and overwrite the recorded
+            # dir with it, so Claude kept working in the real checkout while
+            # the transcript mirror — which derives its project dir from that
+            # record — followed the clone into an empty directory. The rule
+            # itself lives in :mod:`c_lord.workspace_dir`, and it is a no-op
+            # for every thread whose workspace *is* its session dir.
+            try:
+                record_for_dir = await self.repo.get(thread.id)
+            except Exception:
+                # A DB hiccup must not be what decides where this turn runs —
+                # falling through to the session dir is the pre-#687 behaviour.
+                logger.warning(
+                    "%s could not read the recorded workspace; using the session dir",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
+                )
+                record_for_dir = None
+            fixed_checkout = external_workspace(
+                record_for_dir.working_dir if record_for_dir is not None else None,
+                base_dir=(
+                    session_dir_manager.base_dir if session_dir_manager is not None else None
+                ),
+                thread_id=thread.id,
+            )
+            if fixed_checkout is not None:
+                working_dir = fixed_checkout
+                logger.info(
+                    "%s reusing this thread's fixed checkout: %s (#687)",
+                    log_ctx(thread_id=thread.id),
+                    fixed_checkout,
+                )
+            elif session_dir_manager is not None:
                 # #518: hand the turn's requester down so the session dir's
                 # commit hook can credit them as a Co-authored-by. #520: that is
                 # the requester, not the trigger message's author — a /clord

@@ -378,6 +378,29 @@ class SessionRepository:
             rows = await cursor.fetchall()
             return [_record(row) for row in rows]
 
+    async def open_thread_ids(self) -> set[int]:
+        """Thread ids whose workspace is **not** stopped — the live ones.
+
+        The mirror image of :meth:`all_working_dirs`: the #685 sweep decides what
+        to archive by *name* (``[停止]``), and reads this set purely to hold back.
+        A reopen renames and un-archives in one PATCH, and when the rename half
+        loses its ~2-per-10-minutes allowance the retry re-applies only the
+        archive flag (``session_close._build_and_apply``) — leaving a **live**
+        workspace still called ``[停止]``. Name alone would then archive the
+        thread someone is working in; the name is decoration and the row is
+        where the state actually lives, so the row wins.
+
+        Only rows are listed. A thread with no row at all is invisible here, and
+        must stay archivable by name: 7 of the 186 threads found on 2026-09-04
+        had lost their row, and a DB-driven sweep would strand them forever.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT thread_id FROM sessions WHERE closed_at IS NULL OR TRIM(closed_at) = ''"
+            )
+            rows = await cursor.fetchall()
+            return {int(row[0]) for row in rows if row[0] is not None}
+
     async def all_working_dirs(self) -> set[str]:
         """Every ``working_dir`` any row still claims — closed rows included.
 

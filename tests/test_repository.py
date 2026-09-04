@@ -147,3 +147,24 @@ class TestTouch:
 
     async def test_missing_row_is_not_an_error(self, repo):
         await repo.touch(999999)
+
+
+class TestOpenThreadIds:
+    """``open_thread_ids`` — the live-workspace guard the #685 sweep reads."""
+
+    async def test_lists_only_rows_that_are_not_stopped(self, repo):
+        await repo.save(thread_id=1, session_id="live")
+        await repo.save(thread_id=2, session_id="stopped")
+        await repo.set_closed(2, True)
+
+        assert await repo.open_thread_ids() == {1}
+
+    async def test_a_reopened_row_is_live_again(self, repo):
+        await repo.save(thread_id=3, session_id="s")
+        await repo.set_closed(3, True)
+        await repo.set_closed(3, False)
+
+        assert await repo.open_thread_ids() == {3}
+
+    async def test_empty_table_is_an_empty_set(self, repo):
+        assert await repo.open_thread_ids() == set()

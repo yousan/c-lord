@@ -1652,3 +1652,72 @@ async def test_a_prompt_alone_arms_the_progress_line(tmp_path: Path) -> None:
         await mirror.stop()
 
     assert spy.posts, "a prompt-then-silence turn produced no progress line"
+
+
+# ---------------------------------------------------------------------------
+# #682: a menu's free-text answer must not come back as a 👤 bubble
+# ---------------------------------------------------------------------------
+
+
+async def test_menu_free_text_answer_is_not_echoed_as_user_input(tmp_path: Path) -> None:
+    """The text c-lord typed into an open menu is not re-posted as 👤 (#682).
+
+    A menu answer is delivered with ``send_literal``, which deliberately omits
+    the ZWSP marker so the answer string reaching the TUI stays clean (#172 /
+    #650). The CLI can still record it as a plain ``user`` event, and the ZWSP
+    test then reads it as "a human typed in the pane" — so the sentence the
+    user just wrote in Discord came back from the bot two seconds later.
+    """
+    from c_lord.transcript.pane_echo import pane_echo
+
+    answer = "既存のIssueとは競合してない？"
+    project, jsonl = _fresh_jsonl(tmp_path)
+    pane_echo.clear()
+    pane_echo.register(7, answer)
+
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    mirror = TranscriptMirror(thread_id=7, project_dir=project, sink=sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _user_str(answer))
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+        pane_echo.clear()
+
+    assert not [p for p in posted if answer in p], f"answer echoed back: {posted}"
+
+
+async def test_pane_typed_input_is_still_mirrored(tmp_path: Path) -> None:
+    """#682 AC4: a human typing in the pane still reaches Discord as 👤.
+
+    The guard must only swallow what c-lord itself typed — closing this path
+    too would hide the pane from the thread entirely.
+    """
+    from c_lord.transcript.pane_echo import pane_echo
+
+    project, jsonl = _fresh_jsonl(tmp_path)
+    pane_echo.clear()
+    pane_echo.register(8, "c-lord がメニューに打った回答")
+
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    mirror = TranscriptMirror(thread_id=8, project_dir=project, sink=sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _user_str("人がペインで打った別の文"))
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+        pane_echo.clear()
+
+    assert any("人がペインで打った別の文" in p for p in posted), posted
