@@ -295,3 +295,15 @@ class TestReplyUsesTheRecordedCheckout:
             await cog._run_claude(message, thread, "はじめまして", None)
 
         sdm.create_session_dir.assert_called_once()
+
+    async def test_a_db_hiccup_falls_back_to_the_session_dir(self, tmp_path: Path) -> None:
+        """Reading the record is new in #687 — it must not become a way to kill a turn."""
+        base = str(tmp_path / "sessions")
+        cog, sdm, _tmux = _chat_cog(None, base)
+        cog.repo.get = AsyncMock(side_effect=RuntimeError("database is locked"))
+        thread, message = _thread_and_message()
+
+        with contextlib.suppress(BaseException):
+            await cog._run_claude(message, thread, "続きをお願い", None)
+
+        sdm.create_session_dir.assert_called_once()

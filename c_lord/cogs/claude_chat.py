@@ -2629,7 +2629,17 @@ class ClaudeChatCog(commands.Cog):
             # record — followed the clone into an empty directory. The rule
             # itself lives in :mod:`c_lord.workspace_dir`, and it is a no-op
             # for every thread whose workspace *is* its session dir.
-            record_for_dir = await self.repo.get(thread.id)
+            try:
+                record_for_dir = await self.repo.get(thread.id)
+            except Exception:
+                # A DB hiccup must not be what decides where this turn runs —
+                # falling through to the session dir is the pre-#687 behaviour.
+                logger.warning(
+                    "%s could not read the recorded workspace; using the session dir",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
+                )
+                record_for_dir = None
             fixed_checkout = external_workspace(
                 record_for_dir.working_dir if record_for_dir is not None else None,
                 base_dir=(
