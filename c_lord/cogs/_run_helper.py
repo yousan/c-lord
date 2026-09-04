@@ -30,6 +30,7 @@ from ..claude.context_usage import (
 )
 from ..claude.tmux_runner import (
     NO_RESPONSE_ERROR_PREFIX,
+    TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
     TmuxClaudeRunner,
 )
@@ -43,6 +44,7 @@ from ..discord_ui.embeds import (
     error_embed,
     no_response_embed,
     timeout_embed,
+    trust_start_failed_embed,
     trust_stuck_embed,
     usage_limit_embed,
 )
@@ -90,6 +92,13 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # reader looking anywhere but the pane the dialog is still open in.
     if error.startswith(TRUST_STUCK_ERROR_PREFIX):
         return trust_stuck_embed(error)
+    # #684: a sibling outcome with the OPPOSITE pane state — the dialog was
+    # answered and closed, and there is no claude behind it. It gets its own
+    # embed rather than sharing the one above, whose advice ("the dialog is
+    # still open, go approve it") would send the reader after a dialog that is
+    # no longer there.
+    if error.startswith(TRUST_START_FAILED_ERROR_PREFIX):
+        return trust_start_failed_embed(error)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))

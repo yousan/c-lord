@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -11,7 +12,9 @@ import pytest
 
 from c_lord.claude.tmux_runner import (
     _TRUST_ACCEPT_MAX_ATTEMPTS,
+    _TRUST_RESTART_MAX_ATTEMPTS,
     NO_RESPONSE_ERROR_PREFIX,
+    TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
     USAGE_LIMIT_ERROR_PREFIX,
     TmuxClaudeRunner,
@@ -1012,11 +1015,7 @@ class TestTmuxClaudeRunnerTrustPrompt:
         assert TmuxClaudeRunner._has_trust_prompt(text) is False
 
     def test_offset_is_zero_for_numbered_dialog(self) -> None:
-        text = (
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit\n"
-            "Enter to confirm"
-        )
+        text = "❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm"
         assert TmuxClaudeRunner._trust_option_offset(text) == 0
 
     def test_offset_is_one_for_unnumbered_dialog(self) -> None:
@@ -2276,12 +2275,16 @@ class _ContinueTrustTimeline:
     1. ``booting``  — the window exists but claude is not up yet (``run``'s
        opening liveness probe).
     2. ``trust``    — ``claude --continue`` is alive **showing the folder-trust
-       dialog**.  This is the state the fixed 3s verdict used to read as
-       "--continue succeeded": the process really is running, it just has not
-       decided anything yet.
-    3. ``exited``   — the dialog was answered, ``--continue`` printed
+       dialog**, cursor on its default ``❯ No, exit``.  This is the state the
+       fixed 3s verdict used to read as "--continue succeeded": the process
+       really is running, it just has not decided anything yet.
+    3. ``trust_yes`` — a Down landed and the cursor is now on "Yes, I trust this
+       folder".  Modelled explicitly because the runner re-reads the cursor off
+       the pane before confirming (#684); a fake that never moves it would make
+       every accept look like a dropped keystroke.
+    4. ``exited``   — the dialog was answered, ``--continue`` printed
        ``No conversation found to continue`` and claude is gone.
-    4. ``fresh``    — the fallback fresh start is up and answering.
+    5. ``fresh``    — the fallback fresh start is up and answering.
     """
 
     def __init__(self) -> None:
@@ -2289,6 +2292,7 @@ class _ContinueTrustTimeline:
         self._panes = {
             "booting": "",
             "trust": _load_fixture("continue_trust_prompt_at_verdict.txt"),
+            "trust_yes": _load_fixture("trust_prompt_unnumbered_cursor_on_yes.txt"),
             "exited": _load_fixture("continue_no_conversation_exited.txt"),
             "fresh": _make_pane(["● Fresh start response."], with_input_prompt=True),
         }
@@ -2300,7 +2304,9 @@ class _ContinueTrustTimeline:
     def send_keys(self, _thread_id, key) -> bool:
         # Confirming the dialog is what lets --continue reach its real outcome:
         # there is no conversation to resume, so claude exits straight away.
-        if key == "Enter" and self.phase == "trust":
+        if key == "Down" and self.phase == "trust":
+            self.phase = "trust_yes"
+        elif key == "Enter" and self.phase in ("trust", "trust_yes"):
             self.phase = "exited"
         return True
 
@@ -2308,7 +2314,7 @@ class _ContinueTrustTimeline:
         return self._panes[self.phase]
 
     def is_claude_running(self, _thread_id=None) -> bool:
-        return self.phase in ("trust", "fresh")
+        return self.phase in ("trust", "trust_yes", "fresh")
 
 
 class TestContinueVerdictVsTrustPrompt:
@@ -3038,7 +3044,10 @@ class TestParseAskFromPane:
         q = _parse_ask_from_pane(pane)
         assert q is not None
         assert [o.label for o in q.options] == [
-            "カナリアリリース", "ブルーグリーン", "ローリング更新", "一斉切り替え",
+            "カナリアリリース",
+            "ブルーグリーン",
+            "ローリング更新",
+            "一斉切り替え",
         ]
         assert all(o.description for o in q.options), q.options
 
@@ -4515,9 +4524,7 @@ class TestUsageLimitRepeatDetection:
         assert _usage_limit_menu_open(pane) is False
 
     @pytest.mark.asyncio
-    async def test_identical_banner_repeat_is_still_reported(
-        self, runner, tmux_manager
-    ) -> None:
+    async def test_identical_banner_repeat_is_still_reported(self, runner, tmux_manager) -> None:
         """RED: the same banner twice was suppressed as 'history' and lost."""
         before = _normalize_capture(_load_fixture("usage_limit_weekly_hit.txt"))
         after = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
@@ -4614,9 +4621,7 @@ class TestTrustPromptResendGuard:
         ):
             _ = [e async for e in runner.run("do the thing")]
 
-        enters = [
-            c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]
-        ]
+        enters = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]]
         assert len(enters) <= _TRUST_ACCEPT_MAX_ATTEMPTS, (
             f"accepted {len(enters)} times — this is the #630 keystroke storm"
         )
@@ -4649,9 +4654,7 @@ class TestTrustPromptResendGuard:
         assert not result[0].error.startswith(NO_RESPONSE_ERROR_PREFIX)
 
     @pytest.mark.asyncio
-    async def test_a_dialog_that_closes_is_accepted_once(
-        self, runner, tmux_manager
-    ) -> None:
+    async def test_a_dialog_that_closes_is_accepted_once(self, runner, tmux_manager) -> None:
         """The normal path must stay a single Enter — no regression."""
         dialog = self._live_dialog()
         idle = _load_fixture("input_box_empty.txt")
@@ -4677,9 +4680,7 @@ class TestTrustPromptResendGuard:
         ):
             events = [e async for e in runner.run("do the thing")]
 
-        enters = [
-            c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]
-        ]
+        enters = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]]
         assert len(enters) == 1, enters
         result = [e for e in events if e.is_complete]
         assert not (result[0].error or "").startswith(TRUST_STUCK_ERROR_PREFIX)
@@ -4734,3 +4735,222 @@ class TestTrustStuckEmbed:
             )
         )
         assert config.outcome.no_response is True
+
+
+class TestTrustAcceptVerifiesItWorked:
+    """#684: answering the folder-trust dialog must be *checked*, not assumed.
+
+    The current dialog's cursor starts on ``❯ No, exit``, so the accept is
+    "Down, then Enter". If the Down does not land, the Enter DECLINES trust and
+    ``claude`` exits without ever starting a session — leaving a pane that no
+    longer matches the dialog, no transcript, and a generic
+    "Claude exited without producing a response" two minutes later. Seven
+    production threads died exactly that way and were noticed days afterwards.
+
+    Two independent guards, because the first one can only cover the failure
+    mode we know about:
+
+    * never press Enter while the cursor is provably still on "No, exit";
+    * after answering, verify a ``claude`` is actually running — and if not,
+      restart it rather than waiting out the start grace.
+    """
+
+    @staticmethod
+    def _cursor_on_no() -> str:
+        # Real capture: the unnumbered dialog as it renders before any Down.
+        return _load_fixture("continue_trust_prompt_at_verdict.txt")
+
+    @staticmethod
+    def _cursor_on_yes() -> str:
+        # Real capture: the same dialog after the Down landed.
+        return _load_fixture("trust_prompt_unnumbered_cursor_on_yes.txt")
+
+    @staticmethod
+    def _declined_corpse() -> str:
+        # Real capture: what a declined dialog leaves behind — the dialog text
+        # with a shell prompt under it and no claude.
+        return _load_fixture("trust_prompt_declined_corpse.txt")
+
+    @pytest.mark.asyncio
+    async def test_enter_is_withheld_while_the_cursor_is_still_on_no_exit(
+        self, runner, tmux_manager
+    ) -> None:
+        """AC2 (prevention): an Enter here is what exits claude."""
+        tmux_manager.capture_pane.return_value = self._cursor_on_no()
+        tmux_manager.send_keys.return_value = True
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner._accept_trust_prompt(self._cursor_on_no())
+
+        enters = [c for c in tmux_manager.send_keys.call_args_list if "Enter" in c.args[1:]]
+        assert not enters, (
+            "Enter was sent while the cursor was still on 'No, exit' — that is "
+            "the keystroke that declines trust and kills the turn (#684)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_enter_is_sent_once_the_cursor_reaches_yes(self, runner, tmux_manager) -> None:
+        """The normal path still confirms — exactly once."""
+        tmux_manager.capture_pane.return_value = self._cursor_on_yes()
+        tmux_manager.send_keys.return_value = True
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner._accept_trust_prompt(self._cursor_on_no())
+
+        keys = [c.args[1] for c in tmux_manager.send_keys.call_args_list]
+        assert keys.count("Enter") == 1, keys
+        assert keys.index("Down") < keys.index("Enter")
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_menu_still_confirms(self, runner, tmux_manager) -> None:
+        """No deadlock: when the pane cannot be read, keep the old behaviour.
+
+        Refusing to press Enter unless the cursor is *provably* on "Yes" would
+        turn any future dialog this parser cannot read into a permanent stall.
+        The guard only fires on a positive reading of "No, exit".
+        """
+        tmux_manager.capture_pane.return_value = ""
+        tmux_manager.send_keys.return_value = True
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner._accept_trust_prompt(self._cursor_on_no())
+
+        keys = [c.args[1] for c in tmux_manager.send_keys.call_args_list]
+        assert keys.count("Enter") == 1, keys
+
+    @pytest.mark.asyncio
+    async def test_the_numbered_dialog_still_takes_a_bare_enter(self, runner, tmux_manager) -> None:
+        """Regression: the pre-2.1.248 dialog needs no Down at all."""
+        numbered = _load_fixture("trust_prompt_live_v2_1_252.txt")
+        tmux_manager.capture_pane.return_value = numbered
+        tmux_manager.send_keys.return_value = True
+
+        with patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0):
+            await runner._accept_trust_prompt(numbered)
+
+        keys = [c.args[1] for c in tmux_manager.send_keys.call_args_list]
+        assert keys == ["Enter"], keys
+
+    class _TrustFake:
+        """Walks the real startup sequence a fresh workspace goes through.
+
+        dialog(cursor on No) → Down → dialog(cursor on Yes) → Enter → and then,
+        reproducing the production failure, **no claude behind it**: the corpse
+        pane, which no longer matches the dialog. ``revive_after`` says which
+        restart finally leaves one running (``None`` = never).
+        """
+
+        def __init__(self, outer, *, revive_after=None):
+            self._outer = outer
+            self.revive_after = revive_after
+            self.keys: list[str] = []
+            self.running = True
+            self.answered = False
+            self.restarts = 0
+            self.revived = False
+
+        def capture(self, *_a, **_k):
+            if self.revived:
+                return _load_fixture("input_box_empty.txt")
+            if self.answered:
+                return self._outer._declined_corpse()
+            if "Down" in self.keys:
+                return self._outer._cursor_on_yes()
+            return self._outer._cursor_on_no()
+
+        def send_keys(self, _tid, *keys):
+            for k in keys:
+                self.keys.append(k)
+                if k == "Enter":
+                    # The whole point: confirming the dialog left nothing alive.
+                    self.answered = True
+                    self.running = False
+            return True
+
+        def is_running(self, *_a, **_k):
+            return self.running
+
+        def foreground_command(self, *_a, **_k):
+            # What tmux would report: the shell once claude is gone.
+            return "claude" if self.running else "zsh"
+
+        def start_claude(self, *_a, **_k):
+            self.restarts += 1
+            self.keys.clear()
+            self.answered = False
+            if self.revive_after is not None and self.restarts >= self.revive_after:
+                self.running = True
+                self.revived = True
+            return True
+
+    @staticmethod
+    def _fast_loop():
+        return (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._TRUST_ACCEPT_SETTLE", 0.0),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.02),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        )
+
+    def _wire(self, tmux_manager, fake) -> None:
+        tmux_manager.capture_pane.side_effect = fake.capture
+        tmux_manager.send_keys.side_effect = fake.send_keys
+        tmux_manager.is_claude_running.side_effect = fake.is_running
+        tmux_manager.pane_foreground_command.side_effect = fake.foreground_command
+        tmux_manager.start_claude.side_effect = fake.start_claude
+
+    @pytest.mark.asyncio
+    async def test_a_dead_claude_after_the_dialog_is_restarted(self, runner, tmux_manager) -> None:
+        """AC2 (recovery): fault injection — claude is gone once the dialog is.
+
+        This is the shape of the production failure: the dialog is answered, the
+        pane stops matching it, and there is no claude behind it. Waiting out the
+        120s start grace and reporting a generic error is what cost days.
+        """
+        fake = self._TrustFake(self, revive_after=1)
+        self._wire(tmux_manager, fake)
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            events = [e async for e in runner.run("do the thing")]
+
+        assert fake.restarts == 1, f"restarts={fake.restarts}"
+        result = [e for e in events if e.is_complete]
+        assert not (result[0].error or "").startswith(TRUST_START_FAILED_ERROR_PREFIX), (
+            "a restart that recovered must not be reported as a failure"
+        )
+
+    def test_the_error_gets_its_own_embed_not_the_stuck_one(self) -> None:
+        """The stuck embed says "the dialog is still open" — here it is not.
+
+        Sending the reader to approve a dialog that closed two minutes ago is
+        the same misdirection #630 removed; so is "possible startup failure or
+        crash", which is what seven production threads actually got.
+        """
+        from c_lord.cogs._run_helper import _make_error_embed
+
+        embed = _make_error_embed(f"{TRUST_START_FAILED_ERROR_PREFIX} …")
+        assert "信頼ダイアログの応答に失敗" in (embed.title or "")
+        assert "出たまま閉じません" not in (embed.description or "")
+
+    @pytest.mark.asyncio
+    async def test_giving_up_names_the_trust_dialog(self, runner, tmux_manager) -> None:
+        """AC3: the ❌ has to say what failed, not 'possible startup failure'."""
+        fake = self._TrustFake(self, revive_after=None)
+        self._wire(tmux_manager, fake)
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            events = [e async for e in runner.run("do the thing")]
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert (result[0].error or "").startswith(TRUST_START_FAILED_ERROR_PREFIX), result[0].error
+        # And it must be bounded — #630's keystroke storm must not come back.
+        assert fake.restarts == _TRUST_RESTART_MAX_ATTEMPTS, fake.restarts
