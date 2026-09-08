@@ -1566,11 +1566,12 @@ class TmuxClaudeRunner:
         # Wait a moment then snapshot.
         await asyncio.sleep(_POST_STARTUP_DELAY)
 
-        # #583: the baseline for "did MY turn end?".  Taken *after* the prompt
-        # has been delivered and the TUI has settled, because a turn displaced
-        # by this prompt writes its own ``turn_duration`` within milliseconds of
-        # the submit — dating the baseline earlier would hand this turn the
-        # previous one's ending and finalize it on the first poll (#365).
+        # #583: the baseline for "did MY turn end?" — the bus only counts an
+        # instruction Claude read after this moment (and the ending that
+        # follows it).  Taken *after* the prompt has been delivered and the TUI
+        # has settled: a turn displaced by this prompt finishes within
+        # milliseconds of the submit, and dating the baseline earlier would let
+        # its ending count as this turn's (#365).
         turn_started_at = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
 
         # Poll capture-pane and extract response text.
