@@ -203,11 +203,29 @@ async def hint_for_thread(repo: SessionRepository, thread_id: int) -> str:
 
 _RESUME_CRASHED = "🔄 前回のワークスペースが落ちていたので、会話を復元して続けます。"
 _RESUME_REOPENED = "🔄 停止していたワークスペースを復元して、続きから再開します。"
+#: #700: the 7-day idle stop. Neither of the two above: nothing fell over, and
+#: the user pressed nothing — c-lord stopped this workspace on its own and is now
+#: undoing that because a message arrived. One line, because that is the whole of
+#: what happened; the inventory of what survived belongs to the *stop* notice
+#: (:mod:`c_lord.workspace_notice`), which the reader already got.
+_RESUME_AUTO_STOPPED = "🔄 しばらく操作が無かったため停止していました。復元して続きから再開します。"
 
 
-def resume_notice(*, slept: bool, reopened: bool) -> str | None:
+def resume_notice(
+    *,
+    slept: bool,
+    reopened: bool,
+    auto_stopped: bool = False,
+    already_announced: bool = False,
+) -> str | None:
     """What to post before a ``--continue`` resume, or ``None`` to say nothing.
 
+    * **already_announced** — the auto-recovery path (#700) has already posted its
+      one line for this turn. Adding 「落ちていたので」 underneath would contradict
+      the sentence directly above it.
+    * **auto_stopped** — the 7-day idle stop, undone because a message arrived
+      (#700). The user neither caused it nor asked for the recovery, so both other
+      wordings are false: nothing crashed, and no button was pressed.
     * **reopened** — the user just pressed 「▶️ 再開する」. Nothing fell over, so
       calling it a crash is simply false and reads as a fresh failure (#512).
     * **slept** — c-lord stopped Claude itself after 4 idle hours (#572). The
@@ -221,8 +239,13 @@ def resume_notice(*, slept: bool, reopened: bool) -> str | None:
 
     A deliberate reopen wins over a stale sleep mark: a workspace can be slept at
     4 hours, stopped at 7 days and then reopened by hand, and the last of those is
-    the one the user actually did.
+    the one the user actually did. An automatic stop wins over both, for the same
+    reason: it is the most recent thing that happened to this workspace.
     """
+    if already_announced:
+        return None
+    if auto_stopped:
+        return _RESUME_AUTO_STOPPED
     if reopened:
         return _RESUME_REOPENED
     if slept:

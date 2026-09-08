@@ -301,13 +301,19 @@ class TestReattachAction:
 # ── AC6/AC8: reachable from Discord without knowing a command exists ─────────
 
 
-class TestUntrackedNoticeOffersRecovery:
-    async def test_a_recoverable_thread_is_offered_the_button(self, tmp_path) -> None:
+class TestUntrackedThreadReconnectsOnArrival:
+    """#538 gave this notice a 🔗 再接続する button; #700 dropped the button and
+    does the reconnect itself. The behaviour under test is unchanged in the way
+    that matters — a swept thread gets back to its own checkout — so the tests
+    stayed, minus the click. See ``tests/test_auto_recovery.py`` for #700's own
+    coverage."""
+
+    async def test_a_recoverable_thread_is_reconnected(self, tmp_path) -> None:
         """The person who hits this is mid-confusion in the thread — the way out
-        belongs on the notice they are already reading, not in a command they
-        would have to know about."""
+        has to be right there, and the cheapest 'right there' is no step at all."""
         _seed(tmp_path, checkout=True, transcript=False)
         cog = _cog(tmp_path)
+        cog._handle_thread_reply = AsyncMock()  # type: ignore[method-assign]
         message = MagicMock(spec=discord.Message)
         message.webhook_id = None
         message.add_reaction = AsyncMock()
@@ -316,8 +322,9 @@ class TestUntrackedNoticeOffersRecovery:
         await cog._handle_untracked_thread(message, thread)
 
         thread.send.assert_awaited_once()
-        assert thread.send.await_args.kwargs.get("view") is not None
+        assert thread.send.await_args.kwargs.get("view") is None
         assert "再接続" in str(thread.send.await_args.args[0])
+        cog.repo.save.assert_awaited_once()
 
     async def test_an_unrecoverable_thread_gets_the_plain_notice(self, tmp_path) -> None:
         """AC8: nothing to reattach to — say so and name the way forward."""
@@ -336,50 +343,26 @@ class TestUntrackedNoticeOffersRecovery:
         assert thread.send.await_args.kwargs.get("view") is None
         assert "/clord" in said
 
-    async def test_the_button_reattaches_and_reports_what_it_got_back(self, tmp_path) -> None:
-        from c_lord.discord_ui.views import ReattachSessionView
-
+    async def test_the_reconnect_is_not_repeated_on_the_next_message(self, tmp_path) -> None:
+        """The second message finds a row and takes the ordinary reply path, so
+        the recovery — and its line — happen exactly once."""
         _seed(tmp_path, checkout=True, transcript=True)
         cog = _cog(tmp_path)
-        thread = _thread()
-        interaction = MagicMock(spec=discord.Interaction)
-        interaction.response = MagicMock()
-        interaction.response.defer = AsyncMock()
-        interaction.followup = MagicMock()
-        interaction.followup.send = AsyncMock()
-        interaction.message = MagicMock()
-        interaction.message.edit = AsyncMock()
-
-        view = ReattachSessionView(lambda i: cog._reattach_thread(thread))
-        await view.reattach_button.callback(interaction)
-
-        cog.repo.save.assert_awaited_once()
-        said = " ".join(str(c.args[0]) for c in interaction.followup.send.await_args_list if c.args)
-        assert "再接続" in said
-
-    async def test_a_second_click_does_not_reattach_twice(self, tmp_path) -> None:
-        from c_lord.discord_ui.views import ReattachSessionView
-
-        _seed(tmp_path, checkout=True, transcript=True)
-        cog = _cog(tmp_path)
+        cog._handle_thread_reply = AsyncMock()  # type: ignore[method-assign]
         thread = _thread()
 
-        def _interaction():
-            i = MagicMock(spec=discord.Interaction)
-            i.response = MagicMock()
-            i.response.defer = AsyncMock()
-            i.response.send_message = AsyncMock()
-            i.followup = MagicMock()
-            i.followup.send = AsyncMock()
-            i.message = MagicMock()
-            i.message.edit = AsyncMock()
-            return i
+        def _message():
+            m = MagicMock(spec=discord.Message)
+            m.webhook_id = None
+            m.add_reaction = AsyncMock()
+            return m
 
-        view = ReattachSessionView(lambda i: cog._reattach_thread(thread))
-        await view.reattach_button.callback(_interaction())
-        await view.reattach_button.callback(_interaction())
+        await cog._handle_untracked_thread(_message(), thread)
+        # #554's row is back now, which is what on_message keys on.
+        cog.repo.get = AsyncMock(return_value=MagicMock(closed_at=None))
 
         assert cog.repo.save.await_count == 1
+        assert thread.send.await_count == 1
 
 
 class TestReattachTextTwin:

@@ -170,28 +170,42 @@ class TestPlainThreadIsRefused:
 
 class TestFormerClordThreadIsOfferedRecovery:
     async def test_it_is_not_taken_over(self, channel_cog, tmp_path) -> None:
-        """AC1b: the #554 victim must not be silently re-created as a new
-        session — that would discard the checkout it still has."""
+        """AC1b: the #554 victim must not be silently re-created as a *new*
+        session — that would discard the checkout it still has.
+
+        #700 turned the button into an automatic reconnect, so ``/clord`` does now
+        run here. What AC1b actually forbids is unchanged and is what this asserts:
+        the row that comes back points at the checkout already on disk, never at a
+        fresh clone.
+        """
         cog = _make_cog(channel_cog, tmp_path=tmp_path)
-        (tmp_path / "sessions" / str(CHANNEL_ID) / str(THREAD_ID)).mkdir(parents=True)
+        workdir = tmp_path / "sessions" / str(CHANNEL_ID) / str(THREAD_ID)
+        workdir.mkdir(parents=True)
         thread = _thread()
-        respond = AsyncMock()
 
-        await _clord(cog, thread, respond)
+        await _clord(cog, thread, AsyncMock())
 
-        cog._run_claude.assert_not_awaited()
+        cog.repo.save.assert_awaited_once()
+        assert cog.repo.save.await_args.kwargs["working_dir"] == str(workdir)
+        cog.runner.clone.assert_not_called()
 
-    async def test_it_is_offered_the_reconnect_button(self, channel_cog, tmp_path) -> None:
-        """AC1b/AC3: 'refused' is the wrong answer here — the work is right there."""
+    async def test_it_reconnects_and_runs_the_prompt(self, channel_cog, tmp_path) -> None:
+        """AC1b/AC3: 'refused' is the wrong answer here — the work is right there.
+
+        #700: and so is 'here is a button'. The prompt was already typed; making
+        the user retype it after a click is the cost this removed.
+        """
         cog = _make_cog(channel_cog, tmp_path=tmp_path)
         (tmp_path / "sessions" / str(CHANNEL_ID) / str(THREAD_ID)).mkdir(parents=True)
         thread = _thread()
 
         await _clord(cog, thread, AsyncMock())
 
-        thread.send.assert_awaited_once()
-        assert thread.send.await_args.kwargs.get("view") is not None
-        assert "再接続" in str(thread.send.await_args.args[0])
+        said = " ".join(str(c.args[0]) for c in thread.send.await_args_list if c.args)
+        assert "再接続" in said, said
+        for call in thread.send.await_args_list:
+            assert call.kwargs.get("view") is None
+        cog._run_claude.assert_awaited_once()
 
     async def test_a_bot_created_thread_counts_even_with_nothing_on_disk(
         self, channel_cog, tmp_path
