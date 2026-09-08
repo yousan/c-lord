@@ -16,11 +16,9 @@
 #     /home/you/c-lord-staging-3,/home/you/c-lord-staging-4
 #
 # Per-clone config (bot token, channels, webhook) is read from each clone's own
-# .env. Injection mode is auto-resolved per clone: a CLORD_BRIDGE_MODE=jsonl clone
-# does not bind its REST API, so the harness uses webhook+skip-health there
-# automatically (no FUZZ_EXTRA_ARGS needed); otherwise spawn. Override with
-# FUZZ_EXTRA_ARGS="--inject spawn" / "--restart-if-down" only when you've verified
-# FUZZ_API_URL points at a reachable API.
+# .env. Injection defaults to webhook+skip-health (no FUZZ_EXTRA_ARGS needed).
+# Override with FUZZ_EXTRA_ARGS="--inject spawn" / "--restart-if-down" only when
+# you've verified FUZZ_API_URL points at a reachable API.
 #
 # The run borrows a lease; if all clones are busy/absent it skips cleanly (exit 0).
 # Per-run logs land in $FUZZ_LOG_DIR (default /tmp). Tunables: FUZZ_COUNT,

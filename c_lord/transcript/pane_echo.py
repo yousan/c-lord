@@ -75,9 +75,9 @@ class PaneEchoRegistry:
         if not norm:
             return
         now = time.monotonic()
-        # Purge expired entries everywhere: under CLORD_BRIDGE_MODE=skill no
-        # consumer ever calls consume_match, so without this the registry would
-        # grow for the lifetime of the process.
+        # Purge expired entries everywhere: a thread whose mirror never reads
+        # its bucket (no consume_match) would otherwise grow it for the lifetime
+        # of the process.
         for tid in list(self._entries):
             bucket = self._entries[tid]
             bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]

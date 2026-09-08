@@ -31,17 +31,14 @@ def _typed_command(calls: list[list[str]]) -> str:
     return "".join(c[-1] for c in calls if "send-keys" in c and "-l" in c)
 
 
-def _start(prompt: str, *, jsonl: bool) -> str:
+def _start(prompt: str) -> str:
     calls: list[list[str]] = []
 
     def fake_run(args):
         calls.append(list(args))
         return MagicMock(returncode=0, stdout="")
 
-    with (
-        patch("c_lord.tmux._run", side_effect=fake_run),
-        patch("c_lord.transcript.mirror.bridge_mode_jsonl", return_value=jsonl),
-    ):
+    with patch("c_lord.tmux._run", side_effect=fake_run):
         assert _mgr().start_claude(12345, prompt, "sonnet") is True
     return _typed_command(calls)
 
@@ -68,21 +65,15 @@ def _staged(cmd: str) -> str:
 
 
 def test_cold_start_prompt_is_marked_as_clord_originated() -> None:
-    cmd = _start("最初のメッセージ", jsonl=True)
+    cmd = _start("最初のメッセージ")
     assert _staged(cmd) == f"{ZWSP_MARKER}最初のメッセージ", (
         "start_claude must mark its prompt the way send_input does (#530)"
     )
 
 
-def test_cold_start_prompt_is_unmarked_when_the_jsonl_bridge_is_off() -> None:
-    """Under skill mode there is no mirror to fool — do not touch the prompt."""
-    cmd = _start("最初のメッセージ", jsonl=False)
-    assert ZWSP_MARKER not in _staged(cmd)
-
-
 def test_the_marker_never_lands_on_the_command_line() -> None:
     """It rides with the prompt, never on the `claude` command itself."""
-    cmd = _start("hello", jsonl=True)
+    cmd = _start("hello")
     assert cmd.startswith("unalias claude")
     assert ZWSP_MARKER not in cmd
     assert _staged(cmd) == f"{ZWSP_MARKER}hello"

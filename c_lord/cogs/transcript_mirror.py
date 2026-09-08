@@ -1,10 +1,10 @@
 """Cog: JSONL transcript → Discord thread mirror (Issue #71).
 
-When ``CLORD_BRIDGE_MODE=jsonl``, this Cog tails ``~/.claude/projects/<slug>/``
-for every thread that has a stored ``working_dir`` and forwards rendered events
-to the corresponding Discord thread.  It coexists with the legacy skill-based
-reply path: the skill injection itself is suppressed under jsonl mode so each
-event is posted at most once.
+This Cog tails ``~/.claude/projects/<slug>/`` for every thread that has a stored
+``working_dir`` and forwards rendered events to the corresponding Discord
+thread. Since #712 it is the *only* delivery path: it reads what Claude Code
+already wrote, so a turn cannot go undelivered because Claude forgot to post it
+(the failure mode of the retired skill-push path, #491).
 
 Lifecycle:
 - ``on_ready``: walk the sessions table and start a mirror task for every row
@@ -28,7 +28,6 @@ from ..discord_ui.turn_progress import TurnProgress
 from ..notify_policy import owner_notify_id
 from ..transcript.mirror import (
     TranscriptMirror,
-    bridge_mode_jsonl,
     reply_to_trigger_enabled,
     show_url_embeds_enabled,
     silent_posts_enabled,
@@ -69,9 +68,6 @@ class TranscriptMirrorCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        if not bridge_mode_jsonl():
-            logger.info("TranscriptMirrorCog: CLORD_BRIDGE_MODE != jsonl — staying idle")
-            return
         # Sessions are bounded by Discord usage; 10k is well above realistic.
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
@@ -152,11 +148,8 @@ class TranscriptMirrorCog(commands.Cog):
     def start_for(self, thread_id: int, working_dir: str) -> bool:
         """Spawn a mirror for ``thread_id`` if one is not already running.
 
-        Returns True if a new mirror was started, False if one already exists
-        or bridge mode is not jsonl.
+        Returns True if a new mirror was started, False if one already exists.
         """
-        if not bridge_mode_jsonl():
-            return False
         if thread_id in self._mirrors:
             return False
 

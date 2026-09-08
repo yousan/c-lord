@@ -32,8 +32,12 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
 
 ## Key Design Decisions
 
-1. **Claude pushes its own answer via Skill, not scraped from TUI** (#53): Each session dir gets a `.claude/skills/discord-reply/SKILL.md` (with `thread_id`, `api_url`, optional `Authorization: Bearer` baked in) that tells Claude to `curl POST /api/reply` at the end of every turn. c-lord no longer extracts Claude's response from `tmux capture-pane`. The tmux pane is kept solely for human visibility (`tmux attach -t <session>:<work>`) and for `send-keys` input. **This is what structurally prevents the TUI-chrome-leak class of bugs** (#23, #27, #28, #29, #30, #32, #34, #35, #39, #41, #43, #45, #49, #50): there is no text-from-TUI codepath that reaches Discord anymore, so a new chrome element can no longer leak. The legacy `USE_SKILL_REPLY` env remains as an opt-out switch (`USE_SKILL_REPLY=0`) but disabling it does **not** restore the old scrape path — it simply stops the skill from being injected, leaving Claude with no path to Discord. See `c_lord/skills/`.
-   **Update (#216, #492): skill-push above is no longer the default.** Issue #71 added a passive alternative, `TranscriptMirrorCog` (`c_lord/cogs/transcript_mirror.py`, `c_lord/transcript/mirror.py`), which tails Claude Code's own `~/.claude/projects/<slug>/*.jsonl` transcript and forwards it to the thread — it does not depend on Claude remembering to call anything, so it doesn't suffer the "Claude finished a turn without posting" failure mode that skill-push has (#491). #216 decided this jsonl mirror is the real delivery path, and #492 made it the default: `CLORD_BRIDGE_MODE` defaults to `jsonl`. The skill-push path described above still exists as a legacy opt-in (`CLORD_BRIDGE_MODE=skill`) — useful until the mirror gains feature parity on file attachments (#233) and reply-layer decorations like quote-reply/cli-prefix/prompt-choice (#237), both still open.
+1. **Claude's answer is read out of Claude Code's own transcript, not scraped from the TUI and not pushed by Claude** (#71/#216, 単一化は #712): `TranscriptMirrorCog` (`c_lord/cogs/transcript_mirror.py`, `c_lord/transcript/mirror.py`) が Claude Code 自身の `~/.claude/projects/<slug>/*.jsonl` を tail し、スレッドへ転送する。**これが唯一の配信経路**。
+   - **なぜ scrape ではないのか**: かつては `tmux capture-pane` の出力を投稿していたため、TUI の chrome が Discord に漏れるバグが繰り返し出た (#23, #27, #28, #29, #30, #32, #34, #35, #39, #41, #43, #45, #49, #50)。**TUI テキストから Discord へ至る経路がもう存在しない**ので、chrome 要素が増えても漏れようがない。
+   - **なぜ skill push ではないのか**: #53 は各 session dir に `discord-reply` skill を注入し、Claude 自身に `curl POST /api/reply` させていた (経路A)。これは **Claude が投稿を忘れるとターンが丸ごと届かない** (#491)。jsonl ミラーは「Claude が既に書いたもの」を読むので、忘れようがない。#216 でこちらを本命と決め、#492 で既定にし、**#712 で経路A を削除**した（`CLORD_BRIDGE_MODE` / `USE_SKILL_REPLY` という選択肢ごと無くした — 踏める地雷を残さない）。旧 env を .env に残したまま起動しても、**起動時に警告を出して jsonl で動く**（`c_lord/legacy_env.py`）。
+   - **c-lord が Claude に打ち込む入力には zero-width-space マーカーが付く** (`c_lord/tmux.py`)。ミラーはこれを見て「人がペインに打った入力」と区別し、打ち返さない (#71)。だから普通のメッセージは `/` 始まりでもスラッシュコマンドにならない（`/compact` 等が専用コマンドとして存在する理由 — `send_literal` 経由）。
+   - **REST API (`ext/api_server.py`) は配信経路ではなく制御面**なので、bridge とは無関係に**常に起動する** (#712/#543)。ポートが埋まっていれば WARNING を出して API 無しで動き続ける（bot 本体は落とさない）。
+   - 残っている非等価性: 添付ファイル (#233) と reply 層の装飾 (quote-reply / cli-prefix / prompt-choice, #237) は経路A にあって経路B にまだ無い。**独立した bug として追跡中**。
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
 3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. See `docs/specs/thread-lamp.md`.
 4. **Tool-use embeds are still driven by the tmux event stream**: `tmux_runner.py` still polls `capture-pane` and emits SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events. Only the ASSISTANT text events were removed (#53). So Discord still gets live "Bash(...)" / "Read(...)" embeds, status emoji, plan-approval buttons, etc. — none of that goes through the (removed) text-post path.
@@ -190,8 +194,8 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 1. **作成** — ユーザーがチャンネルにメッセージ → `ClaudeChatCog` がスレッドを作成
 2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)。同時に `coauthor.py` が `prepare-commit-msg` フックを (再)注入し、このターンの依頼者を `Co-authored-by` として記録する (#518)
 3. **tmux window 作成** — `channel_repo.py::resolve_tmux_manager(channel_id, thread_id=...)` で session を取得し (thread binding があればそちらの repo 由来、無ければ channel binding 由来)、新規 window (`w1`, `w2`, ...) を立てる
-4. **Claude CLI 起動 + Skill 注入** — `claude/tmux_runner.py` が tmux window 内で `claude` を起動 (`send-keys`)。同時に `session_dir.py` が `<session_dir>/.claude/skills/discord-reply/SKILL.md` を注入 — Claude はこれを読み取り、応答末尾で `curl POST /api/reply` で **自身が** Discord へ最終回答を投稿する (#53)。
-5. **ツール embed / 状態 emoji** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events を yield。 `EventProcessor` がそれぞれの embed/reaction を Discord に post する。**最終回答テキストはここを通らない** — Skill 経由のみ。
+4. **Claude CLI 起動 + transcript ミラー開始** — `claude/tmux_runner.py` が tmux window 内で `claude` を起動 (`send-keys`)。`claude_chat` が `TranscriptMirrorCog.start_for(thread_id, working_dir)` を呼び、そのスレッド用に JSONL の tail を張る — 最終回答はここを通って Discord に届く (#71/#712)。`session_dir.py` は `discord-read` skill (#259) を注入する（他チャンネルを読むための道具で、配信とは無関係）。
+5. **ツール embed / 状態 emoji** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events を yield。 `EventProcessor` がそれぞれの embed/reaction を Discord に post する。**最終回答テキストはここを通らない** — JSONL ミラー経由のみ。
 6. **応答完了** — `RESULT` event で `EventProcessor.finalize()` を呼び、reaction 更新 + registry から unregister
 7. **継続** — 同じスレッドへの reply は session_id を `--resume` で渡して同一セッションを継続
 8. **クリーンアップ (任意)** — `_cleanup_session_dir` / `_cleanup_tmux_session` (現状はコマンド経由で明示的にトリガ。スレッド close 時の自動クリーンアップは未実装)
@@ -290,9 +294,12 @@ c_lord/          # Installable Python package
                          # permission/plan/elicitation/todo events ONLY.
                          # ASSISTANT text events are no longer yielded (#53).
     types.py             # Type definitions for SDK messages
-  skills/                # Per-session SKILL.md generator (#52, #53)
-    discord_reply.py     # SKILL.md template (curl POST /api/reply pattern)
-    injector.py          # Writes SKILL.md into <session_dir>/.claude/skills/
+  legacy_env.py          # Startup notice for removed env switches (#712)
+  skills/                # Per-session SKILL.md generator
+    discord_read.py      # discord-read SKILL.md template (#259) — reads other
+                         # Discord channels; nothing to do with delivery
+    injector.py          # Writes discord-read into <session_dir>/.claude/skills/
+                         # and scrubs the retired output skills (#712)
   database/
     models.py            # SQLite schema
     repository.py        # Session CRUD operations
@@ -305,9 +312,8 @@ c_lord/          # Installable Python package
                          # tui_strip.py / progress_buffer.py were removed in
                          # #53 — the scrape→post path they served is gone.
   ext/
-    api_server.py        # REST API server (always on when bot starts).
-                         # POST /api/reply is the path Claude uses (via the
-                         # injected skill) to post its final answer.
+    api_server.py        # REST API control plane — always started (#712/#543);
+                         # a taken port logs a WARNING, it never kills the bot.
   utils/
     logger.py            # Logging setup
 tests/                   # pytest test suite

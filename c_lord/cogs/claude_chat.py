@@ -1747,10 +1747,10 @@ class ClaudeChatCog(commands.Cog):
         thread's tmux window to compress (summarize) the session context,
         freeing up the context window without losing history (unlike /clear).
 
-        Sent via ``send_literal`` (NOT ``send_input``): under
-        ``CLORD_BRIDGE_MODE=jsonl`` ``send_input`` prepends a zero-width-space
-        marker, so the line would no longer start with ``/`` and the TUI would
-        not treat it as a slash command (see docs/COMMANDS.md). This mirrors the
+        Sent via ``send_literal`` (NOT ``send_input``): ``send_input`` prepends
+        a zero-width-space marker, so the line would no longer start with ``/``
+        and the TUI would not treat it as a slash command (see
+        docs/COMMANDS.md). This mirrors the
         existing ``/context`` probe in ``tmux_runner.py``. Enter is sent
         separately via ``send_keys`` since ``send_literal`` does not submit.
         """
@@ -2861,9 +2861,9 @@ class ClaudeChatCog(commands.Cog):
 
             self._active_runners[thread.id] = runner
 
-            # Issue #71: when CLORD_BRIDGE_MODE=jsonl, kick off a per-thread
-            # transcript mirror so JSONL events flow to this Discord thread
-            # without going through the discord-reply skill.  No-op otherwise.
+            # Issue #71: kick off a per-thread transcript mirror so JSONL
+            # events flow to this Discord thread. This is the delivery path
+            # (#712) — without a mirror the thread hears nothing back.
             transcript_cog = getattr(self.bot, "transcript_mirror_cog", None)
             if transcript_cog is not None and working_dir:
                 try:

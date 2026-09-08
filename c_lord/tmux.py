@@ -2103,9 +2103,8 @@ class TmuxSessionManager:
             # the whole thing back to the thread — one duplicated line for a
             # short message, a dozen messages burying the answer for a big one.
             from .transcript.formatter import ZWSP_MARKER
-            from .transcript.mirror import bridge_mode_jsonl
 
-            marked_prompt = f"{ZWSP_MARKER}{prompt}" if bridge_mode_jsonl() else prompt
+            marked_prompt = f"{ZWSP_MARKER}{prompt}"
 
             # #529: hand the prompt over in a file rather than typing it. Anything
             # typed at the pane's prompt goes through zsh's line editor, and
@@ -2293,14 +2292,12 @@ class TmuxSessionManager:
 
         target = self._target(window)
 
-        # Send the text literally (no tmux key interpretation).  Under
-        # CLORD_BRIDGE_MODE=jsonl the text is prefixed with a zero-width-space
-        # marker so the JSONL ``user`` event Claude Code subsequently writes
-        # is recognised as c-lord-originated and skipped by the transcript
-        # mirror (Issue #71) — prevents double-posting Discord input back to
-        # the same thread.
+        # Send the text literally (no tmux key interpretation).  The text is
+        # prefixed with a zero-width-space marker so the JSONL ``user`` event
+        # Claude Code subsequently writes is recognised as c-lord-originated and
+        # skipped by the transcript mirror (Issue #71) — prevents double-posting
+        # Discord input back to the same thread.
         from .transcript.formatter import ZWSP_MARKER
-        from .transcript.mirror import bridge_mode_jsonl
 
         # #485: if an interactive menu (AskUserQuestion / plan approval) is open
         # in the pane, a plain message's trailing Enter would SELECT the
@@ -2329,7 +2326,7 @@ class TmuxSessionManager:
         if visible.returncode == 0:
             self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
-        payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
+        payload = f"{ZWSP_MARKER}{text}"
         if not self._type_literal(target, payload, what="send_input"):
             return False
 
@@ -2371,9 +2368,8 @@ class TmuxSessionManager:
         if capture.returncode != 0:
             return None
         from .transcript.formatter import ZWSP_MARKER
-        from .transcript.mirror import bridge_mode_jsonl
 
-        payload = f"{ZWSP_MARKER}{text}" if bridge_mode_jsonl() else text
+        payload = f"{ZWSP_MARKER}{text}"
         return _input_box_retains(capture.stdout, payload)
 
     def _confirm_submitted(self, target: str, payload: str, thread_id: int) -> bool:

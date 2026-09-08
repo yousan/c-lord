@@ -1,18 +1,18 @@
 """Tests for c_lord.skills.reply_tracker.
 
-The tracker records when Claude posts via the ``discord-reply`` skill so
-``run_claude_with_config`` can detect turns where the skill was never called
-and surface a fallback notification to Discord (issue #67).
+The tracker remembers the message each thread's last answer landed in, so
+post-turn helpers (e.g. the context-usage line) can append to that bubble
+instead of opening a new one.
 """
 
 from __future__ import annotations
 
-import time
+from unittest.mock import MagicMock
 
 from c_lord.skills.reply_tracker import (
-    record_reply,
+    get_last_reply_message,
+    record_reply_message,
     reset_tracker,
-    was_replied_since,
 )
 
 
@@ -20,30 +20,31 @@ def setup_function() -> None:
     reset_tracker()
 
 
-def test_no_reply_returns_false() -> None:
-    assert was_replied_since(thread_id=12345, since=time.monotonic()) is False
+def test_no_reply_returns_none() -> None:
+    assert get_last_reply_message(thread_id=12345) is None
 
 
-def test_recorded_reply_after_since_returns_true() -> None:
-    before = time.monotonic()
-    record_reply(thread_id=12345)
-    assert was_replied_since(thread_id=12345, since=before) is True
+def test_records_and_returns_the_message() -> None:
+    msg = MagicMock()
+    record_reply_message(12345, msg)
+    assert get_last_reply_message(12345) is msg
 
 
-def test_reply_before_since_returns_false() -> None:
-    record_reply(thread_id=12345)
-    later = time.monotonic() + 1.0
-    assert was_replied_since(thread_id=12345, since=later) is False
+def test_last_write_wins() -> None:
+    first, last = MagicMock(), MagicMock()
+    record_reply_message(12345, first)
+    record_reply_message(12345, last)
+    assert get_last_reply_message(12345) is last
 
 
 def test_other_thread_isolated() -> None:
-    before = time.monotonic()
-    record_reply(thread_id=111)
-    assert was_replied_since(thread_id=222, since=before) is False
-    assert was_replied_since(thread_id=111, since=before) is True
+    msg = MagicMock()
+    record_reply_message(111, msg)
+    assert get_last_reply_message(222) is None
+    assert get_last_reply_message(111) is msg
 
 
 def test_reset_clears_state() -> None:
-    record_reply(thread_id=12345)
+    record_reply_message(12345, MagicMock())
     reset_tracker()
-    assert was_replied_since(thread_id=12345, since=0.0) is False
+    assert get_last_reply_message(12345) is None
