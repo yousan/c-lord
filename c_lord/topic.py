@@ -1,10 +1,19 @@
-"""Stable-topic generator for Discord threads (Issue #95, #121).
+"""Topic (thread-name body) generator for Discord threads (Issue #95, #121, #705).
 
 Given the first user message of a new thread, derive a short Japanese
 topic body (≤20 chars) that will be stored as the thread's stable
-identity.  Two paths:
+identity.
 
-1. ``claude -p --model haiku`` with a 10s timeout (preferred).
+**Which path runs is a user decision (#705).**  By default nothing here calls an
+LLM on its own: :func:`initial_topic` takes the name the thread already carries,
+so the sidebar keeps the user's own words.  The LLM paths run only when asked —
+``/thread-rename`` (:func:`summarize_thread`, sonnet), or the opt-in automatic
+naming (:func:`generate_topic` / :func:`maybe_retitle`, haiku, gated on
+``CLORD_AUTO_TOPIC`` / ``CLORD_THREAD_RETITLE``).
+
+The automatic path has two steps:
+
+1. ``claude -p --model haiku`` with a 30s timeout (preferred).
 2. Heuristic fallback: strip URLs / mentions / code blocks, collapse
    whitespace, take the first 20 chars (always returns a non-empty
    string, never raises).
@@ -54,6 +63,23 @@ _RETITLE_PROMPT_TEMPLATE = (
     "\n<message>\n{msg}\n</message>"
 )
 
+#: Model for the **automatic** path (``generate_topic`` / ``maybe_retitle``).
+#: Cheap because it may fire on any thread's first message; only reachable at all
+#: when the user opted back in with ``CLORD_AUTO_TOPIC`` / ``CLORD_THREAD_RETITLE``.
+AUTO_MODEL = "haiku"
+#: Model for the **command** path (``/thread-rename``, #705). A rename the user
+#: asked for happens once, on demand, and its whole value is the quality of the
+#: summary — so it is worth a bigger model than the automatic path.
+RENAME_MODEL = "sonnet"
+
+_SUMMARIZE_PROMPT_TEMPLATE = (
+    "あなたはDiscordスレッドのタイトル生成器です。"
+    "<conversation>タグ内はスレッドの会話ログです。"
+    "このスレッドが何の作業のスレッドかを、20字以内の日本語のタイトルにしてください。"
+    "タイトルのみ返してください。記号・絵文字・説明文は不要です。"
+    "\n<conversation>\n{conversation}\n</conversation>"
+)
+
 _URL_RE = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"<[@#!&][^>]+>|@\w+")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -87,6 +113,26 @@ def heuristic_topic(first_message: str) -> str:
     return text[:_TOPIC_MAX_LEN]
 
 
+def initial_topic(thread_name: str, first_message: str) -> str:
+    """Topic for a thread's first naming pass **without** asking an LLM (#705).
+
+    Prefers the name the thread already carries — a name a human typed when they
+    opened the thread, or the message c-lord opened it from — over anything
+    generated.  That is the whole point of #705: the sidebar entry a user is
+    looking for should read the way they left it.  Falls back to the first
+    message, then to :data:`_FALLBACK_TOPIC`, so it is never empty.
+
+    The name is parsed first so the decorations c-lord itself writes
+    (``W3 │``, ``#404``, ``[停止]``) are not folded into the stored topic and
+    doubled on the next rebuild — the same reason
+    :func:`~c_lord.thread_name.parse_topic_from_name` exists for manual renames.
+    """
+    from .thread_name import parse_topic_from_name
+
+    body = parse_topic_from_name(thread_name or "")
+    return heuristic_topic(body or first_message or "")
+
+
 def _looks_like_instruction(message: str) -> bool:
     """Return True when the message is instruction-like (not a question/short reply).
 
@@ -115,18 +161,20 @@ def _is_valid_topic(result: str | None, original_msg: str) -> bool:
     return result != original_msg[:_TOPIC_MAX_LEN]
 
 
-async def _call_claude_p(prompt: str) -> str | None:
-    """Call ``claude -p --model haiku`` with the given raw prompt string.
+async def _call_claude_p(prompt: str, *, model: str = AUTO_MODEL) -> str | None:
+    """Call ``claude -p --model <model>`` with the given raw prompt string.
 
     Returns the trimmed, quote-stripped response or None on any failure.
-    Never raises.
+    Never raises.  ``model`` defaults to the cheap automatic-path model so the
+    existing callers (and the tests that patch this by name) are unchanged;
+    ``/thread-rename`` passes :data:`RENAME_MODEL` (#705).
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude",
             "-p",
             "--model",
-            "haiku",
+            model,
             "--",
             prompt,
             stdin=asyncio.subprocess.DEVNULL,
@@ -232,4 +280,37 @@ async def maybe_retitle(message: str, current_topic: str) -> str | None:
         if attempt == 0:
             logger.debug("maybe_retitle: invalid output %r, retrying", new_topic)
 
+    return None
+
+
+async def summarize_thread(conversation: str) -> str | None:
+    """Summarise a thread's conversation into a ≤20-char topic with sonnet (#705).
+
+    The command path behind ``/thread-rename``.  Returns None when the model is
+    unavailable or answers with something unusable (a refusal, an echo of the
+    input) — the caller then leaves the thread's name alone rather than writing
+    a placeholder over a name the user can read.
+
+    Retries once on an invalid answer, like the automatic path does.  Never
+    raises: a failed rename must stay a message, not an exception in a command.
+    """
+    text = (conversation or "").strip()
+    if not text:
+        return None
+
+    prompt = _SUMMARIZE_PROMPT_TEMPLATE.format(conversation=text)
+    for attempt in range(2):
+        try:
+            result = await _call_claude_p(prompt, model=RENAME_MODEL)
+        except Exception:
+            logger.warning("summarize_thread: LLM call failed (attempt=%d)", attempt + 1)
+            return None
+
+        if _is_valid_topic(result, text):
+            return result
+
+        if attempt == 0:
+            logger.debug("summarize_thread: invalid output %r, retrying", result)
+
+    logger.info("summarize_thread: no usable summary from %s", RENAME_MODEL)
     return None
