@@ -18,7 +18,7 @@
 
 | spec | 機能 | 一言で |
 |------|------|--------|
-| [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | トピックは初回固定（自動付け替えは既定オフ）。作業中の `#<Issue/PR番号>` をブランチ/本文から自動表示 |
+| [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | **自動要約は既定オフ（#705）** — 名前は開いたときのまま。要約し直すのは `/thread-rename`（sonnet）を打ったときだけ。作業中の `#<Issue/PR番号>` はブランチ/本文から自動表示 |
 | [thread-lamp.md](./thread-lamp.md) | スレッド名のランプ 🟢/🟡 | 既定オフ（rename レート制限のため）。`CLORD_THREAD_LAMP=1` で有効化すると受信で 🟢・完了で 🟡 |
 | [session-close.md](./session-close.md) | セッションの終了と再開 | `/close-workspace` はスレッド名を `[終了] …` にし、以後の投稿は実行せず再開ボタン付きの案内を出す（落ちただけのペインの自動復元とは別物） |
 | [workspace-vocabulary.md](./workspace-vocabulary.md) | ワークスペースの用語と3操作 | スリープ ⊂ 停止 ⊂ 削除。通知は毎回「止まったもの」と「まだ残っているもの」を並べる棚卸し |
@@ -29,6 +29,7 @@
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
 | [input-delivery.md](./input-delivery.md) | 送ったメッセージが Claude に届くこと | 本文・貼り付け・テキスト添付は長さに関係なく全文が届く。届かないときは理由と次の一手が出る |
 | [attachments.md](./attachments.md) | 添付ファイル | 添付は Claude が開ける実ファイルとして渡る。渡せないときは名前と理由がスレッドに出る（黙って捨てない） |
+| [ask-menu-lifecycle.md](./ask-menu-lifecycle.md) | 質問メニュー（❓ ボタン）の一生 | 1質問1枚。押したら本当に届く。**bot を再起動しても押せて、届く**（メニューは出し直さない） (#671) |
 | [stop-button.md](./stop-button.md) | ⏹ Stop ボタン | ターン中だけ末尾に1個出て、終わると消える。前のプロセスが残した押せないボタンは起動時に掃除される (#634) |
 | [turn-progress.md](./turn-progress.md) | ターン中の進捗表示 | スレッドが90秒黙ったときだけ1行出て、15秒ごとに書き換わり、実出力が戻ると消える（常時は出さない） |
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
@@ -39,6 +40,7 @@
 | [trust-prompt.md](./trust-prompt.md) | 作業ディレクトリの信頼ダイアログ | 1つのダイアログにつき承認は1回。閉じないときは数回でやめて理由を出す（黙って撃ち続けない） |
 | [tmux-window-identity.md](./tmux-window-identity.md) | 1 スレッド = 1 ウィンドウ | 同時に何本立てても全部そのまま起動し、あるスレッド宛のキーが別スレッドの作業ディレクトリに入ることはない |
 | [tmux-window-reaping.md](./tmux-window-reaping.md) | 作業ウィンドウの後片付け | 役目を終えた窓は放っておいても消える。何かが動いている窓と、人が手で作った窓は消えない |
+| [fleet-tmux-restart.md](./fleet-tmux-restart.md) | フリートの tmux が落ちたとき | 巻き添えで止まったスレッドには「あなたのせいではない・作業は残っている」と理由が出る（原因不明のクラッシュ表示にしない） |
 | [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
 | [command-ownership.md](./command-ownership.md) | テキストコマンドの担当と認可 | 同居する c-lord のうち担当1台だけが `!コマンド` に応じ、他は黙る。webhook は owner 設定でも弾かれない |
 | [context-footer.md](./context-footer.md) | ターン末尾の 📊 フッタ | 出る値はどれも「そのターンの実測」。CLI 版数は transcript から取り、bot 起動時の値を憶え続けない |

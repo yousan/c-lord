@@ -21,6 +21,7 @@ from pathlib import Path
 from ..tmux import TmuxSessionManager, pane_command_is_dead
 from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
+from ..utils.logger import log_ctx
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import (
     FREE_TEXT_NONE,
@@ -108,6 +109,22 @@ _TRUST_NAV_MAX_DOWNS = 3
 # outcome from NO_RESPONSE on purpose: both produce an empty turn, but only
 # one of them gets better if you send the message again.
 USAGE_LIMIT_ERROR_PREFIX = "Usage limit —"
+
+# Prefix of the RESULT error for "the tmux server this pane lived in was
+# replaced while the turn was running" (#701).  The one outcome here that is
+# not about this thread at all: the fleet's tmux went down under it, so every
+# thread mid-turn stops at once.  Without its own outcome each of them reports
+# "exited without producing a response (possible startup failure or crash)" —
+# on 2026-09-08 that left two uninvolved threads with no way to learn the cause
+# was elsewhere, and a finished piece of work nearly went unnoticed.
+FLEET_TMUX_RESTART_ERROR_PREFIX = "Fleet tmux restarted —"
+
+# How long to wait before re-reading a tmux server fingerprint that came back
+# unreadable (#701).  "No server answering" is a real fleet-down signal — the
+# #504 accidents kill the server outright rather than replacing it — but a
+# single failed query under load is not, so it is asked twice before the turn
+# is blamed on the fleet.
+_SERVER_RECHECK_DELAY = 1.0
 
 # How long an unknown interactive menu must be continuously visible before we
 # alert Discord (seconds).  Guards against transient TUI redraws.
@@ -1291,6 +1308,47 @@ class TmuxClaudeRunner:
             )
             return []
 
+    async def _fleet_tmux_error(self, server_at_start: str | None) -> str | None:
+        """ "The fleet's tmux went down under this turn" — or ``None`` (#701).
+
+        Every thread on this host lives in windows of ONE tmux server, so when
+        that server is replaced or killed, every thread mid-turn stops at once
+        and each one's own diagnosis is about a machine that no longer exists.
+        Asked at each failure exit, ahead of those diagnoses.
+
+        Both readings have to be known. An unreadable tmux is UNKNOWN, not a
+        dead fleet — blaming the fleet for a failed query would replace one
+        misleading message with another. That leaves one bounded gap on
+        purpose: a server that died *before* this turn began reads as the
+        baseline, so that turn keeps its ordinary "no window" wording.
+        """
+        if server_at_start is None:
+            return None
+        server_now = await asyncio.to_thread(self._tmux.server_fingerprint)
+        if server_now is None:
+            # Nothing answering at all — the fleet's tmux was killed outright
+            # rather than replaced, which is how the #504 accidents end
+            # (``systemctl --user restart c-lord.service`` takes the tmux server
+            # in its cgroup with it). Re-read once first: a single failed query
+            # under load must not be reported as the fleet dying.
+            await asyncio.sleep(_SERVER_RECHECK_DELAY)
+            server_now = await asyncio.to_thread(self._tmux.server_fingerprint)
+        if server_now == server_at_start:
+            return None
+        logger.error(
+            "%s tmux server changed mid-turn (%s → %s) — the fleet's tmux went "
+            "down and took this window with it (#701)",
+            log_ctx(thread_id=self._thread_id),
+            server_at_start,
+            server_now or "gone",
+        )
+        went = "was replaced" if server_now else "went down"
+        return (
+            f"{FLEET_TMUX_RESTART_ERROR_PREFIX} the tmux server holding this "
+            f"thread's pane {went} while the turn was running, so the turn was "
+            "cut off. Nothing was wrong with the request itself."
+        )
+
     async def _start_failure_reason(self, prompt: str) -> str:
         """Explain a failed ``start_claude`` by asking tmux, not by guessing (#621).
 
@@ -1351,6 +1409,13 @@ class TmuxClaudeRunner:
         # previous turn must not survive into this one.
         self._silent_stop = False
 
+        # #701: which tmux server this turn began on.  Read before anything
+        # touches tmux, because every failure exit below — start, delivery, and
+        # the final verdict — has to be able to ask "did the fleet's tmux go
+        # down under me?".  It is only compared when a turn ends badly, so a
+        # healthy turn pays one ``display-message`` and nothing else.
+        server_at_start = await asyncio.to_thread(self._tmux.server_fingerprint)
+
         # Emit a synthetic SYSTEM event so EventProcessor._on_system() saves
         # the session_id to the DB.  Without this, thread replies are ignored
         # because repo.get(thread_id) returns None.
@@ -1410,7 +1475,10 @@ class TmuxClaudeRunner:
                     raw={},
                     message_type=MessageType.RESULT,
                     is_complete=True,
-                    error=reason,
+                    # #701: the fleet's tmux going down explains every one of the
+                    # reasons above, and none of them can say so — the pane they
+                    # describe belonged to a server that is gone.
+                    error=await self._fleet_tmux_error(server_at_start) or reason,
                 )
                 return
         else:
@@ -1433,7 +1501,10 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error=await self._start_failure_reason(prompt),
+                        error=(
+                            await self._fleet_tmux_error(server_at_start)
+                            or await self._start_failure_reason(prompt)
+                        ),
                     )
                     return
 
@@ -1458,7 +1529,10 @@ class TmuxClaudeRunner:
                             raw={},
                             message_type=MessageType.RESULT,
                             is_complete=True,
-                            error=await self._start_failure_reason(prompt),
+                            error=(
+                                await self._fleet_tmux_error(server_at_start)
+                                or await self._start_failure_reason(prompt)
+                            ),
                         )
                         return
             else:
@@ -1479,7 +1553,10 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error=await self._start_failure_reason(prompt),
+                        error=(
+                            await self._fleet_tmux_error(server_at_start)
+                            or await self._start_failure_reason(prompt)
+                        ),
                     )
                     return
 
@@ -1950,9 +2027,9 @@ class TmuxClaudeRunner:
             # mode) nothing changes: the pane detection below still decides.
             if new_turn_started and turn_end_bus.ended_after(self._thread_id, turn_started_at):
                 logger.info(
-                    "Turn end from transcript after %.1fs (thread=%d)",
+                    "%s turn end from transcript after %.1fs",
+                    log_ctx(thread_id=self._thread_id),
                     elapsed,
-                    self._thread_id,
                 )
                 break
 
@@ -2038,7 +2115,19 @@ class TmuxClaudeRunner:
                     or _count_usage_limit(current) > baseline_limit_count
                 ):
                     usage_limit = found_limit
-            if trust_stuck:
+            # #701: asked before every rung below, because a server that was
+            # swapped under the turn invalidates what those rungs read.  The
+            # pane they scrape, the ``claude`` they look for and the window they
+            # target all belonged to a server that is gone, so each of them
+            # would answer confidently about the wrong machine — "exited without
+            # producing a response" is what the three threads of 2026-09-08 got.
+            # Both readings must be known: an unreadable tmux is UNKNOWN, and
+            # blaming the fleet on a failed query is the same class of mistake.
+            fleet_error = await self._fleet_tmux_error(server_at_start)
+
+            if fleet_error is not None:
+                error = fleet_error
+            elif trust_stuck:
                 # #630 sits above the rungs below because it is the only one that
                 # knows what blocked the turn. The others would report a timeout
                 # or "send it again" — both of which send the reader looking in

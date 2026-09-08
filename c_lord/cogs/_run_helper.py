@@ -29,6 +29,7 @@ from ..claude.context_usage import (
     read_latest_usage,
 )
 from ..claude.tmux_runner import (
+    FLEET_TMUX_RESTART_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
@@ -42,6 +43,7 @@ from ..discord_ui.ask_handler import (  # noqa: F401
 )
 from ..discord_ui.embeds import (
     error_embed,
+    fleet_tmux_restart_embed,
     no_response_embed,
     timeout_embed,
     trust_start_failed_embed,
@@ -90,6 +92,12 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # #630: checked before the timeout/no-response embeds because it is the one
     # outcome that knows what blocked the turn — the others would send the
     # reader looking anywhere but the pane the dialog is still open in.
+    # #701: above every pane-level diagnosis below, for the same reason the
+    # runner's rung is: the pane those embeds send the reader to belonged to a
+    # tmux server that no longer exists. This is also the only cause here that
+    # is not about this thread at all.
+    if error.startswith(FLEET_TMUX_RESTART_ERROR_PREFIX):
+        return fleet_tmux_restart_embed(error)
     if error.startswith(TRUST_STUCK_ERROR_PREFIX):
         return trust_stuck_embed(error)
     # #684: a sibling outcome with the OPPOSITE pane state — the dialog was

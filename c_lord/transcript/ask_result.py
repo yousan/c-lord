@@ -23,6 +23,8 @@ import logging
 from pathlib import Path
 from typing import Literal
 
+from ..log_sampler import LogSampler
+
 logger = logging.getLogger(__name__)
 
 #: The answer reached Claude.
@@ -35,13 +37,34 @@ ASK_UNKNOWN = "unknown"
 AskOutcome = Literal["answered", "not_answered", "unknown"]
 
 # Claude Code's own wording for a resolved AskUserQuestion.  Matching on text is
-# unusual for this codebase, but it is what the transcript records — and both
-# strings are stable, tool-specific, and carried verbatim into Claude's context.
-_ANSWERED_MARKER = "The user answered:"
+# unusual for this codebase, but it is what the transcript records.
+#
+# #707: this used to be one string, described here as "stable".  It was not —
+# the CLI changed the success wording and c-lord went quietly blind: EVERY
+# answered menu classified as ``unknown``, so the ✅ that #651 exists to earn was
+# effectively never shown and users were told "Claude が受け取ったかどうかを確認
+# できませんでした" over answers Claude had plainly received.  Nothing broke
+# loudly, because ``unknown`` is also the normal state while polling.
+#
+# Both wordings are kept: transcripts written by older CLIs are still on disk and
+# still read back.
+_ANSWERED_MARKERS = (
+    "The user answered:",  # ≤ v2.1.x
+    "Your questions have been answered:",  # v2.1.263, measured 2026-09-08
+)
 _NOT_ANSWERED_MARKERS = (
     "(No answer provided)",
     "The user wants to clarify these questions",
 )
+
+# #707 AC3: adding a literal fixes today and rebuilds the same trap for tomorrow.
+# What actually failed is that c-lord could not tell "no result yet" from "a
+# result I do not understand" — both are ``unknown``, and ``unknown`` is normal
+# while polling, so nothing ever looked wrong.  A result that exists and matches
+# nothing is now audible.  Sampled per distinct wording (the confirm poll re-reads
+# the same text every 0.5s for up to 12s) — the #678 rule: never DEBUG-and-forget,
+# never flood.
+_unknown_wording_sampler = LogSampler()
 
 # Cheap pre-filter: only lines mentioning the tool are worth parsing.
 _ASK_TOOL_NAME = "AskUserQuestion"
@@ -158,9 +181,20 @@ def classify_ask_result(text: str | None) -> AskOutcome:
     text we do not understand is exactly the failure this module exists to stop.
     """
     if not text:
+        # Nothing written yet — the normal case while the confirm poll waits.
         return ASK_UNKNOWN
     if any(marker in text for marker in _NOT_ANSWERED_MARKERS):
         return ASK_NOT_ANSWERED
-    if _ANSWERED_MARKER in text:
+    if any(marker in text for marker in _ANSWERED_MARKERS):
         return ASK_ANSWERED
+    sample = _unknown_wording_sampler.sample(text[:200])
+    if sample.emit:
+        logger.warning(
+            "AskUserQuestion tool_result in wording c-lord does not recognise — "
+            "the ✅/❔ decision cannot be made and every answered menu will read as "
+            "unconfirmed until this is taught. Claude Code may have changed its "
+            "wording again (#707). First 200 chars: %r%s",
+            text[:200],
+            sample.suffix,
+        )
     return ASK_UNKNOWN

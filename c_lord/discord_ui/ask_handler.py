@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from ..claude.types import AskQuestion
+from ..claude.types import AskQuestion, ask_question_to_dict
 from ..database.ask_repo import PendingAskRepository
 from ..transcript.ask_result import (
     ASK_ANSWERED,
@@ -102,15 +102,29 @@ def _context_chunks(text: str) -> tuple[list[str], bool]:
     return chunks, truncated
 
 
-def _close(thread_id: int, reason: str, message: object | None = None) -> None:
+async def _close(
+    thread_id: int,
+    reason: str,
+    message: object | None = None,
+    ask_repo: PendingAskRepository | None = None,
+) -> None:
     """Mark this thread's menu closed for *reason* and stop tracking *message* (#536).
 
     Recording the reason is what lets a late click say something true; forgetting
     the message keeps a resolved menu from being blanked a second time as if it
     were a stale copy.
+
+    #671: this is also where the restart ledger row goes. Every way a menu can
+    stop accepting answers — timed out, answered in the pane, resolved on
+    another copy, pre-empted, answered here — funnels through this one call, so
+    putting the delete anywhere else would mean five places to keep in step. A
+    row left behind would re-arm a menu that no longer exists on the next boot.
     """
     _ask_bus.note_closed(thread_id, reason)
     _ask_menus.forget(thread_id, getattr(message, "id", None))
+    if ask_repo is not None:
+        with contextlib.suppress(Exception):
+            await ask_repo.delete(thread_id)
 
 
 def _mention(user_id: int | None) -> str | None:
@@ -267,6 +281,37 @@ async def _report_answer_delivery(
         await thread.send(_answer_undeliverable_notice(selected))
 
 
+async def send_answer_keystrokes(
+    runner: TmuxClaudeRunner, question: AskQuestion, selected: list[str]
+) -> bool | None:
+    """Type *selected* into the TUI menu that is open in *runner*'s pane.
+
+    Split out of the bridge so the restart-recovery path (#671) answers a menu
+    the same way a live turn does. The three branches are not
+    interchangeable — picking the wrong one is #650, where every keystroke
+    landed and Claude still recorded "(No answer provided)":
+
+    - multiSelect toggles each chosen index then Submits (#418); ``answer_menu``
+      here dropped all but the first choice;
+    - a single choice navigates ``Down × index`` — which is why the option ORDER
+      matters far more than the label text;
+    - free text goes to whichever affordance this menu has (a "Type something."
+      row, or a preview menu's ``Notes:`` field).
+
+    Returns the runner's own delivery verdict: ``False`` means the keystrokes
+    reached no window at all (#600).
+    """
+    labels = [opt.label for opt in question.options]
+    indices = [labels.index(s) for s in selected if s in labels]
+    if question.multi_select and indices:
+        return await runner.answer_menu_multi(indices, len(question.options))
+    if selected and selected[0] in labels:
+        return await runner.answer_menu(labels.index(selected[0]))
+    return await runner.answer_menu_text(
+        len(question.options), selected[0] if selected else "", mode=question.free_text_mode
+    )
+
+
 async def bridge_pane_ask(
     thread: discord.Thread,
     question: AskQuestion,
@@ -415,6 +460,25 @@ async def _bridge_claimed_menu(
     # #536: while this menu is answerable it must be reachable, so that
     # resolving any OTHER copy can blank this one out (and vice versa).
     _ask_menus.register(thread.id, msg)
+    # #671: write the menu down NOW, while the process that drew it is still
+    # alive. Every route that puts a menu on screen ends up here, and none of
+    # them recorded anything — so the restart-recovery table
+    # (``_restore_pending_ask_views``, shipped long ago) stayed empty in
+    # production forever and every restart left a thread of dead buttons that
+    # answered a press with Discord's red 3-second ACK timeout and not one line
+    # in the log. Suppressed on failure: a ledger write must never be able to
+    # take down a menu that is otherwise working.
+    if ask_repo is not None:
+        with contextlib.suppress(Exception):
+            await ask_repo.save(
+                thread_id=thread.id,
+                # The recovery path re-reads the pane rather than resuming a CLI
+                # session, so no session id is needed — the column is NOT NULL.
+                session_id="",
+                questions=[ask_question_to_dict(question)],
+                question_idx=0,
+                message_id=getattr(msg, "id", None),
+            )
 
     resolved_note = "-# ✅ 端末で回答済み（このボタンは無効です）"
 
@@ -463,7 +527,7 @@ async def _bridge_claimed_menu(
     # the truth instead of the blanket "the bot was restarted" it used to get.
     if not done:
         # 24h timeout with the menu still open → dismiss it.
-        _close(thread.id, CLOSE_TIMEOUT, msg)
+        await _close(thread.id, CLOSE_TIMEOUT, msg, ask_repo)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(
                 content="-# ⏰ Question timed out — send a new message to continue.",
@@ -475,7 +539,7 @@ async def _bridge_claimed_menu(
 
     if click_task not in done:
         # Menu was answered/cancelled directly in the pane — buttons are stale.
-        _close(thread.id, CLOSE_TERMINAL, msg)
+        await _close(thread.id, CLOSE_TERMINAL, msg, ask_repo)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(content=resolved_note, embed=None, view=None)
         return
@@ -484,7 +548,7 @@ async def _bridge_claimed_menu(
     # The menu may have been resolved in the TUI in the same instant the click
     # arrived; sending keystrokes then would leak into the idle prompt (#359).
     if hasattr(runner, "peek_pending_ask") and await runner.peek_pending_ask() is None:
-        _close(thread.id, CLOSE_TERMINAL, msg)
+        await _close(thread.id, CLOSE_TERMINAL, msg, ask_repo)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(content=resolved_note, embed=None, view=None)
         return
@@ -494,7 +558,7 @@ async def _bridge_claimed_menu(
         # is about to be Esc'd away, so its buttons must go with it (#536) —
         # leaving them live is what produced menus that stayed clickable long
         # after the question was gone.
-        _close(thread.id, CLOSE_INTERRUPTED, msg)
+        await _close(thread.id, CLOSE_INTERRUPTED, msg, ask_repo)
         with contextlib.suppress(discord.HTTPException):
             await msg.edit(
                 content="-# ⚡ 新しい指示が届いたので、この質問は取り消しました。",
@@ -504,7 +568,7 @@ async def _bridge_claimed_menu(
         await runner.cancel_menu()
         return
 
-    _close(thread.id, CLOSE_ANSWERED, msg)
+    await _close(thread.id, CLOSE_ANSWERED, msg, ask_repo)
 
     # #651: identify the menu in Claude's own transcript BEFORE answering it, so
     # the outcome can be read back from the authoritative place. Done up front
@@ -516,23 +580,7 @@ async def _bridge_claimed_menu(
         else None
     )
 
-    labels = [opt.label for opt in question.options]
-    indices = [labels.index(s) for s in selected if s in labels]
-    if question.multi_select and indices:
-        # multiSelect: toggle every chosen option and Submit (#418).  Using
-        # answer_menu (single-select) here dropped all but selected[0].
-        delivered = await runner.answer_menu_multi(indices, len(question.options))
-    elif selected[0] in labels:
-        delivered = await runner.answer_menu(labels.index(selected[0]))
-    else:
-        # Free text from the "Other" modal.  How it is typed depends on the
-        # layout the parser read off the pane (#650): the classic menu numbers a
-        # "Type something." row immediately after the real options, while a
-        # preview menu has no such row and takes the text in its ``Notes:``
-        # field instead.  Sending the wrong one answers "(No answer provided)".
-        delivered = await runner.answer_menu_text(
-            len(question.options), selected[0], mode=question.free_text_mode
-        )
+    delivered = await send_answer_keystrokes(runner, question, selected)
     # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
     # is what keeps the menu from silently staying open and being re-posted.
     await _report_answer_delivery(thread, delivered=delivered is not False, selected=selected)
@@ -625,7 +673,7 @@ async def collect_ask_answers(
         try:
             selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)
         except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
-            _close(thread.id, CLOSE_TIMEOUT, msg)
+            await _close(thread.id, CLOSE_TIMEOUT, msg, ask_repo)
             _ask_bus.unregister(thread.id)
             if ask_repo is not None:
                 await ask_repo.delete(thread.id)
@@ -650,10 +698,10 @@ async def collect_ask_answers(
             await ask_repo.delete(thread.id)
 
         if not selected:
-            _close(thread.id, CLOSE_INTERRUPTED, msg)
+            await _close(thread.id, CLOSE_INTERRUPTED, msg, ask_repo)
             continue
 
-        _close(thread.id, CLOSE_ANSWERED, msg)
+        await _close(thread.id, CLOSE_ANSWERED, msg, ask_repo)
         # #651: on this path the answer needs no verification — it is returned
         # from here and injected as Claude's next prompt, so it cannot be lost
         # in a menu. Say so, rather than leaving the click's interim ⏳ standing.

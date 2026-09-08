@@ -34,6 +34,7 @@ from ..session_close import (
 from ..session_dir import SessionDirManager
 from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
 from ..status_view import StatusRow, classify_status, render_status
+from ..thread_rename import rename_thread_topic
 from ..thread_settings import (
     SETTING_THREAD_AUTO_ARCHIVE,
     VALID_DURATIONS,
@@ -484,6 +485,44 @@ class SessionManageCog(commands.Cog):
             await respond(f"❌ Invalid duration `{duration}` — must be a number.", ephemeral=True)
             return
         await self._archive_set_impl(duration=minutes, respond=respond)
+
+    # ── Thread rename (#705) ──────────────────────────────────────────────────
+
+    async def _thread_rename_impl(
+        self, *, channel: object, respond: _Responder, ack: _Acknowledger
+    ) -> None:
+        """Shared core for /thread-rename and !thread-rename (#705).
+
+        c-lord no longer summarises thread names on its own (the sidebar is how a
+        user finds their own thread), so this is the path that produces a fresh
+        summary — with sonnet, on demand, for this thread only. It works on a
+        manually renamed (``auto_topic_locked``) thread too: the lock stops
+        *c-lord* from renaming, and here the user is the one asking.
+        """
+        if not isinstance(channel, discord.Thread):
+            await respond("❌ `/thread-rename` はスレッドの中で実行してください。", ephemeral=True)
+            return
+
+        # The summary shells out to `claude -p`, which takes seconds — ack first
+        # so the interaction does not expire while sonnet is thinking.
+        with contextlib.suppress(Exception):
+            await ack()
+        await respond(await rename_thread_topic(channel, self.repo))
+
+    @app_commands.command(
+        name="thread-rename",
+        description="このスレッドの名前を、いまの会話から要約し直す",
+    )
+    async def thread_rename(self, interaction: discord.Interaction) -> None:
+        """Re-summarise this thread's name on demand (#705)."""
+        respond, ack = self._slash_io(interaction)
+        await self._thread_rename_impl(channel=interaction.channel, respond=respond, ack=ack)
+
+    @commands.command(name="thread-rename")
+    async def thread_rename_text(self, ctx: commands.Context) -> None:
+        """Text/mention twin of /thread-rename — webhook-invokable for E2E (#209)."""
+        respond, ack = self._ctx_io(ctx)
+        await self._thread_rename_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     # ------------------------------------------------------------------
     # Session directory commands

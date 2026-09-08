@@ -2593,6 +2593,9 @@ class TestThreadLampDisabled:
         from c_lord.thread_name import STATUS_EMOJI
 
         monkeypatch.delenv("CLORD_THREAD_LAMP", raising=False)
+        # #705: the initial LLM summary is opt-in now. This test is about the
+        # lamp, so opt in and keep exercising the "topic applied" half.
+        monkeypatch.setenv("CLORD_AUTO_TOPIC", "1")
         cog, thread, tmux = self._make_cog_and_thread(topic=None)
         cog.repo.set_topic = AsyncMock()
         thread.name = "old"
@@ -2622,6 +2625,7 @@ class TestThreadLampDisabled:
         from c_lord.cogs import claude_chat as cc_module
 
         monkeypatch.setenv("CLORD_THREAD_LAMP", "1")
+        monkeypatch.setenv("CLORD_AUTO_TOPIC", "1")  # #705 — see the test above
         cog, thread, tmux = self._make_cog_and_thread(topic=None)
         cog.repo.set_topic = AsyncMock()
         thread.name = "old"

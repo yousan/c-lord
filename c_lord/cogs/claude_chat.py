@@ -69,7 +69,7 @@ from ..session_resume import (
     is_clord_thread,
     resume_notice,
 )
-from ..thread_name import thread_lamp_enabled, thread_retitle_enabled
+from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_auto_enabled
 from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
@@ -222,6 +222,7 @@ class ClaudeChatCog(commands.Cog):
         allowed_role_name: str | None = None,
         thread_lamp: bool | None = None,
         thread_retitle: bool | None = None,
+        auto_topic: bool | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -236,6 +237,12 @@ class ClaudeChatCog(commands.Cog):
         # (#414) — it fired too eagerly and renamed threads users didn't want
         # renamed. Opt in via thread_retitle=True or CLORD_THREAD_RETITLE=1.
         self._thread_retitle = thread_retitle_enabled(thread_retitle)
+        # #705: the *initial* LLM summary of a new thread's name. Off by default
+        # for the same reason the re-titling pass is: the sidebar is how a user
+        # finds their own thread, so c-lord no longer renames it unasked. Opt in
+        # via auto_topic=True or CLORD_AUTO_TOPIC=1; ``/thread-rename`` is the
+        # on-demand path that replaces it.
+        self._auto_topic = topic_auto_enabled(auto_topic)
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         # #466: one allowlist predicate shared by message gating (_is_allowed)
@@ -490,8 +497,10 @@ class ClaudeChatCog(commands.Cog):
     ) -> None:
         """Apply the Issue #95 / #414 naming scheme to ``thread``.
 
-        - Generates and persists ``topic`` on first use (unless the
-          thread is ``auto_topic_locked`` from a previous manual rename).
+        - Persists ``topic`` on first use (unless the thread is
+          ``auto_topic_locked`` from a previous manual rename). By default the
+          topic is the name the thread already carries — no LLM summary is
+          generated unless ``CLORD_AUTO_TOPIC=1`` (#705).
         - Resolves and persists the Issue/PR number (#414) from the session's
           git branch (``working_dir``) or, as a fallback, the first message.
         - Persists the tmux ``window_id`` (immutable) on the row.
@@ -569,12 +578,23 @@ class ClaudeChatCog(commands.Cog):
                     topic = new_topic
 
         # Derive topic if missing and not locked (first message).
+        #
+        # #705: by default this does NOT ask an LLM. ``initial_topic`` keeps the
+        # name the thread already carries — the name a human typed when they
+        # opened it, or the message c-lord opened it from — because the sidebar
+        # is where they recognise their own thread and a summary they did not ask
+        # for costs them that. ``CLORD_AUTO_TOPIC=1`` restores the LLM naming,
+        # and ``/thread-rename`` summarises on demand at any time.
         if not topic and not locked:
-            try:
-                topic, source = await topic_module.generate_topic(first_message or "")
-            except Exception:
-                logger.warning("topic generation failed", exc_info=True)
-                topic, source = topic_module.heuristic_topic(first_message or ""), "heuristic"
+            if not self._auto_topic:
+                topic = topic_module.initial_topic(thread.name or "", first_message or "")
+                source = "thread_name"
+            else:
+                try:
+                    topic, source = await topic_module.generate_topic(first_message or "")
+                except Exception:
+                    logger.warning("topic generation failed", exc_info=True)
+                    topic, source = topic_module.heuristic_topic(first_message or ""), "heuristic"
             if record is not None:
                 await self.repo.set_topic(thread.id, topic, source=source)
             else:
@@ -1977,14 +1997,15 @@ class ClaudeChatCog(commands.Cog):
         - A resume failure (e.g. channel not found) is logged and skipped
           gracefully — it never prevents the bot from becoming ready.
 
-        It also sweeps away ``⏹ Stop`` buttons a previous process could not
-        delete (#634). Startup is the only moment at which "every stop button in
-        the DB's threads is dead" is guaranteed true, so it is the only moment
-        the sweep is safe. Spawned as its own task: it walks up to a few hundred
-        threads and must not hold up becoming ready.
+        It also retires the UI the previous process left behind — dead ⏹ Stop
+        buttons (#634) and question menus whose handlers died with that process
+        (#671). Startup is the only moment at which "everything on screen from
+        the last run is dead" is guaranteed true, so it is the only moment this
+        is safe. Spawned as its own task: it walks up to a few hundred threads
+        and must not hold up becoming ready.
         """
         # Held on the cog so the task is not garbage-collected mid-sweep.
-        self._stop_sweep_task = asyncio.create_task(self._sweep_dead_stop_buttons())
+        self._stop_sweep_task = asyncio.create_task(self._run_startup_recovery())
 
         if self._resume_repo is None:
             return
@@ -2044,12 +2065,17 @@ class ClaudeChatCog(commands.Cog):
             except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
 
-    async def _sweep_dead_stop_buttons(self) -> None:
-        """Remove the previous process's dead ⏹ Stop buttons (#634). Never raises."""
-        from ..stale_stop_buttons import sweep_dead_stop_buttons
+    async def _run_startup_recovery(self) -> None:
+        """Retire the previous process's dead UI (#634 stop buttons, #671 menus).
+
+        One call, on purpose: these two ran from different ``on_ready`` handlers
+        and one of them silently never fired for a month (#671). See
+        ``c_lord/startup_recovery.py``.
+        """
+        from ..startup_recovery import run_startup_recovery
 
         with contextlib.suppress(Exception):
-            await sweep_dead_stop_buttons(self.bot, self.repo)
+            await run_startup_recovery(self.bot, self.repo, self._ask_repo)
 
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
