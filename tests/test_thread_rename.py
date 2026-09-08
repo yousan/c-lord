@@ -321,6 +321,23 @@ class TestThreadRenameCommand:
         assert thread.edit.await_args.kwargs["name"] == "新しい要約"
 
     @pytest.mark.asyncio
+    async def test_reply_cannot_ping_the_channel(self) -> None:
+        """要約は会話由来なので、返信に混ざった @everyone がそのまま鳴らないこと。"""
+        cog = _make_cog()
+        thread = _make_thread(name="W3 │ 認証")
+        sent: list[str] = []
+
+        async def respond(content=None, **kwargs):
+            sent.append(content or "")
+
+        with patch.object(
+            thread_rename.topic_module, "summarize_thread", new=AsyncMock(return_value="@everyone")
+        ):
+            await cog._thread_rename_impl(channel=thread, respond=respond, ack=AsyncMock())
+
+        assert sent and "@everyone" not in sent[0]
+
+    @pytest.mark.asyncio
     async def test_outside_a_thread_is_refused(self) -> None:
         cog = _make_cog()
         channel = MagicMock(spec=discord.TextChannel)

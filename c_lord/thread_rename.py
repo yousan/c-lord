@@ -55,6 +55,18 @@ _MANAGE_THREADS_HINT = (
 )
 
 
+def _safe(name: str) -> str:
+    """Neutralise ``@everyone`` / ``@here`` / role pings before echoing a name.
+
+    The topic is model output derived from the thread's own conversation, and a
+    thread name is quoted back into a Discord **message** here. Discord parses
+    mentions inside backticks too, so code-fencing is not enough: without this a
+    conversation that steers the summary to ``@everyone`` would make c-lord ping
+    the channel. Thread names themselves never ping, so only the echo needs it.
+    """
+    return discord.utils.escape_mentions(name or "")
+
+
 async def collect_recent_text(
     thread: discord.Thread,
     *,
@@ -123,7 +135,7 @@ async def rename_thread_topic(
     current = thread.name if isinstance(thread.name, str) else ""
     new_name = replace_topic_in_name(current, new_topic)
     if new_name == current:
-        return f"ℹ️ 要約は同じでした（`{current}`）。名前は変えていません。"
+        return f"ℹ️ 要約は同じでした（`{_safe(current)}`）。名前は変えていません。"
 
     try:
         await asyncio.wait_for(thread.edit(name=new_name), timeout=RENAME_TIMEOUT_SECONDS)
@@ -150,4 +162,4 @@ async def rename_thread_topic(
             await repo.set_topic(thread.id, new_topic, source="command")
 
     logger.info("%s /thread-rename applied: %r → %r (#705)", ctx, current, new_name)
-    return f"✅ スレッド名を変更しました: `{new_name}`"
+    return f"✅ スレッド名を変更しました: `{_safe(new_name)}`"
