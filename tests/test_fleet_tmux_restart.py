@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -104,17 +105,32 @@ class TestServerFingerprintAgainstRealTmux:
                 ["tmux", "-L", label, *args], capture_output=True, text=True, env=env
             )
 
+        def start_server(session: str = "rig") -> None:
+            """Start a server, tolerating the post-``kill-server`` race.
+
+            A client that connects while the previous server is still tearing
+            its socket down gets ``server exited unexpectedly`` — observed on a
+            CI runner, never on the dev host. That race is about tmux's own
+            startup, not about anything this test asserts, so it is retried.
+            """
+            for _ in range(20):
+                result = tmux("new-session", "-d", "-s", session)
+                if result.returncode == 0:
+                    return
+                time.sleep(0.25)
+            raise AssertionError(f"could not start the rig server: {result.stderr!r}")
+
         try:
-            yield label, tmux
+            yield label, tmux, start_server
         finally:
             tmux("kill-server")
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_a_replaced_server_reads_as_a_different_fingerprint(self, rig) -> None:
-        label, tmux = rig
+        label, tmux, start_server = rig
         assert server_fingerprint(socket_name=label) is None, "no server yet"
 
-        assert tmux("new-session", "-d", "-s", "rig").returncode == 0
+        start_server()
         before = server_fingerprint(socket_name=label)
         assert before is not None
 
@@ -128,7 +144,7 @@ class TestServerFingerprintAgainstRealTmux:
 
         # The #701 accident, reproduced on a socket that only this test owns.
         tmux("kill-server")
-        assert tmux("new-session", "-d", "-s", "rig").returncode == 0
+        start_server()
         after = server_fingerprint(socket_name=label)
         assert after is not None
         assert after != before, "a replaced tmux server must not read as the same server"
