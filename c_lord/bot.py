@@ -12,12 +12,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .claude.types import AskOption, AskQuestion
 from .command_gate import owns_channel
 from .concurrency import SessionRegistry
 from .coordination.service import CoordinationService
-from .discord_ui.ask_bus import ask_bus
-from .discord_ui.ask_view import AskView
 from .discord_ui.authorization import Authorizer
 from .discord_ui.permission_help import command_error_help
 
@@ -205,10 +202,10 @@ class ClaudeDiscordBot(commands.Bot):
         # Issue #323: verify identity BEFORE doing anything else.
         self._assert_expected_identity()
 
-        # Re-register persistent AskViews for any questions that were pending
-        # when the bot last shut down.  This prevents "Interaction Failed" on
-        # old buttons; instead users see a clear "session ended" message.
-        await self._restore_pending_ask_views()
+        # Menus left open by the previous process are re-armed by
+        # ``startup_recovery`` (#671), together with the dead ⏹ Stop buttons of
+        # #634 — one entry point, run from ClaudeChatCog's on_ready. It used to
+        # be a second, separate call here, reading a table nothing ever wrote to.
 
         # Initialise the thread-status dashboard once we have a live channel object
         channel = self.get_channel(self.channel_id)
@@ -382,54 +379,3 @@ class ClaudeDiscordBot(commands.Bot):
                 logger.debug("tmux reaper: nothing to reap")
         except Exception:
             logger.exception("Error during tmux window cleanup")
-
-    async def _restore_pending_ask_views(self) -> None:
-        """Re-register persistent AskViews for questions pending before restart.
-
-        For each pending ask found in the DB, we create an AskView and call
-        ``bot.add_view()`` so discord.py can route button clicks to it.  When
-        clicked, the view tries ``ask_bus.post_answer()`` which returns False
-        (no live session), so it sends an ephemeral "session ended" message and
-        cleans up the DB entry.
-        """
-        if self.ask_repo is None:
-            return
-
-        records = await self.ask_repo.list_all()
-        if not records:
-            return
-
-        logger.info(
-            "Restoring %d pending AskUserQuestion view(s) from previous run",
-            len(records),
-        )
-        for record in records:
-            questions_raw = record.questions()
-            for q_idx in range(record.question_idx, len(questions_raw)):
-                q_raw = questions_raw[q_idx]
-                question = AskQuestion(
-                    question=q_raw.get("question", ""),
-                    header=q_raw.get("header") or "",
-                    multi_select=q_raw.get("multi_select", False),
-                    options=[
-                        AskOption(
-                            label=o.get("label", ""),
-                            description=o.get("description") or "",
-                        )
-                        for o in q_raw.get("options", [])
-                    ],
-                )
-                view = AskView(
-                    question,
-                    thread_id=record.thread_id,
-                    q_idx=q_idx,
-                    bus=ask_bus,
-                    ask_repo=self.ask_repo,
-                    authorizer=self.authorizer,
-                )
-                self.add_view(view)
-                logger.debug(
-                    "Restored AskView for thread %d q_idx=%d",
-                    record.thread_id,
-                    q_idx,
-                )

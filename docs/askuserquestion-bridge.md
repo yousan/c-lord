@@ -481,8 +481,50 @@ process, but copies still outlive processes: a restart leaves the previous
 process's message on screen with working-looking buttons. Every posted menu is
 registered while answerable, and resolving one blanks the rest. A copy from a
 *previous* process is out of reach of an in-memory registry by construction — it
-is handled where it is reachable: its click lands on the honest "already closed"
-path above, which disables it.
+is handled at startup instead, by the recovery below.
+
+## Surviving a restart (#671)
+
+**あるべき動きは [`docs/specs/ask-menu-lifecycle.md`](./specs/ask-menu-lifecycle.md) が正。**
+This section is the mechanism.
+
+A `View`'s callbacks live in the process that built it, so a redeploy used to
+turn every menu on screen into a button that answered nothing: Discord's
+3-second ACK went unanswered and the user got a red
+**"アプリケーションは時間内に応答しませんでした"**, with *no line at all* in the
+bot log. Production restarts up to six times a day, so this hit every open menu
+several times a day.
+
+The recovery machinery (`pending_asks` + a persistent `AskView` re-registered on
+boot) had shipped long before, and had **never run once**: all four bridge routes
+go through `bridge_pane_ask`, and none of them wrote a row. The only writer,
+`collect_ask_answers`, needs `StreamEvent.ask_questions`, which nothing in the
+tree sets. Measured at `e7015d6`: `select count(*) from pending_asks` = 0, and
+`Restoring N pending AskUserQuestion view(s)` appears **0 times in all 169 bot
+logs ever written**.
+
+What happens now:
+
+| when | what |
+|---|---|
+| a menu is posted | `_bridge_claimed_menu` writes the row: question, header, **option order**, `allow_other`, `free_text_mode`, and the message id |
+| a menu closes (any of 5 exits) | `_close()` deletes the row — one place, because five would mean five chances to leak one |
+| the bot starts | `startup_recovery.run_startup_recovery()` re-registers an `AskView` per row (`bot.add_view`), so every button routes to code again |
+| …and the pane no longer shows that menu | the message's buttons are stripped in place and the row dropped — never re-posted (that is #633) |
+| the button is pressed | the ask bus has no waiter (its coroutine died with the old process), so the view falls back to `PaneMenuAnswerer` |
+
+`PaneMenuAnswerer` is where "the button works" becomes "the answer arrives": the
+TUI menu is **still open in the pane with Claude blocked on it**, so the answer
+is typed into it exactly as a live turn would (`send_answer_keystrokes`, shared
+with the bridge so the multiSelect/index/free-text branches cannot drift apart).
+It re-reads the pane first and compares `menu_fingerprint()` — human time passes
+between boot and click, and typing `Down × index` into whatever menu happens to
+be open would answer a *different* question with this one's choice. A mismatch is
+refused with a reason, never answered blind.
+
+Note the ordering constraint: the click is ACKed with the interim ⏳ **before**
+the keystrokes go out, because confirming the answer against Claude's transcript
+(#651) can take up to 12 s and Discord allows 3.
 
 ## What ✅ means — confirming the answer reached Claude (#651)
 

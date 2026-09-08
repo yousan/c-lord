@@ -43,7 +43,10 @@ CREATE TABLE IF NOT EXISTS pending_asks (
     session_id TEXT NOT NULL,
     questions_json TEXT NOT NULL,
     question_idx INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    -- #671: the Discord message this menu is drawn on, so startup can retire a
+    -- menu the tmux pane has since closed.
+    message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS lounge_messages (
@@ -111,6 +114,8 @@ _MIGRATIONS = [
         "last_bridged_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
         "PRIMARY KEY (thread_id, fingerprint))"
     ),
+    # #671: the message a pending menu is drawn on (startup retires closed menus).
+    "ALTER TABLE pending_asks ADD COLUMN message_id INTEGER",
     "ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'discord'",
     "ALTER TABLE sessions ADD COLUMN summary TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id)",

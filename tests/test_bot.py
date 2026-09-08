@@ -259,13 +259,12 @@ class TestSlashCommandSync:
     @pytest.mark.asyncio
     async def test_global_sync_called(self) -> None:
         """tree.sync() with NO guild kwarg must be called to register globally."""
-        from unittest.mock import AsyncMock, call, patch
+        from unittest.mock import call, patch
 
         bot, guild = self._make_bot_with_mocks()
 
         with (
             patch.object(bot, "_assert_expected_identity"),
-            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
             patch("c_lord.bot.isinstance", return_value=False),
         ):
             await bot.on_ready()
@@ -276,13 +275,12 @@ class TestSlashCommandSync:
     @pytest.mark.asyncio
     async def test_copy_global_to_not_called(self) -> None:
         """copy_global_to must NOT be used — that re-creates the per-guild duplicates."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         bot, guild = self._make_bot_with_mocks()
 
         with (
             patch.object(bot, "_assert_expected_identity"),
-            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
             patch("c_lord.bot.isinstance", return_value=False),
         ):
             await bot.on_ready()
@@ -292,13 +290,12 @@ class TestSlashCommandSync:
     @pytest.mark.asyncio
     async def test_legacy_guild_commands_cleared(self) -> None:
         """clear_commands(guild=guild) + sync(guild=guild) must wipe legacy guild commands."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         bot, guild = self._make_bot_with_mocks()
 
         with (
             patch.object(bot, "_assert_expected_identity"),
-            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
             patch("c_lord.bot.isinstance", return_value=False),
         ):
             await bot.on_ready()
@@ -311,7 +308,7 @@ class TestSlashCommandSync:
     @pytest.mark.asyncio
     async def test_sync_order_guild_clear_before_global(self) -> None:
         """Legacy guild clear must happen before the global registration."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         bot, guild = self._make_bot_with_mocks()
         call_order: list[str] = []
@@ -327,7 +324,6 @@ class TestSlashCommandSync:
 
         with (
             patch.object(bot, "_assert_expected_identity"),
-            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
             patch("c_lord.bot.isinstance", return_value=False),
         ):
             await bot.on_ready()
@@ -348,7 +344,6 @@ class TestSlashCommandSync:
 
         with (
             patch.object(bot, "_assert_expected_identity"),
-            patch.object(bot, "_restore_pending_ask_views", new_callable=AsyncMock),
             patch("c_lord.bot.isinstance", return_value=False),
         ):
             await bot.on_ready()

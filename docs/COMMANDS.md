@@ -50,7 +50,7 @@ share one. See [specs/tmux-layout.md](specs/tmux-layout.md).
 | `claude` | Claude の**プロセス** | `/claude-restart` |
 | `workspace` | スレッドに紐づく作業一式 | `/workspace-start` `/workspace-stop` `/workspace-delete` `/workspace-cleanup` |
 | `tmux` | tmux セッション / ウィンドウ | `/tmux-list` `/tmux-screenshot` |
-| `thread` | Discord スレッド | `/thread-archive` |
+| `thread` | Discord スレッド | `/thread-archive` `/thread-rename` |
 | `model` | Claude のモデル設定 | `/model show` `/model set` |
 
 **`session` は目的語に使わない。** #571 で「セッション」は Claude の `session_id` と
@@ -190,6 +190,29 @@ Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful
 | `wait` | tmux window exists, turn done, waiting for your input (🟡) |
 | `err` | tmux window exists, an error is visible in the pane (🔴) |
 | `closed` | no tmux window but the session dir still exists (still uses disk). Two ways to get here: `/workspace-stop`'d (thread renamed `[終了] …`; a message is held and offers a 再開 button, #512) or the pane merely died (bot restart / tmux-server death — a message auto-resumes it via `--continue`, #270) (⚪) |
+
+### Thread Naming
+
+| Command | Description | Where |
+|---------|-------------|-------|
+| `/thread-rename` | Re-summarise this thread's name from its recent conversation | Thread only |
+
+**c-lord does not rename your threads on its own (#705).** A new thread keeps
+the name it was opened with (the one you typed, or the message it was started
+from); only the `W<N> │` prefix and the `#<issue>` number are added around it.
+The sidebar is how you find your own thread, so a name that changes without you
+asking costs you the thread.
+
+`/thread-rename` is the other half: when the name has gone stale, run it in the
+thread and c-lord summarises the recent conversation into a new ≤20-char topic
+with **sonnet** and swaps it in. Everything else in the name survives — the
+`W<N> │` prefix, `<repo>:W<N> │` for a thread bound to another repo (#618), the
+`#<origin> … →#<current>` numbers (#593) and a `[停止]` marker (#512).
+
+It works on a thread you renamed by hand too: the manual-rename lock (#95) stops
+*c-lord* from renaming, and this command is you asking. Set
+`CLORD_AUTO_TOPIC=1` to restore the old behaviour (a summary on the thread's
+first message). See [specs/thread-name.md](specs/thread-name.md).
 
 ### Workspace Management
 
@@ -350,6 +373,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!workspace-stop` | 停止: close the tmux window, keep the session | `!workspace-stop` | `/workspace-stop` |
 | `!workspace-start` | Reopen a 停止 thread | `!workspace-start` | `/workspace-start` |
 | `!workspace-delete` | Delete this thread's tmux window + session dir | `!workspace-delete` | `/workspace-delete` |
+| `!thread-rename` | Re-summarise this thread's name (sonnet) | `!thread-rename` | `/thread-rename` |
 
 **旧名も同じように動きます** — スラッシュ・テキストの両方で。`!restart-claude` /
 `!session-cleanup` / `!close-workspace` / `!reopen-workspace` はそれぞれ
