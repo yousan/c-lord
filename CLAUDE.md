@@ -181,6 +181,8 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
 
 新規にログを書くときは、**thread / session / task / channel のいずれかが文脈上ある場合は必ず `log_ctx()` を使う**。素の文字列 interpolation を増やすと grep 性が落ちる。
 
+**「黙って捨てた」を DEBUG に落として済ませない (#678)。** Discord に何も返さない設計判断（例: 監視 webhook を無視する #556）でも、**捨てた事実は通常運用の INFO に残す**。うるさくなるのが怖いときは DEBUG ではなく `c_lord/log_sampler.py` の `LogSampler` を使い、**スレッド単位で一定時間に 1 回だけ INFO**（抑制した件数は次の 1 行が `(+N suppressed in the last Ms)` として持つ）。DEBUG だけにすると、`grep thread=<id>` が 1 行も返さない状態から「bot が落ちたのか / 対象外なのか」を切り分けられなくなる（2026-09-02 に実際に時間が溶けた）。
+
 ### セッションライフサイクル
 
 c-lord で 1 つの「セッション」が辿る状態遷移:
