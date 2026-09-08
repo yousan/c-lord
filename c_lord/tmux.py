@@ -6,6 +6,13 @@ stored in tmux window options (``@thread_id``) so it survives bot restarts.
 (Windows created before the prefix was shortened are named ``work{N}`` and
 are still recognized — see :func:`parse_work_number`.)
 
+That tag survives a *bot* restart but **not a tmux server restart**:
+tmux-resurrect restores window names and pane paths and no window options at
+all, so after a host reboot every c-lord window comes back untagged. The name
+is what endures, which is why it — not the tag, and not the pane's cwd — is
+what :meth:`TmuxSessionManager.cleanup_orphaned` recognizes c-lord's own
+windows by (#677).
+
 All operations use ``asyncio.to_thread`` for non-blocking execution.
 When tmux is not installed, operations degrade gracefully (log warning, skip).
 """
@@ -79,6 +86,12 @@ WINDOW_PREFIX = "w"
 # (their W<N> Discord label and thread mapping keep working until they are
 # naturally recreated). New windows always use ``WINDOW_PREFIX``.
 _LEGACY_WINDOW_PREFIX = "work"
+
+# #677: foreground commands that mean "this pane is an idle shell", i.e. a
+# corpse. Used only by the reaper's untagged branch, where "not claude" is too
+# weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
+# must survive. A login shell reports itself as ``-zsh``.
+_SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"})
 
 # #374: temporary index base used while re-sorting windows. Windows are first
 # moved into this (free) high range in the desired order, then ``move-window -r``
@@ -1068,6 +1081,33 @@ class TmuxSessionManager:
         if result.returncode != 0:
             return False
         return "claude" in result.stdout.strip().lower()
+
+    def _window_is_idle_shell(self, window: str) -> bool:
+        """True when **every** pane in *window* sits at a plain shell (#677).
+
+        The reaper's untagged branch has no ``@thread_id`` to check against
+        ``active_thread_ids``, so this is the whole of its liveness test — it has
+        to be stricter than :meth:`_window_has_claude`'s "not claude". A window
+        whose panes are all idle shells is a corpse whatever created it; one
+        running anything else (a dev server, a build, a Claude) is somebody's
+        work. A failed probe reads as "not idle", so tmux trouble keeps windows
+        rather than killing them.
+        """
+        result = _run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                self._target(window),
+                "-F",
+                "#{pane_current_command}",
+            ]
+        )
+        if result.returncode != 0:
+            return False
+        commands = [line.strip().lstrip("-").lower() for line in result.stdout.splitlines()]
+        commands = [c for c in commands if c]
+        return bool(commands) and all(c in _SHELL_COMMANDS for c in commands)
 
     @staticmethod
     def _describe(window: str, names: dict[str, str] | None = None) -> str:
@@ -2765,39 +2805,92 @@ class TmuxSessionManager:
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
+    def _kill_window(self, target: str) -> bool:
+        """``tmux kill-window`` on *target*, with no thread bookkeeping (#677).
+
+        :meth:`kill_session` is the thread-addressed door; this is the one the
+        reaper's untagged branch needs, because an untagged window has no thread
+        to address it by.
+        """
+        result = _run(["tmux", "kill-window", "-t", self._target(target)])
+        if result.returncode != 0:
+            logger.debug("tmux window %s not found or already dead", target)
+            return False
+        return True
+
+    def _log_reaped(self, *, window: dict[str, str], reason: str) -> None:
+        """AC5 of #677 — record *what* was reaped, not just how many.
+
+        The old sweep logged a count per session, so a window that vanished
+        could not be traced back to a decision afterwards. Session, window name,
+        id, cwd and the rule that fired are all on one line so a single
+        ``grep "tmux reaper"`` explains every kill.
+        """
+        logger.info(
+            "tmux reaper: killed %s:%s (%s) — %s [cwd=%s]",
+            self.session_name,
+            window.get("window_name", "?"),
+            window.get("window_id", "?"),
+            reason,
+            window.get("working_dir") or "?",
+        )
+
     def cleanup_orphaned(self, active_thread_ids: set[int]) -> int:
-        """Kill leftover tmux windows in this session. Returns the count killed.
+        """Kill leftover c-lord tmux windows in this session. Returns the count.
 
-        A window is reaped only when **all three** hold:
+        Two kinds of window are reaped, and **a pane that is not an idle shell
+        is never one of them** in either case.
 
-        1. it carries an ``@thread_id`` — windows without one were created by
-           hand (``factorio-server-1``, ``work3``, …) and are none of our
-           business,
-        2. its thread is not in *active_thread_ids*, and
-        3. **its pane is not running Claude.**
+        **Tagged** — it carries an ``@thread_id``, its thread is not in
+        *active_thread_ids*, and its pane is not running Claude. The last
+        condition is what makes this callable at all (#570): callers pass
+        ``active_thread_ids=set()`` at startup, so membership alone would mark
+        *every* window orphaned and kill live sessions. The pane's foreground
+        command is read fresh from tmux rather than inferred from our own
+        bookkeeping.
 
-        Condition 3 is the one that makes this callable at all (#570). Callers
-        pass ``active_thread_ids=set()`` at startup — the bot has no in-flight
-        threads yet — so membership alone would mark *every* window orphaned and
-        kill live sessions. The pane's foreground command is the only signal
-        that separates a leftover shell from a running Claude, and it is read
-        fresh from tmux rather than inferred from our own bookkeeping.
+        **Untagged with a c-lord name** (#677) — it has *no* ``@thread_id``, its
+        name is one only :meth:`_next_window_name` hands out (``w{N}``, or the
+        legacy ``work{N}``), and every pane in it is an idle shell.
+
+        The untagged branch exists because ``@thread_id`` is a tmux *window
+        option* and tmux-resurrect's save format stores no window options at
+        all: every host reboot hands c-lord's windows back with their names
+        intact and their tag gone. Requiring the tag therefore did not mean
+        "reap c-lord's windows" but "reap the ones that have not survived a
+        reboot yet" — 15 untouchable corpses had accumulated by 2026-09-02, and
+        18 were back two days later.
+
+        The **name** is the discriminator, deliberately, and the cwd is
+        deliberately not: on the production host the orphans' panes had been
+        restored into tmux's default directory (nowhere near a session dir)
+        while three hand-made Factorio windows sat *inside* one, so a cwd rule
+        matched none of the garbage and all of the windows that must never be
+        touched. ``w{N}``/``work{N}`` is machine-shaped and hand-made windows on
+        that host use none of it (``factorio3``, ``minecraft``, ``rig``, ``zsh``).
+        A human who does name a window ``work3`` keeps it as long as anything at
+        all is running in it — see :meth:`_window_is_idle_shell`.
         """
         if not self._check_available():
             return 0
 
         killed = 0
         for window in self.list_sessions():
-            tid_str = window.get("thread_id", "")
-            if not tid_str.isdigit():
-                continue
-            thread_id = int(tid_str)
-            if thread_id in active_thread_ids:
-                continue
             # #649: probe the window this row *is*, by id. Probing by name meant
             # a duplicate name answered for its twin — and the answer decides
             # whether a live Claude gets killed.
             target = window.get("window_id") or window.get("window_name", "")
+            tid_str = window.get("thread_id", "")
+
+            if not tid_str.isdigit():
+                if self._is_reapable_untagged(window, target) and self._kill_window(target):
+                    self._log_reaped(window=window, reason="no @thread_id, idle c-lord window")
+                    killed += 1
+                continue
+
+            thread_id = int(tid_str)
+            if thread_id in active_thread_ids:
+                continue
             if target and self._window_has_claude(target):
                 logger.debug(
                     "cleanup_orphaned: %s still runs Claude — keeping (thread=%d)",
@@ -2806,9 +2899,25 @@ class TmuxSessionManager:
                 )
                 continue
             if self.kill_session(thread_id):
+                self._log_reaped(window=window, reason=f"thread={thread_id} inactive, no Claude")
                 killed += 1
 
         return killed
+
+    def _is_reapable_untagged(self, window: dict[str, str], target: str) -> bool:
+        """Does this ``@thread_id``-less row belong to c-lord and hold nothing? (#677)"""
+        name = window.get("window_name", "")
+        if parse_work_number(name) is None:
+            return False  # hand-made name — none of our business
+        if not target:
+            return False
+        if not self._window_is_idle_shell(target):
+            logger.debug(
+                "cleanup_orphaned: untagged %s is not an idle shell — keeping",
+                self._describe(target, {target: name}),
+            )
+            return False
+        return True
 
 
 def list_tmux_sessions() -> list[str]:
@@ -2861,11 +2970,13 @@ def cleanup_orphaned_all_sessions(active_thread_ids: set[int]) -> int:
     holds no windows at all. A reaper bound to that one session covers nothing.
 
     Scanning every session is safe because the per-window guards do the
-    filtering: a window is only touched when it carries an ``@thread_id`` and
-    is not running Claude. Sessions a human created by hand are full of windows
-    with neither, so they are skipped without needing an allowlist of names —
-    which matters because c-lord's repo-derived names (``games``, ``pt-jp``)
-    collide with hand-made sessions of the same name.
+    filtering, not an allowlist of session names — which matters because
+    c-lord's repo-derived names (``games``, ``pt-jp``) collide with hand-made
+    sessions of the same name. A window is touched only when it is c-lord's own
+    (an ``@thread_id``, or failing that a ``w{N}``/``work{N}`` name c-lord alone
+    hands out) **and** nothing is running in it. Windows a human made are named
+    for what they do (``factorio3``, ``minecraft``, ``rig``), so they match
+    neither test. See :meth:`TmuxSessionManager.cleanup_orphaned`.
 
     Returns the total number of windows killed.
     """
