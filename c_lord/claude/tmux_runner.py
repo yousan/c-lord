@@ -2016,16 +2016,28 @@ class TmuxClaudeRunner:
             # pane exits stall → the 300s backstop, 🟡 five minutes late) or —
             # with background work still redrawing — never freezes at all (not
             # even the backstop fires, and the turn stays open until the user's
-            # next message pre-empts it).  The marker is delivered by the
+            # next message pre-empts it).  The evidence is delivered by the
             # TranscriptMirror via :mod:`c_lord.turn_end_bus`.
             #
-            # Still gated on ``new_turn_started``: the #365 rule that only THIS
-            # turn's ending may finalize it is what the timestamp comparison and
-            # this gate enforce together.  Deliberately NOT gated on the pane
-            # being quiet — a pane kept alive by background tasks is exactly the
-            # case this exists for.  With no marker (older builds, skill bridge
-            # mode) nothing changes: the pane detection below still decides.
-            if new_turn_started and turn_end_bus.ended_after(self._thread_id, turn_started_at):
+            # The #365 rule that only THIS turn's ending may finalize it is
+            # enforced entirely inside the bus, on the transcript's own record:
+            # an instruction Claude read after this run began, and then an
+            # ending after it.  Deliberately NOT also gated on the pane
+            # (``new_turn_started``): a pane kept alive by background work is
+            # one of the cases this exists for, and a long answer whose ``●``
+            # markers scrolled away leaves the pane unable to answer at all —
+            # that is the 2026-09-08 staging miss, where the turn hung to the
+            # backstop with the marker already in the transcript.  With no
+            # marker at all (older builds, skill bridge mode) nothing changes:
+            # the pane detection below still decides.
+            if turn_end_bus.ended_after(self._thread_id, turn_started_at):
+                # The transcript also answers the other question the verdict
+                # below asks — "did this turn actually run at all?" (#562) —
+                # and it answers it better than the pane, which in this very
+                # case had nothing readable on it. Without this the turn would
+                # end with "応答がありませんでした" for an answer that Discord
+                # already has.
+                new_turn_started = True
                 logger.info(
                     "%s turn end from transcript after %.1fs",
                     log_ctx(thread_id=self._thread_id),

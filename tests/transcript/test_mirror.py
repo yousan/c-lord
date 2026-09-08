@@ -1877,6 +1877,13 @@ async def test_turn_end_marker_is_published_on_the_turn_end_bus(tmp_path: Path) 
     try:
         await asyncio.sleep(0.15)
         assert turn_end_bus.ended_after(thread_id, started) is False
+        # The turn as the transcript records it: c-lord's prompt (never
+        # rendered — it carries the ZWSP marker), the answer, the end marker.
+        _write_event(jsonl, clord_marker_event(uuid="prompt-583"))
+        await asyncio.sleep(0.2)
+        assert turn_end_bus.ended_after(thread_id, started) is False, (
+            "a prompt alone is not a finished turn"
+        )
         _write_event(jsonl, _assistant_text("the final answer"))
         _write_event(
             jsonl,

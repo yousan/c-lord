@@ -264,6 +264,24 @@ def _is_turn_end(event: dict) -> bool:
     return t == "result" or (t == "system" and event.get("subtype") == "turn_duration")
 
 
+def _is_user_prompt(event: dict) -> bool:
+    """Return True for "Claude read an instruction" — the start of a turn (#583).
+
+    A ``user`` event whose content is a plain string is an instruction: c-lord's
+    own (which carries the zero-width-space marker and is never rendered — see
+    :func:`c_lord.transcript.formatter._render_user`), or one typed straight
+    into the pane.  Tool results are ``user`` events too, but their content is a
+    list of blocks, and counting one as the start of a turn would hand this turn
+    the ending of the turn it displaced.
+
+    Sidechains are a subagent's own conversation, not this thread's turn.
+    """
+    if event.get("type") != "user" or event.get("isMeta") or event.get("isSidechain"):
+        return False
+    content = (event.get("message") or {}).get("content")
+    return isinstance(content, str) and bool(content.strip())
+
+
 def _event_time(event: dict) -> datetime | None:
     """The event's own ``timestamp`` as a datetime, or None if unusable.
 
@@ -544,6 +562,12 @@ class TranscriptMirror:
                 # verbosity / turn-end / who triggered the turn.
                 await self._maybe_bridge_ask(event)
 
+                # #583: the first half of "whose turn ended?" — Claude read an
+                # instruction. The runner's poll loop needs it to tell its own
+                # turn's ending from that of the turn its prompt displaced.
+                if _is_user_prompt(event):
+                    turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
+
                 if _is_turn_end(event):
                     if self._verbosity == "minimal":
                         # #539: the turn is over — take the progress line away
@@ -564,7 +588,8 @@ class TranscriptMirror:
                     # AFTER the flush above on purpose: the runner reacts by
                     # ending the turn (and posting the 📊 context footer), and
                     # that must never overtake the answer the footer belongs to.
-                    turn_end_bus.mark(self.thread_id, at=_event_time(event))
+                    if not event.get("isSidechain"):
+                        turn_end_bus.mark(self.thread_id, at=_event_time(event))
                     continue
 
                 rendered = render_event(event)
