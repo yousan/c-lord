@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
@@ -28,8 +30,10 @@ from ..discord_ui.turn_progress import TurnProgress
 from ..notify_policy import owner_notify_id
 from ..transcript.mirror import (
     TranscriptMirror,
+    UserFileRequest,
     bridge_mode_jsonl,
     reply_to_trigger_enabled,
+    send_user_file_enabled,
     show_url_embeds_enabled,
     silent_posts_enabled,
     turn_progress_enabled,
@@ -43,6 +47,42 @@ if TYPE_CHECKING:
     from ..database.repository import SessionRepository
 
 logger = logging.getLogger(__name__)
+
+#: Attachments Discord accepts on one message.  A message carrying more is
+#: rejected whole, so a ``SendUserFile`` call with more files than this is split
+#: across several messages rather than truncated (#233).
+MAX_ATTACHMENTS = 10
+
+#: Default ceiling for one attachment.  Discord's own limit depends on the
+#: guild's boost tier (10 MB unboosted, 50/100 MB boosted); this is a sanity
+#: guard so a stray multi-gigabyte path is reported instead of uploaded.
+#: Override with ``CLORD_USER_FILE_MAX_BYTES``.
+DEFAULT_USER_FILE_MAX_BYTES = 25 * 1024 * 1024
+
+
+def user_file_max_bytes() -> int:
+    """Per-file ceiling for ``SendUserFile`` attachments (#233)."""
+    raw = os.getenv("CLORD_USER_FILE_MAX_BYTES", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_USER_FILE_MAX_BYTES
+    return value if value > 0 else DEFAULT_USER_FILE_MAX_BYTES
+
+
+def _mb(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _code(name: str) -> str:
+    """Render *name* as inline code for a Discord message.
+
+    The backtick is the one character that would let a filename escape the span
+    and turn the rest of the sentence into markdown of its own choosing — the
+    name reaches us from a tool call's argument, so it is replaced rather than
+    trusted.
+    """
+    return f"`{name.replace('`', '_')}`"
 
 
 class TranscriptMirrorCog(commands.Cog):
@@ -171,6 +211,7 @@ class TranscriptMirrorCog(commands.Cog):
             sink=sink,
             reply_sink=reply_sink,
             file_sink=file_sink,
+            user_file_sink=self._make_user_file_sink(thread_id),
             reply_cursor_sink=reply_cursor_sink,
             verbosity=verbosity_mode(),
             ask_bridge_cb=self._make_ask_bridge(thread_id),
@@ -424,6 +465,164 @@ class TranscriptMirrorCog(commands.Cog):
                 )
 
         return file_sink
+
+    def _make_user_file_sink(self, thread_id: int):
+        """Return the sink that puts ``SendUserFile`` files on Discord (#233).
+
+        Returns ``None`` when ``CLORD_SEND_USER_FILE=0``.  Wired here rather
+        than left to consumers: before this, the harness tool reported success
+        while nothing arrived, so an upgrade alone has to fix it (Zero-Config).
+
+        Deliberately its own message rather than a rider on the final answer:
+        a call can carry more files than one message holds, the prose that
+        introduces them ("下に貼ります") is written *before* the call, and a turn
+        that dies before its final answer would otherwise lose them entirely.
+        Being its own message also means these files never compete with
+        ``progress.txt`` / table images for the 10-attachment budget (#683).
+        """
+        if not send_user_file_enabled():
+            return None
+        bot = self.bot
+
+        async def user_file_sink(request: UserFileRequest) -> None:
+            channel = await self._resolve_channel(bot, thread_id)
+            send = getattr(channel, "send", None) if channel is not None else None
+            if send is None:
+                logger.warning(
+                    "TranscriptMirror user_file_sink: no channel for thread=%d — "
+                    "%d attachment(s) not delivered",
+                    thread_id,
+                    len(request.paths),
+                )
+                return
+
+            sendable, problems = self._vet_user_files(request.paths)
+            delivered = 0
+            for index, batch in enumerate(
+                [
+                    sendable[i : i + MAX_ATTACHMENTS]
+                    for i in range(0, len(sendable), MAX_ATTACHMENTS)
+                ]
+            ):
+                # The caption introduces the files, so it rides the first batch.
+                caption = request.caption if index == 0 else None
+                sent, failures = await self._send_user_file_batch(send, batch, caption)
+                delivered += sent
+                problems.extend(failures)
+
+            if request.caption and not sendable:
+                # Nothing to attach, but Claude still wrote a sentence about it —
+                # posting the caption alone keeps the warning below in context.
+                with contextlib.suppress(discord.HTTPException):
+                    await self._send_chunks(send, request.caption, silent=True)
+
+            if problems:
+                # #678 / #233: the failure mode being fixed is silence. Say which
+                # file did not arrive and why — in the thread, not only in a log.
+                logger.info(
+                    "TranscriptMirror user_file_sink: thread=%d delivered=%d undelivered=%d (%s)",
+                    thread_id,
+                    delivered,
+                    len(problems),
+                    "; ".join(problems),
+                )
+                note = "⚠️ 次のファイルは添付できませんでした:\n" + "\n".join(
+                    f"- {p}" for p in problems
+                )
+                with contextlib.suppress(discord.HTTPException):
+                    # Not silent: the reader is waiting for a file that is not
+                    # coming, so this is exactly the case worth a notification.
+                    await self._send_chunks(send, note)
+
+        return user_file_sink
+
+    @staticmethod
+    def _vet_user_files(paths: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
+        """Split *paths* into sendable ``(path, display_name)`` pairs and problems.
+
+        Checked before touching Discord so a bad path costs a line of text
+        instead of the whole message.  The display name is reduced to one
+        harmless component — it goes into a Discord API payload, and the path
+        came from a tool call, not from us.
+        """
+        from ..attachments import sanitize_filename
+
+        max_bytes = user_file_max_bytes()
+        sendable: list[tuple[str, str]] = []
+        problems: list[str] = []
+        for raw in paths:
+            path = Path(raw)
+            name = sanitize_filename(path.name)
+            try:
+                if not path.is_file():
+                    problems.append(f"{_code(name)} — ファイルが見つかりません")
+                    continue
+                size = path.stat().st_size
+            except OSError as exc:
+                problems.append(f"{_code(name)} — 読めませんでした ({exc.strerror or exc})")
+                continue
+            if size > max_bytes:
+                problems.append(
+                    f"{_code(name)} — {_mb(size)} は上限 {_mb(max_bytes)} を超えています"
+                )
+                continue
+            sendable.append((str(path), name))
+        return sendable, problems
+
+    @classmethod
+    async def _send_user_file_batch(
+        cls,
+        send,
+        batch: list[tuple[str, str]],
+        caption: str | None,
+    ) -> tuple[int, list[str]]:
+        """Send one message carrying *batch*; retry file-by-file if it is rejected.
+
+        Discord rejects a message as a whole, so a single oversized or unreadable
+        file would otherwise take its nine innocent neighbours with it. Returns
+        the number delivered and a problem line for each one that was not.
+        """
+        files: list[discord.File] = []
+        try:
+            files = [discord.File(p, filename=n) for p, n in batch]
+            await cls._send_chunks(send, caption or "", silent=True, files=files)
+            return len(batch), []
+        except (discord.HTTPException, OSError) as exc:
+            # Bound outside the handler: ``except ... as`` unbinds the name at
+            # the end of the block, and the reason is needed below.
+            failure: BaseException = exc
+            # discord.File opens its path on construction, and a send that never
+            # completed leaves those handles to the garbage collector. The retry
+            # below reopens them, so close these now rather than accumulate one
+            # dangling descriptor per rejected attachment.
+            for f in files:
+                with contextlib.suppress(Exception):
+                    f.close()
+            logger.warning(
+                "TranscriptMirror user_file_sink: batch of %d rejected (%s) — "
+                "retrying one at a time",
+                len(batch),
+                exc,
+            )
+
+        if len(batch) == 1:
+            _path, name = batch[0]
+            return 0, [f"{_code(name)} — Discord に拒否されました ({cls._reason(failure)})"]
+
+        delivered = 0
+        problems: list[str] = []
+        for pair in batch:
+            sent, failures = await cls._send_user_file_batch(send, [pair], None)
+            delivered += sent
+            problems.extend(failures)
+        return delivered, problems
+
+    @staticmethod
+    def _reason(exc: BaseException) -> str:
+        """A short, human-readable cause for a rejected attachment."""
+        status = getattr(exc, "status", None)
+        text = getattr(exc, "text", None) or str(exc)
+        return f"{status}: {text}" if status else str(text)
 
     @staticmethod
     def _table_files(text: str, *, reserved: int = 0) -> list[discord.File]:

@@ -26,6 +26,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,68 @@ FileSink = Callable[[str, str], Awaitable[None]]
 # Called with the first AskUserQuestion of a tool_use to bridge it to Discord
 # buttons (#232). Constructed by TranscriptMirrorCog (knows tmux + thread).
 AskBridgeCb = Callable[[AskQuestion], Coroutine[object, object, None]]
+
+
+@dataclass(frozen=True)
+class UserFileRequest:
+    """One ``SendUserFile`` call: the files Claude meant to hand the reader (#233).
+
+    ``tool_use_id`` is the transcript's own id for the call and is what keeps a
+    re-read of the same line from posting the files twice.
+    """
+
+    tool_use_id: str | None
+    paths: list[str]
+    caption: str | None
+
+
+UserFileSink = Callable[[UserFileRequest], Awaitable[None]]
+
+# The harness tool whose "1 file delivered to user." goes to the harness's own
+# delivery channel — not to Discord (#233).
+_SEND_USER_FILE_TOOL = "SendUserFile"
+
+
+def _user_file_requests(event: dict) -> list[UserFileRequest]:
+    """Extract every ``SendUserFile`` call from one raw transcript event (#233).
+
+    Returns an empty list for anything else, including a call whose ``input``
+    has a shape we did not expect — a malformed tool call must not be able to
+    stop the mirror, and there is nothing to deliver from one anyway.  This runs
+    on *every* event the tail yields, so it never assumes a shape: an exception
+    here would kill the tail task, taking the whole thread's mirror with it.
+    """
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    requests: list[UserFileRequest] = []
+    for block in content:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") != "tool_use"
+            or block.get("name") != _SEND_USER_FILE_TOOL
+        ):
+            continue
+        inp = block.get("input")
+        if not isinstance(inp, dict):
+            continue
+        raw_files = inp.get("files")
+        if not isinstance(raw_files, list):
+            continue
+        paths = [p.strip() for p in raw_files if isinstance(p, str) and p.strip()]
+        if not paths:
+            continue
+        caption = inp.get("caption")
+        tool_use_id = block.get("id")
+        requests.append(
+            UserFileRequest(
+                tool_use_id=tool_use_id if isinstance(tool_use_id, str) else None,
+                paths=paths,
+                caption=caption.strip() if isinstance(caption, str) and caption.strip() else None,
+            )
+        )
+    return requests
 
 
 def _first_ask_question(event: dict) -> AskQuestion | None:
@@ -192,6 +255,16 @@ def show_url_embeds_enabled() -> bool:
     return os.getenv("CLORD_SHOW_URL_EMBEDS", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
+def send_user_file_enabled() -> bool:
+    """Return True unless ``CLORD_SEND_USER_FILE`` is explicitly ``0/false/no``.
+
+    Defaults to True (#233): before this, every ``SendUserFile`` call was
+    dropped in silence while the tool told the session it had succeeded — the
+    kind of breakage a consumer cannot even see, let alone opt into fixing.
+    """
+    return os.getenv("CLORD_SEND_USER_FILE", "1").strip().lower() not in ("0", "false", "no")
+
+
 def turn_progress_enabled() -> bool:
     """Return True unless ``CLORD_TURN_PROGRESS`` is explicitly ``0/false/no``.
 
@@ -325,6 +398,7 @@ class TranscriptMirror:
         sink: Sink,
         reply_sink: Sink | None = None,
         file_sink: FileSink | None = None,
+        user_file_sink: UserFileSink | None = None,
         reply_cursor_sink: Sink | None = None,
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
@@ -341,6 +415,12 @@ class TranscriptMirror:
         self._progress = progress if progress is not None else _null_progress()
         self._reply_sink = reply_sink
         self._file_sink = file_sink
+        # #233: delivers the files of a SendUserFile call. Optional so a mirror
+        # built without one (older consumers, tests) keeps working unchanged.
+        self._user_file_sink = user_file_sink
+        # tool_use ids already delivered — a transcript line re-read after a
+        # rewrite (#433) must not attach the same files a second time.
+        self._delivered_user_files: set[str] = set()
         # #232: bridges an AskUserQuestion menu (detected in the transcript) to
         # Discord buttons even when no run_claude poll loop is active.
         self._ask_bridge_cb = ask_bridge_cb
@@ -694,6 +774,12 @@ class TranscriptMirror:
                 else:
                     await self._post(rendered)
 
+                # #233: after the branch above on purpose. Claude narrates
+                # ("下に貼ります") and *then* calls SendUserFile, so the prose
+                # held in _pending_text has to reach the thread first —
+                # otherwise the images land above the sentence introducing them.
+                await self._deliver_user_files(event)
+
         except asyncio.CancelledError:
             pass
         finally:
@@ -706,6 +792,39 @@ class TranscriptMirror:
                     await _flush_pending_as_reply()
                     await _commit_cursor()
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
+
+    async def _deliver_user_files(self, event: dict) -> None:
+        """Hand every ``SendUserFile`` call in *event* to the sink (#233).
+
+        Sidechain events are delivered too: a subagent that calls the tool means
+        the same thing the main agent does — give this to the reader — and
+        dropping it would be the very silence this fixes.
+        """
+        if self._user_file_sink is None:
+            return
+        for request in _user_file_requests(event):
+            if request.tool_use_id is not None:
+                if request.tool_use_id in self._delivered_user_files:
+                    continue
+                self._delivered_user_files.add(request.tool_use_id)
+            logger.info(
+                "TranscriptMirror: delivering %d SendUserFile attachment(s) thread=%d id=%s",
+                len(request.paths),
+                self.thread_id,
+                request.tool_use_id,
+            )
+            await self._progress.note_output()
+            try:
+                await self._user_file_sink(request)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "TranscriptMirror user_file_sink failed for thread=%d id=%s",
+                    self.thread_id,
+                    request.tool_use_id,
+                    exc_info=True,
+                )
 
     async def _flush_as_reply(self, text: str, progress: list[str]) -> None:
         """Flush pending text as the final reply for the current turn."""
