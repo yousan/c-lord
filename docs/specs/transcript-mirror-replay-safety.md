@@ -1,6 +1,6 @@
 # Transcript mirror — どれを読み、何を二度流さないか (#627 / #433)
 
-このドキュメントは、`CLORD_BRIDGE_MODE=jsonl` のときに動く JSONL transcript ミラー
+このドキュメントは、JSONL transcript ミラー
 (`c_lord/transcript/`、`c_lord/cogs/transcript_mirror.py`) の **「あるべき動き」**
 のうち「**どの transcript を読むか**」と「過去ログを二度 Discord に流さない」保証を定める。
 

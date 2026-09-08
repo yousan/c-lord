@@ -19,7 +19,6 @@ import asyncio
 import contextlib
 import logging
 import re
-import time
 
 import discord
 
@@ -399,9 +398,6 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
 
     runner = config.runner
     processor = EventProcessor(config)
-    # Issue #67: capture turn start so we can detect whether Claude ever
-    # invoked the discord-reply skill before the runner finished.
-    turn_started_at = time.monotonic()
     run_errored = False
 
     try:
@@ -434,16 +430,11 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         if config.image_paths:
             await _cleanup_image_tempfiles(config.image_paths)
 
-    from ..skills.injector import skills_enabled
-
     # #219/#222: the run loop may have finalized just before an AskUserQuestion
-    # menu rendered (or Claude called discord-reply and then asked a follow-up),
-    # leaving Claude blocked on a TUI menu that was never bridged. Recover it by
-    # re-checking the pane. This is INDEPENDENT of bridge mode and of whether
-    # discord-reply was called — the menu is read from the pane, not the
-    # skill-reply path — so it must run OUTSIDE the skills_enabled()/was_replied
-    # guards that gate the #67 notice below. (Gating it there left prod's jsonl
-    # mode never recovering a post-turn menu, so the user saw no choices — #222.)
+    # menu rendered, leaving Claude blocked on a TUI menu that was never
+    # bridged. Recover it by re-checking the pane. (This used to sit behind the
+    # skill-mode guards, which left production never recovering a post-turn
+    # menu, so the user saw no choices — #222.)
     pending_pane_ask = None
     if (
         not run_errored
@@ -470,25 +461,6 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             authorizer=config.authorizer,
             notify_user_id=config.notify_user_id,
         )
-    elif not run_errored and not processor.pending_ask and skills_enabled():
-        # Issue #67: surface a fallback notice when the skill-reply path was
-        # active but Claude never called discord-reply — otherwise the user is
-        # left staring at silence. Skill-mode only: in jsonl bridge mode the
-        # reply arrives via the transcript mirror (which never calls
-        # record_reply), so the tracker is always empty and this would
-        # false-fire every turn.
-        from ..skills.reply_tracker import was_replied_since
-
-        if not was_replied_since(config.thread.id, turn_started_at):
-            logger.warning(
-                "%s Claude finished without calling discord-reply — posting fallback notice",
-                ctx,
-            )
-            with contextlib.suppress(Exception):
-                await config.thread.send(
-                    "-# ⚠️ Claude finished without calling the `discord-reply` skill. "
-                    "Check the tmux pane for the response, or retry the turn."
-                )
 
     # After the stream ends, handle pending AskUserQuestion by showing Discord
     # UI and resuming the session with the user's answer.

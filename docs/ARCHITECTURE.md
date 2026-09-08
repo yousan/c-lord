@@ -3,8 +3,9 @@
 > **⚠️ この文書は古い構成（#53 以前）を説明しています。** 当時は `runner.py` が
 > Claude CLI の stdout を読み、`chunker.py` が応答テキストを分割して Discord に
 > 投稿していました。#53 でこの「TUI/stdout を読んで Discord に貼る」経路は撤去され、
-> Claude 自身が Skill 経由で `curl POST /api/reply` して最終回答を投稿する方式に
-> 変わっています。そのため下記の `runner.py` / `parser.py` / `chunker.py` /
+> いったん Claude 自身が Skill 経由で `curl POST /api/reply` する方式になり、その後
+> #71/#216 の JSONL transcript ミラーに移行しました（#712 で skill 経路は削除、
+> ミラーが唯一の配信経路です）。そのため下記の `runner.py` / `parser.py` / `chunker.py` /
 > `streaming_manager.py` などは**現在は存在しません**（実体は `claude/tmux_runner.py`
 > や `discord_ui/reply_chunker.py` などに置き換わっています）。
 >

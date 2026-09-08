@@ -12,7 +12,6 @@ from c_lord.discord_ui.ask_bus import ask_bus
 from c_lord.transcript.mirror import (
     TranscriptMirror,
     _first_ask_question,
-    bridge_mode_jsonl,
     verbosity_mode,
 )
 
@@ -165,21 +164,6 @@ async def test_mirror_sink_errors_do_not_kill_task(tmp_path: Path) -> None:
 
     # Both events attempted; second one succeeded after first raised.
     assert calls >= 2
-
-
-def test_bridge_mode_jsonl_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """#492: unset defaults to jsonl (the mode #216 decided is the real path)."""
-    monkeypatch.delenv("CLORD_BRIDGE_MODE", raising=False)
-    assert bridge_mode_jsonl() is True
-
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
-    assert bridge_mode_jsonl() is False
-
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
-    assert bridge_mode_jsonl() is True
-
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "JSONL")
-    assert bridge_mode_jsonl() is True
 
 
 # ---------------------------------------------------------------------------

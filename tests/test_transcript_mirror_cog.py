@@ -30,24 +30,31 @@ def _row(thread_id: int, working_dir: str | None, *, closed_at: str | None = Non
     return r
 
 
-async def test_cog_stays_idle_when_bridge_mode_not_jsonl(
+async def test_cog_runs_even_with_the_removed_bridge_env_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # #492: jsonl is now the default, so "not jsonl" must be pinned explicitly.
+    """#712: ``CLORD_BRIDGE_MODE=skill`` used to park this cog and leave the
+    thread with no delivery path at all. The env is gone; the mirror always runs.
+    """
     monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+
     bot = MagicMock()
-    repo = _make_repo([_row(1, str(tmp_path))])
+    repo = _make_repo([_row(1, "/some/cwd")])
     cog = TranscriptMirrorCog(bot, session_repo=repo)
-    await cog.on_ready()
-    # list_all is not consulted, no mirrors registered.
-    repo.list_all.assert_not_called()
-    assert cog._mirrors == {}
+    try:
+        await cog.on_ready()
+        repo.list_all.assert_called_once()
+        assert 1 in cog._mirrors
+    finally:
+        await cog.cog_unload()
 
 
 async def test_cog_starts_mirrors_from_existing_sessions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     # Lie about the projects root so derive_project_dir lands inside tmp_path.
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
@@ -65,7 +72,6 @@ async def test_cog_starts_mirrors_from_existing_sessions(
 
 
 async def test_start_for_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".claude" / "projects" / "-cwd").mkdir(parents=True)
 
@@ -79,14 +85,20 @@ async def test_start_for_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path
         await cog.cog_unload()
 
 
-async def test_start_for_noop_when_not_jsonl_mode(
+async def test_start_for_is_idempotent_per_thread(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # #492: jsonl is now the default, so "not jsonl" must be pinned explicitly.
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
+    """A second start for the same thread must not spawn a second tail."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects" / "-some-cwd").mkdir(parents=True)
+
     bot = MagicMock()
     cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
-    assert cog.start_for(1, str(tmp_path)) is False
+    try:
+        assert cog.start_for(1, "/some/cwd") is True
+        assert cog.start_for(1, "/some/cwd") is False
+    finally:
+        await cog.cog_unload()
 
 
 async def test_sink_chunks_long_messages_without_truncation(
@@ -94,7 +106,6 @@ async def test_sink_chunks_long_messages_without_truncation(
 ) -> None:
     """Issue #235: long bodies must be split into multiple sends, not
     truncated to 1985 chars + '…'."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     bot = MagicMock()
     channel = MagicMock()
     channel.send = AsyncMock()
@@ -117,7 +128,6 @@ async def test_reply_sink_chunks_long_messages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #235: final assistant text longer than 2000 chars is chunked."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     bot = MagicMock()
     channel = MagicMock()
     channel.send = AsyncMock()
@@ -141,7 +151,6 @@ async def test_reply_sink_suppresses_url_embeds_by_default(
     """#372: in jsonl bridge mode the final answer goes through reply_sink.
     By default (CLORD_SHOW_URL_EMBEDS unset) it must set suppress_embeds=True
     so a URL in Claude's reply doesn't expand into an OGP card."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
     bot = MagicMock()
     channel = MagicMock()
@@ -159,7 +168,6 @@ async def test_reply_sink_shows_url_embeds_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#372: CLORD_SHOW_URL_EMBEDS=true restores OGP previews on reply_sink."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("CLORD_SHOW_URL_EMBEDS", "true")
     bot = MagicMock()
     channel = MagicMock()
@@ -178,7 +186,6 @@ async def test_file_sink_chunks_and_attaches_to_last_only(
 ) -> None:
     """Issue #235: when the final answer is chunked, the progress.txt
     attachment rides on the last message only."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     bot = MagicMock()
     channel = MagicMock()
     channel.send = AsyncMock()
@@ -204,7 +211,6 @@ async def test_file_sink_chunks_and_attaches_to_last_only(
 async def test_sink_falls_back_to_fetch_channel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     bot = MagicMock()
     bot.get_channel.return_value = None
     fetched = MagicMock()
@@ -224,7 +230,6 @@ async def test_end_to_end_jsonl_event_posts_to_discord(
     """Write an event to the project's jsonl and confirm it lands on Discord."""
     import asyncio as _asyncio
 
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
@@ -840,7 +845,6 @@ async def test_on_ready_recovers_undelivered_final_answer(
 ) -> None:
     """Issue #215: a newer completed turn's final answer (uuid != the stored
     cursor) was written while the bot was down → re-delivered on on_ready."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
@@ -899,7 +903,6 @@ async def test_on_ready_seeds_cursor_silently_when_null(
     migration added the column) the last answer must NOT be re-posted —
     otherwise every existing thread is spammed on the first deploy. The cursor
     is seeded silently instead."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
@@ -945,7 +948,6 @@ async def test_on_ready_does_not_redeliver_when_uuid_matches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """If the stored uuid already matches the last final answer, no re-delivery."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
@@ -1095,7 +1097,6 @@ async def test_on_ready_skips_closed_sessions(
     its (often huge) transcript forever.  Startup must not mirror it — and must
     not pay the Issue #215 recovery scan for it either, which is what made the
     on_ready walk cost ~1 GB of parsing on the production host."""
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     project.mkdir(parents=True)
@@ -1153,7 +1154,6 @@ async def test_progress_line_is_wired_by_default(
 ) -> None:
     """Zero-Config: upgrading the package alone must turn #539 on."""
     monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
 
     assert cog._make_progress(123) is not None

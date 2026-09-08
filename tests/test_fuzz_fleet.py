@@ -35,22 +35,17 @@ def test_candidate_clones_default_cwd() -> None:
     assert candidate_clones(parse_args([]), {}) == ["."]
 
 
-# -- jsonl-bridge inject resolution -----------------------------------------
-def test_build_config_jsonl_defaults_to_webhook_skiphealth() -> None:
-    cfg = build_config({"CLORD_BRIDGE_MODE": "jsonl"}, parse_args([]))
+# -- inject resolution -------------------------------------------------------
+def test_build_config_defaults_to_webhook_skiphealth() -> None:
+    cfg = build_config({}, parse_args([]))
     assert cfg.inject_mode == "webhook"
     assert cfg.skip_health is True
 
 
-def test_build_config_non_jsonl_defaults_spawn() -> None:
-    cfg = build_config({}, parse_args([]))
+def test_build_config_explicit_inject_spawn() -> None:
+    cfg = build_config({}, parse_args(["--inject", "spawn"]))
     assert cfg.inject_mode == "spawn"
     assert cfg.skip_health is False
-
-
-def test_build_config_explicit_inject_overrides_jsonl() -> None:
-    cfg = build_config({"CLORD_BRIDGE_MODE": "jsonl"}, parse_args(["--inject", "spawn"]))
-    assert cfg.inject_mode == "spawn"
 
 
 def test_build_config_explicit_skip_health_flag() -> None:

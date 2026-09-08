@@ -27,7 +27,6 @@ def _make_repo() -> MagicMock:
 
 
 def _cog_with_channel(monkeypatch: pytest.MonkeyPatch) -> tuple[TranscriptMirrorCog, MagicMock]:
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     bot = MagicMock()
     channel = MagicMock()
     channel.send = AsyncMock()

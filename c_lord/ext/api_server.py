@@ -771,14 +771,11 @@ class ApiServer:
                     send_kwargs["files"] = all_files
             last_sent = await raw.send(**send_kwargs)  # type: ignore[union-attr]
 
-        # Issue #67: record the successful reply so run_helper can detect
-        # turns where Claude never invoked the discord-reply skill.  Also
-        # record the final message object so post-turn helpers (e.g. the
+        # Record the final message object so post-turn helpers (e.g. the
         # context-usage line) can edit it in place instead of creating a new
         # bubble.
-        from ..skills.reply_tracker import record_reply, record_reply_message
+        from ..skills.reply_tracker import record_reply_message
 
-        record_reply(thread_id)
         if last_sent is not None:
             record_reply_message(thread_id, last_sent)
 

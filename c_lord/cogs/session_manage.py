@@ -1225,9 +1225,8 @@ class SessionManageCog(commands.Cog):
         thread the moment any message lands in it, so the thread never closes
         (#379). Stopping the mirror **before** the kill/archive breaks that loop.
 
-        No-op when ``CLORD_BRIDGE_MODE`` is not ``jsonl`` (the cog stays idle and
-        keeps no per-thread mirror) or when the cog is not registered at all, so
-        this is safe to call unconditionally (zero-config).
+        No-op when the cog is not registered, or keeps no mirror for this
+        thread, so this is safe to call unconditionally (zero-config).
         """
         mirror_cog = self.bot.get_cog("TranscriptMirrorCog")
         stop_for = getattr(mirror_cog, "stop_for", None)

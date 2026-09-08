@@ -792,37 +792,31 @@ class TestReplyEndpoint:
         assert "file" in last or "files" in last
 
     @pytest.mark.asyncio
-    async def test_successful_reply_records_in_tracker(self, reply_client: TestClient) -> None:
-        """Issue #67: api_server records each /api/reply call so run_helper
-        can detect turns where the skill was never invoked."""
-        import time
-
-        from c_lord.skills.reply_tracker import reset_tracker, was_replied_since
+    async def test_successful_reply_records_the_message(self, reply_client: TestClient) -> None:
+        """The posted message is remembered so post-turn helpers (e.g. the
+        context-usage line) can append to that bubble."""
+        from c_lord.skills.reply_tracker import get_last_reply_message, reset_tracker
 
         reset_tracker()
-        before = time.monotonic()
         resp = await reply_client.post(
             "/api/reply",
             json={"thread_id": 555666777, "content": "answered"},
         )
         assert resp.status == 200
-        assert was_replied_since(thread_id=555666777, since=before) is True
+        assert get_last_reply_message(555666777) is not None
 
     @pytest.mark.asyncio
     async def test_failed_reply_does_not_record(self, reply_client: TestClient) -> None:
         """A 400 (missing content) MUST NOT be recorded as a successful reply."""
-        import time
-
-        from c_lord.skills.reply_tracker import reset_tracker, was_replied_since
+        from c_lord.skills.reply_tracker import get_last_reply_message, reset_tracker
 
         reset_tracker()
-        before = time.monotonic()
         resp = await reply_client.post(
             "/api/reply",
             json={"thread_id": 555666777},  # missing content
         )
         assert resp.status == 400
-        assert was_replied_since(thread_id=555666777, since=before) is False
+        assert get_last_reply_message(555666777) is None
 
     @pytest.mark.asyncio
     async def test_reply_to_trigger_without_progress_file(

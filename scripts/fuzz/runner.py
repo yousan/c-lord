@@ -83,11 +83,11 @@ def build_config(
     Precedence: explicit CLI arg > FUZZ_* key > generic fallback key > default.
 
     ``staging_dir`` (when given) is the specific clone this config targets — each
-    fleet clone has its own ``.env``, so ``env`` should be that clone's. The
-    injection mode is resolved here: a clone running ``CLORD_BRIDGE_MODE=jsonl``
-    does not bind its REST API, so ``spawn`` + ``/api/health`` are unreachable —
-    we default such a clone to ``webhook`` + ``skip_health`` unless the operator
-    passed an explicit ``--inject``.
+    fleet clone has its own ``.env``, so ``env`` should be that clone's.
+    Injection defaults to ``webhook`` + ``skip_health``: it needs nothing but a
+    thread, which is what every clone has. ``--inject spawn`` uses the REST API
+    instead — always bound since #712, but it needs the API reachable from the
+    harness host.
     """
 
     def pick(*keys: str, default: str | None = None) -> str | None:
@@ -97,12 +97,8 @@ def build_config(
                 return v
         return default
 
-    bridge_jsonl = (env.get("CLORD_BRIDGE_MODE") or "").strip().lower() == "jsonl"
-    explicit_inject = getattr(args, "inject", None)
-    inject_mode = explicit_inject or ("webhook" if bridge_jsonl else "spawn")
-    skip_health = bool(getattr(args, "skip_health", False)) or (
-        bridge_jsonl and inject_mode == "webhook"
-    )
+    inject_mode = getattr(args, "inject", None) or "webhook"
+    skip_health = bool(getattr(args, "skip_health", False)) or inject_mode == "webhook"
     resolved_staging = (
         staging_dir
         if staging_dir is not None
@@ -412,7 +408,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("spawn", "webhook"),
         default=None,
         help="spawn = fresh thread/scenario; webhook = multi-turn into one thread. "
-        "Default: auto — webhook on CLORD_BRIDGE_MODE=jsonl clones (API unbound), else spawn.",
+        "Default: webhook (+ skip-health); spawn needs the clone's REST API reachable.",
     )
     p.add_argument("--focus", default=None, help="bias the generated batch toward a theme")
     p.add_argument("--model", default="haiku", help="claude model for generation (default haiku)")

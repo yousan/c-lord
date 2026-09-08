@@ -629,19 +629,10 @@ class TestRunClaudeInThread:
         )
 
 
-class TestNoReplyFallback:
-    """Issue #67: when Claude finishes a turn without calling discord-reply,
-    run_claude_with_config must surface a fallback notification so the user
-    isn't left staring at silence.
-
-    This fallback only exists in skill mode (#216/#492 made jsonl the
-    default), so pin CLORD_BRIDGE_MODE=skill here; test_no_fallback_in_jsonl_mode
-    below overrides it back to jsonl to test the opposite case.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _skill_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
+class TestNoSkillFallbackNotice:
+    """#712: the skill-push path is gone, so the "Claude never called
+    discord-reply" notice (#67) must never appear — under the JSONL mirror the
+    tracker it consulted was always empty, so it would fire on every turn."""
 
     @pytest.fixture
     def thread(self) -> MagicMock:
@@ -668,111 +659,17 @@ class TestNoReplyFallback:
         return gen
 
     @pytest.mark.asyncio
-    async def test_fallback_posted_when_no_reply_call(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    @pytest.mark.parametrize("legacy_env", [{}, {"CLORD_BRIDGE_MODE": "skill"}])
+    async def test_no_fallback_notice_on_a_normal_turn(
+        self,
+        thread: MagicMock,
+        runner: MagicMock,
+        repo: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        legacy_env: dict[str, str],
     ) -> None:
-        """A successful run with NO /api/reply call must post a fallback notice."""
-        from c_lord.skills.reply_tracker import reset_tracker
-
-        reset_tracker()
-
-        events = [
-            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
-            StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                session_id="sess-1",
-            ),
-        ]
-        runner.run = self._make_async_gen(events)
-
-        await run_claude_in_thread(thread, runner, repo, "hello", None)
-
-        sent_strings = []
-        for call in thread.send.call_args_list:
-            for arg in call.args:
-                if isinstance(arg, str):
-                    sent_strings.append(arg)
-            if "content" in call.kwargs and isinstance(call.kwargs["content"], str):
-                sent_strings.append(call.kwargs["content"])
-
-        assert any("discord-reply" in s for s in sent_strings), (
-            f"Expected fallback notice mentioning discord-reply, got sends: {sent_strings}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_fallback_when_reply_was_called(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
-    ) -> None:
-        """If /api/reply was called during the turn, no fallback notice is sent."""
-        from c_lord.skills.reply_tracker import record_reply, reset_tracker
-
-        reset_tracker()
-
-        async def gen_with_reply(*args, **kwargs):
-            yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
-            # Simulate Claude calling /api/reply mid-turn.
-            record_reply(thread.id)
-            yield StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                session_id="sess-1",
-            )
-
-        runner.run = gen_with_reply
-
-        await run_claude_in_thread(thread, runner, repo, "hello", None)
-
-        for call in thread.send.call_args_list:
-            for arg in call.args:
-                if isinstance(arg, str):
-                    assert "discord-reply" not in arg
-            content = call.kwargs.get("content")
-            if isinstance(content, str):
-                assert "discord-reply" not in content
-
-    @pytest.mark.asyncio
-    async def test_no_fallback_on_error(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
-    ) -> None:
-        """Errors already produce their own embed; the fallback must not pile on."""
-        from c_lord.skills.reply_tracker import reset_tracker
-
-        reset_tracker()
-
-        events = [
-            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
-            StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                error="Timed out after 300 seconds",
-                session_id="sess-1",
-            ),
-        ]
-        runner.run = self._make_async_gen(events)
-
-        await run_claude_in_thread(thread, runner, repo, "hello", None)
-
-        for call in thread.send.call_args_list:
-            for arg in call.args:
-                if isinstance(arg, str):
-                    assert "discord-reply" not in arg
-            content = call.kwargs.get("content")
-            if isinstance(content, str):
-                assert "discord-reply" not in content
-
-    @pytest.mark.asyncio
-    async def test_no_fallback_in_jsonl_mode(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock, monkeypatch
-    ) -> None:
-        """In jsonl bridge mode the reply comes via the transcript mirror, not the
-        discord-reply skill, so the skill-reply tracker is always empty. The #67
-        fallback must be skipped there — otherwise it fires a false notice every turn."""
-        from c_lord.skills.reply_tracker import reset_tracker
-
-        reset_tracker()
-        monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
-        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        for key, value in legacy_env.items():
+            monkeypatch.setenv(key, value)
 
         events = [
             StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
@@ -863,14 +760,14 @@ class TestRecoverMissedPaneAsk:
                 assert "discord-reply" not in content
 
     @pytest.mark.asyncio
-    async def test_open_menu_bridged_in_jsonl_mode(
+    async def test_open_menu_bridged_with_legacy_env_set(
         self, thread: MagicMock, repo: MagicMock, monkeypatch
     ) -> None:
-        """#222: post-turn menu recovery must run in jsonl bridge mode too.
+        """#222: post-turn menu recovery must run even with a legacy env set.
 
-        The menu is read from the pane, independent of the skill-reply path, so
-        gating it behind skills_enabled() (False in jsonl = production's mode)
-        left prod never recovering a post-turn menu — the user saw no choices.
+        The menu is read from the pane, independent of delivery, so gating it
+        behind the (now removed) skill-mode check left production never
+        recovering a post-turn menu — the user saw no choices.
         """
         from unittest.mock import patch
 
@@ -879,8 +776,7 @@ class TestRecoverMissedPaneAsk:
         from c_lord.skills.reply_tracker import reset_tracker
 
         reset_tracker()
-        monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
-        monkeypatch.delenv("USE_SKILL_REPLY", raising=False)
+        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
 
         runner = MagicMock(spec=TmuxClaudeRunner)
         runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
@@ -903,16 +799,16 @@ class TestRecoverMissedPaneAsk:
         bridge.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_open_menu_bridged_even_after_reply(
+    async def test_open_menu_bridged_even_after_the_answer_landed(
         self, thread: MagicMock, repo: MagicMock
     ) -> None:
-        """#222: a follow-up menu rendered AFTER discord-reply was called must
-        still be recovered — was_replied_since must not gate menu recovery."""
+        """#222: a follow-up menu rendered AFTER the answer was delivered must
+        still be recovered — delivery must not gate menu recovery."""
         from unittest.mock import patch
 
         from c_lord.claude.tmux_runner import TmuxClaudeRunner
         from c_lord.claude.types import AskOption, AskQuestion
-        from c_lord.skills.reply_tracker import record_reply, reset_tracker
+        from c_lord.skills.reply_tracker import record_reply_message, reset_tracker
 
         reset_tracker()
 
@@ -921,7 +817,7 @@ class TestRecoverMissedPaneAsk:
 
         async def gen_with_reply(*args, **kwargs):
             yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
-            record_reply(thread.id)
+            record_reply_message(thread.id, MagicMock(spec=discord.Message))
             yield StreamEvent(
                 message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"
             )

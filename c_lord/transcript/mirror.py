@@ -208,16 +208,6 @@ def _truncate_progress(content: str) -> str:
     return truncated + "\n… [truncated]"
 
 
-def bridge_mode_jsonl() -> bool:
-    """Return True unless ``CLORD_BRIDGE_MODE`` names another mode explicitly.
-
-    #216/#492: jsonl is the default delivery path (mirrors ``skills_enabled()``
-    in ``c_lord.skills.injector``, which must stay in lockstep with this
-    default so the two paths never disagree for an unset/unrecognized value).
-    """
-    return os.getenv("CLORD_BRIDGE_MODE", "jsonl").strip().lower() == "jsonl"
-
-
 def verbosity_mode() -> str:
     """Return the mirror verbosity mode from ``CLORD_MIRROR_VERBOSITY``.
 

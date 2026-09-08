@@ -40,7 +40,8 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 
 † #1 は既存 staging。2026-06-11 に bot/channel/ディレクトリを全て `staging-1` 系へ改称完了(旧名 `c-lord-parallel-3` / `C-lord-3` / `#c-lord-3`)。統合ロール名のみ `C-lord-3` のまま残る(managed ロールは API 改名不可。Portal の Application 名変更で揃う。機能には無影響)。
 
-- **port = 8087 + 2×N**(prod=N0=8087)。`CLORD_BRIDGE_MODE=jsonl` では ApiServer 非バインドなので名目値。
+- **port = 8087 + 2×N**(prod=N0=8087)。#712 以降は **全台が実際にこのポートを bind する**(REST API は常時起動)。
+  重複すると WARNING が出て API 無しで動く(bot は落ちない)ので、増設時は必ず空きポートを振る。
 - channel アクセスは共有ロール **`c-lord-staging`**(`1514537446132682853`)一本で制御(staging bot 全台に付与)。
   bot を増やしたらこのロールを付けるだけ(個別の permission overwrite は不要)。
 - 各 clone の `.env` に `DISCORD_CHANNEL_ID` / `EXPECTED_BOT_USER_ID` / `E2E_TEST_THREAD_ID` 設定済み。
@@ -276,8 +277,9 @@ bash scripts/staging.sh release            # 検証後の原状復帰とセッ�
 `stop` はリースが無ければ可(掃除目的)、他人の有効リース中は不可(検証中の bot を殺さない)。
 リースの確認だけなら `status`(lease 行に owner / purpose / TTL が出る)。
 
-> 旧ドキュメントの「Lounge API (`/api/lounge`) で占有を宣言」は**使えない**:
-> `CLORD_BRIDGE_MODE=jsonl` の本デプロイでは ApiServer 自体が起動しない(#322 根因B)。
+> 旧ドキュメントの「Lounge API (`/api/lounge`) で占有を宣言」は**使わない**: 占有は
+> `scripts/staging.sh borrow/release` のリースが唯一の正(API は #712 以降起動しているが、
+> リースの所在を2箇所に分けない)。
 
 ## 検証レシピ(RED→GREEN on staging)
 
@@ -336,4 +338,4 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 | webhook を投げても無反応 | `E2E_TEST_THREAD_ID` の sessions レコード有無 | スレッドにセッションが無い / thread_id 空(前提節を参照) |
 | `instances: 2+` | `staging.sh status` | 二重起動 — `stop` → `restart`。手動 kill 禁止事項を守ったか確認 |
 | 起動直後に死ぬ | per-run ログ末尾 | LoginFailure(token 不正)/ DB スキーマ不整合(古いブランチ — idle は main) |
-| `API server not listening` | 仕様 | `CLORD_BRIDGE_MODE=jsonl` では ApiServer は起動しない(バグではない) |
+| `API server not listening` | per-run ログの `REST API could not bind` | ポート衝突。その clone の `CLORD_API_PORT` を空き番号に(#712 以降 API は常時起動する) |
