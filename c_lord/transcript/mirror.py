@@ -26,6 +26,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import datetime
 from pathlib import Path
 
 from ..claude.types import AskQuestion, _parse_ask_questions
@@ -33,6 +34,7 @@ from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
 from ..discord_ui.pane_context import replace_pane_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
+from ..turn_end_bus import turn_end_bus
 from .formatter import RenderedEvent, render_event
 from .pane_echo import pane_echo
 from .tail import tail_events
@@ -260,6 +262,25 @@ def _is_turn_end(event: dict) -> bool:
     """
     t = event.get("type")
     return t == "result" or (t == "system" and event.get("subtype") == "turn_duration")
+
+
+def _event_time(event: dict) -> datetime | None:
+    """The event's own ``timestamp`` as a datetime, or None if unusable.
+
+    #583 compares the marker against the moment c-lord delivered its prompt, so
+    the *event's* time is what matters — not when the tail got around to
+    reading it.  Anything unparseable degrades to None, which the bus dates at
+    read time.
+    """
+    raw = event.get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        # Claude Code writes ``2026-09-08T06:21:54.551Z``; fromisoformat only
+        # learned to read the ``Z`` in 3.11.
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 _KIND_PREFIX = {
@@ -523,17 +544,27 @@ class TranscriptMirror:
                 # verbosity / turn-end / who triggered the turn.
                 await self._maybe_bridge_ask(event)
 
-                if self._verbosity == "minimal" and _is_turn_end(event):
-                    # #539: the turn is over — take the progress line away before
-                    # the final answer lands so it never trails below the answer.
-                    await self._progress.end_turn()
-                    # Turn boundary: flush pending as the final reply.
-                    await _flush_pending_as_reply()
-                    await _commit_cursor()
-                    # #399: disarm unconsumed pane-bridge entries — the
-                    # legitimate flush always precedes its turn end, so a
-                    # surviving entry could only swallow a future real message.
-                    bridged_context.clear_thread(self.thread_id)
+                if _is_turn_end(event):
+                    if self._verbosity == "minimal":
+                        # #539: the turn is over — take the progress line away
+                        # before the final answer lands so it never trails
+                        # below the answer.
+                        await self._progress.end_turn()
+                        # Turn boundary: flush pending as the final reply.
+                        await _flush_pending_as_reply()
+                        await _commit_cursor()
+                        # #399: disarm unconsumed pane-bridge entries — the
+                        # legitimate flush always precedes its turn end, so a
+                        # surviving entry could only swallow a future real
+                        # message.
+                        bridged_context.clear_thread(self.thread_id)
+                    # #583: the pane cannot see a turn boundary, so the runner's
+                    # poll loop learns it here — this is the only place in
+                    # c-lord that reads Claude's own turn-end marker. Marked
+                    # AFTER the flush above on purpose: the runner reacts by
+                    # ending the turn (and posting the 📊 context footer), and
+                    # that must never overtake the answer the footer belongs to.
+                    turn_end_bus.mark(self.thread_id, at=_event_time(event))
                     continue
 
                 rendered = render_event(event)

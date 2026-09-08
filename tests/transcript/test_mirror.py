@@ -1821,3 +1821,81 @@ async def test_mirror_still_suppresses_when_there_is_nothing_to_rewrite(
         bridged_context.clear()
 
     assert not any("楽観ロック" in p for p in posted)
+
+
+# ---------------------------------------------------------------------------
+# #583: the turn-end marker must also reach the runner's poll loop
+# ---------------------------------------------------------------------------
+
+
+async def test_turn_end_marker_is_published_on_the_turn_end_bus(tmp_path: Path) -> None:
+    """The mirror is the only thing that reads ``system/turn_duration``.
+
+    The runner's poll loop cannot see it (the pane says nothing about turn
+    boundaries), so without this hand-off the turn stays open until the 300s
+    inactivity backstop — or, when background work keeps the pane moving,
+    until the user's next message pre-empts it (#583).
+
+    Ordering matters as much as the fact: the bus is marked **after** the final
+    answer has been flushed, so the runner's own turn-end work (the 📊 context
+    footer) can never overtake the answer it belongs to.
+    """
+    from datetime import datetime, timezone
+
+    from c_lord.turn_end_bus import turn_end_bus
+
+    thread_id = 58301
+    turn_end_bus.forget(thread_id)
+    started = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    # What the bus said at the moment the final answer was posted.
+    seen_at_reply: list[bool] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        seen_at_reply.append(turn_end_bus.ended_after(thread_id, started))
+
+    mirror = TranscriptMirror(
+        thread_id=thread_id,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        assert turn_end_bus.ended_after(thread_id, started) is False
+        _write_event(jsonl, _assistant_text("the final answer"))
+        _write_event(
+            jsonl,
+            {
+                "type": "system",
+                "subtype": "turn_duration",
+                "timestamp": datetime.now(timezone.utc)  # noqa: UP017
+                .isoformat()
+                .replace("+00:00", "Z"),
+            },
+        )
+        await asyncio.sleep(0.3)
+        ended = turn_end_bus.ended_after(thread_id, started)
+    finally:
+        await mirror.stop()
+        turn_end_bus.forget(thread_id)
+
+    assert ended is True, "the turn-end marker never reached the runner's poll loop"
+    assert seen_at_reply == [False], (
+        "the bus was marked before the answer was posted — the runner could "
+        "close the turn and post its 📊 footer above Claude's answer"
+    )

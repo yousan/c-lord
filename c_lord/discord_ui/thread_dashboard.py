@@ -171,6 +171,7 @@ class ThreadStatusDashboard:
         notify_user_id: int | None = None,
         no_response: bool = False,
         usage_limit: UsageLimit | None = None,
+        preempted: bool = False,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -194,6 +195,12 @@ class ThreadStatusDashboard:
             when ``None``. This makes the completion ping reach whoever is
             actually waiting (any guild, any authorized user) instead of a single
             fixed owner, and still fires when no owner is configured.
+        preempted:
+            #583: this turn ended because the user's next message replaced it,
+            not because Claude finished. The state still moves — the turn IS
+            over — but nobody is summoned: the ping would land seconds after
+            they typed, tell them their reply is needed, and be answered by a
+            new turn one second later. They are already here.
         """
         async with self._lock:
             prev_state = self._threads[thread_id].state if thread_id in self._threads else None
@@ -223,6 +230,8 @@ class ThreadStatusDashboard:
                 and prev_state != ThreadState.WAITING_INPUT
                 and mention_id is not None
                 and thread is not None
+                # #583: a turn the user replaced summons nobody.
+                and not preempted
             )
 
             await self._refresh_dashboard()

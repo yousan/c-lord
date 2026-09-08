@@ -500,7 +500,11 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             )
             return await run_claude_with_config(config.with_prompt(answer_prompt))
 
-    if not run_errored:
+    # #583: a turn the user's next message displaced gets no closing ceremony.
+    # The footer describes a turn that did not reach its end, and it lands after
+    # "⚡ Interrupted…" — i.e. on top of the message that replaced it, reading as
+    # a response to it. The replacement turn posts its own.
+    if not run_errored and not getattr(runner, "preempted", False):
         await _post_context_usage(config, processor.session_id)
 
     logger.info(

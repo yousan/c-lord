@@ -4954,3 +4954,207 @@ class TestTrustAcceptVerifiesItWorked:
         assert (result[0].error or "").startswith(TRUST_START_FAILED_ERROR_PREFIX), result[0].error
         # And it must be bounded — #630's keystroke storm must not come back.
         assert fake.restarts == _TRUST_RESTART_MAX_ATTEMPTS, fake.restarts
+
+
+class TestTurnEndFromTranscript:
+    """#583: the turn must close when Claude's transcript says the turn ended.
+
+    Two production shapes, one root cause — "the answer was delivered but the
+    turn never closed":
+
+    * **Quiet pane (the Issue's original symptom).** In jsonl bridge mode the
+      pane freezes the moment the answer lands, and the frozen pane yields no
+      scrapable response, so neither the completion exit (needs a *non-empty*
+      stable response) nor the idle exit (needs an *empty* ``last_response``)
+      can fire.  The turn hung until the 300s inactivity backstop, and 🟡
+      arrived ~5 minutes after the answer.
+    * **Busy pane (the 2026-08-31 follow-up).** With background work in flight
+      the pane never freezes at all, so even the backstop could not fire: the
+      turn stayed open until the user's *next message* pre-empted it — 14m38s
+      in the reported case.
+
+    ``turn_end_bus`` carries Claude Code's own ``system/turn_duration`` marker
+    (read by the TranscriptMirror) into the poll loop, so completion no longer
+    depends on the pane going quiet.
+    """
+
+    # A pane that is alive and ticking (background task) but shows no
+    # extractable ``●`` response — the shape both symptoms end in.
+    @staticmethod
+    def _ticking(n: int) -> str:
+        return (
+            f"  Running 2 background tasks ({n}s)\n"
+            "────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────\n"
+            "-- INSERT -- ⏵⏵ bypass permissions on"
+        )
+
+    @staticmethod
+    def _generating(n: int) -> str:
+        return f"\n✽ Generating… ({n}s · ↑ 1.2k tokens)\n────────\n❯\n────────\n-- INSERT --"
+
+    @pytest.mark.asyncio
+    async def test_turn_closes_when_the_transcript_marks_it_done(self, tmux_manager) -> None:
+        """AC1/AC5: closing must not wait for the pane to freeze."""
+        from c_lord.turn_end_bus import turn_end_bus
+
+        thread_id = 5831
+        turn_end_bus.forget(thread_id)
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=thread_id,
+            model="sonnet",
+            # Long enough that reaching it means the fix is absent: the pane
+            # below never freezes, so the inactivity backstop can never fire
+            # and the run would hang forever.
+            timeout_seconds=600,
+        )
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager._find_window_for_thread.return_value = "work1"
+
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            n = calls["n"]
+            if n <= 4:
+                return self._generating(n)
+            if n == 6:
+                # Claude finished: the mirror posted the answer and wrote the
+                # turn-end marker.  The pane keeps ticking on background work.
+                turn_end_bus.mark(thread_id)
+            return self._ticking(n)
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        try:
+            with (
+                patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+                patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+            ):
+
+                async def _drain():
+                    async for event in runner.run("test"):
+                        events.append(event)
+
+                await asyncio.wait_for(_drain(), timeout=5.0)
+        except asyncio.TimeoutError:  # noqa: UP041 — 3.10 alias # pragma: no cover
+            pytest.fail(
+                "run() never finished: the transcript said the turn was over at "
+                f"poll 6, and the loop was still polling {calls['n']} polls later. "
+                "The turn stays open until the 300s backstop (quiet pane) or "
+                "until the user speaks (busy pane) — #583"
+            )
+        finally:
+            turn_end_bus.forget(thread_id)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is None, "a turn that ended normally must report no error"
+        # Closed promptly — not "eventually".  A couple of polls of slack for
+        # the marker to be noticed.
+        assert calls["n"] <= 12, f"took {calls['n']} polls to notice the turn ended"
+
+    @pytest.mark.asyncio
+    async def test_marker_from_the_previous_turn_does_not_close_this_one(
+        self, tmux_manager
+    ) -> None:
+        """#365 regression guard: a stale marker must not finalize a new turn.
+
+        A turn displaced by a new instruction has its ``turn_duration`` written
+        at interrupt time — before this turn's prompt is delivered.  Honouring
+        it would fire 🟡 before Claude said anything, which is the bug #583 is
+        trying to *remove*, not add.
+        """
+        from c_lord.turn_end_bus import turn_end_bus
+
+        thread_id = 5832
+        turn_end_bus.forget(thread_id)
+        turn_end_bus.mark(thread_id)  # the PREVIOUS turn's marker
+
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=thread_id,
+            model="sonnet",
+            timeout_seconds=0.2,
+        )
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        # The previous turn's answer is still on screen; this turn has not
+        # started generating.
+        stale = _make_pane(["● Previous turn answer."], with_input_prompt=True)
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            return stale
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        try:
+            with (
+                patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+                patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+            ):
+                async for event in runner.run("follow up"):
+                    events.append(event)
+        finally:
+            turn_end_bus.forget(thread_id)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        # It must have run out the backstop rather than believing the stale
+        # marker, and it must say the turn never started (#562) — never
+        # "finished".
+        assert result[0].error is not None
+        assert result[0].error.startswith(NO_RESPONSE_ERROR_PREFIX), result[0].error
+
+    @pytest.mark.asyncio
+    async def test_marker_is_ignored_until_the_new_turn_has_started(self, tmux_manager) -> None:
+        """#365 gate is kept: no spinner, no new output ⇒ not our turn's end.
+
+        Same guard as above for the case where the marker lands *during* the
+        run (a still-generating predecessor that only stops after our prompt is
+        typed).
+        """
+        from c_lord.turn_end_bus import turn_end_bus
+
+        thread_id = 5833
+        turn_end_bus.forget(thread_id)
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager,
+            thread_id=thread_id,
+            model="sonnet",
+            timeout_seconds=0.2,
+        )
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        stale = _make_pane(["● Previous turn answer."], with_input_prompt=True)
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                turn_end_bus.mark(thread_id)
+            return stale
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        try:
+            with (
+                patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+                patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+            ):
+                async for event in runner.run("follow up"):
+                    events.append(event)
+        finally:
+            turn_end_bus.forget(thread_id)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error is not None
+        assert result[0].error.startswith(NO_RESPONSE_ERROR_PREFIX), result[0].error

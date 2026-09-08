@@ -2950,4 +2950,10 @@ class ClaudeChatCog(commands.Cog):
                         # reset time instead of asking for a resend that cannot
                         # work until the limit resets.
                         usage_limit=run_config.outcome.usage_limit,
+                        # #583: …and when the user's own next message is what
+                        # ended this turn, say nothing at all. The ping would
+                        # arrive seconds after they typed, tell them their reply
+                        # is needed, and be answered by the replacement turn a
+                        # second later.
+                        preempted=runner.preempted,
                     )
