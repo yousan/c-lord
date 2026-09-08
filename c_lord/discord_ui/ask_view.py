@@ -305,6 +305,14 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         except Exception:
             logger.exception("AskView: pane recovery raised for thread %d (#671)", self._thread_id)
             ok, reason = False, _CLOSED_UNKNOWN
+        # Either way this menu is finished, so the restart ledger must let go of
+        # it. Found on staging: a delivered answer left its row behind, and the
+        # NEXT boot re-armed a menu that no longer existed and then retired it —
+        # overwriting the message that recorded the answer. The bridge gets this
+        # from ``_close``; this path has no bridge, so it does it here.
+        if self._ask_repo is not None:
+            with contextlib.suppress(Exception):
+                await self._ask_repo.delete(self._thread_id)
         if ok:
             return
         # Never the values themselves: on the ✏️ Other path they are whatever the
@@ -315,9 +323,6 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             self._thread_id,
             reason,
         )
-        if self._ask_repo is not None:
-            with contextlib.suppress(Exception):
-                await self._ask_repo.delete(self._thread_id)
         if message is not None:
             question = self._question
             with contextlib.suppress(Exception):

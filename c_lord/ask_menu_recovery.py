@@ -221,8 +221,12 @@ async def _retire(channel: Any, message_id: int | None) -> bool:
     except Exception:
         logger.debug("restart recovery: menu message %s unreachable", message_id, exc_info=True)
         return False
+    # ``view=None`` strips the buttons; the embed is deliberately NOT touched.
+    # Passing ``embed=None`` would blank the question — and, on a menu that had
+    # just recorded an answer, the answer with it (#536: the menu message is
+    # where a reader looks back to see what was asked and what became of it).
     with contextlib.suppress(Exception):
-        await message.edit(content=_RETIRED_NOTE, embed=None, view=None)
+        await message.edit(content=_RETIRED_NOTE, view=None)
         return True
     return False
 

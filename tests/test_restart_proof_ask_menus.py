@@ -401,3 +401,57 @@ class TestOneStartupEntryPoint:
 
         swept.assert_awaited()
         recovered.assert_awaited()
+
+
+# ── found on staging, 2026-09-08 — both would have shipped ───────────────────
+
+
+class TestTheRowGoesAwayWhenTheAnswerLands:
+    """A delivered answer must clear the ledger, exactly like `_close` does.
+
+    Found on staging: the press delivered ``B案`` into the pane and Claude replied
+    in the thread — but the ``pending_asks`` row survived, because the recovery
+    path never goes through ``_close``. On the NEXT boot that stale row re-arms a
+    menu that no longer exists, and then retires it — overwriting the message
+    that recorded the answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_delivered_answer_drops_the_ledger_row(self) -> None:
+        repo = _repo()
+        view = AskView(
+            _question(),
+            thread_id=THREAD_ID,
+            q_idx=0,
+            ask_repo=repo,
+            recovery=AsyncMock(return_value=(True, "")),
+        )
+        ask_bus.unregister(THREAD_ID)
+
+        await view._recover_via_pane(["B案"], MagicMock(id=MESSAGE_ID, edit=AsyncMock()))
+
+        repo.delete.assert_awaited_with(THREAD_ID)
+
+
+class TestRetiringKeepsTheRecord:
+    """Retiring strips the buttons; it must not erase what was asked (#536).
+
+    ``embed=None`` would blank a menu that had just recorded an answer, leaving
+    the thread with a note where the decision used to be.
+    """
+
+    @pytest.mark.asyncio
+    async def test_retire_removes_the_buttons_but_keeps_the_embed(self) -> None:
+        from c_lord.ask_menu_recovery import _retire
+
+        message = MagicMock(id=MESSAGE_ID)
+        message.edit = AsyncMock()
+        channel = MagicMock()
+        channel.fetch_message = AsyncMock(return_value=message)
+
+        assert await _retire(channel, MESSAGE_ID) is True
+        kwargs = message.edit.await_args.kwargs
+        assert kwargs["view"] is None, "the buttons must go — that is the point"
+        assert "embed" not in kwargs, (
+            "passing embed=None wipes the question and any recorded answer with it"
+        )
