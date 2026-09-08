@@ -43,8 +43,15 @@ from .embeds import ask_sending_embed, ask_undelivered_embed
 from .error_reporting import ErrorReportingViewMixin
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from ..claude.types import AskQuestion
     from ..database.ask_repo import PendingAskRepository
+
+    # #671: ``(selected, menu message) -> (delivered, reason)``. Implemented by
+    # ``ask_menu_recovery.PaneMenuAnswerer``; typed structurally so the view does
+    # not import the recovery module (which imports the view).
+    RecoveryDeliver = Callable[[list[str], object | None], Awaitable[tuple[bool, str]]]
 
 logger = logging.getLogger(__name__)
 
@@ -119,10 +126,16 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         bus: AskAnswerBus | None = None,
         ask_repo: PendingAskRepository | None = None,
         authorizer: Authorizer | None = None,
+        recovery: RecoveryDeliver | None = None,
     ) -> None:
         super().__init__(timeout=None)  # persistent — survives bot restarts
         self._authorizer = authorizer
         self._thread_id = thread_id
+        # #671: what to do when the ask bus has no waiter. Set only on views
+        # rebuilt at startup, where that is the NORMAL state (the coroutine that
+        # would have received the answer died with the previous process) and the
+        # TUI menu is still open in the pane, waiting to be typed into.
+        self._recovery = recovery
         # Kept so the resolved message can still show WHAT was asked (#536):
         # the old code wiped the embed and left a bare "Selected: X".
         self._question = question
@@ -232,12 +245,28 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         """
         delivered = self._bus.post_answer(self._thread_id, values)
         question = self._question
+        message = getattr(interaction, "message", None)
+        recovering = False
         if delivered:
             # #651: the bus accepted the answer — that is all that is known
             # right now. The keystrokes have not been sent, and "sent" is not
             # "received" either (#650). The bridge replaces this with the
             # verified outcome once Claude's transcript says what happened.
             embed = ask_sending_embed(question.question, question.header, values)
+        elif self._recovery is not None:
+            # #671: no waiter is the EXPECTED state after a restart, not a dead
+            # end — the TUI menu is still open in the pane with Claude blocked
+            # on it. ACK with the same interim ⏳ the live path shows (Discord
+            # gives us 3 seconds; typing and confirming can take twelve), then
+            # let the answerer type into the pane and rewrite this message with
+            # what it verified.
+            logger.info(
+                "AskView: thread %d has no live session — answering the "
+                "still-open pane instead (#671)",
+                self._thread_id,
+            )
+            embed = ask_sending_embed(question.question, question.header, values)
+            recovering = True
         else:
             if self._ask_repo is not None:
                 await self._ask_repo.delete(self._thread_id)
@@ -252,11 +281,51 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
 
         await interaction.response.edit_message(content=None, embed=embed, view=None)
 
-        message_id = getattr(getattr(interaction, "message", None), "id", None)
+        if recovering:
+            await self._recover_via_pane(values, message)
+
+        message_id = getattr(message, "id", None)
         ask_menus.forget(self._thread_id, message_id)
         with contextlib.suppress(Exception):
             await disable_stale_copies(self._thread_id, message_id, _STALE_COPY_NOTE)
         self.stop()
+
+    async def _recover_via_pane(self, values: list[str], message: object | None) -> None:
+        """Type *values* into the still-open TUI menu after a restart (#671).
+
+        The answerer rewrites *message* with the verified outcome when it
+        succeeds. A refusal is written here instead — with the reason it gave,
+        never a generic "the session was lost": that sentence was shown to
+        people whose menu had merely been answered in the terminal (#536).
+        """
+        if self._recovery is None:
+            return
+        try:
+            ok, reason = await self._recovery(values, message)
+        except Exception:
+            logger.exception("AskView: pane recovery raised for thread %d (#671)", self._thread_id)
+            ok, reason = False, _CLOSED_UNKNOWN
+        if ok:
+            return
+        # Never the values themselves: on the ✏️ Other path they are whatever the
+        # user typed (same convention as _other_callback, which logs a length).
+        logger.info(
+            "AskView: pane recovery refused %d value(s) for thread %d (%s) (#671)",
+            len(values),
+            self._thread_id,
+            reason,
+        )
+        if self._ask_repo is not None:
+            with contextlib.suppress(Exception):
+                await self._ask_repo.delete(self._thread_id)
+        if message is not None:
+            question = self._question
+            with contextlib.suppress(Exception):
+                await message.edit(  # type: ignore[attr-defined]
+                    content=None,
+                    embed=ask_undelivered_embed(question.question, question.header, values, reason),
+                    view=None,
+                )
 
     async def _select_callback(self, interaction: discord.Interaction) -> None:
         values: list[str] = interaction.data.get("values", [])  # type: ignore[union-attr]
@@ -376,9 +445,15 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             delivered = self._bus.post_answer(self._thread_id, [modal.answer])
             message = getattr(interaction, "message", None)
             question = self._question
+            recovering = False
             if delivered:
                 # #651: interim — the bridge confirms and rewrites this.
                 embed = ask_sending_embed(question.question, question.header, [modal.answer])
+            elif self._recovery is not None:
+                # #671: same fallback as the buttons — the pane still has the
+                # free-text affordance open, so a typed answer can still land.
+                embed = ask_sending_embed(question.question, question.header, [modal.answer])
+                recovering = True
             else:
                 if self._ask_repo is not None:
                     await self._ask_repo.delete(self._thread_id)
@@ -401,6 +476,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             if message is not None:
                 with contextlib.suppress(discord.HTTPException, Exception):
                     await message.edit(content=None, embed=embed, view=None)
+            if recovering:
+                await self._recover_via_pane([modal.answer], message)
             message_id = getattr(message, "id", None)
             ask_menus.forget(self._thread_id, message_id)
             with contextlib.suppress(Exception):

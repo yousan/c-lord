@@ -29,6 +29,7 @@
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
 | [input-delivery.md](./input-delivery.md) | 送ったメッセージが Claude に届くこと | 本文・貼り付け・テキスト添付は長さに関係なく全文が届く。届かないときは理由と次の一手が出る |
 | [attachments.md](./attachments.md) | 添付ファイル | 添付は Claude が開ける実ファイルとして渡る。渡せないときは名前と理由がスレッドに出る（黙って捨てない） |
+| [ask-menu-lifecycle.md](./ask-menu-lifecycle.md) | 質問メニュー（❓ ボタン）の一生 | 1質問1枚。押したら本当に届く。**bot を再起動しても押せて、届く**（メニューは出し直さない） (#671) |
 | [stop-button.md](./stop-button.md) | ⏹ Stop ボタン | ターン中だけ末尾に1個出て、終わると消える。前のプロセスが残した押せないボタンは起動時に掃除される (#634) |
 | [turn-progress.md](./turn-progress.md) | ターン中の進捗表示 | スレッドが90秒黙ったときだけ1行出て、15秒ごとに書き換わり、実出力が戻ると消える（常時は出さない） |
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
