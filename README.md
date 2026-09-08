@@ -140,6 +140,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Concurrent sessions** — Multiple parallel sessions with configurable limit
 - **Stop without clearing** — `/stop` halts a session while preserving it for resume
 - **Session interrupt** — Sending a new message to an active thread sends SIGINT to the running session and starts fresh with the new instruction; no manual `/stop` needed
+- **Thread names stay yours** — c-lord never re-summarises a thread's name on its own. A thread keeps the name it was opened with (only the `W<N> │` prefix and the `#<issue>` number are added around it); run `/thread-rename` in the thread when you want a fresh summary of the recent conversation (sonnet). `CLORD_AUTO_TOPIC=1` restores the old auto-summary (#705)
 
 #### 📡 Real-time Feedback
 - **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⚠️ if it stalls). Reactions stay responsive under heavy use; the thread-name lamp is the slower, eventually-consistent sidebar view (#246)
@@ -392,6 +393,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_BRIDGE_MODE` | `jsonl` (default) tails Claude Code JSONL transcripts and forwards events to Discord threads (TranscriptMirror, #216). Set to `skill` to use the legacy discord-reply skill-push path instead (#53) — Claude must actively call a skill each turn to reach Discord, which is less reliable. | `jsonl` |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
+| `CLORD_AUTO_TOPIC` | Set to `1`/`true`/`yes`/`on` to let c-lord summarise a **new** thread's name with an LLM (haiku) on its first message — the pre-#705 behaviour. Off by default: the thread keeps the name it was opened with, and `/thread-rename` (sonnet) re-summarises on demand. | `false` |
+| `CLORD_THREAD_RETITLE` | Set to `1`/`true`/`yes`/`on` to re-title a thread mid-conversation when an LLM judges the work changed (#121). Off by default (#414) — it renamed threads too eagerly. | `false` |
 
 ### URL Link Previews (CLORD_SHOW_URL_EMBEDS)
 
