@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from c_lord.tmux import TmuxSessionManager
 
 
@@ -32,11 +34,18 @@ class FakeTmux:
         windows: dict[str, list[str]] | None = None,
         thread_ids: dict[str, str] | None = None,
         pane_commands: dict[str, str] | None = None,
+        pane_paths: dict[str, str] | None = None,
     ) -> None:
         self.sessions = sessions if sessions is not None else ["clord"]
         self.windows = windows or {}
         self.thread_ids = thread_ids or {}
         self.pane_commands = pane_commands or {}
+        # #677: the reaper must not use the pane's cwd as a kill signal, so the
+        # fixtures need to be able to put a *hand-made* window inside a c-lord
+        # session dir (``tachikoma1:factorio3``) and a *c-lord* window outside
+        # one (every orphan on the production host, after resurrect restored it
+        # into tmux's default dir).
+        self.pane_paths = pane_paths or {}
         self.killed: list[str] = []
         # #649: tmux targets are ``window_id``s now. Test data stays keyed by the
         # readable ``session:name``; this gives every window a stable id and
@@ -68,7 +77,7 @@ class FakeTmux:
                     ("#{window_id}", wid),
                     ("#{window_name}", name),
                     ("#{@thread_id}", self.thread_ids.get(key, "")),
-                    ("#{pane_current_path}", f"/work/{name}"),
+                    ("#{pane_current_path}", self.pane_paths.get(key, f"/work/{name}")),
                 ):
                     row = row.replace(token, value)
                 body += row + "\n"
@@ -146,9 +155,10 @@ class TestReaperNeverKillsLiveClaude:
 
         assert killed == 0
 
-    def test_window_without_thread_id_is_never_touched(self) -> None:
+    def test_hand_named_window_without_thread_id_is_never_touched(self) -> None:
         """Manually created windows (``factorio-server-1`` etc.) carry no
-        ``@thread_id`` and must be invisible to the reaper."""
+        ``@thread_id`` **and** no c-lord-generated name, so they stay invisible
+        to the reaper even after #677 taught it to reap untagged windows."""
         fake = FakeTmux(
             windows={"clord": ["factorio-server-1"]},
             thread_ids={},
@@ -263,3 +273,232 @@ class TestBotWiring:
             "on_ready does not start the tmux reaper — it is dead code again"
         )
         assert asyncio  # keep the import meaningful for linters
+
+
+class TestReaperReclaimsUntaggedClordWindows:
+    """#677: a window that *lost* its ``@thread_id`` must still be reclaimable.
+
+    ``@thread_id`` is a tmux **window option**, and tmux-resurrect's save format
+    stores no window options at all — so every host reboot returns c-lord's
+    windows with their names intact and their tag gone. Requiring the tag put
+    those windows permanently outside the reaper: 15 had piled up by 2026-09-02
+    and 18 were back by 2026-09-04.
+
+    The name is what survives, and ``w{N}`` / ``work{N}`` is a name only
+    :meth:`TmuxSessionManager._next_window_name` hands out.
+    """
+
+    def test_untagged_window_with_clord_name_is_reaped(self) -> None:
+        """The production case: ``welovefactorio:work1``, tag gone, bare zsh."""
+        fake = FakeTmux(
+            sessions=["welovefactorio"],
+            windows={"welovefactorio": ["work1"]},
+            thread_ids={},
+            pane_commands={"welovefactorio:work1": "zsh"},
+        )
+        mgr = _manager("welovefactorio")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 1
+        assert fake.killed == ["welovefactorio:work1"]
+
+    def test_untagged_short_prefix_window_is_reaped(self) -> None:
+        """Both naming generations are c-lord's: ``w{N}`` (#356) and ``work{N}``."""
+        fake = FakeTmux(
+            sessions=["claude_base"],
+            windows={"claude_base": ["w6", "w8"]},
+            thread_ids={},
+            pane_commands={"claude_base:w6": "zsh", "claude_base:w8": "-bash"},
+        )
+        mgr = _manager("claude_base")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 2
+        assert sorted(fake.killed) == ["claude_base:w6", "claude_base:w8"]
+
+    def test_session_shell_window_is_not_reaped(self) -> None:
+        """A session's own initial window (``zsh``) is not a c-lord work window."""
+        fake = FakeTmux(
+            sessions=["games"],
+            windows={"games": ["zsh"]},
+            thread_ids={},
+            pane_commands={"games:zsh": "zsh"},
+        )
+        mgr = _manager("games")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 0
+        assert fake.killed == []
+
+    def test_untagged_window_running_a_program_is_not_reaped(self) -> None:
+        """AC3-adjacent: only an *idle shell* is a corpse.
+
+        ``not claude`` is too weak a guard for the untagged branch — a human's
+        ``work3`` running a dev server would pass it. Every pane must be sitting
+        at a plain shell.
+        """
+        fake = FakeTmux(
+            sessions=["games"],
+            windows={"games": ["w4", "w5"]},
+            thread_ids={},
+            pane_commands={"games:w4": "node", "games:w5": "zsh\nnode"},
+        )
+        mgr = _manager("games")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 0
+        assert fake.killed == []
+
+    def test_untagged_window_running_claude_is_not_reaped(self) -> None:
+        """AC3: a live Claude is untouchable, tagged or not.
+
+        ``i633rig:rig`` on the production host is exactly this — a Claude a
+        human started by hand, with no ``@thread_id``.
+        """
+        fake = FakeTmux(
+            sessions=["c-lord"],
+            windows={"c-lord": ["w7"]},
+            thread_ids={},
+            pane_commands={"c-lord:w7": "claude"},
+        )
+        mgr = _manager("c-lord")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 0
+        assert fake.killed == []
+
+
+class TestReaperNeverKillsHandMadeWindows:
+    """AC2 — the three windows this fix must not be able to touch.
+
+    ``tachikoma1``'s ``factorio2-discord`` / ``factorio3`` / ``factorio3-discord``
+    are hand-made Factorio ops windows whose panes happen to sit **inside a
+    c-lord session directory**. They are the reason the cwd-based candidate (a)
+    was rejected: on the production host it matched *zero* of the 18 orphans
+    (resurrect had dropped them into tmux's default dir) and *all three* of
+    these.
+    """
+
+    HAND_MADE = ["factorio2-discord", "factorio3", "factorio3-discord"]
+    SESSION_DIR = "/home/yousan/c-lord-sessions/1506819883797712998/1507245403215499304"
+
+    def test_hand_made_windows_in_a_session_dir_survive(self) -> None:
+        fake = FakeTmux(
+            sessions=["tachikoma1"],
+            windows={"tachikoma1": self.HAND_MADE},
+            thread_ids={},
+            pane_commands={f"tachikoma1:{n}": "zsh" for n in self.HAND_MADE},
+            pane_paths={f"tachikoma1:{n}": self.SESSION_DIR for n in self.HAND_MADE},
+        )
+        mgr = _manager("tachikoma1")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 0
+        assert fake.killed == []
+
+    def test_reaping_is_decided_by_name_not_by_cwd(self) -> None:
+        """The discriminator must be the window name, in both directions.
+
+        Same session, same bare-zsh panes, same c-lord session dir: only the
+        ``w{N}``-named window goes.
+        """
+        fake = FakeTmux(
+            sessions=["tachikoma1"],
+            windows={"tachikoma1": ["factorio3", "w9"]},
+            thread_ids={},
+            pane_commands={"tachikoma1:factorio3": "zsh", "tachikoma1:w9": "zsh"},
+            pane_paths={
+                "tachikoma1:factorio3": self.SESSION_DIR,
+                "tachikoma1:w9": self.SESSION_DIR,
+            },
+        )
+        mgr = _manager("tachikoma1")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 1
+        assert fake.killed == ["tachikoma1:w9"]
+
+    def test_untagged_orphan_outside_any_session_dir_is_still_reaped(self) -> None:
+        """The mirror image: the real orphans' cwd is tmux's default dir.
+
+        A cwd-based rule would have spared every one of them.
+        """
+        fake = FakeTmux(
+            sessions=["c-lord-parallel-3"],
+            windows={"c-lord-parallel-3": ["work5"]},
+            thread_ids={},
+            pane_commands={"c-lord-parallel-3:work5": "zsh"},
+            pane_paths={"c-lord-parallel-3:work5": "/home/yousan/c-lord"},
+        )
+        mgr = _manager("c-lord-parallel-3")
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 1
+        assert fake.killed == ["c-lord-parallel-3:work5"]
+
+
+class TestReaperLogsWhatItKilled:
+    """AC5 — a count alone cannot be audited after the fact."""
+
+    def test_kill_is_logged_with_session_window_and_reason(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake = FakeTmux(
+            sessions=["welovefactorio"],
+            windows={"welovefactorio": ["work1"]},
+            thread_ids={},
+            pane_commands={"welovefactorio:work1": "zsh"},
+            pane_paths={"welovefactorio:work1": "/home/yousan/c-lord"},
+        )
+        mgr = _manager("welovefactorio")
+
+        with (
+            caplog.at_level("INFO", logger="c_lord.tmux"),
+            patch("c_lord.tmux._run", side_effect=fake),
+        ):
+            mgr.cleanup_orphaned(active_thread_ids=set())
+
+        line = "\n".join(r.getMessage() for r in caplog.records)
+        assert "welovefactorio" in line
+        assert "work1" in line
+        assert "/home/yousan/c-lord" in line
+        assert "no @thread_id" in line
+
+    def test_tagged_kill_is_logged_with_session_window_and_reason(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake = FakeTmux(
+            sessions=["c-lord"],
+            windows={"c-lord": ["w1"]},
+            thread_ids={"c-lord:w1": "111"},
+            pane_commands={"c-lord:w1": "zsh"},
+            pane_paths={"c-lord:w1": "/work/w1"},
+        )
+        mgr = _manager("c-lord")
+
+        with (
+            caplog.at_level("INFO", logger="c_lord.tmux"),
+            patch("c_lord.tmux._run", side_effect=fake),
+        ):
+            mgr.cleanup_orphaned(active_thread_ids=set())
+
+        line = "\n".join(r.getMessage() for r in caplog.records)
+        assert "c-lord" in line
+        assert "w1" in line
+        assert "111" in line
