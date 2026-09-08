@@ -305,3 +305,83 @@ def parse_topic_from_name(name: str) -> str:
     body = _TRAILING_CUR_REF_RE.sub("", body)
     body = _TRAILING_INDEX_RE.sub("", body)
     return body.strip()
+
+
+def topic_auto_enabled(explicit: bool | None = None) -> bool:
+    """Whether c-lord may summarise a thread's topic **on its own** (#705).
+
+    **Off by default (#705).** The naming pass used to ask an LLM for a ≤20-char
+    summary of the thread's first message and rename the thread to it. The
+    sidebar is where a user recognises their own threads, so a name that changes
+    without them asking costs them the thread — "思ったより勝手に書き換えられて
+    困ってる". Off, the topic comes from the name the thread already carries (the
+    user's own words), and a summary is produced only when ``/thread-rename``
+    asks for one.
+
+    ``CLORD_AUTO_TOPIC=1`` (or ``true``/``yes``/``on``) restores the old
+    behaviour. This gates the **initial** naming; the mid-conversation re-titling
+    pass has its own, older switch (:func:`thread_retitle_enabled`, #414), and
+    both must be on for a thread to be renamed twice without being asked.
+
+    ``explicit`` (a constructor override) wins over the environment when not
+    ``None``; otherwise the ``CLORD_AUTO_TOPIC`` env var decides.
+    """
+    if explicit is not None:
+        return explicit
+    return os.getenv("CLORD_AUTO_TOPIC", "").strip().lower() in _LAMP_TRUTHY
+
+
+def split_name(name: str) -> tuple[str, str, str]:
+    """Split a thread name into ``(prefix, topic, suffix)`` (#705).
+
+    The same decorations :func:`parse_topic_from_name` throws away are *kept*
+    here, so a caller can swap the topic body without rebuilding the name from
+    parts it would have to re-derive (tmux window number, session label, state).
+    ``prefix`` is everything up to the body (status emoji, ``[停止]`` marker,
+    ``<session>:W<N> │`` work prefix, leading ``#<origin>``), ``suffix`` is
+    everything after it (``→#<current>``, the legacy trailing `` #N``).
+    """
+    rest = name or ""
+    prefix = ""
+    for pattern in (_LEADING_EMOJI_RE, _CLOSED_PREFIX_RE, _WORK_PREFIX_RE, _LEADING_REF_RE):
+        match = pattern.match(rest)
+        if match:
+            prefix += match.group(0)
+            rest = rest[match.end() :]
+    suffix = ""
+    for pattern in (_TRAILING_CUR_REF_RE, _TRAILING_INDEX_RE):
+        match = pattern.search(rest)
+        if match:
+            suffix = match.group(0) + suffix
+            rest = rest[: match.start()]
+    return prefix, rest.strip(), suffix
+
+
+def replace_topic_in_name(name: str, new_topic: str) -> str:
+    """Return ``name`` with its topic body replaced by ``new_topic`` (#705).
+
+    Everything else survives: the status emoji, the ``[停止]`` marker (#512), the
+    ``<session>:W<N> │`` work prefix (#618) and the ``#<origin> … →#<current>``
+    number pair (#414, #593). Swapping in place rather than calling
+    :func:`build_name` is deliberate — ``/thread-rename`` changes exactly one
+    thing, and re-deriving the rest would let a stale lookup silently drop a
+    prefix the user is using to find the thread.
+
+    Length is capped at :data:`MAX_NAME_LEN` the same way ``build_name`` caps it:
+    the topic is truncated, and only under extreme pressure (a prefix that
+    already fills the name) is the trailing token dropped. An empty
+    ``new_topic`` returns ``name`` unchanged — a nameless thread helps nobody.
+    """
+    topic = (new_topic or "").strip()
+    if not topic:
+        return name
+    prefix, _body, suffix = split_name(name)
+    if prefix and not prefix.endswith(" "):
+        prefix += " "
+    budget = MAX_NAME_LEN - len(prefix) - len(suffix)
+    if budget < 1:
+        suffix = ""
+        budget = MAX_NAME_LEN - len(prefix)
+    if len(topic) > budget:
+        topic = topic[: max(budget, 0)]
+    return f"{prefix}{topic}{suffix}"[:MAX_NAME_LEN]

@@ -18,7 +18,7 @@
 
 | spec | 機能 | 一言で |
 |------|------|--------|
-| [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | トピックは初回固定（自動付け替えは既定オフ）。作業中の `#<Issue/PR番号>` をブランチ/本文から自動表示 |
+| [thread-name.md](./thread-name.md) | スレッド名（トピック＋Issue/PR番号） | **自動要約は既定オフ（#705）** — 名前は開いたときのまま。要約し直すのは `/thread-rename`（sonnet）を打ったときだけ。作業中の `#<Issue/PR番号>` はブランチ/本文から自動表示 |
 | [thread-lamp.md](./thread-lamp.md) | スレッド名のランプ 🟢/🟡 | 既定オフ（rename レート制限のため）。`CLORD_THREAD_LAMP=1` で有効化すると受信で 🟢・完了で 🟡 |
 | [session-close.md](./session-close.md) | セッションの終了と再開 | `/close-workspace` はスレッド名を `[終了] …` にし、以後の投稿は実行せず再開ボタン付きの案内を出す（落ちただけのペインの自動復元とは別物） |
 | [workspace-vocabulary.md](./workspace-vocabulary.md) | ワークスペースの用語と3操作 | スリープ ⊂ 停止 ⊂ 削除。通知は毎回「止まったもの」と「まだ残っているもの」を並べる棚卸し |
