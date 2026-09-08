@@ -15,10 +15,12 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..tmux import TmuxSessionManager, pane_command_is_dead
 from ..transcript.resolver import derive_project_dir
+from ..turn_end_bus import turn_end_bus
 from ..utils.logger import log_ctx
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import (
@@ -1403,6 +1405,9 @@ class TmuxClaudeRunner:
         7. Yield a final RESULT event with ``is_complete=True``.
         """
         self._stopped = False
+        # #583: ``preempted`` is read after the run, so a stale flag from a
+        # previous turn must not survive into this one.
+        self._silent_stop = False
 
         # #701: which tmux server this turn began on.  Read before anything
         # touches tmux, because every failure exit below — start, delivery, and
@@ -1560,6 +1565,14 @@ class TmuxClaudeRunner:
 
         # Wait a moment then snapshot.
         await asyncio.sleep(_POST_STARTUP_DELAY)
+
+        # #583: the baseline for "did MY turn end?" — the bus only counts an
+        # instruction Claude read after this moment (and the ending that
+        # follows it).  Taken *after* the prompt has been delivered and the TUI
+        # has settled: a turn displaced by this prompt finishes within
+        # milliseconds of the submit, and dating the baseline earlier would let
+        # its ending count as this turn's (#365).
+        turn_started_at = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
 
         # Poll capture-pane and extract response text.
         # Completion is detected by the response text stabilising (not changing
@@ -1998,6 +2011,41 @@ class TmuxClaudeRunner:
                 bool(last_response) and last_response != baseline_response
             )
 
+            # #583: Claude's own transcript says when the turn ended, and the
+            # pane cannot.  In jsonl mode the answer never touches the pane, so
+            # a finished turn either freezes with nothing scrapable on it (both
+            # pane exits stall → the 300s backstop, 🟡 five minutes late) or —
+            # with background work still redrawing — never freezes at all (not
+            # even the backstop fires, and the turn stays open until the user's
+            # next message pre-empts it).  The evidence is delivered by the
+            # TranscriptMirror via :mod:`c_lord.turn_end_bus`.
+            #
+            # The #365 rule that only THIS turn's ending may finalize it is
+            # enforced entirely inside the bus, on the transcript's own record:
+            # an instruction Claude read after this run began, and then an
+            # ending after it.  Deliberately NOT also gated on the pane
+            # (``new_turn_started``): a pane kept alive by background work is
+            # one of the cases this exists for, and a long answer whose ``●``
+            # markers scrolled away leaves the pane unable to answer at all —
+            # that is the 2026-09-08 staging miss, where the turn hung to the
+            # backstop with the marker already in the transcript.  With no
+            # marker at all (older builds, skill bridge mode) nothing changes:
+            # the pane detection below still decides.
+            if turn_end_bus.ended_after(self._thread_id, turn_started_at):
+                # The transcript also answers the other question the verdict
+                # below asks — "did this turn actually run at all?" (#562) —
+                # and it answers it better than the pane, which in this very
+                # case had nothing readable on it. Without this the turn would
+                # end with "応答がありませんでした" for an answer that Discord
+                # already has.
+                new_turn_started = True
+                logger.info(
+                    "%s turn end from transcript after %.1fs",
+                    log_ctx(thread_id=self._thread_id),
+                    elapsed,
+                )
+                break
+
             if (
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
@@ -2280,6 +2328,23 @@ class TmuxClaudeRunner:
         """
         return self._stopped
 
+    @property
+    def preempted(self) -> bool:
+        """True when a NEW INSTRUCTION displaced this turn (#583).
+
+        The silent interrupt has exactly one caller — ``_preempt_prior_turn``,
+        the path behind ``⚡ Interrupted. Starting with new instruction...`` —
+        so "stopped silently" *is* "replaced by the user's next message".  The
+        ⏹ Stop button interrupts loudly and is deliberately not this: that turn
+        ended because the user ended it, and its ordinary ending still applies.
+
+        What reads it: the turn-end ping.  A turn the user replaced must not
+        answer them with "🟡 Claude has finished — your reply is needed here",
+        four seconds after they typed and one second before the replacement
+        turn starts.
+        """
+        return self._stopped and self._silent_stop
+
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).
 
@@ -2287,7 +2352,8 @@ class TmuxClaudeRunner:
             silent: When True, the RESULT event will have ``error=None``
                 instead of ``"Stopped by user"``.  Used when a new message
                 automatically interrupts the previous run — users should
-                not see a scary error embed they didn't cause.
+                not see a scary error embed they didn't cause.  That is also
+                what marks the turn :attr:`preempted` (#583).
         """
         self._stopped = True
         self._silent_stop = silent
