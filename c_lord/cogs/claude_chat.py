@@ -48,6 +48,7 @@ from ..discord_ui.views import (
     StopView,
     TextAnsweredMenuView,
 )
+from ..log_sampler import LogSampler
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed
 from ..session_reattach import (
@@ -291,6 +292,10 @@ class ClaudeChatCog(commands.Cog):
         # restore", so the notice is posted at most once per process per thread
         # (the ⚠️ reaction still marks every dropped message).
         self._untracked_notice_sent: set[int] = set()
+        # #678: the webhook drop below is quiet in Discord but must not be quiet in
+        # the log. INFO once per thread per window, DEBUG in between — see
+        # c_lord.log_sampler for why both halves are needed.
+        self._untracked_webhook_log = LogSampler()
         # #538: where Claude Code keeps its transcripts. None = its real
         # location (``~/.claude/projects``); tests point it at a tmp dir.
         self._projects_root: Path | None = None
@@ -764,12 +769,14 @@ class ClaudeChatCog(commands.Cog):
 
         Three cases get the log line only. **Webhook messages** (#556): nobody is
         waiting on the other end, so all three responses above are noise — see the
-        guard below for what that cost in production. In a thread that is not ours
-        (#522) it drops to DEBUG: several c-lord instances can share a guild and
-        every one of them sees this message, so answering would mean each bystander
-        bot posting the same notice. And while a turn is already in flight, the row
-        is simply not written yet — see below. Nothing here may raise: this is
-        already the path for a message we are failing to run.
+        guard below for what that cost in production. That log line is INFO once per
+        thread per window and DEBUG in between (#678): quiet in Discord must not
+        mean invisible in the log, and a chatty alert webhook must not flood it. In
+        a thread that is not ours (#522) it drops to DEBUG: several c-lord instances
+        can share a guild and every one of them sees this message, so answering
+        would mean each bystander bot posting the same notice. And while a turn is
+        already in flight, the row is simply not written yet — see below. Nothing
+        here may raise: this is already the path for a message we are failing to run.
         """
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
@@ -781,9 +788,25 @@ class ClaudeChatCog(commands.Cog):
             # thread, where from the #545 deploy on, each alert was given a ⚠️ and
             # a wall of text about restoring a session, during incidents.
             #
-            # DEBUG, not INFO: an alerting webhook can be chatty, and unlike the
-            # human case there is no one to tell.
-            logger.debug("%s webhook message in an untracked thread — quiet (#556)", ctx)
+            # Quiet in Discord, not quiet in the log (#678). #556 put this line at
+            # DEBUG because an alerting webhook can be chatty — and then on
+            # 2026-09-02 a probe sent into such a thread produced no reply and no
+            # INFO line at all, so "bot down / webhook broken / thread out of
+            # scope" could not be told apart without reading this file. INFO once
+            # per thread per window keeps both: the one-off probe is always
+            # visible, the flood still cannot reach INFO.
+            sample = self._untracked_webhook_log.sample(thread.id)
+            if sample.emit:
+                logger.info(
+                    "%s webhook message dropped — no session row for this thread; "
+                    "quiet by design (#556)%s",
+                    ctx,
+                    sample.suffix,
+                )
+            else:
+                logger.debug(
+                    "%s webhook message dropped — no session row (#556, rate-limited #678)", ctx
+                )
             return
         if thread.id in self._active_runners or self.is_processing(thread.id):
             # A freshly spawned thread has no row until Claude emits its first
