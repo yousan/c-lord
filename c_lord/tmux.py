@@ -608,6 +608,42 @@ def _tmux_available() -> bool:
     return result.returncode == 0
 
 
+def server_fingerprint(socket_name: str | None = None) -> str | None:
+    """Identity of the running tmux server, or ``None`` when there is none (#701).
+
+    Every c-lord thread on this host lives in windows of ONE tmux server, so a
+    server that is replaced takes the whole fleet with it: on 2026-09-08 a
+    single work thread ran ``tmux -f /dev/null new-session …`` (``-f`` skips the
+    config file; it does NOT change the socket) and the three threads that were
+    mid-turn all died within five minutes, each reporting nothing but "Claude
+    exited without producing a response".
+
+    ``#{pid}`` alone would nearly do — a new server is a new process — so
+    ``#{start_time}`` is folded in as the tiebreaker against PID reuse. Both are
+    SERVER-wide (verified on tmux 3.4: two sessions of one server report the
+    same ``start_time`` while their ``session_created`` differ), which is the
+    whole point: creating windows and sessions, the fleet's normal traffic, must
+    not read as a restart.
+
+    ``None`` means UNKNOWN, never "changed" — no server yet, tmux missing, a
+    failed query. Callers compare two readings and act only when both are known
+    and differ; blaming the fleet for an unreadable tmux would replace one
+    misleading message with another.
+
+    *socket_name* maps to ``-L``, i.e. a DIFFERENT server on a different socket.
+    Production never passes it; tests and verification rigs always do, so that
+    exercising this against real tmux cannot repeat the accident it exists for.
+    """
+    args = ["tmux"]
+    if socket_name:
+        args += ["-L", socket_name]
+    args += ["display-message", "-p", "#{pid}:#{start_time}"]
+    result = _run(args)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 class TmuxSessionManager:
     """Manages tmux windows for Claude Code Discord threads.
 
@@ -682,6 +718,17 @@ class TmuxSessionManager:
             if not self._available:
                 logger.warning("tmux is not installed — tmux features disabled")
         return self._available
+
+    def server_fingerprint(self) -> str | None:
+        """Identity of the tmux server this manager's windows live in (#701).
+
+        Thin wrapper over the module-level :func:`server_fingerprint` (not a
+        recursive call — the method name only shadows it on instances) so
+        callers holding a manager need not know how the server is addressed.
+        """
+        if not self._check_available():
+            return None
+        return server_fingerprint()
 
     # ── Helpers ────────────────────────────────────────────────────────
 

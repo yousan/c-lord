@@ -6,6 +6,11 @@ Class-level fixtures with the same name take precedence (pytest scoping rules).
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -84,3 +89,55 @@ def _isolated_prompt_dir(tmp_path_factory, monkeypatch):
     """
     directory = tmp_path_factory.mktemp("clord-prompts")
     monkeypatch.setattr("c_lord.tmux._prompt_file_dir", lambda: directory)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolated_tmux_socket():
+    """Keep the whole test run off the fleet's tmux socket (#701).
+
+    ``pytest`` is routinely run on the bot host while the fleet is live, and a
+    handful of tests drive real tmux. Every tmux client — ours in
+    ``c_lord.tmux._run`` included, since it inherits this process's environment
+    — resolves its socket under ``$TMUX_TMPDIR``, so pointing that at a private
+    directory puts a wall between the suite and ``/tmp/tmux-<uid>/default``,
+    where the production windows live.
+
+    This is the mechanical half of #701: the written rule ("isolate real tmux
+    with ``-L``") only helps whoever reads it, and the incident it comes from
+    was caused by someone who intended to isolate and simply used the wrong
+    flag. A test that forgets is isolated anyway.
+
+    ``TMUX_TMPDIR`` alone is NOT enough, and finding that out is half the value
+    of this fixture: a client started inside a pane reads ``$TMUX`` (socket
+    path, server pid, session) and talks to *that* server, ignoring
+    ``TMUX_TMPDIR`` entirely. The suite is very often run from inside a c-lord
+    pane, where ``$TMUX`` names the fleet's own socket — measured here, a bare
+    ``tmux new-session`` under ``TMUX_TMPDIR`` alone still landed on the
+    production server. So ``TMUX``/``TMUX_PANE`` are dropped too. (Same shape as
+    the mistake in #701 itself: a flag that looks like isolation but is not.)
+
+    Teardown kills only servers whose socket file sits inside that private
+    directory, addressed by path (``-S``) so the command cannot resolve
+    anywhere else.
+    """
+    directory = tempfile.mkdtemp(prefix="clord-tests-tmux-")
+    previous = {name: os.environ.get(name) for name in ("TMUX_TMPDIR", "TMUX", "TMUX_PANE")}
+    os.environ["TMUX_TMPDIR"] = directory
+    os.environ.pop("TMUX", None)
+    os.environ.pop("TMUX_PANE", None)
+    try:
+        yield directory
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if shutil.which("tmux"):
+            for socket_path in Path(directory).rglob("*"):
+                if socket_path.is_socket():
+                    subprocess.run(
+                        ["tmux", "-S", str(socket_path), "kill-server"],
+                        capture_output=True,
+                    )
+        shutil.rmtree(directory, ignore_errors=True)
