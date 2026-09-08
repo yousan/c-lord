@@ -14,6 +14,7 @@ import contextlib
 import logging
 
 from ..claude.tmux_runner import (
+    FLEET_TMUX_RESTART_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
@@ -332,11 +333,16 @@ class EventProcessor:
             # #684 joins them: a trust dialog that was answered but left no
             # claude also produced nothing, so it must not be announced as a
             # finished turn either.
+            # #701 joins them for the same reason: a turn cut off when the
+            # fleet's tmux server was replaced produced nothing either, so
+            # announcing "終わりました" would summon the owner to read an answer
+            # that does not exist.
             if event.error.startswith(
                 (
                     NO_RESPONSE_ERROR_PREFIX,
                     TRUST_STUCK_ERROR_PREFIX,
                     TRUST_START_FAILED_ERROR_PREFIX,
+                    FLEET_TMUX_RESTART_ERROR_PREFIX,
                 )
             ):
                 self._config.outcome.no_response = True
