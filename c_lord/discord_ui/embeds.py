@@ -292,6 +292,43 @@ def trust_start_failed_embed(detail: str) -> discord.Embed:
     )
 
 
+def fleet_tmux_restart_embed(detail: str) -> discord.Embed:
+    """Embed for a turn cut off because the host's tmux server was replaced (#701).
+
+    The only failure embed whose cause lies OUTSIDE the thread reading it. On
+    2026-09-08 one work thread ran ``tmux -f /dev/null new-session …`` — which
+    isolates nothing, ``-f`` only skips the config file — and the fleet's tmux
+    server was replaced under three unrelated threads. All three showed "Claude
+    exited without producing a response (possible startup failure or crash)",
+    so each bystander was left looking for a crash in its own work; one had
+    finished work (+372/-228, tests green) that nearly went unnoticed because
+    nobody could tell why the thread had gone quiet.
+
+    So this embed leads with "not your doing", says the work survives (the
+    workspace is a git checkout on disk — only the pane died), and gives the one
+    action that helps: send it again. It deliberately does NOT send the reader
+    to the pane like the crash embeds do — the pane it would open belongs to a
+    tmux server that no longer exists.
+    """
+    return discord.Embed(
+        title="⚠️ フリートの tmux が落ちたため中断しました",
+        description=(
+            f"{detail}\n\n"
+            "このスレッドの Claude が動いていた **tmux サーバが、ターンの途中で落ちました**"
+            "（別のサーバに入れ替わった場合も含みます）。"
+            "同じホストの全スレッドが1つの tmux サーバを共有しているため、"
+            "**別の作業がそれを落とすと、動いていたスレッドは巻き添えで一斉に止まります**。\n\n"
+            "**このスレッドの操作が原因ではありません。**\n\n"
+            "**作業内容は残っています:** ワークスペースのファイル・ブランチ・コミットはディスク上に"
+            "そのままです。失われたのは実行中だったペインだけです。\n\n"
+            "**できること:**\n"
+            "• もう一度送る（新しいペインで再開します）\n"
+            "• 直前の作業が途中で切れていないか、`git status` / ブランチを確認する"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def usage_limit_embed(limit: UsageLimit) -> discord.Embed:
     """Embed for a turn Claude refused because the account is rate limited (#631).
 
