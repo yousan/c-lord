@@ -115,6 +115,52 @@ class AskQuestion:
     context: str = ""
 
 
+def ask_question_to_dict(question: AskQuestion) -> dict[str, Any]:
+    """Serialise *question* for the ``pending_asks`` restart ledger (#671).
+
+    Everything an answer needs to reach the right place is carried, not just
+    what a menu needs to be *drawn*: the option order (answers are typed as
+    ``Down × index``, so a reordered list selects the wrong thing),
+    ``allow_other`` (whether the ✏️ Other affordance exists at all) and
+    ``free_text_mode`` (which keystrokes deliver typed text — sending the wrong
+    one answered "(No answer provided)" in #650).
+
+    ``context`` is deliberately dropped: the 経緯 prose was already posted as its
+    own message when the menu went up, and it can be long. The restored menu
+    re-uses the message that is still on screen, so nothing needs re-rendering.
+    """
+    return {
+        "question": question.question,
+        "header": question.header,
+        "multi_select": question.multi_select,
+        "allow_other": question.allow_other,
+        "free_text_mode": question.free_text_mode,
+        "options": [{"label": o.label, "description": o.description} for o in question.options],
+    }
+
+
+def ask_question_from_dict(raw: dict[str, Any]) -> AskQuestion:
+    """Rebuild an :class:`AskQuestion` from :func:`ask_question_to_dict`.
+
+    Tolerant of rows written by older versions (which stored only
+    question/header/multi_select/options): the missing keys fall back to the
+    dataclass defaults rather than raising, because a row that cannot be parsed
+    would silently become an un-restored — that is, dead — menu.
+    """
+    mode = raw.get("free_text_mode") or FREE_TEXT_ROW
+    return AskQuestion(
+        question=raw.get("question", ""),
+        header=raw.get("header") or "",
+        multi_select=bool(raw.get("multi_select", False)),
+        options=[
+            AskOption(label=o.get("label", ""), description=o.get("description") or "")
+            for o in raw.get("options", [])
+        ],
+        allow_other=bool(raw.get("allow_other", True)),
+        free_text_mode=mode if mode in ("row", "notes", "none") else FREE_TEXT_ROW,
+    )
+
+
 @dataclass
 class TodoItem:
     """A single item in a TodoWrite task list."""

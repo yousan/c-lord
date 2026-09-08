@@ -1977,14 +1977,15 @@ class ClaudeChatCog(commands.Cog):
         - A resume failure (e.g. channel not found) is logged and skipped
           gracefully — it never prevents the bot from becoming ready.
 
-        It also sweeps away ``⏹ Stop`` buttons a previous process could not
-        delete (#634). Startup is the only moment at which "every stop button in
-        the DB's threads is dead" is guaranteed true, so it is the only moment
-        the sweep is safe. Spawned as its own task: it walks up to a few hundred
-        threads and must not hold up becoming ready.
+        It also retires the UI the previous process left behind — dead ⏹ Stop
+        buttons (#634) and question menus whose handlers died with that process
+        (#671). Startup is the only moment at which "everything on screen from
+        the last run is dead" is guaranteed true, so it is the only moment this
+        is safe. Spawned as its own task: it walks up to a few hundred threads
+        and must not hold up becoming ready.
         """
         # Held on the cog so the task is not garbage-collected mid-sweep.
-        self._stop_sweep_task = asyncio.create_task(self._sweep_dead_stop_buttons())
+        self._stop_sweep_task = asyncio.create_task(self._run_startup_recovery())
 
         if self._resume_repo is None:
             return
@@ -2044,12 +2045,17 @@ class ClaudeChatCog(commands.Cog):
             except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
 
-    async def _sweep_dead_stop_buttons(self) -> None:
-        """Remove the previous process's dead ⏹ Stop buttons (#634). Never raises."""
-        from ..stale_stop_buttons import sweep_dead_stop_buttons
+    async def _run_startup_recovery(self) -> None:
+        """Retire the previous process's dead UI (#634 stop buttons, #671 menus).
+
+        One call, on purpose: these two ran from different ``on_ready`` handlers
+        and one of them silently never fired for a month (#671). See
+        ``c_lord/startup_recovery.py``.
+        """
+        from ..startup_recovery import run_startup_recovery
 
         with contextlib.suppress(Exception):
-            await sweep_dead_stop_buttons(self.bot, self.repo)
+            await run_startup_recovery(self.bot, self.repo, self._ask_repo)
 
     async def _handle_thread_reply(self, message: discord.Message) -> None:
         """Continue a Claude Code session in an existing thread.
