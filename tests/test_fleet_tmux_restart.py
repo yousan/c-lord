@@ -195,6 +195,43 @@ class TestInterruptedTurnSaysTheFleetTmuxDied:
         assert "startup failure or crash" not in result.error
 
     @pytest.mark.asyncio
+    async def test_a_turn_that_never_started_says_it_too(
+        self, runner: TmuxClaudeRunner, tmux_manager: MagicMock
+    ) -> None:
+        """The gap staging found: the fleet can die during *startup*.
+
+        ``start_claude`` then fails and the runner returns before the poll loop
+        ever runs, so the fleet check has to sit on that exit as well. Measured
+        on staging-3: without it the thread was told "this thread's tmux window
+        was never created — check that the channel is bound with /clord-init",
+        which sends the reader to a setting that is perfectly fine.
+        """
+        tmux_manager.start_claude.return_value = False
+        tmux_manager.session_exists.return_value = False
+        seen = iter(["1725546:1788800000"])
+        tmux_manager.server_fingerprint.side_effect = lambda: next(seen, None)
+
+        with patch("c_lord.claude.tmux_runner._SERVER_RECHECK_DELAY", 0.0):
+            result = await _run_to_result(runner)
+
+        assert result.error is not None
+        assert result.error.startswith(FLEET_TMUX_RESTART_ERROR_PREFIX), result.error
+        assert "clord-init" not in result.error
+
+    @pytest.mark.asyncio
+    async def test_a_start_failure_without_a_fleet_death_keeps_its_own_reason(
+        self, runner: TmuxClaudeRunner, tmux_manager: MagicMock
+    ) -> None:
+        """The same exit must not blame the fleet when tmux is fine."""
+        tmux_manager.start_claude.return_value = False
+        tmux_manager.session_exists.return_value = False
+
+        result = await _run_to_result(runner)
+
+        assert result.error is not None
+        assert not result.error.startswith(FLEET_TMUX_RESTART_ERROR_PREFIX), result.error
+
+    @pytest.mark.asyncio
     async def test_unchanged_server_still_reports_the_crash(
         self, runner: TmuxClaudeRunner, tmux_manager: MagicMock
     ) -> None:
