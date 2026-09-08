@@ -109,13 +109,12 @@ class TestSendLiteralRegisters:
         from c_lord.transcript.pane_echo import pane_echo
 
         pane_echo.clear()
-        with patch.dict("os.environ", {"CLORD_BRIDGE_MODE": "jsonl"}):
-            with patch("c_lord.tmux._run") as mock_run:
-                mock_run.side_effect = [
-                    MagicMock(returncode=0, stdout="12345\n"),
-                    MagicMock(returncode=0),
-                ]
-                assert self._mgr().send_literal(12345, "メロン") is True
+        with patch("c_lord.tmux._run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),
+                MagicMock(returncode=0),
+            ]
+            assert self._mgr().send_literal(12345, "メロン") is True
             typed = mock_run.call_args_list[1][0][0]
         assert "メロン" in typed
         assert ZWSP_MARKER not in "".join(typed)

@@ -2079,8 +2079,8 @@ class TestCompactCommand:
     """Tests for /compact command — fires the TUI /compact via send_literal (#278).
 
     The whole point of #278 is that a normal message would go through
-    ``send_input`` which (under ``CLORD_BRIDGE_MODE=jsonl``) prepends a
-    zero-width-space, breaking the leading ``/``. ``/compact`` must therefore
+    ``send_input``, which prepends a zero-width-space, breaking the leading
+    ``/``. ``/compact`` must therefore
     use ``send_literal`` (no ZWSP) + a separate Enter, mirroring the existing
     ``/context`` probe in ``tmux_runner.py``.
     """
