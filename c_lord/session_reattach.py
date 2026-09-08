@@ -42,9 +42,9 @@ __all__ = [
     "HISTORY_FILENAME",
     "Plan",
     "Recovery",
+    "auto_reattach_notice",
     "plan_recovery",
     "reattach_notice",
-    "recoverable_notice",
     "render_history",
 ]
 
@@ -141,35 +141,42 @@ _NOTICES = {
 }
 
 
-_RECOVERABLE = {
+#: The single line posted when a swept thread reconnects on its own — #700.
+#:
+#: What it replaced was five lines of wall, led by 「いま送ったメッセージは Claude
+#: に届いていません」 and ending in a button. That sentence is no longer true —
+#: the message *is* run, right after this line — and the button was asking the
+#: reader to authorise something they never asked c-lord to undo in the first
+#: place. What is left is the one fact they cannot see for themselves: this
+#: workspace had been stopped, and it is coming back.
+#:
+#: One line, deliberately. The inventory of what survived belongs to the notice
+#: that announced the *stop* (:mod:`c_lord.workspace_notice`); repeating it on
+#: the way back would make a routine return look like an incident.
+_AUTO_REATTACH = {
     Recovery.FULL: (
-        "⚠️ このスレッドの c-lord 側の記録が見つかりません"
-        "（30 日以上使われていないと自動で整理されます）。\n"
-        "**いま送ったメッセージは Claude に届いていません。**\n\n"
-        "ただし、**作業ディレクトリも会話の履歴もディスクに残っています**。\n"
-        "下のボタンで**再接続**すれば、前の会話の続きから再開できます。"
+        "🔗 しばらく使われていなかったため停止していました。再接続して続きから実行します。"
     ),
     Recovery.WORKDIR: (
-        "⚠️ このスレッドの c-lord 側の記録が見つかりません"
-        "（30 日以上使われていないと自動で整理されます）。\n"
-        "**いま送ったメッセージは Claude に届いていません。**\n\n"
-        "ただし、**作業ディレクトリは残っています**（書きかけの成果物もそのままです）。\n"
-        "会話の履歴は失われていますが、下のボタンで**再接続**すれば、"
-        "このスレッドの過去ログを引き継いで続きから作業できます。"
+        "🔗 しばらく使われていなかったため停止していました。"
+        "会話の履歴は残っていなかったので、このスレッドの過去ログを引き継いで再接続します。"
     ),
 }
 
 
-def recoverable_notice(plan: Plan) -> str:
-    """The notice shown when a swept thread *can* be reconnected — #538 AC6.
+def auto_reattach_notice(plan: Plan) -> str:
+    """The one line posted while a swept thread is reconnected — #700.
 
-    Leads with the same fact the old notice did — the message did not reach
-    Claude — because that is still what the reader needs first. What follows is
-    the part that was missing: the work is not gone, and here is the way back.
-    Never called for :attr:`Recovery.NONE`; that case keeps the original wording,
-    which is the honest one when nothing survived.
+    Two wordings, because the two outcomes differ in the one way the reader cares
+    about: whether Claude still remembers. Saying nothing at all (the way the
+    4-hour sleep returns, #572) would be wrong here — a WORKDIR recovery hands
+    Claude a document instead of its memory, and the reader is owed that fact
+    before the answer arrives sounding subtly like someone else's.
+
+    Never called for :attr:`Recovery.NONE`: nothing was reattached, so the honest
+    thing is still the full notice naming the way forward (#538 AC8).
     """
-    return _RECOVERABLE[plan.kind]
+    return _AUTO_REATTACH[plan.kind]
 
 
 def reattach_notice(plan: Plan) -> str:

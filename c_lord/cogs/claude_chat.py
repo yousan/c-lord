@@ -50,14 +50,14 @@ from ..discord_ui.views import (
 )
 from ..log_sampler import LogSampler
 from ..notify_policy import Kind, owner_notify_id
-from ..session_close import apply_open_name, closed_notice_embed, is_closed
+from ..session_close import apply_open_name, closed_notice_embed, is_closed, was_auto_stopped
 from ..session_reattach import (
     HISTORY_FILENAME,
     Plan,
     Recovery,
+    auto_reattach_notice,
     plan_recovery,
     reattach_notice,
-    recoverable_notice,
     render_history,
 )
 from ..session_resume import (
@@ -284,6 +284,14 @@ class ClaudeChatCog(commands.Cog):
         # deliberate-reopen wording — a user who closed the session on purpose is
         # not recovering from a crash and should not be told they are.
         self._reopened_threads: set[int] = set()
+        # #700: thread ids whose 7-day idle stop was undone by this very message.
+        # Consumed once, for the same reason as ``_reopened_threads`` and with a
+        # third wording: nothing crashed, and nobody pressed anything.
+        self._auto_reopened_threads: set[int] = set()
+        # #700: thread ids whose one-line recovery notice has already been posted
+        # for the turn about to run. Consumed once, to keep the ``--continue``
+        # resume from adding 「落ちていたので」 under a line that just said why.
+        self._resume_announced: set[int] = set()
         # Issue #429: thread ids already shown the "rename needs Manage Threads"
         # hint, so it is posted at most once per process per thread (not per turn).
         self._rename_hint_sent: set[int] = set()
@@ -757,8 +765,18 @@ class ClaudeChatCog(commands.Cog):
         Before #538 this path was ``return`` — no reply, no log — so a thread whose
         row was missing swallowed every message, including the ones sent because
         c-lord itself had promised the thread would resume on the next message
-        (:mod:`c_lord.session_resume`). Three things happen instead, in decreasing
-        order of how sure we are they are wanted:
+        (:mod:`c_lord.session_resume`).
+
+        **#700: when the workspace is still on disk, the message simply runs.** The
+        30-day sweep is c-lord's own doing and the reader never asked for it, so
+        making them read a wall of text and press 🔗 再接続する was charging them
+        for c-lord's housekeeping — while the stop notice they had already been
+        given promised 「このスレッドに投稿しても再開できます」. What is left is one
+        line saying the workspace had been stopped, and then the turn they asked
+        for. See :meth:`_auto_reattach`.
+
+        Only when **nothing** is left to reconnect to does the old shape remain,
+        because then the message really did not run:
 
         1. **A log line.** Greppable by ``thread=<id>``, so "I sent it and nothing
            happened" is diagnosable at all.
@@ -828,7 +846,15 @@ class ClaudeChatCog(commands.Cog):
             # did; there is nothing to tell its author.
             logger.debug("%s message ignored — never a c-lord thread (#556)", ctx)
             return
-        logger.info("%s message not run — no session row for this thread (#538)", ctx)
+        # #700: reconnect first, and only fall back to the notice when there is
+        # genuinely nothing left to reconnect to. Ordering matters — the ⚠️ below
+        # means "your message did not run", which would be a lie once it does.
+        if await self._auto_reattach(thread, parent_channel_id) is not None:
+            logger.info("%s reattached on arrival — running the message (#700)", ctx)
+            await self._handle_thread_reply(message)
+            return
+
+        logger.info("%s message not run — nothing left to reconnect to (#538)", ctx)
 
         with contextlib.suppress(discord.HTTPException):
             await message.add_reaction(UNTRACKED_REACTION)
@@ -836,21 +862,23 @@ class ClaudeChatCog(commands.Cog):
         if thread.id in self._untracked_notice_sent:
             return
         self._untracked_notice_sent.add(thread.id)
-        await self._offer_recovery(thread, parent_channel_id)
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(UNTRACKED_NOTICE)
 
-    async def _offer_recovery(self, thread: discord.Thread, parent_channel_id: int) -> None:
-        """Post the notice, with a 🔗 再接続する button when there is one — #538 AC6.
+    async def _auto_reattach(self, thread: discord.Thread, parent_channel_id: int) -> Plan | None:
+        """Reconnect a swept thread to what is still on disk — #700 (was #538's button).
 
-        Before this the notice could only say the thread was beyond help and send
-        the reader off to start a new one. Usually that was wrong: #554 takes the
-        row and leaves the checkout, so the work is still there and the thread can
-        be reconnected to it. The button goes on this message because this is the
-        message the confused person is already reading (AC6: reachable from
-        Discord). When nothing survived, the wording is unchanged and names the
-        way forward instead (AC8).
+        Returns the :class:`~c_lord.session_reattach.Plan` that was carried out, or
+        ``None`` when nothing could be reconnected — in which case the caller owns
+        the "this did not run" answer, which is still the honest one (#538 AC8).
+
+        The one line goes out **before** the reattach, not after: a WORKDIR
+        recovery reads up to 500 Discord messages and writes them into the
+        checkout, and the reader is left staring at their own message meanwhile.
+        The line is also what suppresses the ``--continue`` resume notice
+        (:func:`~c_lord.session_resume.resume_notice`), so the turn opens with one
+        sentence rather than two that disagree about what happened.
         """
-        from ..discord_ui.views import ReattachSessionView
-
         sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
         plan = plan_recovery(
             session_dir_base=getattr(sdm, "base_dir", None),
@@ -858,13 +886,18 @@ class ClaudeChatCog(commands.Cog):
             projects_root=self._projects_root,
         )
         if plan.kind is Recovery.NONE:
-            with contextlib.suppress(discord.HTTPException):
-                await thread.send(UNTRACKED_NOTICE)
-            return
+            return None
 
-        view = ReattachSessionView(lambda _i: self._reattach_thread(thread))
         with contextlib.suppress(discord.HTTPException):
-            await thread.send(recoverable_notice(plan), view=view)
+            await thread.send(auto_reattach_notice(plan))
+        self._resume_announced.add(thread.id)
+        done = await self._reattach_thread(thread)
+        if done.kind is Recovery.NONE:
+            # The checkout went away between the plan and the act. Nothing was
+            # written, so hand the caller back to the "did not run" answer.
+            self._resume_announced.discard(thread.id)
+            return None
+        return done
 
     async def _is_our_thread(self, parent_channel_id: int, thread_id: int) -> bool:
         """Whether this instance should speak up in this thread (#522).
@@ -918,7 +951,7 @@ class ClaudeChatCog(commands.Cog):
 
     async def _handle_clord_without_session(
         self, thread: discord.Thread, parent_channel_id: int, respond: _Responder
-    ) -> None:
+    ) -> bool:
         """``/clord`` in a thread with no ``sessions`` row — #551 branches 2 and 3.
 
         No row means one of two very different things, and the first cut of #551
@@ -930,21 +963,32 @@ class ClaudeChatCog(commands.Cog):
         :mod:`c_lord.thread_origin` tells them apart (the same test #556 uses, so
         the two cannot drift):
 
-        * **was ours** → offer the reconnect (#538). Not a takeover: it reattaches
-          to what is already on disk, and starts no new session.
+        * **was ours** → reconnect to what is on disk and carry on (#538, #700).
+          Not a takeover: it reattaches to an existing checkout and starts no new
+          session.
         * **never ours** → refuse and change nothing, which is what #551 is for.
+
+        Returns ``True`` when the caller should carry on with the command — i.e.
+        the thread now has a row again. #700: before this it always returned after
+        posting a notice with a button, so ``/clord`` in a month-quiet thread ran
+        nothing at all and the prompt had to be retyped after the click.
         """
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
-        if await self._was_ever_our_thread(thread, parent_channel_id):
-            logger.info("%s /clord: no session row, offering reconnect (#551/#538)", ctx)
-            await self._offer_recovery(thread, parent_channel_id)
-            await respond(
-                "ℹ️ このスレッドの記録が見つかりませんでした。スレッドに再接続の案内を出しました。",
-                ephemeral=True,
-            )
-            return
-        logger.info("%s /clord refused — never a c-lord thread (#551)", ctx)
-        await respond(NOT_A_CLORD_THREAD, ephemeral=True)
+        if not await self._was_ever_our_thread(thread, parent_channel_id):
+            logger.info("%s /clord refused — never a c-lord thread (#551)", ctx)
+            await respond(NOT_A_CLORD_THREAD, ephemeral=True)
+            return False
+        if await self._auto_reattach(thread, parent_channel_id) is not None:
+            logger.info("%s /clord: reattached, continuing (#551/#538/#700)", ctx)
+            return True
+        logger.info("%s /clord: nothing left to reconnect to (#538 AC8)", ctx)
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(UNTRACKED_NOTICE)
+        await respond(
+            "ℹ️ このスレッドの記録が見つかりませんでした。スレッドに案内を出しました。",
+            ephemeral=True,
+        )
+        return False
 
     async def _reattach_thread(self, thread: discord.Thread) -> Plan:
         """Reconnect ``thread`` to the Claude session it already has — #538 AC6.
@@ -1116,8 +1160,13 @@ class ClaudeChatCog(commands.Cog):
             # shared guild does not get one refusal per bystander bot (#522).
             thread_record = await self.repo.get(channel.id)
             if not is_clord_thread(classify(thread_record)):
-                await self._handle_clord_without_session(channel, parent_channel_id, respond)
-                return
+                if not await self._handle_clord_without_session(
+                    channel, parent_channel_id, respond
+                ):
+                    return
+                # #700: reconnected — the row exists again, so read it back and
+                # continue as if it had never been swept.
+                thread_record = await self.repo.get(channel.id)
         else:
             channel_id = (
                 channel.id
@@ -2022,15 +2071,24 @@ class ClaudeChatCog(commands.Cog):
         thread = message.channel
         assert isinstance(thread, discord.Thread)
 
-        # #512: a session the user closed on purpose (/close-workspace) holds
+        # #512: a session the user closed on purpose (/workspace-stop) holds
         # incoming messages instead of running them. Checked before the lock and
         # before any prompt building so nothing is spent on a message we will not
         # run. Note this keys on the persisted ``closed_at`` — NOT on "the tmux
         # pane is dead", which is the crash case that must keep auto-resuming
         # via --continue (#270, #464).
-        if is_closed(await self.repo.get(thread.id)):
-            await self._post_closed_notice(thread, message)
-            return
+        #
+        # #700 splits that by *who stopped it*. The 7-day idle stop is c-lord's
+        # own doing — the user neither asked for it nor was consulted — so holding
+        # their message behind a button charges them for c-lord's housekeeping.
+        # A manual stop is the opposite: it is a decision, and session-close.md is
+        # explicit that 「自分で終わらせたなら、勝手に動き出さないでほしい」.
+        closed_record = await self.repo.get(thread.id)
+        if is_closed(closed_record):
+            if not was_auto_stopped(closed_record):
+                await self._post_closed_notice(thread, message)
+                return
+            await self._reopen_thread(thread, auto=True)
 
         # #536 AC7: if a menu is open, this sentence is almost certainly the
         # ANSWER to it, not a new order — that is what a user types when the
@@ -2084,21 +2142,36 @@ class ClaudeChatCog(commands.Cog):
                     pane_alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
                     try_continue = not pane_alive
 
+            # #512 / #572 / #700: same mechanism, five different stories. A user
+            # who just pressed 「再開する」 did not suffer a crash, a workspace
+            # c-lord itself put to sleep after 4 idle hours never had a problem to
+            # report, one it stopped at 7 days did but neither caused nor asked
+            # about it, and a reconnected thread was told a line ago. The wording
+            # lives in one function so they cannot drift apart.
+            #
+            # Read outside the ``try_continue`` guard: these marks belong to *this*
+            # turn, and a turn that finds a live pane must still clear them — left
+            # behind, they would word (or silence) somebody else's resume later.
+            reopened = thread.id in self._reopened_threads
+            self._reopened_threads.discard(thread.id)
+            auto_stopped = thread.id in self._auto_reopened_threads
+            self._auto_reopened_threads.discard(thread.id)
+            announced = thread.id in self._resume_announced
+            self._resume_announced.discard(thread.id)
+
             # #464 ②: the dead pane is about to be auto-resumed via --continue.
             # Announce it first, otherwise the resumed turn re-emits the prior
             # turn's output and reads as the bot replaying garbage / being broken
             # (exactly what the 2026-06-25 tmux-server-death incident looked like
             # to the user). A visible notice makes the recovery legible.
             if try_continue:
-                # #512 / #572: same mechanism, three different stories. A user
-                # who just pressed 「再開する」 did not suffer a crash, and a
-                # workspace c-lord itself put to sleep after 4 idle hours never
-                # had a problem to report at all. The wording lives in one
-                # function so the three cannot drift apart.
-                reopened = thread.id in self._reopened_threads
-                self._reopened_threads.discard(thread.id)
                 slept = bool(record is not None and record.slept_at)
-                notice = resume_notice(slept=slept, reopened=reopened)
+                notice = resume_notice(
+                    slept=slept,
+                    reopened=reopened,
+                    auto_stopped=auto_stopped,
+                    already_announced=announced,
+                )
                 if notice is not None:
                     with contextlib.suppress(discord.HTTPException):
                         await thread.send(notice)
@@ -2343,12 +2416,25 @@ class ClaudeChatCog(commands.Cog):
         """
         self._reopened_threads.add(thread_id)
 
-    async def _reopen_thread(self, thread: discord.Thread) -> None:
-        """Clear the 終了 state and drop the ``[終了]`` marker from the name (#512)."""
+    async def _reopen_thread(self, thread: discord.Thread, *, auto: bool = False) -> None:
+        """Clear the 停止 state and drop the ``[停止]`` marker from the name (#512).
+
+        ``auto`` marks a reopen c-lord decided on itself, because a message
+        arrived in a workspace its own 7-day timer had stopped (#700). It changes
+        one thing: the sentence the resume is announced with. 「停止していた
+        ワークスペースを復元して」 is written for someone who just pressed a
+        button, and nobody pressed anything here.
+        """
         await self.repo.set_closed(thread.id, False)
         self.mark_reopened(thread.id)
+        if auto:
+            self._auto_reopened_threads.add(thread.id)
         await apply_open_name(self.repo, thread)
-        logger.info("%s session reopened (#512)", log_ctx(thread_id=thread.id))
+        logger.info(
+            "%s workspace reopened (%s) (#512/#700)",
+            log_ctx(thread_id=thread.id),
+            "auto" if auto else "manual",
+        )
 
     async def _post_closed_notice(self, thread: discord.Thread, message: discord.Message) -> None:
         """Tell the user the thread is closed and offer a one-click reopen (#512).

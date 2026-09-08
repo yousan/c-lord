@@ -75,6 +75,26 @@ def is_closed(record: SessionRecord | None) -> bool:
     return isinstance(closed_at, str) and bool(closed_at.strip())
 
 
+def was_auto_stopped(record: SessionRecord | None) -> bool:
+    """True when **c-lord** stopped this workspace, not the user — #700.
+
+    The 7-day idle stop writes ``closed_reason="idle"`` (#574). Only that value
+    counts: ``"manual"`` is a decision the user made, and a row with **no** reason
+    predates #574, when ``/close-workspace`` was the only way a workspace could be
+    closed at all — so both mean "a person did this".
+
+    Read deliberately as "prove it was automatic", never "prove it was manual".
+    The two failure modes are not symmetric: treating an automatic stop as manual
+    costs one button press, while treating a manual stop as automatic restarts a
+    workspace somebody deliberately put away — which is precisely what
+    ``docs/specs/session-close.md`` promises will not happen.
+
+    Meaningless unless :func:`is_closed` is already true; the state itself is
+    still decided by ``closed_at`` alone, so this column can never contradict it.
+    """
+    return getattr(record, "closed_reason", None) == "idle"
+
+
 def closed_notice_embed() -> discord.Embed:
     """The notice shown when a message lands in a closed thread (#512).
 

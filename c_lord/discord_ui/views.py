@@ -117,12 +117,19 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
 
 
 class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
-    """A ▶️ 再開する button attached to the "this thread is closed" notice (#512).
+    """A ▶️ 再開する button attached to the "this workspace is stopped" notice (#512).
 
-    A message sent to a session the user closed with ``/close-workspace`` is
+    A message sent to a workspace the user stopped with ``/workspace-stop`` is
     **held**, not run — c-lord posts :func:`c_lord.session_close.closed_notice_embed`
-    with this view instead. Clicking the button reopens the session and then runs
+    with this view instead. Clicking the button reopens the workspace and then runs
     the message that was held, so the user does not have to retype it.
+
+    **Only a stop the user asked for gets this button (#700).** The 7-day idle
+    stop is c-lord's own housekeeping, so a message there simply reopens and runs;
+    a button would be charging the reader for a decision they never made. What
+    survives here is the opposite case, and the reason it survives is
+    ``docs/specs/session-close.md``: 「自分で終わらせたなら、勝手に動き出さないで
+    ほしい」.
 
     ``on_reopen`` is an async callable taking the button's
     :class:`discord.Interaction`; it does the actual reopen (clear ``closed_at``,
@@ -170,70 +177,6 @@ class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui
                 await interaction.message.edit(view=self)
 
         await self._on_reopen(interaction)
-        self.stop()
-
-
-class ReattachSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
-    """A 🔗 再接続する button on the "no session record" notice — #538 AC6.
-
-    A thread whose ``sessions`` row was swept (#554) still has its checkout, and
-    usually its Discord history; what it lost is the link between them. This
-    button restores the link. It sits on the notice because that notice is where
-    the confusion actually happens — someone sent a message, got told it did not
-    reach Claude, and needs the way out right there rather than in a command they
-    would first have to learn exists.
-
-    ``on_reattach`` is an async callable taking the :class:`discord.Interaction`
-    and returning the :class:`~c_lord.session_reattach.Plan` that was carried out;
-    the button reports what came back, since "reconnected" means something
-    different when the conversation survived than when only the work did. Keeping
-    it injected leaves this class free of cog/database imports.
-
-    ``timeout=None`` for the same reason as :class:`ReopenSessionView`: the notice
-    may sit unread for days, and a silently dead button would strand the only
-    visible way back.
-    """
-
-    def __init__(
-        self,
-        on_reattach: Callable[[discord.Interaction], Awaitable[object]],
-        authorizer: Authorizer | None = None,
-    ) -> None:
-        super().__init__(timeout=None)
-        self._on_reattach = on_reattach
-        self._authorizer = authorizer
-        self._reattached = False
-
-    @discord.ui.button(label="再接続する", emoji="🔗", style=discord.ButtonStyle.primary)
-    async def reattach_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button | None = None
-    ) -> None:
-        """Reattach the thread and report what was recovered."""
-        # A second click would write the row again — harmless in itself, but it
-        # would also re-export the thread history over the copy Claude may
-        # already be reading.
-        if self._reattached:
-            with contextlib.suppress(discord.HTTPException):
-                await interaction.response.send_message(
-                    "🔗 このスレッドは再接続済みです。", ephemeral=True
-                )
-            return
-        self._reattached = True
-
-        if button is not None:
-            button.disabled = True
-            button.label = "再接続しました"
-        with contextlib.suppress(discord.HTTPException):
-            await interaction.response.defer()
-        if interaction.message is not None:
-            with contextlib.suppress(discord.HTTPException):
-                await interaction.message.edit(view=self)
-
-        plan = await self._on_reattach(interaction)
-        from ..session_reattach import reattach_notice
-
-        with contextlib.suppress(discord.HTTPException):
-            await interaction.followup.send(reattach_notice(plan))  # type: ignore[arg-type]
         self.stop()
 
 

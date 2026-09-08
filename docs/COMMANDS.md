@@ -112,7 +112,7 @@ tmux セッション**だけ**を指す語に予約した。利用者が名指�
 | The thread | `/clord` does |
 |---|---|
 | has a session | continues it, as before |
-| **was** c-lord's but lost its record (the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep)) | offers **🔗 再接続する** — reconnects to what is on disk, rather than starting over |
+| **was** c-lord's but lost its record (the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep)) | **reconnects to what is on disk and runs the prompt** — one line says the workspace had been stopped, then it continues (#700). Never a fresh clone |
 | was never c-lord's | **refuses, and changes nothing** |
 
 ```
@@ -214,8 +214,13 @@ conversation can be picked up later. What you see:
   be retyped. `/workspace-start` does the same without the button (but does not
   re-send your message).
 
+**The button is only for a stop you asked for (#700).** A workspace c-lord
+stopped by itself after 7 idle days is not a decision you made, so a message
+there simply reopens it and runs — with a single line saying it had been stopped.
+Asking you to approve the undo of c-lord's own housekeeping was work for nothing.
+
 This is deliberately different from a session whose pane merely *died* (bot
-restart, `kill -9`, tmux-server death): that one is not "終了", carries no marker,
+restart, `kill -9`, tmux-server death): that one is not "停止", carries no marker,
 and still auto-resumes on the next message via `--continue` (#270).
 
 Use `/workspace-delete` instead when you want the disk back — that one is not
@@ -234,21 +239,21 @@ It does **not** touch the Claude process or the conversation — the session is 
 
 There is **no channel-wide twin**. `/resync-channel` existed until #619 and was removed: it swept a single tmux session, so threads bound to another repo were silently skipped — while the 60s menu watchdog already re-bridges stranded menus across **every** session on its own. Reconnecting is therefore two things: the watchdog (automatic, all sessions) and `/resync` (manual, this thread, plus a pane snapshot the watchdog does not post).
 
-**`/tmux-screenshot` on a stopped workspace restores it and then takes the picture (#642).** No tmux window means no pixels to capture, and since [the 4-hour sleep](specs/workspace-sleep.md) any thread nobody touched for four hours is in exactly that state — so answering with "send a message and it will come back" made the command stop returning pictures at all. It now brings the workspace back the way a message would (`claude --continue`, but with **no prompt**, so no turn runs), captures the restored pane, and posts the PNG with a `-# 🔄 …復元してから撮影しました` line so the few seconds of waiting are accounted for. Two thread states are **not** restored, because a message would not restore them either: a `[終了]` thread (that state was your decision — it still offers **▶️ 再開する**) and a thread c-lord has no record of. If the restore itself fails, it says so instead of posting an empty screen.
+**`/tmux-screenshot` on a stopped workspace restores it and then takes the picture (#642).** No tmux window means no pixels to capture, and since [the 4-hour sleep](specs/workspace-sleep.md) any thread nobody touched for four hours is in exactly that state — so answering with "send a message and it will come back" made the command stop returning pictures at all. It now brings the workspace back the way a message would (`claude --continue`, but with **no prompt**, so no turn runs), captures the restored pane, and posts the PNG with a `-# 🔄 …復元してから撮影しました` line so the few seconds of waiting are accounted for. Two thread states are **not** restored by the screenshot itself: a `[停止]` thread and a thread c-lord has no record of. A **message** in either does now bring them back (#700) — except a stop **you** asked for, which still offers **▶️ 再開する** because that state was your decision. If the restore itself fails, it says so instead of posting an empty screen.
 
 If the thread's work session is **stopped** (no tmux window — e.g. after a bot restart or a tmux-server death), `/resync` (and `/tmux-screenshot`, for the two states above) no longer dead-ends with a bare "No tmux window found." It tells you what sending a message will *actually* do, which depends on the thread (#538):
 
 - **The thread has a session record** → sending a message auto-restores it (the on-disk conversation resumes via `--continue`, announced with a "🔄 …会話を復元して続けます" notice — #270 / #465). This is what keeps a restart from leaving you stuck (#464).
-- **The session was closed** (`[終了]` / `/workspace-stop`) → the message is held and a **▶️ 再開する** button is offered instead (#512).
-- **c-lord has no record of the thread** (usually the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep); also a rebuilt DB, or a thread from another host) → the message did not run, and it is answered rather than dropped in silence: a ⚠️ reaction plus a one-time notice saying so. What the notice offers depends on **what is still on disk** (#538):
+- **The workspace was stopped** → it depends on **who stopped it** (#700). The **7-day idle stop** is c-lord's own housekeeping, so the message reopens the workspace and runs, with one line saying why it had been stopped. A stop **you** asked for (`/workspace-stop`, `[停止]`) still holds the message and offers **▶️ 再開する** — that state was your decision (#512).
+- **c-lord has no record of the thread** (usually the [30-day sweep](#why-a-thread-loses-its-record-the-30-day-sweep); also a rebuilt DB, or a thread from another host) → **c-lord reconnects to what is still on disk and runs the message** (#700), announcing it with a single line. Only when nothing survived is the message not run — then it is still answered rather than dropped in silence: a ⚠️ reaction plus a one-time notice. What happens depends on **what is still on disk** (#538):
 
-| Still on disk | The notice offers |
+| Still on disk | What happens |
 |---|---|
-| checkout + transcript | **🔗 再接続する** — reconnects, and the next message continues the real conversation |
-| checkout only (the common case) | **🔗 再接続する** — reconnects to the work; the thread's own history is written into the checkout so Claude can pick up where it left off |
-| neither | no button: says nothing is left to reconnect to, and points at `/clord` in the channel |
+| checkout + transcript | **reconnects and runs the message**, continuing the real conversation |
+| checkout only (the common case) | **reconnects and runs the message**; the thread's own history is written into the checkout so Claude can pick up where it left off |
+| neither | nothing ran: says nothing is left to reconnect to, and points at `/clord` in the channel |
 
-  `/clord-reattach` does the same thing from a command, for when you already know what happened and would rather not send a message that will not run.
+  `/clord-reattach` does the same reconnect from a command, for when you want the record back without starting a turn.
 
   **Reattaching only ever reconnects.** It never clones, never creates a session dir, and refuses a thread with nothing on disk — so it cannot be used to turn an ordinary thread into a Claude session (the door #551 closes).
 
