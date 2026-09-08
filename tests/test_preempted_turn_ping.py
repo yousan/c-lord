@@ -244,3 +244,62 @@ class TestInterruptedPathMarksTheRunner:
             "the interrupt notice is the user-visible half of this path"
         )
         assert runner.preempted is True
+
+
+class TestContextFooterSkippedForAPreemptedTurn:
+    """The 📊 footer is the other half of the ceremony (#583, 2026-08-31 AC6).
+
+    It is posted at turn end, so an unclosed turn's footer lands wherever the
+    turn finally closes — after ``⚡ Interrupted…``, i.e. on top of the message
+    that replaced it, describing a turn that never reached its end.
+    """
+
+    @staticmethod
+    def _runner_yielding_a_clean_turn(*, preempted: bool) -> MagicMock:
+        from c_lord.claude.types import MessageType, StreamEvent
+
+        runner = MagicMock(spec=TmuxClaudeRunner)
+        runner.stopped = preempted
+        runner.preempted = preempted
+        runner.peek_pending_ask = AsyncMock(return_value=None)
+
+        async def gen(*args, **kwargs):
+            yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1")
+            yield StreamEvent(
+                message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"
+            )
+
+        runner.run = gen
+        return runner
+
+    @staticmethod
+    def _thread() -> MagicMock:
+        t = MagicMock(spec=discord.Thread)
+        t.id = 58302
+        t.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        return t
+
+    async def _run(self, *, preempted: bool) -> AsyncMock:
+        from c_lord.cogs._run_helper import run_claude_with_config
+        from c_lord.cogs.run_config import RunConfig
+
+        repo = MagicMock()
+        repo.save = AsyncMock()
+        config = RunConfig(
+            thread=self._thread(),
+            runner=self._runner_yielding_a_clean_turn(preempted=preempted),
+            repo=repo,
+            prompt="hello",
+        )
+        footer = AsyncMock()
+        with patch("c_lord.cogs._run_helper._post_context_usage", footer):
+            await run_claude_with_config(config)
+        return footer
+
+    @pytest.mark.asyncio
+    async def test_no_footer_for_a_preempted_turn(self) -> None:
+        assert (await self._run(preempted=True)).await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_turn_still_gets_its_footer(self) -> None:
+        assert (await self._run(preempted=False)).await_count == 1
