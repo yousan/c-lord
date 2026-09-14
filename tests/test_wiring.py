@@ -53,6 +53,12 @@ MUST_BE_WIRED = [
     ("orphaned_containers", "devenv.py"),
     # #575: 行を消すときにディレクトリも消す
     ("remove_clean_session_dir", "session_cleanup.py"),
+    # #730: 復元したとき「開発環境は停止したまま」と言う1行。
+    #
+    # この表が想定している事故そのものが起きた例 — #574 の AC として書かれたのに
+    # 3回先送りされ、どの復元経路からも呼ばれないまま19日間 Issue が閉じていた。
+    # 配線が無ければ「決めたのに言わない」に戻る。
+    ("restored_devenv_notice", "workspace_notice.py"),
 ]
 
 
