@@ -1835,6 +1835,7 @@ class TmuxClaudeRunner:
                 # user is eventually told, so it is recorded before the restart
                 # clears ``trust_answered``.
                 answered_here = trust_answered
+                answered_trigger_seen = answered_trigger_seen or answered_here
                 # ``pane_command_is_dead`` rather than ``not is_claude_running``
                 # (#510's asymmetry): the latter folds "no window" and "tmux
                 # hiccup" into False, and acting on *don't know* here would type
@@ -1862,7 +1863,6 @@ class TmuxClaudeRunner:
                     break
                 else:
                     trust_restarts += 1
-                    answered_trigger_seen = answered_trigger_seen or answered_here
                     # #678: this is the one line that used to be missing. Before
                     # it, the only trace of a turn that died here was an
                     # ``Idle timeout`` two minutes later, and ``grep thread=<id>``
