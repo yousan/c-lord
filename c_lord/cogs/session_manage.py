@@ -47,6 +47,7 @@ from ..workspace_notice import (
     DockerOutcome,
     WorkspaceAction,
     WorkspaceReason,
+    restored_devenv_notice,
     workspace_notice_embed,
 )
 
@@ -1639,6 +1640,23 @@ class SessionManageCog(commands.Cog):
 
         lines = [reopen_rename_notice(old_name, new_name) or f"🏷️ スレッド名: `{new_name}`"]
         lines.append("💬 このスレッドにメッセージを送ると、これまでの会話の続きから再開します。")
+
+        # #730: 停止 stopped the containers, and restoring deliberately does not
+        # start them again (#540: compose takes tens of seconds to minutes, and
+        # coming back to re-read the conversation should not pay that). Saying so
+        # is the other half of that decision — without it the reader sees 「再開
+        # しました」 and reasonably assumes the environment came back too. Built
+        # by the shared builder, so this and the message-triggered restore cannot
+        # drift apart (the #538 failure mode).
+        devenv_line = None
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(channel.parent_id or channel.id)
+            if sdm is not None:
+                devenv_line = await restored_devenv_notice(
+                    str(Path(sdm.base_dir) / str(channel.id))
+                )
+        if devenv_line is not None:
+            lines.append(devenv_line)
 
         embed = discord.Embed(
             title="▶️ このスレッドのワークスペースを再開しました",

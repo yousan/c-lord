@@ -23,15 +23,19 @@ implemented it disagreed), so the structure prevents it rather than a review.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
 import discord
 
+from .devenv import containers_for_session_dir
 from .discord_ui.embeds import COLOR_ERROR, COLOR_INFO
 
 if TYPE_CHECKING:
     from .devenv import DevContainer
+
+logger = logging.getLogger(__name__)
 
 #: Amber — a stop is not an error, but it is not business as usual either.
 _COLOR_STOP = 0xFEE75C
@@ -262,3 +266,74 @@ def workspace_notice_embed(
 def workspace_notice_color(action: WorkspaceAction) -> int:
     """Colour used for *action* — exposed so callers can match surrounding UI."""
     return _COLORS.get(action, COLOR_INFO)
+
+
+# ── restoring: the other half of "we do not start docker for you" (#730) ─────
+
+#: How many container names to name before falling back to a count. Two fits the
+#: line comfortably and is enough to recognise the stack ("supabase_db_…").
+_NAMES_SHOWN = 2
+
+_RESTORED_DEVENV = (
+    "⏹ 開発環境 (docker) は停止したままです（{what}）。"
+    "自動では起こしません — 必要なら Claude に「開発環境を起動して」と頼んでください。"
+)
+
+
+def _name_list(containers: list[DevContainer]) -> str:
+    names = [f"`{c.name}`" for c in containers]
+    if len(names) <= _NAMES_SHOWN:
+        return " ".join(names)
+    return f"{' '.join(names[:_NAMES_SHOWN])} ほか{len(names) - _NAMES_SHOWN}件"
+
+
+def restored_devenv_line(containers: list[DevContainer]) -> str | None:
+    """The one line a restored workspace owes the reader, or ``None``.
+
+    #540 decided that coming back to a workspace must **not** run ``compose up``:
+    it takes tens of seconds to minutes, and someone returning only to re-read
+    the conversation should not pay that. This sentence is the other half of that
+    decision — the half that was written as an AC on #574 and then deferred out
+    of existence (#730). Without it the asymmetry is plainly wrong: stopping the
+    environment is announced in detail, staying stopped is not announced at all.
+
+    ``None`` — say nothing — in the two cases where there is nothing to say:
+
+    * **no containers.** Most threads never start docker; they must not grow a
+      notice describing a thing they do not have.
+    * **everything is already running.** A *sleep* leaves docker up on purpose,
+      so a restore from one has nothing to report — and going unnoticed is the
+      entire point of sleep (#572).
+
+    A partly-running stack does get the line, listing only the stopped half: that
+    is precisely the state a reader cannot infer, and the one that produces
+    "why is this connection refused?" ten minutes later.
+    """
+    stopped = [c for c in containers if not c.running]
+    if not stopped:
+        return None
+    return _RESTORED_DEVENV.format(what=_name_list(stopped))
+
+
+async def restored_devenv_notice(session_dir: str | None) -> str | None:
+    """:func:`restored_devenv_line` for the workspace living in *session_dir*.
+
+    Both restore paths — ``/workspace-start`` and a message reopening a stopped
+    workspace — call this one function, for the reason this module exists: two
+    functions producing "the same" message drift, and #538 was exactly that.
+
+    Discovery only. Nothing here starts, creates or removes a container, which
+    is the decision this sentence exists to explain.
+
+    Every failure is answered with ``None``. A restore is the user's turn
+    starting; a host without docker, or one whose daemon is wedged, may cost them
+    a courtesy sentence but must never cost them the turn.
+    """
+    if not session_dir:
+        return None
+    try:
+        containers = await containers_for_session_dir(session_dir)
+    except Exception:  # pragma: no cover - defensive; devenv already swallows
+        logger.debug("restored_devenv_notice: discovery failed", exc_info=True)
+        return None
+    return restored_devenv_line(containers)
