@@ -12,7 +12,7 @@ The bridge's security goal is:
 
 | Threat | Mitigation |
 |--------|-----------|
-| Unauthorized users invoking Claude | `allowed_user_ids` allowlist in `ClaudeChatCog` and `SkillCommandCog` |
+| Unauthorized users invoking Claude | One `Authorizer` shared by every gate — messages, buttons, `/skill`, `/clord-init`. **Unconfigured, it allows only the Discord application's owner** (#713) |
 | Unauthorized users clicking decision buttons (Allow/Approve/Stop) | Same allowlist enforced in every View via `AuthorizedViewMixin.interaction_check` (#466) |
 | Shell injection via user prompts | `create_subprocess_exec` (no shell), `--` separator before prompt arg |
 | Flag injection via prompts | `--` separator prevents `-p`, `--resume` etc. in prompt text |
@@ -165,8 +165,20 @@ class ClaudeChatCog(commands.Cog):
 ```
 
 - When `allowed_user_ids` is set: only listed Discord user IDs can invoke Claude
-- When `allowed_user_ids` is `None`: all users in the channel can invoke Claude (for trusted private servers)
-- The same check applies to `SkillCommandCog`
+- When `CLORD_ALLOWED_ROLE` is set: members holding that role can (OR logic)
+- When **neither** is set: only the Discord application's own owner can — the
+  account that created the bot, which Discord already knows, so nothing has to
+  be configured for the bot to be usable *by you* and unusable by everyone else
+  (#713). Until the bot has logged in and asked Discord, nobody passes.
+- `CLORD_ALLOW_ANYONE=1` restores "anyone in the server", with a startup warning
+- The same check applies to `SkillCommandCog` and `ChannelRepoCog` — they hold
+  the same `Authorizer` instance rather than a copy of the rule
+
+**Why the default is not "everyone"**: being able to talk to c-lord is being
+able to run shell commands on the host that runs it. A fail-open default means
+someone who follows the README and starts the bot has handed that to every
+member of the server without being told. See
+[specs/authorization-default.md](specs/authorization-default.md).
 
 #### Interactive buttons enforce the same allowlist (#466)
 
@@ -182,8 +194,8 @@ Each `discord.ui.View` mixes in `AuthorizedViewMixin`
 (`c_lord/discord_ui/authorization.py`), whose `interaction_check` consults the
 same `Authorizer` (built from `allowed_user_ids` / `allowed_role_name`). A
 non-allowlisted click runs no callback and gets an ephemeral "権限がありません"
-notice. When no allowlist is configured, everyone may click (zero-config —
-unchanged). The allowlist is built once in `ClaudeChatCog` and shared with the
+notice. When no allowlist is configured, the rule is the same as everywhere
+else — the application owner only (#713), not everyone. The allowlist is built once in `ClaudeChatCog` and shared with the
 in-session Views (via `RunConfig`), the persistent-view restore path
 (`bot.py`), and `AutoUpgradeCog` — so configuring the allowlist alone protects
 every button, no extra wiring.
@@ -246,7 +258,7 @@ Code session, treat the listener as privileged:
 
 1. **Private Discord server**: Run the bot on a server only you have access to
 2. **Dedicated channel**: Use a specific channel for Claude interactions, not a general chat
-3. **Set `allowed_user_ids`**: Always set this in production — don't rely solely on channel permissions
+3. **Set `allowed_user_ids`**: Always set this in production — don't rely solely on channel permissions. Left unset the bot falls back to its application owner, which is safe but implicit; naming the allowlist makes it reviewable. Never set `CLORD_ALLOW_ANYONE=1` on a host you care about
 4. **Review Claude Code permissions**: Configure `permission_mode` and `allowed_tools` to restrict Claude Code's capabilities as needed
 5. **Don't use `dangerously_skip_permissions`**: This flag exists for power users who understand the implications. It disables Claude Code's built-in safety prompts
 6. **Monitor the bot**: Check logs regularly. Claude Code sessions are logged with timing and cost data
@@ -261,5 +273,5 @@ Before merging changes to `runner.py`, `_run_helper.py`, or any Cog:
 - [ ] All external input validated (session IDs, skill names, channel IDs)
 - [ ] `SENSITIVE_ENV_KEYS` (`c_lord/tmux.py`) covers any new secret variables
 - [ ] No string formatting in SQL queries (use `?` placeholders)
-- [ ] `allowed_user_ids` check present in any new message handler
+- [ ] The shared `Authorizer` is consulted in any new message handler, button or command — never a fresh copy of the rule (#713: the two copies that existed kept the fail-open default after it was fixed for the other two)
 - [ ] No new `os.system()`, `subprocess.run(shell=True)`, or `eval()` calls

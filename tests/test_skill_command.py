@@ -15,6 +15,7 @@ from c_lord.cogs.skill_command import (
     _load_skills,
     _parse_skill_meta,
 )
+from c_lord.discord_ui.authorization import Authorizer
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +50,10 @@ def _make_cog(
         claude_channel_id=999,
         skills_dir=skills_dir,
         allowed_user_ids=allowed_user_ids,
+        # #713: the shipped default is owner-only, resolved from Discord at
+        # on_ready — which a unit test never reaches. Tests that pass an
+        # allowlist keep it; the rest are not about who may run /skill.
+        authorizer=None if allowed_user_ids else Authorizer(allow_anyone=True),
     )
     # Override skills list for testing if provided
     if skills is not None:

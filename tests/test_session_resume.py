@@ -22,6 +22,7 @@ import discord
 import pytest
 
 from c_lord.database.repository import SessionRecord
+from c_lord.discord_ui.authorization import Authorizer
 from c_lord.session_resume import (
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
@@ -156,7 +157,13 @@ def _make_cog():
     repo.save = AsyncMock()
     runner = MagicMock()
     runner.clone = MagicMock(return_value=MagicMock())
-    return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    return ClaudeChatCog(
+        bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True)
+    )
 
 
 BOT_USER_ID = 777

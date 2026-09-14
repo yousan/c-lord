@@ -37,7 +37,7 @@ from ..database.repository import SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
-from ..discord_ui.authorization import Authorizer
+from ..discord_ui.authorization import Authorizer, resolve_fallback_owner_ids
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
@@ -240,6 +240,7 @@ class ClaudeChatCog(commands.Cog):
         resume_repo: PendingResumeRepository | None = None,
         settings_repo: SettingsRepository | None = None,
         allowed_role_name: str | None = None,
+        authorizer: Authorizer | None = None,
         thread_lamp: bool | None = None,
         thread_retitle: bool | None = None,
         auto_topic: bool | None = None,
@@ -269,7 +270,9 @@ class ClaudeChatCog(commands.Cog):
         # and button gating (View.interaction_check). Published on the bot so
         # cross-cog Views (AutoUpgrade) and the persistent-view restore path
         # (bot.py) enforce the same allowlist without extra wiring.
-        self._authorizer = Authorizer(allowed_user_ids, allowed_role_name)
+        # #713: ``setup_bridge`` passes ONE instance to every cog, so the app
+        # owner resolved at on_ready reaches all of them at once.
+        self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
         if getattr(bot, "authorizer", None) is None:
             bot.authorizer = self._authorizer
         self._registry = registry or getattr(bot, "session_registry", None)
@@ -339,7 +342,9 @@ class ClaudeChatCog(commands.Cog):
         """Check if a member/user is authorized to use the bot.
 
         OR logic: allowed_user_ids match OR allowed_role_name match.
-        When neither is configured, everyone is allowed.
+        When neither is configured, only the Discord application's owner is
+        allowed (#713) — "not configured" must not mean "everyone may run a
+        shell on this host".
 
         Delegates to :class:`Authorizer` so message gating and button gating
         (View.interaction_check, #466) apply the exact same rule.
@@ -2032,6 +2037,10 @@ class ClaudeChatCog(commands.Cog):
         is safe. Spawned as its own task: it walks up to a few hundred threads
         and must not hold up becoming ready.
         """
+        # #713: who may drive this bot. Must happen before the first message
+        # is served, and can only happen now — the owner comes from Discord.
+        await resolve_fallback_owner_ids(self.bot, self._authorizer)
+
         # Held on the cog so the task is not garbage-collected mid-sweep.
         self._stop_sweep_task = asyncio.create_task(self._run_startup_recovery())
 

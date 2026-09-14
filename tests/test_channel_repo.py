@@ -14,6 +14,7 @@ from c_lord.database.channel_repo import (
 )
 from c_lord.database.repository import SessionRecord
 from c_lord.database.thread_repo import ThreadRepository
+from c_lord.discord_ui.authorization import Authorizer
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -68,6 +69,8 @@ def cog(repo: ChannelRepository, thread_repo: ThreadRepository, tmp_path) -> Cha
         repo=repo,
         thread_repo=thread_repo,
         allowed_user_ids=None,
+        # #713: not an authorization test — see tests/test_default_authorization.py
+        authorizer=Authorizer(allow_anyone=True),
         session_dir_base=str(tmp_path / "sessions"),
     )
 

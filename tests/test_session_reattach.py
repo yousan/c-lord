@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from c_lord.discord_ui.authorization import Authorizer
 from c_lord.session_reattach import (
     HISTORY_FILENAME,
     Plan,
@@ -204,7 +205,13 @@ def _cog(tmp_path):
     repo.save = AsyncMock()
     runner = MagicMock()
     runner.clone = MagicMock(return_value=MagicMock())
-    cog = ClaudeChatCog(bot=bot, repo=repo, runner=runner)
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    cog = ClaudeChatCog(
+        bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True)
+    )
     sdm = MagicMock()
     sdm.base_dir = str(tmp_path / "sessions" / "9999")
     cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)  # type: ignore[method-assign]
