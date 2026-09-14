@@ -9,6 +9,7 @@ import discord
 from c_lord.cogs.channel_repo import ChannelRepoCog
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.cogs.skill_command import SkillCommandCog
+from c_lord.discord_ui.authorization import set_fallback_owner_ids
 
 # ---------------------------------------------------------------------------
 # Helpers — mock Member / User with roles
@@ -137,10 +138,13 @@ class TestClaudeChatCogIsAllowed:
         member = _make_member(user_id=99, role_names=["some-other-role"])
         assert cog._is_allowed(member) is False
 
-    def test_both_unset_allows_all(self) -> None:
+    def test_both_unset_means_the_app_owner_only(self) -> None:
+        """#713: no allowlist is not "everyone" — it is the app's own owner."""
         cog = _make_chat_cog()
-        member = _make_member(user_id=99)
-        assert cog._is_allowed(member) is True
+        assert cog._is_allowed(_make_member(user_id=99)) is False
+        set_fallback_owner_ids({99})
+        assert cog._is_allowed(_make_member(user_id=99)) is True
+        assert cog._is_allowed(_make_member(user_id=100)) is False
 
     def test_user_id_or_role(self) -> None:
         """User in allowed_user_ids should pass even without role."""
@@ -221,10 +225,14 @@ class TestMessageAuthorization:
         cog = _make_chat_cog(allowed_user_ids={42})
         assert cog._is_message_authorized(self._msg(self._human(7))) is False
 
-    def test_unconfigured_allows_human(self) -> None:
-        # Zero-config preserved: with no allowlist, humans are still allowed.
+    def test_unconfigured_allows_the_app_owner(self) -> None:
+        # Zero-config preserved (#713): with no allowlist the owner is still
+        # allowed without configuring anything — but only the owner.
         cog = _make_chat_cog()
+        assert cog._is_message_authorized(self._msg(self._human(7))) is False
+        set_fallback_owner_ids({7})
         assert cog._is_message_authorized(self._msg(self._human(7))) is True
+        assert cog._is_message_authorized(self._msg(self._human(8))) is False
 
 
 # ===========================================================================
@@ -416,10 +424,13 @@ class TestSkillCommandCogIsAuthorized:
         member = _make_member(user_id=99, role_names=["other"])
         assert cog._is_authorized(member) is False
 
-    def test_both_unset_allows_all(self) -> None:
+    def test_both_unset_means_the_app_owner_only(self) -> None:
+        """#713: ``/skill`` shares the rule — it used to have its own copy."""
         cog = _make_skill_cog()
-        member = _make_member(user_id=99)
-        assert cog._is_authorized(member) is True
+        assert cog._is_authorized(_make_member(user_id=99)) is False
+        set_fallback_owner_ids({99})
+        assert cog._is_authorized(_make_member(user_id=99)) is True
+        assert cog._is_authorized(_make_member(user_id=100)) is False
 
     def test_user_id_or_role(self) -> None:
         cog = _make_skill_cog(allowed_user_ids={42}, allowed_role_name="claude-operator")
@@ -461,10 +472,13 @@ class TestChannelRepoCogIsAllowed:
         member = _make_member(user_id=99, role_names=["other"])
         assert cog._is_allowed(member) is False
 
-    def test_both_unset_allows_all(self) -> None:
+    def test_both_unset_means_the_app_owner_only(self) -> None:
+        """#713: ``/clord-init`` shares the rule — it used to have its own copy."""
         cog = _make_channel_cog()
-        member = _make_member(user_id=99)
-        assert cog._is_allowed(member) is True
+        assert cog._is_allowed(_make_member(user_id=99)) is False
+        set_fallback_owner_ids({99})
+        assert cog._is_allowed(_make_member(user_id=99)) is True
+        assert cog._is_allowed(_make_member(user_id=100)) is False
 
     def test_user_id_or_role(self) -> None:
         cog = _make_channel_cog(allowed_user_ids={42}, allowed_role_name="claude-operator")

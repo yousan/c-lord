@@ -11,6 +11,7 @@ import pytest
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.concurrency import SessionRegistry
 from c_lord.coordination.service import CoordinationService
+from c_lord.discord_ui.authorization import Authorizer
 
 
 def _make_channel_cog_mock(
@@ -46,7 +47,13 @@ def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
     repo.delete = AsyncMock(return_value=True)
     runner = MagicMock()
     runner.clone = MagicMock(return_value=MagicMock())
-    return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    return ClaudeChatCog(
+        bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True)
+    )
 
 
 def _make_thread_interaction(thread_id: int = 12345) -> MagicMock:
@@ -1360,10 +1367,16 @@ class TestStartSessionCommand:
         assert call_kwargs.get("ephemeral") is True
 
     @pytest.mark.asyncio
-    async def test_no_allowed_user_ids_allows_everyone(self) -> None:
-        """When allowed_user_ids is None, any user can use /claude."""
+    async def test_an_authorized_user_reaches_the_command(self) -> None:
+        """An allowed user is not stopped by the gate (#713 renamed this).
+
+        It used to be called ``test_no_allowed_user_ids_allows_everyone`` and
+        relied on the unconfigured default being "everyone".  That default is
+        now the app owner only, and *which* users are allowed is pinned in
+        tests/test_default_authorization.py — here we only need one who is.
+        """
         cc = _make_channel_cog_mock(tmux_manager=MagicMock())
-        cog = _make_cog(channel_cog=cc)  # allowed_user_ids=None
+        cog = _make_cog(channel_cog=cc)
         interaction = _make_channel_interaction()
         interaction.user = MagicMock()
         interaction.user.id = 42

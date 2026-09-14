@@ -10,9 +10,9 @@ These tests pin down:
 
 * ``Authorizer.is_allowed`` — the extracted allowlist predicate (same
   semantics as ``ClaudeChatCog._is_allowed``).
-* ``AuthorizedViewMixin.interaction_check`` — allow when no authorizer
-  (zero-config), allow allowlisted users, reject others with an ephemeral
-  notice.
+* ``AuthorizedViewMixin.interaction_check`` — allow allowlisted users,
+  reject others with an ephemeral notice, and (since #713) treat a View with no
+  authorizer as "no allowlist configured", i.e. owner-only rather than open.
 * Every real interactive View enforces the authorizer it is given.
 """
 
@@ -27,7 +27,11 @@ import pytest
 from c_lord.claude.types import AskOption, AskQuestion
 from c_lord.cogs.auto_upgrade import UpgradeApprovalView
 from c_lord.discord_ui.ask_view import AskView
-from c_lord.discord_ui.authorization import AuthorizedViewMixin, Authorizer
+from c_lord.discord_ui.authorization import (
+    AuthorizedViewMixin,
+    Authorizer,
+    set_fallback_owner_ids,
+)
 from c_lord.discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from c_lord.discord_ui.permission_view import PermissionView
 from c_lord.discord_ui.plan_view import PlanApprovalView
@@ -72,9 +76,17 @@ def _make_interaction(user: MagicMock) -> MagicMock:
 
 
 class TestAuthorizer:
-    def test_no_allowlist_allows_everyone(self) -> None:
+    def test_no_allowlist_denies_everyone_but_the_app_owner(self) -> None:
+        """#713: no allowlist means *the owner*, never *everyone*.
+
+        Talking to c-lord runs a shell on its host, so "not configured" can
+        not be the setting that hands that to the whole server.
+        """
         auth = Authorizer(allowed_user_ids=None, allowed_role_name=None)
+        assert auth.is_allowed(_make_member(user_id=123)) is False
+        set_fallback_owner_ids({123})
         assert auth.is_allowed(_make_member(user_id=123)) is True
+        assert auth.is_allowed(_make_member(user_id=124)) is False
 
     def test_allowed_by_user_id(self) -> None:
         auth = Authorizer(allowed_user_ids={42})
@@ -119,8 +131,11 @@ class _DummyView(AuthorizedViewMixin, discord.ui.View):
 
 
 class TestInteractionCheck:
-    async def test_none_authorizer_allows_everyone(self) -> None:
+    async def test_none_authorizer_falls_back_to_the_owner_default(self) -> None:
+        """#713: an un-wired View is "nothing configured" — owner-only."""
         view = _DummyView(authorizer=None)
+        assert await view.interaction_check(_make_interaction(_make_member(123))) is False
+        set_fallback_owner_ids({123})
         interaction = _make_interaction(_make_member(user_id=123))
         assert await view.interaction_check(interaction) is True
         interaction.response.send_message.assert_not_called()
@@ -202,7 +217,14 @@ class TestEveryViewEnforcesAuthorizer:
         interaction = _make_interaction(_make_member(user_id=42))
         assert await view.interaction_check(interaction) is True
 
-    async def test_no_authorizer_allows_everyone(self, cls_name: str) -> None:
+    async def test_no_authorizer_falls_back_to_the_owner_default(self, cls_name: str) -> None:
+        """#713: not wired up ⇒ the unconfigured rule, which is owner-only.
+
+        Every one of these buttons decides something on the session owner's
+        behalf, so "we forgot to pass the authorizer" must not be the setting
+        that lets any member of a public thread press it.
+        """
         view = _build_view(cls_name, None)
-        interaction = _make_interaction(_make_member(user_id=99))
-        assert await view.interaction_check(interaction) is True
+        assert await view.interaction_check(_make_interaction(_make_member(99))) is False
+        set_fallback_owner_ids({99})
+        assert await view.interaction_check(_make_interaction(_make_member(99))) is True

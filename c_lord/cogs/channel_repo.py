@@ -36,6 +36,7 @@ from ..database.channel_repo import (
     normalize_repo_url,
     validate_repo_url,
 )
+from ..discord_ui.authorization import Authorizer
 from ..session_dir import SessionDirManager
 from ..session_resume import NOT_A_CLORD_THREAD_BINDING, classify, is_clord_thread
 from ..thread_origin import inspect_origin
@@ -60,6 +61,7 @@ class ChannelRepoCog(commands.Cog):
         session_dir_base: str | None = None,
         allowed_role_name: str | None = None,
         session_repo: SessionRepository | None = None,
+        authorizer: Authorizer | None = None,
     ) -> None:
         self.bot = bot
         self._repo = repo
@@ -71,6 +73,11 @@ class ChannelRepoCog(commands.Cog):
         self._session_repo = session_repo
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
+        # #713: the one allowlist rule, shared with every other gate. Binding a
+        # channel to a repository decides what Claude checks out on this host,
+        # so it follows the same default as everything else — and does so by
+        # using the same object, not a copy of the rule.
+        self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
         self._session_dir_base = session_dir_base
         self._manager_cache: dict[int, SessionDirManager] = {}
         self._thread_manager_cache: dict[int, SessionDirManager] = {}
@@ -328,20 +335,12 @@ class ChannelRepoCog(commands.Cog):
         """Check if a member/user is authorized.
 
         Accepts a Member, User, or bare int (user ID) for backward compatibility.
+        Delegates to :class:`Authorizer` so this gate cannot drift from the one
+        on messages and buttons (#713).
         """
         if isinstance(member, int):
-            user_id = member
-            if self._allowed_user_ids is not None and user_id in self._allowed_user_ids:
-                return True
-            return self._allowed_user_ids is None and self._allowed_role_name is None
-
-        if self._allowed_user_ids is not None and member.id in self._allowed_user_ids:
-            return True
-        if self._allowed_role_name is not None:
-            if isinstance(member, discord.Member):
-                return any(r.name == self._allowed_role_name for r in member.roles)
-            return False  # DM — no role info
-        return self._allowed_user_ids is None
+            return self._authorizer.is_allowed_user_id(member)
+        return self._authorizer.is_allowed(member)
 
     def _authorize(
         self, user: discord.Member | discord.User, message: discord.Message | None

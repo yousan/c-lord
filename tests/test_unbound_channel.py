@@ -6,13 +6,13 @@ a clear error message instead of silently falling back to a global manager.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
 
 from c_lord.cogs.claude_chat import ClaudeChatCog
-
+from c_lord.discord_ui.authorization import Authorizer
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,6 +43,11 @@ def _make_cog(**overrides: object) -> ClaudeChatCog:
     runner.working_dir = "/tmp/test"
     runner.model = "sonnet"
     runner.timeout_seconds = 300
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    overrides.setdefault("authorizer", Authorizer(allow_anyone=True))
     return ClaudeChatCog(bot=bot, repo=repo, runner=runner, **overrides)
 
 
