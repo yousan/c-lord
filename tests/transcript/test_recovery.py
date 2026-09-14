@@ -241,3 +241,61 @@ def test_returns_none_when_no_transcript_is_ours(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert last_completed_final_answer(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# #631: the rate-limit banner is not an answer, so it is not recoverable.
+# ---------------------------------------------------------------------------
+
+
+def _rate_limit_banner(uuid: str, text: str) -> dict:
+    """A turn that ended on Claude's plan-limit refusal, as the CLI writes it."""
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]},
+        "error": "rate_limit",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 429,
+    }
+
+
+def test_rate_limit_banner_is_not_a_recoverable_answer(tmp_path: Path) -> None:
+    """The restart rescue must not re-deliver a refusal (#631).
+
+    The mirror folds this banner into one Japanese line and never lets it be a
+    final answer — but the rescue reads the same transcript by itself, and here
+    it would post the raw English *and* ping for it, which is worse than the
+    bug #631 was filed for.  A limit that was hit before a restart is long since
+    stale anyway: there is nothing to re-deliver.
+    """
+    _write_jsonl(
+        tmp_path / "s.jsonl",
+        [
+            _rate_limit_banner(
+                "u1", "You've hit your weekly limit · resets Aug 29, 4pm (Asia/Tokyo)"
+            ),
+            _turn_end(),
+        ],
+    )
+    assert last_completed_final_answer(tmp_path) is None
+
+
+def test_a_real_answer_before_a_banner_turn_is_still_not_re_delivered(tmp_path: Path) -> None:
+    """Skipping the banner must not promote an older, already-delivered answer."""
+    _write_jsonl(
+        tmp_path / "s.jsonl",
+        [
+            _assistant("u1", "前のターンの本物の回答"),
+            _turn_end(),
+            _rate_limit_banner("u2", "You've hit your session limit · resets 3pm (Asia/Tokyo)"),
+            _turn_end(),
+        ],
+    )
+    # The newest completed turn carries no answer, so the rescue falls back to
+    # the previous one — which the cursor has already passed, so
+    # final_answer_needs_recovery declines it (see test below).
+    assert last_completed_final_answer(tmp_path) == FinalAnswer("u1", "前のターンの本物の回答")
+    from c_lord.transcript.recovery import final_answer_needs_recovery
+
+    assert final_answer_needs_recovery(tmp_path, "u1") is None
