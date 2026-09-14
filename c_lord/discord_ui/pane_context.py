@@ -21,6 +21,20 @@ Two rules the implementation exists to keep:
 - **Never lose text.** Every failure path leaves what is in the thread alone,
   and surplus messages are removed only after every edit has landed. An ugly
   経緯 is a nuisance; a missing one is the bug #549 was about.
+
+**Folding (裁定 2026-09-14).** The replacement above only lands when the menu
+resolves — and that is exactly when nobody needs to read the prose any more.
+While the question is open, the box-drawn wall is all there is: production
+2026-09-08 left a 1,900-char message with 933 box characters sitting unanswered,
+and unreadable, for three days. So a wall is not posted at all. Over
+``FOLD_BOX_CHAR_THRESHOLD`` box characters the prose is folded to a single
+pointer (``fold_pane_context``) — the prose lines that are still readable, plus
+the promise that the full text arrives in a readable form — and the flush
+replaces that pointer instead. Under the threshold nothing changes.
+
+A pointer is **not** a delivery: it does not contain the prose. That is why the
+registry entry is tagged ``folded`` — if the markdown will not fit into the
+pointer, the mirror must post it rather than suppress it as a duplicate.
 """
 
 from __future__ import annotations
@@ -37,6 +51,84 @@ from .reply_chunker import chunk_discord_content
 from .table_renderer import get_table_images
 
 logger = logging.getLogger(__name__)
+
+
+# #686: the box-drawing characters Claude Code's table renderer uses. Counting
+# them is how "the pane handed us a rendered table" is told from "the pane handed
+# us prose": a sentence has none, and a table has one per cell edge per row, so
+# the count grows with the part that is unreadable rather than with the text.
+_BOX_CHARS = frozenset("┌─┬┐│└┴┘├┼┤")
+
+# 100 is the 裁定 (2026-09-14) threshold. For scale: a 2-row table is ~30 and
+# reads fine as text; the production case that motivated this was 933.
+FOLD_BOX_CHAR_THRESHOLD = 100
+
+# What the pointer keeps of the prose. Per line so one runaway line cannot eat
+# the summary, and overall so the pointer stays a pointer.
+_FOLD_LINE_LIMIT = 200
+_FOLD_SUMMARY_LIMIT = 400
+_FOLD_MSG_LIMIT = 1900
+
+_FOLD_FOOTER = "-# 回答すると、全文が読める形でここに届きます"
+
+
+def box_char_count(text: str) -> int:
+    """How many box-drawing characters *text* holds (#686)."""
+    return sum(1 for ch in text if ch in _BOX_CHARS)
+
+
+def should_fold_pane_context(text: str) -> bool:
+    """True when *text* is a box-drawn wall rather than something readable."""
+    return box_char_count(text) >= FOLD_BOX_CHAR_THRESHOLD
+
+
+def _fold_summary(text: str) -> str:
+    """The readable lines of *text* — the ones with no box drawing in them.
+
+    Head first (what this is about) and the last line always (the 推し is
+    conventionally last, and it is the line a reader about to choose needs).
+    """
+    prose = [line.strip() for line in text.splitlines()]
+    prose = [line for line in prose if line and not any(ch in _BOX_CHARS for ch in line)]
+    if not prose:
+        return ""
+
+    def _clip(line: str) -> str:
+        return line if len(line) <= _FOLD_LINE_LIMIT else line[:_FOLD_LINE_LIMIT] + "…"
+
+    kept: list[str] = []
+    used = 0
+    for line in prose:
+        clipped = _clip(line)
+        if kept and used + len(clipped) > _FOLD_SUMMARY_LIMIT:
+            break
+        kept.append(clipped)
+        used += len(clipped) + 1
+    last = _clip(prose[-1])
+    if last not in kept:
+        kept.extend(("…", last))
+    return "\n".join(kept)
+
+
+def fold_pane_context(text: str) -> str:
+    """One message standing in for the box-drawn *text* (#686).
+
+    Says what the prose was about, how much was folded away, and that the
+    readable version is coming — so the menu still has a 経緯 (#549) instead of
+    a hole, without pasting a wall nobody can read into the thread.
+    """
+    head = (
+        "📄 **この質問の経緯は、ターミナルの罫線表示のままで読める形ではないので畳みました**"
+        f"（本文 {len(text):,} 文字 / 罫線 {box_char_count(text):,} 個）"
+    )
+    summary = _fold_summary(text)
+    if not summary:
+        return f"{head}\n{_FOLD_FOOTER}"
+    body = "\n".join(f"> {line}" for line in summary.splitlines())
+    budget = _FOLD_MSG_LIMIT - len(head) - len(_FOLD_FOOTER) - 4
+    if len(body) > budget:
+        body = body[: max(budget - 1, 0)].rstrip() + "…"
+    return f"{head}\n{body}\n{_FOLD_FOOTER}"
 
 
 async def replace_pane_context(messages: Sequence[Any], markdown: str) -> bool:

@@ -1179,3 +1179,84 @@ async def test_menu_with_context_carries_no_such_note(monkeypatch):
     embed = thread.send.await_args_list[-1].kwargs.get("embed")
     text = f"{embed.description or ''}{getattr(embed.footer, 'text', '') or ''}"
     assert "回答後" not in text, text
+
+
+# -- #686 裁定 (2026-09-14): 罫線の壁は畳んでから出す ------------------------
+
+
+_BOXY_CONTEXT = (
+    "リリースタグを比較しました。\n"
+    + "┌─────────────┬───────────┬──────────┐\n"
+    + "│    タグ     │ バージョン │  公開日  │\n"
+    + "├─────────────┼───────────┼──────────┤\n"
+    + ("│ latest      │ 2026.8.1  │ 08-31    │\n" * 12)
+    + "└─────────────┴───────────┴──────────┘\n"
+    + "私の推しは latest です。"
+)
+
+
+def _fast(monkeypatch) -> None:
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+    monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_MISSES", 2)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_TIMEOUT", 0.05)
+    monkeypatch.setattr(ask_handler, "_ANSWER_CONFIRM_POLL", 0.01)
+
+
+@pytest.mark.asyncio
+async def test_box_drawn_context_is_folded_instead_of_posted_raw(monkeypatch):
+    """#686 AC1: the pane rendering of a table is unreadable on Discord and the
+    CLI does not flush until the menu resolves — so while the reader actually
+    needs it, the wall is all there is. Post a pointer, not the wall."""
+    _fast(monkeypatch)
+    thread, _msg = _thread(686_0001)
+    q = _question()
+    q.context = _BOXY_CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    context_sends = [
+        s for s in thread.send.await_args_list if "content" in s.kwargs and "embed" not in s.kwargs
+    ]
+    assert len(context_sends) == 1  # one pointer, not three chunks of wall
+    posted = context_sends[0].kwargs["content"]
+    assert "┌" not in posted and "│" not in posted
+    assert "リリースタグを比較しました。" in posted  # still says what it was about
+    assert "回答すると" in posted  # ...and what happens next
+
+
+@pytest.mark.asyncio
+async def test_context_below_the_box_threshold_is_posted_unchanged(monkeypatch):
+    """#686 AC2: folding is for walls only — ordinary prose keeps the #399
+    behaviour exactly, including a small table that reads fine as text."""
+    _fast(monkeypatch)
+    thread, _msg = _thread(686_0002)
+    q = _question()
+    q.context = _CONTEXT + "\n┌───┬───┐\n│ a │ b │\n└───┴───┘"
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    context_sends = [
+        s for s in thread.send.await_args_list if "content" in s.kwargs and "embed" not in s.kwargs
+    ]
+    assert "".join(s.kwargs["content"] for s in context_sends) == q.context
+
+
+@pytest.mark.asyncio
+async def test_a_folded_context_still_registers_the_full_text_for_replacement(monkeypatch):
+    """#686 AC3: the pointer is only a placeholder, so the flush that carries
+    the real markdown must still find it — and be told it is a fold, because a
+    placeholder is NOT a delivery: if the markdown cannot be edited into it, it
+    has to be posted rather than dropped."""
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    _fast(monkeypatch)
+    thread, _msg = _thread(686_0003)
+    q = _question()
+    q.context = _BOXY_CONTEXT
+
+    await asyncio.wait_for(bridge_pane_ask(thread, q, _resolved_runner()), timeout=3.0)
+
+    entry = bridged_context.take_match(thread.id, _BOXY_CONTEXT, source="pane")
+    assert entry is not None
+    assert entry.folded is True
+    assert len(entry.messages) == 1

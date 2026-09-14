@@ -20,7 +20,13 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from c_lord.discord_ui.pane_context import replace_pane_context
+from c_lord.discord_ui.pane_context import (
+    FOLD_BOX_CHAR_THRESHOLD,
+    box_char_count,
+    fold_pane_context,
+    replace_pane_context,
+    should_fold_pane_context,
+)
 
 _PANE = (
     "  比較しました。\n"
@@ -142,3 +148,68 @@ async def test_no_tables_means_no_attachments_argument(monkeypatch):
     assert await replace_pane_context([a], _MARKDOWN) is True
 
     assert "attachments" not in a.edit.await_args.kwargs
+
+
+# -- #686 裁定 (2026-09-14): 長すぎたら畳む -----------------------------------
+#
+# The replacement above only helps *after* the menu resolves, and the CLI does
+# not flush until then — so for the whole time the reader has to read the prose
+# to decide, it is the box-drawn rendering. Measured on production: a 1,900-char
+# message with 933 box characters sat unanswered, unreadable, for three days.
+# So do not post an unreadable wall at all: fold it to a pointer, and let the
+# markdown replace the pointer when it lands.
+
+
+_BOXY = (
+    "  リリースタグを比較しました。\n"
+    + "  ┌─────────────┬───────────┬──────────┐\n"
+    + "  │    タグ     │ バージョン │  公開日  │\n"
+    + "  ├─────────────┼───────────┼──────────┤\n"
+    + ("  │ latest      │ 2026.8.1  │ 08-31    │\n" * 12)
+    + "  └─────────────┴───────────┴──────────┘\n"
+    + "  私の推しは latest です。"
+)
+
+
+def test_the_box_characters_are_counted():
+    assert box_char_count("| タグ |") == 0
+    assert box_char_count(_BOXY) >= FOLD_BOX_CHAR_THRESHOLD
+
+
+def test_a_box_drawn_wall_is_folded_but_ordinary_prose_is_not():
+    """#686 AC1/AC2: the threshold is what separates 'unreadable' from 'fine'."""
+    assert should_fold_pane_context(_BOXY) is True
+    assert should_fold_pane_context(_PANE) is False  # a 2-row table: still readable
+    assert should_fold_pane_context("ただの説明文です。") is False
+    assert should_fold_pane_context("") is False
+
+
+def test_the_fold_keeps_the_prose_and_promises_the_full_text():
+    """The pointer has to say what this was about and what happens next —
+    otherwise it is just a hole where the 経緯 used to be (#549)."""
+    folded = fold_pane_context(_BOXY)
+
+    assert "リリースタグを比較しました。" in folded
+    assert "私の推しは latest です。" in folded  # the 推し is conventionally last
+    assert "回答すると" in folded and "届きます" in folded
+    assert "┌" not in folded and "│" not in folded  # the wall itself is gone
+    assert len(folded) <= 2000
+
+
+def test_the_fold_fits_one_message_even_for_a_huge_context():
+    folded = fold_pane_context("説明です。" * 2000 + "\n" + "┌─┬┐│└┴┘├┼┤" * 50)
+
+    assert len(folded) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_the_folded_placeholder_is_replaced_by_the_markdown():
+    """#686 AC3: folding must not break #698 — when the flush finally lands,
+    the pointer becomes the readable markdown, in place."""
+    m = _msg()
+    m.content = fold_pane_context(_BOXY)
+
+    assert await replace_pane_context([m], _MARKDOWN) is True
+
+    assert m.edit.await_args.kwargs["content"] == _MARKDOWN
+    m.delete.assert_not_awaited()

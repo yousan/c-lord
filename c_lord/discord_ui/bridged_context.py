@@ -104,6 +104,15 @@ class BridgedEntry:
     norm: str
     source: str
     messages: tuple[Any, ...] = field(default=())
+    folded: bool = False
+    """True when *messages* hold a fold (#686) — a pointer, not the prose.
+
+    The distinction decides what a *failed* replacement means. A real pane
+    delivery already put the words in the thread, so dropping the flush is
+    merely a missed upgrade. A fold did not: it says "回答すると、全文が読める形で
+    ここに届きます". Suppress the flush on top of that and the reader is left
+    with a pointer to nothing, so the flush is posted instead.
+    """
 
 
 class BridgedContextRegistry:
@@ -135,12 +144,16 @@ class BridgedContextRegistry:
         text: str,
         source: str = "pane",
         messages: Sequence[Any] | None = None,
+        folded: bool = False,
     ) -> None:
         """Record *text* as delivered to Discord by *source* for *thread_id*.
 
         *messages* are the Discord messages that delivery went into, kept so the
         suppressing side can rewrite them rather than drop the better copy
         (#686). Omit them and the entry behaves exactly as before.
+
+        *folded* says those messages hold a pointer rather than the text itself
+        (#686) — see :class:`BridgedEntry`.
         """
         norm = _normalize(text)
         if len(norm) < _MIN_NORM_LEN:
@@ -154,7 +167,7 @@ class BridgedContextRegistry:
             if not bucket:
                 del self._entries[tid]
         bucket = self._entries.setdefault(thread_id, [])
-        bucket.append(BridgedEntry(now, norm, source, tuple(messages or ())))
+        bucket.append(BridgedEntry(now, norm, source, tuple(messages or ()), folded))
         del bucket[:-_MAX_PER_THREAD]
 
     def consume_match(self, thread_id: int, text: str, source: str = "pane") -> bool:
