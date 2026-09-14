@@ -24,8 +24,12 @@ from c_lord.workspace_notice import (
 
 def _c(name: str, ports: tuple[int, ...] = (), status: str = "running") -> DevContainer:
     return DevContainer(
-        container_id=f"id-{name}", name=name, status=status, ports=ports,
-        project=None, source="mount",
+        container_id=f"id-{name}",
+        name=name,
+        status=status,
+        ports=ports,
+        project=None,
+        source="mount",
     )
 
 
@@ -47,9 +51,7 @@ class TestAlwaysNamesTheThreadFirst:
 
 class TestAlwaysListsWhatSurvives:
     @pytest.mark.parametrize("action", list(WorkspaceAction))
-    def test_conversation_history_is_always_reported_as_kept(
-        self, action: WorkspaceAction
-    ) -> None:
+    def test_conversation_history_is_always_reported_as_kept(self, action: WorkspaceAction) -> None:
         """True for every action, delete included — and the whole reason the
         inventory exists."""
         e = workspace_notice_embed(action, reason=WorkspaceReason.IDLE)
@@ -121,7 +123,9 @@ class TestAutomaticDiffersByExactlyOneLine:
 
     def _fields(self, reason: WorkspaceReason) -> dict[str, str]:
         e = workspace_notice_embed(
-            WorkspaceAction.STOP, reason=reason, idle_label="7日間",
+            WorkspaceAction.STOP,
+            reason=reason,
+            idle_label="7日間",
             containers=[_c("db", (5432,))],
         )
         return {f.name: f.value for f in e.fields}

@@ -170,6 +170,7 @@ class TestEventProcessorFolding:
             assert edits == []
             m.delete.assert_not_called()
 
+
 class TestEmptyProgressNotSent:
     """#542: a progress.txt whose only line is the session banner must not ship.
 
@@ -226,9 +227,7 @@ class TestEmptyProgressNotSent:
         )
 
         file_sends = [c for c in thread.send.await_args_list if "file" in c.kwargs]
-        assert file_sends == [], (
-            f"an empty progress.txt was posted: {file_sends!r}"
-        )
+        assert file_sends == [], f"an empty progress.txt was posted: {file_sends!r}"
         # The session-start embed is still cleaned up, so the thread ends in the
         # same state as a folded turn — just without the empty bubble.
         sent_messages[0].delete.assert_awaited_once()

@@ -252,6 +252,40 @@ async def test_repeated_banners_in_one_turn_post_once(tmp_path: Path, clean_noti
     assert sum(1 for p in h.posted if "⏳" in p) == 1
 
 
+async def test_clords_notice_does_not_silence_the_following_turn(
+    tmp_path: Path, clean_notices
+) -> None:
+    """AC8 is about *this* turn; the next one is a new fact (#631 AC9).
+
+    Observed on staging 2026-09-14: c-lord announced the limit at 12:53:16 and
+    the mirror then suppressed the banner of the turn that started at 12:54:25
+    too, because the registry entry was still inside its wall-clock TTL.  Under
+    a live limit — which is weekly, by design, for this operator — that is the
+    "上限中は何も出さない" failure: the reader sends again and the thread says
+    nothing at all.
+    """
+    h = _Harness(tmp_path, thread_id=6319)
+    usage_limit_notices.note(6319)
+    h.mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        # Turn 1: c-lord already spoke, so the mirror stays quiet.
+        _write_event(h.jsonl, _fixture_event("i631-session"))
+        _write_event(h.jsonl, _turn_end())
+        await asyncio.sleep(0.3)
+        assert h.all_text.strip() == ""
+        # Turn 2: nobody has spoken about *this* turn.
+        event = _fixture_event("i631-session")
+        event["uuid"] = "i631-session-turn2"
+        _write_event(h.jsonl, event)
+        _write_event(h.jsonl, _turn_end())
+        await asyncio.sleep(0.3)
+    finally:
+        await h.mirror.stop()
+
+    assert any("⏳" in p for p in h.posted)
+
+
 async def test_a_new_turn_may_report_the_limit_again(tmp_path: Path, clean_notices) -> None:
     """Per turn, not per thread — the next turn is a new fact about the limit."""
     h = _Harness(tmp_path, thread_id=6316)

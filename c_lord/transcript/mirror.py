@@ -665,13 +665,19 @@ class TranscriptMirror:
                 if _is_user_prompt(event):
                     turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                     _limit_reported = False
+                    usage_limit_notices.clear_thread(self.thread_id)
 
                 if _is_turn_end(event):
                     # #631: a limit reported for the turn that just ended says
                     # nothing about the next one — the limit may well have reset
                     # in between, and a thread that silently stops explaining why
-                    # it is stuck is the bug this came from.
+                    # it is stuck is the bug this came from.  c-lord's own notice
+                    # is scoped the same way: AC8 asks whether *this* turn has
+                    # already been told, and leaving the entry standing made the
+                    # next turn silent for the rest of the TTL (staging,
+                    # 2026-09-14: announced 12:53:16, wrongly suppressed 12:54:35).
                     _limit_reported = False
+                    usage_limit_notices.clear_thread(self.thread_id)
                     if self._verbosity == "minimal":
                         # #539: the turn is over — take the progress line away
                         # before the final answer lands so it never trails

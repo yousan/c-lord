@@ -141,9 +141,12 @@ class TestEveryBridgedMenuIsRecorded:
             await task
         ask_bus.unregister(thread.id)
 
-        repo.save.assert_awaited(), (
-            "bridge_pane_ask posted a menu without recording it — this is #671: "
-            "the restart-recovery table stayed empty in production forever"
+        (
+            repo.save.assert_awaited(),
+            (
+                "bridge_pane_ask posted a menu without recording it — this is #671: "
+                "the restart-recovery table stayed empty in production forever"
+            ),
         )
         kwargs = repo.save.await_args.kwargs
         assert kwargs["thread_id"] == THREAD_ID
@@ -239,9 +242,12 @@ class TestStartupReArmsTheButtons:
 
         await recover_ask_menus(bot, repo, runner_factory=_never_a_runner_factory(_question()))
 
-        thread.send.assert_not_called(), (
-            "recovery posted a new menu — that is #633 (188 re-bridges, the same "
-            "question six times over three days) reintroduced"
+        (
+            thread.send.assert_not_called(),
+            (
+                "recovery posted a new menu — that is #633 (188 re-bridges, the same "
+                "question six times over three days) reintroduced"
+            ),
         )
 
 
@@ -268,16 +274,17 @@ class TestTheRestoredButtonDelivers:
 
         question = _question()
         factory = _never_a_runner_factory(question)
-        answerer = PaneMenuAnswerer(
-            thread_id=THREAD_ID, question=question, runner_factory=factory
-        )
+        answerer = PaneMenuAnswerer(thread_id=THREAD_ID, question=question, runner_factory=factory)
 
         delivered, _reason = await answerer(["即送信にする"])
 
         assert delivered is True
-        factory.runner.answer_menu.assert_awaited_with(1), (
-            "the answer must be typed at the option's INDEX — the pane menu is "
-            "navigated with Down × index, not by label"
+        (
+            factory.runner.answer_menu.assert_awaited_with(1),
+            (
+                "the answer must be typed at the option's INDEX — the pane menu is "
+                "navigated with Down × index, not by label"
+            ),
         )
 
     @pytest.mark.asyncio
@@ -330,9 +337,12 @@ class TestTheRestoredButtonDelivers:
         button = next(c for c in view.children if getattr(c, "label", "") == "即送信にする")
         await button.callback(interaction)
 
-        recovery.assert_awaited(), (
-            "the bus had no waiter and the view gave up — that is the restart "
-            "behaviour #671 is about; the still-open pane was never tried"
+        (
+            recovery.assert_awaited(),
+            (
+                "the bus had no waiter and the view gave up — that is the restart "
+                "behaviour #671 is about; the still-open pane was never tried"
+            ),
         )
         assert recovery.await_args.args[0] == ["即送信にする"]
 
@@ -371,9 +381,12 @@ class TestClosedMenusAreRetired:
 
         await recover_ask_menus(bot, repo, runner_factory=_never_a_runner_factory(None))
 
-        msg.edit.assert_awaited(), (
-            "a menu whose pane is menu-free is dead — leaving it clickable is the "
-            "'looks live and is not' state #634 removed for ⏹ Stop"
+        (
+            msg.edit.assert_awaited(),
+            (
+                "a menu whose pane is menu-free is dead — leaving it clickable is the "
+                "'looks live and is not' state #634 removed for ⏹ Stop"
+            ),
         )
         repo.delete.assert_awaited_with(THREAD_ID)
         thread.send.assert_not_called()  # AC4 again: retire, never re-post
@@ -384,9 +397,7 @@ class TestClosedMenusAreRetired:
 
 class TestOneStartupEntryPoint:
     @pytest.mark.asyncio
-    async def test_startup_recovery_covers_stop_buttons_and_ask_menus(
-        self, monkeypatch
-    ) -> None:
+    async def test_startup_recovery_covers_stop_buttons_and_ask_menus(self, monkeypatch) -> None:
         """#634's sweep and #671's re-arm are the same job: retire the previous
         process's dead UI. Splitting them across two ``on_ready`` handlers is how
         one of them silently never ran for a month."""

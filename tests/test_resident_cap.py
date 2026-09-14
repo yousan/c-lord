@@ -297,7 +297,9 @@ class TestCapEnforcement:
         loop = _loop(records, resident=set(range(1, 8)), limit=5)
 
         assert await loop.tick() == 2
-        ids = [c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list]
+        ids = [
+            c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list
+        ]
         assert ids == [7, 6]  # 最も長くアイドルな順
 
     @pytest.mark.asyncio
@@ -409,7 +411,9 @@ class TestEmergencyBrake:
         await loop.tick()
         await loop.tick()
 
-        ids = [c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list]
+        ids = [
+            c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list
+        ]
         assert 1 not in ids
 
     @pytest.mark.asyncio
@@ -509,8 +513,7 @@ class TestTheNoticeTellsTheTruthAboutWhy:
         from c_lord.workspace_notice import WorkspaceReason
 
         fields = [
-            tuple((f.name, f.value) for f in self._embed(r, "30本").fields)
-            for r in WorkspaceReason
+            tuple((f.name, f.value) for f in self._embed(r, "30本").fields) for r in WorkspaceReason
         ]
         assert len(set(fields)) == 1
 

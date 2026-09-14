@@ -274,7 +274,6 @@ class TestChatCogWakeWorkspace:
         cog, thread = self._cog(None)
         assert await cog.wake_workspace(thread) is False
 
-
     async def test_waits_for_the_per_thread_setup_lock(self, monkeypatch):
         """Two clicks (or a message landing mid-wake) must not each start a
         Claude into the same pane — the second would type into the first's TUI."""

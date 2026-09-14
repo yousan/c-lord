@@ -217,12 +217,15 @@ def folded_notice(limit: UsageLimit | None) -> str:
 
 # -- "c-lord already said this in Japanese" ------------------------------------
 
-# How long a c-lord notice suppresses the mirror's own line.  Only has to cover
-# the gap between the two paths seeing the same limit — a second in the
-# 2026-09-04 capture — but is generous because the cost of being too long is one
-# missing line in a thread that already carries the Japanese notice, while the
-# cost of being too short is the duplicate this exists to remove.
-_NOTICE_TTL_SECONDS = 300.0
+# Backstop only.  An entry is normally dropped at the turn boundary by the
+# mirror, because AC8 asks whether *this* turn has already been told; the TTL
+# just keeps a thread whose boundary never arrived (a restart mid-turn) from
+# carrying the entry forever.  It is deliberately short: a stale entry does not
+# cause a duplicate, it causes SILENCE — the following turn's banner is folded
+# away with nothing in its place — and under a live limit the reader is sending
+# again right now.  Staging showed exactly that at a 300 s TTL on 2026-09-14
+# (announced 12:53:16, wrongly suppressed the 12:54:25 turn).
+_NOTICE_TTL_SECONDS = 60.0
 # Production mirrors hundreds of threads; the map is bounded and evicted
 # oldest-first.  A dropped entry costs one duplicated line, never correctness.
 _MAX_THREADS = 2048

@@ -91,12 +91,18 @@ class TestUnparsableMenuIsRecorded:
         from c_lord.thread_state_sync import record_unparsable_menu
 
         first = record_unparsable_menu(
-            thread_id=4242, session_name="s", window_name="w",
-            pane_text=UNPARSABLE, directory=tmp_path,
+            thread_id=4242,
+            session_name="s",
+            window_name="w",
+            pane_text=UNPARSABLE,
+            directory=tmp_path,
         )
         again = record_unparsable_menu(
-            thread_id=4242, session_name="s", window_name="w",
-            pane_text=UNPARSABLE, directory=tmp_path,
+            thread_id=4242,
+            session_name="s",
+            window_name="w",
+            pane_text=UNPARSABLE,
+            directory=tmp_path,
         )
         assert first is not None
         assert again is None, "the same pane must not be captured twice"
@@ -106,12 +112,18 @@ class TestUnparsableMenuIsRecorded:
         from c_lord.thread_state_sync import record_unparsable_menu
 
         record_unparsable_menu(
-            thread_id=1, session_name="s", window_name="w",
-            pane_text=UNPARSABLE, directory=tmp_path,
+            thread_id=1,
+            session_name="s",
+            window_name="w",
+            pane_text=UNPARSABLE,
+            directory=tmp_path,
         )
         other = record_unparsable_menu(
-            thread_id=1, session_name="s", window_name="w",
-            pane_text=UNPARSABLE + "\na different frame\n", directory=tmp_path,
+            thread_id=1,
+            session_name="s",
+            window_name="w",
+            pane_text=UNPARSABLE + "\na different frame\n",
+            directory=tmp_path,
         )
         assert other is not None
         assert len(list(tmp_path.glob("*.txt"))) == 2
@@ -124,8 +136,11 @@ class TestUnparsableMenuIsRecorded:
 
         with caplog.at_level("WARNING", logger="c_lord.thread_state_sync"):
             record_unparsable_menu(
-                thread_id=99887766, session_name="c-lord", window_name="w3",
-                pane_text=UNPARSABLE, directory=tmp_path,
+                thread_id=99887766,
+                session_name="c-lord",
+                window_name="w3",
+                pane_text=UNPARSABLE,
+                directory=tmp_path,
             )
         joined = "\n".join(r.getMessage() for r in caplog.records)
         assert "thread=99887766" in joined
@@ -139,8 +154,11 @@ class TestUnparsableMenuIsRecorded:
         blocked.write_text("I am a file, not a directory")
         assert (
             record_unparsable_menu(
-                thread_id=1, session_name="s", window_name="w",
-                pane_text=UNPARSABLE, directory=blocked,
+                thread_id=1,
+                session_name="s",
+                window_name="w",
+                pane_text=UNPARSABLE,
+                directory=blocked,
             )
             is None
         )
@@ -151,7 +169,10 @@ class TestUnparsableMenuIsRecorded:
 
         for i in range(_MAX_UNPARSABLE_CAPTURES + 5):
             record_unparsable_menu(
-                thread_id=i, session_name="s", window_name="w",
-                pane_text=UNPARSABLE + f"\nframe {i}\n", directory=tmp_path,
+                thread_id=i,
+                session_name="s",
+                window_name="w",
+                pane_text=UNPARSABLE + f"\nframe {i}\n",
+                directory=tmp_path,
             )
         assert len(list(tmp_path.glob("*.txt"))) <= _MAX_UNPARSABLE_CAPTURES

@@ -76,9 +76,7 @@ async def test_rows_name_the_session_each_thread_is_really_in(monkeypatch):
     cog = _make_cog(dirs, records, windows, monkeypatch)
 
     respond, ack = AsyncMock(), AsyncMock()
-    await cog._clord_status_impl(
-        channel=_channel(), show_all=False, respond=respond, ack=ack
-    )
+    await cog._clord_status_impl(channel=_channel(), show_all=False, respond=respond, ack=ack)
 
     out = " ".join(str(a) for c in respond.await_args_list for a in c.args)
     assert "qiita-article:w1" in out, "the row must name the session the thread is really in"
@@ -94,9 +92,7 @@ async def test_legacy_work_window_is_reported_verbatim(monkeypatch):
     cog = _make_cog(dirs, records, windows, monkeypatch)
 
     respond, ack = AsyncMock(), AsyncMock()
-    await cog._clord_status_impl(
-        channel=_channel(), show_all=False, respond=respond, ack=ack
-    )
+    await cog._clord_status_impl(channel=_channel(), show_all=False, respond=respond, ack=ack)
 
     out = " ".join(str(a) for c in respond.await_args_list for a in c.args)
     assert "claude_base:work5" in out
@@ -109,9 +105,7 @@ async def test_thread_without_a_window_offers_no_attach_target(monkeypatch):
     cog = _make_cog(dirs, records, [], monkeypatch)
 
     respond, ack = AsyncMock(), AsyncMock()
-    await cog._clord_status_impl(
-        channel=_channel(), show_all=True, respond=respond, ack=ack
-    )
+    await cog._clord_status_impl(channel=_channel(), show_all=True, respond=respond, ack=ack)
 
     out = " ".join(str(a) for c in respond.await_args_list for a in c.args)
     assert "closed" in out
