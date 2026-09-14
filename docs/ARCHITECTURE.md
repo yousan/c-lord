@@ -124,7 +124,8 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 2. on_message() in ClaudeChatCog
    │
 3. _handle_new_conversation()
-   ├── Create Discord thread (name = first 100 chars of message)
+   ├── Create Discord thread (name = topic read off the message —
+   │   one line, no markdown/URLs, … when cut; #721)
    │
 4. _run_claude()
    ├── Check semaphore (post "waiting" if full)

@@ -17,10 +17,11 @@ def test_heuristic_topic_strips_url():
 
 
 def test_heuristic_topic_strips_code_fences():
+    # #721: the fenced code never leaks — and what follows the fence is on
+    # another line, so it is no longer glued onto the first one either.
     out = topic.heuristic_topic("見て ```python\nprint('x')\n``` どう")
     assert "print" not in out
-    assert "見て" in out
-    assert "どう" in out
+    assert out == "見て"
 
 
 def test_heuristic_topic_strips_mentions():
@@ -515,6 +516,63 @@ async def test_maybe_retitle_live_llm_action_messages() -> None:
                 failures.append((msg, result))
 
     assert not failures, f"retitle failures: {failures}"
+
+
+class TestReadableName:
+    """#721: the name a thread is opened with must be readable.
+
+    The default thread name used to be ``message.content[:100]`` — a raw cut of
+    the prompt that merged the URL and markdown lines of a dispatch prompt into
+    one unreadable run of characters, and stopped mid-word. These pin the three
+    rules that make it readable again (AC1-AC3 of #721).
+    """
+
+    #: The dispatch prompt shape from the Issue: a one-line instruction, then a
+    #: URL line, then a markdown title line.
+    DISPATCH = (
+        "#999 を担当してください。\n"
+        "https://example.com/x\n"
+        "**bug(P1): 長いタイトルがここにずっと続く**"
+    )
+
+    def test_ac1_uses_only_the_first_line(self) -> None:
+        """AC1: nothing from after the newline reaches the name."""
+        out = topic.heuristic_topic(self.DISPATCH)
+        assert out == "#999 を担当してください。"
+
+    def test_ac2_no_markdown_or_url_markers(self) -> None:
+        """AC2: ``**`` / ``##`` / backticks / ``http(s)://`` never appear."""
+        samples = [
+            self.DISPATCH,
+            "## 見出しの担当をお願いします",
+            "**強調**された `コード` の修正 https://example.com/a",
+            "- [ ] https://example.com/b を直す",
+        ]
+        for sample in samples:
+            out = topic.heuristic_topic(sample)
+            for marker in ("**", "##", "`", "http://", "https://"):
+                assert marker not in out, f"{marker!r} leaked from {sample!r} into {out!r}"
+
+    def test_ac3_truncation_is_visible(self) -> None:
+        """AC3: a name that was cut short ends with …; one that fits does not."""
+        out = topic.heuristic_topic("あ" * 100)
+        assert out.endswith("…")
+        assert len(out) == 20
+        assert topic.heuristic_topic("短い依頼") == "短い依頼"
+
+    def test_issue_number_survives_the_markdown_scrub(self) -> None:
+        """``#233`` is the thread's identity — only ``##``-style hashes go."""
+        assert topic.heuristic_topic("#233 を担当してください。") == "#233 を担当してください。"
+        assert topic.heuristic_topic("## 見出しです") == "見出しです"
+
+    def test_heading_line_keeps_its_text(self) -> None:
+        out = topic.heuristic_topic("### ランプが点かない\n本文")
+        assert out == "ランプが点かない"
+
+    def test_first_line_with_only_a_url_falls_through(self) -> None:
+        """A line that cleans to nothing is skipped — lines are never joined."""
+        out = topic.heuristic_topic("https://example.com/x\nこれを読んで直して")
+        assert out == "これを読んで直して"
 
 
 if __name__ == "__main__":  # pragma: no cover
