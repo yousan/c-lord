@@ -313,6 +313,18 @@ class TestFormatContextLine:
         line = format_context_line(used=60_000, total=200_000, cli_version="1.2.3")
         assert "CLI 1.2.3" in line
 
+    def test_clord_version_appended_next_to_cli(self) -> None:
+        """#722: the footer must say which c-lord build ran this turn."""
+        line = format_context_line(
+            used=60_000,
+            total=200_000,
+            cli_version="2.1.263",
+            clord_version="v1.4.183-bd80c47e-20260908",
+        )
+        assert "c-lord v1.4.183-bd80c47e-20260908" in line
+        # Adjacent to the CLI version — the two versions read as one pair.
+        assert line.index("CLI 2.1.263") < line.index("c-lord v1.4.183")
+
     def test_cost_appended(self) -> None:
         line = format_context_line(used=60_000, total=200_000, cost_usd=0.0042)
         assert "$0.0042" in line
@@ -324,11 +336,13 @@ class TestFormatContextLine:
             model="claude-sonnet-4-6",
             effort="medium",
             cli_version="1.2.3",
+            clord_version="v1.4.183-bd80c47e-20260908",
             cost_usd=0.0042,
         )
         assert "sonnet-4-6" in line
         assert "medium" in line
         assert "CLI 1.2.3" in line
+        assert "c-lord v1.4.183-bd80c47e-20260908" in line
         assert "$0.0042" in line
         assert " · " in line
 

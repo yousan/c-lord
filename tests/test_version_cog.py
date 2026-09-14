@@ -33,7 +33,7 @@ def test_cog_registers_slash_and_text_commands() -> None:
 @pytest.mark.asyncio
 async def test_version_impl_posts_embed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "c_lord.cogs.version_cmd.resolve_version",
+        "c_lord.cogs.version_cmd.runtime_version",
         lambda: "v9.9.9-bdeadbee-20260529",
     )
     cog = VersionCog(MagicMock())
@@ -51,7 +51,7 @@ async def test_version_impl_posts_embed(monkeypatch: pytest.MonkeyPatch) -> None
 @pytest.mark.asyncio
 async def test_slash_io_sends_embed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "c_lord.cogs.version_cmd.resolve_version",
+        "c_lord.cogs.version_cmd.runtime_version",
         lambda: "v1.0.0-bcafef00-20260529",
     )
     cog = VersionCog(MagicMock())
@@ -66,3 +66,36 @@ async def test_slash_io_sends_embed(monkeypatch: pytest.MonkeyPatch) -> None:
     call = send_message.await_args
     assert call is not None
     assert "v1.0.0-bcafef00-20260529" in call.kwargs["embed"].description
+
+
+@pytest.mark.asyncio
+async def test_version_reports_the_running_build_not_the_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#722: /version must answer "what am I running", not "what is on disk".
+
+    After a ``git pull`` without a restart the checkout moves but the loaded
+    code does not. Re-resolving would make the old build claim the new commit
+    — and would disagree with the 📊 footer and the boot log, which are pinned.
+    """
+    from c_lord.version import runtime_version
+
+    checkout = iter(["v1.4.183-bd80c47e-20260908", "v1.4.190-bfeedfac-20260914"])
+    monkeypatch.setattr("c_lord.version.resolve_version", lambda: next(checkout))
+    runtime_version.cache_clear()
+    cog = VersionCog(MagicMock())
+    seen: list[str] = []
+
+    async def respond(content: str | None = None, *, embed=None, ephemeral: bool = False) -> None:
+        seen.append(embed.description)
+
+    try:
+        await cog._version_impl(respond=respond)
+        await cog._version_impl(respond=respond)  # the checkout moved in between
+    finally:
+        runtime_version.cache_clear()
+
+    assert "v1.4.183-bd80c47e-20260908" in seen[0]
+    assert "v1.4.183-bd80c47e-20260908" in seen[1], (
+        "/version followed the checkout instead of the running build"
+    )
