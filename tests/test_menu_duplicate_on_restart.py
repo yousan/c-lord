@@ -320,3 +320,35 @@ class TestTheOriginalButtonsStillWork:
         with patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge:
             await _sweep(loop, 717_005, pane)
         assert bridge.await_count == 0, "and no second card is posted next to it"
+
+
+class TestTheSkipIsVisibleInTheLog:
+    """#678: not posting is a decision — it must be readable at INFO.
+
+    After this fix the watchdog stays quiet about every menu the turn already
+    posted, which is the normal state of every restart. A reader asking "why
+    didn't my question come back?" must not have to turn on DEBUG to find out.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_watchdog_says_why_it_did_not_post(
+        self, ledger_db, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+        pane = _fixture("ask_rich_descriptions.txt")
+        question = _pane_question(pane)
+
+        use_shared_ledger(MenuRebridgeLedger(MenuBridgeRepository(ledger_db)))
+        await _post_from_a_turn(717_006, question)
+
+        loop = _watchdog(MenuRebridgeLedger(MenuBridgeRepository(ledger_db)))
+        with caplog.at_level("INFO", logger="c_lord.thread_state_sync"):
+            await _sweep(loop, 717_006, pane)
+            await _sweep(loop, 717_006, pane)  # the 60s re-sighting must not repeat it
+
+        lines = [r.message for r in caplog.records if "already bridged" in r.message]
+        assert len(lines) == 1, (
+            "the skip must be stated once at INFO — silent (DEBUG-only) is #678, "
+            f"one line per tick is the log flood #579 buried: got {lines}"
+        )
+        assert "thread=717006" in lines[0], "the line must be greppable by thread"

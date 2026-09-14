@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from .log_sampler import LogSampler
 from .menu_ledger import (
     _MAX_REBRIDGES_PER_MENU,
     MenuRebridgeLedger,
@@ -650,6 +651,13 @@ class MenuWatchdogLoop:
         # ledger is reset by every bot restart — which is what re-posted one
         # stranded menu 188 times.
         self._rebridges = rebridge_ledger or MenuRebridgeLedger()
+        # #678/#717: "this menu is already on screen, so I am not posting it
+        # again" is the NORMAL path after every restart now that the turn-side
+        # bridge records its posts too. It has to be visible in the INFO log —
+        # a reader asking "why didn't my question come back?" must not have to
+        # turn on DEBUG — but a stuck menu is re-seen every 60s, so it is
+        # sampled: once per thread per window, with the suppressed count.
+        self._rebridge_skip_log = LogSampler()
 
     def start(self) -> None:
         """Spawn the loop task. Idempotent."""
@@ -886,15 +894,24 @@ class MenuWatchdogLoop:
         # budget comes back only when the pane is seen without a menu on it.
         signature = menu_fingerprint(question)
         if await self._rebridges.exhausted(thread_id, signature):
-            logger.debug(
-                "%s menu %r already bridged and still open — not posting it again. "
-                "If it needs answering, the answer is probably not reaching the "
-                "pane; check `tmux attach -t %s` window %s (#633)",
-                log_ctx(thread_id=thread_id),
-                question.header,
-                session_name,
-                window_name,
-            )
+            sample = self._rebridge_skip_log.sample(thread_id)
+            if sample.emit:
+                logger.info(
+                    "%s menu %r already bridged and still open — not posting it again. "
+                    "If it needs answering, the answer is probably not reaching the "
+                    "pane; check `tmux attach -t %s` window %s (#633/#717)%s",
+                    log_ctx(thread_id=thread_id),
+                    question.header,
+                    session_name,
+                    window_name,
+                    sample.suffix,
+                )
+            else:
+                logger.debug(
+                    "%s menu %r already bridged and still open (rate-limited #678)",
+                    log_ctx(thread_id=thread_id),
+                    question.header,
+                )
             return
         attempt = await self._rebridges.record(thread_id, signature)
         logger.info(
