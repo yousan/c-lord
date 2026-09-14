@@ -51,6 +51,7 @@ from .embeds import (
     ask_unconfirmed_embed,
     ask_undelivered_embed,
 )
+from .pane_context import box_char_count, fold_pane_context, should_fold_pane_context
 
 if TYPE_CHECKING:
     from ..claude.tmux_runner import TmuxClaudeRunner
@@ -416,7 +417,28 @@ async def _bridge_claimed_menu(
             # match and post the pane's copy on top of the mirror's (#680).
             _bridged_context.note_delivered(thread.id, question.context)
         else:
-            chunks, truncated = _context_chunks(question.context)
+            # #686 (裁定 2026-09-14): while the menu is open the pane is the
+            # only source, and what it gives is the TUI *rendering* — a
+            # box-drawn table Discord cannot line up, ~3x longer than the
+            # markdown. The flush that would fix it (#698) does not arrive
+            # until the menu resolves, i.e. only once nobody needs to read it
+            # any more: production 2026-09-08 left 1,900 chars / 933 box
+            # characters sitting unanswered and unreadable for three days.
+            # So a wall is not posted. It is folded to one pointer, which the
+            # flush then replaces exactly as it would have replaced the wall.
+            folded = should_fold_pane_context(question.context)
+            if folded:
+                logger.info(
+                    "bridge_pane_ask: folding the pane rendering — it is a "
+                    "box-drawn wall, not readable prose (thread=%d context_chars=%d "
+                    "box_chars=%d) (#686)",
+                    thread.id,
+                    len(question.context),
+                    box_char_count(question.context),
+                )
+                chunks, truncated = [fold_pane_context(question.context)], False
+            else:
+                chunks, truncated = _context_chunks(question.context)
             posted: list[discord.Message] = []
             try:
                 for chunk in chunks:
@@ -437,8 +459,15 @@ async def _bridge_claimed_menu(
                 # flush can rewrite this TUI rendering into the CLI's markdown
                 # instead of dropping the only readable copy.
                 if not truncated:
+                    # #686: ``folded`` says these messages hold a pointer, not
+                    # the prose — so a replacement that cannot land must post
+                    # the markdown rather than drop it as a duplicate.
                     _bridged_context.register(
-                        thread.id, question.context, source="pane", messages=posted
+                        thread.id,
+                        question.context,
+                        source="pane",
+                        messages=posted,
+                        folded=folded,
                     )
 
     view = AskView(question, thread_id=thread.id, q_idx=0, ask_repo=ask_repo, authorizer=authorizer)

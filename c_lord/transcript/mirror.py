@@ -791,20 +791,35 @@ class TranscriptMirror:
                             replaced = False
                             if bridged.messages:
                                 replaced = await replace_pane_context(bridged.messages, body)
-                            # The pane bridge already delivered this text, so it
-                            # counts as delivered for cursor purposes (#215).
-                            _delivered_uuid = event.get("uuid") or _delivered_uuid
+                            if replaced or not bridged.folded:
+                                # The pane bridge already delivered this text, so
+                                # it counts as delivered for cursor purposes
+                                # (#215).
+                                _delivered_uuid = event.get("uuid") or _delivered_uuid
+                                logger.info(
+                                    "TranscriptMirror: suppressed pane-bridged ask context "
+                                    "thread=%d (markdown replacement: %s)",
+                                    self.thread_id,
+                                    "applied" if replaced else "not applied",
+                                )
+                                # Commit immediately: the text IS delivered, and
+                                # a turn-end marker may never arrive — without
+                                # this a hard-killed bot would re-post it on
+                                # restart (#215).
+                                await _commit_cursor()
+                                continue
+                            # #686: what is in the thread is a FOLD — a pointer
+                            # saying the readable version is coming — and the
+                            # markdown would not fit into it. Suppressing here
+                            # would leave a pointer to nothing, so fall through
+                            # and post it. Not a #680 duplicate: the pointer
+                            # never held the prose.
                             logger.info(
-                                "TranscriptMirror: suppressed pane-bridged ask context "
-                                "thread=%d (markdown replacement: %s)",
+                                "TranscriptMirror: pane-bridged ask context was folded and the "
+                                "markdown did not fit it — posting the markdown instead of "
+                                "suppressing it thread=%d (#686)",
                                 self.thread_id,
-                                "applied" if replaced else "not applied",
                             )
-                            # Commit immediately: the text IS delivered, and a
-                            # turn-end marker may never arrive — without this a
-                            # hard-killed bot would re-post it on restart (#215).
-                            await _commit_cursor()
-                            continue
                         # Another text while one is pending → previous was intermediate.
                         if _pending_text is not None:
                             await _flush_pending_silently()

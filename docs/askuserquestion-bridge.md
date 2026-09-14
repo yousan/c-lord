@@ -388,6 +388,36 @@ no replacement:
   has fully succeeded. If the flush never comes — the turn is killed, the bot
   restarts — the pane copy simply stays.
 
+**A wall is folded rather than posted (#686, 裁定 2026-09-14).** The replacement
+above lands when the menu *resolves* — which is precisely when nobody needs to
+read the prose any more. While the question is open the box-drawn rendering is
+the only copy there is, so the reader is asked to decide from the one version
+they cannot read. Production 2026-09-08: 1,900 characters, 933 box characters,
+unanswered and unreadable for three days.
+
+So over `FOLD_BOX_CHAR_THRESHOLD` (100) box-drawing characters — `┌─┬┐│└┴┘├┼┤`,
+counted because a sentence has none and a rendered table has one per cell edge
+per row — the bridge does not post the prose at all. It posts one **fold**
+(`pane_context.fold_pane_context`): the lines that are still readable (head, plus
+the last line — the 推し is conventionally last), how much was folded away, and
+「回答すると、全文が読める形でここに届きます」. Under the threshold nothing
+changes: a two-row table reads fine as text, and #399's behaviour is untouched.
+
+The fold is what the flush then replaces, exactly as it would have replaced the
+wall — so folding costs nothing once the answer is in. What it does change is the
+failure mode, and that is why the registry entry is tagged `folded`: **a fold is
+a pointer, not a delivery.** The wall at least contained the words, so dropping
+the flush on top of it was only a missed upgrade; dropping it on top of a fold
+would leave a pointer to nothing. When the markdown will not fit into the fold
+(the "never post a new message" rule declines the edit), the mirror therefore
+posts the markdown instead of suppressing it. Degraded mode stays "late, never
+lost".
+
+The other case the alternative had to answer: restoring the box-drawn table back
+into a markdown table (option (a) of the 2026-09-11 review) was rejected as too
+heavy for what it buys — the goal is only to stop pasting something unreadable
+while the question is open, not to recover the table's typography.
+
 ## Concurrency & stuck-menu safety (#485)
 
 A concurrent second session starting in the same tmux session used to desync the
@@ -816,6 +846,8 @@ from Claude Code v2.1.252.
 | Suppress flushed-twin context | `c_lord/transcript/mirror.py` (assistant_text branch) |
 | One delivery per turn across N questions (#680) | `bridged_context.py::note_delivered` / `already_delivered` |
 | Replace the pane rendering with the flushed markdown (#686) | `c_lord/discord_ui/pane_context.py::replace_pane_context` |
+| Fold an unreadable box-drawn wall while the menu is open (#686) | `pane_context.py::should_fold_pane_context` / `fold_pane_context` |
+| Post the markdown when a fold cannot be replaced (#686) | `BridgedEntry.folded` → `transcript/mirror.py` |
 | Buttons & legend | `c_lord/discord_ui/ask_view.py`, `embeds.py::ask_embed` |
 | Empty-label backstop / watchdog retry cap (#579) | `ask_view.py::_button_label`, `thread_state_sync.py::_ASK_BRIDGE_MAX_FAILURES` |
 | One post per menu, across restarts (#633) | `thread_state_sync.py::menu_fingerprint` / `MenuRebridgeLedger`, `c_lord/database/menu_bridge_repo.py::MenuBridgeRepository`, `menu_bridges` table |
