@@ -201,3 +201,134 @@ class TestReactionLamp:
             assert adds == [EMOJI_RUNNING, EMOJI_WAITING]
             assert sm._current_emoji == EMOJI_WAITING
             await sm.cleanup()
+
+
+class _HttpFakeMessage:
+    """A message that models Discord's HTTP semantics for reactions.
+
+    The reaction is applied on the server the moment the request goes out; the
+    coroutine then awaits the *response*. That gap is where #718 lives: a
+    ``task.cancel()`` landing there stops our bookkeeping but does **not**
+    un-send the request, so Discord ends up showing an emoji the manager does
+    not know about.
+    """
+
+    def __init__(self) -> None:
+        self.reactions: list[str] = []
+        self.guild = MagicMock()
+        self._gates: dict[str, asyncio.Event] = {}
+        self._sent: dict[str, asyncio.Event] = {}
+
+    def hold(self, emoji: str) -> asyncio.Event:
+        """Make ``add_reaction(emoji)`` hang while awaiting its response.
+
+        Returns an event that fires once the request has gone out (i.e. the
+        emoji is already on the message and the caller is awaiting the reply).
+        """
+        self._gates[emoji] = asyncio.Event()
+        self._sent[emoji] = asyncio.Event()
+        return self._sent[emoji]
+
+    def release(self, emoji: str) -> None:
+        self._gates[emoji].set()
+
+    async def add_reaction(self, emoji: str) -> None:
+        if emoji not in self.reactions:
+            self.reactions.append(emoji)  # the server applied it
+        sent = self._sent.get(emoji)
+        if sent is not None:
+            sent.set()
+        gate = self._gates.get(emoji)
+        if gate is not None:
+            await gate.wait()  # still awaiting the response
+        else:
+            await asyncio.sleep(0)
+
+    async def remove_reaction(self, emoji: str, member: object) -> None:
+        if emoji in self.reactions:
+            self.reactions.remove(emoji)
+        await asyncio.sleep(0)
+
+
+class TestStallOverrideIsTemporary:
+    """#718: ⏳/⚠️ are *temporary* overrides — a finished turn ends on 🟡 alone.
+
+    The stall monitor runs in its own task, so its paint can overlap the end of
+    the turn. Before the fix that overlap left either two lamps (⚠️ *and* 🟡) or
+    the override alone, and the user could not tell whose turn it was.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_turn_ending_mid_stall_paint_leaves_only_the_waiting_lamp(self) -> None:
+        """AC1/AC4②: ⚠️ already sent to Discord, then the turn ends → 🟡 alone."""
+        msg = _HttpFakeMessage()
+        in_flight = msg.hold(EMOJI_STALL_HARD)
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.wait_for(in_flight.wait(), timeout=10)
+        assert msg.reactions == [EMOJI_STALL_HARD]  # ⚠️ is on the message already
+
+        finish = asyncio.create_task(sm.set_waiting())  # the turn ends right now
+        await asyncio.sleep(0)
+        msg.release(EMOJI_STALL_HARD)
+        await asyncio.wait_for(finish, timeout=10)
+        await asyncio.sleep(0.05)
+
+        assert msg.reactions == [EMOJI_WAITING]
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_an_error_ending_mid_stall_paint_leaves_only_the_error_lamp(self) -> None:
+        """AC1: the same guarantee for the ❌ ending."""
+        msg = _HttpFakeMessage()
+        in_flight = msg.hold(EMOJI_STALL_HARD)
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.wait_for(in_flight.wait(), timeout=10)
+
+        finish = asyncio.create_task(sm.set_error())
+        await asyncio.sleep(0)
+        msg.release(EMOJI_STALL_HARD)
+        await asyncio.wait_for(finish, timeout=10)
+        await asyncio.sleep(0.05)
+
+        assert msg.reactions == [EMOJI_ERROR]
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_the_monitor_is_finished_when_the_final_lamp_is_painted(self) -> None:
+        """AC2/AC4①: `set_waiting()` must not merely *request* the cancel.
+
+        A cancel that is only requested leaves the monitor free to run up to its
+        next await — including the rest of an ``add_reaction(⚠️)`` — after the
+        turn's final lamp has been decided.
+        """
+        msg = _make_message()
+        sm = StatusManager(msg)
+        await sm.set_running()
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_STALL_HARD
+        monitor = sm._stall_task
+
+        await sm.set_waiting()
+
+        assert monitor is not None and monitor.done()
+        await asyncio.sleep(0.05)
+        assert sm._current_emoji == EMOJI_WAITING
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_a_late_stall_paint_is_dropped(self) -> None:
+        """AC2: a stall paint that lands after the turn ended is a no-op."""
+        msg = _HttpFakeMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        await sm.set_waiting()
+
+        await sm._paint_stall(EMOJI_STALL_HARD)
+
+        assert msg.reactions == [EMOJI_WAITING]
+        await sm.cleanup()

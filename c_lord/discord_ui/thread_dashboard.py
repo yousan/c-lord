@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -56,9 +58,38 @@ _STATE_LABEL: dict[str, str] = {
     "waiting": "Waiting for input",
 }
 
+#: Embed title that marks a message as a Session Status board. The board is
+#: identified by this title + our own authorship — nothing else is ever
+#: adopted or deleted (#720).
+DASHBOARD_TITLE = "📊 Session Status"
+
+#: How far back in channel history a starting bot looks for the board it should
+#: take over. Deep enough to find it in a busy channel, shallow enough to cost
+#: a handful of API calls at startup.
+_BOARD_SCAN_LIMIT = 500
+
+#: Upper bound on how many dead boards one start deletes. A channel that
+#: accumulated boards for months is cleaned over a few starts rather than in
+#: one multi-thousand-request burst.
+_SWEEP_MAX_DELETES = 400
+
+#: Stop sweeping after this many delete failures — they mean "not allowed",
+#: not "try harder".
+_SWEEP_MAX_FAILURES = 5
+
+#: Opt out of deleting the dead boards (the board is still reused, never
+#: duplicated). Set ``CLORD_DASHBOARD_SWEEP=0`` to keep the history as-is.
+_SWEEP_ENV_FLAG = "CLORD_DASHBOARD_SWEEP"
+_OFF_VALUES = {"0", "false", "no", "off"}
+
 # Threads older than this are pruned from the dashboard automatically.
 # Keeps the embed from accumulating stale entries after a long idle period.
 _STALE_HOURS = 4
+
+
+def _sweep_enabled() -> bool:
+    """Whether startup deletes the dead boards of earlier processes (#720)."""
+    return os.getenv(_SWEEP_ENV_FLAG, "").strip().lower() not in _OFF_VALUES
 
 
 class ThreadState(str, Enum):  # noqa: UP042 — requires-python = ">=3.10", StrEnum is 3.11+
@@ -110,6 +141,20 @@ def _completion_text(
     return f"🟡 Claude has finished — your reply is needed here. <@{mention_id}>"
 
 
+async def _as_async_iter(source: object) -> AsyncIterator[discord.Message]:
+    """Iterate a discord.py listing that may be an iterator *or* a coroutine.
+
+    ``TextChannel.pins()`` returns a list to await on discord.py < 2.6 and an
+    async iterator from 2.6 on; c-lord supports both (``discord.py>=2.4``).
+    """
+    if hasattr(source, "__aiter__"):
+        async for item in source:  # type: ignore[attr-defined]
+            yield item
+        return
+    for item in await source:  # type: ignore[misc]
+        yield item
+
+
 @dataclass
 class _ThreadInfo:
     thread_id: int
@@ -129,6 +174,21 @@ class ThreadStatusDashboard:
     3. Call ``await dashboard.remove(thread_id)`` when a thread is no longer
        relevant (optional — stale entries are auto-pruned after ``_STALE_HOURS``).
 
+    One board per channel (#720)
+    ----------------------------
+    ``initialize()`` runs on every bot start, so it must not *post* on every
+    bot start: it used to, and the production channel ended up holding 369
+    boards — 77% of everything ever posted there — of which exactly one was
+    alive. Worse, 📌 pointed at four boards from 2026-02-24, because the board
+    is pinned when it is posted and the pin of the *live* board kept failing
+    silently (Discord caps a channel at 50 pins).
+
+    So a starting bot **takes over the board that is already there**: it looks
+    through recent history and the pin list for a message it wrote itself
+    carrying a ``DASHBOARD_TITLE`` embed, edits the newest one in place, makes
+    sure that one is pinned, and deletes the dead ones in the background.
+    Nothing else in the channel is ever touched.
+
     Thread safety
     -------------
     All public methods are coroutines protected by an ``asyncio.Lock``.
@@ -138,8 +198,11 @@ class ThreadStatusDashboard:
         self,
         channel: discord.TextChannel,
         owner_id: int | None = None,
+        bot_user_id: int | None = None,
     ) -> None:
         self._channel = channel
+        self._bot_user_id = bot_user_id
+        self._sweep_task: asyncio.Task[None] | None = None
         self._owner_id = owner_id
         self._threads: dict[int, _ThreadInfo] = {}
         self._dashboard_message: discord.Message | None = None
@@ -149,18 +212,186 @@ class ThreadStatusDashboard:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def channel_id(self) -> int:
+        """Id of the channel this dashboard posts in."""
+        return self._channel.id
+
     async def initialize(self) -> None:
-        """Post the initial (empty) dashboard embed and pin it."""
+        """Take over the channel's board — or post one if there is none (#720).
+
+        Never posts a second board: an already-initialised dashboard just
+        refreshes, and a fresh process adopts the board its predecessor left
+        behind. The dead boards of earlier processes are deleted in the
+        background (opt out with ``CLORD_DASHBOARD_SWEEP=0``).
+        """
+        stale: list[discord.Message] = []
         async with self._lock:
+            if self._dashboard_message is not None:
+                # Already live in this process — refresh it, do not add one.
+                await self._refresh_dashboard()
+                await self._ensure_pinned()
+                return
+
             embed = self._build_embed()
-            self._dashboard_message = await self._channel.send(embed=embed)
-            try:
-                await self._dashboard_message.pin()
-            except discord.HTTPException:
-                logger.debug(
-                    "Could not pin dashboard message "
-                    "(missing Manage Messages permission or pin limit reached)"
+            for candidate in await self._find_own_boards():
+                if self._dashboard_message is None and await self._adopt(candidate, embed):
+                    continue
+                stale.append(candidate)
+
+            if self._dashboard_message is None:
+                self._dashboard_message = await self._channel.send(embed=embed)
+                logger.info(
+                    "Posted a new Session Status board (%s) in channel %s",
+                    getattr(self._dashboard_message, "id", "?"),
+                    getattr(self._channel, "id", "?"),
                 )
+
+            await self._ensure_pinned()
+
+        if stale:
+            # Fire-and-forget: deleting hundreds of dead boards is rate-limited
+            # and must never hold up on_ready. Keep the reference so the task
+            # is not garbage collected mid-flight.
+            self._sweep_task = asyncio.create_task(self._sweep_dead_boards(stale))
+
+    async def _adopt(self, candidate: discord.Message, embed: discord.Embed) -> bool:
+        """Try to take over *candidate* as the live board. True when adopted."""
+        try:
+            await candidate.edit(embed=embed)
+        except discord.HTTPException:
+            logger.warning(
+                "Could not take over Session Status board %s; treating it as dead",
+                getattr(candidate, "id", "?"),
+                exc_info=True,
+            )
+            return False
+        self._dashboard_message = candidate
+        logger.info(
+            "Took over the Session Status board (%s) left by a previous start",
+            getattr(candidate, "id", "?"),
+        )
+        return True
+
+    async def _ensure_pinned(self) -> None:
+        """Pin the live board, and say so out loud when that fails (#678).
+
+        A silent DEBUG line here is why the channel's 📌 pointed at a
+        2026-02-24 board for half a year.
+        """
+        message = self._dashboard_message
+        if message is None or getattr(message, "pinned", False):
+            return
+        try:
+            await message.pin()
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Session Status board %s is NOT pinned (%s) — 📌 will not show the "
+                "live board. Give the bot Manage Messages, or free a pin slot "
+                "(Discord caps a channel at 50 pins).",
+                getattr(message, "id", "?"),
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Finding / sweeping the boards of earlier processes (#720)
+    # ------------------------------------------------------------------
+
+    def _own_user_id(self) -> int | None:
+        """Our own Discord user id, or None when it cannot be established."""
+        if isinstance(self._bot_user_id, int):
+            return self._bot_user_id
+        me = getattr(getattr(self._channel, "guild", None), "me", None)
+        user_id = getattr(me, "id", None)
+        return user_id if isinstance(user_id, int) else None
+
+    def _is_own_board(self, message: discord.Message, bot_user_id: int) -> bool:
+        if getattr(getattr(message, "author", None), "id", None) != bot_user_id:
+            return False
+        return any(getattr(e, "title", None) == DASHBOARD_TITLE for e in (message.embeds or []))
+
+    async def _find_own_boards(self) -> list[discord.Message]:
+        """Our boards already in the channel, newest first.
+
+        Reads both recent history and the pin list: the boards behind 📌 can be
+        far older than any sane history scan (2026-02-24 in the #720 channel),
+        and those are exactly the ones holding the pin slot hostage.
+        """
+        bot_user_id = self._own_user_id()
+        if bot_user_id is None:
+            logger.warning(
+                "Cannot determine the bot's own user id — skipping the Session Status "
+                "board scan and posting a fresh board (channel %s)",
+                getattr(self._channel, "id", "?"),
+            )
+            return []
+
+        found: dict[int, discord.Message] = {}
+        for source, description in (
+            (lambda: self._channel.history(limit=_BOARD_SCAN_LIMIT), "history"),
+            (lambda: self._channel.pins(), "pins"),
+        ):
+            try:
+                async for message in _as_async_iter(source()):
+                    if self._is_own_board(message, bot_user_id):
+                        found.setdefault(message.id, message)
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not read channel %s %s while looking for the Session Status board",
+                    getattr(self._channel, "id", "?"),
+                    description,
+                    exc_info=True,
+                )
+
+        # Snowflake ids are monotonic in time: newest board first.
+        return sorted(found.values(), key=lambda m: m.id, reverse=True)
+
+    async def _sweep_dead_boards(self, boards: list[discord.Message]) -> None:
+        """Delete the boards earlier processes left behind (#720 AC5).
+
+        Only messages this bot wrote itself, only ones carrying the board
+        embed, and never the live one. Bounded per start; whatever is left over
+        is picked up by the next one.
+        """
+        if not _sweep_enabled():
+            logger.info(
+                "Session Status sweep disabled (%s=0) — %d dead board(s) left in place",
+                _SWEEP_ENV_FLAG,
+                len(boards),
+            )
+            return
+
+        deleted = failed = 0
+        for message in boards[:_SWEEP_MAX_DELETES]:
+            try:
+                await message.delete()
+                deleted += 1
+            except discord.NotFound:
+                deleted += 1  # someone beat us to it — same outcome
+            except discord.HTTPException:
+                failed += 1
+                if failed >= _SWEEP_MAX_FAILURES:
+                    logger.warning(
+                        "Stopping the Session Status sweep after %d failed deletes "
+                        "(missing permissions?) — %d dead board(s) remain",
+                        failed,
+                        len(boards) - deleted,
+                        exc_info=True,
+                    )
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Session Status sweep aborted unexpectedly", exc_info=True)
+                break
+
+        remaining = len(boards) - deleted
+        logger.info(
+            "Session Status sweep: deleted %d dead board(s), %d failed, %d left for the next start",
+            deleted,
+            failed,
+            max(remaining, 0),
+        )
 
     async def set_state(
         self,
@@ -296,7 +527,7 @@ class ThreadStatusDashboard:
         """Construct the Discord embed reflecting current thread states."""
         if not self._threads:
             return discord.Embed(
-                title="📊 Session Status",
+                title=DASHBOARD_TITLE,
                 description="No active sessions.",
                 color=_COLOR_IDLE,
             )
@@ -304,7 +535,7 @@ class ThreadStatusDashboard:
         any_waiting = any(t.state == ThreadState.WAITING_INPUT for t in self._threads.values())
         color = _COLOR_WAITING if any_waiting else _COLOR_PROCESSING
 
-        embed = discord.Embed(title="📊 Session Status", color=color)
+        embed = discord.Embed(title=DASHBOARD_TITLE, color=color)
 
         now = time.monotonic()
         for info in sorted(self._threads.values(), key=lambda t: t.started_at):

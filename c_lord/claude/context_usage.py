@@ -225,6 +225,7 @@ def format_context_line(
     model: str | None = None,
     effort: str | None = None,
     cli_version: str | None = None,
+    clord_version: str | None = None,
     cost_usd: float | None = None,
 ) -> str:
     """Build the Discord message announcing context usage.
@@ -232,7 +233,9 @@ def format_context_line(
     Below the auto-compact threshold this is a subtle ``-#`` line; at or above
     it the message is promoted to a visible warning so the user can ``/clear``
     or ``/compact`` before auto-compact kicks in.  Optional keyword arguments
-    append model, effort, CLI version, and cost separated by ``·``.
+    append model, effort, CLI version, c-lord version, and cost separated by
+    ``·``.  ``clord_version`` sits next to ``cli_version`` so the pair
+    "which Claude Code / which c-lord" reads in one glance (#722).
     """
     pct = min(100.0, used / total * 100) if total else 0.0
     used_str, total_str = _fmt_tokens(used), _fmt_tokens(total)
@@ -244,6 +247,8 @@ def format_context_line(
         extras.append(effort)
     if cli_version:
         extras.append(f"CLI {cli_version}")
+    if clord_version:
+        extras.append(f"c-lord {clord_version}")
     if cost_usd is not None:
         extras.append(f"${cost_usd:.4f}")
     suffix = (" · " + " · ".join(extras)) if extras else ""
