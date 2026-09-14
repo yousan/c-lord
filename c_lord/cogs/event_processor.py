@@ -37,6 +37,7 @@ from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
 from ..discord_ui.progress_folder import ProgressFolder
 from ..discord_ui.tool_timer import LiveToolTimer
+from ..usage_limit import usage_limit_notices
 from ..utils.logger import log_ctx
 from .run_config import RunConfig
 
@@ -353,6 +354,12 @@ class EventProcessor:
             if event.usage_limit is not None:
                 self._config.outcome.no_response = True
                 self._config.outcome.usage_limit = event.usage_limit
+                # #631 AC8: tell the transcript mirror this thread has just been
+                # given the limit in Japanese, so it does not follow up with the
+                # same fact folded from Claude's English banner.  Recorded here
+                # rather than at detection because what the mirror must not
+                # duplicate is a message that actually went out.
+                usage_limit_notices.note(self._config.thread.id)
             # #681: the mention rides in the *content* — an embed alone never
             # pushes, which is exactly how a dead turn goes unnoticed.
             err_msg = await self._config.thread.send(

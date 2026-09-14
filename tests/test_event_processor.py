@@ -786,3 +786,53 @@ class TestUsageLimitOutcome:
         # The turn produced nothing, and the caller must know *why*.
         assert config.outcome.no_response is True
         assert config.outcome.usage_limit == limit
+
+    @pytest.mark.asyncio
+    async def test_limit_embed_tells_the_mirror_not_to_repeat_it(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """#631 AC8: the same fact must not arrive again in English a second later.
+
+        The mirror meets Claude's own banner in the transcript and folds it into
+        a line of its own; this registration is how it learns that this thread
+        has already been told, in the richer wording, by c-lord.
+        """
+        from c_lord.claude.tmux_runner import USAGE_LIMIT_ERROR_PREFIX
+        from c_lord.claude.types import UsageLimit
+        from c_lord.usage_limit import usage_limit_notices
+
+        usage_limit_notices.clear_all()
+        config = _make_config(thread, runner)
+        assert usage_limit_notices.announced(thread.id) is False
+
+        await EventProcessor(config).process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                error=f"{USAGE_LIMIT_ERROR_PREFIX} Claude hit your weekly limit.",
+                usage_limit=UsageLimit("weekly limit", "Aug 29, 4pm (Asia/Tokyo)", ""),
+            )
+        )
+
+        assert usage_limit_notices.announced(thread.id) is True
+        usage_limit_notices.clear_all()
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_leaves_the_mirror_free_to_speak(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """Only a limit notice silences the mirror — not every error embed."""
+        from c_lord.usage_limit import usage_limit_notices
+
+        usage_limit_notices.clear_all()
+        config = _make_config(thread, runner)
+
+        await EventProcessor(config).process(
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
+                error="Claude exited without producing a response",
+            )
+        )
+
+        assert usage_limit_notices.announced(thread.id) is False
