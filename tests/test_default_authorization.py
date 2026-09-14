@@ -237,7 +237,24 @@ class TestOwnerResolution:
         with caplog.at_level(logging.WARNING, logger="c_lord.discord_ui.authorization"):
             await resolve_fallback_owner_ids(bot, Authorizer())
         assert Authorizer().is_allowed(_make_member(user_id=OUTSIDER)) is False
+        assert Authorizer().is_allowed(_make_member(user_id=OWNER)) is False
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    async def test_api_failure_is_retried_on_reconnect(self) -> None:
+        """Fail-closed must not mean permanently locked out by one network blip.
+
+        ``on_ready`` fires again on reconnect; the failed attempt releases the
+        once-only flag so the next one can succeed.
+        """
+        bot = _make_bot(owner_id=OWNER)
+        bot.application_info = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+        await resolve_fallback_owner_ids(bot, Authorizer())
+        assert get_fallback_owner_ids() == set()  # nobody, for now
+
+        bot.application_info = _make_bot(owner_id=OWNER).application_info  # network back
+        await resolve_fallback_owner_ids(bot, Authorizer())
+        assert get_fallback_owner_ids() == {OWNER}
+        assert Authorizer().is_allowed(_make_member(user_id=OWNER)) is True
 
     async def test_uses_cached_application_when_available(self) -> None:
         """``bot.application`` is discord.py's cache — don't re-hit the API."""

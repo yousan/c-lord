@@ -202,11 +202,16 @@ async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
             owner_label = str(app.owner)
     except Exception:
         # Fail closed: an owner we could not read is not an owner we can trust.
+        # But a network blip must not be a permanent lockout, so the once-only
+        # flag is released and the next ``on_ready`` (reconnect) tries again.
+        # The empty set denies everyone until one of those attempts succeeds.
         set_fallback_owner_ids(set())
+        _announced = False
         logger.warning(
             "Authorization: could not ask Discord who owns this application, so "
-            "nobody is allowed to drive the bot. Set DISCORD_OWNER_ID to your "
-            "Discord user ID (or %s=1 to allow everyone) and restart.",
+            "nobody is allowed to drive the bot for now (retried on reconnect). "
+            "If it keeps failing, set DISCORD_OWNER_ID to your Discord user ID "
+            "(or %s=1 to allow everyone) and restart.",
             ALLOW_ANYONE_ENV,
             exc_info=True,
         )
