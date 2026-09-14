@@ -72,6 +72,24 @@ _fallback_owner_ids: set[int] | None = None
 # about this process, so it is said once rather than on every network blip.
 _announced = False
 
+# The process's real :class:`Authorizer` — the one holding whatever allowlist
+# was configured. A View that was constructed without one consults this rather
+# than inventing a blank ``Authorizer()`` (#739: a blank one has no allowlist
+# AND no resolved owner, so it rejected everybody — including the owner who was
+# on the configured allowlist).
+_default_authorizer: Authorizer | None = None
+
+
+def set_default_authorizer(authorizer: Authorizer | None) -> None:
+    """Publish the process's Authorizer for Views that were not handed one."""
+    global _default_authorizer
+    _default_authorizer = authorizer
+
+
+def get_default_authorizer() -> Authorizer | None:
+    """The process's Authorizer, or ``None`` before a cog has published one."""
+    return _default_authorizer
+
 
 def allow_anyone_enabled(explicit: bool | None = None) -> bool:
     """Whether the explicit fail-open switch is on (``CLORD_ALLOW_ANYONE``)."""
@@ -228,29 +246,80 @@ async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
     )
 
 
+def _denial_reason(authorizer: Authorizer, unwired: bool) -> str:
+    """Why this click was refused — the two cases look identical otherwise (#739).
+
+    A single "Rejected unauthorized button interaction" line cannot tell
+    "this user is not on the configured allowlist" apart from "there is no
+    usable allowlist, so nobody passes", and the second one is a c-lord bug
+    rather than a user error. Naming which is which is what made #739 take
+    longer to diagnose than it should have.
+    """
+    where = "view was not wired, used the process authorizer" if unwired else "view's authorizer"
+    if authorizer.has_explicit_allowlist:
+        ids = sorted(authorizer.allowed_user_ids) if authorizer.allowed_user_ids else None
+        return (
+            f"not on the configured allowlist "
+            f"(user_ids={ids} role={authorizer.allowed_role_name}; {where})"
+        )
+    owners = get_fallback_owner_ids()
+    if owners is None:
+        return f"no allowlist configured and the app owner is not resolved yet ({where})"
+    if not owners:
+        return f"no allowlist configured and the app owner could not be read ({where})"
+    return f"no allowlist configured, so only the app owner {sorted(owners)} may click ({where})"
+
+
 class AuthorizedViewMixin:
     """Mixin adding allowlist enforcement to a ``discord.ui.View``.
 
     Reads ``self._authorizer`` (an :class:`Authorizer` or ``None``).  ``None``
-    means the construction site has not been wired up, and is treated as *no
-    allowlist configured* — i.e. the same rule as everywhere else, which since
-    #713 is "the app owner only", not "everyone may click" (AC5).  A View that
-    should follow a configured allowlist must still be handed the authorizer;
-    ``tests/test_button_authorization.py`` holds every View to that.
+    means the construction site has not been wired up; the check then falls back
+    to the process's own authorizer (:func:`get_default_authorizer`) so the
+    *configured* allowlist still decides.
+
+    It used to build a blank ``Authorizer()`` there instead, which was wrong in
+    the one case that mattered most (#739): a blank authorizer has no allowlist,
+    so it took the "nothing configured" branch and consulted the app-owner
+    fallback — which :func:`resolve_fallback_owner_ids` deliberately leaves
+    unresolved whenever an allowlist *is* configured. The result was a View that
+    rejected **everyone**, the owner on the allowlist included. Deny-by-default
+    is right; deny-by-default computed from the wrong allowlist is not.
+
+    A View should still be handed its authorizer explicitly — this fallback is
+    the floor, not the design. ``tests/test_button_authorization.py`` holds
+    every View to being wired.
     """
 
     # Class-level default so a View that forgets to set it still behaves
-    # (owner-only) rather than raising AttributeError.
+    # rather than raising AttributeError.
     _authorizer: Authorizer | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        authorizer = getattr(self, "_authorizer", None) or Authorizer()
+        wired = getattr(self, "_authorizer", None)
+        authorizer = wired or get_default_authorizer()
+        if authorizer is None:
+            # No cog has published one: c-lord is not running this View, or it
+            # was built before setup. Nothing can be checked against, so deny —
+            # and say which of the two "denied" cases this is (#739 AC5).
+            logger.warning(
+                "Rejected button interaction from user %s on %s: no authorizer "
+                "on the view and none published for this process — c-lord could "
+                "not tell whether this user is allowed",
+                getattr(interaction.user, "id", "?"),
+                type(self).__name__,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(UNAUTHORIZED_MESSAGE, ephemeral=True)
+            return False
+
         if authorizer.is_allowed(interaction.user):
             return True
         logger.info(
-            "Rejected unauthorized button interaction from user %s on %s",
+            "Rejected unauthorized button interaction from user %s on %s: %s",
             getattr(interaction.user, "id", "?"),
             type(self).__name__,
+            _denial_reason(authorizer, wired is None),
         )
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.send_message(UNAUTHORIZED_MESSAGE, ephemeral=True)

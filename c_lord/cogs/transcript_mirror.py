@@ -318,6 +318,9 @@ class TranscriptMirrorCog(commands.Cog):
                 question,
                 runner,
                 ask_repo=getattr(bot, "ask_repo", None),
+                # #739: without this the AskView is built with no authorizer,
+                # and a View with no authorizer could not tell who was allowed.
+                authorizer=getattr(bot, "authorizer", None),
                 notify_user_id=owner_notify_id(bot, kind="blocked"),
             )
 

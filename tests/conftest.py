@@ -145,16 +145,18 @@ def _isolated_tmux_socket():
 
 @pytest.fixture(autouse=True)
 def _reset_fallback_owner_ids():
-    """Keep the #713 owner fallback from leaking between tests.
+    """Keep the process-global authorization state from leaking between tests.
 
-    The resolved application owner is process-global on purpose (one bot per
-    process, one owner), so a test that resolves it would otherwise decide who
-    is authorized in every test that runs after it.
+    The resolved application owner (#713) and the published authorizer (#739)
+    are process-global on purpose — one bot per process — so a test that sets
+    either would otherwise decide who is authorized in every test after it.
     """
     from c_lord.discord_ui import authorization
 
     authorization.set_fallback_owner_ids(None)
+    authorization.set_default_authorizer(None)
     try:
         yield
     finally:
         authorization.set_fallback_owner_ids(None)
+        authorization.set_default_authorizer(None)
