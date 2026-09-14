@@ -105,7 +105,7 @@ class RunConfig:
     image_paths: list[str] | None = None
     # Absolute path of the session's working directory. Persisted to the
     # sessions DB so TranscriptMirrorCog can restart mirrors after a bot
-    # restart (CLORD_BRIDGE_MODE=jsonl). None when no session_dir_manager.
+    # restart. None when no session_dir_manager.
     working_dir: str | None = None
     # #466: allowlist predicate forwarded to interactive Views so button
     # clicks (permission / plan / elicitation / ask) are gated to the same

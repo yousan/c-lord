@@ -10,7 +10,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -19,6 +19,9 @@ from .claude.config import ClaudeConfig
 from .session_cleanup import DirOutcome, remove_clean_session_dir, sweep_days
 from .setup import setup_bridge
 from .utils.logger import setup_logging
+
+if TYPE_CHECKING:
+    from .ext.api_server import ApiServer
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +214,92 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     }
 
 
+async def build_api_server(
+    bot: ClaudeDiscordBot,
+    *,
+    default_channel_id: int,
+    data_dir: Path,
+    port_override: int | None = None,
+) -> ApiServer | None:
+    """Build the REST API control plane.
+
+    Unconditional by design (#712/#543). The API server started life as the
+    endpoint the ``discord-reply`` skill posted to, so it used to be gated on
+    that skill being active — which meant the default (jsonl) configuration had
+    no ``/api/spawn``, no ``/api/tasks`` and no ``/api/notify`` at all, silently
+    contradicting Key Design Decisions #7 and #8. Delivery and control plane are
+    separate concerns; the control plane is always on.
+
+    Args:
+        bot: The Discord bot the endpoints act through.
+        default_channel_id: Channel used when a request names none.
+        data_dir: Directory holding ``notifications.db``.
+        port_override: Bind port, bypassing ``CLORD_API_PORT`` (tests).
+
+    Returns:
+        The server, or ``None`` when aiohttp is not installed (logged).
+    """
+    try:
+        from .database.notification_repo import NotificationRepository
+        from .ext.api_server import ApiServer
+    except ImportError:
+        logger.warning(
+            "aiohttp is not installed; the REST API will NOT start — /api/spawn, "
+            "/api/tasks and /api/notify are unavailable this run. "
+            "Install with `uv add aiohttp`."
+        )
+        return None
+
+    notif_repo = NotificationRepository(str(data_dir / "notifications.db"))
+    await notif_repo.init_db()
+
+    if port_override is not None:
+        api_port = port_override
+    else:
+        api_port_env = os.getenv("CLORD_API_PORT", "")
+        api_port = int(api_port_env) if api_port_env.isdigit() else 8080
+
+    return ApiServer(
+        repo=notif_repo,
+        bot=bot,
+        default_channel_id=default_channel_id,
+        host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
+        port=api_port,
+        api_secret=os.getenv("CLORD_API_SECRET") or None,
+        # #372: OGP/URL link previews are OFF by default; opt back in.
+        show_url_embeds=os.getenv("CLORD_SHOW_URL_EMBEDS", "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+    )
+
+
+async def start_api_server(api_server: ApiServer | None) -> bool:
+    """Bind the REST API, reporting rather than raising when it cannot.
+
+    Now that every bot binds a port by default (#712), two clones on one host
+    that both leave ``CLORD_API_PORT`` unset is an ordinary mistake — and the
+    bot's real job (answering Discord) does not depend on the API. So a bind
+    failure costs the API, not the process, and says why (#543 AC4).
+
+    Returns:
+        True if the API is listening.
+    """
+    if api_server is None:
+        return False
+    try:
+        await api_server.start()
+    except OSError as exc:
+        logger.warning(
+            "REST API could not bind %s:%d (%s) — /api/* is unavailable this run. "
+            "Another process is probably using the port; set CLORD_API_PORT to a free one.",
+            api_server.host,
+            api_server.port,
+            exc,
+        )
+        return False
+    logger.info("REST API enabled (host=%s port=%d)", api_server.host, api_server.port)
+    return True
+
+
 async def main(env_path: Path | None = None) -> None:
     """Start the bot."""
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -259,38 +348,11 @@ async def main(env_path: Path | None = None) -> None:
         ),
     )
 
-    # Issue #53: REST API is the only path Claude has for reaching Discord
-    # (the legacy capture-pane scrape→post pipeline was removed). Always start
-    # the API server unless skills are explicitly disabled via USE_SKILL_REPLY=0.
-    from .skills.injector import skills_enabled
-
-    api_server = None
-    api_port_env = os.getenv("CLORD_API_PORT", "")
-    if skills_enabled():
-        try:
-            from .database.notification_repo import NotificationRepository
-            from .ext.api_server import ApiServer
-        except ImportError:
-            logger.warning(
-                "aiohttp is not installed; API server will NOT start and "
-                "Claude has no path to Discord. Install with `uv add aiohttp`."
-            )
-        else:
-            notif_db = str(data_dir / "notifications.db")
-            notif_repo = NotificationRepository(notif_db)
-            await notif_repo.init_db()
-            api_port = int(api_port_env) if api_port_env.isdigit() else 8080
-            api_server = ApiServer(
-                repo=notif_repo,
-                bot=bot,
-                default_channel_id=int(config["channel_id"]),
-                host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
-                port=api_port,
-                api_secret=os.getenv("CLORD_API_SECRET") or None,
-                # #372: OGP/URL link previews are OFF by default; opt back in.
-                show_url_embeds=os.getenv("CLORD_SHOW_URL_EMBEDS", "false").strip().lower()
-                in ("1", "true", "yes", "on"),
-            )
+    api_server = await build_api_server(
+        bot,
+        default_channel_id=int(config["channel_id"]),
+        data_dir=data_dir,
+    )
 
     async with bot:
         components = await setup_bridge(
@@ -306,13 +368,7 @@ async def main(env_path: Path | None = None) -> None:
             max_concurrent=int(config["max_concurrent"]),
         )
 
-        if api_server is not None:
-            await api_server.start()
-            logger.info(
-                "REST API enabled (host=%s port=%d) — discord-reply skill ready",
-                api_server.host,
-                api_server.port,
-            )
+        await start_api_server(api_server)
 
         # Cleanup old sessions on startup.
         # #554: this used to be silent — a count in the log, nothing in Discord —

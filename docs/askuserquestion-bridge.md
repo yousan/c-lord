@@ -1,7 +1,7 @@
 # AskUserQuestion → Discord Bridge
 
 How c-lord turns Claude Code's **AskUserQuestion** TUI menu into clickable
-Discord buttons in `CLORD_BRIDGE_MODE=jsonl` / tmux mode (production's mode).
+Discord buttons in tmux mode (production's mode).
 
 Related issues: #166 (bridge), #169 (descriptions), #171 (keystroke timing),
 #172 (free-text — open). See also [`tui-prompts.md`](./tui-prompts.md) §2-3.

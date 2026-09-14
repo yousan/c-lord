@@ -1014,6 +1014,76 @@ class TestSpawnSession:
         assert user_msg_arg is seed_msg
 
 
+class TestDefaultThreadName:
+    """#721: the name a new thread is opened with must be readable.
+
+    Both creation paths used to write ``prompt[:100]`` straight into the thread
+    name, so a dispatch prompt (instruction line + URL line + ``**title**``)
+    became one unreadable run that also stops mid-word — and that raw cut stays
+    in the channel forever on the "started a thread" line.
+    """
+
+    DISPATCH = (
+        "#999 を担当してください。\n"
+        "https://github.com/yousan/c-lord/issues/999\n"
+        "**bug(P1): とても長いタイトルがここに延々と続きます**"
+    )
+
+    @pytest.mark.asyncio
+    async def test_message_triggered_thread_gets_a_readable_name(self) -> None:
+        cog = _make_cog()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 42
+        message = MagicMock(spec=discord.Message)
+        message.id = 7
+        message.content = self.DISPATCH
+        message.create_thread = AsyncMock(return_value=thread)
+        cog._build_prompt_and_images = AsyncMock(return_value=("p", []))
+        cog._run_claude = AsyncMock()
+
+        await cog._handle_new_conversation(message)
+
+        name = message.create_thread.await_args.kwargs["name"]
+        assert name == "#999 を担当してください。"
+
+    @pytest.mark.asyncio
+    async def test_spawned_thread_gets_a_readable_name(self) -> None:
+        from unittest.mock import patch
+
+        cog = _make_cog()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 43
+        thread.send = AsyncMock()
+        channel = MagicMock()
+        channel.create_thread = AsyncMock(return_value=thread)
+
+        with patch.object(cog, "_run_claude", new=AsyncMock()):
+            await cog.spawn_session(channel, self.DISPATCH)
+
+        name = channel.create_thread.await_args.kwargs["name"]
+        assert name == "#999 を担当してください。"
+
+    @pytest.mark.asyncio
+    async def test_explicit_thread_name_is_still_honoured(self) -> None:
+        """An explicit name is the caller's words — only newlines are dropped."""
+        from unittest.mock import patch
+
+        cog = _make_cog()
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 44
+        thread.send = AsyncMock()
+        channel = MagicMock()
+        channel.create_thread = AsyncMock(return_value=thread)
+
+        with patch.object(cog, "_run_claude", new=AsyncMock()):
+            await cog.spawn_session(channel, self.DISPATCH, thread_name="手で付けた名前")
+
+        assert channel.create_thread.await_args.kwargs["name"] == "手で付けた名前"
+
+
 class TestOnReady:
     """Tests for ClaudeChatCog.on_ready — startup session resume logic."""
 
@@ -2092,8 +2162,8 @@ class TestCompactCommand:
     """Tests for /compact command — fires the TUI /compact via send_literal (#278).
 
     The whole point of #278 is that a normal message would go through
-    ``send_input`` which (under ``CLORD_BRIDGE_MODE=jsonl``) prepends a
-    zero-width-space, breaking the leading ``/``. ``/compact`` must therefore
+    ``send_input``, which prepends a zero-width-space, breaking the leading
+    ``/``. ``/compact`` must therefore
     use ``send_literal`` (no ZWSP) + a separate Enter, mirroring the existing
     ``/context`` probe in ``tmux_runner.py``.
     """

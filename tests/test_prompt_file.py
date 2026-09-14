@@ -34,17 +34,14 @@ def _mgr() -> TmuxSessionManager:
     return mgr
 
 
-def _typed(prompt: str, *, jsonl: bool = True) -> str:
+def _typed(prompt: str) -> str:
     calls: list[list[str]] = []
 
     def fake_run(args):
         calls.append(list(args))
         return MagicMock(returncode=0, stdout="")
 
-    with (
-        patch("c_lord.tmux._run", side_effect=fake_run),
-        patch("c_lord.transcript.mirror.bridge_mode_jsonl", return_value=jsonl),
-    ):
+    with patch("c_lord.tmux._run", side_effect=fake_run):
         assert _mgr().start_claude(12345, prompt, "sonnet") is True
     return "".join(c[-1] for c in calls if "send-keys" in c and "-l" in c)
 

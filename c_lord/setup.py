@@ -143,6 +143,7 @@ async def setup_bridge(
     from .database.task_repo import TaskRepository
     from .database.thread_repo import ThreadRepository
     from .discord_ui.authorization import Authorizer
+    from .legacy_env import warn_removed_delivery_env
 
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:
@@ -154,6 +155,11 @@ async def setup_bridge(
     # two. Sharing the instance also means the app owner resolved at on_ready
     # is in effect everywhere at once.
     authorizer = Authorizer(allowed_user_ids, allowed_role_name)
+
+    # #712: say so if the operator's .env still selects the retired skill-push
+    # delivery path. Wired here rather than in main() so instance repos that
+    # call setup_bridge() themselves get the notice too (Zero-Config).
+    warn_removed_delivery_env()
 
     # Lounge shares the coordination channel unless explicitly overridden
     if lounge_channel_id is None:
@@ -270,11 +276,11 @@ async def setup_bridge(
     bot.session_cleanup_cog = session_cleanup_cog  # type: ignore[attr-defined]
     logger.info("Registered SessionCleanupCog")
 
-    # --- TranscriptMirrorCog (Issue #71, gated by CLORD_BRIDGE_MODE=jsonl) ---
+    # --- TranscriptMirrorCog (Issue #71) — the delivery path (#712) ---
     transcript_cog = TranscriptMirrorCog(bot, session_repo=session_repo)
     await bot.add_cog(transcript_cog)
     bot.transcript_mirror_cog = transcript_cog  # type: ignore[attr-defined]
-    logger.info("Registered TranscriptMirrorCog (active when CLORD_BRIDGE_MODE=jsonl)")
+    logger.info("Registered TranscriptMirrorCog")
 
     # --- VersionCog (read-only /version + !version twin, zero-config) ---
     await bot.add_cog(VersionCog(bot))
