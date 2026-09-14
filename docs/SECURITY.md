@@ -200,6 +200,15 @@ in-session Views (via `RunConfig`), the persistent-view restore path
 (`bot.py`), and `AutoUpgradeCog` — so configuring the allowlist alone protects
 every button, no extra wiring.
 
+A View that is *not* handed the authorizer falls back to the one published for
+the process (`set_process_authorizer`), not to a fresh empty one: an
+argument-less `Authorizer` knows no allowlist, takes the "nothing configured"
+branch, and finds the owner fallback deliberately unresolved — so it denied
+**everyone, the configured owner included** (#739). The fallback points at the
+real allowlist, never at a wider rule. Denials name the branch that refused and
+which authorizer answered, so "not on the list" and "never got the list" are one
+grep apart.
+
 ### Channel-Level Authorization
 
 Both Cogs only respond to messages in the configured channel (`channel_id`) and its child threads. Messages in other channels are silently ignored.

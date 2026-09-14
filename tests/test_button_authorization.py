@@ -19,7 +19,9 @@ These tests pin down:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+import logging
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
@@ -31,6 +33,7 @@ from c_lord.discord_ui.authorization import (
     AuthorizedViewMixin,
     Authorizer,
     set_fallback_owner_ids,
+    set_process_authorizer,
 )
 from c_lord.discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from c_lord.discord_ui.permission_view import PermissionView
@@ -61,6 +64,12 @@ def _make_user(user_id: int = 1) -> MagicMock:
     user = MagicMock(spec=discord.User)
     user.id = user_id
     return user
+
+
+def _ask_pane() -> str:
+    """A real ``capture-pane`` of an open AskUserQuestion menu."""
+    path = Path(__file__).parent / "fixtures" / "panes" / "ask_context_prose_above_menu.txt"
+    return path.read_text()
 
 
 def _make_interaction(user: MagicMock) -> MagicMock:
@@ -228,3 +237,192 @@ class TestEveryViewEnforcesAuthorizer:
         assert await view.interaction_check(_make_interaction(_make_member(99))) is False
         set_fallback_owner_ids({99})
         assert await view.interaction_check(_make_interaction(_make_member(99))) is True
+
+
+# ---------------------------------------------------------------------------
+# #739 — a View nobody handed the authorizer must still obey the real allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestUnwiredViewFollowsTheConfiguredAllowlist:
+    """#739: the owner pressing their own button got 「権限がありません」.
+
+    Production, 2026-09-14 (``/tmp/clord-bot-c-lord-20260914-135153.log``)::
+
+        13:51:57 Authorization: using the configured allowlist
+                 (user_ids=[499163459418587176] role=None)
+        13:57:02 menu watchdog: bridging unwatched TUI menu (thread=1548897737465004032 ...)
+        13:57:36 Rejected unauthorized button interaction from user 499163459418587176 on AskView
+
+    The rejected ID *is* the configured allowlist.  The menu came from the #359
+    watchdog, which called ``bridge_pane_ask`` without an authorizer, so the
+    ``AskView`` fell through to ``interaction_check``'s ``or Authorizer()`` —
+    a fresh, argument-less predicate that knows nothing about the configured
+    allowlist and, since #713, denies rather than opens up.
+
+    The fix is not to re-open the fallback (that is the fail-open #713 closed):
+    the fallback must reach **the process's own authorizer**, the one holding
+    the configured allowlist.
+    """
+
+    def _view(self):
+        question = AskQuestion(question="pick one", options=[AskOption("A"), AskOption("B")])
+        return AskView(question, thread_id=1, q_idx=0)  # exactly what the watchdog builds
+
+    async def test_configured_allowlist_reaches_a_view_that_was_not_handed_it(self) -> None:
+        set_process_authorizer(Authorizer(allowed_user_ids={499163459418587176}))
+        view = self._view()
+        interaction = _make_interaction(_make_member(user_id=499163459418587176))
+        assert await view.interaction_check(interaction) is True
+        interaction.response.send_message.assert_not_called()
+
+    async def test_outsider_is_still_rejected(self) -> None:
+        set_process_authorizer(Authorizer(allowed_user_ids={499163459418587176}))
+        view = self._view()
+        interaction = _make_interaction(_make_member(user_id=99))
+        assert await view.interaction_check(interaction) is False
+        interaction.response.send_message.assert_called_once()
+
+    async def test_a_wired_authorizer_still_wins(self) -> None:
+        """The process fallback is a backstop, never an override."""
+        set_process_authorizer(Authorizer(allowed_user_ids={1}))
+        question = AskQuestion(question="pick one", options=[AskOption("A")])
+        view = AskView(question, thread_id=1, q_idx=0, authorizer=Authorizer(allowed_user_ids={2}))
+        assert await view.interaction_check(_make_interaction(_make_member(2))) is True
+        assert await view.interaction_check(_make_interaction(_make_member(1))) is False
+
+    async def test_no_process_authorizer_still_means_owner_only(self) -> None:
+        """#713 must not regress: nothing configured anywhere ⇒ owner only."""
+        view = self._view()
+        assert await view.interaction_check(_make_interaction(_make_member(99))) is False
+        set_fallback_owner_ids({99})
+        assert await view.interaction_check(_make_interaction(_make_member(99))) is True
+
+
+class TestDenialSaysWhy:
+    """AC5 — the rejection log must name the branch that refused.
+
+    Both failures below wrote the *same* line in production, which is why
+    telling "the owner is not on the list" apart from "this View never got the
+    list" took an incident's worth of reading.
+    """
+
+    async def test_not_on_the_configured_allowlist(self, caplog) -> None:
+        view = _build_view("AskView", Authorizer(allowed_user_ids={42}))
+        with caplog.at_level(logging.INFO, logger="c_lord.discord_ui.authorization"):
+            await view.interaction_check(_make_interaction(_make_member(99)))
+        assert "not on the configured allowlist" in caplog.text
+
+    async def test_owner_fallback_unresolved(self, caplog) -> None:
+        view = _build_view("AskView", None)
+        with caplog.at_level(logging.INFO, logger="c_lord.discord_ui.authorization"):
+            await view.interaction_check(_make_interaction(_make_member(99)))
+        assert "no allowlist is configured" in caplog.text
+        assert "owner" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# #739 AC3/AC4 — every path that builds an AskView hands it the authorizer
+# ---------------------------------------------------------------------------
+
+
+class TestEveryAskViewPathIsWired:
+    """No construction site may leave the allowlist behind.
+
+    ``AskView`` is built from four places, and the two the watchdogs use passed
+    nothing.  These drive the real call paths rather than reading the source,
+    so a new path that forgets is caught by the same assertion.
+    """
+
+    async def test_menu_watchdog_passes_the_authorizer(self) -> None:
+        """#359 sweep — the path that produced the 2026-09-14 incident."""
+        from c_lord import thread_state_sync
+        from c_lord.discord_ui import ask_handler
+
+        authorizer = Authorizer(allowed_user_ids={42})
+        bot = MagicMock()
+        bot.get_cog.return_value = None
+        bot.authorizer = authorizer
+        bot.ask_repo = None
+        bot.tmux_manager = MagicMock()
+        bot.tmux_manager.capture_pane_tall = MagicMock(return_value="")
+        bot.get_channel.return_value = MagicMock(spec=discord.Thread)
+        loop = thread_state_sync.MenuWatchdogLoop(bot, interval_seconds=60)
+
+        pane = _ask_pane()
+        bridge = AsyncMock()
+        with (
+            patch.object(ask_handler, "bridge_pane_ask", bridge),
+            patch.object(thread_state_sync, "_capture_pane_text", return_value=pane),
+            patch.object(thread_state_sync, "_pane_foreground_command", return_value="claude"),
+        ):
+            await loop._maybe_bridge_open_menu(1, "sess", "w1", pane)
+            await asyncio.sleep(0)
+            task = loop._ask_bridges.get(1)
+            if task is not None:
+                await task
+
+        bridge.assert_awaited_once()
+        assert bridge.await_args.kwargs.get("authorizer") is authorizer
+
+    async def test_transcript_mirror_ask_bridge_passes_the_authorizer(self) -> None:
+        """#232 mirror bridge — same omission, same consequence."""
+        from c_lord.cogs import transcript_mirror as tm
+        from c_lord.discord_ui import ask_handler
+
+        authorizer = Authorizer(allowed_user_ids={42})
+        bot = MagicMock()
+        bot.get_cog.return_value = None
+        bot.authorizer = authorizer
+        bot.ask_repo = None
+        bot.tmux_manager = MagicMock()
+
+        cog = tm.TranscriptMirrorCog.__new__(tm.TranscriptMirrorCog)
+        cog.bot = bot
+        thread = MagicMock(spec=discord.Thread)
+        thread.parent_id = 7
+
+        bridge = AsyncMock()
+        with (
+            patch.object(ask_handler, "bridge_pane_ask", bridge),
+            patch.object(
+                tm.TranscriptMirrorCog, "_resolve_channel", AsyncMock(return_value=thread)
+            ),
+        ):
+            await cog._make_ask_bridge(1)(MagicMock())
+
+        bridge.assert_awaited_once()
+        assert bridge.await_args.kwargs.get("authorizer") is authorizer
+
+    async def test_restart_recovery_passes_the_authorizer(self) -> None:
+        """#671 re-arm — already wired; pinned so it stays that way."""
+        from c_lord import ask_menu_recovery
+
+        authorizer = Authorizer(allowed_user_ids={42})
+        bot = MagicMock()
+        bot.authorizer = authorizer
+        bot.get_channel.return_value = MagicMock(spec=discord.Thread)
+        record = MagicMock()
+        record.thread_id = 1
+        record.question_idx = 0
+        record.message_id = None
+        record.questions.return_value = [
+            {"question": "pick one", "options": [{"label": "A"}], "header": "h"}
+        ]
+        repo = MagicMock()
+        repo.delete = AsyncMock()
+
+        captured: list = []
+        real_ask_view = ask_menu_recovery.AskView
+
+        def _spy(*args, **kwargs):
+            captured.append(kwargs.get("authorizer"))
+            return real_ask_view(*args, **kwargs)
+
+        async def _no_runner(_tid):
+            return None
+
+        with patch.object(ask_menu_recovery, "AskView", _spy):
+            await ask_menu_recovery._recover_one(bot, repo, record, _no_runner)
+
+        assert captured == [authorizer]

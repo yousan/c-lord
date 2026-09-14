@@ -296,6 +296,10 @@ class SkillCommandCog(commands.Cog):
                     registry=self._registry,
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
+                    # #739: the buttons a skill run posts (permission / plan /
+                    # elicitation / ask) are gated by the allowlist, so they
+                    # need it handed to them like any other turn's.
+                    authorizer=self._authorizer,
                     # #480: ping the invoking user if a question-mode pause blocks the skill.
                     notify_user_id=user.id,
                 )
@@ -347,6 +351,8 @@ class SkillCommandCog(commands.Cog):
                 registry=self._registry,
                 session_dir_manager=sdm,
                 tmux_manager=tmux,
+                # #739: same allowlist as every other turn's buttons.
+                authorizer=self._authorizer,
                 # #480: ping the invoking user if a question-mode pause blocks the skill.
                 notify_user_id=user.id,
             )

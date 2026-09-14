@@ -189,6 +189,8 @@ class WebhookTriggerCog(commands.Cog):
                     session_id=None,
                     status=None,
                     registry=self._registry,
+                    # #739: a webhook turn's buttons are gated like any other's.
+                    authorizer=getattr(self.bot, "authorizer", None),
                     # #480: no human poster on a webhook (CI/CD) turn — fall back
                     # to the bot owner so a question-mode pause still pings someone
                     # (#525: unless this deployment turned that fallback off).

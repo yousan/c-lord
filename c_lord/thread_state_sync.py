@@ -937,6 +937,12 @@ class MenuWatchdogLoop:
                     question,
                     runner,
                     ask_repo=getattr(self._bot, "ask_repo", None),
+                    # #739: the buttons this posts are gated by the allowlist,
+                    # so they need the allowlist. Omitting it here is what
+                    # locked the owner out of their own menu on 2026-09-14:
+                    # the AskView fell back to an empty predicate that denied
+                    # everybody, on a host whose allowlist named that owner.
+                    authorizer=getattr(self._bot, "authorizer", None),
                     # #480: watchdog bridges a menu no Discord turn is watching
                     # (terminal-driven), so ping the bot owner as the fallback
                     # (#525: unless this deployment turned that fallback off).

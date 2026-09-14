@@ -69,8 +69,42 @@ Discord にログインするまで分からないので、`on_ready` で 1 回�
 fail-open が残り、`/skill`（任意のスキル実行）と `/clord-init`（リポジトリ紐づけ）は誰でも
 叩ける状態が続いた**。規則のコピーは、いつか片方だけ直る。
 
-View に `_authorizer` を渡し忘れた場合は「未設定」と同じ扱い（＝所有者のみ）になる。
-全 View が渡されていることは `tests/test_button_authorization.py` が固定している。
+### View に渡し忘れたとき (#739)
+
+View は `_authorizer` を受け取るのが原則で、**全 View / 全構築経路が渡していることは
+`tests/test_button_authorization.py` が固定している**。それでも渡っていない View が
+作られたときは、**そのプロセスに公開されている `Authorizer`**（`setup_bridge` /
+`ClaudeChatCog` が `set_process_authorizer()` で publish したもの）を見る。所有者の解決
+(`_fallback_owner_ids`) と同じ理屈で、1 プロセス＝1 bot＝1 規則だから、View がどこで作られても
+同じ答えに辿り着く。
+
+これは #739 の修正。それまでは引数なしの `Authorizer()` を新しく作っていた。**新品の
+`Authorizer` は allowlist を知らない**ので規則 4（未設定）に落ち、そこで見る
+`_fallback_owner_ids` は「allowlist が設定済みなら解決しない」（上の「所有者はいつ分かるか」）
+ため空のまま — 結果 **allowlist を正しく設定している環境で、その allowlist に載っている
+本人を含む全員が拒否された**。2026-09-14 に #359 メニュー監視が出したボタンで実際に起きた。
+
+**直し方として「渡っていなければ全員許可」に戻してはいけない** — それは #713 が塞いだ
+fail-open そのもの。フォールバックは「広い方」ではなく「**本物の allowlist**」を指す。
+
+ターン中に出るボタン（permission / plan / elicitation / ask）へは `RunConfig.authorizer`
+が運ぶ。`RunConfig` を作るのに `authorizer=` を渡し忘れた経路が無いことは
+`tests/test_architecture.py` が構造的に固定している（#739 時点で `/skill` ×2・scheduler・
+webhook の 4 箇所が渡していなかった）。
+
+### 拒否したときのログ (#739)
+
+拒否は理由まで出す。「明示 allowlist に載っていない」のか「allowlist が未設定で所有者も
+未解決」なのかが 1 行で分かる（#739 以前は両者が同じ 1 行で、切り分けに時間が溶けた）。
+
+```
+Rejected unauthorized button interaction from user 499163459418587176 on AskView:
+  not on the configured allowlist (user_ids=[123] role=None) [wired into the view]
+```
+
+末尾の `[...]` は**どの Authorizer が答えたか** — `wired into the view` /
+`the process authorizer — this view was not handed one (#739)` /
+`no authorizer reached this view and none is published (#739)`。
 
 ## スコープ外
 

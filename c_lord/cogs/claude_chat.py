@@ -37,7 +37,12 @@ from ..database.repository import SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
-from ..discord_ui.authorization import Authorizer, resolve_fallback_owner_ids
+from ..discord_ui.authorization import (
+    Authorizer,
+    get_process_authorizer,
+    resolve_fallback_owner_ids,
+    set_process_authorizer,
+)
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
@@ -275,6 +280,11 @@ class ClaudeChatCog(commands.Cog):
         self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
         if getattr(bot, "authorizer", None) is None:
             bot.authorizer = self._authorizer
+        # #739: and process-wide, for Views that are built where the bot is not
+        # in reach. Published here too — not only in setup_bridge — because a
+        # consumer may add this cog by hand (Zero-Config: no extra wiring).
+        if get_process_authorizer() is None:
+            set_process_authorizer(self._authorizer)
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
         # #634: the startup sweep for a previous process's dead ⏹ Stop buttons.

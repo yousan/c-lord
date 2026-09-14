@@ -110,3 +110,51 @@ class TestSingleDeliveryPath:
                 "jsonl is the only bridge; do not reintroduce a mode gate:\n"
                 + "\n".join(violations)
             )
+
+
+class TestEveryRunConfigCarriesTheAuthorizer:
+    """#739: every turn's interactive buttons must know the allowlist.
+
+    ``RunConfig.authorizer`` is what reaches ``EventProcessor`` and from there
+    every View a turn posts — permission Allow/Deny, plan Approve/Cancel,
+    elicitation, AskUserQuestion.  It defaults to ``None`` for backward
+    compatibility, so a cog that builds a ``RunConfig`` and forgets it posts
+    buttons that do not know who may press them.  Four of the six sites had
+    forgotten (``/skill`` twice, the scheduler, and webhook triggers) — the
+    same omission that locked the owner out of their own menu in #739.
+
+    Checked structurally because the failure is a *missing* keyword: there is
+    no call to intercept and no behaviour to observe until someone clicks.
+    """
+
+    _SRC = Path(__file__).parent.parent / "c_lord"
+    # The legacy shim in _run_helper.py has no production caller and no
+    # authorizer parameter to forward; it is covered by the process-wide
+    # fallback (AuthorizedViewMixin._resolve_authorizer).
+    _EXEMPT = {("_run_helper.py", "run_claude_in_thread")}
+
+    def test_all_runconfig_constructions_pass_authorizer(self) -> None:
+        import ast
+
+        violations: list[str] = []
+        for path in sorted(self._SRC.rglob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            enclosing: dict[int, str] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    for child in ast.walk(node):
+                        enclosing.setdefault(id(child), node.name)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if getattr(node.func, "id", None) != "RunConfig":
+                    continue
+                if (path.name, enclosing.get(id(node), "")) in self._EXEMPT:
+                    continue
+                if not any(kw.arg == "authorizer" for kw in node.keywords):
+                    violations.append(f"  {path.relative_to(self._SRC.parent)}:{node.lineno}")
+
+        assert not violations, (
+            "RunConfig built without authorizer=, so this turn's buttons will "
+            "not know the allowlist (#739):\n" + "\n".join(violations)
+        )

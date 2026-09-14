@@ -142,7 +142,7 @@ async def setup_bridge(
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
     from .database.thread_repo import ThreadRepository
-    from .discord_ui.authorization import Authorizer
+    from .discord_ui.authorization import Authorizer, set_process_authorizer
     from .legacy_env import warn_removed_delivery_env
     from .version import runtime_version
 
@@ -164,6 +164,10 @@ async def setup_bridge(
     # two. Sharing the instance also means the app owner resolved at on_ready
     # is in effect everywhere at once.
     authorizer = Authorizer(allowed_user_ids, allowed_role_name)
+    # #739: also publish it process-wide, so a View that was never handed one
+    # still asks the configured allowlist instead of an empty predicate that
+    # denies everybody (see AuthorizedViewMixin._resolve_authorizer).
+    set_process_authorizer(authorizer)
 
     # #712: say so if the operator's .env still selects the retired skill-push
     # delivery path. Wired here rather than in main() so instance repos that

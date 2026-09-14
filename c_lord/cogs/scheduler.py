@@ -246,6 +246,9 @@ class SchedulerCog(commands.Cog):
                 prompt=task["prompt"],
                 session_id=None,
                 registry=registry,
+                # #739: a scheduled turn can still open a menu, and its buttons
+                # obey the same allowlist as everyone else's.
+                authorizer=getattr(self.bot, "authorizer", None),
                 # #480: scheduled turns have no human poster — fall back to
                 # the bot owner so a question-mode pause still pings someone
                 # (#525: unless this deployment turned that fallback off).

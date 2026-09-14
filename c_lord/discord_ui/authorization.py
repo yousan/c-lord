@@ -73,6 +73,25 @@ _fallback_owner_ids: set[int] | None = None
 _announced = False
 
 
+# The one :class:`Authorizer` this process runs on, published by
+# ``setup_bridge`` / ``ClaudeChatCog`` (#739).  Same reasoning as
+# ``_fallback_owner_ids`` above: one process runs one bot, so one predicate
+# answers for all of it — and a View that was never handed one can still find
+# it instead of inventing an empty one that denies everybody.
+_process_authorizer: Authorizer | None = None
+
+
+def set_process_authorizer(authorizer: Authorizer | None) -> None:
+    """Publish the process's configured :class:`Authorizer` (#739)."""
+    global _process_authorizer
+    _process_authorizer = authorizer
+
+
+def get_process_authorizer() -> Authorizer | None:
+    """The process's configured :class:`Authorizer`, if one was published."""
+    return _process_authorizer
+
+
 def allow_anyone_enabled(explicit: bool | None = None) -> bool:
     """Whether the explicit fail-open switch is on (``CLORD_ALLOW_ANYONE``)."""
     if explicit is not None:
@@ -158,6 +177,30 @@ class Authorizer:
             return user_id in _fallback_owner_ids
         return False  # owner unknown — deny rather than widen
 
+    def deny_reason(self) -> str:
+        """Which branch of the rule refused, in words (#739 AC5).
+
+        A denial used to be logged as one undifferentiated line, so "the owner
+        is not on the configured list" and "this gate never received the list"
+        read identically — and telling them apart is exactly what #739 cost an
+        incident to do.  Said out loud, the two are one grep apart.
+        """
+        if self.has_explicit_allowlist:
+            ids = sorted(self.allowed_user_ids) if self.allowed_user_ids else None
+            return f"not on the configured allowlist (user_ids={ids} role={self.allowed_role_name})"
+        if _fallback_owner_ids is None:
+            return (
+                "no allowlist is configured and the app owner is not resolved yet "
+                "(on_ready has not run) — nobody passes until it is"
+            )
+        if not _fallback_owner_ids:
+            return (
+                "no allowlist is configured and the app owner could not be read "
+                "from Discord — set DISCORD_OWNER_ID to your user ID"
+            )
+        owners = ", ".join(str(i) for i in sorted(_fallback_owner_ids))
+        return f"no allowlist is configured, so only the app owner ({owners}) may click"
+
 
 async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
     """Resolve the default allowlist from the Discord application (#713).
@@ -232,10 +275,12 @@ class AuthorizedViewMixin:
     """Mixin adding allowlist enforcement to a ``discord.ui.View``.
 
     Reads ``self._authorizer`` (an :class:`Authorizer` or ``None``).  ``None``
-    means the construction site has not been wired up, and is treated as *no
-    allowlist configured* — i.e. the same rule as everywhere else, which since
-    #713 is "the app owner only", not "everyone may click" (AC5).  A View that
-    should follow a configured allowlist must still be handed the authorizer;
+    means the construction site has not been wired up, and since #739 falls
+    back to the process's published authorizer (:func:`get_process_authorizer`)
+    — the instance that actually holds the configured allowlist — before the
+    "nothing configured" rule, which since #713 is "the app owner only", not
+    "everyone may click" (#713 AC5).  A View that should follow a configured
+    allowlist must still be handed the authorizer;
     ``tests/test_button_authorization.py`` holds every View to that.
     """
 
@@ -243,14 +288,42 @@ class AuthorizedViewMixin:
     # (owner-only) rather than raising AttributeError.
     _authorizer: Authorizer | None = None
 
+    def _resolve_authorizer(self) -> tuple[Authorizer, str]:
+        """The predicate to ask, and where it came from (for the log).
+
+        #739: falling back to a bare ``Authorizer()`` here was a silent
+        lockout.  An argument-less one has no allowlist, so it takes the
+        "nothing configured" branch and consults ``_fallback_owner_ids`` —
+        which :func:`resolve_fallback_owner_ids` deliberately leaves empty
+        whenever an allowlist *is* configured.  A View nobody had wired up
+        therefore denied **everyone**, the configured owner included, on a
+        deployment that had configured access correctly.
+
+        The fix is not a wider fallback (that is the fail-open #713 closed) but
+        a *truthful* one: ask the process's own authorizer, the instance that
+        holds the configured allowlist.  Wiring the View explicitly is still
+        the rule — ``tests/test_button_authorization.py`` holds every
+        construction site to it — this is the backstop for the one that is
+        added next year and forgets.
+        """
+        wired = getattr(self, "_authorizer", None)
+        if wired is not None:
+            return wired, "wired into the view"
+        process = get_process_authorizer()
+        if process is not None:
+            return process, "the process authorizer — this view was not handed one (#739)"
+        return Authorizer(), "no authorizer reached this view and none is published (#739)"
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        authorizer = getattr(self, "_authorizer", None) or Authorizer()
+        authorizer, source = self._resolve_authorizer()
         if authorizer.is_allowed(interaction.user):
             return True
         logger.info(
-            "Rejected unauthorized button interaction from user %s on %s",
+            "Rejected unauthorized button interaction from user %s on %s: %s [%s]",
             getattr(interaction.user, "id", "?"),
             type(self).__name__,
+            authorizer.deny_reason(),
+            source,
         )
         with contextlib.suppress(discord.HTTPException):
             await interaction.response.send_message(UNAUTHORIZED_MESSAGE, ephemeral=True)

@@ -318,6 +318,8 @@ class TranscriptMirrorCog(commands.Cog):
                 question,
                 runner,
                 ask_repo=getattr(bot, "ask_repo", None),
+                # #739: same allowlist as every other button in the thread.
+                authorizer=getattr(bot, "authorizer", None),
                 notify_user_id=owner_notify_id(bot, kind="blocked"),
             )
 

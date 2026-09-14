@@ -154,7 +154,9 @@ def _reset_fallback_owner_ids():
     from c_lord.discord_ui import authorization
 
     authorization.set_fallback_owner_ids(None)
+    authorization.set_process_authorizer(None)
     try:
         yield
     finally:
         authorization.set_fallback_owner_ids(None)
+        authorization.set_process_authorizer(None)
