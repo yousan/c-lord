@@ -206,6 +206,33 @@ def test_every_askview_construction_passes_an_authorizer(rel: str) -> None:
         )
 
 
+RUN_CONFIG_SITES = [
+    "cogs/claude_chat.py",
+    "cogs/skill_command.py",
+    "cogs/scheduler.py",
+    "cogs/webhook_trigger.py",
+]
+
+
+@pytest.mark.parametrize("rel", RUN_CONFIG_SITES)
+def test_every_run_posts_views_that_can_see_the_allowlist(rel: str) -> None:
+    """A run's ``RunConfig.authorizer`` is what gates the buttons it posts.
+
+    ``event_processor`` builds PermissionView / StopView / AskView from it, so a
+    cog that starts a run without one produces the un-wired Views of #739. Four
+    of the five construction sites had never passed it.
+    """
+    tree = ast.parse((_SRC / rel).read_text())
+    calls = _calls_named(tree, "RunConfig")
+    assert calls, f"no RunConfig construction found in {rel} — did it move?"
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "authorizer" in kwargs, (
+            f"{rel}:{call.lineno} builds a RunConfig without authorizer= — "
+            "the buttons that run posts cannot see the allowlist (#739)"
+        )
+
+
 @pytest.mark.parametrize("rel", ASK_BRIDGE_CALLERS)
 def test_every_ask_bridge_caller_passes_an_authorizer(rel: str) -> None:
     """``bridge_pane_ask`` forwards its ``authorizer`` into the AskView, so a
