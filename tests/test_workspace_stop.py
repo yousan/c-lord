@@ -23,12 +23,8 @@ from c_lord.thread_name import CLOSED_MARK, LEGACY_CLOSED_MARKS, parse_topic_fro
 
 def _c(name: str, ports: tuple[int, ...] = (), status: str = "running") -> DevContainer:
     return DevContainer(
-        container_id=f"id-{name}",
-        name=name,
-        status=status,
-        ports=ports,
-        project=None,
-        source="mount",
+        container_id=f"id-{name}", name=name, status=status, ports=ports,
+        project=None, source="mount",
     )
 
 

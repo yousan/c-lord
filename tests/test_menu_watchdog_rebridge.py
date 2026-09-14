@@ -187,6 +187,7 @@ class TestOneBridgePerMenu:
             await _sweep(loop, 633_004, pane)
         assert bridge.await_count == 1
 
+
     @pytest.mark.asyncio
     async def test_a_post_that_failed_is_still_retried(self, ledger_db) -> None:
         """#579 must survive #633: a menu nobody could SEE keeps its budget.

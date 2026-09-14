@@ -106,14 +106,9 @@ class TestStopAllAtOnce:
 
         now = datetime.datetime(2026, 8, 31, 12, 0, 0)
         base = SessionRecord(
-            thread_id=0,
-            session_id="a" * 32,
-            working_dir="/w",
-            model="opus",
-            origin="discord",
-            summary=None,
-            created_at="2026-01-01 00:00:00",
-            last_used_at="2026-01-01 00:00:00",
+            thread_id=0, session_id="a" * 32, working_dir="/w", model="opus",
+            origin="discord", summary=None,
+            created_at="2026-01-01 00:00:00", last_used_at="2026-01-01 00:00:00",
         )
         records = [replace(base, thread_id=i) for i in range(1, 94)]
 

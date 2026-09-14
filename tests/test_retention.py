@@ -57,7 +57,9 @@ class TestReadsClaudeCodeSetting:
 
         assert claude_transcript_retention_days(managed_path=str(managed)) == 7
 
-    def test_absent_setting_falls_back_to_the_observed_default(self, tmp_path, monkeypatch) -> None:
+    def test_absent_setting_falls_back_to_the_observed_default(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """30 is Claude Code's own default, confirmed by measurement rather than
         by documentation (the settings page does not list the key)."""
         home = tmp_path / "home"
@@ -71,7 +73,9 @@ class TestReadsClaudeCodeSetting:
         monkeypatch.setenv("HOME", str(tmp_path / "nothing-here"))
         assert claude_transcript_retention_days() == RETENTION_FALLBACK_DAYS
 
-    def test_malformed_json_falls_back_rather_than_raising(self, tmp_path, monkeypatch) -> None:
+    def test_malformed_json_falls_back_rather_than_raising(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """A broken settings file must not stop the bot, and must not be read as
         "retention is zero" — that would delete everything."""
         home = tmp_path / "home"

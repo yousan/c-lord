@@ -61,7 +61,9 @@ def test_fixture_is_the_real_compact_continuation_event() -> None:
     assert body.startswith(
         "This session is being continued from a previous conversation that ran out of context"
     )
-    assert body.rstrip().endswith("Pick up the last task as if the break never happened.")
+    assert body.rstrip().endswith(
+        "Pick up the last task as if the break never happened."
+    )
 
 
 def test_the_fixture_would_have_been_nine_discord_messages() -> None:
