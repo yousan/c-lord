@@ -69,8 +69,30 @@ Discord にログインするまで分からないので、`on_ready` で 1 回�
 fail-open が残り、`/skill`（任意のスキル実行）と `/clord-init`（リポジトリ紐づけ）は誰でも
 叩ける状態が続いた**。規則のコピーは、いつか片方だけ直る。
 
-View に `_authorizer` を渡し忘れた場合は「未設定」と同じ扱い（＝所有者のみ）になる。
-全 View が渡されていることは `tests/test_button_authorization.py` が固定している。
+View に `_authorizer` を渡し忘れた場合は、**プロセスが実際に使っている `Authorizer`**
+（`set_default_authorizer()` で公開されるもの）を参照する。どちらも無ければ拒否する。
+
+> **#739 の教訓**: ここは当初「渡し忘れたら空の `Authorizer()` を作る」だった。空の
+> `Authorizer()` は allowlist を持たないので上の 4 に落ちるが、**allowlist が設定されている
+> 環境では所有者フォールバックが意図的に未解決のまま**（3 の手前で return する）なので、
+> 結果として**全員拒否**になった。`DISCORD_OWNER_ID` を設定している本番で、**allowlist に
+> 載っている所有者自身がボタンを押せなくなった**。deny 既定は正しいが、**間違った allowlist
+> から計算した deny は正しくない**。
+>
+> 配線漏れそのものは #713 以前から存在していた（`_authorizer is None` が「全員許可」だった
+> ため見えていなかっただけ）。実際に漏れていたのは `bridge_pane_ask` を呼ぶ 2 箇所
+> （`cogs/transcript_mirror.py` — jsonl 経路なので**本番の主経路**、`thread_state_sync.py` —
+> watchdog 経路）。
+
+全 View が authorizer を渡されていることは `tests/test_button_authorization.py` が、
+`AskView` の全構築経路が `authorizer=` を持つことは `tests/test_view_authorizer_wiring.py`
+が（AST で）固定している。
+
+### 拒否したときは理由を出す
+
+「allowlist に無い」のと「authorizer が無く判定できない」は**利用者にとっては同じ無反応でも、
+運用者にとっては別物**（後者は c-lord のバグ）。拒否ログは両者を書き分ける — #739 の切り分けに
+時間がかかった原因がこれだった。
 
 ## スコープ外
 

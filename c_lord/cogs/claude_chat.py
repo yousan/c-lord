@@ -37,7 +37,11 @@ from ..database.repository import SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
-from ..discord_ui.authorization import Authorizer, resolve_fallback_owner_ids
+from ..discord_ui.authorization import (
+    Authorizer,
+    resolve_fallback_owner_ids,
+    set_default_authorizer,
+)
 from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
@@ -275,6 +279,11 @@ class ClaudeChatCog(commands.Cog):
         self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
         if getattr(bot, "authorizer", None) is None:
             bot.authorizer = self._authorizer
+        # #739: also publish it process-wide. ``bot.authorizer`` only reaches
+        # call sites that remember to read it — and two of them did not, which
+        # is how a View ended up judging the owner against an empty allowlist.
+        # This is the floor under that mistake, not a licence to skip wiring.
+        set_default_authorizer(getattr(bot, "authorizer", None) or self._authorizer)
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
         # #634: the startup sweep for a previous process's dead ⏹ Stop buttons.

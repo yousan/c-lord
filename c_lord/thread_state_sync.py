@@ -937,6 +937,9 @@ class MenuWatchdogLoop:
                     question,
                     runner,
                     ask_repo=getattr(self._bot, "ask_repo", None),
+                    # #739: the menu's buttons are gated by this — omitting it
+                    # left the View unable to tell who was allowed to press.
+                    authorizer=getattr(self._bot, "authorizer", None),
                     # #480: watchdog bridges a menu no Discord turn is watching
                     # (terminal-driven), so ping the bot owner as the fallback
                     # (#525: unless this deployment turned that fallback off).

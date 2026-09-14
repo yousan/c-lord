@@ -30,6 +30,7 @@ from c_lord.discord_ui.ask_view import AskView
 from c_lord.discord_ui.authorization import (
     AuthorizedViewMixin,
     Authorizer,
+    set_default_authorizer,
     set_fallback_owner_ids,
 )
 from c_lord.discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
@@ -131,14 +132,30 @@ class _DummyView(AuthorizedViewMixin, discord.ui.View):
 
 
 class TestInteractionCheck:
-    async def test_none_authorizer_falls_back_to_the_owner_default(self) -> None:
-        """#713: an un-wired View is "nothing configured" — owner-only."""
+    async def test_none_authorizer_uses_the_process_authorizer(self) -> None:
+        """An un-wired View follows the allowlist the bot actually runs (#739).
+
+        #713 first made this branch build a blank ``Authorizer()``, which meant
+        "nothing configured" even on a deployment that HAD an allowlist — so the
+        allowlisted owner was rejected. It now reads the published one.
+        """
         view = _DummyView(authorizer=None)
+        # Nothing published yet: nothing to check against, so deny.
         assert await view.interaction_check(_make_interaction(_make_member(123))) is False
-        set_fallback_owner_ids({123})
+
+        set_default_authorizer(Authorizer(allowed_user_ids={123}))
         interaction = _make_interaction(_make_member(user_id=123))
         assert await view.interaction_check(interaction) is True
         interaction.response.send_message.assert_not_called()
+        assert await view.interaction_check(_make_interaction(_make_member(124))) is False
+
+    async def test_none_authorizer_on_an_unconfigured_deployment_is_owner_only(self) -> None:
+        """#713 still holds where no allowlist is configured."""
+        view = _DummyView(authorizer=None)
+        set_default_authorizer(Authorizer())
+        set_fallback_owner_ids({123})
+        assert await view.interaction_check(_make_interaction(_make_member(123))) is True
+        assert await view.interaction_check(_make_interaction(_make_member(124))) is False
 
     async def test_allowlisted_user_passes(self) -> None:
         view = _DummyView(authorizer=Authorizer(allowed_user_ids={42}))
@@ -217,14 +234,16 @@ class TestEveryViewEnforcesAuthorizer:
         interaction = _make_interaction(_make_member(user_id=42))
         assert await view.interaction_check(interaction) is True
 
-    async def test_no_authorizer_falls_back_to_the_owner_default(self, cls_name: str) -> None:
-        """#713: not wired up ⇒ the unconfigured rule, which is owner-only.
+    async def test_no_authorizer_uses_the_process_authorizer(self, cls_name: str) -> None:
+        """Not wired up ⇒ the allowlist the bot runs, never an empty one (#739).
 
         Every one of these buttons decides something on the session owner's
         behalf, so "we forgot to pass the authorizer" must not be the setting
-        that lets any member of a public thread press it.
+        that lets any member of a public thread press it (#713) — nor the
+        setting that stops the owner pressing it (#739).
         """
         view = _build_view(cls_name, None)
         assert await view.interaction_check(_make_interaction(_make_member(99))) is False
-        set_fallback_owner_ids({99})
+        set_default_authorizer(Authorizer(allowed_user_ids={99}))
         assert await view.interaction_check(_make_interaction(_make_member(99))) is True
+        assert await view.interaction_check(_make_interaction(_make_member(98))) is False

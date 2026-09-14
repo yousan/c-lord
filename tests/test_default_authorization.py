@@ -28,6 +28,7 @@ from c_lord.discord_ui.authorization import (
     AuthorizedViewMixin,
     Authorizer,
     get_fallback_owner_ids,
+    set_default_authorizer,
     resolve_fallback_owner_ids,
     set_fallback_owner_ids,
 )
@@ -277,7 +278,11 @@ class _DummyView(AuthorizedViewMixin, discord.ui.View):
 
 
 class TestUnwiredViewFollowsTheSameDefault:
+    """An un-wired View reads the process authorizer (#739), so on a deployment
+    with no allowlist it lands on exactly this module's rule: the app owner."""
+
     async def test_outsider_cannot_click(self) -> None:
+        set_default_authorizer(Authorizer())
         set_fallback_owner_ids({OWNER})
         view = _DummyView(authorizer=None)
         interaction = _make_interaction(_make_member(user_id=OUTSIDER))
@@ -285,6 +290,7 @@ class TestUnwiredViewFollowsTheSameDefault:
         interaction.response.send_message.assert_called_once()
 
     async def test_owner_can_click(self) -> None:
+        set_default_authorizer(Authorizer())
         set_fallback_owner_ids({OWNER})
         view = _DummyView(authorizer=None)
         interaction = _make_interaction(_make_member(user_id=OWNER))
@@ -294,6 +300,7 @@ class TestUnwiredViewFollowsTheSameDefault:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("CLORD_ALLOW_ANYONE", "1")
+        set_default_authorizer(Authorizer())
         view = _DummyView(authorizer=None)
         interaction = _make_interaction(_make_member(user_id=OUTSIDER))
         assert await view.interaction_check(interaction) is True

@@ -296,6 +296,10 @@ class SkillCommandCog(commands.Cog):
                     registry=self._registry,
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
+                    # #739: the views this run posts (ask menu / permission /
+                    # stop) are gated by this; without it they cannot see the
+                    # allowlist and fall back to the process-wide one.
+                    authorizer=self._authorizer,
                     # #480: ping the invoking user if a question-mode pause blocks the skill.
                     notify_user_id=user.id,
                 )
@@ -347,6 +351,8 @@ class SkillCommandCog(commands.Cog):
                 registry=self._registry,
                 session_dir_manager=sdm,
                 tmux_manager=tmux,
+                # #739: see above — the run's buttons are gated by this.
+                authorizer=self._authorizer,
                 # #480: ping the invoking user if a question-mode pause blocks the skill.
                 notify_user_id=user.id,
             )

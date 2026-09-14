@@ -242,6 +242,9 @@ class SchedulerCog(commands.Cog):
                 # it because that is the checkout the run really used, and both
                 # the reply path (#687) and the mirror restore (#71) read it back.
                 repo=getattr(self.bot, "session_repo", None),
+                # #739: a scheduled run posts the same buttons as any other, so
+                # it needs the same allowlist to gate them.
+                authorizer=getattr(self.bot, "authorizer", None),
                 working_dir=working_dir,
                 prompt=task["prompt"],
                 session_id=None,
