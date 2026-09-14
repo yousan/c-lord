@@ -429,18 +429,26 @@ async def setup_bridge(
     # with CLORD_MENU_WATCHDOG=0.
     if os.getenv("CLORD_MENU_WATCHDOG", "1") not in ("0", "false", "no"):
         from .database.menu_bridge_repo import MenuBridgeRepository
-        from .thread_state_sync import MenuRebridgeLedger, MenuWatchdogLoop
+        from .menu_ledger import MenuRebridgeLedger, use_shared_ledger
+        from .thread_state_sync import MenuWatchdogLoop
 
+        # The ledger is SQLite-backed so "already posted this menu" survives a
+        # restart — in memory it did not, and every restart re-posted every
+        # stranded menu (#633).
+        rebridge_ledger = MenuRebridgeLedger(MenuBridgeRepository(session_db_path))
+        # #717: and the turn-side bridge writes to the SAME ledger, so a menu it
+        # posted is not mistaken for one nobody has seen after a restart. Before
+        # this, only the watchdog's own posts were recorded — and the watchdog
+        # posts the minority of menus, so a restart duplicated the question card
+        # (and its 経緯) in every thread that had one open.
+        use_shared_ledger(rebridge_ledger)
         # repo wired so the sweep only bridges windows THIS bot owns on a shared
-        # tmux server — never another bot's menu (#438). rebridge_ledger is
-        # SQLite-backed so "already posted this menu" survives a restart — in
-        # memory it did not, and every restart re-posted every stranded menu
-        # (#633).
+        # tmux server — never another bot's menu (#438).
         menu_watchdog = MenuWatchdogLoop(
             bot,
             is_processing=chat_cog.is_processing,
             repo=session_repo,
-            rebridge_ledger=MenuRebridgeLedger(MenuBridgeRepository(session_db_path)),
+            rebridge_ledger=rebridge_ledger,
         )
         menu_watchdog.start()
         bot.menu_watchdog = menu_watchdog  # type: ignore[attr-defined]
