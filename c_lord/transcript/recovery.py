@@ -33,6 +33,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..usage_limit import banner_only, is_rate_limit_event, is_refusal_shaped
 from .formatter import render_event
 from .resolver import ThreadSessionResolver
 
@@ -60,7 +61,15 @@ def _as_final_answer(event: dict) -> FinalAnswer | None:
     """Return the plain-text answer ``event`` renders as, or ``None``.
 
     ``None`` for anything the mirror would not post as a reply — tool-use
-    events, empty bodies, and events without a stable ``uuid`` to dedup on.
+    events, empty bodies, events without a stable ``uuid`` to dedup on, and
+    Claude's plan-limit refusal (#631).
+
+    The refusal matters most here.  It is written into the transcript exactly
+    like an answer, so the rescue would re-deliver it on the next restart — as
+    the raw English banner, through ``reply_sink``, *with* a ping.  That is a
+    worse version of the bug #631 was filed for, and it would bypass the fold
+    the mirror does on the live path.  A limit hit before a restart is stale by
+    definition: there is nothing worth re-delivering.
     """
     if event.get("type") != "assistant":
         return None
@@ -69,6 +78,10 @@ def _as_final_answer(event: dict) -> FinalAnswer | None:
         return None
     rendered = render_event(event)
     if rendered is None or rendered.kind != "assistant_text" or not rendered.body:
+        return None
+    if banner_only(rendered.body) is not None or (
+        is_rate_limit_event(event) and is_refusal_shaped(rendered.body)
+    ):
         return None
     return FinalAnswer(uuid=uuid, text=rendered.body)
 
