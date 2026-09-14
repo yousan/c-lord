@@ -178,7 +178,6 @@ async def test_on_ready_does_not_block_the_event_loop(
     """
     from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
 
-    monkeypatch.setenv("CLORD_BRIDGE_MODE", "jsonl")
     monkeypatch.setenv("HOME", str(tmp_path))
     project = tmp_path / ".claude" / "projects" / "-some-cwd"
     _write_big_transcript(project, lines=10)

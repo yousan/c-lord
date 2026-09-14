@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Claude が渡したファイルが Discord に届くようになった** — ハーネスの `SendUserFile` ツールは `1 file delivered to user.` を返すが、その届け先はハーネス側の配送チャンネルであって Discord ではない。jsonl ミラー（#492 以降の既定経路）はこの `tool_use` を素通りさせていたため、**ホスト全体で 29 件のファイルが1件も届かないまま、セッション側は成功したと信じていた**。利用者から見ると「送ったと言われたのに無い」という壊れ方。ミラーが `SendUserFile` を検知し、`input.files` を**実名で**、`input.caption` を本文として**独立した1メッセージ**で添付するようにした（最終回答に相乗りしないので `progress.txt` / テーブル PNG (#683) の 10 添付枠を奪わない）。11個以上は10個ずつ分割し、**添付できなかったファイルは ⚠️ で名前と理由がスレッドに出る**（黙って捨てない）。パッケージ更新だけで有効、`CLORD_SEND_USER_FILE=0` で opt-out。あるべき動きは `docs/specs/user-file-delivery.md` (#233)
+
 ### Changed
 - **コマンド名を名詞先頭に統一** — `/restart-claude` → **`/claude-restart`**、`/session-cleanup` → **`/workspace-cleanup`**（テキスト版も同様）。24 コマンドに命名規約が3つ並立していたので、既に多数派だった目的語-動詞（名詞先頭）に揃えた。Discord のオートコンプリートは前方一致なので、`/workspace` と打てば start / stop / delete / cleanup が揃って出る。`session-cleanup` の「セッション」は #571 で `session_id` / tmux セッションに予約した語で、このコマンドが消すのは**作業ディレクトリ**なので `workspace` に改めた。**旧名はスラッシュ・テキストの両方でエイリアスとして動き続ける**ので、利用者側の変更は不要（パッケージ更新のみ）。規約そのものは `docs/COMMANDS.md` の「コマンド命名規約」に明記し、`tests/test_command_naming.py` が新規コマンド名を CI で検査する (#578)
 

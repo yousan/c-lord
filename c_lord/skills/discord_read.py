@@ -95,7 +95,8 @@ curl -s -H "Authorization: Bot $TOKEN" \\
    reads a thread.
 3. Scope: you can read any channel/guild the **bot** is a member of (the bot
    token is cross-guild within its memberships). This is intentional.
-4. This skill is for **reading**. To post your answer, use `discord-reply`.
+4. This skill is for **reading**. You do not need to post your answer
+   anywhere — c-lord mirrors your reply into the thread on its own.
 """
 
 _DISCORD_READ_SKILL_NO_PATH = """\
@@ -146,7 +147,8 @@ curl -s -H "Authorization: Bot $TOKEN" \\
 2. A Discord thread ID works as a channel ID.
 3. Scope: any channel/guild the **bot** is a member of (cross-guild within its
    memberships). This is intentional.
-4. This skill is for **reading**. To post your answer, use `discord-reply`.
+4. This skill is for **reading**. You do not need to post your answer
+   anywhere — c-lord mirrors your reply into the thread on its own.
 """
 
 

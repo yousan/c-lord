@@ -137,7 +137,7 @@ The option autocompletes with the channel's default (shown first) and every repo
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
 
-**`/compact`** fires the Claude Code TUI's built-in `/compact` for this thread's session, compressing the conversation history into a summary so the context window is freed **without losing continuity** (unlike `/clear`, which discards the session). Pass optional `instructions` to focus the summary (e.g. `/compact keep the open tasks and decisions`). Note: a plain `/compact` typed as a normal message does **not** work under `CLORD_BRIDGE_MODE=jsonl` (the leading-slash note below) — this command exists precisely because it sends `/compact` via the zero-width-space-free `send_literal` path.
+**`/compact`** fires the Claude Code TUI's built-in `/compact` for this thread's session, compressing the conversation history into a summary so the context window is freed **without losing continuity** (unlike `/clear`, which discards the session). Pass optional `instructions` to focus the summary (e.g. `/compact keep the open tasks and decisions`). Note: a plain `/compact` typed as a normal message does **not** work (the leading-slash note below) — this command exists precisely because it sends `/compact` via the zero-width-space-free `send_literal` path.
 
 **`/clord-attach`** links a thread to a tmux window so you can interact with the same Claude Code session from both Discord and the terminal.
 
@@ -401,8 +401,8 @@ twins are the webhook-invocable path, so these flows can be verified
 automatically (see `tests/e2e/test_text_command_twins.py`).
 
 > **Note (leading-slash is _not_ a substitute).** Typing `/skill-name` as an
-> ordinary message does **not** run the skill: under `CLORD_BRIDGE_MODE=jsonl`
-> c-lord prefixes every message sent to the Claude TUI with a zero-width-space
+> ordinary message does **not** run the skill: c-lord prefixes every message
+> sent to the Claude TUI with a zero-width-space
 > marker, so the line no longer starts with `/` and the TUI does not treat it as
 > a slash command. Use the `!`/mention twin instead.
 

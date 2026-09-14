@@ -3,8 +3,9 @@
 > **⚠️ この文書は古い構成（#53 以前）を説明しています。** 当時は `runner.py` が
 > Claude CLI の stdout を読み、`chunker.py` が応答テキストを分割して Discord に
 > 投稿していました。#53 でこの「TUI/stdout を読んで Discord に貼る」経路は撤去され、
-> Claude 自身が Skill 経由で `curl POST /api/reply` して最終回答を投稿する方式に
-> 変わっています。そのため下記の `runner.py` / `parser.py` / `chunker.py` /
+> いったん Claude 自身が Skill 経由で `curl POST /api/reply` する方式になり、その後
+> #71/#216 の JSONL transcript ミラーに移行しました（#712 で skill 経路は削除、
+> ミラーが唯一の配信経路です）。そのため下記の `runner.py` / `parser.py` / `chunker.py` /
 > `streaming_manager.py` などは**現在は存在しません**（実体は `claude/tmux_runner.py`
 > や `discord_ui/reply_chunker.py` などに置き換わっています）。
 >
@@ -103,7 +104,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 |--------|---------------|------|
 | `status.py` | `StatusManager` | Emoji reaction lamp on the user's trigger message: 🟢 running (turn start, kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce) — the lamp changes only a couple of times per turn, and reactions use a different rate-limit bucket than thread renames. This replaced the per-turn thread-name lamp that saturated Discord's ~2/10min rename limit (#246); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. Includes stall detection: soft (⏳) at 10s, hard (⚠️) at 30s. |
 | `chunker.py` | `chunk_message()` | Fence-aware message splitter. Splits at paragraph boundaries (preferred), then line boundaries, then hard-splits. Tracks open code fences and properly closes/reopens them across chunk boundaries. Limits chunks to 1950 chars (2000 minus overhead). |
-| `embeds.py` | `tool_use_embed()`, `session_start_embed()`, etc. | Discord embed builders. Color-coded: blurple for info, green for success, red for error, yellow for tool use. Consistent visual language across all bot output. |
+| `embeds.py` | `session_start_embed()`, `ask_embed()`, etc. | Discord embed builders. Color-coded: blurple for info, green for success, red for error, yellow for tool use. Consistent visual language across all bot output. **`tool_use_embed()` (and `tool_timer.py`, which renders it) is currently unreachable** — nothing sets `StreamEvent.tool_use` any more, so no tool-use embed has ever been posted (#723). Tool activity reaches Discord through the jsonl mirror instead: the turn progress line (`turn_progress.py`) and the `progress.txt` attachment. |
 
 ### Utilities (`utils/`)
 
@@ -115,13 +116,16 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 
 ### New Conversation
 
+> ⚠️ **この図は #53 以前の subprocess 経路のまま**で、いまの tmux ペイン常駐 + jsonl ミラー配信とは違う（書き直しは #724）。確かなのは、`tmux_runner` が yield するイベントが **SYSTEM（`session_id` / `pane_ask` / `unknown_tui_prompt`）と RESULT の 2 種だけ**で、**回答本文は jsonl ミラーが配信する**こと (#712/#723)。
+
 ```
 1. User sends message in configured channel
    │
 2. on_message() in ClaudeChatCog
    │
 3. _handle_new_conversation()
-   ├── Create Discord thread (name = first 100 chars of message)
+   ├── Create Discord thread (name = topic read off the message —
+   │   one line, no markdown/URLs, … when cut; #721)
    │
 4. _run_claude()
    ├── Check semaphore (post "waiting" if full)
@@ -139,7 +143,6 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 7. Stream events:
    ├── SYSTEM {session_id} → save to DB, post session_start_embed
    ├── ASSISTANT {text}    → accumulate in SessionState
-   ├── ASSISTANT {tool_use} → set status emoji, post tool_use_embed
    ├── USER {tool_result}  → set thinking emoji
    ├── RESULT {text, cost} → post chunked text, session_complete_embed
    │

@@ -390,7 +390,6 @@ uv lock --upgrade-package c-lord && uv sync
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
 | `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
-| `CLORD_BRIDGE_MODE` | `jsonl` (default) tails Claude Code JSONL transcripts and forwards events to Discord threads (TranscriptMirror, #216). Set to `skill` to use the legacy discord-reply skill-push path instead (#53) — Claude must actively call a skill each turn to reach Discord, which is less reliable. | `jsonl` |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
 | `CLORD_AUTO_TOPIC` | Set to `1`/`true`/`yes`/`on` to let c-lord summarise a **new** thread's name with an LLM (haiku) on its first message — the pre-#705 behaviour. Off by default: the thread keeps the name it was opened with, and `/thread-rename` (sonnet) re-summarises on demand. | `false` |
@@ -658,11 +657,18 @@ Session marking is fully opt-in — it only activates when `setup_bridge()` has 
 
 ## REST API
 
-Optional REST API for notifications and task management. Requires aiohttp:
+c-lord's control plane for notifications, scheduled tasks and spawning
+sessions. It starts on every run — it is not tied to how answers are delivered
+(#712/#543). Requires aiohttp:
 
 ```bash
 uv add "c-lord[api]"
 ```
+
+It binds `CLORD_API_HOST:CLORD_API_PORT` (default `127.0.0.1:8080`). If that
+port is already in use — two clones on one host, say — the bot logs a WARNING
+and runs without the API rather than failing to start; give each clone its own
+`CLORD_API_PORT`.
 
 ### Endpoints
 

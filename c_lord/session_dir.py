@@ -131,10 +131,9 @@ class SessionDirManager:
         """Create (or return existing) session directory for a thread.
 
         Idempotent: if the directory already exists, returns its path
-        without re-cloning. The skill bundle (#52) is (re)injected on every
-        call when the flag is enabled — this keeps SKILL.md in sync with the
-        current ``CLORD_API_URL`` / ``CLORD_API_SECRET`` even if the operator
-        changes them between sessions.
+        without re-cloning. The ``discord-read`` skill (#259) is (re)injected on
+        every call so its baked-in ``.env`` path stays current, and any skill
+        left behind by the retired skill-push path is scrubbed (#712).
 
         Args:
             thread_id: Discord thread the session belongs to.
@@ -186,36 +185,20 @@ class SessionDirManager:
         else:
             logger.info("Session dir already exists: %s", target)
 
-        # Issue #52 Phase 1: (re)inject discord-reply skill so Claude can push
-        # final answers via REST API instead of relying on capture-pane
-        # scraping. Gated by USE_SKILL_REPLY env so old path stays default.
-        # Runs on every call to keep api_url / api_secret in sync.
-        from .skills.injector import (
-            inject_read_skill,
-            inject_skills,
-            remove_injected_skills,
-            skills_enabled,
-        )
+        from .skills.injector import inject_read_skill, remove_legacy_skills
 
-        if skills_enabled():
-            try:
-                inject_skills(target, thread_id=thread_id)
-            except OSError as exc:
-                # Don't fail session creation on a skill write error.
-                logger.warning("Failed to inject skills for thread %d: %s", thread_id, exc)
-        else:
-            # jsonl bridge mode etc.: scrub any stale REST-API output skill left
-            # by a prior skill-mode session so Claude isn't pointed at a dead
-            # REST API.
-            try:
-                remove_injected_skills(target)
-            except OSError as exc:
-                logger.warning("Failed to remove stale skills for thread %d: %s", thread_id, exc)
+        # #712: scrub the retired output skills (discord-reply /
+        # discord-prompt-choice) if an older c-lord left them here. They tell
+        # Claude to POST its answer to the REST API, which is listening again —
+        # so a leftover would get the answer delivered twice.
+        try:
+            remove_legacy_skills(target)
+        except OSError as exc:
+            logger.warning("Failed to remove legacy skills for thread %d: %s", thread_id, exc)
 
-        # Issue #259: discord-read is bridge-independent (it curls the Discord
-        # REST API directly, not c-lord's API), so inject it in every mode —
-        # including jsonl, where the output skills above are scrubbed. This is
-        # what lets Claude read other channels regardless of cwd or #71 state.
+        # Issue #259: discord-read lets Claude read other Discord channels by
+        # curl-ing Discord's own API — nothing to do with how its answers get
+        # delivered, so every session gets it, regardless of cwd.
         try:
             inject_read_skill(target)
         except OSError as exc:

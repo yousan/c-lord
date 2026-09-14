@@ -114,15 +114,15 @@ harness は「チャンネルが用意され `/clord-init` 済み」を前提に
    ログは `$FUZZ_LOG_DIR`（既定 `/tmp`）に per-run + 最新 symlink で残る。単一台なら
    `FUZZ_STAGING_CLONES` の代わりに `FUZZ_STAGING_CLONE_DIR` でも可。
 
-### フリート rotation と注入モード自動判定（#395）
+### フリート rotation と注入モード（#395）
 
 - **rotation**: `--staging-clones`（または `FUZZ_STAGING_CLONES`）に複数 clone を渡すと、harness は
   **lease を borrow できた最初の台で実走**する。全台が占有中/不在なら静かに skip（exit 0）。1台が
   検証で塞がっていても、別の空き台で撃てる（staging フリート #381 の活用）。
-- **jsonl-bridge 自動判定**: 対象 clone の `.env` が `CLORD_BRIDGE_MODE=jsonl` の場合、その bot は
-  **REST API（ApiServer）を bind しない**（`docs/STAGING.md`「staging フリート」節）。harness は
-  `--inject` 未指定ならこの台を自動的に **webhook + skip-health** で撃つ（spawn の偽陽性 SPAWN_FAILED/
-  HEALTH_DOWN を出さない）。明示 `--inject spawn` は尊重する。
+- **注入モード**: `--inject` 未指定なら **webhook + skip-health**（スレッドさえあれば撃てる。
+  spawn の偽陽性 SPAWN_FAILED / HEALTH_DOWN を出さない）。REST API は #712 以降どの clone でも
+  起動しているので、`--inject spawn` を明示すればそちらも使える（harness ホストから API に
+  到達できることが前提）。
 - **堅牢化**: `--staging-dir`/clone が**存在しない**場合は「その台を skip」として扱い、`FileNotFoundError`
   で落ちない（フリート改称で対象 dir が消えた事故を踏まえた #395）。
 

@@ -225,6 +225,23 @@ Key principles:
 - Parameterized queries throughout (`?` placeholders, no string formatting)
 - `cleanup_old()` method for age-based data removal
 
+## REST API exposure (#712)
+
+The control-plane API (`c_lord/ext/api_server.py`) now starts on **every** run —
+it used to be gated on the retired skill-push delivery path, so the default
+configuration had no API at all (#543). Since `POST /api/spawn` starts a Claude
+Code session, treat the listener as privileged:
+
+- It binds `CLORD_API_HOST`, **default `127.0.0.1`** — loopback only. Do not
+  bind `0.0.0.0` unless something else (firewall, reverse proxy with auth) is in
+  front of it.
+- Set **`CLORD_API_SECRET`** to require `Authorization: Bearer …` on every
+  endpoint except `/api/health`. Without it, any process on the host can spawn a
+  session; that is the same trust boundary as the `.env` file, but it is now the
+  default rather than opt-in.
+- One bot per port. A port collision is logged as a WARNING and the bot runs
+  without the API — it does not silently attach to another bot's listener.
+
 ## Deployment Recommendations
 
 1. **Private Discord server**: Run the bot on a server only you have access to

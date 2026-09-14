@@ -72,6 +72,29 @@ STATUS_EMOJI: dict[str, str] = {
 #: "keep the original number" must not cost "what is this thread about".
 MAX_NAME_LEN = 45
 
+#: Written at the end of a name that did not fit (#721).
+#:
+#: A cut without a mark reads as a name that simply ends there — which is how
+#: ``W2 │ #233 を担当してください。 経路A→B でファ`` managed to look like someone's
+#: idea of a title rather than a truncation. One character buys the reader the
+#: knowledge that there was more.
+ELLIPSIS = "…"
+
+
+def truncate_with_ellipsis(text: str, limit: int) -> str:
+    """Cut ``text`` to ``limit`` characters, marking the cut with :data:`ELLIPSIS`.
+
+    The mark is counted inside ``limit``, so the result is never longer than the
+    budget the caller computed. Text that already fits is returned untouched —
+    a name that was not cut must not look like one that was.
+    """
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + ELLIPSIS
+
+
 # #512: prefix marking a workspace that was stopped on purpose.
 # Deliberately plain text rather than an emoji: it must stay legible where emoji
 # don't render, and it reads as a state word rather than as one more lamp colour.
@@ -229,7 +252,8 @@ def build_name(
         budget = MAX_NAME_LEN - len(fixed)
 
     if len(topic_clean) > budget:
-        topic_clean = topic_clean[: max(budget, 0)]
+        # #721: mark the cut so a truncated topic is not read as the whole topic.
+        topic_clean = truncate_with_ellipsis(topic_clean, max(budget, 0))
 
     name = f"{fixed}{topic_clean}"[:MAX_NAME_LEN]
     # The ``→#<current>`` token is strictly additive: it is appended only when it
@@ -383,5 +407,5 @@ def replace_topic_in_name(name: str, new_topic: str) -> str:
         suffix = ""
         budget = MAX_NAME_LEN - len(prefix)
     if len(topic) > budget:
-        topic = topic[: max(budget, 0)]
+        topic = truncate_with_ellipsis(topic, max(budget, 0))  # #721
     return f"{prefix}{topic}{suffix}"[:MAX_NAME_LEN]
