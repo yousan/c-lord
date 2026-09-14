@@ -16,6 +16,7 @@ import pytest
 
 from c_lord.usage_limit import (
     banner_only,
+    count_usage_limit,
     extract_usage_limit,
     folded_notice,
     is_rate_limit_event,
@@ -164,6 +165,31 @@ def test_refusal_shape_bounds_what_the_marked_path_may_fold() -> None:
     assert is_refusal_shaped("") is False
     assert is_refusal_shaped("調べました。\n結論は次のとおりです。") is False
     assert is_refusal_shaped("あ" * 201) is False
+
+
+def test_the_scan_stays_linear_on_chrome_heavy_text() -> None:
+    """A line of dashes must not be able to hang the scan (catastrophic backtracking).
+
+    The first version of the gutter pattern nested its quantifiers, so a run of
+    dashes — a markdown rule, a table border, an ASCII box, all of which Claude
+    writes constantly — took exponential time: 28 dashes cost 10 seconds, and
+    the whole CI test matrix hung on it.  Reachable from the pane since #666 and,
+    once the mirror folds banners, from every assistant message and every
+    transcript rescue scan.
+    """
+    import time
+
+    for probe in ("-" * 4000, "|" * 4000, "*-" * 2000, ("| a | b |\n|---|---|\n" * 2000)):
+        start = time.monotonic()
+        assert extract_usage_limit(probe) is None
+        assert count_usage_limit(probe) == 0
+        assert banner_only(probe) is None
+        assert time.monotonic() - start < 1.0, "scan is not linear"
+
+
+def test_a_long_answer_is_rejected_without_scanning_it() -> None:
+    """banner_only caps its input: the mirror calls it on every assistant message."""
+    assert banner_only("え" * 500_000) is None
 
 
 # ---------------------------------------------------------------------------

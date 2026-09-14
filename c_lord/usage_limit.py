@@ -58,7 +58,21 @@ logger = logging.getLogger(__name__)
 # matching when it merely appears inside Claude's own prose — the same
 # false-positive class as #156 / #184, and a live one here because c-lord
 # threads discuss this very banner.
-_LIMIT_GUTTER = r"^[^\S\n]*(?:[●⏺⎿╰│┃|>*•-]+[^\S\n]*)*"
+#
+# ONE character at a time under ONE quantifier, deliberately.  The first version
+# of this pattern nested them — ``(?:[glyphs]+[space]*)*`` — which is the classic
+# catastrophic-backtracking shape: every way of splitting a run of dashes between
+# the inner and outer repeat is tried before the match can fail.  A line of 28
+# dashes (a markdown rule, a table border, an ASCII box — things Claude writes
+# constantly) took **10 seconds**, and 40 would outlive the process.  That was
+# reachable from the pane all along, and #631's fold made it reachable from every
+# assistant message and every transcript rescue scan as well.
+#
+# Here the two branches are disjoint and each consumes exactly one character, so
+# there is only ever one way to match a given run: linear, with no ambiguity to
+# back-track through.  The whitespace branch stays ``[^\S\n]`` rather than a
+# literal " \t" class because real panes are full of NBSP.
+_LIMIT_GUTTER = r"^(?:[^\S\n]|[●⏺⎿╰│┃|>*•-])*"
 
 # The blocking banners, and the reset clause that may follow them.
 _USAGE_LIMIT_RE = re.compile(
@@ -86,6 +100,12 @@ _LIMIT_SCOPE_RE = re.compile(r"^[A-Za-z][A-Za-z' ]{0,39}$")
 _LIMIT_RESET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:,()/_. +-]{0,49}$")
 
 
+# Cheap literal pre-filter.  Every banner contains one of these verbatim, so a
+# text holding neither cannot match — and skipping the scan keeps the regex away
+# from the long prose the mirror hands it on every single turn.
+_LIMIT_MARKERS = ("hit your", "usage credits")
+
+
 def extract_usage_limit(text: str) -> UsageLimit | None:
     """Return the plan limit shown anywhere in *text*, or None when there is none.
 
@@ -98,7 +118,7 @@ def extract_usage_limit(text: str) -> UsageLimit | None:
     ``_extract_startup_error`` is gated — a banner Claude *quotes* inside a real
     answer must not end that answer's turn (#631).
     """
-    if not text:
+    if not text or not any(marker in text for marker in _LIMIT_MARKERS):
         return None
     match = _USAGE_LIMIT_RE.search(text)
     if match is None:
@@ -123,9 +143,23 @@ def count_usage_limit(text: str) -> int:
     banner text is what makes a repeat of the *same* limit detectable — the text
     is identical every time.
     """
-    if not text:
+    if not text or not any(marker in text for marker in _LIMIT_MARKERS):
         return 0
     return sum(1 for _ in _USAGE_LIMIT_RE.finditer(text))
+
+
+# A refusal is one short line.  The marked-envelope path folds without reading
+# the wording at all, so this cap is what stops it from being able to destroy a
+# real answer: whatever else a rate-limit envelope might one day carry, anything
+# longer than a banner is posted as-is rather than replaced by a line that would
+# not describe it.  Every capture of the real thing is under 70 characters.
+_MAX_REFUSAL_CHARS = 200
+
+
+def is_refusal_shaped(text: str) -> bool:
+    """True when *text* is short enough to be the CLI's one-line refusal."""
+    stripped = text.strip()
+    return bool(stripped) and "\n" not in stripped and len(stripped) <= _MAX_REFUSAL_CHARS
 
 
 def banner_only(text: str) -> UsageLimit | None:
@@ -140,6 +174,11 @@ def banner_only(text: str) -> UsageLimit | None:
     if not text:
         return None
     stripped = text.strip()
+    # "Only the banner" implies the refusal's own shape, and asking that first
+    # caps what the scan ever sees at one short line — the mirror calls this on
+    # every assistant message, including answers megabytes long.
+    if not is_refusal_shaped(stripped):
+        return None
     limit = extract_usage_limit(stripped)
     if limit is None:
         return None
@@ -172,20 +211,6 @@ def is_rate_limit_event(event: object) -> bool:
     if event.get("error") != _RATE_LIMIT_ERROR:
         return False
     return bool(event.get("isApiErrorMessage")) or event.get("apiErrorStatus") == 429
-
-
-# A refusal is one short line.  The marked-envelope path folds without reading
-# the wording at all, so this cap is what stops it from being able to destroy a
-# real answer: whatever else a rate-limit envelope might one day carry, anything
-# longer than a banner is posted as-is rather than replaced by a line that would
-# not describe it.  Every capture of the real thing is under 70 characters.
-_MAX_REFUSAL_CHARS = 200
-
-
-def is_refusal_shaped(text: str) -> bool:
-    """True when *text* is short enough to be the CLI's one-line refusal."""
-    stripped = text.strip()
-    return bool(stripped) and "\n" not in stripped and len(stripped) <= _MAX_REFUSAL_CHARS
 
 
 # -- What c-lord says instead --------------------------------------------------
