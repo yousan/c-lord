@@ -74,6 +74,7 @@ from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
+from ..workspace_notice import restored_devenv_notice
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -2488,6 +2489,27 @@ class ClaudeChatCog(commands.Cog):
             log_ctx(thread_id=thread.id),
             "auto" if auto else "manual",
         )
+
+        # #730: 停止 stopped this workspace's containers, and reopening it
+        # deliberately does not start them again — #540 decided compose (tens of
+        # seconds to minutes) must not run just because someone came back to read
+        # the conversation. This line is the other half of that decision: without
+        # it the reader is told the workspace is back and is left to discover the
+        # environment is not, as a connection refused ten minutes later.
+        #
+        # The chokepoint for both remaining restores — the 7-day stop undone by a
+        # message (#700) and the 「▶️ 再開する」 button (#512) — so neither can
+        # end up with its own wording. Best effort throughout: a wedged docker
+        # costs a sentence, never the reopen.
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(
+                thread.parent_id or thread.id, thread_id=thread.id
+            )
+            if sdm is not None:
+                line = await restored_devenv_notice(str(Path(sdm.base_dir) / str(thread.id)))
+                if line is not None:
+                    with contextlib.suppress(discord.HTTPException):
+                        await thread.send(line)
 
     async def _post_closed_notice(self, thread: discord.Thread, message: discord.Message) -> None:
         """Tell the user the thread is closed and offer a one-click reopen (#512).
