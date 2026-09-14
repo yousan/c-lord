@@ -342,3 +342,39 @@ async def test_no_global_tmux_manager(tmp_path: object) -> None:
         type(bot).__setattr__ = original_setattr  # type: ignore[assignment]
 
     assert "tmux_manager" not in assigned_attrs
+
+
+@pytest.mark.asyncio
+async def test_setup_bridge_logs_clord_version(
+    tmp_path: object, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#722 AC1/AC4: boot must state which build is running.
+
+    Regression for 2026-09-10: an instance ran an 09-02 build for two days and
+    told its user a feature "does not exist" that had shipped 09-08. Nothing in
+    30+ lines of startup INFO said which build it was — ``grep -i version``
+    returned nothing.
+    """
+    from c_lord.version import runtime_version
+
+    monkeypatch.setattr("c_lord.version.resolve_version", lambda: "v1.4.183-bd80c47e-20260908")
+    runtime_version.cache_clear()
+    bot = _make_bot()
+    runner = _make_runner()
+
+    try:
+        with caplog.at_level("INFO", logger="c_lord.setup"):
+            await setup_bridge(
+                bot,
+                runner,
+                session_db_path=str(tmp_path / "sessions.db"),  # type: ignore[operator]
+                enable_scheduler=False,
+            )
+    finally:
+        runtime_version.cache_clear()
+
+    # The line a grepping operator actually types: `grep -i version <log>`.
+    hits = [r.getMessage() for r in caplog.records if "version" in r.getMessage().lower()]
+    assert hits, "startup log must contain a line matching `grep -i version`"
+    assert any("v1.4.183-bd80c47e-20260908" in h for h in hits), hits
+    assert any(h.startswith("c-lord version ") for h in hits), hits

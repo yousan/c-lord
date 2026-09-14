@@ -15,6 +15,7 @@ from c_lord.version import (
     extract_changelog_section,
     format_version_string,
     parse_local_version,
+    runtime_version,
 )
 
 
@@ -149,3 +150,44 @@ class TestExtractChangelogSection:
         section = extract_changelog_section(_CHANGELOG, "1.4.0")
         assert section is not None
         assert not section.startswith("## [")
+
+
+class TestRuntimeVersion:
+    """#722: the version the *running process* reports.
+
+    ``resolve_version()`` reads the checkout on disk. The running process
+    loaded its code at import time, so once the bot is up, disk and process
+    can disagree (``git pull`` without a restart). Pinning at first call is
+    therefore a correctness property, not an optimisation.
+    """
+
+    def test_resolved_once_per_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = {"n": 0}
+
+        def fake_resolve() -> str:
+            calls["n"] += 1
+            return f"v1.2.3-bdeadbee-2026090{calls['n']}"
+
+        monkeypatch.setattr("c_lord.version.resolve_version", fake_resolve)
+        runtime_version.cache_clear()
+        try:
+            first = runtime_version()
+            second = runtime_version()
+        finally:
+            runtime_version.cache_clear()
+
+        assert calls["n"] == 1, "version must be pinned at boot, not re-read per call"
+        assert first == second == "v1.2.3-bdeadbee-20260901"
+
+    def test_resolver_failure_degrades_to_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A banner must never be able to take the bot down."""
+
+        def boom() -> str:
+            raise RuntimeError("no git here")
+
+        monkeypatch.setattr("c_lord.version.resolve_version", boom)
+        runtime_version.cache_clear()
+        try:
+            assert runtime_version() == "unknown"
+        finally:
+            runtime_version.cache_clear()

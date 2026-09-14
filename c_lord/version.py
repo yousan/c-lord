@@ -14,14 +14,21 @@ Layers:
 * **Resolver** (``resolve_version``) — thin, side-effecting: reads live git
   metadata when running from a checkout, otherwise falls back to the version
   baked in at build time by ``hatch-vcs`` (``importlib.metadata``).
+* **Runtime pin** (``runtime_version``) — what the *running process* is, as
+  opposed to what is on disk right now. Everything user-facing (the boot log
+  line, the 📊 footer, ``/version``) reports this one (#722).
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 BumpLevel = Literal["major", "minor", "patch"]
 
@@ -200,3 +207,31 @@ def resolve_version() -> str:
         return format_version_string(base, commit, date)
 
     return "unknown"
+
+
+@lru_cache(maxsize=1)
+def runtime_version() -> str:
+    """Return the version of the build **this process is running**, pinned.
+
+    :func:`resolve_version` describes the checkout *on disk*. That is the right
+    answer for ``c-lord version`` on a shell, but not for a bot that has been
+    up for days: the process loaded its code at import time, so a ``git pull``
+    (or a ``uv tool upgrade``) into the same tree makes disk and process
+    disagree. Re-reading later would make a running old build claim to be the
+    new one — a lie in exactly the direction #722 exists to stop. So the value
+    is resolved once, on first use, and kept for the process's lifetime; a
+    restart is what changes it, which is also what changes the running code.
+
+    (Keeping it also means no ``git describe`` subprocess per turn — the footer
+    reads this for free, the same rule the CLI version follows in
+    ``docs/specs/context-footer.md``.)
+
+    Never raises: a version banner must not be able to take the bot down. An
+    unresolvable build reports ``"unknown"``, and callers that render it to
+    users drop the item rather than showing that.
+    """
+    try:
+        return resolve_version()
+    except Exception:  # pragma: no cover - defensive; resolve_version swallows its own
+        logger.debug("could not resolve the running c-lord version", exc_info=True)
+        return "unknown"
