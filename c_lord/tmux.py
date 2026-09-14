@@ -2413,6 +2413,22 @@ class TmuxSessionManager:
                     log_ctx(thread_id=thread_id),
                 )
                 return True
+            command = self._target_foreground_command(target)
+            if pane_command_is_dead(command):
+                # The dialog is gone and so is claude: the confirm landed on
+                # "No, exit" after all. Typing now would put the message into a
+                # SHELL, where its trailing Enter runs it as a command — a much
+                # worse ending than a reported delivery failure. Only a positive
+                # reading acts (#510's asymmetry); an unreadable pane keeps
+                # waiting.
+                logger.error(
+                    "%s send_input: the folder-trust dialog closed but the pane runs %r, "
+                    "not claude — the confirm did not take. Withholding the message "
+                    "rather than typing it into a shell (#716)",
+                    log_ctx(thread_id=thread_id),
+                    command,
+                )
+                return False
         if dialog_open:
             logger.error(
                 "%s send_input: the folder-trust dialog is still open %.0fs after it was "
@@ -3000,16 +3016,16 @@ class TmuxSessionManager:
         if window is None:
             return None
 
-        result = _run(
-            [
-                "tmux",
-                "list-panes",
-                "-t",
-                self._target(window),
-                "-F",
-                "#{pane_current_command}",
-            ]
-        )
+        return self._target_foreground_command(self._target(window))
+
+    @staticmethod
+    def _target_foreground_command(target: str) -> str | None:
+        """Same reading as :meth:`pane_foreground_command`, addressed by target.
+
+        Split out for callers inside :meth:`send_input`, which already hold the
+        resolved target and must not re-run window lookup mid-delivery.
+        """
+        result = _run(["tmux", "list-panes", "-t", target, "-F", "#{pane_current_command}"])
         if result.returncode != 0:
             return None
         return result.stdout.strip() or None

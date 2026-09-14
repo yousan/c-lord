@@ -60,6 +60,10 @@ class _Pane:
         self.claude_alive = True
 
     def run(self, args: list[str]) -> MagicMock:
+        if "list-panes" in args:
+            return MagicMock(
+                returncode=0, stdout="claude\n" if self.claude_alive else "zsh\n", stderr=""
+            )
         if "capture-pane" in args:
             return MagicMock(returncode=0, stdout=self._pane, stderr="")
         if "send-keys" in args:
@@ -185,3 +189,31 @@ def test_a_normal_pane_gets_no_trust_keystrokes() -> None:
 
     assert "Down" not in pane.keys, pane.keys
     assert pane.typed
+
+
+def test_a_confirm_that_did_not_take_never_types_into_the_shell() -> None:
+    """The worst ending this guard can have, and it must not happen.
+
+    If the confirm lands on "No, exit" anyway, the dialog goes away and claude
+    goes with it — leaving a SHELL prompt. Typing the message there does not
+    just lose it: the trailing Enter runs the user's text as a shell command.
+    A reported delivery failure is strictly better, and #716's restart then
+    brings the session back.
+    """
+    pane = _Pane()
+    # The Down is dropped (#171's failure mode), so the confirm declines trust.
+    pane._steerable = False
+    with (
+        patch("c_lord.tmux._run", side_effect=pane.run),
+        patch("c_lord.tmux._TRUST_NAV_DELAY", 0.0),
+        patch("c_lord.tmux._TRUST_SETTLE", 0.0),
+        patch("c_lord.tmux._SUBMIT_SETTLE", 0.0),
+        # Force the Enter through despite the cursor reading, to exercise the
+        # *second* guard rather than the first.
+        patch("c_lord.tmux.TmuxSessionManager._steer_trust_cursor", return_value=True),
+    ):
+        ok = _mgr().send_input(12345, _MESSAGE)
+
+    assert not pane.claude_alive, "precondition: the confirm declined trust"
+    assert not pane.typed, "the message must never be typed into a shell (#716)"
+    assert ok is False
