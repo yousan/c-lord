@@ -111,6 +111,8 @@ async def _post_from_a_turn(thread_id: int, question, *, send=None) -> MagicMock
 
     Cancelling stands in for the process dying: the menu message is on screen
     and the TUI menu is still open, which is exactly the state a restart finds.
+    The ``ask_repo`` mock it used is left on the returned thread as
+    ``.ask_repo``, so a test can replay what the restart would read back.
     """
     thread = MagicMock()
     thread.id = thread_id
@@ -130,7 +132,35 @@ async def _post_from_a_turn(thread_id: int, question, *, send=None) -> MagicMock
     with pytest.raises(asyncio.CancelledError):
         await task
     ask_bus.unregister(thread_id)
+    thread.ask_repo = repo
     return thread
+
+
+def _recovery_repo(thread: MagicMock) -> MagicMock:
+    """A ``pending_asks`` repo holding exactly what the turn wrote down.
+
+    Reads the row out of the save() call the bridge made, so the restart is
+    replayed from the real written record rather than a hand-built one.
+    """
+    import json
+
+    from c_lord.database.ask_repo import PendingAskRecord
+
+    saved = thread.ask_repo.save.await_args.kwargs
+    record = PendingAskRecord(
+        thread_id=saved["thread_id"],
+        session_id=saved["session_id"],
+        questions_json=json.dumps(saved["questions"]),
+        question_idx=saved["question_idx"],
+        created_at="2026-09-08 23:00:35",
+        message_id=saved["message_id"],
+    )
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=[record])
+    repo.cleanup_old = AsyncMock(return_value=0)
+    repo.delete = AsyncMock()
+    repo.save = AsyncMock()
+    return repo
 
 
 class TestTheTurnSideBridgeWritesTheMenuDown:
@@ -244,3 +274,49 @@ class TestARestartDoesNotRepostIt:
         assert bridge.await_count == 1, (
             "a menu that never reached the thread must still be retried (#579)"
         )
+
+
+class TestTheOriginalButtonsStillWork:
+    """AC3 — the quiet watchdog must not leave the user with dead buttons.
+
+    Not posting a second card is only acceptable because the first card's
+    buttons come back (#671). The two facts share one write, so they are
+    asserted together: what silences the watchdog is the same record that
+    re-arms the menu already on screen.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_menu_is_re_armed_on_the_message_it_was_posted_on(
+        self, ledger_db, monkeypatch
+    ) -> None:
+        from c_lord.ask_menu_recovery import recover_ask_menus
+
+        monkeypatch.setattr(ask_handler, "_PANE_RESOLVE_POLL", 0.01)
+        pane = _fixture("ask_rich_descriptions.txt")
+        question = _pane_question(pane)
+
+        use_shared_ledger(MenuRebridgeLedger(MenuBridgeRepository(ledger_db)))
+        thread = await _post_from_a_turn(717_005, question)
+
+        # --- the next process comes up ---------------------------------------
+        bot = MagicMock()
+        bot.get_channel.return_value = thread
+        bot.add_view = MagicMock()
+        runner = _open_pane_runner(question)  # the pane still shows the question
+
+        async def runner_factory(_thread_id):
+            return runner
+
+        rearmed = await recover_ask_menus(
+            bot, _recovery_repo(thread), runner_factory=runner_factory
+        )
+
+        assert rearmed == 1, "the menu the turn posted was not re-armed (#671)"
+        assert bot.add_view.call_args.kwargs.get("message_id") == thread.send.return_value.id, (
+            "the handler must be bound to the card that is actually on screen — "
+            "the one the watchdog is now staying quiet about"
+        )
+        loop = _watchdog(MenuRebridgeLedger(MenuBridgeRepository(ledger_db)))
+        with patch("c_lord.discord_ui.ask_handler.bridge_pane_ask", new=AsyncMock()) as bridge:
+            await _sweep(loop, 717_005, pane)
+        assert bridge.await_count == 0, "and no second card is posted next to it"
