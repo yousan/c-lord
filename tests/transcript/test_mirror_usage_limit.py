@@ -48,7 +48,7 @@ def _turn_end() -> dict:
 class _Harness:
     """One mirror wired to list sinks, in the production (minimal) verbosity."""
 
-    def __init__(self, tmp_path: Path, thread_id: int) -> None:
+    def __init__(self, tmp_path: Path, thread_id: int, grace: float = 0.0) -> None:
         self.posted: list[str] = []
         self.replied: list[str] = []
         project = tmp_path / "proj"
@@ -69,6 +69,7 @@ class _Harness:
             reply_sink=reply_sink,
             verbosity="minimal",
             poll_interval=0.05,
+            usage_limit_grace=grace,
         )
 
     @property
@@ -175,6 +176,58 @@ async def test_nothing_is_posted_when_clord_already_announced(
         await h.mirror.stop()
 
     assert h.all_text.strip() == ""
+
+
+async def test_nothing_is_posted_when_clord_announces_a_moment_later(
+    tmp_path: Path, clean_notices
+) -> None:
+    """AC8 has to hold when c-lord's embed lands *after* the mirror sees it.
+
+    Observed on staging 2026-09-14 while verifying this very change: folding the
+    banner made the mirror **faster** than the path it was supposed to defer to,
+    and the thread got both messages 108 ms apart —
+
+        12:45:04.475  ⏳ 一時的に Claude のsession limit（利用上限）に…   (mirror)
+        12:45:04.583  ⏳ Claude の利用上限に達しました                     (c-lord's embed)
+
+    which is the AC8 complaint again with the two messages swapped.  The pane
+    reader always breaks its poll loop within a poll or two of the banner, so a
+    short grace window before posting is enough to let the richer message win.
+    """
+    h = _Harness(tmp_path, thread_id=6317, grace=0.5)
+    h.mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(h.jsonl, _fixture_event("i631-session"))
+        await asyncio.sleep(0.2)
+        # c-lord's own ⏳ embed goes out while the mirror is still holding.
+        usage_limit_notices.note(6317)
+        _write_event(h.jsonl, _turn_end())
+        await asyncio.sleep(0.7)
+    finally:
+        await h.mirror.stop()
+
+    assert h.all_text.strip() == ""
+
+
+async def test_the_grace_window_does_not_swallow_the_line(tmp_path: Path, clean_notices) -> None:
+    """When c-lord never announces, the notice still arrives — just a beat later.
+
+    Six of the eight threads on 2026-09-04 got no c-lord notice at all; going
+    quiet there would be the "上限中は何も出さない" failure, which is worse than
+    the duplicate.
+    """
+    h = _Harness(tmp_path, thread_id=6318, grace=0.3)
+    h.mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _write_event(h.jsonl, _fixture_event("i631-session"))
+        _write_event(h.jsonl, _turn_end())
+        await asyncio.sleep(0.8)
+    finally:
+        await h.mirror.stop()
+
+    assert any("⏳" in p for p in h.posted)
 
 
 # ---------------------------------------------------------------------------

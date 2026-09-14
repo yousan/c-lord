@@ -201,6 +201,17 @@ def _transcript_has_ask_result(project_dir: Path, tool_use_id: str) -> bool:
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
 
+# #631 AC8: the pane reader and this mirror witness the same limit, and the
+# reader's ⏳ embed is the message that should survive — it names the scope, the
+# reset time and what the reader can do about it.  Which one reaches Discord
+# first, though, is a race, and folding the banner *won* that race: on staging
+# (2026-09-14) the folded line beat the embed by 108 ms and the thread got both,
+# which is exactly the duplication AC8 exists to remove.  So the fold waits this
+# long and asks again.  The reader breaks its poll loop within a poll or two of
+# the banner (0.5 s interval), so this is generous; and because the turn is
+# stalled by definition, the delay costs the reader nothing.
+USAGE_LIMIT_GRACE_SECONDS = 3.0
+
 # Maximum byte size for progress.txt content.  Caps runaway tool output so
 # that progress.txt stays well within Discord's 8 MB file-upload limit.
 _PROGRESS_MAX_BYTES = 50_000  # 50 KB
@@ -400,6 +411,7 @@ class TranscriptMirror:
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
         idle_flush_seconds: float | None = None,
+        usage_limit_grace: float = USAGE_LIMIT_GRACE_SECONDS,
         ask_bridge_cb: AskBridgeCb | None = None,
         progress: TurnProgress | None = None,
     ) -> None:
@@ -431,6 +443,9 @@ class TranscriptMirror:
         self._idle_flush_seconds = (
             idle_flush_seconds if idle_flush_seconds is not None else idle_flush_seconds_env()
         )
+        # #631 AC8: how long to let c-lord's own ⏳ embed win the race before
+        # folding the banner ourselves.  A knob only so tests need not sleep.
+        self._usage_limit_grace = usage_limit_grace
         self._task: asyncio.Task[None] | None = None
 
     def note_turn_started(self) -> None:
@@ -849,6 +864,19 @@ class TranscriptMirror:
                 self.thread_id,
             )
             return
+        # Give the pane reader its head start (see USAGE_LIMIT_GRACE_SECONDS).
+        # Inline rather than in a task: the tail keeps filling its queue while we
+        # wait, so nothing is lost, and every later event still reaches Discord
+        # behind this one.
+        if self._usage_limit_grace > 0:
+            await asyncio.sleep(self._usage_limit_grace)
+            if usage_limit_notices.announced(self.thread_id):
+                logger.info(
+                    "TranscriptMirror: suppressed usage-limit banner thread=%d "
+                    "(c-lord posted its own notice during the grace window)",
+                    self.thread_id,
+                )
+                return
         logger.info(
             "TranscriptMirror: folded usage-limit banner thread=%d scope=%s",
             self.thread_id,
