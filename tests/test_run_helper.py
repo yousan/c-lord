@@ -1269,3 +1269,108 @@ class TestFooterCliVersion:
         cfg = self._config()
         asyncio.run(rh._post_context_usage(cfg, "s"))
         assert "CLI 2.1.260" in cfg.thread.send.await_args.args[0]
+
+
+class TestFooterClordVersion:
+    """#722: the footer must also say which *c-lord* build ran this turn.
+
+    Regression for 2026-09-10: an instance stuck on an 09-02 build told its
+    user a feature "does not exist" that had shipped two days earlier. Nothing
+    the user or the operator could see named the build.
+    """
+
+    @staticmethod
+    def _config(settings_repo: object | None = None):
+        cfg = MagicMock()
+        cfg.thread.id = 1
+        cfg.thread.send = AsyncMock()
+        cfg.runner.working_dir = "/tmp/x"
+        cfg.runner.model = "opus"
+        cfg.runner.effort = None
+        cfg.runner.probe_context_window = AsyncMock(return_value=200_000)
+        cfg.settings_repo = settings_repo
+        return cfg
+
+    @staticmethod
+    def _patch(monkeypatch, version: str = "v1.4.183-bd80c47e-20260908"):
+        from pathlib import Path
+
+        from c_lord.claude.context_usage import ContextUsage
+        from c_lord.cogs import _run_helper
+        from c_lord.version import runtime_version
+
+        _run_helper._context_window_cache.clear()
+        monkeypatch.setattr(
+            _run_helper,
+            "read_latest_usage",
+            lambda _p: ContextUsage(input_tokens=20_000, cli_version="2.1.263"),
+        )
+        monkeypatch.setattr(_run_helper, "latest_session_jsonl", lambda _d: Path("/tmp/f.jsonl"))
+        monkeypatch.setattr("c_lord.version.resolve_version", lambda: version)
+        runtime_version.cache_clear()
+        return _run_helper
+
+    def test_footer_names_the_running_build(self, monkeypatch) -> None:
+        from c_lord.version import runtime_version
+
+        rh = self._patch(monkeypatch)
+        cfg = self._config()
+        try:
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+        finally:
+            runtime_version.cache_clear()
+        line = cfg.thread.send.await_args.args[0]
+        assert "c-lord v1.4.183-bd80c47e-20260908" in line
+        assert "CLI 2.1.263" in line
+
+    def test_footer_omits_the_item_when_the_build_is_unknown(self, monkeypatch) -> None:
+        """知らないことは黙る — never print ``c-lord unknown``."""
+        from c_lord.version import runtime_version
+
+        rh = self._patch(monkeypatch, version="unknown")
+        cfg = self._config()
+        try:
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+        finally:
+            runtime_version.cache_clear()
+        assert "c-lord" not in cfg.thread.send.await_args.args[0]
+
+    def test_item_can_be_switched_off(self, monkeypatch) -> None:
+        """Like every other footer item: ``context_footer.clord_version=0``."""
+        from c_lord.version import runtime_version
+
+        rh = self._patch(monkeypatch)
+        settings = MagicMock()
+
+        async def get(key: str, default: str = "1") -> str:
+            return "0" if key == "context_footer.clord_version" else default
+
+        settings.get = get
+        cfg = self._config(settings_repo=settings)
+        try:
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+        finally:
+            runtime_version.cache_clear()
+        line = cfg.thread.send.await_args.args[0]
+        assert "c-lord" not in line
+        assert "CLI 2.1.263" in line, "switching off one item must not drop the others"
+
+    def test_footer_spawns_no_subprocess_per_turn(self, monkeypatch) -> None:
+        """The build is pinned at boot — no ``git describe`` per turn."""
+        import subprocess
+
+        from c_lord.version import runtime_version
+
+        rh = self._patch(monkeypatch)
+        cfg = self._config()
+        try:
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+
+            def _boom(*_a, **_kw):  # pragma: no cover - must never run
+                raise AssertionError("the footer shelled out for the version")
+
+            monkeypatch.setattr(subprocess, "run", _boom)
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+        finally:
+            runtime_version.cache_clear()
+        assert "c-lord v1.4.183-bd80c47e-20260908" in cfg.thread.send.await_args.args[0]
