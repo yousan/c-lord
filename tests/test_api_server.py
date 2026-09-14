@@ -195,15 +195,29 @@ class TestCancelScheduled:
 
 
 class TestAuthentication:
+    """Bearer auth. The *other* way in — being the bot's own Unix user — and
+    the refusal of everyone else live in ``tests/test_api_peer_auth.py`` (#457).
+    """
+
     @pytest.mark.asyncio
-    async def test_health_bypasses_auth(self, auth_client: TestClient) -> None:
+    async def test_health_is_served_to_the_bots_own_user(self, auth_client: TestClient) -> None:
+        """Health used to bypass auth for *everyone*; now it is UID-gated (#457)."""
         resp = await auth_client.get("/api/health")
         assert resp.status == 200
 
     @pytest.mark.asyncio
-    async def test_missing_auth_header(self, auth_client: TestClient) -> None:
+    async def test_own_user_needs_no_auth_header(self, auth_client: TestClient) -> None:
+        """A caller running as the bot's user can already read the secret.
+
+        Before #457 this answered 401. Requiring the header from our own user
+        bought nothing (the secret is in ``.env``, readable by that same user)
+        while breaking the control plane, since ``CLORD_API_SECRET`` is stripped
+        from the tmux environment by #353 — a Claude session has no way to send
+        it. A foreign UID with no header gets 403, which is the case that
+        matters and is pinned in ``test_api_peer_auth.py``.
+        """
         resp = await auth_client.post("/api/notify", json={"message": "test"})
-        assert resp.status == 401
+        assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_invalid_token(self, auth_client: TestClient) -> None:

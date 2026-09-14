@@ -32,6 +32,7 @@ The bridge's security goal is:
 | Discord server admin abuse | If someone has admin on your Discord server, they already have control |
 | Physical access to the host | Out of scope — standard server security applies |
 | Claude reading the bot token from c-lord's `.env` | Accepted (#259). Same-UID processes can already read `.env`; the spawn-read skill relies on that. See below. |
+| A process running as the **same** Unix user driving the REST API | Accepted (#457). It can already read `.env` and every session directory. Access from **another** Unix user is blocked — see [REST API exposure](#rest-api-exposure-712-457). |
 
 **The security boundary is at the Discord layer, not the CLI layer.** Once a session starts, Claude Code has full CLI-level access. The bridge's job is to ensure only the right person can start sessions.
 
@@ -237,22 +238,59 @@ Key principles:
 - Parameterized queries throughout (`?` placeholders, no string formatting)
 - `cleanup_old()` method for age-based data removal
 
-## REST API exposure (#712)
+## REST API exposure (#712, #457)
 
-The control-plane API (`c_lord/ext/api_server.py`) now starts on **every** run —
-it used to be gated on the retired skill-push delivery path, so the default
+The control-plane API (`c_lord/ext/api_server.py`) starts on **every** run — it
+used to be gated on the retired skill-push delivery path, so the default
 configuration had no API at all (#543). Since `POST /api/spawn` starts a Claude
-Code session, treat the listener as privileged:
+Code session, the listener is privileged: **reaching it is equivalent to a shell
+as the user running the bot.**
 
+**`127.0.0.1` is a network boundary, not a UID boundary.** Loopback TCP ports
+are not isolated per Unix user, so on a multi-user host every account could
+reach the port — and before #457 the API answered them. Measured on the
+maintainer's host on 2026-09-14, with `CLORD_API_SECRET` unset: `GET
+/api/health` → 200, `GET /api/tasks` → 200 (scheduled-task prompt bodies), `POST
+/api/spawn` → 400 `prompt is required` — i.e. an unauthenticated caller reached
+request validation. That host has eleven human accounts and a second c-lord
+running under a different user.
+
+**The gate (#457).** Every request must satisfy one of:
+
+1. **Same Unix user.** The peer's UID is read from `/proc/net/tcp`(`6`) by
+   matching the connection's 4-tuple (`c_lord/ext/peer_uid.py`) and compared
+   with the bot's own UID. `root` also passes — it can read `.env`, `ptrace` the
+   process, or simply become that user, so refusing it would protect nothing.
+2. **`Authorization: Bearer <CLORD_API_SECRET>`**, when a secret is configured.
+   This is how you deliberately let *another* user or another host in.
+
+Everything else gets **403**, including `/api/health` — it used to answer 200 to
+anyone, which turned a port scan into an inventory of every c-lord on the host.
+Denials are logged at WARNING (sampled per peer UID, `c_lord/log_sampler.py`).
+
+Notes and limits:
+
+- **Same UID is not isolated, by design.** Any process running as the bot's user
+  — including every Claude session it spawns — can drive the API. That is the
+  same trust boundary as the `.env` file it can already read (see *Accepted
+  risks* below). #457 closes the *cross-UID* hole only.
+- **A same-UID caller is served without the header even when a secret is set.**
+  Demanding it would protect nothing (that user can read the secret) and would
+  break the control plane: `CLORD_API_SECRET` is in `SENSITIVE_ENV_KEYS`, so a
+  Claude session cannot read it from its environment (#353).
+- **If the peer's UID cannot be proven** — no `/proc` (non-Linux), or a peer
+  from another host — the request is refused. Set `CLORD_API_SECRET` for those
+  callers, or `CLORD_API_ALLOW_ANY_PEER=1` to serve unverified local callers;
+  the escape hatch logs a WARNING naming itself at every start.
+- **Every start logs who is served**, e.g.
+  `REST API access: serving uid=1000 only, no secret configured`.
 - It binds `CLORD_API_HOST`, **default `127.0.0.1`** — loopback only. Do not
   bind `0.0.0.0` unless something else (firewall, reverse proxy with auth) is in
-  front of it.
-- Set **`CLORD_API_SECRET`** to require `Authorization: Bearer …` on every
-  endpoint except `/api/health`. Without it, any process on the host can spawn a
-  session; that is the same trust boundary as the `.env` file, but it is now the
-  default rather than opt-in.
+  front of it; a remote peer cannot be UID-verified and will need the secret.
 - One bot per port. A port collision is logged as a WARNING and the bot runs
-  without the API — it does not silently attach to another bot's listener.
+  without the API — it does not silently attach to another bot's listener. (A
+  listener belonging to *another user* cannot serve your callers either: they
+  are the ones who get refused.)
 
 ## Deployment Recommendations
 
