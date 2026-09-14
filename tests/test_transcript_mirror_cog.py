@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -1331,3 +1332,169 @@ async def test_file_sink_reserves_an_attachment_slot_for_progress_txt(
         assert len(files) <= 10
     filenames = [getattr(f, "filename", "") for f in sent_with_files[-1].kwargs["files"]]
     assert "progress.txt" in filenames
+
+
+# ── Issue #719: one transcript, one mirror ────────────────────────────
+
+
+async def test_on_ready_starts_one_mirror_per_project_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#719 AC3: two open rows may share a ``working_dir`` — a scheduled task
+    makes a new thread every run while keeping its checkout — and both mirrors
+    then tail the *same* transcript, posting this run's turn into last run's
+    thread as well.  ``list_all`` is ordered ``last_used_at DESC``, so the first
+    row is the thread that used the workspace last: it keeps the mirror.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _recovery_repo(
+        [
+            _session_row(22, "/some/cwd", "u-old"),  # this week's run (newest)
+            _session_row(11, "/some/cwd", "u-old"),  # last week's run
+        ]
+    )
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        try:
+            await cog.on_ready()
+            mirrored = set(cog._mirrors)
+        finally:
+            await cog.cog_unload()
+
+    assert mirrored == {22}, mirrored
+    duplicate_lines = [r.getMessage() for r in caplog.records if "#719" in r.getMessage()]
+    assert len(duplicate_lines) == 1, caplog.text
+    assert "11" in duplicate_lines[0] and "22" in duplicate_lines[0], duplicate_lines[0]
+
+
+async def test_on_ready_does_not_recover_into_the_stale_duplicate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#719: the #215 recovery walks rows too.  A final answer belongs to the
+    thread that owns the transcript — replaying it into the stale duplicate is
+    the very symptom (last week's thread filling with this week's work).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project = tmp_path / ".claude" / "projects" / "-some-cwd"
+    project.mkdir(parents=True)
+    (project / "s.jsonl").write_text(
+        "\n".join(
+            json.dumps(e, ensure_ascii=False)
+            for e in [
+                clord_marker_event(),
+                {
+                    "type": "assistant",
+                    "uuid": "u-final",
+                    "message": {"content": [{"type": "text", "text": "this run's answer"}]},
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+        )
+        + "\n"
+    )
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    repo = _recovery_repo(
+        [
+            _session_row(22, "/some/cwd", "u-old"),
+            _session_row(11, "/some/cwd", "u-old"),
+        ]
+    )
+    cog = TranscriptMirrorCog(bot, session_repo=repo)
+    try:
+        await cog.on_ready()
+    finally:
+        await cog.cog_unload()
+
+    # Recovered once, for the owning thread only.
+    assert [c.args for c in repo.set_mirror_replied_uuid.await_args_list] == [(22, "u-final")]
+    assert [c.args[0] for c in bot.get_channel.call_args_list] == [22]
+
+
+async def test_a_live_claim_takes_the_mirror_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#719 AC1/AC2: when a turn starts in a thread whose project dir another
+    thread is already mirroring, the new thread is the one about to write that
+    transcript — it takes the claim over and the stale mirror is stopped.
+    Refusing the newcomer instead would leave the live thread with no delivery
+    path at all (#712).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects" / "-some-cwd").mkdir(parents=True)
+
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        try:
+            assert cog.start_for(11, "/some/cwd") is True
+            stale = cog._mirrors[11]
+            assert cog.start_for(22, "/some/cwd") is True
+            assert set(cog._mirrors) == {22}
+            stale_task = stale._task
+            assert stale_task is not None
+            for _ in range(100):  # let the displaced mirror's cancellation settle
+                if stale_task.done():
+                    break
+                await asyncio.sleep(0.01)
+            assert stale_task.done(), "the displaced mirror kept tailing"
+        finally:
+            await cog.cog_unload()
+
+    takeover_lines = [r.getMessage() for r in caplog.records if "#719" in r.getMessage()]
+    assert len(takeover_lines) == 1, caplog.text
+    assert "11" in takeover_lines[0] and "22" in takeover_lines[0], takeover_lines[0]
+
+
+async def test_threads_with_different_project_dirs_both_mirror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#719 must not collapse the ordinary case: per-thread session dirs differ,
+    so every thread keeps its own mirror."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".claude" / "projects"
+    (root / "-a-cwd").mkdir(parents=True)
+    (root / "-b-cwd").mkdir(parents=True)
+
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    try:
+        assert cog.start_for(11, "/a/cwd") is True
+        assert cog.start_for(22, "/b/cwd") is True
+        assert set(cog._mirrors) == {11, 22}
+    finally:
+        await cog.cog_unload()
+
+
+async def test_stop_for_releases_the_project_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stopped mirror no longer holds its project dir, so the next thread to
+    use that workspace claims it without a takeover."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects" / "-some-cwd").mkdir(parents=True)
+
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    with caplog.at_level(logging.WARNING, logger="c_lord.cogs.transcript_mirror"):
+        try:
+            assert cog.start_for(11, "/some/cwd") is True
+            await cog.stop_for(11)
+            assert cog.start_for(22, "/some/cwd") is True
+            assert set(cog._mirrors) == {22}
+        finally:
+            await cog.cog_unload()
+
+    assert not [r for r in caplog.records if "#719" in r.getMessage()], caplog.text
