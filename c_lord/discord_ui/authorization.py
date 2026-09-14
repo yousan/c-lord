@@ -68,6 +68,10 @@ _TRUE_VALUES = ("1", "true", "yes", "on")
 # means "not resolved yet" — which denies, rather than allows, everyone.
 _fallback_owner_ids: set[int] | None = None
 
+# ``on_ready`` fires again on every reconnect; the startup statement below is
+# about this process, so it is said once rather than on every network blip.
+_announced = False
+
 
 def allow_anyone_enabled(explicit: bool | None = None) -> bool:
     """Whether the explicit fail-open switch is on (``CLORD_ALLOW_ANYONE``)."""
@@ -82,8 +86,10 @@ def set_fallback_owner_ids(ids: set[int] | None) -> None:
     ``None`` resets to "not resolved" (used by tests); an empty set means
     "resolution failed" and denies everyone, which is the safe direction.
     """
-    global _fallback_owner_ids
+    global _fallback_owner_ids, _announced
     _fallback_owner_ids = set(ids) if ids is not None else None
+    if ids is None:
+        _announced = False  # reset (tests)
 
 
 def get_fallback_owner_ids() -> set[int] | None:
@@ -156,14 +162,21 @@ class Authorizer:
 async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
     """Resolve the default allowlist from the Discord application (#713).
 
-    Called once from ``on_ready``, when the bot is logged in and can ask
-    Discord who owns it.  Does nothing when an allowlist is configured — an
-    explicit allowlist is never quietly widened with the owner.
+    Called from ``on_ready``, when the bot is logged in and can ask Discord who
+    owns it.  Does nothing when an allowlist is configured — an explicit
+    allowlist is never quietly widened with the owner.  ``on_ready`` fires
+    again on every reconnect, so the work and the log line happen once per
+    process.
 
     Always says, in one startup log line, who ended up allowed and how to
     change it: narrowing access in silence is the failure shape c-lord refuses
     (#585), and so is widening it in silence.
     """
+    global _announced
+    if _announced:
+        return
+    _announced = True
+
     if authorizer.allow_anyone:
         logger.warning(
             "%s is set: EVERYONE in the server may drive this bot — and driving "
@@ -179,9 +192,6 @@ async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
             authorizer.allowed_role_name,
         )
         return
-    if get_fallback_owner_ids() is not None:
-        return  # already resolved (on_ready fires again on every reconnect)
-
     try:
         app = getattr(bot, "application", None) or await bot.application_info()
         if getattr(app, "team", None) is not None:

@@ -355,3 +355,19 @@ class TestEveryGateSharesTheDefault:
         assert skill._authorizer is shared
         assert channel._authorizer is shared
         assert chat._authorizer is shared
+
+
+class TestAnnouncedOncePerProcess:
+    """``on_ready`` fires on every reconnect — the startup line does not."""
+
+    async def test_second_call_is_silent_and_does_not_refetch(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bot = _make_bot(owner_id=OWNER)
+        await resolve_fallback_owner_ids(bot, Authorizer())
+        bot.application_info.reset_mock()
+        with caplog.at_level(logging.INFO, logger="c_lord.discord_ui.authorization"):
+            await resolve_fallback_owner_ids(bot, Authorizer())
+        bot.application_info.assert_not_called()
+        assert caplog.records == []
+        assert get_fallback_owner_ids() == {OWNER}
