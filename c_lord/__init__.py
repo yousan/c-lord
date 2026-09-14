@@ -40,7 +40,7 @@ from .protocols import DrainAware
 from .session_dir import CleanupResult, SessionDirInfo, SessionDirManager
 from .setup import BridgeComponents, setup_bridge
 from .tmux import TmuxSessionManager
-from .version import resolve_version
+from .version import resolve_version, runtime_version
 
 
 def _resolve_dist_version() -> str:
@@ -65,6 +65,7 @@ __version__ = _resolve_dist_version()
 __all__ = [
     "__version__",
     "resolve_version",
+    "runtime_version",
     # Core
     "ClaudeConfig",
     "TmuxClaudeRunner",
