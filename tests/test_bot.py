@@ -233,6 +233,46 @@ class TestOnError:
         assert any("zombie" in r.message.lower() for r in caplog.records)
 
 
+class TestDashboardOnReady:
+    """#720: on_ready must not add a Session Status board on every reconnect.
+
+    ``on_ready`` fires again on every RESUME/IDENTIFY, not only at startup.
+    Rebuilding the dashboard there threw away the live session states and — by
+    way of the unconditional ``channel.send`` in ``initialize()`` — left another
+    dead board in the channel each time.
+    """
+
+    def _make_bot(self) -> tuple:
+        bot = ClaudeDiscordBot(channel_id=123)
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 123
+        channel.guild = MagicMock()
+        board = MagicMock(spec=discord.Message)
+        board.id = 1
+        board.pinned = False
+        board.pin = AsyncMock()
+        board.edit = AsyncMock()
+        channel.send = AsyncMock(return_value=board)
+        bot.tree.clear_commands = MagicMock()
+        bot.tree.sync = AsyncMock(return_value=[])
+        bot.get_channel = MagicMock(return_value=channel)
+        return bot, channel
+
+    @pytest.mark.asyncio
+    async def test_second_on_ready_keeps_the_same_dashboard(self) -> None:
+        from unittest.mock import patch
+
+        bot, channel = self._make_bot()
+
+        with patch.object(bot, "_assert_expected_identity"):
+            await bot.on_ready()
+            first = bot.thread_dashboard
+            await bot.on_ready()
+
+        assert bot.thread_dashboard is first
+        assert channel.send.await_count == 1
+
+
 class TestSlashCommandSync:
     """Slash command sync must register GLOBALLY so commands work in every guild.
 
