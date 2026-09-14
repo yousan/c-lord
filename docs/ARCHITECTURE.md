@@ -104,7 +104,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 |--------|---------------|------|
 | `status.py` | `StatusManager` | Emoji reaction lamp on the user's trigger message: 🟢 running (turn start, kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce) — the lamp changes only a couple of times per turn, and reactions use a different rate-limit bucket than thread renames. This replaced the per-turn thread-name lamp that saturated Discord's ~2/10min rename limit (#246); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. Includes stall detection: soft (⏳) at 10s, hard (⚠️) at 30s. |
 | `chunker.py` | `chunk_message()` | Fence-aware message splitter. Splits at paragraph boundaries (preferred), then line boundaries, then hard-splits. Tracks open code fences and properly closes/reopens them across chunk boundaries. Limits chunks to 1950 chars (2000 minus overhead). |
-| `embeds.py` | `tool_use_embed()`, `session_start_embed()`, etc. | Discord embed builders. Color-coded: blurple for info, green for success, red for error, yellow for tool use. Consistent visual language across all bot output. |
+| `embeds.py` | `session_start_embed()`, `ask_embed()`, etc. | Discord embed builders. Color-coded: blurple for info, green for success, red for error, yellow for tool use. Consistent visual language across all bot output. **`tool_use_embed()` (and `tool_timer.py`, which renders it) is currently unreachable** — nothing sets `StreamEvent.tool_use` any more, so no tool-use embed has ever been posted (#723). Tool activity reaches Discord through the jsonl mirror instead: the turn progress line (`turn_progress.py`) and the `progress.txt` attachment. |
 
 ### Utilities (`utils/`)
 
@@ -115,6 +115,8 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 ## Data Flow
 
 ### New Conversation
+
+> ⚠️ **この図は #53 以前の subprocess 経路のまま**で、いまの tmux ペイン常駐 + jsonl ミラー配信とは違う（書き直しは #724）。確かなのは、`tmux_runner` が yield するイベントが **SYSTEM（`session_id` / `pane_ask` / `unknown_tui_prompt`）と RESULT の 2 種だけ**で、**回答本文は jsonl ミラーが配信する**こと (#712/#723)。
 
 ```
 1. User sends message in configured channel
@@ -141,7 +143,6 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 7. Stream events:
    ├── SYSTEM {session_id} → save to DB, post session_start_embed
    ├── ASSISTANT {text}    → accumulate in SessionState
-   ├── ASSISTANT {tool_use} → set status emoji, post tool_use_embed
    ├── USER {tool_result}  → set thinking emoji
    ├── RESULT {text, cost} → post chunked text, session_complete_embed
    │
