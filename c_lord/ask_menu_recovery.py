@@ -93,7 +93,7 @@ def _for_log(question: AskQuestion, selected: list[str]) -> list[str]:
 
 def _fingerprint(question: AskQuestion) -> str:
     """The #633 menu identity — imported lazily to keep the import graph flat."""
-    from .thread_state_sync import menu_fingerprint
+    from .menu_ledger import menu_fingerprint
 
     return menu_fingerprint(question)
 

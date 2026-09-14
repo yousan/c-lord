@@ -25,6 +25,7 @@ import discord
 
 from ..claude.types import AskQuestion, ask_question_to_dict
 from ..database.ask_repo import PendingAskRepository
+from ..menu_ledger import menu_fingerprint, shared_ledger
 from ..transcript.ask_result import (
     ASK_ANSWERED,
     ASK_NOT_ANSWERED,
@@ -497,6 +498,7 @@ async def _bridge_claimed_menu(
     # answered a press with Discord's red 3-second ACK timeout and not one line
     # in the log. Suppressed on failure: a ledger write must never be able to
     # take down a menu that is otherwise working.
+    recoverable = False
     if ask_repo is not None:
         with contextlib.suppress(Exception):
             await ask_repo.save(
@@ -508,6 +510,24 @@ async def _bridge_claimed_menu(
                 question_idx=0,
                 message_id=getattr(msg, "id", None),
             )
+            recoverable = True
+    # #717: tell the menu ledger the same thing. That ledger is what the #359
+    # watchdog reads to decide whether a menu open in the pane has ever reached
+    # Discord — and until now only the watchdog's OWN posts were written to it,
+    # while every other check it makes (``_is_processing`` / ``_ask_bridges`` /
+    # ``ask_bus``) is in-memory. So after a restart a menu this bridge had
+    # posted looked unbridged, and the watchdog posted it again: the 経緯 message
+    # and the question card a second time, two live sets of buttons, at the one
+    # moment the user is being asked to decide something (2026-09-08 23:27 —
+    # both of the two threads that had an open question).
+    #
+    # Only when the row above was written: staying quiet is justified by #671
+    # bringing this menu's own buttons back after the restart. With nothing to
+    # recover from, a fresh copy is the only way the question can still be
+    # answered, and a duplicate beats a dead end.
+    if recoverable:
+        with contextlib.suppress(Exception):
+            await shared_ledger().note_posted(thread.id, menu_fingerprint(question))
 
     resolved_note = "-# ✅ 端末で回答済み（このボタンは無効です）"
 
