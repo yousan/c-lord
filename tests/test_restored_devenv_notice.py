@@ -211,21 +211,38 @@ class TestNeverStartsDocker:
 
     @pytest.mark.asyncio
     async def test_discovery_is_the_only_docker_verb_used(self, monkeypatch) -> None:
-        """``restored_devenv_notice`` may inspect. It may not act."""
+        """``restored_devenv_notice`` may inspect. It may not act.
+
+        Driven through a docker that *answers*, so both calls discovery makes
+        (``ps`` then ``inspect``) are recorded — a fake that fails at ``ps``
+        would assert about a single command and prove almost nothing.
+        """
+        import json
+
         from c_lord import devenv, workspace_notice
+
+        doc = {
+            "Id": "abc",
+            "Name": "/supabase_db_555",
+            "State": {"Status": "exited"},
+            "Config": {"Labels": {}},
+            "Mounts": [{"Source": "/work/555"}],
+            "HostConfig": {"PortBindings": {}},
+        }
 
         argvs: list[list[str]] = []
 
         async def fake_docker(argv: list[str]) -> tuple[int, str]:
             argvs.append(argv)
-            return 1, ""
+            if "ps" in argv:
+                return 0, "abc\n"
+            return 0, json.dumps(doc) + "\n"
 
         monkeypatch.setattr(devenv, "_docker", fake_docker)
-        await workspace_notice.restored_devenv_notice("/work/555")
+        line = await workspace_notice.restored_devenv_notice("/work/555")
 
-        for argv in argvs:
-            assert "start" not in argv
-            assert "up" not in argv
+        assert line is not None  # the fake really did drive discovery
+        assert [argv[1] for argv in argvs] == ["ps", "inspect"]
 
 
 # ── AC1/AC2/AC3: both restore paths, one function ────────────────────────────
