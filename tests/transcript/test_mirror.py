@@ -1890,3 +1890,63 @@ async def test_turn_end_marker_is_published_on_the_turn_end_bus(tmp_path: Path) 
         "the bus was marked before the answer was posted — the runner could "
         "close the turn and post its 📊 footer above Claude's answer"
     )
+
+
+async def test_a_fold_that_cannot_be_replaced_still_delivers_the_markdown(
+    tmp_path: Path,
+) -> None:
+    """#686: a fold is a *placeholder*, not a delivery — it holds a pointer, not
+    the prose. So when the markdown will not fit into it, suppressing the flush
+    the way a real pane delivery does would leave the thread with the pointer
+    and nothing to point at. Post it instead: the pointer promised it."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from c_lord.discord_ui.bridged_context import bridged_context
+
+    long_md = ("読める markdown です。" * 300) + "\n\n私の推しは (A) です。"  # > 1 message
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    posted: list[str] = []
+    replied: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replied.append(text)
+
+    fold_msg = MagicMock()
+    fold_msg.edit = AsyncMock()
+    fold_msg.delete = AsyncMock()
+
+    bridged_context.clear()
+    bridged_context.register(99686, long_md, source="pane", messages=[fold_msg], folded=True)
+    mirror = TranscriptMirror(
+        thread_id=99686,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_text(long_md))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+        bridged_context.clear()
+
+    assert any("私の推しは (A) です。" in p for p in posted + replied), (
+        "the fold could not be replaced and the markdown was dropped — the reader "
+        "is left with a pointer to nothing"
+    )
+    fold_msg.delete.assert_not_awaited()
