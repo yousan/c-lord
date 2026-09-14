@@ -31,6 +31,7 @@ from ..claude.tmux_runner import TmuxClaudeRunner
 from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
+from ..discord_ui.authorization import Authorizer
 from ..thread_settings import resolve_auto_archive_duration
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -103,6 +104,7 @@ class SkillCommandCog(commands.Cog):
         allowed_user_ids: set[int] | None = None,
         registry: SessionRegistry | None = None,
         allowed_role_name: str | None = None,
+        authorizer: Authorizer | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -110,6 +112,10 @@ class SkillCommandCog(commands.Cog):
         self.claude_channel_id = claude_channel_id
         self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
+        # #713: the one allowlist rule, shared with every other gate (#466's
+        # DRY, finished). ``setup_bridge`` passes the instance ClaudeChatCog
+        # uses, so the owner resolved at startup applies to /skill too.
+        self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
         self._registry = registry or getattr(bot, "session_registry", None)
 
         # Default to ~/.claude/skills/
@@ -157,22 +163,14 @@ class SkillCommandCog(commands.Cog):
         """Check if a member/user is authorized.
 
         Accepts a Member, User, or bare int (user ID) for backward compatibility.
+        Delegates to :class:`Authorizer` (#713): ``/skill`` runs arbitrary
+        skills, so it must not answer this question differently from the gate
+        on plain messages — a second copy of the rule is a second default to
+        get wrong, which is what left ``/skill`` open to everyone.
         """
         if isinstance(member, int):
-            # Legacy call-site: bare user ID — cannot check roles
-            user_id = member
-            if self._allowed_user_ids is not None and user_id in self._allowed_user_ids:
-                return True
-            # Cannot check roles with a bare int
-            return self._allowed_user_ids is None and self._allowed_role_name is None
-
-        if self._allowed_user_ids is not None and member.id in self._allowed_user_ids:
-            return True
-        if self._allowed_role_name is not None:
-            if isinstance(member, discord.Member):
-                return any(r.name == self._allowed_role_name for r in member.roles)
-            return False  # DM — no role info
-        return self._allowed_user_ids is None
+            return self._authorizer.is_allowed_user_id(member)
+        return self._authorizer.is_allowed(member)
 
     async def _skill_name_autocomplete(
         self,

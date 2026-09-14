@@ -17,6 +17,7 @@ import discord
 import pytest
 
 from c_lord.cogs.claude_chat import ClaudeChatCog
+from c_lord.discord_ui.authorization import Authorizer
 from c_lord.discord_ui.permission_help import ThreadCreateForbiddenError
 
 
@@ -51,7 +52,17 @@ def _make_cog() -> ClaudeChatCog:
     runner.working_dir = "/tmp/test"
     runner.model = "sonnet"
     runner.timeout_seconds = 300
-    return ClaudeChatCog(bot=bot, repo=repo, runner=runner, settings_repo=None)
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    return ClaudeChatCog(
+        bot=bot,
+        repo=repo,
+        runner=runner,
+        settings_repo=None,
+        authorizer=Authorizer(allow_anyone=True),
+    )
 
 
 class TestSpawnSessionCreateThreadForbidden:

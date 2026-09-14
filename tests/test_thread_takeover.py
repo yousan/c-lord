@@ -37,6 +37,7 @@ from c_lord.cogs.channel_repo import ChannelRepoCog
 from c_lord.database.channel_repo import ChannelRepository
 from c_lord.database.repository import SessionRecord
 from c_lord.database.thread_repo import ThreadRepository
+from c_lord.discord_ui.authorization import Authorizer
 
 CHANNEL_ID = 500
 THREAD_ID = 601
@@ -72,6 +73,8 @@ def channel_cog(channel_repo, thread_repo, tmp_path) -> ChannelRepoCog:
         repo=channel_repo,
         thread_repo=thread_repo,
         allowed_user_ids=None,
+        # #713: not an authorization test — see tests/test_default_authorization.py
+        authorizer=Authorizer(allow_anyone=True),
         session_dir_base=str(tmp_path / "sessions"),
     )
 
@@ -104,7 +107,13 @@ def _make_cog(channel_cog, *, record=None, tmp_path=None):
     repo.save = AsyncMock()
     runner = MagicMock()
     runner.clone = MagicMock(return_value=MagicMock())
-    cog = ClaudeChatCog(bot=bot, repo=repo, runner=runner)
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    cog = ClaudeChatCog(
+        bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True)
+    )
     cog._run_claude = AsyncMock()  # type: ignore[method-assign]
     cog.spawn_session = AsyncMock()  # type: ignore[method-assign]
     if tmp_path is not None:
@@ -341,7 +350,7 @@ class TestGuidanceMatchesBehaviour:
         """#545 told the reader to run ``/clord`` right here. This PR makes that
         a refusal — so the notice has to change with it, or c-lord instructs
         people to run the command it rejects."""
-        from c_lord.session_resume import UNTRACKED_NOTICE, stopped_hint, ThreadResume
+        from c_lord.session_resume import UNTRACKED_NOTICE, ThreadResume, stopped_hint
 
         for text in (UNTRACKED_NOTICE, stopped_hint(ThreadResume.UNTRACKED)):
             assert "このスレッドで新しく始める" not in text, text
