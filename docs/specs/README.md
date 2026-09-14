@@ -44,6 +44,7 @@
 | [fleet-tmux-restart.md](./fleet-tmux-restart.md) | フリートの tmux が落ちたとき | 巻き添えで止まったスレッドには「あなたのせいではない・作業は残っている」と理由が出る（原因不明のクラッシュ表示にしない） |
 | [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
 | [command-ownership.md](./command-ownership.md) | テキストコマンドの担当と認可 | 同居する c-lord のうち担当1台だけが `!コマンド` に応じ、他は黙る。webhook は owner 設定でも弾かれない |
+| [session-status-board.md](./session-status-board.md) | チャンネルの 📊 Session Status ボード | 板はチャンネルに1枚だけ。再起動しても増えず、既にある板を引き継いで書き換える。📌 はいつも生きている板を指す |
 | [context-footer.md](./context-footer.md) | ターン末尾の 📊 フッタ | 出る値はどれも「そのターンの実測」。CLI 版数は transcript から取り、bot 起動時の値を憶え続けない |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。

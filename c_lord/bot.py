@@ -213,10 +213,18 @@ class ClaudeDiscordBot(commands.Bot):
         if isinstance(channel, discord.TextChannel):
             from .discord_ui.thread_dashboard import ThreadStatusDashboard
 
-            self.thread_dashboard = ThreadStatusDashboard(
-                channel=channel,
-                owner_id=self.owner_id,
-            )
+            # #720: on_ready fires again on every reconnect, not just on start.
+            # Rebuilding the dashboard there would throw away the live session
+            # states — and, before #720, post another board. Keep the instance
+            # we already have for this channel; initialize() then only refreshes.
+            if self.thread_dashboard is None or self.thread_dashboard.channel_id != channel.id:
+                self.thread_dashboard = ThreadStatusDashboard(
+                    channel=channel,
+                    owner_id=self.owner_id,
+                    # #720: so a starting bot can recognise (and take over) the
+                    # board its own previous process left in the channel.
+                    bot_user_id=self.user.id if self.user else None,
+                )
             await self.thread_dashboard.initialize()
             logger.info("Thread status dashboard initialised in channel %d", self.channel_id)
         else:
