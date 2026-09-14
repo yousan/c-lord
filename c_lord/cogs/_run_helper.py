@@ -55,6 +55,7 @@ from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: 
 from ..lounge import build_lounge_prompt
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
+from ..version import runtime_version
 from .event_processor import EventProcessor
 from .run_config import RunConfig  # noqa: F401
 
@@ -358,6 +359,19 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         # rather than showing a guess (#693 AC3).
         cli_version = usage.cli_version
 
+    clord_version: str | None = None
+    if await _context_footer_enabled(settings_repo, "clord_version"):
+        # #722: the opposite rule from ``cli_version`` above, for the opposite
+        # reason. Claude Code updates itself under a running process, so its
+        # version must be re-read every turn. c-lord's own code is fixed at
+        # import time, so its version is pinned at boot (``runtime_version``)
+        # — re-reading the checkout would let an old running build claim the
+        # commit someone just pulled. Both rules say the same thing: report
+        # what actually ran this turn.
+        resolved = runtime_version()
+        # 知らないことは黙る — never render "c-lord unknown".
+        clord_version = resolved if resolved != "unknown" else None
+
     cost_usd: float | None = None
     if await _context_footer_enabled(settings_repo, "cost"):
         get_cost = getattr(config.runner, "get_cost_from_pane", None)
@@ -374,6 +388,7 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         model=model,
         effort=effort,
         cli_version=cli_version,
+        clord_version=clord_version,
         cost_usd=cost_usd,
     )
 

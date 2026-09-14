@@ -30,12 +30,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from ..claude.types import AskQuestion, _parse_ask_questions
+from ..claude.types import AskQuestion, UsageLimit, _parse_ask_questions
 from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
 from ..discord_ui.pane_context import replace_pane_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
 from ..turn_end_bus import turn_end_bus
+from ..usage_limit import (
+    banner_only,
+    folded_notice,
+    is_rate_limit_event,
+    is_refusal_shaped,
+    usage_limit_notices,
+)
 from .formatter import RenderedEvent, render_event
 from .pane_echo import pane_echo
 from .tail import tail_events
@@ -193,6 +200,17 @@ def _transcript_has_ask_result(project_dir: Path, tool_use_id: str) -> bool:
 
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
+
+# #631 AC8: the pane reader and this mirror witness the same limit, and the
+# reader's ⏳ embed is the message that should survive — it names the scope, the
+# reset time and what the reader can do about it.  Which one reaches Discord
+# first, though, is a race, and folding the banner *won* that race: on staging
+# (2026-09-14) the folded line beat the embed by 108 ms and the thread got both,
+# which is exactly the duplication AC8 exists to remove.  So the fold waits this
+# long and asks again.  The reader breaks its poll loop within a poll or two of
+# the banner (0.5 s interval), so this is generous; and because the turn is
+# stalled by definition, the delay costs the reader nothing.
+USAGE_LIMIT_GRACE_SECONDS = 3.0
 
 # Maximum byte size for progress.txt content.  Caps runaway tool output so
 # that progress.txt stays well within Discord's 8 MB file-upload limit.
@@ -393,6 +411,7 @@ class TranscriptMirror:
         verbosity: str = "minimal",
         poll_interval: float = 0.5,
         idle_flush_seconds: float | None = None,
+        usage_limit_grace: float = USAGE_LIMIT_GRACE_SECONDS,
         ask_bridge_cb: AskBridgeCb | None = None,
         progress: TurnProgress | None = None,
     ) -> None:
@@ -424,6 +443,9 @@ class TranscriptMirror:
         self._idle_flush_seconds = (
             idle_flush_seconds if idle_flush_seconds is not None else idle_flush_seconds_env()
         )
+        # #631 AC8: how long to let c-lord's own ⏳ embed win the race before
+        # folding the banner ourselves.  A knob only so tests need not sleep.
+        self._usage_limit_grace = usage_limit_grace
         self._task: asyncio.Task[None] | None = None
 
     def note_turn_started(self) -> None:
@@ -537,6 +559,11 @@ class TranscriptMirror:
         # mistook that answer for a dropped one and re-posted it. The cursor must
         # only ever advance on a real final-answer delivery.
         _delivered_uuid: str | None = None
+        # #631 AC9: has this turn already reported the plan limit?  The CLI
+        # retries internally and writes the same refusal again on each attempt —
+        # six times in one turn on 2026-09-04 — and every copy says exactly the
+        # same thing, so only the first is worth a message.
+        _limit_reported = False
 
         async def _commit_cursor() -> None:
             nonlocal _delivered_uuid
@@ -637,8 +664,20 @@ class TranscriptMirror:
                 # turn's ending from that of the turn its prompt displaced.
                 if _is_user_prompt(event):
                     turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
+                    _limit_reported = False
+                    usage_limit_notices.clear_thread(self.thread_id)
 
                 if _is_turn_end(event):
+                    # #631: a limit reported for the turn that just ended says
+                    # nothing about the next one — the limit may well have reset
+                    # in between, and a thread that silently stops explaining why
+                    # it is stuck is the bug this came from.  c-lord's own notice
+                    # is scoped the same way: AC8 asks whether *this* turn has
+                    # already been told, and leaving the entry standing made the
+                    # next turn silent for the rest of the TTL (staging,
+                    # 2026-09-14: announced 12:53:16, wrongly suppressed 12:54:35).
+                    _limit_reported = False
+                    usage_limit_notices.clear_thread(self.thread_id)
                     if self._verbosity == "minimal":
                         # #539: the turn is over — take the progress line away
                         # before the final answer lands so it never trails
@@ -700,6 +739,31 @@ class TranscriptMirror:
                 if rendered is None:
                     continue
 
+                # #631 AC7: Claude's rate-limit refusal is written to the
+                # transcript as an ordinary assistant message, so the mirror used
+                # to post it verbatim — a bare English line with no explanation
+                # and no recovery time, six times over in the worst thread.  Fold
+                # it into one Japanese line carrying the reset time instead.
+                #
+                # Deliberately NOT held as _pending_text: the refusal is not an
+                # answer, and the CLI often retries past it (the turn then runs
+                # anyway, as it did in six of the eight threads on 2026-09-04).
+                # Letting it become the turn's final answer would ping the owner
+                # with it and, worse, take the place of the answer that follows.
+                # Any text already pending is left pending for the same reason:
+                # a refusal arriving behind it is no proof it was intermediate,
+                # and flushing it here would silently strip its ping.  The cost
+                # is that the notice can precede it in the thread, which is only
+                # an ordering wobble in a case the banner rarely takes (it is
+                # normally the turn's first assistant event).
+                if rendered.kind == "assistant_text":
+                    limit = banner_only(rendered.body)
+                    marked = is_rate_limit_event(event) and is_refusal_shaped(rendered.body)
+                    if limit is not None or marked:
+                        await self._report_usage_limit(limit, reported=_limit_reported)
+                        _limit_reported = True
+                        continue
+
                 if self._verbosity == "minimal":
                     if rendered.kind in _BUFFERED_KINDS:
                         # Tool event: if there's pending text, it was intermediate.
@@ -727,20 +791,35 @@ class TranscriptMirror:
                             replaced = False
                             if bridged.messages:
                                 replaced = await replace_pane_context(bridged.messages, body)
-                            # The pane bridge already delivered this text, so it
-                            # counts as delivered for cursor purposes (#215).
-                            _delivered_uuid = event.get("uuid") or _delivered_uuid
+                            if replaced or not bridged.folded:
+                                # The pane bridge already delivered this text, so
+                                # it counts as delivered for cursor purposes
+                                # (#215).
+                                _delivered_uuid = event.get("uuid") or _delivered_uuid
+                                logger.info(
+                                    "TranscriptMirror: suppressed pane-bridged ask context "
+                                    "thread=%d (markdown replacement: %s)",
+                                    self.thread_id,
+                                    "applied" if replaced else "not applied",
+                                )
+                                # Commit immediately: the text IS delivered, and
+                                # a turn-end marker may never arrive — without
+                                # this a hard-killed bot would re-post it on
+                                # restart (#215).
+                                await _commit_cursor()
+                                continue
+                            # #686: what is in the thread is a FOLD — a pointer
+                            # saying the readable version is coming — and the
+                            # markdown would not fit into it. Suppressing here
+                            # would leave a pointer to nothing, so fall through
+                            # and post it. Not a #680 duplicate: the pointer
+                            # never held the prose.
                             logger.info(
-                                "TranscriptMirror: suppressed pane-bridged ask context "
-                                "thread=%d (markdown replacement: %s)",
+                                "TranscriptMirror: pane-bridged ask context was folded and the "
+                                "markdown did not fit it — posting the markdown instead of "
+                                "suppressing it thread=%d (#686)",
                                 self.thread_id,
-                                "applied" if replaced else "not applied",
                             )
-                            # Commit immediately: the text IS delivered, and a
-                            # turn-end marker may never arrive — without this a
-                            # hard-killed bot would re-post it on restart (#215).
-                            await _commit_cursor()
-                            continue
                         # Another text while one is pending → previous was intermediate.
                         if _pending_text is not None:
                             await _flush_pending_silently()
@@ -782,6 +861,49 @@ class TranscriptMirror:
                     await _flush_pending_as_reply()
                     await _commit_cursor()
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
+
+    async def _report_usage_limit(self, limit: UsageLimit | None, *, reported: bool) -> None:
+        """Say once, in Japanese, that Claude is waiting on a plan limit (#631).
+
+        Says nothing at all when c-lord's own ⏳ notice already went out for this
+        thread (AC8): that message is the richer one — it names the scope, the
+        reset time and what the reader can actually do — and repeating it in
+        different words reads as a second, separate thing having gone wrong.
+        That is what the thread of 2026-09-04 showed, the English copy landing
+        one second after the Japanese one.
+        """
+        if reported:
+            logger.info(
+                "TranscriptMirror: usage-limit banner already reported this turn thread=%d",
+                self.thread_id,
+            )
+            return
+        if usage_limit_notices.announced(self.thread_id):
+            logger.info(
+                "TranscriptMirror: suppressed usage-limit banner thread=%d "
+                "(c-lord already posted its own notice)",
+                self.thread_id,
+            )
+            return
+        # Give the pane reader its head start (see USAGE_LIMIT_GRACE_SECONDS).
+        # Inline rather than in a task: the tail keeps filling its queue while we
+        # wait, so nothing is lost, and every later event still reaches Discord
+        # behind this one.
+        if self._usage_limit_grace > 0:
+            await asyncio.sleep(self._usage_limit_grace)
+            if usage_limit_notices.announced(self.thread_id):
+                logger.info(
+                    "TranscriptMirror: suppressed usage-limit banner thread=%d "
+                    "(c-lord posted its own notice during the grace window)",
+                    self.thread_id,
+                )
+                return
+        logger.info(
+            "TranscriptMirror: folded usage-limit banner thread=%d scope=%s",
+            self.thread_id,
+            limit.scope if limit is not None else "(unparsed)",
+        )
+        await self._try_sink(folded_notice(limit))
 
     async def _deliver_user_files(self, event: dict) -> None:
         """Hand every ``SendUserFile`` call in *event* to the sink (#233).

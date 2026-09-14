@@ -21,6 +21,7 @@ from pathlib import Path
 from ..tmux import TmuxSessionManager, pane_command_is_dead
 from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
+from ..usage_limit import count_usage_limit, extract_usage_limit
 from ..utils.logger import log_ctx
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import (
@@ -415,55 +416,12 @@ def _extract_startup_error(pane: str) -> str | None:
 # never work, because the limit holds until it resets.  So the banner has to be
 # recognised, and its reset time reported instead.
 #
-# The wording comes from the CLI's own builders (verified against the shipped
-# 2.1.252 binary): ``"You've hit your ${label}${suffix}"`` where ``suffix`` is
-# ``" · resets ${when}"`` and ``label`` is one of "weekly limit" (seven_day),
-# "session limit" (five_hour), "Opus limit" / "Sonnet limit" (seven_day_opus /
-# seven_day_sonnet), "usage limit" (overage), "org's monthly usage limit", or a
-# bare "limit"; plus ``"You're out of usage credits${suffix}"``.  ``when`` is
-# rendered as ``"Aug 29, 4pm (Asia/Tokyo)"`` more than a day out and as a bare
-# ``"4pm (Asia/Tokyo)"`` within the day, and the whole clause is absent when the
-# API sent no ``resetsAt``.
-#
-# What must NOT match is just as important: the same screen also carries the
-# *warning* banners ("You've used 79% of your weekly limit · resets ...",
-# "Approaching weekly limit · ...", "You're close to your usage limit"), which
-# render while Claude is working perfectly well.  Treating one of those as a
-# stop would strand a healthy session.
-
-# Leading TUI chrome allowed before the banner: indentation plus the gutter
-# glyphs Claude Code draws beside message and tool-result lines.  Anchoring to
-# a line that holds NOTHING but chrome + banner is what keeps the phrase from
-# matching when it merely appears inside Claude's own prose — the same
-# false-positive class as #156 / #184, and a live one here because c-lord
-# threads discuss this very banner.
-_LIMIT_GUTTER = r"^[^\S\n]*(?:[●⏺⎿╰│┃|>*•-]+[^\S\n]*)*"
-
-# The blocking banners, and the reset clause that may follow them.
-_USAGE_LIMIT_RE = re.compile(
-    _LIMIT_GUTTER
-    + r"(?:You've hit your (?P<scope>[^·\n]+?)"
-    + r"|You(?:'|’)re out of (?P<credits>usage credits))"
-    + r"[^\S\n]*"
-    + r"(?:·[^\S\n]*resets[^\S\n]+(?P<reset>[^·\n]+?)[^\S\n]*)?"
-    + r"(?:·[^\n]*)?$",
-    re.MULTILINE,
-)
-
-
-# The banner's two variable parts end up in Discord — the reset time inside an
-# embed, and the scope inside a PLAIN thread message, which pings.  Both are
-# scraped from a pane whose contents Claude (and therefore any file or web page
-# Claude echoed) can influence, so an ``@everyone`` smuggled through the banner
-# would mass-ping the guild.  The CLI's label vocabulary is small and closed
-# ("weekly limit", "session limit", "Opus limit", "Sonnet limit", "usage limit",
-# "usage credit limit", "org's monthly usage limit", "monthly spend limit",
-# "fast limit", bare "limit"), and its reset rendering is a localised date/time,
-# so anything outside these shapes is not a banner worth acting on: reject it
-# rather than sanitise it, which also keeps false positives down.
-_LIMIT_SCOPE_RE = re.compile(r"^[A-Za-z][A-Za-z' ]{0,39}$")
-_LIMIT_RESET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:,()/_. +-]{0,49}$")
-
+# The banner's vocabulary lives in :mod:`c_lord.usage_limit`, because the
+# transcript mirror meets the same sentence in the jsonl and folds it there
+# (#631 AC7).  Two copies of these patterns would drift, and a drifted copy
+# means one reader stops recognising a limit the other still does.  Only the
+# pane-shaped parts — the choice menu, which exists nowhere but the TUI — stay
+# here.
 
 # The choice menu Claude Code opens under the banner (2.1.252):
 #
@@ -520,18 +478,6 @@ def _usage_limit_menu_open(pane: str) -> bool:
     return False
 
 
-def _count_usage_limit(pane: str) -> int:
-    """How many blocking limit banners are on *pane*.
-
-    A rising count means this turn added one.  Comparing counts rather than the
-    banner text is what makes a repeat of the *same* limit detectable — the text
-    is identical every time.
-    """
-    if not pane:
-        return 0
-    return sum(1 for _ in _USAGE_LIMIT_RE.finditer(pane))
-
-
 def _usage_limit_wait_option(pane: str) -> int | None:
     """0-based index of the limit menu's "keep waiting" option, else None.
 
@@ -558,40 +504,6 @@ def _usage_limit_wait_option(pane: str) -> int | None:
         if any(marker in label for marker in _LIMIT_MENU_WAIT_MARKERS):
             return i
     return None
-
-
-def _extract_usage_limit(pane: str) -> UsageLimit | None:
-    """Return the plan limit shown on *pane*, or None when there is none.
-
-    Only the *blocking* banners count.  The percentage / "Approaching" warnings
-    are deliberately excluded: they share the vocabulary but mean the opposite
-    (Claude is still answering), and stopping a turn on one of those would be
-    the same class of lie this function exists to remove.
-
-    Callers gate this on "no response text yet this turn", the way
-    :func:`_extract_startup_error` is gated — a banner Claude *quotes* inside a
-    real answer must not end that answer's turn (#631).
-    """
-    if not pane:
-        return None
-    match = _USAGE_LIMIT_RE.search(pane)
-    if match is None:
-        return None
-    scope = (match.group("scope") or match.group("credits") or "").strip()
-    if not _LIMIT_SCOPE_RE.match(scope):
-        return None
-    reset = match.group("reset")
-    reset = reset.strip() if reset else None
-    if reset is not None and not _LIMIT_RESET_RE.match(reset):
-        # A banner whose reset clause is not a plain localised time is not one
-        # we will quote at a user.  Keep the limit (it is real) but drop the
-        # part we cannot vouch for, rather than passing it through.
-        reset = None
-    return UsageLimit(
-        scope=scope,
-        resets_at=reset,
-        line=match.group(0).strip()[:300],
-    )
 
 
 # Regex matching [y/N] or [Y/n] inline yes/no prompts (Claude Code v2.1+).
@@ -1757,8 +1669,8 @@ class TmuxClaudeRunner:
                 # _TURN_START_GRACE window.  Gated on ``not last_response`` for
                 # the same reason as the startup error above: the phrase can
                 # legitimately appear inside Claude's own answer.
-                found_limit = _extract_usage_limit(current)
-                limit_count = _count_usage_limit(current)
+                found_limit = extract_usage_limit(current)
+                limit_count = count_usage_limit(current)
                 if not baseline_limit_captured:
                     baseline_limit_captured = True
                     baseline_limit_count = limit_count
@@ -2177,10 +2089,10 @@ class TmuxClaudeRunner:
             if usage_limit is None and not last_response:
                 # Same baseline rule as the poll loop: a banner that was already
                 # there when the turn started belongs to an earlier turn.
-                found_limit = _extract_usage_limit(current)
+                found_limit = extract_usage_limit(current)
                 if found_limit is not None and (
                     _usage_limit_menu_open(current)
-                    or _count_usage_limit(current) > baseline_limit_count
+                    or count_usage_limit(current) > baseline_limit_count
                 ):
                     usage_limit = found_limit
             # #701: asked before every rung below, because a server that was

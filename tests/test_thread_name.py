@@ -401,3 +401,23 @@ class TestSessionLabel:
             session_label="qiita-article",
         )
         assert parse_topic_from_name(name) == "Qiita記事執筆"
+
+
+class TestTruncationIsVisible:
+    """#721: a name that was cut short must say so, in every builder."""
+
+    def test_build_name_truncated_topic_ends_with_ellipsis(self):
+        name = build_name("あ" * 100, "running", 12, lamp=False, issue_ref="404")
+        assert len(name) <= MAX_NAME_LEN
+        assert name.endswith("…"), name
+
+    def test_build_name_leaves_a_fitting_topic_alone(self):
+        assert build_name("認証リファクタ", "running", 3, lamp=False) == "W3 │ 認証リファクタ"
+
+    def test_replace_topic_truncated_topic_ends_with_ellipsis(self):
+        from c_lord.thread_name import replace_topic_in_name
+
+        out = replace_topic_in_name("W3 │ #404 認証", "あ" * 100)
+        assert len(out) <= MAX_NAME_LEN
+        assert out.startswith("W3 │ #404 ")
+        assert out.endswith("…"), out

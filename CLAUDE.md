@@ -40,7 +40,10 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
    - 残っている非等価性: reply 層の装飾 (quote-reply / cli-prefix / prompt-choice) が経路A にあって経路B にまだ無い (#237)。添付ファイルは #233 で解消済み — ミラーが harness の `SendUserFile` `tool_use` を jsonl から読んで自分で添付する (`docs/specs/user-file-delivery.md`)。
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
 3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. See `docs/specs/thread-lamp.md`.
-4. **Tool-use embeds are still driven by the tmux event stream**: `tmux_runner.py` still polls `capture-pane` and emits SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events. Only the ASSISTANT text events were removed (#53). So Discord still gets live "Bash(...)" / "Read(...)" embeds, status emoji, plan-approval buttons, etc. — none of that goes through the (removed) text-post path.
+4. **ツールの実行状況は embed ではなく jsonl ミラー由来の 2 か所に出る** (#723): `tmux_runner.py` はいまも `capture-pane` を polling しているが、**yield するイベントは SYSTEM と RESULT の 2 種だけ**。SYSTEM は (a) session_id を DB に保存させる合成イベント、(b) TUI のメニューを Discord のボタンへ橋渡しする `pane_ask` (#166/#251)、(c) 未知の対話プロンプトを知らせる `unknown_tui_prompt` の 3 用途。RESULT はターン完了 / エラー / usage limit。**`tool_use` / `todo_list` / `permission_request` / `elicitation` をセットする箇所はコードのどこにも無い** (`grep -rn "tool_use=" c_lord/` が 0 件) ので、`tool_use_embed()` / `discord_ui/tool_timer.py` / `EventProcessor._handle_tool_use()` は**本番で一度も呼ばれていない**（実測: 2026-06-05〜2026-09-11 の bot メッセージ 10,607 通に tool-use embed は 0 件）。
+   - **いまツールの様子が見えるのは 2 か所**、どちらも供給元は tmux イベントではなく **jsonl ミラー**: ターンが 90 秒沈黙したときに出る turn progress line (`-# ⚙️ 作業中 5:56 · 🔧 Bash: … · ツール 61 件`、`discord_ui/turn_progress.py`) と、返信に添付される `progress.txt` (`transcript/formatter.py` が `🔧 Bash: …` の形に畳む)。
+   - **permission プロンプトは Discord に出ない** — `tmux_runner._accept_permission_prompt()` がペイン内で自動承認する。**plan 承認 (ExitPlanMode) と AskUserQuestion は同じ `pane_ask` の ask bridge** を通って Discord のボタンになる (#166/#251、`discord_ui/ask_handler.py`)。ステータス絵文字はターン開始と SYSTEM / RESULT から駆動される (決定 3)。
+   - 到達不能になった `tool_use_embed` / `tool_timer.py` / `_handle_tool_use` は**まだコードに残っている**（消すかどうかは別判断 — #723 の Out of scope）。触る前に「では誰が `tool_use` をセットするのか」を確かめること。
 5. **Installable package**: `c_lord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
 6. **Shared run helper**: `cogs/_run_helper.py` centralizes Claude CLI execution logic used by both ClaudeChatCog and SkillCommandCog.
 7. **REST API as the control plane**: Claude Code subprocesses communicate back to c-lord via REST API (`CLORD_API_URL` env var), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
@@ -172,6 +175,9 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
 **構造化コンテキスト**: 重要な処理ポイントには `log_ctx()` ヘルパー (`c_lord/utils/logger.py`) で `[thread=<id> session=<short> task=<id> channel=<id>]` 形式の prefix が付く。これで `grep "thread=12345"` すると 1 スレッドの一連の処理を抽出できる。`session=` は UUID-shaped (≥32 文字) のときは先頭セグメントだけに省略される。
 
 **主要な入口/出口ログ**:
+- `setup.py:setup_bridge` — `c-lord version v1.4.183-bd80c47e-20260908` (#722)。**起動ログで最初に見る行**。
+  「そのインスタンスがいつのビルドで走っているか」がここにしか無い（`grep -i version <log>`）。
+  古いビルドは「その機能はありません」と利用者に答えてしまうので、挙動が古く見えたらまずこれを見る
 - `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit` (Claude 実行 1 回ごと)
 - `cogs/scheduler.py:_run_task` — `_run_task: enter` / `_run_task: exit` (スケジュール実行ごと)
 - `cogs/scheduler.py:_master_loop` — `SchedulerCog: N task(s) due (ids=[...])` (30 秒ごと、due があるときのみ)

@@ -19,9 +19,7 @@ from c_lord.claude.tmux_runner import (
     USAGE_LIMIT_ERROR_PREFIX,
     TmuxClaudeRunner,
     _clean_tui_lines,
-    _count_usage_limit,
     _extract_startup_error,
-    _extract_usage_limit,
     _is_ask_submit_screen,
     _normalize_capture,
     _parse_ask_from_pane,
@@ -36,6 +34,7 @@ from c_lord.claude.types import (
     FREE_TEXT_ROW,
     MessageType,
 )
+from c_lord.usage_limit import count_usage_limit, extract_usage_limit
 
 
 @pytest.fixture
@@ -4035,7 +4034,7 @@ class TestUsageLimitDetection:
         the turn fell through to "No response — … Send the message again".
         """
         pane = _load_fixture("usage_limit_weekly_hit.txt")
-        limit = _extract_usage_limit(pane)
+        limit = extract_usage_limit(pane)
         assert limit is not None
         assert limit.scope == "weekly limit"
         assert limit.resets_at == "Aug 29, 4pm (Asia/Tokyo)"
@@ -4096,7 +4095,7 @@ class TestUsageLimitDetection:
     def test_blocking_variants(self, line: str, scope: str, resets_at: str | None) -> None:
         """Every blocking banner the CLI can print must be recognised (AC4)."""
         pane = f"● Some earlier output\n\n  ⎿  {line}\n\n❯ \n"
-        limit = _extract_usage_limit(pane)
+        limit = extract_usage_limit(pane)
         assert limit is not None, line
         assert limit.scope == scope
         assert limit.resets_at == resets_at
@@ -4117,7 +4116,7 @@ class TestUsageLimitDetection:
     def test_warning_variants_are_not_a_limit(self, line: str) -> None:
         """Approaching/percentage banners are warnings, not a stop (AC4)."""
         pane = f"● Some earlier output\n\n  ⎿  {line}\n\n❯ \n"
-        assert _extract_usage_limit(pane) is None
+        assert extract_usage_limit(pane) is None
 
     def test_prose_quoting_the_banner_is_not_a_limit(self) -> None:
         """The phrase inside a sentence must not trip detection.
@@ -4130,11 +4129,11 @@ class TestUsageLimitDetection:
             "  それを c-lord が検知していないのが #631 です。\n"
             "\n❯ \n"
         )
-        assert _extract_usage_limit(pane) is None
+        assert extract_usage_limit(pane) is None
 
     def test_clean_pane_is_not_a_limit(self) -> None:
         """An ordinary working pane must not be read as limited."""
-        assert _extract_usage_limit(_load_fixture("running_spinner_above_footer.txt")) is None
+        assert extract_usage_limit(_load_fixture("running_spinner_above_footer.txt")) is None
 
 
 def _stub_limit_appearing(tmux_manager) -> None:
@@ -4282,7 +4281,7 @@ class TestUsageLimitInjectionSafety:
         ],
     )
     def test_mention_bearing_banner_is_rejected(self, line: str) -> None:
-        limit = _extract_usage_limit(f"  ⎿  {line}\n\n❯ \n")
+        limit = extract_usage_limit(f"  ⎿  {line}\n\n❯ \n")
         if limit is not None:
             rendered = f"{limit.scope} {limit.resets_at or ''}"
             assert "@everyone" not in rendered, rendered
@@ -4304,7 +4303,7 @@ class TestUsageLimitInjectionSafety:
             "limit",
         ):
             pane = f"  ⎿  You've hit your {scope} · resets Sep 4, 5pm (Asia/Tokyo)\n\n❯ \n"
-            limit = _extract_usage_limit(pane)
+            limit = extract_usage_limit(pane)
             assert limit is not None, scope
             assert limit.scope == scope
 
@@ -4318,7 +4317,7 @@ class TestUsageLimitInjectionSafety:
             "Oct 1, 9am (UTC)",
         ):
             pane = f"  ⎿  You've hit your weekly limit · resets {reset}\n\n❯ \n"
-            limit = _extract_usage_limit(pane)
+            limit = extract_usage_limit(pane)
             assert limit is not None, reset
             assert limit.resets_at == reset
 
@@ -4411,7 +4410,7 @@ class TestUsageLimitChoiceMenu:
 
     def test_real_menu_pane_is_detected_as_a_limit(self) -> None:
         pane = _normalize_capture(_load_fixture("usage_limit_choice_menu_v2_1_252.txt"))
-        limit = _extract_usage_limit(pane)
+        limit = extract_usage_limit(pane)
         assert limit is not None
         assert limit.scope == "weekly limit"
         assert limit.resets_at == "Sep 4, 6:10pm (Asia/Tokyo)"
@@ -4507,7 +4506,7 @@ class TestUsageLimitRepeatDetection:
     def test_repeat_pane_has_two_banners_and_an_open_menu(self) -> None:
         """The staging capture of a second consecutive refusal."""
         pane = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
-        assert _count_usage_limit(pane) == 2
+        assert count_usage_limit(pane) == 2
         assert _usage_limit_menu_open(pane) is True
         # 4 options here, not 3 — the menu shape varies, so the wait option must
         # still be found by name.
@@ -4516,7 +4515,7 @@ class TestUsageLimitRepeatDetection:
     def test_menu_is_not_open_on_a_plain_banner_pane(self) -> None:
         pane = _load_fixture("usage_limit_weekly_hit.txt")
         assert _usage_limit_menu_open(pane) is False
-        assert _count_usage_limit(pane) == 1
+        assert count_usage_limit(pane) == 1
 
     def test_an_unrelated_menu_is_not_the_limit_menu(self) -> None:
         """Only the limit's own menu counts — not every numbered TUI menu."""
@@ -5367,9 +5366,7 @@ class TestTurnEndFromTranscript:
         assert result[0].error.startswith(NO_RESPONSE_ERROR_PREFIX), result[0].error
 
     @pytest.mark.asyncio
-    async def test_a_marker_before_our_prompt_does_not_close_the_turn(
-        self, tmux_manager
-    ) -> None:
+    async def test_a_marker_before_our_prompt_does_not_close_the_turn(self, tmux_manager) -> None:
         """Order matters, not just presence: end-then-prompt is the predecessor.
 
         Same displaced-turn shape as above, but here c-lord's prompt DOES reach
