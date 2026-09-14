@@ -2,8 +2,8 @@
 
 Exposes ``/version`` (slash) and ``!version`` (text/mention twin, so it is
 webhook-invokable for E2E like the other ops commands, #209/#230). The string
-follows the article format ``v1.4.0-b<commit>-<YYYYMMDD>`` resolved by
-:func:`c_lord.version.resolve_version`.
+follows the article format ``v1.4.0-b<commit>-<YYYYMMDD>`` reported by
+:func:`c_lord.version.runtime_version`.
 
 Read-only — no permission gate needed. Auto-registered by ``setup_bridge`` so
 consumers get it by updating the package alone (zero-config principle).
@@ -18,7 +18,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..discord_ui.embeds import COLOR_INFO
-from ..version import resolve_version
+from ..version import runtime_version
 
 _Responder = Callable[..., Awaitable[None]]
 
@@ -70,8 +70,15 @@ class VersionCog(commands.Cog):
         return respond
 
     async def _version_impl(self, *, respond: _Responder) -> None:
-        """Shared core for /version and !version."""
-        await respond(embed=version_embed(resolve_version()))
+        """Shared core for /version and !version.
+
+        #722: reports :func:`runtime_version` — the build this process is
+        running — not the checkout as it stands right now. After a ``git pull``
+        without a restart the two differ, and the running one is the answer to
+        "why did it behave like that?". It is also the value the boot log and
+        the 📊 footer print, so the three can never contradict each other.
+        """
+        await respond(embed=version_embed(runtime_version()))
 
     @app_commands.command(name="version", description="Show the running c-lord build version")
     async def version(self, interaction: discord.Interaction) -> None:

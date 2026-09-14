@@ -38,6 +38,8 @@ import contextlib
 import logging
 import re
 
+from .thread_name import truncate_with_ellipsis
+
 logger = logging.getLogger(__name__)
 
 # 20 characters is the upper bound for the topic body (Japanese full-width
@@ -80,12 +82,33 @@ _SUMMARIZE_PROMPT_TEMPLATE = (
     "\n<conversation>\n{conversation}\n</conversation>"
 )
 
-_URL_RE = re.compile(r"https?://\S+")
+# ``\S*`` (not ``\S+``) so a bare "http://" — nothing after the slashes — is
+# stripped too. #721 AC2 forbids the scheme from appearing at all, not just
+# whole URLs.
+_URL_RE = re.compile(r"https?://\S*")
 _MENTION_RE = re.compile(r"<[@#!&][^>]+>|@\w+")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 _WHITESPACE_RE = re.compile(r"\s+")
 _FALLBACK_TOPIC = "新しいスレッド"
+
+# --- markdown scrubbing (#721) ------------------------------------------------
+# A name is read, never rendered: the markers that make Discord draw a heading or
+# bold text are pure noise in a sidebar entry, and they are what a blind cut
+# leaves dangling (``**bug(P1): 経路A→B でファ``).
+#
+# ``[text](url)`` → ``text``. Runs before the URL strip, which would otherwise
+# eat the closing paren and leave ``[text](`` behind.
+_MD_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+# A leading ``#``-run that is a heading — it has whitespace after it. ``#233``
+# does not, and must survive: it is the thread's identity (#414).
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}[ \t]+")
+_MD_QUOTE_RE = re.compile(r"^[ \t]*(?:>[ \t]*)+")
+# ``- ``, ``* ``, ``+ ``, ``1. `` — with the GitHub checkbox that often follows.
+_MD_BULLET_RE = re.compile(r"^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+(?:\[[ xX]?\][ \t]+)?")
+# Inline emphasis and any leftover fence/backtick or ``##``-style hash run.
+# A single ``_`` is left alone: it is a word character in snake_case, not markup.
+_MD_INLINE_RE = re.compile(r"\*+|_{2,}|~~|`+|#{2,}")
 
 # Minimum length for a message to be considered instruction-like.
 _INSTRUCTION_MIN_LEN = 15
@@ -95,22 +118,51 @@ _INSTRUCTION_MIN_LEN = 15
 _INVALID_TOPIC_MARKERS = ("許可", "Permission", "権限", "申し訳", "---")
 
 
+def _clean_line(line: str) -> str:
+    """Strip markdown, URLs and mentions from one line; collapse its whitespace.
+
+    Returns ``""`` when nothing readable is left (a line that was only a URL, a
+    bullet marker or a code fence).
+    """
+    text = _MD_QUOTE_RE.sub("", line)
+    text = _MD_BULLET_RE.sub("", text)
+    text = _MD_HEADING_RE.sub("", text)
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _INLINE_CODE_RE.sub(" ", text)
+    text = _URL_RE.sub(" ", text)
+    text = _MENTION_RE.sub(" ", text)
+    text = _MD_INLINE_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
 def heuristic_topic(first_message: str) -> str:
     """Derive a topic from ``first_message`` without invoking any LLM.
 
     Always returns a non-empty string ≤20 chars.  Pure function — safe
     to call from anywhere.
+
+    **One line, no markup, and the cut is visible (#721).**  The topic is built
+    from a *single* line of the message — never two joined together — with
+    markdown markers, URLs and mentions removed, and an ``…`` written wherever it
+    had to be cut short.  The dispatch prompts this mostly sees are an
+    instruction line, then a URL line, then a ``**title**`` line; concatenating
+    them produced names like ``#233 を担当してください。https://github.com/…**bug(P1):
+    経路A→B でファ`` that no one can tell apart in a sidebar.
+
+    Lines that clean to nothing (a bare URL, a fence marker) are skipped rather
+    than allowed to win: the first line that *says* something is the name.  That
+    is still one line — nothing is ever joined across a newline.
     """
     if not first_message:
         return _FALLBACK_TOPIC
-    text = _CODE_FENCE_RE.sub(" ", first_message)
-    text = _INLINE_CODE_RE.sub(" ", text)
-    text = _URL_RE.sub(" ", text)
-    text = _MENTION_RE.sub(" ", text)
-    text = _WHITESPACE_RE.sub(" ", text).strip()
-    if not text:
-        return _FALLBACK_TOPIC
-    return text[:_TOPIC_MAX_LEN]
+    # Fenced blocks go first, replaced by a newline rather than a space: a fence
+    # spans lines, and collapsing it to a space would join the text around it.
+    text = _CODE_FENCE_RE.sub("\n", first_message)
+    for line in text.splitlines():
+        cleaned = _clean_line(line)
+        if cleaned:
+            return truncate_with_ellipsis(cleaned, _TOPIC_MAX_LEN)
+    return _FALLBACK_TOPIC
 
 
 def initial_topic(thread_name: str, first_message: str) -> str:

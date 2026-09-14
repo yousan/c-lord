@@ -74,6 +74,7 @@ from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
+from ..workspace_notice import restored_devenv_notice
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -128,6 +129,25 @@ _SEND_PERMISSION_HELP = (
     "Bot に「メッセージの送信」「公開スレッドでのメッセージ送信」"
     "「プライベートスレッドでのメッセージ送信」を付与してください。"
 )
+
+
+#: Discord's own hard cap on a thread name.
+_DISCORD_NAME_LEN = 100
+
+
+def _explicit_thread_name(thread_name: str | None) -> str:
+    """The caller's chosen thread name, trimmed to something Discord accepts.
+
+    A name passed in explicitly (``POST /api/spawn``, a command) is a decision
+    someone made, so it is kept as written — only the newlines Discord would
+    flatten into an unreadable run are dropped (#721). Returns ``""`` when no
+    usable name was given, which is the caller's signal to derive one from the
+    prompt instead.
+    """
+    for line in (thread_name or "").splitlines():
+        if line.strip():
+            return line.strip()[:_DISCORD_NAME_LEN]
+    return ""
 
 
 def _requester_of_turn(
@@ -1810,7 +1830,11 @@ class ClaudeChatCog(commands.Cog):
 
     async def _handle_new_conversation(self, message: discord.Message) -> None:
         """Create a new thread and start a Claude Code session."""
-        thread_name = message.content[:100] if message.content else "Claude Chat"
+        # #721: a readable name, not a raw cut of the prompt. This one is
+        # permanent in a way the thread's own name is not — Discord writes it
+        # into the channel's "started a thread" line, which no later rename
+        # touches — so the channel keeps whatever is written here forever.
+        thread_name = topic_module.heuristic_topic(message.content or "")
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
         try:
             thread = await message.create_thread(
@@ -1853,8 +1877,9 @@ class ClaudeChatCog(commands.Cog):
         Args:
             channel: The parent text channel in which to create the thread.
             prompt: The instruction to send to Claude Code.
-            thread_name: Optional thread title; defaults to the first 100 chars
-                of *prompt*.
+            thread_name: Optional thread title; defaults to a readable topic
+                derived from *prompt* (#721 — one line, no markdown or URLs,
+                ``…`` when cut short).
             session_id: Optional Claude session ID to resume via ``--resume``.
                         When supplied the new Claude process continues the
                         previous conversation rather than starting fresh.
@@ -1871,7 +1896,10 @@ class ClaudeChatCog(commands.Cog):
         Returns:
             The newly created :class:`discord.Thread`.
         """
-        name = (thread_name or prompt)[:100]
+        # #721: an explicit name is the caller's own words — keep it, minus the
+        # newlines Discord would flatten. Only the prompt-derived default gets
+        # cleaned up into a topic.
+        name = _explicit_thread_name(thread_name) or topic_module.heuristic_topic(prompt)
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
         try:
             thread = await channel.create_thread(
@@ -2461,6 +2489,27 @@ class ClaudeChatCog(commands.Cog):
             log_ctx(thread_id=thread.id),
             "auto" if auto else "manual",
         )
+
+        # #730: 停止 stopped this workspace's containers, and reopening it
+        # deliberately does not start them again — #540 decided compose (tens of
+        # seconds to minutes) must not run just because someone came back to read
+        # the conversation. This line is the other half of that decision: without
+        # it the reader is told the workspace is back and is left to discover the
+        # environment is not, as a connection refused ten minutes later.
+        #
+        # The chokepoint for both remaining restores — the 7-day stop undone by a
+        # message (#700) and the 「▶️ 再開する」 button (#512) — so neither can
+        # end up with its own wording. Best effort throughout: a wedged docker
+        # costs a sentence, never the reopen.
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(
+                thread.parent_id or thread.id, thread_id=thread.id
+            )
+            if sdm is not None:
+                line = await restored_devenv_notice(str(Path(sdm.base_dir) / str(thread.id)))
+                if line is not None:
+                    with contextlib.suppress(discord.HTTPException):
+                        await thread.send(line)
 
     async def _post_closed_notice(self, thread: discord.Thread, message: discord.Message) -> None:
         """Tell the user the thread is closed and offer a one-click reopen (#512).

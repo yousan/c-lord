@@ -452,8 +452,9 @@ class ApiServer:
             prompt: The instruction to send to Claude (required).
             channel_id: Parent channel ID (optional; defaults to the
                 ``default_channel_id`` configured at startup).
-            thread_name: Custom thread title (optional; defaults to the
-                first 100 characters of *prompt*).
+            thread_name: Custom thread title (optional; defaults to a
+                readable topic derived from *prompt* — #721: one line, no
+                markdown or URLs, ``…`` when it had to be cut short).
 
         Returns (201):
             ``{"status": "spawned", "thread_id": "...", "thread_name": "..."}``

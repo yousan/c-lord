@@ -143,6 +143,15 @@ async def setup_bridge(
     from .database.task_repo import TaskRepository
     from .database.thread_repo import ThreadRepository
     from .legacy_env import warn_removed_delivery_env
+    from .version import runtime_version
+
+    # #722: the first thing a startup log should answer is "which build is
+    # this?". Until now nothing did — 30+ lines of INFO and ``grep -i version``
+    # found nothing — so an instance could sit two days behind and tell its
+    # user a shipped feature "does not exist" with no way for anyone to
+    # notice. Logged here rather than in main() so instance repos that call
+    # setup_bridge() themselves get it too (Zero-Config).
+    logger.info("c-lord version %s", runtime_version())
 
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:
