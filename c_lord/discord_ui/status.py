@@ -57,13 +57,14 @@ class StatusManager:
         self._message = message
         self._current_emoji: str | None = None
         self._stall_task: asyncio.Task | None = None
+        self._turn_active = False
         self._lock = asyncio.Lock()
         self._last_activity = asyncio.get_running_loop().time()
 
     async def set_running(self) -> None:
         """🟢 — Claude is actively working (turn start)."""
         await self._set_reaction(EMOJI_RUNNING)
-        self._start_stall_timer()
+        await self._start_stall_timer()
 
     async def set_thinking(self) -> None:
         """Alias for :meth:`set_running` — work continues, lamp stays 🟢."""
@@ -86,7 +87,7 @@ class StatusManager:
 
     async def set_waiting(self) -> None:
         """🟡 — flip the lamp to *waiting for user input*."""
-        self._cancel_stall_timer()
+        await self._stop_stall_timer()
         await self._set_reaction(EMOJI_WAITING)
 
     async def set_compact(self) -> None:
@@ -96,25 +97,42 @@ class StatusManager:
 
     async def set_error(self) -> None:
         """❌ — the turn ended in an error (temporary override, left visible)."""
-        self._cancel_stall_timer()
+        await self._stop_stall_timer()
         await self._set_reaction(EMOJI_ERROR)
 
     async def cleanup(self) -> None:
         """Remove the current status reaction."""
-        self._cancel_stall_timer()
+        await self._stop_stall_timer()
         async with self._lock:
             await self._remove_current_locked()
             self._current_emoji = None
 
-    async def _set_reaction(self, emoji: str) -> None:
+    async def _paint_stall(self, emoji: str) -> None:
+        """Paint a stall override (⏳/⚠️) — but only while the turn is running.
+
+        The monitor decides to paint from its own task, so a paint decided just
+        before the turn ended can land just after it. The lamp is final by then,
+        so a late override must be dropped rather than reopen it (#718).
+        """
+        await self._set_reaction(emoji, only_while_running=True)
+
+    async def _set_reaction(self, emoji: str, *, only_while_running: bool = False) -> None:
         """Replace the current reaction with ``emoji`` (immediate, single-flight)."""
         async with self._lock:
+            if only_while_running and not self._turn_active:
+                return
             if self._current_emoji == emoji:
                 return
             await self._remove_current_locked()
+            # Record the target *before* the request goes out: ``add_reaction``
+            # applies on Discord the moment the request is sent, so a cancel
+            # landing while we await the response must not leave us believing
+            # the *old* emoji is still the one on the message. It did, and the
+            # next paint then removed that old emoji and left two lamps side by
+            # side — ⚠️ next to 🟡 on a turn that had finished (#718).
+            self._current_emoji = emoji
             with contextlib.suppress(discord.HTTPException):
                 await self._message.add_reaction(emoji)
-            self._current_emoji = emoji
 
     async def _remove_current_locked(self) -> None:
         """Remove the bot's current reaction. Caller must hold ``self._lock``."""
@@ -124,26 +142,42 @@ class StatusManager:
                 if guild:
                     await self._message.remove_reaction(self._current_emoji, guild.me)
 
-    def _start_stall_timer(self) -> None:
+    async def _start_stall_timer(self) -> None:
         """Start the stall detection timer."""
-        self._cancel_stall_timer()
+        await self._stop_stall_timer()
         self._last_activity = asyncio.get_running_loop().time()
+        self._turn_active = True
         self._stall_task = asyncio.create_task(self._stall_monitor())
 
     def _reset_stall_timer(self) -> None:
         """Reset the stall timer (activity detected)."""
         self._last_activity = asyncio.get_running_loop().time()
 
-    def _cancel_stall_timer(self) -> None:
-        """Cancel the stall timer."""
-        if self._stall_task and not self._stall_task.done():
-            self._stall_task.cancel()
+    async def _stop_stall_timer(self) -> None:
+        """Stop the stall monitor and *wait for it to be gone* (#718).
+
+        ``task.cancel()`` only **requests** cancellation: a monitor already
+        inside ``_set_reaction`` keeps running as far as its next await, and the
+        ⚠️ it had already sent to Discord stays on the message. Awaiting the
+        task makes the monitor provably finished before the turn's final lamp
+        is painted, so that final paint sees the true current emoji.
+        """
+        self._turn_active = False
+        task, self._stall_task = self._stall_task, None
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        # ``asyncio.wait`` waits without re-raising the monitor's CancelledError
+        # (and without swallowing a cancellation aimed at *us*).
+        await asyncio.wait({task})
 
     async def _stall_monitor(self) -> None:
         """Monitor for stall conditions and override the lamp accordingly."""
         soft_warned = False
         while True:
             await asyncio.sleep(2)
+            if not self._turn_active:
+                return
             elapsed = asyncio.get_running_loop().time() - self._last_activity
 
             if elapsed >= STALL_HARD_SECONDS and self._current_emoji != EMOJI_STALL_HARD:
@@ -151,11 +185,11 @@ class StatusManager:
                 # It used to also post a prose line into the thread saying the
                 # same thing — a warning for what is a normal long think, and
                 # repeatable several times in one turn.
-                await self._set_reaction(EMOJI_STALL_HARD)
+                await self._paint_stall(EMOJI_STALL_HARD)
             elif (
                 elapsed >= STALL_SOFT_SECONDS
                 and not soft_warned
                 and self._current_emoji != EMOJI_STALL_HARD
             ):
-                await self._set_reaction(EMOJI_STALL_SOFT)
+                await self._paint_stall(EMOJI_STALL_SOFT)
                 soft_warned = True
