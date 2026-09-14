@@ -420,7 +420,17 @@ The bot supports two authorization methods (OR logic — either one grants acces
 1. **User ID** — Set `DISCORD_OWNER_ID` in `.env` to restrict commands to a specific user.
 2. **Discord Role** — Set `CLORD_ALLOWED_ROLE` in `.env` to a role name (e.g., `claude-operator`). Any member with that role can use the bot.
 
-If neither is configured, all users can use the bot.
+If neither is configured, c-lord asks Discord who owns the application and
+allows **only that account** (or, for a team-owned app, that team's members) —
+nothing to configure, and not open to the server. Talking to c-lord runs shell
+commands on its host, so "not configured" must not mean "everyone" (#713). The
+startup log says who ended up allowed.
+
+3. **Everyone, explicitly** — `CLORD_ALLOW_ANYONE=1` restores the pre-#713
+   behavior where any member of the server can drive the bot. c-lord logs a
+   warning at startup when it is set.
+
+See [specs/authorization-default.md](specs/authorization-default.md).
 
 ---
 

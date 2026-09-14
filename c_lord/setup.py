@@ -142,10 +142,18 @@ async def setup_bridge(
     from .database.settings_repo import SettingsRepository
     from .database.task_repo import TaskRepository
     from .database.thread_repo import ThreadRepository
+    from .discord_ui.authorization import Authorizer
 
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:
         allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
+
+    # #713: ONE allowlist predicate for every gate — messages, buttons,
+    # /skill and /clord-init. They used to carry their own copies, which is how
+    # two of them kept the fail-open default after #466 fixed it for the other
+    # two. Sharing the instance also means the app owner resolved at on_ready
+    # is in effect everywhere at once.
+    authorizer = Authorizer(allowed_user_ids, allowed_role_name)
 
     # Lounge shares the coordination channel unless explicitly overridden
     if lounge_channel_id is None:
@@ -194,6 +202,7 @@ async def setup_bridge(
         max_concurrent=max_concurrent,
         allowed_user_ids=allowed_user_ids,
         allowed_role_name=allowed_role_name,
+        authorizer=authorizer,
         ask_repo=ask_repo,
         lounge_repo=lounge_repo,
         resume_repo=resume_repo,
@@ -230,6 +239,7 @@ async def setup_bridge(
         thread_repo=thread_repo,
         allowed_user_ids=allowed_user_ids,
         allowed_role_name=allowed_role_name,
+        authorizer=authorizer,
         session_dir_base=session_dir_base,
         session_repo=session_repo,
     )
@@ -245,6 +255,7 @@ async def setup_bridge(
             claude_channel_id=claude_channel_id,
             allowed_user_ids=allowed_user_ids,
             allowed_role_name=allowed_role_name,
+            authorizer=authorizer,
         )
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")

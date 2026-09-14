@@ -18,6 +18,7 @@ from c_lord.cogs.channel_repo import ChannelRepoCog
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.database.channel_repo import ChannelRepository
 from c_lord.database.thread_repo import ThreadRepository
+from c_lord.discord_ui.authorization import Authorizer
 
 REPO_B = "git@github.com:yousan/dotclaude.git"
 
@@ -45,6 +46,8 @@ def channel_cog(channel_repo, thread_repo, tmp_path) -> ChannelRepoCog:
         repo=channel_repo,
         thread_repo=thread_repo,
         allowed_user_ids=None,
+        # #713: not an authorization test — see tests/test_default_authorization.py
+        authorizer=Authorizer(allow_anyone=True),
         session_dir_base=str(tmp_path / "sessions"),
     )
 
@@ -59,7 +62,13 @@ def _make_cog(channel_cog: ChannelRepoCog | None = None) -> ClaudeChatCog:
     repo.save = AsyncMock()
     runner = MagicMock()
     runner.clone = MagicMock(return_value=MagicMock())
-    return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
+    # #713: this file is not about *who* may drive c-lord. The shipped
+    # default is owner-only, resolved from Discord at on_ready — which a
+    # unit test never reaches — so the gate is opened explicitly here and
+    # the rule itself is pinned in tests/test_default_authorization.py.
+    return ClaudeChatCog(
+        bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True)
+    )
 
 
 def _make_text_channel(channel_id: int = 500) -> MagicMock:

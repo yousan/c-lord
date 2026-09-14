@@ -77,7 +77,8 @@ class ClaudeDiscordBot(commands.Bot):
         # #466: allowlist predicate, published by ClaudeChatCog on load.  Used
         # here to re-arm restored persistent AskViews and by AutoUpgradeCog so
         # button clicks enforce the same allowlist as messages.  None until a
-        # cog sets it (⇒ no allowlist ⇒ everyone may click — zero-config).
+        # cog sets it; an unset one means the unconfigured rule, which since
+        # #713 is the app owner only rather than everyone.
         self.authorizer: Authorizer | None = None
 
     async def process_commands(self, message: discord.Message, /) -> None:

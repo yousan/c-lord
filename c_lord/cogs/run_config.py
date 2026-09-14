@@ -109,7 +109,8 @@ class RunConfig:
     working_dir: str | None = None
     # #466: allowlist predicate forwarded to interactive Views so button
     # clicks (permission / plan / elicitation / ask) are gated to the same
-    # allowed users as messages. None ⇒ no allowlist ⇒ everyone may click.
+    # allowed users as messages. None ⇒ the unconfigured rule ⇒ the app owner
+    # only (#713), never everyone.
     authorizer: Authorizer | None = None
     # #480: Discord user to @-mention when an interactive prompt (permission /
     # plan / elicitation / AskUserQuestion) pauses the turn awaiting input.

@@ -205,7 +205,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Session ID validation** — Strict regex before passing to `--resume`
 - **Flag injection prevention** — `--` separator before all prompts
 - **Secret isolation** — Bot token stripped from subprocess environment
-- **User authorization** — `allowed_user_ids` restricts who can invoke Claude
+- **User authorization** — `allowed_user_ids` / `CLORD_ALLOWED_ROLE` restrict who can invoke Claude. **With neither configured, only the Discord application's own owner may use the bot** — talking to c-lord runs shell commands on its host, so "not configured" is not "everyone" (#713). `CLORD_ALLOW_ANYONE=1` opens it to the whole server on purpose (and says so at startup). See [docs/specs/authorization-default.md](docs/specs/authorization-default.md)
 
 ---
 
@@ -385,7 +385,9 @@ uv lock --upgrade-package c-lord && uv sync
 | `MAX_CONCURRENT_SESSIONS` | Max **turns running at once**. Not a cap on resident `claude` processes — the semaphore wraps turn execution only and is released when the turn ends, while the tmux pane lives on. For the resident cap see `CLORD_MAX_RESIDENT_WORKSPACES` (#576). | `3` |
 | `CLORD_MAX_RESIDENT_WORKSPACES` | Max workspaces holding a live `claude` at once. Over the cap, the longest-idle ones are put to sleep; creating a new workspace is never blocked. Unlike the idle TTLs this default **is** host-dependent, so it is computed from `MemTotal` (cgroup limit first) rather than shipped as a constant. `0` disables. See `docs/specs/resident-cap.md`. | auto (`max(2, MemTotal_GiB × 0.4 / 0.45)`) |
 | `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout | `300` |
-| `DISCORD_OWNER_ID` | User ID to @-mention when Claude needs input | (optional) |
+| `DISCORD_OWNER_ID` | User ID allowed to drive the bot, and @-mentioned when Claude needs input. Unset, the bot allows only the Discord application's owner (#713) | (optional) |
+| `CLORD_ALLOWED_ROLE` | Discord role name whose members may drive the bot (OR with `DISCORD_OWNER_ID`) | (optional) |
+| `CLORD_ALLOW_ANYONE` | `1` lets **every** member of the server drive the bot — which means running shell commands on the host. Warned about at startup | `false` |
 | `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end 🟡 + pauses + failures), `blocked` (pauses + failures — quiet when it works, loud when it breaks), `off` (never, failures included) | `blocked` |
 | `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
 | `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
