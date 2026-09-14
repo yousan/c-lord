@@ -28,6 +28,7 @@ from ..claude.context_usage import (
     read_latest_usage,
 )
 from ..claude.tmux_runner import (
+    CLAUDE_VANISHED_ERROR_PREFIX,
     FLEET_TMUX_RESTART_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
@@ -41,6 +42,7 @@ from ..discord_ui.ask_handler import (  # noqa: F401
     collect_ask_answers,
 )
 from ..discord_ui.embeds import (
+    claude_vanished_embed,
     error_embed,
     fleet_tmux_restart_embed,
     no_response_embed,
@@ -107,6 +109,11 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # no longer there.
     if error.startswith(TRUST_START_FAILED_ERROR_PREFIX):
         return trust_start_failed_embed(error)
+    # #716: the same pane state reached without c-lord having answered anything.
+    # Its own embed because the one above names the trust dialog as the cause,
+    # and on this path that is an inference, not an observation.
+    if error.startswith(CLAUDE_VANISHED_ERROR_PREFIX):
+        return claude_vanished_embed(error)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))

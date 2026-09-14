@@ -292,6 +292,38 @@ def trust_start_failed_embed(detail: str) -> discord.Embed:
     )
 
 
+def claude_vanished_embed(detail: str) -> discord.Embed:
+    """Embed for a claude that was alive at hand-off and gone by the first poll (#716).
+
+    Sibling of :func:`trust_start_failed_embed`, and separate from it on purpose.
+    There, c-lord pressed the Enter and can name what swallowed the turn. Here it
+    only knows that the message was delivered into a running ``claude`` and that
+    ``claude`` is no longer running — the trust dialog is the likeliest culprit
+    (a message typed onto it selects "No, exit"), but saying so as fact would be
+    the guess-as-diagnosis that ``docs/specs/trust-prompt.md`` rules out.
+
+    What the reader needs either way is the same: the turn did not run, and
+    re-sending it is the fix — which is exactly what nobody knew for 29 and 71
+    minutes on the two production threads that died this way.
+    """
+    return discord.Embed(
+        title="⚠️ Claude が起動直後に居なくなりました",
+        description=(
+            f"{detail}\n\n"
+            "メッセージを渡した時点では `claude` が動いていましたが、"
+            "その直後に居なくなっていました。起動し直しても同じだったので、"
+            "**このターンは一度も走っていません**。\n\n"
+            "スレッドを立てた直後（数秒以内）に2通目を送ったときは、"
+            "作業ディレクトリの信頼ダイアログに本文が打ち込まれた可能性があります。\n\n"
+            "**確認すること:**\n"
+            "• `/clord-attach` (または tmux) でペインを開き、"
+            "シェルに戻っていないか／ダイアログが残っていないかを見る\n"
+            "• 復旧したらもう一度送る（同じ内容で構いません）"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def fleet_tmux_restart_embed(detail: str) -> discord.Embed:
     """Embed for a turn cut off because the host's tmux server was replaced (#701).
 

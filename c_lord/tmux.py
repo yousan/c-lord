@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .utils.logger import log_ctx
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -160,6 +162,25 @@ _INSERT_SETTLE = 0.15
 # #485: pause after Esc-dismissing a stuck menu so the TUI closes it before the
 # message is typed (otherwise the text could still land on the closing menu).
 _MENU_DISMISS_SETTLE = 0.3
+
+# #716: pause between the Downs that steer the folder-trust dialog's cursor onto
+# "Yes, I trust this folder".  Mirrors ``tmux_runner._MENU_NAV_DELAY`` for the
+# same reason (#171): this TUI drops navigation keys sent as one fast burst.
+_TRUST_NAV_DELAY = 0.25
+
+# #716: how many Downs may be spent looking for "Yes, I trust this folder".
+# Mirrors ``tmux_runner._TRUST_NAV_MAX_DOWNS``.
+_TRUST_NAV_MAX_DOWNS = 3
+
+# #716: pause after confirming the trust dialog, per poll, while waiting for
+# ``claude`` to draw its input box — typing before it is up loses the keystrokes.
+_TRUST_SETTLE = 0.5
+
+# #716: how long to wait for the TUI to come up after the trust dialog is
+# confirmed, before typing anyway.  Generous: a cold ``claude`` start behind the
+# dialog took up to 6s in production captures.  Waiting forever is not an option
+# either — an unreadable pane must not hold a message hostage (#544's rule).
+_TRUST_BOOT_TIMEOUT = 20.0
 
 # #560: ``send-keys -l`` delivers a long message as one fast burst, which the
 # Claude Code TUI treats as a *paste* and folds into a ``[Pasted text #N +M
@@ -585,6 +606,29 @@ def _pane_has_open_menu(pane_text: str) -> bool:
         return False
     norm = _normalize_capture(pane_text)
     return _parse_ask_from_pane(norm) is not None or _parse_plan_from_pane(norm) is not None
+
+
+def _pane_trust_dialog_downs(pane_text: str) -> int | None:
+    """Downs needed to reach "Yes" on a LIVE folder-trust dialog, else ``None`` (#716).
+
+    ``None`` means "no dialog to answer" — no dialog at all, a corpse left behind
+    by one that was already declined (#630's liveness rule), or a pane that could
+    not be parsed.  ``0`` is a real answer: the pre-2.1.248 dialog opens with the
+    cursor already on "1. Yes, I trust this folder".
+
+    Kept separate from :func:`_pane_has_open_menu` on purpose. That guard's
+    remedy is Esc, and Esc on *this* dialog cancels it — which exits ``claude``,
+    the very outcome being prevented. The parsers live in ``claude.tmux_runner``
+    (which imports this module), so they are imported lazily as above.
+    """
+    try:
+        from .claude.tmux_runner import TmuxClaudeRunner, _normalize_capture
+    except ImportError:  # pragma: no cover - defensive
+        return None
+    norm = _normalize_capture(pane_text)
+    if not TmuxClaudeRunner._has_trust_prompt(norm):
+        return None
+    return TmuxClaudeRunner._trust_option_offset(norm)
 
 
 def pane_command_is_dead(command: object) -> bool:
@@ -2274,6 +2318,134 @@ class TmuxSessionManager:
         _run(["tmux", "send-keys", "-t", target, "BSpace"])
         time.sleep(_INSERT_SETTLE)
 
+    def _clear_trust_dialog(self, target: str, thread_id: int, pane_text: str) -> bool:
+        """Approve an open folder-trust dialog so a message can be typed (#716).
+
+        The dialog is the one prompt where the #485 reflex — Esc, then type — is
+        actively harmful: Esc *cancels* it, and cancelling exits ``claude``.  So
+        it is answered instead, with "Yes, I trust this folder", and the message
+        is typed only once the TUI behind it is up.
+
+        Returns True when it is safe to type (there was no dialog, or it has been
+        confirmed), False when the caller must not type at all.
+
+        The False case matters as much as the True one.  The current dialog opens
+        with the cursor on ``❯ No, exit``, so a message typed here does not merely
+        get lost — its trailing Enter *declines trust* and ``claude`` exits
+        without running a line.  When the cursor cannot be moved off "No", the
+        honest outcome is a reported delivery failure; withholding the Enter is
+        #684's rule, applied on the delivery path.
+        """
+        downs = _pane_trust_dialog_downs(pane_text)
+        if downs is None:
+            return True
+
+        logger.warning(
+            "%s send_input: the folder-trust dialog is open in this pane — approving it "
+            "before delivering the message (down=%d). Typing here would answer the "
+            "dialog instead, and its cursor starts on 'No, exit' (#716)",
+            log_ctx(thread_id=thread_id),
+            downs,
+        )
+        if downs > 0 and not self._steer_trust_cursor(target, thread_id):
+            return False
+        _run(["tmux", "send-keys", "-t", target, "Enter"])
+        return self._await_trust_dialog_closed(target, thread_id)
+
+    def _steer_trust_cursor(self, target: str, thread_id: int) -> bool:
+        """Move the trust dialog's cursor onto "Yes, I trust this folder" (#684/#716).
+
+        Each Down is followed by a fresh read of the pane rather than an
+        assumption that it landed — this TUI drops navigation keys (#171), and
+        here a dropped key is not a retry but a dead session.
+
+        A pane that cannot be parsed counts as success, exactly as in
+        :meth:`TmuxClaudeRunner._accept_trust_prompt`: the guard fires only on a
+        *positive* reading of "No, exit", because refusing to confirm whenever
+        the parser is unsure would turn every future dialog shape into a
+        permanent stall.
+        """
+        from .claude.tmux_runner import TmuxClaudeRunner, _normalize_capture
+
+        label: str | None = None
+        for _ in range(_TRUST_NAV_MAX_DOWNS):
+            _run(["tmux", "send-keys", "-t", target, "Down"])
+            time.sleep(_TRUST_NAV_DELAY)
+            capture = _run(["tmux", "capture-pane", "-p", "-t", target])
+            if capture.returncode != 0:
+                return True
+            label = TmuxClaudeRunner._trust_cursor_label(_normalize_capture(capture.stdout))
+            if label is None or label.startswith("Yes"):
+                return True
+        logger.error(
+            "%s send_input: the trust dialog's cursor is still on %r after %d Down(s) — "
+            "withholding the message rather than confirming, which would decline trust "
+            "and exit claude (#716)",
+            log_ctx(thread_id=thread_id),
+            label,
+            _TRUST_NAV_MAX_DOWNS,
+        )
+        return False
+
+    def _await_trust_dialog_closed(self, target: str, thread_id: int) -> bool:
+        """Wait for the confirmed dialog to give way to Claude's input box (#716).
+
+        Typing before the TUI has drawn itself loses the keystrokes, so this
+        waits for the input prompt — but only for :data:`_TRUST_BOOT_TIMEOUT`,
+        and only the *dialog still being up* blocks delivery.  A pane that simply
+        cannot be read is not evidence of anything (#544's rule) and must not
+        hold the message hostage.
+        """
+        deadline = time.monotonic() + _TRUST_BOOT_TIMEOUT
+        dialog_open = True
+        while time.monotonic() < deadline:
+            time.sleep(_TRUST_SETTLE)
+            capture = _run(["tmux", "capture-pane", "-p", "-t", target])
+            if capture.returncode != 0:
+                continue
+            dialog_open = _pane_trust_dialog_downs(capture.stdout) is not None
+            if dialog_open:
+                continue
+            if _pane_at_input_prompt(capture.stdout):
+                logger.info(
+                    "%s send_input: folder-trust dialog approved, Claude's input box is "
+                    "up — delivering the message now (#716)",
+                    log_ctx(thread_id=thread_id),
+                )
+                return True
+            command = self._target_foreground_command(target)
+            if pane_command_is_dead(command):
+                # The dialog is gone and so is claude: the confirm landed on
+                # "No, exit" after all. Typing now would put the message into a
+                # SHELL, where its trailing Enter runs it as a command — a much
+                # worse ending than a reported delivery failure. Only a positive
+                # reading acts (#510's asymmetry); an unreadable pane keeps
+                # waiting.
+                logger.error(
+                    "%s send_input: the folder-trust dialog closed but the pane runs %r, "
+                    "not claude — the confirm did not take. Withholding the message "
+                    "rather than typing it into a shell (#716)",
+                    log_ctx(thread_id=thread_id),
+                    command,
+                )
+                return False
+        if dialog_open:
+            logger.error(
+                "%s send_input: the folder-trust dialog is still open %.0fs after it was "
+                "confirmed — withholding the message, because typing it would answer "
+                "the dialog (#716)",
+                log_ctx(thread_id=thread_id),
+                _TRUST_BOOT_TIMEOUT,
+            )
+            return False
+        logger.warning(
+            "%s send_input: the folder-trust dialog closed but Claude's input box never "
+            "appeared within %.0fs; delivering the message anyway (#716)",
+            log_ctx(thread_id=thread_id),
+            _TRUST_BOOT_TIMEOUT,
+        )
+        return True
+
     def send_input(self, thread_id: int, text: str) -> bool:
         """Send text to the Claude process in the tmux window via ``send-keys -l``.
 
@@ -2309,6 +2481,18 @@ class TmuxSessionManager:
         # replying with text instead of clicking cancels the menu and delivers
         # the message. Last line of defense — see tests/test_send_input_menu_guard.py.
         visible = _run(["tmux", "capture-pane", "-p", "-t", target])
+
+        # #716: the folder-trust dialog is checked FIRST and answered rather than
+        # dismissed. It is the one prompt where the Esc below would make things
+        # worse (Esc cancels it, which exits claude), and it is the one that is
+        # routinely open when a second message arrives: a freshly cloned session
+        # dir raises it on the first launch and it stays up for a median of 5s.
+        # A message typed onto it selects "No, exit" and the whole turn is lost.
+        if visible.returncode == 0 and _pane_trust_dialog_downs(visible.stdout) is not None:
+            if not self._clear_trust_dialog(target, thread_id, visible.stdout):
+                return False
+            visible = _run(["tmux", "capture-pane", "-p", "-t", target])
+
         if visible.returncode == 0 and _pane_has_open_menu(visible.stdout):
             logger.warning(
                 "send_input: interactive menu open in pane (thread=%d); dismissing "
@@ -2832,16 +3016,16 @@ class TmuxSessionManager:
         if window is None:
             return None
 
-        result = _run(
-            [
-                "tmux",
-                "list-panes",
-                "-t",
-                self._target(window),
-                "-F",
-                "#{pane_current_command}",
-            ]
-        )
+        return self._target_foreground_command(self._target(window))
+
+    @staticmethod
+    def _target_foreground_command(target: str) -> str | None:
+        """Same reading as :meth:`pane_foreground_command`, addressed by target.
+
+        Split out for callers inside :meth:`send_input`, which already hold the
+        resolved target and must not re-run window lookup mid-delivery.
+        """
+        result = _run(["tmux", "list-panes", "-t", target, "-F", "#{pane_current_command}"])
         if result.returncode != 0:
             return None
         return result.stdout.strip() or None

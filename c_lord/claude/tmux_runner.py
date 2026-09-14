@@ -95,6 +95,14 @@ _TRUST_ACCEPT_SETTLE = 2.0
 # happened is that the dialog swallowed the turn.
 TRUST_START_FAILED_ERROR_PREFIX = "Trust prompt not accepted —"
 
+# Prefix of the RESULT error for "the claude this turn was handed to is gone"
+# (#716).  Kept apart from TRUST_START_FAILED even though the recovery is the
+# same code: there, c-lord answered the dialog and knows what killed the
+# session; here it only knows that a claude which was running at hand-off is
+# not running now.  Naming the trust dialog anyway would be a guess dressed as
+# a diagnosis — the misdirection docs/specs/trust-prompt.md exists to forbid.
+CLAUDE_VANISHED_ERROR_PREFIX = "Claude vanished mid-delivery —"
+
 # How many times a thread may be restarted when answering the folder-trust
 # dialog leaves nothing running (#684).  A restart costs seconds, not a
 # keystroke, so this is deliberately smaller than the accept budget; two tries
@@ -106,6 +114,13 @@ _TRUST_RESTART_MAX_ATTEMPTS = 2
 # the next, so this is a ceiling on a loop that normally runs once — not a
 # blind repeat count.
 _TRUST_NAV_MAX_DOWNS = 3
+
+# How often, in seconds, the startup window re-asks whether the claude this turn
+# was delivered into is still running (#716).  Only a ``tmux list-panes`` each
+# time, and only while the turn has produced nothing yet — but the poll loop
+# spins at 0.5s and this question does not need answering that often.
+_ALIVE_RECHECK_INTERVAL = 2.0
+
 # Prefix of the RESULT error for "Claude is rate limited" (#631).  A separate
 # outcome from NO_RESPONSE on purpose: both produce an empty turn, but only
 # one of them gets better if you send the message again.
@@ -1546,6 +1561,22 @@ class TmuxClaudeRunner:
         trust_answered = False
         trust_restarts = 0
         trust_start_failed = False
+        # #716: this turn was handed to a claude that was already running, so a
+        # pane that positively stops running claude before the turn produces
+        # anything means something killed it *after* the hand-off.  The case
+        # that cost 29 and 71 minutes: the message itself landed on the
+        # folder-trust dialog and its trailing Enter chose "No, exit".
+        # ``trust_answered`` cannot see that — the Enter was the message's, not
+        # this runner's — so the #684 recovery below never fired.  Who pressed
+        # Enter is not the evidence that matters; whether a claude is running is.
+        verify_alive = claude_running
+        last_alive_check = -_ALIVE_RECHECK_INTERVAL
+        # Did any restart on this turn follow a dialog THIS runner answered?
+        # That is the difference between "the trust dialog swallowed the turn"
+        # (#684 — a diagnosis) and "the claude we handed the message to is gone"
+        # (#716 — all that is actually known), and the two get different embeds.
+        answered_trigger_seen = False
+        claude_vanished = False
         # Plan limit scraped from the pane (#631).  Set when Claude refuses the
         # turn because the account is rate limited; surfaced as the RESULT
         # outcome so Discord reports the reset time instead of telling the user
@@ -1702,7 +1733,21 @@ class TmuxClaudeRunner:
             # ``not new_turn_started`` so this can only fire in the startup
             # window — a claude that exits *after* answering is the normal
             # end-of-turn case the final verdict already handles.
-            if trust_answered and not new_turn_started:
+            #
+            # #716 widens the question from "did answering it leave a claude
+            # behind?" to "is there a claude behind this turn at all?", because
+            # the dialog can be answered by the message c-lord delivered rather
+            # than by this runner.  Same remedy, same budget, same asymmetry —
+            # only the trigger is broader, and it is rate-limited because the
+            # poll loop is far faster than this question needs asking.
+            recheck_due = verify_alive and elapsed - last_alive_check >= _ALIVE_RECHECK_INTERVAL
+            if (trust_answered or recheck_due) and not new_turn_started:
+                last_alive_check = elapsed
+                # Which of the two questions is being answered decides what the
+                # user is eventually told, so it is recorded before the restart
+                # clears ``trust_answered``.
+                answered_here = trust_answered
+                answered_trigger_seen = answered_trigger_seen or answered_here
                 # ``pane_command_is_dead`` rather than ``not is_claude_running``
                 # (#510's asymmetry): the latter folds "no window" and "tmux
                 # hiccup" into False, and acting on *don't know* here would type
@@ -1715,24 +1760,34 @@ class TmuxClaudeRunner:
                 if not pane_command_is_dead(command):
                     trust_answered = False
                 elif trust_restarts >= _TRUST_RESTART_MAX_ATTEMPTS:
-                    logger.warning(
-                        "Trust dialog answered but the pane runs %r after %d "
-                        "restart(s), giving up (thread=%d)",
+                    logger.error(
+                        "%s the pane runs %r, not claude, after %d restart(s) — giving "
+                        "up on this turn (dialog answered here: %s) (#684/#716)",
+                        log_ctx(thread_id=self._thread_id),
                         command,
                         trust_restarts,
-                        self._thread_id,
+                        answered_here,
                     )
-                    trust_start_failed = True
+                    if answered_trigger_seen:
+                        trust_start_failed = True
+                    else:
+                        claude_vanished = True
                     break
                 else:
                     trust_restarts += 1
+                    # #678: this is the one line that used to be missing. Before
+                    # it, the only trace of a turn that died here was an
+                    # ``Idle timeout`` two minutes later, and ``grep thread=<id>``
+                    # could not tell "bot was not running" from "claude was not".
                     logger.warning(
-                        "Trust dialog answered but the pane runs %r, not claude — "
-                        "restarting it (attempt %d/%d, thread=%d) (#684)",
+                        "%s the pane runs %r, not claude, and this turn has produced "
+                        "nothing — restarting it (attempt %d/%d, dialog answered here: "
+                        "%s) (#684/#716)",
+                        log_ctx(thread_id=self._thread_id),
                         command,
                         trust_restarts,
                         _TRUST_RESTART_MAX_ATTEMPTS,
-                        self._thread_id,
+                        answered_here,
                     )
                     await asyncio.to_thread(
                         self._tmux.start_claude,
@@ -2072,6 +2127,18 @@ class TmuxClaudeRunner:
                     f'("Yes, I trust this folder") was answered, but no claude was '
                     f"running afterwards and {_TRUST_RESTART_MAX_ATTEMPTS} restart(s) "
                     "did not change that, so this turn never ran."
+                )
+            elif claude_vanished:
+                # #716: sits with #684 above the generic rungs, and apart from it
+                # for honesty's sake. All that is known here is that a claude was
+                # running when this message was handed over and is not running
+                # now — the folder-trust dialog answering itself "No, exit" is
+                # the likeliest cause but not an observed one.
+                error = (
+                    f"{CLAUDE_VANISHED_ERROR_PREFIX} claude was running when this "
+                    f"message was delivered and is not running now; "
+                    f"{_TRUST_RESTART_MAX_ATTEMPTS} restart(s) did not change that, "
+                    "so this turn never ran."
                 )
             elif pane_error is not None:
                 error = f"Claude failed to start: {pane_error}"
