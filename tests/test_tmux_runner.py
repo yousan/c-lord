@@ -4956,6 +4956,204 @@ class TestTrustAcceptVerifiesItWorked:
         assert fake.restarts == _TRUST_RESTART_MAX_ATTEMPTS, fake.restarts
 
 
+class TestDeadClaudeAfterDeliveryIsRestarted:
+    """#716: recovery must not depend on *who* answered the trust dialog.
+
+    #684 restarts a claude that died answering the dialog — but only when this
+    runner pressed the Enter (``trust_answered``).  The expensive case is the
+    other author: a second message arriving inside the dialog's 5-second window
+    is typed onto the dialog, and *its* trailing Enter selects "No, exit".
+    ``trust_answered`` is False, the corpse no longer matches
+    ``_has_trust_prompt``, and nothing downstream notices — the thread waits out
+    the whole 120s start grace and reports "Claude exited without producing a
+    response".  Two production threads sat like that for 29 and 71 minutes.
+
+    The evidence that matters is not who pressed Enter: it is whether a claude is
+    still running behind a turn that was delivered into one.
+    """
+
+    class _DeadAfterDelivery:
+        """claude was alive at hand-off and is a corpse by the first poll."""
+
+        def __init__(self, *, revive_after: int | None = 1):
+            self.revive_after = revive_after
+            self.restarts = 0
+            self.alive_at_handoff = True
+            self.revived = False
+
+        def capture(self, *_a, **_k):
+            if self.revived:
+                return _load_fixture("input_box_empty.txt")
+            # The corpse: the dialog text with a shell prompt under it. It does
+            # NOT match _has_trust_prompt, which is exactly why it went unnoticed.
+            return _load_fixture("trust_prompt_declined_corpse.txt")
+
+        def is_running(self, *_a, **_k):
+            # True only for the hand-off check at the top of run(): that is what
+            # sends the message down the send_input path in the first place.
+            was = self.alive_at_handoff
+            self.alive_at_handoff = False
+            return was
+
+        def foreground_command(self, *_a, **_k):
+            return "claude" if self.revived else "zsh"
+
+        def start_claude(self, *_a, **_k):
+            self.restarts += 1
+            if self.revive_after is not None and self.restarts >= self.revive_after:
+                self.revived = True
+            return True
+
+    def _wire(self, tmux_manager, fake) -> None:
+        tmux_manager.capture_pane.side_effect = fake.capture
+        tmux_manager.is_claude_running.side_effect = fake.is_running
+        tmux_manager.pane_foreground_command.side_effect = fake.foreground_command
+        tmux_manager.start_claude.side_effect = fake.start_claude
+        tmux_manager.send_input.return_value = True
+
+    @staticmethod
+    def _fast_loop():
+        return (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._ALIVE_RECHECK_INTERVAL", 0.0),
+            patch("c_lord.claude.tmux_runner._TRUST_ACCEPT_SETTLE", 0.0),
+            patch("c_lord.claude.tmux_runner._MENU_NAV_DELAY", 0.0),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_message_delivered_into_a_dying_claude_is_restarted(
+        self, runner, tmux_manager
+    ) -> None:
+        """AC4: no dialog answered by this runner, and the turn still recovers."""
+        fake = self._DeadAfterDelivery(revive_after=1)
+        self._wire(tmux_manager, fake)
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            [e async for e in runner.run("2通目の本文")]
+
+        assert fake.restarts == 1, (
+            "the pane stopped running claude inside the startup window and "
+            "nothing restarted it — this is the 29- and 71-minute silence (#716)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_restart_carries_the_undelivered_prompt(self, runner, tmux_manager) -> None:
+        """The message must be what the restarted claude runs — not be dropped."""
+        fake = self._DeadAfterDelivery(revive_after=1)
+        self._wire(tmux_manager, fake)
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            [e async for e in runner.run("2通目の本文")]
+
+        assert tmux_manager.start_claude.call_args.args[1] == "2通目の本文"
+
+    @pytest.mark.asyncio
+    async def test_the_failure_leaves_a_log_line_naming_the_thread(
+        self, runner, tmux_manager, caplog
+    ) -> None:
+        """AC5: INFO or worse, with log_ctx, instead of only an idle timeout (#678)."""
+        fake = self._DeadAfterDelivery(revive_after=None)
+        self._wire(tmux_manager, fake)
+
+        runner.timeout_seconds = 2
+        with (
+            caplog.at_level(logging.INFO, logger="c_lord.claude.tmux_runner"),
+            contextlib.ExitStack() as stack,
+        ):
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            [e async for e in runner.run("2通目の本文")]
+
+        assert any(
+            "thread=12345" in r.getMessage() and "claude" in r.getMessage().lower()
+            for r in caplog.records
+            if r.levelno >= logging.INFO
+        ), [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_giving_up_does_not_claim_the_dialog_was_answered(
+        self, runner, tmux_manager
+    ) -> None:
+        """c-lord answered nothing here, so the ❌ must not say it did.
+
+        ``trust_start_failed_embed`` names the folder-trust dialog as the cause.
+        That is a diagnosis #684 has earned — it pressed the Enter. On this path
+        the dialog is only the likeliest suspect, and stating it as fact is the
+        guess-as-diagnosis ``docs/specs/trust-prompt.md`` rules out.
+        """
+        from c_lord.claude.tmux_runner import CLAUDE_VANISHED_ERROR_PREFIX
+        from c_lord.cogs._run_helper import _make_error_embed
+
+        fake = self._DeadAfterDelivery(revive_after=None)
+        self._wire(tmux_manager, fake)
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            events = [e async for e in runner.run("2通目の本文")]
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        error = result[0].error or ""
+        assert error.startswith(CLAUDE_VANISHED_ERROR_PREFIX), error
+        assert not error.startswith(TRUST_START_FAILED_ERROR_PREFIX), error
+        # And it must not be the generic rung seven threads already died on.
+        assert "possible startup failure" not in error
+
+        embed = _make_error_embed(error)
+        assert "居なくなりました" in (embed.title or "")
+        assert "もう一度送る" in (embed.description or "")
+        assert fake.restarts == _TRUST_RESTART_MAX_ATTEMPTS, fake.restarts
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_follow_up_turn_is_never_restarted(self, runner, tmux_manager) -> None:
+        """The common case: a live claude must not be re-launched under the user.
+
+        ``pane_foreground_command`` reads the same tmux field as
+        ``is_claude_running``, so "claude was there at hand-off and is not there
+        now" is a real change — but only a POSITIVE reading of a non-claude
+        foreground may act. Anything else (a live claude, an unreadable pane) is
+        left alone.
+        """
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_input.return_value = True
+        tmux_manager.pane_foreground_command.return_value = "claude"
+        tmux_manager.capture_pane.return_value = _load_fixture("input_box_empty.txt")
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            [e async for e in runner.run("普通のフォローアップ")]
+
+        tmux_manager.start_claude.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_pane_is_never_restarted(self, runner, tmux_manager) -> None:
+        """#510's asymmetry: *don't know* must not be acted on as *dead*."""
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager.send_input.return_value = True
+        tmux_manager.pane_foreground_command.return_value = None
+        tmux_manager.capture_pane.return_value = _load_fixture("input_box_empty.txt")
+
+        runner.timeout_seconds = 2
+        with contextlib.ExitStack() as stack:
+            for cm in self._fast_loop():
+                stack.enter_context(cm)
+            [e async for e in runner.run("普通のフォローアップ")]
+
+        tmux_manager.start_claude.assert_not_called()
+
+
 class TestTurnEndFromTranscript:
     """#583: the turn must close when Claude's transcript says the turn ended.
 
