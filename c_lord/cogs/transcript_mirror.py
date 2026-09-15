@@ -85,13 +85,30 @@ def _code(name: str) -> str:
 
 
 class TranscriptMirrorCog(commands.Cog):
-    """Owns a ``TranscriptMirror`` per active thread."""
+    """Owns a ``TranscriptMirror`` per active thread — and one per project dir.
+
+    A thread normally has a working copy to itself (``c-lord-sessions/<ch>/<thr>``),
+    so "one mirror per thread" and "one mirror per transcript" mean the same
+    thing.  They come apart whenever a ``working_dir`` is *named* rather than
+    derived: a scheduled task makes a new thread every run while keeping its
+    checkout, and ``/clord-thread-init`` can point two threads at one path.  Both
+    threads then resolve to the same ``~/.claude/projects/<slug>`` and tail the
+    same jsonl, so one thread's turn is posted into the other as well — last
+    week's finished thread fills up with this week's work, one message at a time
+    (#719).  :attr:`_owners` is what keeps that to one mirror.
+    """
 
     def __init__(self, bot: commands.Bot, *, session_repo: SessionRepository) -> None:
         self.bot = bot
         self._session_repo = session_repo
         self._mirrors: dict[int, TranscriptMirror] = {}
         self._trigger_messages: dict[int, int] = {}
+        # project dir → the one thread allowed to mirror it (#719).  Derived
+        # state, kept beside ``_mirrors`` rather than scanned out of it so the
+        # on_ready walk over every session row stays linear.
+        self._owners: dict[Path, int] = {}
+        # In-flight cancellations of displaced mirrors — see :meth:`_release`.
+        self._releasing: set[asyncio.Task[None]] = set()
 
     def set_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Record the Discord message ID that triggered the current Claude turn.
@@ -113,6 +130,13 @@ class TranscriptMirrorCog(commands.Cog):
         started = 0
         recovered = 0
         closed = 0
+        duplicate = 0
+        # #719: ``list_all`` is ordered ``last_used_at DESC``, so for a shared
+        # working_dir the first row is the thread that used the workspace last —
+        # the one the transcript belongs to.  Every later row pointing at the
+        # same project dir is last run's thread; restoring a mirror (or a #215
+        # recovery post) for it is what replays this run's work into it.
+        claimed: dict[Path, int] = {}
         for row in rows:
             if not row.working_dir:
                 continue
@@ -123,6 +147,20 @@ class TranscriptMirrorCog(commands.Cog):
             if getattr(row, "closed_at", None):
                 closed += 1
                 continue
+            project_dir = derive_project_dir(row.working_dir)
+            owner = claimed.get(project_dir)
+            if owner is not None:
+                duplicate += 1
+                logger.warning(
+                    "TranscriptMirrorCog: not mirroring thread=%d — project_dir=%s is already "
+                    "mirrored by thread=%d, which used it more recently; they share a "
+                    "working_dir and one transcript may only feed one thread (#719)",
+                    row.thread_id,
+                    project_dir,
+                    owner,
+                )
+                continue
+            claimed[project_dir] = row.thread_id
             # Issue #215: re-deliver a final answer that was written to the
             # jsonl while the bot was down (mirror not tailing). The resumed
             # mirror tails from EOF and would otherwise skip it forever.
@@ -139,10 +177,12 @@ class TranscriptMirrorCog(commands.Cog):
                 started += 1
         logger.info(
             "TranscriptMirrorCog: started %d mirror(s) from %d session row(s) "
-            "(%d closed row(s) skipped), recovered %d dropped final answer(s)",
+            "(%d closed row(s) skipped, %d sharing an already-mirrored working_dir), "
+            "recovered %d dropped final answer(s)",
             started,
             len(rows),
             closed,
+            duplicate,
             recovered,
         )
 
@@ -189,11 +229,32 @@ class TranscriptMirrorCog(commands.Cog):
         """Spawn a mirror for ``thread_id`` if one is not already running.
 
         Returns True if a new mirror was started, False if one already exists.
+
+        **At most one mirror per project dir** (#719).  A caller here is a
+        thread whose turn is *starting*, so it is the session about to write
+        that transcript: it takes the claim over from whoever held it and the
+        previous holder's mirror is stopped.  Refusing the newcomer instead
+        would leave the live thread with no delivery path at all — the jsonl
+        mirror is the only one there is (#712).  ``on_ready`` never reaches this
+        branch: it walks the rows newest-first and skips the stale duplicates
+        itself, because there the *first* claim is the right one.
         """
         if thread_id in self._mirrors:
             return False
 
         project_dir = derive_project_dir(working_dir)
+        incumbent = self._owners.get(project_dir)
+        if incumbent is not None and incumbent != thread_id:
+            logger.warning(
+                "TranscriptMirrorCog: thread=%d takes the mirror of project_dir=%s over from "
+                "thread=%d — they share a working_dir, so only the thread whose turn is "
+                "starting may tail it (#719)",
+                thread_id,
+                project_dir,
+                incumbent,
+            )
+            self._release(incumbent)
+
         sink = self._make_sink(thread_id)
         reply_sink = self._make_reply_sink(thread_id)
         file_sink = self._make_file_sink(thread_id)
@@ -212,6 +273,7 @@ class TranscriptMirrorCog(commands.Cog):
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
+        self._owners[project_dir] = thread_id
         logger.info(
             "TranscriptMirrorCog: started mirror thread=%d project_dir=%s",
             thread_id,
@@ -219,14 +281,64 @@ class TranscriptMirrorCog(commands.Cog):
         )
         return True
 
+    def _release(self, thread_id: int) -> None:
+        """Drop ``thread_id``'s mirror now; let its tail task unwind in the background.
+
+        Ownership has to change hands inside :meth:`start_for`, which is sync and
+        called from the turn-start path — an ``await`` there would let the two
+        mirrors overlap for exactly as long as the cancellation takes.  Dropping
+        the bookkeeping first and awaiting the cancellation afterwards keeps the
+        overlap at zero posts: the tail is cancelled before Claude has written
+        anything for the new turn.
+        """
+        mirror = self._mirrors.pop(thread_id, None)
+        if mirror is None:
+            return
+        self._forget_owner(thread_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - start_for always runs on the loop
+            return
+        task = loop.create_task(
+            self._stop_quietly(mirror), name=f"transcript-mirror-release-{thread_id}"
+        )
+        # Hold the reference: asyncio keeps only a weak one, and a release task
+        # collected mid-flight would leave the displaced mirror tailing — the
+        # exact thing this call exists to prevent.
+        self._releasing.add(task)
+        task.add_done_callback(self._releasing.discard)
+
+    async def _stop_quietly(self, mirror: TranscriptMirror) -> None:
+        try:
+            await mirror.stop()
+        except Exception:  # pragma: no cover - defensive; a stop must not surface
+            logger.warning(
+                "TranscriptMirrorCog: displaced mirror thread=%d did not stop cleanly",
+                mirror.thread_id,
+                exc_info=True,
+            )
+
+    def _forget_owner(self, thread_id: int) -> None:
+        for project_dir, owner in list(self._owners.items()):
+            if owner == thread_id:
+                del self._owners[project_dir]
+
     async def stop_for(self, thread_id: int) -> None:
         mirror = self._mirrors.pop(thread_id, None)
+        self._forget_owner(thread_id)
         if mirror is not None:
             await mirror.stop()
 
     async def cog_unload(self) -> None:
-        await asyncio.gather(*(m.stop() for m in self._mirrors.values()), return_exceptions=True)
+        await asyncio.gather(
+            *(m.stop() for m in self._mirrors.values()),
+            # Displaced mirrors are no longer in ``_mirrors`` but may still be
+            # unwinding, so they are waited on here too (#719).
+            *tuple(self._releasing),
+            return_exceptions=True,
+        )
         self._mirrors.clear()
+        self._owners.clear()
 
     def _make_progress(self, thread_id: int) -> TurnProgress | None:
         """Build the #539 silence filler for *thread_id*, or None when disabled.

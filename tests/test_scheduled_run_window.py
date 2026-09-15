@@ -163,29 +163,43 @@ class TestSchedulerStartsTranscriptMirror:
         mirror_cog.start_for.assert_called_once_with(thread.id, "/home/yousan/c-lord-audit")
 
     async def test_previous_run_of_the_same_task_stops_mirroring(
-        self, cog: SchedulerCog, repo: TaskRepository
+        self, cog: SchedulerCog, repo: TaskRepository, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
         """Two runs share one working_dir, so the old thread would echo the new run.
 
         Every run of a task tails the same ``~/.claude/projects/<slug>``. Left
         running, last week's mirror would replay this week's whole turn into
         last week's thread.
+
+        The guard used to live here, as a ``task_id → last thread`` note in the
+        scheduler's memory; #719 moved it into ``TranscriptMirrorCog``, which is
+        why this asserts on a real cog rather than on a ``stop_for`` call.  A
+        note in memory cannot hold the line: a restart wiped it while
+        ``on_ready`` put last week's mirror back (see
+        ``tests/test_scheduler.py::TestScheduledRunMirrorOwnership``).
         """
+        from c_lord.cogs.transcript_mirror import TranscriptMirrorCog
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".claude" / "projects" / "-home-yousan-c-lord-audit").mkdir(parents=True)
         thread, _tmux = _wire_channel(cog)
-        mirror_cog = MagicMock()
-        mirror_cog.start_for = MagicMock(return_value=True)
-        mirror_cog.stop_for = AsyncMock()
+        session_repo = MagicMock()
+        session_repo.list_all = AsyncMock(return_value=[])
+        mirror_cog = TranscriptMirrorCog(_make_bot(), session_repo=session_repo)
         cog.bot.transcript_mirror_cog = mirror_cog  # type: ignore[attr-defined]
         task = await _make_task(repo, working_dir="/home/yousan/c-lord-audit")
 
-        with patch("c_lord.cogs.scheduler.run_claude_with_config", new_callable=AsyncMock):
-            await cog._run_task(task)
-            mirror_cog.stop_for.assert_not_called()  # nothing to stop on the first run
+        try:
+            with patch("c_lord.cogs.scheduler.run_claude_with_config", new_callable=AsyncMock):
+                await cog._run_task(task)
+                assert set(mirror_cog._mirrors) == {777}
 
-            thread.id = 888  # the next run gets a brand-new thread
-            await cog._run_task(task)
+                thread.id = 888  # the next run gets a brand-new thread
+                await cog._run_task(task)
 
-        mirror_cog.stop_for.assert_awaited_once_with(777)
+            assert set(mirror_cog._mirrors) == {888}
+        finally:
+            await mirror_cog.cog_unload()
 
 
 # ---------------------------------------------------------------------------

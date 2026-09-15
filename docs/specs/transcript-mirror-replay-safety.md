@@ -2,7 +2,8 @@
 
 このドキュメントは、JSONL transcript ミラー
 (`c_lord/transcript/`、`c_lord/cogs/transcript_mirror.py`) の **「あるべき動き」**
-のうち「**どの transcript を読むか**」と「過去ログを二度 Discord に流さない」保証を定める。
+のうち「**どの transcript を読むか**」「**1 つの transcript を何本のミラーが読むか**」
+「過去ログを二度 Discord に流さない」保証を定める。
 
 応答性(ミラーが Discord のメッセージ処理を邪魔しないこと)は
 [transcript-mirror-liveness.md](./transcript-mirror-liveness.md)、
@@ -42,6 +43,64 @@ bot 再起動中に終わった `claude -p` の最終回答が「落ちた回答
 
 テスト: `tests/transcript/test_session_pinning.py`、
 `tests/transcript/test_recovery.py::test_does_not_recover_a_sub_invocations_answer`。
+
+## 1 つの transcript を読むミラーは 1 本だけ (#719)
+
+前節が「**1 本のミラーがどのファイルを読むか**」を決めるのに対し、ここは
+「**1 つのファイルを何本のミラーが読んでよいか**」を決める。答えは **1 本**。
+
+### なぜ 2 本になりうるのか
+
+普通のスレッドは `c-lord-sessions/<channel>/<thread>/` に自分だけの作業コピーを持つので、
+「スレッド 1 本 : ミラー 1 本」と「transcript 1 つ : ミラー 1 本」は同じことを言っている。
+**`working_dir` を*名指し*した瞬間にこの 2 つはずれる**:
+
+- **スケジュール実行**は `working_dir` を固定したまま、**実行のたびに新しいスレッド**を立てる
+  ([scheduled-tasks.md](./scheduled-tasks.md))。N 週目には同じ `working_dir` を持つスレッドが N 本。
+- **`/clord-thread-init`** で 2 つのスレッドを同じパスに向けても同じことが起きる。
+
+`working_dir` が同じ ⇒ `~/.claude/projects/<slug>` が同じ ⇒ **同じ jsonl**。
+ミラーが 2 本張られると、Claude が 1 回書いた文章が 2 つのスレッドに投稿される。
+重複排除 (`mirror_replied_uuid`) は**スレッドごと**に持っているので効かない。
+
+### あるべき動き (利用者から見た期待)
+
+- **とっくに終わったスレッドが、ある日いきなり別のスレッドの作業で埋まらない。**
+  自分は何も送っていないのに知らない作業の途中経過が流れ続ける、という状態にならない。
+- **作業は、それを始めたスレッドにだけ届く。** 週次タスクが 10 週走っても、
+  投稿先は常にその回のスレッド 1 本。
+- **bot を再起動しても同じ。** 再起動で古い組み合わせが復活しない。
+
+### 実装上の不変条件
+
+**1 つの project dir を映してよいのは 1 スレッドだけ**
+(`cogs/transcript_mirror.py` の `_owners`)。誰がその 1 本かは、経路ごとに決まる:
+
+| 経路 | 誰が持つか | なぜ |
+|---|---|---|
+| `start_for()` — ターンが**今から**始まるスレッド | **新しく名乗り出た方**。前の持ち主のミラーは止める (WARNING 1 行) | これから transcript に書くのはそのセッション。ここで新参を拒むと、生きているスレッドが配信経路を 1 つも持たなくなる (#712 で jsonl ミラーが唯一の経路になった) |
+| `on_ready()` — 再起動後の復元 | **`last_used_at` が新しい行**。同じ project dir を指す後続の行は飛ばす (WARNING 1 行) | `list_all` は `last_used_at DESC`。最後にその作業コピーを使ったスレッドが、その transcript の持ち主 |
+| `stop_for()` / `cog_unload()` | 誰も持たない | 止めたミラーが project dir を握ったままだと、次の名乗りが不要な takeover になる |
+
+**#215 の救出スキャンも同じ規則に従う** — `on_ready` で飛ばした行は救出も走らせない。
+落ちた最終回答は transcript の持ち主のものなので、古い方に再投稿すればそれこそが症状になる。
+
+### なぜ「覚えておく」方式をやめたか
+
+#621 では `SchedulerCog` 側に `task_id → 前回のスレッド` を覚えさせ、次の実行で
+そのミラーを止めていた。コメントはこう言っていた: 「In-memory only: a restart kills
+the mirrors too」。**これが事実と違った。** `on_ready` は `closed_at` が空の行すべてに
+ミラーを張り直すので、**再起動はガードの記憶だけを消して、止めたい相手を復活させる**。
+2026-09-04 のスレッドに 2026-09-11 の週次実行が丸ごと流れ込んだのはこれ (#719)。
+
+だから規則は「誰かが覚えている」ところではなく、**ミラーを配る当人** (`TranscriptMirrorCog`)
+が持つ。記憶は要らない — 張ろうとした瞬間に project dir の持ち主を見るだけで済む。
+
+テスト: `tests/test_transcript_mirror_cog.py`
+(`test_on_ready_starts_one_mirror_per_project_dir` /
+`test_on_ready_does_not_recover_into_the_stale_duplicate` /
+`test_a_live_claim_takes_the_mirror_over`)、
+`tests/test_scheduler.py::TestScheduledRunMirrorOwnership`。
 
 ## 二度流さない (#433)
 
