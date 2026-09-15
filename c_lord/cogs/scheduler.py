@@ -58,11 +58,6 @@ class SchedulerCog(commands.Cog):
         self.repo = repo
         # Track in-flight tasks to avoid double-running the same task_id.
         self._running: set[int] = set()
-        # task_id → the thread of its most recent run (#621).  Every run of a
-        # task shares one working_dir, hence one transcript; the previous run's
-        # mirror has to be stopped or it replays this run into last week's
-        # thread.  In-memory only: a restart kills the mirrors too.
-        self._last_thread: dict[int, int] = {}
 
     async def cog_load(self) -> None:
         """Start the master loop when the Cog is loaded."""
@@ -117,27 +112,23 @@ class SchedulerCog(commands.Cog):
     ) -> None:
         """Tail this run's transcript into its thread (#621, jsonl bridge mode).
 
-        Also stops the mirror left behind by the previous run of the same task:
-        the two runs share a ``working_dir``, so they share the Claude Code
-        project dir the mirror tails, and a live mirror on last week's thread
-        would post this week's whole turn into it a second time.
+        Every run of a task shares one ``working_dir``, hence one Claude Code
+        project dir, hence one transcript — so the previous run's mirror has to
+        stop or it replays this run into last week's thread.  That used to be
+        arranged here from a ``task_id → last thread`` dict, whose comment
+        claimed "in-memory only: a restart kills the mirrors too".  It does not:
+        ``TranscriptMirrorCog.on_ready`` restores a mirror for every *open*
+        session row, and last week's row is open.  A restart therefore erased
+        the guard's memory while resurrecting the very mirror it existed to
+        stop, and the two ran side by side for a week (#719).
+
+        So the rule now lives where it cannot be forgotten: ``start_for``
+        below hands the project dir to this thread and stops whoever held it,
+        remembering nothing across calls.
         """
         mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
         if mirror_cog is None or not working_dir:
             return
-
-        previous = self._last_thread.get(task_id)
-        if previous is not None and previous != thread_id:
-            try:
-                await mirror_cog.stop_for(previous)
-            except Exception:
-                logger.warning(
-                    "%s could not stop the previous run's transcript mirror (thread=%d)",
-                    log_ctx(task_id=task_id),
-                    previous,
-                    exc_info=True,
-                )
-        self._last_thread[task_id] = thread_id
 
         try:
             mirror_cog.start_for(thread_id, working_dir)

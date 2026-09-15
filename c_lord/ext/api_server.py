@@ -8,11 +8,13 @@ to Discord channels via the bot.
 
 Security:
 - Binds to 127.0.0.1 by default (localhost only)
-- Optional Bearer token authentication via api_secret
+- Every request must come from the bot's own Unix user (#457), or carry
+  ``Authorization: Bearer <api_secret>`` when one is configured
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -21,6 +23,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from aiohttp import web
+
+from ..log_sampler import LogSampler
+from .peer_uid import resolve_peer_uid
 
 if TYPE_CHECKING:
     import discord
@@ -33,6 +38,12 @@ if TYPE_CHECKING:
     from ..database.task_repo import TaskRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _current_uid() -> int | None:
+    """Our own UID, or ``None`` where the platform has no such notion."""
+    getuid = getattr(os, "getuid", None)
+    return getuid() if getuid is not None else None
 
 
 class ApiServer:
@@ -65,6 +76,8 @@ class ApiServer:
         resume_repo: PendingResumeRepository | None = None,
         session_repo: SessionRepository | None = None,
         show_url_embeds: bool = False,
+        owner_uid: int | None = None,
+        allow_any_peer: bool = False,
     ) -> None:
         self.repo = repo
         self.bot = bot
@@ -86,9 +99,17 @@ class ApiServer:
             lounge_channel_id = int(ch_str) if ch_str.isdigit() else None
         self.lounge_channel_id = lounge_channel_id
 
+        # #457: the UID this bot runs as. Only that user (and root, which can
+        # read the bot's .env anyway) may drive the control plane. Resolved at
+        # construction so a test can move it instead of becoming another user.
+        self.owner_uid = _current_uid() if owner_uid is None else owner_uid
+        self.allow_any_peer = allow_any_peer
+        self._denial_log = LogSampler()
+
         self.app = web.Application()
-        if self.api_secret:
-            self.app.middlewares.append(self._auth_middleware)
+        # Unconditional: without a secret this used to be no middleware at all,
+        # which is how every user on the host reached /api/spawn (#457).
+        self.app.middlewares.append(self._auth_middleware)
         self._setup_routes()
         self._runner: web.AppRunner | None = None
 
@@ -123,19 +144,81 @@ class ApiServer:
         request: web.Request,
         handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
     ) -> web.StreamResponse:
-        """Bearer token authentication middleware."""
-        if request.path == "/api/health":
-            return await handler(request)
+        """Refuse anything that is neither our own Unix user nor holding the secret."""
+        denial = self._authorize(request)
+        if denial is not None:
+            return denial
+        return await handler(request)
 
+    def _authorize(self, request: web.Request) -> web.Response | None:
+        """``None`` to let the request through, otherwise the refusal to send.
+
+        Two independent ways in, because they answer different questions:
+
+        * **Same UID** — the caller already *is* the bot's user, so it can read
+          ``.env``, the session dirs and the secret itself. Demanding a header
+          from it would protect nothing and would break the control plane
+          (``CLORD_API_SECRET`` is stripped from the tmux environment by #353,
+          so a Claude session cannot read it from ``env`` anyway).
+        * **``CLORD_API_SECRET``** — the explicit way to let *someone else* in:
+          another Unix user, or another host. Holding it is the proof.
+
+        ``/api/health`` is gated too. It used to answer 200 unconditionally,
+        which turned a port scan into an inventory of every c-lord on the host.
+        """
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return web.json_response({"error": "Missing Authorization header"}, status=401)
-
-        token = auth_header[7:]
-        if token != self.api_secret:
+        if self.api_secret and auth_header.startswith("Bearer "):
+            if self._token_matches(auth_header[7:]):
+                return None
             return web.json_response({"error": "Invalid token"}, status=401)
 
-        return await handler(request)
+        uid = self._peer_uid(request)
+        # root is not a distinct trust level here: it can read the bot's .env,
+        # ptrace the process, or just become the bot's user.
+        if uid is not None and (uid == self.owner_uid or uid == 0):
+            return None
+        if self.allow_any_peer:
+            return None
+
+        # The refusal itself says nothing: a foreign caller should not be able to
+        # tell a c-lord from any other 403 on the host. The operator, who does
+        # need to know, has the log line below.
+        sample = self._denial_log.sample(uid)
+        if sample.emit:
+            logger.warning(
+                "REST API denied %s %s from uid=%s (this bot runs as uid=%s). "
+                "Set CLORD_API_SECRET and send `Authorization: Bearer …` to allow "
+                "another user or host in%s",
+                request.method,
+                request.path,
+                "unknown" if uid is None else uid,
+                self.owner_uid,
+                sample.suffix,
+            )
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    def _token_matches(self, token: str) -> bool:
+        """Constant-time comparison against ``api_secret``.
+
+        ``==`` short-circuits on the first differing byte and leaks the token's
+        prefix through timing. ``compare_digest`` raises ``TypeError`` on a
+        non-ASCII string, and the value comes straight off the wire — so a
+        header of ``Bearer ñ`` would otherwise be a 500 anyone could trigger.
+        """
+        try:
+            return hmac.compare_digest(token, self.api_secret or "")
+        except TypeError:
+            return False
+
+    def _peer_uid(self, request: web.Request) -> int | None:
+        """UID behind this request's socket, or ``None`` when unprovable."""
+        transport = request.transport
+        if transport is None:
+            return None
+        return resolve_peer_uid(
+            transport.get_extra_info("peername"),
+            transport.get_extra_info("sockname"),
+        )
 
     async def start(self) -> None:
         """Start the API server."""
@@ -144,6 +227,33 @@ class ApiServer:
         site = web.TCPSite(self._runner, self.host, self.port)
         await site.start()
         logger.info("REST API started: http://%s:%d", self.host, self.port)
+        # #457: who may drive the control plane is never left implicit — an
+        # opened gate says so at every start, not only in the docs.
+        log = (
+            logger.info
+            if (self.owner_uid is not None and not self.allow_any_peer)
+            else logger.warning
+        )
+        log("REST API access: %s", self._gate_summary())
+
+    def _gate_summary(self) -> str:
+        """One line saying who may call this API — printed at every start (#457)."""
+        if self.allow_any_peer:
+            return (
+                "CLORD_API_ALLOW_ANY_PEER=1: ANY user on this host may spawn Claude "
+                "sessions as you — unset it unless you meant this"
+            )
+        if self.owner_uid is None:
+            return (
+                "peer UID cannot be verified on this platform; only callers holding "
+                "CLORD_API_SECRET are served. Set CLORD_API_ALLOW_ANY_PEER=1 to accept "
+                "unverified local callers instead"
+            )
+        # Named `note`, not `secret`: the value is one of two constants, but a
+        # variable called `secret` in a logged f-string trips CodeQL's
+        # clear-text-logging heuristic (py/clear-text-logging-sensitive-data).
+        note = "or holding CLORD_API_SECRET" if self.api_secret else "no secret configured"
+        return f"serving uid={self.owner_uid} only, {note}"
 
     async def stop(self) -> None:
         """Stop the API server."""

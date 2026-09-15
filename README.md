@@ -672,6 +672,15 @@ port is already in use — two clones on one host, say — the bot logs a WARNIN
 and runs without the API rather than failing to start; give each clone its own
 `CLORD_API_PORT`.
 
+**It only serves the Unix user running the bot** (#457). `POST /api/spawn` starts
+a Claude Code session, so reaching this port is equivalent to a shell as that
+user — and loopback is a *network* boundary, not a *UID* one: every account on a
+multi-user host can connect to `127.0.0.1`. So the peer's UID is read from
+`/proc/net/tcp` and checked against the bot's own, `/api/health` included;
+everyone else gets `403`. Nothing to configure — your own calls keep working as
+they are. To let another user or another host in, set `CLORD_API_SECRET` and
+have them send `Authorization: Bearer …`. See [docs/SECURITY.md](docs/SECURITY.md#rest-api-exposure-712-457).
+
 ### Endpoints
 
 | Method | Path | Description |
