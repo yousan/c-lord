@@ -249,8 +249,11 @@ class ApiServer:
                 "CLORD_API_SECRET are served. Set CLORD_API_ALLOW_ANY_PEER=1 to accept "
                 "unverified local callers instead"
             )
-        secret = "or holding CLORD_API_SECRET" if self.api_secret else "no secret configured"
-        return f"serving uid={self.owner_uid} only, {secret}"
+        # Named `note`, not `secret`: the value is one of two constants, but a
+        # variable called `secret` in a logged f-string trips CodeQL's
+        # clear-text-logging heuristic (py/clear-text-logging-sensitive-data).
+        note = "or holding CLORD_API_SECRET" if self.api_secret else "no secret configured"
+        return f"serving uid={self.owner_uid} only, {note}"
 
     async def stop(self) -> None:
         """Stop the API server."""
