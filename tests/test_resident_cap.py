@@ -29,7 +29,8 @@ from __future__ import annotations
 import datetime
 import logging
 from dataclasses import replace
-from unittest.mock import AsyncMock, MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -297,7 +298,9 @@ class TestCapEnforcement:
         loop = _loop(records, resident=set(range(1, 8)), limit=5)
 
         assert await loop.tick() == 2
-        ids = [c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list]
+        ids = [
+            c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list
+        ]
         assert ids == [7, 6]  # 最も長くアイドルな順
 
     @pytest.mark.asyncio
@@ -409,7 +412,9 @@ class TestEmergencyBrake:
         await loop.tick()
         await loop.tick()
 
-        ids = [c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list]
+        ids = [
+            c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list
+        ]
         assert 1 not in ids
 
     @pytest.mark.asyncio
@@ -509,8 +514,7 @@ class TestTheNoticeTellsTheTruthAboutWhy:
         from c_lord.workspace_notice import WorkspaceReason
 
         fields = [
-            tuple((f.name, f.value) for f in self._embed(r, "30本").fields)
-            for r in WorkspaceReason
+            tuple((f.name, f.value) for f in self._embed(r, "30本").fields) for r in WorkspaceReason
         ]
         assert len(set(fields)) == 1
 
@@ -547,3 +551,196 @@ class TestAnOlderBotSurvivesANewerDatabase:
         record = await repo.get(555)
         assert record is not None and record.thread_id == 555
         assert (await repo.list_all())[0].thread_id == 555
+
+
+# ── #742: 再起動をまたいで「走っている」を見失わない ──────────────────────────
+
+
+def _completed(returncode: int, stdout: str = ""):
+    """``subprocess.run`` の戻り値を装う。"""
+    import subprocess
+
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+#: 実機から採ったペイン (2026-09-15 / Claude Code v2.1.271)。ハンドメイドの
+#: 文字列ではなく本物を使う — 判定が実機で効くことが要件そのものなので
+#: (`tests/test_pane_running.py` も同じ fixture を見ている)。
+_PANES = Path(__file__).parent / "fixtures" / "panes"
+#: ツール実行中。上部の spinner は経過タイマーを出し続ける。
+RUNNING_PANE = (_PANES / "i742_running_mid_turn_v2_1_271.txt").read_text(encoding="utf-8")
+#: ターンが終わった直後。spinner は括弧のタイマーを失って畳まれる (#190)。
+IDLE_PANE = (_PANES / "i742_idle_after_turn_v2_1_271.txt").read_text(encoding="utf-8")
+
+
+def _fake_tmux(panes: dict[int, str]):
+    """``thread_id → そのペインの見た目`` で tmux を差し替える ``_run``。"""
+    pane_ids = {tid: f"%{100 + i}" for i, tid in enumerate(sorted(panes))}
+
+    def _run(args: list[str]):
+        if args[:2] == ["tmux", "-V"]:
+            return _completed(0, "tmux 3.4\n")
+        if args[:3] == ["tmux", "list-panes", "-a"]:
+            return _completed(
+                0, "".join(f"{tid}\tclaude\t{pane_ids[tid]}\n" for tid in sorted(panes))
+            )
+        if args[:2] == ["tmux", "capture-pane"]:
+            target = args[args.index("-t") + 1]
+            for tid, pane_id in pane_ids.items():
+                if pane_id == target:
+                    return _completed(0, panes[tid])
+        return _completed(1, "")
+
+    return _run
+
+
+def _restarted_loop(records, *, resident: set[int], limit: int, mem=None) -> ResidentCapLoop:
+    """再起動直後の bot — ``ClaudeChatCog._active_tasks`` が空の状態。
+
+    ``in_flight_fn`` を**注入しない**のが肝。本番と同じ既定の経路を通す。
+    """
+    cog = MagicMock()
+    cog._sleep_workspace_impl = AsyncMock(return_value=True)
+    cog._active_tasks = {}  # ← 再起動で空になった in-memory の台帳
+
+    bot = MagicMock()
+    bot.get_cog = MagicMock(return_value=cog)
+    bot.get_channel = MagicMock(side_effect=lambda t: MagicMock(id=t))
+
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=records)
+
+    samples = list(mem or [(31 * GIB, 20 * GIB)])
+
+    def _mem():
+        return samples[0] if len(samples) == 1 else samples.pop(0)
+
+    loop = ResidentCapLoop(bot, repo, limit=limit, resident_fn=lambda: set(resident), mem_fn=_mem)
+    loop._cog_for_test = cog  # type: ignore[attr-defined]
+    return loop
+
+
+def _slept_ids(loop: ResidentCapLoop) -> list[int]:
+    return [
+        c.kwargs["channel"].id for c in loop._cog_for_test._sleep_workspace_impl.await_args_list
+    ]
+
+
+LOW = (31 * GIB, int(31 * GIB * 0.05))
+OK = (31 * GIB, int(31 * GIB * 0.50))
+
+
+class TestARestartMustNotMakeLiveWorkLookIdle:
+    """#742 — 再起動をまたぐと「実行中」と「最終利用時刻」の両方が実態とズレる。
+
+    ``ClaudeChatCog._active_tasks`` は **in-memory** なので再起動で空になる。一方
+    tmux の ``claude`` は再起動を生き延びる (#503) ので、**c-lord だけが「誰も
+    走っていない」と思い込む**。さらに ``last_used_at`` はターン開始時にしか
+    書かれないので、31分働き続けている行が「31分アイドル」として最古に並ぶ。
+
+    2026-09-14 に実際に起きた: #719 の担当が緊急ブレーキに眠らされ、スレッドには
+    1文字も出ないまま26時間止まった。
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_brake_does_not_sleep_a_turn_that_survived_the_restart(self) -> None:
+        """AC1/AC2 — ``_active_tasks`` が空でも、走っているペインは選ばれない。"""
+        # 1 は 31分前にターンを始めて**まだ走っている**（= last_used_at は最古）。
+        records = [_rec(1, hours_ago=99), _rec(2, hours_ago=1)]
+        loop = _restarted_loop(records, resident={1, 2}, limit=20, mem=[LOW, LOW, LOW, OK, OK])
+
+        with patch("c_lord.tmux._run", side_effect=_fake_tmux({1: RUNNING_PANE, 2: IDLE_PANE})):
+            await loop.tick()
+            await loop.tick()
+            await loop.tick()
+
+        assert 1 not in _slept_ids(loop), "走っているターンが緊急ブレーキに眠らされた (#742)"
+
+    @pytest.mark.asyncio
+    async def test_the_brake_still_sleeps_an_idle_workspace(self) -> None:
+        """ブレーキ自体は無効化しない (#576)。守るのは「走っているもの」だけ。"""
+        records = [_rec(1, hours_ago=99), _rec(2, hours_ago=1)]
+        loop = _restarted_loop(records, resident={1, 2}, limit=20, mem=[LOW, LOW, LOW, OK, OK])
+
+        with patch("c_lord.tmux._run", side_effect=_fake_tmux({1: RUNNING_PANE, 2: IDLE_PANE})):
+            await loop.tick()
+            await loop.tick()
+            slept = await loop.tick()
+
+        assert slept == 1
+        assert _slept_ids(loop) == [2]
+
+    @pytest.mark.asyncio
+    async def test_the_cap_does_not_evict_a_turn_that_survived_the_restart(self) -> None:
+        """緊急ブレーキだけでなく、通常の上限超過でも同じ保証が要る。"""
+        records = [_rec(i, hours_ago=10 - i) for i in range(1, 4)]  # 1 が最古
+        loop = _restarted_loop(records, resident={1, 2, 3}, limit=2)
+
+        panes = {1: RUNNING_PANE, 2: IDLE_PANE, 3: IDLE_PANE}
+        with patch("c_lord.tmux._run", side_effect=_fake_tmux(panes)):
+            assert await loop.tick() == 1
+
+        assert _slept_ids(loop) == [2], "最古だが走っている 1 を追い出してしまった (#742)"
+
+    @pytest.mark.asyncio
+    async def test_a_pane_that_is_not_running_claude_is_not_protected(self) -> None:
+        """ペインの前景がシェルのウィンドウは残骸。守る対象ではない。"""
+        records = [_rec(1, hours_ago=99), _rec(2, hours_ago=1)]
+        loop = _restarted_loop(records, resident={1, 2}, limit=1)
+
+        def _run(args: list[str]):
+            if args[:2] == ["tmux", "-V"]:
+                return _completed(0, "tmux 3.4\n")
+            if args[:3] == ["tmux", "list-panes", "-a"]:
+                return _completed(0, "1\tzsh\t%100\n2\tclaude\t%101\n")
+            return _completed(1, "")
+
+        with patch("c_lord.tmux._run", side_effect=_run):
+            assert await loop.tick() == 1
+
+        assert _slept_ids(loop) == [1]
+
+
+class TestAnAllRunningFleetIsQuiet:
+    """AC5 — 1本も眠らせられない状態が続いても、毎tick WARNING を撒かない。
+
+    #742 の修正で「眠らせられない」は現実的な定常状態になる（全部走っていれば
+    1本も選べない）。ここが毎tick WARNING を出すと、逼迫中に唯一読みたいログが
+    自分のノイズで埋まる (#678 と同じ失敗)。
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_brake_logs_once_per_episode_not_once_per_tick(self, caplog) -> None:
+        records = [_rec(i, hours_ago=i) for i in range(1, 4)]
+        loop = _restarted_loop(records, resident={1, 2, 3}, limit=20, mem=[LOW] * 12)
+        panes = dict.fromkeys((1, 2, 3), RUNNING_PANE)
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("c_lord.tmux._run", side_effect=_fake_tmux(panes)),
+        ):
+            for _ in range(12):
+                assert await loop.tick() == 0  # 無限ループにも例外にもならない
+
+        engaged = [r for r in caplog.records if "EMERGENCY brake ENGAGED" in r.getMessage()]
+        nothing = [r for r in caplog.records if "nothing it may sleep" in r.getMessage()]
+        assert len(engaged) == 1, f"1 episode に {len(engaged)} 回 ENGAGED が出ている"
+        assert len(nothing) == 1, f"1 episode に {len(nothing)} 回「眠らせられない」が出ている"
+
+    @pytest.mark.asyncio
+    async def test_a_new_episode_speaks_up_again(self, caplog) -> None:
+        """黙らせるのは1つの episode の中だけ。回復して再発したら必ず出す。"""
+        records = [_rec(i, hours_ago=i) for i in range(1, 4)]
+        mem = [LOW, LOW, LOW, LOW, OK, LOW, LOW, LOW, LOW]
+        loop = _restarted_loop(records, resident={1, 2, 3}, limit=20, mem=mem)
+        panes = dict.fromkeys((1, 2, 3), RUNNING_PANE)
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("c_lord.tmux._run", side_effect=_fake_tmux(panes)),
+        ):
+            for _ in range(9):
+                await loop.tick()
+
+        engaged = [r for r in caplog.records if "EMERGENCY brake ENGAGED" in r.getMessage()]
+        assert len(engaged) == 2, "回復をはさんだ2回目の episode が黙ってしまった"

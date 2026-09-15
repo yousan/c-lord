@@ -32,10 +32,11 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .pane_running import pane_shows_running
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
 # Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
 # unrelated trailing-numeric path components (PIDs, ports, etc.).
@@ -45,6 +46,17 @@ _THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
 # server, so it needs no session qualifier and — unlike a window *name* — can
 # never resolve to a sibling that happens to share it (#649).
 _WINDOW_ID_RE = re.compile(r"^@\d+$")
+
+# tmux's per-pane handle, e.g. ``%141``. Same idea as ``_WINDOW_ID_RE``, and
+# validated for the same reason the session id is (#742): tmux minted it, but a
+# value that reaches an argv gets checked at the boundary anyway.
+_PANE_ID_RE = re.compile(r"^%\d+$")
+
+# How many bottom lines to capture when asking a pane "are you mid-turn?".
+# The spinner renders above the input box, which the box + footer + any
+# in-progress tool-result preview push 10–20 lines off the bottom (#190), so a
+# narrow capture would answer "idle" for a pane that is plainly working.
+_RUNNING_CAPTURE_LINES = 40
 
 logger = logging.getLogger(__name__)
 
@@ -3157,34 +3169,89 @@ def list_tmux_sessions() -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def resident_thread_ids() -> set[int]:
-    """Thread ids whose tmux pane is running Claude right now, host-wide (#576).
+def _claude_panes_by_thread() -> dict[int, str]:
+    """``thread_id → pane_id`` for every pane positively running claude, host-wide.
 
     **One** ``tmux list-panes -a`` call regardless of how many sessions exist —
     the resident-cap loop asks every 30 seconds, and the per-session walk
     :func:`cleanup_orphaned_all_sessions` does (one ``list-windows`` plus one
     ``list-panes`` each) costs ~40 subprocesses on a busy host.
 
-    Counts only panes that are *positively* running claude. A pane whose
-    foreground process is a shell holds a window, not the ~400 MB the cap is
-    about, so counting it would evict a live workspace to make room for a
-    corpse. Windows without an ``@thread_id`` were made by hand and are none of
-    our business.
+    Only panes that are *positively* running claude. A pane whose foreground
+    process is a shell holds a window, not the ~400 MB the cap is about, so
+    counting it would evict a live workspace to make room for a corpse. Windows
+    without an ``@thread_id`` were made by hand and are none of our business.
     """
     if not _tmux_available():
-        return set()
+        return {}
 
-    result = _run(["tmux", "list-panes", "-a", "-F", "#{@thread_id}\t#{pane_current_command}"])
+    result = _run(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{@thread_id}\t#{pane_current_command}\t#{pane_id}",
+        ]
+    )
     if result.returncode != 0:
+        return {}
+
+    panes: dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        tid, _, rest = line.partition("\t")
+        command, _, pane_id = rest.partition("\t")
+        tid = tid.strip()
+        pane_id = pane_id.strip()
+        if tid.isdigit() and "claude" in command.strip().lower():
+            panes[int(tid)] = pane_id
+    return panes
+
+
+def resident_thread_ids() -> set[int]:
+    """Thread ids whose tmux pane is running Claude right now, host-wide (#576)."""
+    return set(_claude_panes_by_thread())
+
+
+def running_thread_ids(candidates: Iterable[int] | None = None) -> set[int]:
+    """Of *candidates*, the ones whose pane is **mid-turn right now** (#742).
+
+    Read from the pane, because **that is the evidence a bot restart cannot
+    erase.** c-lord's own ledger of running turns
+    (``ClaudeChatCog._active_tasks``) lives in memory and empties on restart,
+    while the ``claude`` inside tmux survives one (#503) — so after a restart
+    the bot believed nothing was running and the emergency brake slept a
+    workspace that was 31 minutes into a turn, silently (2026-09-14, #742). The
+    working spinner Claude Code draws for itself keeps ticking either way.
+
+    Costs one ``list-panes`` plus one ``capture-pane`` **per candidate**, so
+    callers pass the set they are about to act on — never the whole host — and
+    only on the paths that are about to evict something. ``candidates=None``
+    means "every resident", which on a busy host is ~30 captures.
+
+    Answers ``set()`` for anything it cannot read: an unreadable pane is not
+    evidence that nobody is working, but it is also not evidence that someone
+    is, and the caller's other guards (``_active_tasks``, the TTL) still apply.
+    """
+    panes = _claude_panes_by_thread()
+    if candidates is not None:
+        wanted = {int(tid) for tid in candidates}
+        panes = {tid: pane_id for tid, pane_id in panes.items() if tid in wanted}
+    if not panes:
         return set()
 
-    resident: set[int] = set()
-    for line in result.stdout.splitlines():
-        tid, _, command = line.partition("\t")
-        tid = tid.strip()
-        if tid.isdigit() and "claude" in command.strip().lower():
-            resident.add(int(tid))
-    return resident
+    running: set[int] = set()
+    for thread_id, pane_id in panes.items():
+        if not _PANE_ID_RE.match(pane_id):
+            # tmux minted it, but the eviction guard is not the place to trust
+            # an unvalidated token into an argv.
+            continue
+        result = _run(
+            ["tmux", "capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{_RUNNING_CAPTURE_LINES}"]
+        )
+        if result.returncode == 0 and pane_shows_running(result.stdout):
+            running.add(thread_id)
+    return running
 
 
 def cleanup_orphaned_all_sessions(active_thread_ids: set[int]) -> int:

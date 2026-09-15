@@ -28,6 +28,15 @@
 いないもの」に限定する。復帰は投稿1通（#572 の無言復元）なので、外したときの損害は
 次のターンが数秒遅いことだけ。
 
+**「走っている」は再起動を生き延びる根拠で判定する** (#742)。in-memory の台帳
+(``ClaudeChatCog._active_tasks``) は再起動で空になるのに、tmux の ``claude`` は
+生き延びる (#503) ので、台帳だけを見ていると**再起動直後の bot は「誰も走って
+いない」と誤認する**。2026-09-14 に実際に、31分走っていたターンがこのブレーキに
+眠らされ、スレッドには1文字も出ないまま26時間止まった。だから眠らせる直前に
+ペインの working spinner も見る（:func:`c_lord.tmux.running_thread_ids`）。
+``last_used_at`` は代わりにならない — **ターンが始まった時刻**しか書かないので、
+長く走っているターンほど「長くアイドル」に見えて真っ先に選ばれる。
+
 **緊急ブレーキは片方向のみ。** ``MemAvailable`` が総量の10%を3回連続（90秒）下回った
 ら、TTL を待たずにアイドルの長い順にスリープさせ、回復したら止める。**余裕がある
 から上限を上げる方向には決して動かさない** — 上げる方向は事故を増やすだけで、利用者
@@ -52,6 +61,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .idle_sweep import parse_timestamp
+from .log_sampler import LogSampler
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -228,6 +238,17 @@ def select_lru_victims(
     what the cap is for: the point is to survive a runaway, not to interrupt the
     person using the tool.
 
+    **That guarantee is only as good as *in_flight*.** It used to be read from
+    the bot's in-memory task ledger alone, which a restart empties while the
+    ``claude`` in tmux keeps working (#503) — so one restart turned "never
+    chosen" into "chosen first", and on 2026-09-14 a workspace 31 minutes into a
+    turn was slept without a word reaching its thread (#742). Callers must pass
+    evidence that survives a restart; :meth:`ResidentCapLoop._turns_in_flight`
+    is where that is assembled.
+
+    *last_used_at* cannot stand in for it: it is written when a turn **starts**,
+    so the longer a turn runs the older — the more evictable — its row looks.
+
     *resident* must already be scoped to workspaces **this bot owns** — see
     :meth:`ResidentCapLoop._enforce_cap`. A window this instance cannot manage
     must not push its own users out.
@@ -286,6 +307,11 @@ class ResidentCapLoop:
         self._mem_fn = mem_fn or (lambda: (memory_total(), memory_available()))
         self._low_streak = 0
         self._braking = False
+        # One "episode" = one stretch of braking, from engaged to released. The
+        # loud lines are keyed to it so a pressure spell that lasts an hour
+        # says so once, not 120 times — see :meth:`_emergency_brake` (#742 AC5).
+        self._episode = 0
+        self._quiet = LogSampler()
         self._task: object | None = None
 
     @property
@@ -343,7 +369,27 @@ class ResidentCapLoop:
             return resident_thread_ids()
         return set()
 
+    async def _turns_in_flight(self, candidates: set[int]) -> set[int]:
+        """Everything in *candidates* with a turn running, by both kinds of evidence.
+
+        Two sources, because the cheap one is amnesiac:
+
+        * ``ClaudeChatCog._active_tasks`` — free to read, and the only thing
+          that knows about a turn whose pane has not drawn a spinner yet. Empty
+          after a restart.
+        * the pane itself (:func:`c_lord.tmux.running_thread_ids`) — costs a
+          ``capture-pane`` per candidate, and is the only thing that still knows
+          after a restart, because the ``claude`` that survived it is the one
+          drawing the spinner (#503 / #742).
+
+        Asked only on the paths that are about to evict something, and only
+        about the residents in question — never the whole host.
+        """
+        in_flight = self._in_flight()
+        return in_flight | await self._running_on_host(candidates - in_flight)
+
     def _in_flight(self) -> set[int]:
+        """Turns **this process** started and is still awaiting. In-memory only."""
         if self._in_flight_fn is not None:
             with contextlib.suppress(Exception):
                 return set(self._in_flight_fn())  # type: ignore[operator]
@@ -353,6 +399,20 @@ class ResidentCapLoop:
             active = getattr(cog, "_active_tasks", None)
             if isinstance(active, dict):
                 return {int(t) for t in active}
+        return set()
+
+    async def _running_on_host(self, candidates: set[int]) -> set[int]:
+        """Of *candidates*, whose pane is mid-turn — the restart-proof half.
+
+        Off the event loop: a ``capture-pane`` per candidate is ~10 ms and the
+        brake may be holding thirty of them.
+        """
+        if not candidates:
+            return set()
+        from .tmux import running_thread_ids
+
+        with contextlib.suppress(Exception):
+            return await asyncio.to_thread(running_thread_ids, candidates)
         return set()
 
     def _memory(self) -> tuple[int, int]:
@@ -396,7 +456,11 @@ class ResidentCapLoop:
             return False
 
         self._low_streak += 1
-        logger.warning(
+        # Loud on the way in (at most three lines before the brake fires), quiet
+        # once it has: while braking, the streak counting up to 47/3 says
+        # nothing the brake's own lines do not already say (#742 AC5).
+        logger.log(
+            logging.DEBUG if self._braking else logging.WARNING,
             "resident-cap: memory low (%.1f%% available, %d/%d consecutive samples)",
             available / total * 100,
             self._low_streak,
@@ -413,29 +477,44 @@ class ResidentCapLoop:
         is cheap — erring toward twenty is not.
 
         The cap is **never** touched here. This method can only remove residents.
+
+        **Every loud line here is once per episode, not once per tick** (#742
+        AC5). Since the brake now refuses to touch running turns, "nothing I may
+        sleep" is a normal steady state — every resident busy — and a WARNING on
+        each 30-second tick would bury the one log a human reads during exactly
+        that kind of incident (the #678 failure, in the worst possible place).
         """
+        if not self._braking:
+            self._episode += 1
         self._braking = True
         total, available = self._memory()
-        logger.warning(
-            "resident-cap: EMERGENCY brake ENGAGED — MemAvailable %.1f%% of total "
-            "for %d consecutive samples; sleeping the longest-idle workspaces "
-            "ahead of their TTL",
-            (available / total * 100) if total else 0.0,
-            self._low_streak,
-        )
+        engaged = self._quiet.sample(("engaged", self._episode))
+        if engaged.emit:
+            logger.warning(
+                "resident-cap: EMERGENCY brake ENGAGED — MemAvailable %.1f%% of total "
+                "for %d consecutive samples; sleeping the longest-idle workspaces "
+                "ahead of their TTL%s",
+                (available / total * 100) if total else 0.0,
+                self._low_streak,
+                engaged.suffix,
+            )
 
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
+        resident = self._resident() & {rec.thread_id for rec in records}
         victims = select_lru_victims(
             records,
-            resident=self._resident() & {rec.thread_id for rec in records},
+            resident=resident,
             target=0,  # ordering only — the loop below stops as soon as it recovers
-            in_flight=self._in_flight(),
+            in_flight=await self._turns_in_flight(resident),
         )
         if not victims:
-            logger.warning(
-                "resident-cap: EMERGENCY brake has nothing it may sleep "
-                "(every resident workspace has a running turn or no session row)"
-            )
+            stuck = self._quiet.sample(("nothing", self._episode))
+            if stuck.emit:
+                logger.warning(
+                    "resident-cap: EMERGENCY brake has nothing it may sleep "
+                    "(every resident workspace has a running turn or no session row)%s",
+                    stuck.suffix,
+                )
             return 0
 
         from .workspace_notice import WorkspaceReason
@@ -485,16 +564,22 @@ class ResidentCapLoop:
             records,
             resident=resident,
             target=self._limit,
-            in_flight=self._in_flight(),
+            in_flight=await self._turns_in_flight(resident),
         )
         if not victims:
             # Say so: "over the cap and doing nothing" must not look like "fine".
-            logger.info(
-                "resident-cap: %d resident > limit %d, but nothing may be slept "
-                "(running turns / no session row)",
-                len(resident),
-                self._limit,
-            )
+            # Sampled, because a fleet that is entirely busy stays over the cap
+            # for as long as it is busy, and this would otherwise be a line
+            # every 30 seconds for hours (#742 AC5).
+            stuck = self._quiet.sample("cap-stuck")
+            if stuck.emit:
+                logger.info(
+                    "resident-cap: %d resident > limit %d, but nothing may be slept "
+                    "(running turns / no session row)%s",
+                    len(resident),
+                    self._limit,
+                    stuck.suffix,
+                )
             return 0
 
         logger.info(
