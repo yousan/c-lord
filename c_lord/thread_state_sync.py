@@ -34,7 +34,6 @@ import datetime
 import hashlib
 import logging
 import os
-import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -49,6 +48,7 @@ from .menu_ledger import (
     menu_fingerprint,
 )
 from .notify_policy import owner_notify_id
+from .pane_running import pane_shows_running
 from .session_close import is_closed
 from .thread_name import build_name
 from .tmux import parse_work_number
@@ -105,25 +105,16 @@ _DEFAULT_RENAME_BACKOFF_SECONDS = 600.0
 # How many bottom lines of the pane to check for error indicators.
 _PANE_PROBE_LINES = 6
 
-# How many bottom lines to scan for the live working spinner. The spinner
-# renders just above the input box, but the box + status footer (~8 lines) and
-# any in-progress tool-result preview push it 10–20 lines off the bottom — so a
-# narrow window misses it. Verified against live captures (#190).
-_RUNNING_PROBE_LINES = 30
-
-# The live working spinner shows a "(<elapsed> · …)" timer that only exists
-# while Claude is actively generating/executing, e.g.
-#   ✢ Swirling… (2m 29s · ↓ 9.3k tokens)
-#   ✶ Creating PR… (11m 57s · ↑ 36.5k tokens)
-#   ✻ Running… (12s · esc to interrupt)
-# A completed turn collapses to "<char> <Word> for <N>s" (no parenthetical), so
-# matching the timer — not the spinner glyph — avoids false-positives on stale
-# completed spinners left in scrollback (#190). It is also independent of which
-# glyph the spinner is cycling through (✢ ✻ ✶ · …), which the old glyph set missed.
-_RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
-
-# Spinner glyphs that, at the very bottom of the pane, still signal active work.
-# Kept as a narrow fallback for panes where the spinner has no timer line yet.
+# "このペインは走っているか" の本体は :mod:`c_lord.pane_running` が持つ。ランプが
+# 見せる「走っている」と、常駐上限が「追い出さない」と決める「走っている」が
+# 食い違わないように、根拠は1箇所にしか書かない (#742)。
+#
+# ランプだけは、その上に glyph のフォールバックを足す。spinner がまだタイマー行を
+# 出していない一瞬で 🟢→🟡 に戻ると見た目がちらつくためで、ここで許される誤りは
+# 「1ポーリング分よけいに 🟢」で済む。眠らせる判断は同じ誤りを許せない
+# (``✻ Baked for 3m 9s`` は**終わった**ペインの通常の姿なので、glyph で数えると
+# ほぼ全部が「走っている」になり上限が1本も眠らせられなくなる) ので、足すのは
+# 呼び手であるこちら側。
 _RUNNING_CHARS = frozenset({"✢", "✻", "✶"})
 
 # Substrings that indicate an error state (checked in the bottom pane lines).
@@ -149,10 +140,9 @@ def _pane_lamp_state(pane_text: str) -> str:
     draft text in input, ``-- INSERT --`` etc.) is far more common than
     active execution.
 
-    Running is detected by the live working spinner's ``(<elapsed> · …)`` timer
-    (see :data:`_RUNNING_SPINNER_RE`), scanned across a wide bottom window since
-    the input box + footer + tool-result preview push it well off the bottom
-    (#190). A narrow bottom-glyph check remains as a fallback.
+    Running is detected by :func:`c_lord.pane_running.pane_shows_running` — the
+    live working spinner's ``(<elapsed> · …)`` timer (#190) — plus this lamp's
+    own bottom-glyph tolerance (see :data:`_RUNNING_CHARS`).
     """
     if not pane_text:
         return "waiting"
@@ -164,9 +154,8 @@ def _pane_lamp_state(pane_text: str) -> str:
             if indicator in line:
                 return "error"
 
-    for line in lines[-_RUNNING_PROBE_LINES:]:
-        if _RUNNING_SPINNER_RE.search(line):
-            return "running"
+    if pane_shows_running(pane_text):
+        return "running"
 
     for line in tail:
         if any(ch in line for ch in _RUNNING_CHARS):

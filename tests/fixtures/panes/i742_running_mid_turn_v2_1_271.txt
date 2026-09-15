@@ -1,0 +1,41 @@
+                                                                                                                                                                
+      142                                                                                                                                                       
+      143      Running is detected by :func:`c_lord.pane_running.pane_shows_runni        5 files changed +416 -64                                             ✕ 
+           ng` — the                                                                                                                                            
+      136 -    live working spinner's ``(<elapsed> · …)`` timer (#190).                  c_lord/pane_running.py                                                 
+      144 +    live working spinner's ``(<elapsed> · …)`` timer (#190) — plus thi        c_lord/resident_cap.py                                        +103 -21 
+          +s lamp's                                                                      c_lord/thread_state_sync.py                                    +16 -27 
+      145 +    own bottom-glyph tolerance (see :data:`_RUNNING_CHARS`).                  c_lord/tmux.py                                                 +82 -15 
+      146      """                                                                       1 test/generated (show)                                                
+      147      if not pane_text:                                                                                                                                
+      148          return "waiting"                                                      ────────────────────────────────────────────────────────────────────── 
+     ...                                                                                 c_lord/pane_running.py (untracked)                                     
+      154              if indicator in line:                                             ────────────────────────────────────────────────────────────────────── 
+      155                  return "error"                                                New file not yet staged.                                               
+      156                                                                                Run `git add :/c_lord/pane_running.py` to see line counts.             
+      148 -    return "running" if pane_shows_running(pane_text) else "waiting"                                                                                 
+      157 +    if pane_shows_running(pane_text):                                         ────────────────────────────────────────────────────────────────────── 
+      158 +        return "running"                                                      c_lord/resident_cap.py                                                 
+      159 +                                                                              ────────────────────────────────────────────────────────────────────── 
+      160 +    for line in tail:                                                          52  from typing import TYPE_CHECKING                                  
+      161 +        if any(ch in line for ch in _RUNNING_CHARS):                           53                                                                    
+      162 +            return "running"                                                   54  from .idle_sweep import parse_timestamp                           
+      163 +                                                                               55 +from .log_sampler import LogSampler                               
+     … 4 more lines                                                                       56  from .utils.logger import log_ctx                                 
+                                                                                          57                                                                    
+● Running 2 shell commands…                                                               58  if TYPE_CHECKING:                                                 
+  ⎿  $ tmux capture-pane -p -J -t %141 -S -14 >                                           229      what the cap is for: the point is to survive a runaway, not  
+     tests/fixtures/panes/i742_idle_after_turn_v2_1_271.txt && tmux capture-pane -p -J         to interrupt the                                                 
+     -t %145 -S -14 > tests/fixtures/panes/i742_running_mid_turn_v2_1_271.txt && echo     230      person using the tool.                                       
+     "=== idle ===" && cat tests/fixtures/panes/i742_idle_after_turn_v2_1_271.txt &&      231                                                                   
+     echo "=== run…                                                                       232 +    **That guarantee is only as good as *in_flight*.** It used t 
+                                                                                              +o be read from                                                   
+✶ Transfiguring… (4m 6s · ↓ 48.0k tokens · thought for 4s)                                233 +    the bot's in-memory task ledger alone, which a restart empti 
+                                                                                                                                                              
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                                                                             
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5  v2.1.271  Style: default  Ctx: 168.3k  Context: [███░░░░░░░░░░░░░] 168k/1.0M (17%)  Ctx Used: 17.0%  Ctx(u) Used: 21.0% 
+   Cost: $4.30  Session: 11.0%  Weekly: 42.0%  Session: 4m  Reset: 45m  Weekly Reset: 3d 7hr 45m  Block: 4hr 14m  In: 134  Out: 110.7k  Cached: 8.0M  Tot...    
+   ⎇ fix/742-live-turn-survives-restart  (+418,-65)  +418  -65  1549210701263016008  𖠰 main  cwd: /home/yousan/c-lord-sessions/1505747831447883806/154921...
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
