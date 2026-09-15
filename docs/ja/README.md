@@ -457,6 +457,14 @@ class MyCog(commands.Cog):
 uv add "c-lord[api]"
 ```
 
+**bot を動かしている Unix ユーザーだけに応答する** (#457)。`POST /api/spawn` は Claude Code
+セッションを起動するので、このポートに届くことは**そのユーザーのシェルを取ること**と同じ。
+`127.0.0.1` バインドは*ネットワーク*境界であって *UID* 境界ではない（同一ホストの別アカウントは
+普通に到達できる）ため、接続元の UID を `/proc/net/tcp` から引いて bot 自身の UID と突き合わせ、
+一致しなければ `403`（`/api/health` も同様）。**設定は不要** — 自分のユーザーからの呼び出しは
+そのまま通る。別ユーザー・別ホストを通したいときは `CLORD_API_SECRET` を設定し、
+`Authorization: Bearer …` を送らせる。詳細は [docs/SECURITY.md](../SECURITY.md#rest-api-exposure-712-457)。
+
 ### エンドポイント
 
 | メソッド | パス | 説明 |

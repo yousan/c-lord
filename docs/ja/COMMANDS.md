@@ -168,7 +168,10 @@ Bot は 2 つの認可方式に対応しています（OR 条件 — どちら�
 オプションの REST API サーバーにより、外部ツール（Claude Code CLI、CI/CD、スクリプト等）から Bot をプログラム的に操作できます。
 
 **ベース URL:** `http://127.0.0.1:8080`（変更可能）
-**認証:** `Authorization: Bearer <CLORD_API_SECRET>` ヘッダー（`/api/health` 以外はオプション）
+**認証 (#457):** **bot を動かしている Unix ユーザーだけ**に応答する（`/api/health` も含む）。
+接続元の UID を bot 自身の UID と突き合わせる。別ユーザー・別ホストから叩くときは
+`Authorization: Bearer <CLORD_API_SECRET>` が必要。自分のユーザーならヘッダーは不要。
+それ以外は `403`。
 
 ### エンドポイント一覧
 

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **REST API は bot を動かしている Unix ユーザーにしか応答しなくなった** — `POST /api/spawn` は新しいスレッドを立てて Claude Code を起動するので、この control-plane ポートに届くことは**そのユーザーのシェルを取ること**と同じ。ところが `127.0.0.1` バインドは*ネットワーク*境界であって *UID* 境界ではなく、同一ホストの**別 Unix ユーザーが無認証で到達できていた**（実測 2026-09-14: `/api/health` 200 / `/api/tasks` 200（スケジュールタスクのプロンプト本文が読める）/ `/api/spawn` 400 = 認証で弾かれずバリデーションまで到達。人間アカウントが11個あり、別ユーザーがもう1つ c-lord を動かしているホスト）。#712 で API が既定起動になるまでは #543 のバグが偶然この露出を止めていた。接続元の UID を `/proc/net/tcp(6)` の 4-tuple 照合で引き（`c_lord/ext/peer_uid.py`）、bot 自身の UID（と root）以外は **403** にした。**`/api/health` も対象** — 以前は誰にでも 200 を返し、ポートスキャンがホスト上の c-lord の一覧になっていた。**利用者の設定は不要**で、自分のユーザーからの呼び出し（セッション内 Claude の curl、`scripts/fuzz`、`staging.sh`）は今までどおり通る。別ユーザー・別ホストを通したいときは `CLORD_API_SECRET` を設定して `Authorization: Bearer …` を送る（自分のユーザーはヘッダー不要 — その secret は同 UID から読めるので要求しても何も守れないうえ、#353 で tmux env から除去されるためセッションは送れない）。UID を証明できない環境（非 Linux）は deny + 起動時 WARNING、明示的な逃がし口は `CLORD_API_ALLOW_ANY_PEER=1`（有効時は起動のたびに警告）。起動ログに毎回「誰に応答するか」が1行出る (#457)
+
 ### Fixed
 - **Claude が渡したファイルが Discord に届くようになった** — ハーネスの `SendUserFile` ツールは `1 file delivered to user.` を返すが、その届け先はハーネス側の配送チャンネルであって Discord ではない。jsonl ミラー（#492 以降の既定経路）はこの `tool_use` を素通りさせていたため、**ホスト全体で 29 件のファイルが1件も届かないまま、セッション側は成功したと信じていた**。利用者から見ると「送ったと言われたのに無い」という壊れ方。ミラーが `SendUserFile` を検知し、`input.files` を**実名で**、`input.caption` を本文として**独立した1メッセージ**で添付するようにした（最終回答に相乗りしないので `progress.txt` / テーブル PNG (#683) の 10 添付枠を奪わない）。11個以上は10個ずつ分割し、**添付できなかったファイルは ⚠️ で名前と理由がスレッドに出る**（黙って捨てない）。パッケージ更新だけで有効、`CLORD_SEND_USER_FILE=0` で opt-out。あるべき動きは `docs/specs/user-file-delivery.md` (#233)
 

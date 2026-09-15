@@ -439,7 +439,10 @@ See [specs/authorization-default.md](specs/authorization-default.md).
 The optional REST API server allows external tools (Claude Code CLI, CI/CD, scripts) to interact with the bot programmatically.
 
 **Base URL:** `http://127.0.0.1:8080` (configurable)
-**Auth:** `Authorization: Bearer <CLORD_API_SECRET>` header (optional, except `/api/health`)
+**Auth (#457):** served only to the Unix user running the bot — the peer's UID is
+checked against the bot's own, `/api/health` included. Callers from another user
+or another host must send `Authorization: Bearer <CLORD_API_SECRET>`; your own
+user never needs a header. Anything else gets `403`.
 
 ### Endpoints
 

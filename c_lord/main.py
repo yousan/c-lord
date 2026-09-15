@@ -266,6 +266,10 @@ async def build_api_server(
         host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
         port=api_port,
         api_secret=os.getenv("CLORD_API_SECRET") or None,
+        # #457: loopback is not a UID boundary. The API only serves the Unix
+        # user running the bot; this opens it to anyone who can reach the port.
+        allow_any_peer=os.getenv("CLORD_API_ALLOW_ANY_PEER", "false").strip().lower()
+        in ("1", "true", "yes", "on"),
         # #372: OGP/URL link previews are OFF by default; opt back in.
         show_url_embeds=os.getenv("CLORD_SHOW_URL_EMBEDS", "false").strip().lower()
         in ("1", "true", "yes", "on"),
