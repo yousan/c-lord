@@ -444,12 +444,27 @@ def _unresolved_notice(report: UnresolvedTranscript) -> str:
       there.  Restarting Claude re-names it, and ``/claude-restart`` keeps the
       conversation.
     * **c-lord never named it** — the session predates #773 (it was started by
-      an older c-lord, or it is still running from before the upgrade).  A
-      ``/claude-restart`` will **not** help: it resumes with ``--continue``,
-      which reuses the very transcript nothing can recognise and names nothing.
-      Only a new session gets a name, and that is ``/clear``.  The workspace —
-      the checkout, the branch, the files — is untouched; the conversation is
-      what does not carry over, and saying so is the honest trade.
+      an older c-lord, or it is still running from before the upgrade).  Here
+      the advice is ordered by what it costs the reader, cheapest first:
+
+      ``/claude-restart`` keeps the conversation and *may* be enough, because
+      the next process is started fresh: on a CLI that still writes c-lord's
+      input marker it becomes recognisable again by the old rule, and on any
+      resume that finds no conversation at all c-lord falls through to a fresh
+      **named** start.  What it cannot promise is the middle case — a resume
+      that succeeds on a CLI that strips the marker reopens the same unnamed
+      transcript and names nothing (``--session-id`` is refused with
+      ``--continue``).
+
+      So ``/clear`` is named as the one that always works: a new session is a
+      named session.  The workspace — the checkout, the branch, the files — is
+      untouched; the conversation is what does not carry over, and saying so is
+      the honest trade.
+
+    Deliberately not decided here by reading the CLI's version: what matters is
+    what the *next* process will do, the reader can try the cheap option first
+    either way, and a notice that is wrong about a version it guessed at is
+    worse than one that is honest about the order.
     """
     if report.candidates == 0:
         detail = "このワークスペースには transcript がまだ 1 つもありません。"
@@ -465,11 +480,11 @@ def _unresolved_notice(report: UnresolvedTranscript) -> str:
     else:
         recovery = (
             "このセッションは c-lord がセッションに名前を付けるようになる前"
-            "（#773 以前）に起動したものです。`/claude-restart` では直りません"
-            "（`--continue` は名前の無いセッションをそのまま開き直すため）。"
-            "`/clear` で新しいセッションを始めてください — 作業ディレクトリ"
-            "（チェックアウト・ブランチ・ファイル）はそのままで、会話の文脈だけが"
-            "引き継がれません。"
+            "（#773 以前）に起動したものです。\n"
+            "1. まず `/claude-restart`（会話の文脈は残ります）。これで直ることがあります\n"
+            "2. 直らなければ `/clear` — 新しいセッションには必ず名前が付くので確実に復旧します。"
+            "作業ディレクトリ（チェックアウト・ブランチ・ファイル）はそのままで、"
+            "会話の文脈だけが引き継がれません"
         )
     return (
         "⚠️ このスレッドの transcript が見つからないため、Claude の返事を "

@@ -169,16 +169,17 @@ def _report(**kw) -> UnresolvedTranscript:
     return UnresolvedTranscript(**base)  # type: ignore[arg-type]
 
 
-def test_an_unnamed_session_is_not_sent_to_claude_restart() -> None:
-    """``/claude-restart`` resumes with ``--continue``, which names nothing.
+def test_an_unnamed_session_is_offered_the_cheap_option_first() -> None:
+    """Both options, cheapest first — and ``/clear`` named as the sure one.
 
-    Telling the reader to run it would cost them a restart and change nothing —
-    the session that predates #773 has no name, and only a *new* session gets
-    one.
+    ``/claude-restart`` keeps the conversation and is enough on a CLI that still
+    writes the marker, so sending the reader straight to ``/clear`` would throw
+    away context they did not have to lose.  But it cannot be promised, so the
+    notice has to name the one that always works as well.
     """
     text = _unresolved_notice(_report(claimed_session_id=None))
-    assert "/clear" in text
-    assert "`/claude-restart` では直りません" in text
+    assert text.index("/claude-restart") < text.index("/clear"), text
+    assert "確実に復旧します" in text
 
 
 def test_a_named_session_is_sent_to_claude_restart() -> None:
