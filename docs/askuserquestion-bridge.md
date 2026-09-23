@@ -582,6 +582,14 @@ the final state after the keystrokes, from the best evidence available:
    The menu's `tool_use` id is looked up **before** answering (afterwards a newer
    menu may already exist), and the pane's cwd gives the project dir
    (`TmuxClaudeRunner.transcript_project_dir`).
+   **The newest ask is this menu only if it has no result yet** (#746, found on
+   staging). The CLI sometimes writes a menu's `tool_use` only together with its
+   result; the newest ask in the file is then an earlier, finished one, and
+   judging this answer by *its* result (a rejection, say) is wrong. So when the
+   newest ask already has a result, the menu is the **first ask written after
+   it** (`first_ask_tool_use_after` — the earliest, never a later question), read
+   once it appears. Plan approval (`allow_other=False`) writes no ask at all, so
+   for it the pane is the evidence (`ask_handler._locate_menu`).
 2. **The pane**, when there is no transcript to read: "the menu is gone". Weaker
    — it cannot tell a real answer from a discarded one — but far better than the
    pre-#651 answer of not looking at all.
@@ -871,7 +879,7 @@ from Claude Code v2.1.252.
 | One-owner-per-thread menu arbitration (#535) | `c_lord/discord_ui/ask_bus.py::AskAnswerBus.register` |
 | Why a menu closed / what a late click is told (#536) | `ask_bus.py::note_closed`, `ask_view.py::_undeliverable_reason` |
 | Answered / undelivered embeds (#536) | `embeds.py::ask_answered_embed`, `ask_undelivered_embed` |
-| Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
+| Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_locate_menu` / `_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
 | Interim / unconfirmed embeds (#651/#746) | `embeds.py::ask_sending_embed`, `ask_confirming_embed`, `ask_unconfirmed_embed` |
 | Correcting the menu when the result lands late (#746) | `ask_handler.py::settle_answer` / `_confirm_late` |
 | Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |

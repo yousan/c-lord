@@ -36,19 +36,18 @@ gave leftover ⏹ Stop buttons.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 from typing import TYPE_CHECKING, Any
 
 from .claude.types import AskQuestion, ask_question_from_dict
 from .discord_ui.ask_handler import (
-    _transcript_dir,
+    _locate_menu,
     send_answer_keystrokes,
     settle_answer,
 )
 from .discord_ui.ask_view import AskView
-from .transcript.ask_result import ASK_ANSWERED, latest_ask_tool_use
+from .transcript.ask_result import ASK_ANSWERED
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -182,12 +181,7 @@ class PaneMenuAnswerer:
 
         # #651: note which tool_use this menu is BEFORE answering, so the outcome
         # can be read back from Claude's own transcript afterwards.
-        project_dir = await _transcript_dir(runner)
-        ask_ref = (
-            await asyncio.to_thread(latest_ask_tool_use, project_dir)
-            if project_dir is not None
-            else None
-        )
+        menu_ref = await _locate_menu(runner, pane_question)
 
         logger.info(
             "%s restart recovery: typing %r into the still-open menu %r (#671)",
@@ -212,8 +206,7 @@ class PaneMenuAnswerer:
             self._question,
             selected,
             runner,
-            project_dir,
-            ask_ref,
+            menu_ref,
             thread_id=self._thread_id,
         )
         logger.info("%s restart recovery: outcome=%s for %r (#671)", ctx, outcome, loggable)

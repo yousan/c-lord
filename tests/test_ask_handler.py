@@ -282,11 +282,17 @@ def _transcript(project_dir, result_text: str | None) -> None:
     )
 
 
-def _verifying_runner(project_dir, *, closes_on_answer: bool = True) -> MagicMock:
+def _verifying_runner(
+    project_dir, *, closes_on_answer: bool = True, result_on_answer: str | None = None
+) -> MagicMock:
     """A runner whose menu stays open until answered, reading *project_dir*.
 
     The menu must stay open until the click lands, or the bridge takes the
     "answered in the pane" path and never sends keystrokes at all.
+
+    *result_on_answer* is what Claude Code writes as the menu's tool_result once
+    the keys land — written then, not before: a menu that is still open has no
+    result, and #746 relies on exactly that to tell this menu from an earlier one.
     """
     runner = MagicMock()
     state = {"answered": False}
@@ -299,6 +305,8 @@ def _verifying_runner(project_dir, *, closes_on_answer: bool = True) -> MagicMoc
 
     async def _answer(*_args, **_kwargs):
         state["answered"] = True
+        if result_on_answer is not None and project_dir is not None:
+            _transcript(project_dir, result_on_answer)
         return True
 
     runner.peek_pending_ask = _peek
@@ -349,9 +357,9 @@ async def test_answer_that_never_reached_claude_is_not_reported_as_answered(monk
     (or even "did the menu close") calls it ✅ and the user is left thinking
     they were ignored.
     """
-    _transcript(tmp_path, _REJECTED_RESULT)
+    _transcript(tmp_path, None)
     thread, msg = _thread(651_0001)
-    runner = _verifying_runner(tmp_path)
+    runner = _verifying_runner(tmp_path, result_on_answer=_REJECTED_RESULT)
 
     await _answer_via_bridge(monkeypatch, thread, msg, runner, "A1")
 
@@ -364,9 +372,9 @@ async def test_answer_that_never_reached_claude_is_not_reported_as_answered(monk
 @pytest.mark.asyncio
 async def test_answer_confirmed_in_the_transcript_is_reported_as_answered(monkeypatch, tmp_path):
     """#651 AC2: ✅ is earned by the transcript, not by the keystrokes."""
-    _transcript(tmp_path, _ANSWERED_RESULT)
+    _transcript(tmp_path, None)
     thread, msg = _thread(651_0002)
-    runner = _verifying_runner(tmp_path)
+    runner = _verifying_runner(tmp_path, result_on_answer=_ANSWERED_RESULT)
 
     await _answer_via_bridge(monkeypatch, thread, msg, runner, "A1")
 

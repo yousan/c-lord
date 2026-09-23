@@ -296,10 +296,12 @@ async def test_an_on_time_no_answer_result_still_reads_as_undelivered(monkeypatc
     """AC3: the in-window path is untouched by the late watcher."""
     _fast(monkeypatch)
     _write_tool_use(tmp_path)
-    _append_tool_result(tmp_path, _REJECTED_RESULT)
     thread, msg = _thread(746_0005)
+    runner = _flushing_runner(
+        tmp_path, flush=[_tool_result(_TOOL_USE_ID, "2026-09-14T03:02:12.000Z", _REJECTED_RESULT)]
+    )
 
-    await _answer(thread, _runner(tmp_path))
+    await _answer(thread, runner)
 
     final = _last_text(msg)
     assert "伝わっていません" in final and "✅" not in final, final
@@ -370,3 +372,127 @@ async def test_a_restored_menu_is_also_corrected_by_a_late_result(monkeypatch, t
     _append_tool_result(tmp_path, _ANSWERED_RESULT)
 
     assert await _until(lambda: _answered(msg)), _last_text(msg)
+
+
+# -- the menu on screen is not in the transcript yet (found on staging) -------
+#
+# staging 2026-09-23 21:04: 案B was Esc'd (its tool_result says "rejected"), then
+# 案C was asked and answered. The CLI had not written 案C's tool_use yet when the
+# bridge looked it up — it lands together with the result — so "the newest
+# AskUserQuestion" was 案B, and 案C's answer was judged by 案B's rejection:
+# ``outcome=unknown`` over an answer Claude had received. With the late watcher
+# that became worse: it would watch 案B's result, which never changes, for 25h.
+
+_OLD_ID = "toolu_01OLDxxxxxxxxxxxxxxxxxxxx"
+_NEW_ID = "toolu_01NEWxxxxxxxxxxxxxxxxxxxx"
+_PLAIN_REJECTION = (
+    "The user doesn't want to proceed with this tool use. The tool use was rejected "
+    "(eg. if it was a file edit, the new_string was NOT written to the file). STOP what "
+    "you are doing and wait for the user to tell you how to proceed."
+)
+
+
+def _write_events(project_dir: Path, events: list[dict], *, append: bool = False) -> None:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    with _session_file(project_dir).open(mode, encoding="utf-8") as fh:
+        for e in events:
+            fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def _tool_use(tool_id: str, ts: str) -> dict:
+    return {
+        "timestamp": ts,
+        "message": {
+            "content": [{"type": "tool_use", "id": tool_id, "name": "AskUserQuestion", "input": {}}]
+        },
+    }
+
+
+def _tool_result(tool_id: str, ts: str, text: str) -> dict:
+    return {
+        "timestamp": ts,
+        "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id, "content": text}]},
+    }
+
+
+def _flushing_runner(project_dir: Path, *, flush: list[dict], closes: bool = True) -> MagicMock:
+    """A pane whose answer makes the CLI write *flush* (tool_use + result at once)."""
+    runner = _runner(project_dir)
+    state = {"answered": False}
+
+    async def _peek():
+        return None if (state["answered"] and closes) else _question()
+
+    async def _peek_state():
+        return (await _peek(), True)
+
+    async def _answer(*_args, **_kwargs):
+        state["answered"] = True
+        _write_events(project_dir, flush, append=True)
+        return True
+
+    runner.peek_pending_ask = _peek
+    runner.peek_menu_state = _peek_state
+    runner.answer_menu = _answer
+    runner.answer_menu_multi = _answer
+    runner.answer_menu_text = _answer
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_an_unwritten_ask_is_not_judged_by_the_previous_one(monkeypatch, tmp_path, caplog):
+    """RED before the fix: 案C read 案B's rejection → ⏳ forever, outcome=unknown."""
+    _fast(monkeypatch)
+    _write_events(
+        tmp_path,
+        [
+            _tool_use(_OLD_ID, "2026-09-23T11:54:12.683Z"),
+            _tool_result(_OLD_ID, "2026-09-23T12:02:50.959Z", _PLAIN_REJECTION),
+        ],
+    )
+    runner = _flushing_runner(
+        tmp_path,
+        flush=[
+            _tool_use(_NEW_ID, "2026-09-23T12:02:56.631Z"),
+            _tool_result(_NEW_ID, "2026-09-23T12:04:39.715Z", _ANSWERED_RESULT),
+        ],
+    )
+    thread, msg = _thread(746_0101)
+
+    with caplog.at_level(logging.INFO, logger="c_lord.discord_ui.ask_handler"):
+        await _answer(thread, runner)
+        assert await _until(lambda: _answered(msg)), _last_text(msg)
+
+    assert "ask answer outcome=unknown" not in caplog.text, caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_plan_menu_is_not_watched_through_an_old_ask(monkeypatch, tmp_path):
+    """Plan approval (#251, ``allow_other=False``) raises no AskUserQuestion at
+    all, so "the newest ask" is always some earlier, finished one. Judging by
+    it — and, since #746, watching it for a day — is wrong either way; the pane
+    closing is the evidence for these menus, exactly as when no ask exists."""
+    _fast(monkeypatch)
+    _write_events(
+        tmp_path,
+        [
+            _tool_use(_OLD_ID, "2026-09-23T11:54:12.683Z"),
+            _tool_result(_OLD_ID, "2026-09-23T12:02:50.959Z", _PLAIN_REJECTION),
+        ],
+    )
+    runner = _flushing_runner(tmp_path, flush=[])
+    thread, msg = _thread(746_0102)
+    plan = _question()
+    plan.allow_other = False
+
+    async def _click_soon() -> None:
+        await asyncio.sleep(0.05)
+        ask_bus.post_answer(thread.id, ["A1"])
+
+    await asyncio.gather(
+        asyncio.wait_for(bridge_pane_ask(thread, plan, runner), timeout=5.0), _click_soon()
+    )
+
+    assert _answered(msg), _last_text(msg)
+    assert not ask_handler._late_confirmations, "a watcher was left on an unrelated ask"
