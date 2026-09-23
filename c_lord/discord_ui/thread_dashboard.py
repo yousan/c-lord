@@ -84,7 +84,7 @@ _OFF_VALUES = {"0", "false", "no", "off"}
 
 # Threads older than this are pruned from the dashboard automatically.
 # Keeps the embed from accumulating stale entries after a long idle period.
-_STALE_HOURS = 4
+_STALE_HOURS = 0.05  # VERIFY ONLY (#754): 3 min instead of 4h — never merge
 
 
 def _sweep_enabled() -> bool:
