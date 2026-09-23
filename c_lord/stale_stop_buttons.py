@@ -208,22 +208,12 @@ async def _sweep_thread(
     else:
         messages = thread.history(limit=first_visit_messages, before=boundary)
 
-    failed = 0
-    oldest_failed: int | None = None
+    found: list[tuple[Any, str]] = []
     try:
         async for message in messages:
             kind = _residue_kind(message, my_id, thread_id, keep_menu)
-            if kind is None:
-                continue
-            if await _clear(message, kind):
-                if kind == "stop":
-                    tally.stops += 1
-                else:
-                    tally.menus += 1
-            else:
-                failed += 1
-                mid = int(message.id)
-                oldest_failed = mid if oldest_failed is None else min(oldest_failed, mid)
+            if kind is not None:
+                found.append((message, kind))
     except Exception:
         # #678: not DEBUG — a thread that is never readable is a thread whose
         # residue stays live, and that has to be findable with grep thread=<id>.
@@ -235,6 +225,10 @@ async def _sweep_thread(
             exc_info=True,
         )
         return
+
+    failed_ids = await _clear_all(thread, found, tally, ctx)
+    failed = len(failed_ids)
+    oldest_failed = min(failed_ids) if failed_ids else None
 
     # Everything before this process started has now been examined — except what
     # could not be cleared: the cursor stops short of it so the next start tries
@@ -252,6 +246,59 @@ async def _sweep_thread(
     if cursors is not None and new_cursor != cursor:
         with contextlib.suppress(Exception):
             await cursors.set(thread_id, new_cursor)
+
+
+async def _clear_all(
+    thread: Any, found: list[tuple[Any, str]], tally: _Tally, ctx: str
+) -> list[int]:
+    """Clear *found* in *thread*; return the ids that could not be cleared.
+
+    An archived thread is reopened for the duration and archived again after.
+    That is where nearly all of the residue lives — production 2026-09-23: 81 of
+    82 dead menus and 52 of 65 dead Stops, in ``[停止]`` threads #685 archives —
+    and Discord refuses every edit and delete there ("Thread is archived"). It
+    is reopened only when there is something to clear, so a sweep over a quiet
+    archive changes nothing.
+    """
+    if not found:
+        return []
+    reopened = False
+    if getattr(thread, "archived", None) is True:
+        try:
+            await thread.edit(archived=False)
+        except Exception as exc:
+            # A locked thread needs Manage Threads to reopen (#678: said, not
+            # swallowed — the next start retries, see the cursor below).
+            logger.info(
+                "%s dead-button sweep: could not reopen this archived thread to clear "
+                "%d dead button message(s): %s (#752)",
+                ctx,
+                len(found),
+                exc,
+            )
+            return [int(message.id) for message, _kind in found]
+        reopened = True
+    failed: list[int] = []
+    try:
+        for message, kind in found:
+            if not await _clear(message, kind):
+                failed.append(int(message.id))
+            elif kind == "stop":
+                tally.stops += 1
+            else:
+                tally.menus += 1
+    finally:
+        if reopened:
+            try:
+                await thread.edit(archived=True)
+            except Exception:
+                logger.warning(
+                    "%s dead-button sweep: could not archive this thread again after "
+                    "clearing its dead buttons (#752)",
+                    ctx,
+                    exc_info=True,
+                )
+    return failed
 
 
 def _residue_kind(

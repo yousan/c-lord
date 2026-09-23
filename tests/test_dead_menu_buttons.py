@@ -476,3 +476,108 @@ async def test_startup_rearms_before_it_sweeps(monkeypatch) -> None:
     keep = seen_keep[0]
     assert keep(THREAD_ID, 12345) is True
     assert keep(THREAD_ID, 99999) is False
+
+
+# ── ⑦ archived threads: where nearly all of production's residue lives ──────
+
+
+class _ArchivedThread(_Thread):
+    """A thread Discord refuses to modify messages in until it is unarchived."""
+
+    def __init__(self, thread_id: int, messages: list[_Msg], *, locked: bool = False) -> None:
+        super().__init__(thread_id, messages)
+        self.archived = True
+        self.locked = locked
+        self.edits: list[dict] = []
+        for m in messages:
+            m.thread = self
+
+    async def edit(self, **kwargs) -> None:
+        if self.locked and kwargs.get("archived") is False:
+            raise discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+        self.edits.append(kwargs)
+        if "archived" in kwargs:
+            self.archived = kwargs["archived"]
+
+
+class _MsgInThread(_Msg):
+    thread: _ArchivedThread | None = None
+
+    def _check(self) -> None:
+        if self.thread is not None and self.thread.archived:
+            raise discord.HTTPException(MagicMock(status=400), "Thread is archived")
+
+    async def delete(self) -> None:
+        self._check()
+        await super().delete()
+
+    async def edit(self, **kwargs) -> None:
+        self._check()
+        await super().edit(**kwargs)
+
+
+def _archived_menu(msg_id: int) -> _MsgInThread:
+    return _MsgInThread(
+        msg_id,
+        components=[_Row(_Button(f"ask_{THREAD_ID}_0_0"), _Button(f"ask_{THREAD_ID}_0_1"))],
+    )
+
+
+def _archived_stop(msg_id: int) -> _MsgInThread:
+    return _MsgInThread(
+        msg_id, content=f"{STOP_MESSAGE_PREFIX} (`w1`)", components=[_Row(_Button("x"))]
+    )
+
+
+@pytest.mark.asyncio
+async def test_residue_in_an_archived_thread_is_cleared_and_the_thread_re_archived() -> None:
+    """Production 2026-09-23: 81 of 82 dead menus and 52 of 65 dead Stops sat
+    in archived threads (``[停止]`` threads are archived by #685), where Discord
+    refuses every edit and delete. Found on staging: "could not clear 10".
+
+    The thread is reopened only for as long as it takes, and only when there
+    is something to clear — then put back exactly as it was.
+    """
+    from c_lord.stale_stop_buttons import sweep_dead_buttons
+
+    menu = _archived_menu(_snowflake(600))
+    stop = _archived_stop(_snowflake(500))
+    thread = _ArchivedThread(THREAD_ID, [menu, stop])
+
+    await sweep_dead_buttons(_bot(thread), _session_repo(THREAD_ID))
+
+    assert _retired(menu), "a dead menu in an archived thread stayed live-looking"
+    assert stop.deleted
+    assert thread.edits == [{"archived": False}, {"archived": True}]
+    assert thread.archived is True, "the thread must end up archived again"
+
+
+@pytest.mark.asyncio
+async def test_an_archived_thread_with_nothing_to_clear_is_left_archived() -> None:
+    from c_lord.stale_stop_buttons import sweep_dead_buttons
+
+    thread = _ArchivedThread(THREAD_ID, [_MsgInThread(_snowflake(600), content="実装しました。")])
+
+    await sweep_dead_buttons(_bot(thread), _session_repo(THREAD_ID))
+
+    assert thread.edits == [], "reopening a thread with nothing to clear is pure noise"
+
+
+@pytest.mark.asyncio
+async def test_a_locked_thread_that_cannot_be_reopened_is_logged(caplog) -> None:
+    """AC4: a locked thread needs Manage Threads to reopen — say so, at INFO."""
+    from c_lord.stale_stop_buttons import sweep_dead_buttons
+
+    menu = _archived_menu(_snowflake(600))
+    thread = _ArchivedThread(THREAD_ID, [menu], locked=True)
+
+    with caplog.at_level(logging.INFO, logger="c_lord.stale_stop_buttons"):
+        await sweep_dead_buttons(_bot(thread), _session_repo(THREAD_ID))
+
+    assert not _retired(menu)
+    assert any(
+        r.levelno == logging.INFO
+        and f"thread={THREAD_ID}" in r.getMessage()
+        and "#752" in r.getMessage()
+        for r in caplog.records
+    ), caplog.text
