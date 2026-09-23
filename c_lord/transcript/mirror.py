@@ -45,7 +45,7 @@ from ..usage_limit import (
 )
 from .formatter import RenderedEvent, render_event
 from .pane_echo import pane_echo
-from .tail import tail_events
+from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +414,8 @@ class TranscriptMirror:
         usage_limit_grace: float = USAGE_LIMIT_GRACE_SECONDS,
         ask_bridge_cb: AskBridgeCb | None = None,
         progress: TurnProgress | None = None,
+        expect_turn: bool = False,
+        unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
     ) -> None:
         self.thread_id = thread_id
         self.project_dir = project_dir
@@ -447,6 +449,16 @@ class TranscriptMirror:
         # folding the banner ourselves.  A knob only so tests need not sleep.
         self._usage_limit_grace = usage_limit_grace
         self._task: asyncio.Task[None] | None = None
+        # #773: is somebody waiting on this mirror right now?  Only then is
+        # "I cannot find this thread's transcript" news worth posting — a mirror
+        # restored at startup for an idle workspace has nothing to read by
+        # design, and ``on_ready`` restores one for every open session on the
+        # host.
+        self._turn_active = expect_turn
+        self._unresolved_after = unresolved_after
+        # One notice per turn: the tail keeps reporting for as long as the
+        # outage lasts, which is what lets the *next* turn be told too.
+        self._unresolved_told = False
 
     def note_turn_started(self) -> None:
         """Tell the progress line a turn just began (#539).
@@ -456,6 +468,48 @@ class TranscriptMirror:
         the reader has been waiting for all of it.
         """
         self._progress.begin_turn(restart=True)
+        # #773: from here on, silence is a symptom rather than an idle thread.
+        self._turn_active = True
+        self._unresolved_told = False
+
+    async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
+        """Say out loud that this thread's transcript cannot be found (#773/#585).
+
+        The jsonl mirror is the only delivery path there is (#712), so a mirror
+        that resolves nothing is a thread that receives nothing — and #627 made
+        that failure *silent* on purpose, to avoid the worse failure of posting
+        a stranger's conversation.  Silence is still the right thing to post; it
+        is the wrong thing to *say*, which is why this exists.  In #773 the
+        fleet was mute for three days and the only trace was one log line per
+        mirror.
+        """
+        logger.error(
+            "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
+            "(%d jsonl file(s) present, claimed session id %s) — Claude's replies "
+            "cannot reach this thread (#773)",
+            self.thread_id,
+            report.project_dir,
+            report.seconds,
+            report.candidates,
+            report.claimed_session_id or "none",
+        )
+        if not self._turn_active or self._unresolved_told:
+            return
+        self._unresolved_told = True
+        if report.candidates == 0:
+            detail = "このワークスペースには transcript がまだ 1 つもありません。"
+        else:
+            detail = (
+                f"transcript は {report.candidates} 本ありますが、"
+                "どれもこのスレッドのセッションのものと確認できません。"
+            )
+        await self._try_sink(
+            "⚠️ このスレッドの transcript が見つからないため、Claude の返事を "
+            f"Discord に転送できていません（{report.seconds:.0f} 秒間）。\n"
+            f"{detail}\n"
+            "`/claude-restart` で Claude を立て直すと、c-lord が新しいセッションに "
+            "名前を付け直して復旧します（作業内容は残ります）。"
+        )
 
     def start(self) -> None:
         """Spawn the tail task.  Idempotent."""
@@ -618,7 +672,12 @@ class TranscriptMirror:
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _producer() -> None:
-            async for event in tail_events(self.project_dir, poll_interval=self._poll_interval):
+            async for event in tail_events(
+                self.project_dir,
+                poll_interval=self._poll_interval,
+                on_unresolved=self._on_unresolved,
+                unresolved_after=self._unresolved_after,
+            ):
                 await queue.put(event)
 
         producer = asyncio.create_task(_producer(), name=f"transcript-tail-{self.thread_id}")
@@ -668,6 +727,8 @@ class TranscriptMirror:
                     usage_limit_notices.clear_thread(self.thread_id)
 
                 if _is_turn_end(event):
+                    # #773: nobody is waiting on this mirror until the next turn.
+                    self._turn_active = False
                     # #631: a limit reported for the turn that just ended says
                     # nothing about the next one — the limit may well have reset
                     # in between, and a thread that silently stops explaining why

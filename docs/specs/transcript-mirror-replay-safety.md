@@ -28,9 +28,36 @@
 
 | ルール | 中身 |
 |---|---|
-| 1. 資格 | c-lord がペインに送るプロンプトには必ず ZWSP (U+200B) が付く (`tmux.send_input` / `start_claude` #530)。それが `"content":"` の直後に生の UTF-8 で入っている transcript だけが対象。`claude -p` の transcript には決して入らない |
-| 2. 前進のみ | いったん決めたら、乗り換えてよいのは**それを決めた後に現れたファイル**だけ (= `/clear` の後継)。既にあったファイルは mtime がどれだけ新しく見えても乗っ取れない。`touch` で読了済み transcript に戻って再投稿する事故を塞ぐ |
-| 3. 該当なし | 資格を満たすファイルが無ければ**何も出さない**。ログに 1 度だけ警告する。他人の会話を流すくらいなら黙る。次に c-lord がターンを回した時点で自動的に解消する |
+| 0. 名前 (#773) | **c-lord は自分が起動するセッションに自分で名前を付ける**。`start_claude` が `--session-id <uuid>` を渡し、その uuid を transcript の隣 (`<project_dir>/.clord-session`) に記録する (`c_lord/transcript/claim.py`)。`<uuid>.jsonl` が存在すれば**それがこのスレッドの transcript**。中身を読まないので、CLI の入力整形に左右されない |
+| 1. 資格（後方互換） | 名前が無いセッション（#773 以前に起動して走り続けているもの）だけがここに来る。c-lord がペインに送るプロンプトには ZWSP (U+200B) が付く (`tmux.send_input` / `start_claude` #530) ので、それが `"content":"` の直後に生の UTF-8 で入っている transcript は対象。**付いていても偽陽性にはならない**ので残してあるが、**CLI 2.1.278 以降は付かない**ので、これ単独では成立しない |
+| 2. 前進のみ | 名前で決まらなかったとき、いったん決めたら乗り換えてよいのは**それを決めた後に現れたファイル**だけ (= `/clear` の後継)。既にあったファイルは mtime がどれだけ新しく見えても乗っ取れない。`touch` で読了済み transcript に戻って再投稿する事故を塞ぐ |
+| 3. 該当なし | どれにも当たらなければ**何も出さない**。他人の会話を流すくらいなら黙る。**ただし黙っていることは隠さない** — 次節 |
+
+**resume も名前で戻る (#773)**: ペインが落ちたスレッドを起こし直すとき、`--continue`
+（= その作業ディレクトリで**最後に書いた**会話を開く）ではなく **`--resume <記録した uuid>`**
+を使う。`--continue` が開く「最後に書いた会話」は `claude -p` のサブ呼び出しかもしれず、
+それは #627 と同じ取り違えを一段下で再現する。`--resume` は同じ jsonl に追記されるので、
+ミラーは追従し直す必要すらない（記録が無い古いスレッドは従来どおり `--continue`）。
+
+### 見つからないことを黙らない (#773 / #585)
+
+ルール 3 の沈黙は**投稿の方針としては正しいが、利用者への説明としては間違っている**。
+配信経路は jsonl ミラー一本 (#712) なので、**ミラーが黙る = そのスレッドには何も届かない**。
+
+- **ターンが走っているスレッドにだけ**、「transcript が見つからないので転送できていない」と
+  **1 ターンに 1 回**投稿する (`TranscriptMirror._on_unresolved`)。
+  復旧手段 (`/claude-restart`) も併記する
+- **アイドルのスレッドには出さない。** bot 起動時 (`on_ready`) に復元されるミラーは
+  `expect_turn=False` で立つ。Claude を一度も動かしていないワークスペースに transcript が
+  無いのは正常で、このホストにはそれが数百ある
+- ログには（ターンの有無に関わらず）`ERROR` で 1 行出す。
+  `候補 jsonl の本数` と `記録した session id` を含めるので、
+  「1本も書かれていない」と「書かれているが自分のものと確認できない」を切り分けられる
+
+**なぜ必要か**: #773 では CLI 2.1.278 が ZWSP を削るようになり、**全スレッドが同時に**
+ルール 3 に落ちた。2026-09-20 から 09-23 まで誰も気づかず、9/23 には一斉発注した
+作業スレッド 17 本が丸一日、開始通知のまま止まって見えた（中身は進んでいて PR も 15 本
+上がっていた）。痕跡はミラー 1 本につき WARNING 1 行だけだった。
 
 **同じ判定を #215 の救出スキャンにも使う** (`recovery.py`)。mtime 最新を読むと、
 bot 再起動中に終わった `claude -p` の最終回答が「落ちた回答」として
@@ -41,7 +68,13 @@ bot 再起動中に終わった `claude -p` の最終回答が「落ちた回答
 「印つきの最新」と旧ルールの選択が食い違うケースは **0 件** — つまりこの規則は
 正常に動いていたスレッドの挙動を変えずに、事故だけを塞ぐ。
 
-テスト: `tests/transcript/test_session_pinning.py`、
+**実測 (2026-09-23, CLI 2.1.280, 隔離 tmux)**: `--session-id <uuid>` を付けて対話モードで
+起動すると、transcript は `<渡した uuid>.jsonl` として作られ、**中の ZWSP は 0 バイト**
+（TUI 自身が `Removed 1 invisible character from the launch prompt before sending it` と
+表示する）。つまり**ルール 1 だけでは 0 件、ルール 0 なら確実に当たる**。
+
+テスト: `tests/transcript/test_session_claim.py`、`tests/transcript/test_session_pinning.py`、
+`tests/transcript/test_unresolved_notice.py`、`tests/test_start_claude_session_id.py`、
 `tests/transcript/test_recovery.py::test_does_not_recover_a_sub_invocations_answer`。
 
 ## 1 つの transcript を読むミラーは 1 本だけ (#719)

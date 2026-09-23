@@ -176,6 +176,8 @@ class TestStartClaudeWithoutPrompt:
             assert mgr.start_claude(123, None, "sonnet", try_continue=True) is True
 
         cmd = typed[0]
+        # No claim recorded for this workspace, so the resume falls back to
+        # --continue (a claimed one resumes by id instead — #773).
         assert "--continue" in cmd
         assert "CLORD_PROMPT" not in cmd, "a prompt file must not be staged for a wake"
 

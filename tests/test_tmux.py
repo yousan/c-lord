@@ -555,7 +555,8 @@ class TestTmuxSessionManager:
         assert send_keys, "start_claude must send keys to the pane"
         assert all(f"{SESSION_NAME}:work1" in args for args in send_keys)
         cmd_str = _typed_command(mock_run)
-        assert "claude --model sonnet" in cmd_str
+        # #773: c-lord names the session it starts, between `claude` and --model.
+        assert re.search(r"claude --session-id [0-9a-f-]{36} --model sonnet", cmd_str), cmd_str
         # #529: the prompt rides in a file, never on the typed command line.
         assert "hello world" not in cmd_str
         assert "hello world" in _staged_prompt(mock_run)
@@ -616,7 +617,7 @@ class TestTmuxSessionManager:
             assert mgr.start_claude(12345, "hello", "sonnet") is True
 
         cmd_str = _typed_command(mock_run)
-        assert "claude --model sonnet" in cmd_str
+        assert re.search(r"claude --session-id [0-9a-f-]{36} --model sonnet", cmd_str), cmd_str
         assert "project=" not in cmd_str  # unknown repo -> attribute omitted
         assert "cwd=/tmp/not-a-repo" in cmd_str
 
@@ -671,7 +672,11 @@ class TestTmuxSessionManager:
         assert hostile not in _typed_command(mock_run)
 
     def test_start_claude_with_try_continue_flag(self) -> None:
-        """start_claude with try_continue=True includes --continue in the command."""
+        """try_continue=True resumes — with ``--continue`` when nothing is claimed.
+
+        A workspace c-lord has already named a session in resumes that session by
+        id instead (#773); see ``tests/test_start_claude_session_id.py``.
+        """
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"

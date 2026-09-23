@@ -19,6 +19,23 @@ import pytest
 from c_lord.claude.types import MessageType, StreamEvent
 
 
+@pytest.fixture(autouse=True)
+def _isolated_claude_home(tmp_path_factory, monkeypatch) -> None:
+    """Keep ``~/.claude`` out of the test run (#773).
+
+    ``start_claude`` now records which session it started in
+    ``~/.claude/projects/<slug>/.clord-session``, derived from the pane's cwd.
+    Unit tests hand it fake pane paths, so without this every run would leave
+    claims in the developer's real home **and read each other's** — three tmux
+    tests started failing on a second run because an earlier test's claim turned
+    their ``--continue`` into a ``--resume``.
+
+    Set through ``$HOME`` rather than by patching ``Path.home``, so a test that
+    wants its own home (``monkeypatch.setenv("HOME", ...)``) still wins.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+
+
 @pytest.fixture
 def thread() -> MagicMock:
     """A MagicMock discord.Thread with send and id set."""
