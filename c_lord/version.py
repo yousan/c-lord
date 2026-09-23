@@ -17,13 +17,19 @@ Layers:
 * **Runtime pin** (``runtime_version``) — what the *running process* is, as
   opposed to what is on disk right now. Everything user-facing (the boot log
   line, the 📊 footer, ``/version``) reports this one (#722).
+* **Build age** (``build_date``, ``stale_build_age``, ``label_with_age``) — how
+  old that build is, judged from the version string's ``-YYYYMMDD`` tail and
+  today's date only. No network: an OSS framework must not phone home by
+  default, and must keep working where it cannot (#756).
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import subprocess
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -34,6 +40,13 @@ BumpLevel = Literal["major", "minor", "patch"]
 
 # setuptools_scm / hatch-vcs local version, e.g. "1.4.1.dev3+g599631.d20251203"
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+#: A build at least this many days old says so — a WARNING at boot and
+#: ``(Nd)`` after the version in the 📊 footer (#756). One place, on purpose.
+STALE_BUILD_DAYS = 7
+
+# The article format's date tail: "v1.4.197-b3f06814-20260915" -> "20260915".
+_DATE_TAIL_RE = re.compile(r"-(\d{8})$")
 
 
 def format_version_string(base: str, commit: str | None, date: str | None) -> str:
@@ -134,6 +147,46 @@ def extract_changelog_section(changelog_text: str, version: str) -> str | None:
     return "\n".join(lines[start:end]).strip()
 
 
+def build_date(version: str) -> date | None:
+    """Return the commit date in an article-format version string, or None.
+
+    ``None`` whenever there is no usable ``-YYYYMMDD`` tail — ``"unknown"``, a
+    bare ``v1.4.197``, or a tail that is not a real date.
+    """
+    match = _DATE_TAIL_RE.search(version)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def stale_build_age(version: str, today: date | None = None) -> int | None:
+    """Return the build's age in days once it is worth saying, else None.
+
+    #756: the version string already says when the build is from, but nobody
+    turns ``-20260908`` into "two weeks ago" — so instances ran builds 18
+    releases behind while their users hit bugs fixed on main. This does that
+    arithmetic, locally: the date tail plus today, nothing else.
+
+    ``None`` for a build younger than :data:`STALE_BUILD_DAYS`, and for one
+    whose date is unknown (知らないことは黙る — never "None days"). A date in
+    the future (a skewed clock) is not stale either.
+    """
+    built = build_date(version)
+    if built is None:
+        return None
+    age = ((today or date.today()) - built).days
+    return age if age >= STALE_BUILD_DAYS else None
+
+
+def label_with_age(version: str, today: date | None = None) -> str:
+    """Return ``version``, followed by `` (Nd)`` when the build is stale."""
+    age = stale_build_age(version, today)
+    return f"{version} ({age}d)" if age is not None else version
+
+
 # ---------------------------------------------------------------------------
 # Resolver (side-effecting, thin)
 # ---------------------------------------------------------------------------
@@ -174,6 +227,38 @@ def _distribution_version() -> str | None:
         return None
 
 
+def _baked_commit_date() -> str | None:
+    """Return the commit date ``hatch_build.py`` baked into the wheel, if any.
+
+    Imported by name at runtime: the module only exists in a built package
+    (it is generated at build time and gitignored, like ``_version.py``).
+    """
+    try:
+        info = importlib.import_module("c_lord._build_info")
+    except Exception:
+        return None
+    value = getattr(info, "COMMIT_DATE", None)
+    if isinstance(value, str) and _DATE_TAIL_RE.search(f"-{value}"):
+        return value
+    return None
+
+
+def _installed_version() -> str | None:
+    """Resolve the version of an installed package (no ``.git``), or None.
+
+    hatch-vcs puts a date in the local version only for a *dirty* build, so a
+    clean install reports ``1.4.197`` / ``1.4.198.dev1+g3f06814`` with no date.
+    The commit date baked in at build time fills that gap (#756) — otherwise
+    the build age could never be known for exactly the instances that fall
+    behind (installed packages, as opposed to checkouts that get pulled).
+    """
+    dist = _distribution_version()
+    if not dist:
+        return None
+    base, commit, built = parse_local_version(dist)
+    return format_version_string(base, commit, built or _baked_commit_date())
+
+
 def resolve_version() -> str:
     """Resolve the running build's article-format version string.
 
@@ -182,7 +267,8 @@ def resolve_version() -> str:
     1. **Live git** (running from a checkout): latest tag + short commit +
        commit date — the freshest, exact answer.
     2. **Installed metadata** (``hatch-vcs``-baked, e.g. a wheel): parse the
-       local version to recover commit/date when present.
+       local version to recover commit/date when present, taking the date from
+       the build hook's ``_build_info`` when the local version has none.
     3. ``"unknown"`` if nothing is available.
     """
     repo_root = Path(__file__).resolve().parent.parent
@@ -201,12 +287,7 @@ def resolve_version() -> str:
             base = parse_local_version(dist)[0] if dist else "0.0.0"
         return format_version_string(base, commit, date)
 
-    dist = _distribution_version()
-    if dist:
-        base, commit, date = parse_local_version(dist)
-        return format_version_string(base, commit, date)
-
-    return "unknown"
+    return _installed_version() or "unknown"
 
 
 @lru_cache(maxsize=1)
