@@ -22,6 +22,13 @@ elapsed time: while Claude grinds through tools the mirror keeps seeing jsonl
 events even though none of them are posted, so "tools are moving" is a real
 signal that the session is alive. When even that stops, the line says so
 instead of claiming progress it cannot see.
+
+"Stops" has to mean *nothing is running*, not *nothing was written* (#757).
+A single long call — a 2-minute build, a CI wait — writes its ``tool_use`` when
+it starts and its ``tool_result`` when it ends, and nothing in between. Going by
+event recency alone, the line dropped the tool name it had at 60s and guessed
+"長考かコンテキスト圧縮" while the command was plainly still running. So the
+line also tracks which calls are open, and keeps saying 作業中 while one is.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ import contextlib
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -45,7 +52,8 @@ DEFAULT_QUIET_SECONDS = 90.0
 # is far below it.
 DEFAULT_UPDATE_SECONDS = 15.0
 
-# If no tool event has been seen for this long, stop claiming "作業中".
+# If no tool event has been seen for this long, stop claiming "作業中" —
+# unless a call is still open (#757): one long call writes nothing until it returns.
 DEFAULT_STALLED_SECONDS = 60.0
 
 # Tool labels can be long (a full Bash command); keep the line to one row.
@@ -152,6 +160,9 @@ class TurnProgress:
         self._last_edit = 0.0
         self._tool_label: str | None = None
         self._tool_count = 0
+        # Tool calls whose ``tool_result`` has not arrived yet, oldest first,
+        # mapped to the label they were started with (#757).
+        self._running: dict[str, str | None] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -177,6 +188,9 @@ class TurnProgress:
         self._last_activity = now
         self._tool_label = None
         self._tool_count = 0
+        # A call left open by the previous turn (its result never written — the
+        # session died mid-call) must not keep this one "作業中".
+        self._running.clear()
 
     async def end_turn(self) -> None:
         """Disarm and take the line away. Safe to call when nothing is shown."""
@@ -195,12 +209,28 @@ class TurnProgress:
         self._last_output = self._clock()
         await self._remove()
 
-    def note_activity(self, label: str | None = None) -> None:
-        """A tool event was seen — evidence the session is alive but busy."""
+    def note_activity(
+        self,
+        label: str | None = None,
+        *,
+        started: Iterable[str] = (),
+        finished: Iterable[str] = (),
+    ) -> None:
+        """A tool event was seen — evidence the session is alive but busy.
+
+        *started* / *finished* are the transcript ids of the calls this event
+        opened (``tool_use``) and closed (``tool_result``). While any call is
+        open the line keeps saying 作業中, however long it has been since the
+        last event (#757).
+        """
         self._last_activity = self._clock()
         if label:
             self._tool_label = _shorten(label)
             self._tool_count += 1
+        for tool_id in started:
+            self._running[tool_id] = self._tool_label
+        for tool_id in finished:
+            self._running.pop(tool_id, None)
 
     # -- driving -----------------------------------------------------------
 
@@ -237,6 +267,11 @@ class TurnProgress:
     def _render(self, now: float) -> str:
         elapsed = _mmss(now - self._turn_start)
         idle = now - self._last_activity
+        # The newest call still open: with parallel calls, the one that already
+        # returned is not what the reader is waiting on.
+        running = next((lbl for lbl in reversed(self._running.values()) if lbl), None)
+        if running is not None:
+            return f"-# ⚙️ 作業中 {elapsed} · 🔧 {running} · ツール {self._tool_count} 件"
         if self._tool_label is not None and idle < self._stalled_seconds:
             return f"-# ⚙️ 作業中 {elapsed} · 🔧 {self._tool_label} · ツール {self._tool_count} 件"
         return (
