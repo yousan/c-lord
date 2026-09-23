@@ -75,7 +75,8 @@ def _render_assistant(event: dict[str, Any]) -> RenderedEvent | None:
             continue
         bt = block.get("type")
         if bt == "text":
-            text = (block.get("text") or "").strip()
+            # #755: the model can write harness blocks back out as its own words.
+            text = _fold_echoed_harness_blocks(block.get("text") or "").strip()
             if text:
                 parts.append(text)
         elif bt == "tool_use":
@@ -136,14 +137,8 @@ def _is_task_notification(text: str) -> bool:
     return text.startswith(_TASK_NOTIFICATION_OPEN)
 
 
-def _render_task_notification(text: str, session_id: str | None) -> RenderedEvent | None:
-    """Render a task notification as tool activity, or ``None`` to drop it (#380).
-
-    Folded into ``progress.txt`` in minimal mode like any other tool result, so
-    the record survives without a 👤 bubble per background task.  It also counts
-    as tool activity for the in-turn progress line (#539), which is what makes
-    "a background task is running" visible during the turn without spending a
-    message on it.
+def _task_notification_detail(text: str) -> str:
+    """The one human-readable field of a task notification, or ``""`` (#380).
 
     Falls back to ``<status>`` when there is no summary, and to tag-stripping for
     a malformed marker — the raw storage form must never reach Discord (#487).
@@ -156,6 +151,19 @@ def _render_task_notification(text: str, session_id: str | None) -> RenderedEven
     if not detail:
         # Malformed or empty: strip every tag rather than leak the storage form.
         detail = _TASK_TAG_RE.sub("", text).strip()
+    return detail
+
+
+def _render_task_notification(text: str, session_id: str | None) -> RenderedEvent | None:
+    """Render a task notification as tool activity, or ``None`` to drop it (#380).
+
+    Folded into ``progress.txt`` in minimal mode like any other tool result, so
+    the record survives without a 👤 bubble per background task.  It also counts
+    as tool activity for the in-turn progress line (#539), which is what makes
+    "a background task is running" visible during the turn without spending a
+    message on it.
+    """
+    detail = _task_notification_detail(text)
     if not detail:
         return None
     return RenderedEvent(
@@ -163,6 +171,86 @@ def _render_task_notification(text: str, session_id: str | None) -> RenderedEven
         body=f"⏹ バックグラウンド: {detail}",
         session_id=session_id,
     )
+
+
+# The same harness blocks, echoed back by the model inside its *own* text
+# (#755).  Every scrub above sits on the ``user`` side, where the harness
+# injects them; on 2026-09-14 the model wrote a whole ``<system-reminder>`` —
+# a ``<task-notification>`` and its ``/tmp/claude-…`` output path inside — back
+# out as part of a reply, and it reached the thread verbatim three times.
+#
+# The shape is what separates an echo from Claude *talking about* the tags,
+# which it does far more often (23 of the 26 assistant texts mentioning them in
+# the corpus, 2026-06 → 09, every one an inline code span):
+#
+# - the opening tag starts its own line and nothing follows it on that line
+#   (the harness writes them that way; prose puts them mid-sentence),
+# - the block is closed by its own closing tag — an unclosed one is left alone,
+# - it is not inside a fenced code block, where it is being quoted on purpose.
+#
+# The model also glues the role word onto the tag (``user<system-reminder>``),
+# echoing the turn boundary it was shown; that word belongs to the echo.
+_ECHOED_BLOCK_RE = re.compile(
+    r"^(?:user|human|assistant)?<(system-reminder|task-notification)>[ \t]*\n.*?</\1>[ \t]*",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+_TASK_BLOCK_RE = re.compile(r"<task-notification>.*?</task-notification>", re.DOTALL)
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(```|~~~)")
+# Only the ``<summary>`` survives the fold, but a summary is a free-form label
+# and can quote a command line; the internal paths must not ride out on it.
+_INTERNAL_PATH_RE = re.compile(r"(?:/tmp/claude-|/home/)[^\s\"'`<>]*")
+_ECHOED_REMINDER_NOTICE = "-# ⚙️ Claude Code の内部通知（省略）"
+
+
+def _fenced_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of fenced code blocks in *text* (an unclosed fence runs to the end)."""
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    fence = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        m = _FENCE_RE.match(line)
+        if m is not None:
+            if start is None:
+                start, fence = offset, m.group(1)
+            elif m.group(1) == fence:
+                spans.append((start, offset + len(line)))
+                start = None
+        offset += len(line)
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
+def _fold_echoed_block(block: str) -> str:
+    """One subtext line per background task the echoed block carried (#755).
+
+    The same line the ``user``-side notification becomes (#380), so the thread
+    reads the same whichever side it came from.  A reminder that carried no
+    notification still leaves one line: folded, not silently dropped (#678).
+    """
+    lines: list[str] = []
+    for m in _TASK_BLOCK_RE.finditer(block):
+        detail = _INTERNAL_PATH_RE.sub("…", _task_notification_detail(m.group(0)))
+        if detail:
+            lines.append(f"-# ⏹ バックグラウンド: {detail}")
+    return "\n".join(lines) or _ECHOED_REMINDER_NOTICE
+
+
+def _fold_echoed_harness_blocks(text: str) -> str:
+    """Replace harness blocks the model echoed into its reply with one line each (#755)."""
+    if "<system-reminder>" not in text and "<task-notification>" not in text:
+        return text
+    fenced = _fenced_spans(text)
+
+    def _fold(m: re.Match[str]) -> str:
+        if any(start <= m.start() < end for start, end in fenced):
+            return m.group(0)
+        return _fold_echoed_block(m.group(0))
+
+    # Each block becomes a line in its own place, so the surrounding prose keeps
+    # its spacing and nothing outside a matched block is touched.
+    return _ECHOED_BLOCK_RE.sub(_fold, text)
 
 
 # Claude Code context compaction (#628).  When the context window fills, the
