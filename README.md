@@ -139,7 +139,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Thread names stay yours** — c-lord never re-summarises a thread's name on its own. A thread keeps the name it was opened with (only the `W<N> │` prefix and the `#<issue>` number are added around it); run `/thread-rename` in the thread when you want a fresh summary of the recent conversation (sonnet). `CLORD_AUTO_TOPIC=1` restores the old auto-summary (#705)
 
 #### 📡 Real-time Feedback
-- **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⚠️ if it stalls). Reactions stay responsive under heavy use; the thread-name lamp is the slower, eventually-consistent sidebar view (#246)
+- **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⏳ / ⚠️ if it goes quiet for 10 s / 30 s). Reactions stay responsive under heavy use. A 🟢/🟡 lamp in the thread name is off by default (#329); set `CLORD_THREAD_LAMP=1` for that slower, eventually-consistent sidebar view (#246)
 - **Streaming text** — Intermediate assistant text appears as Claude works
 - **Tool result embeds** — Live tool call results with elapsed time ticking up every 10s
 - **Extended thinking** — Reasoning shown as spoiler-tagged embeds (click to reveal)
@@ -155,8 +155,8 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 #### 📊 Observability
 - **Token usage** — Cache hit rate and token counts shown in session-complete embed
 - **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
-- **Compact detection** — Notifies in-thread when context compaction occurs (trigger type + token count before compact)
-- **Hard stall notification** — Thread message after 30 s of no activity (extended thinking or context compression); resets automatically when Claude resumes
+- **Compact notice** — When Claude Code compacts the context, the thread gets a one-line `🗜️ コンテキストを圧縮しました` instead of the raw continuation summary (#628)
+- **Hard stall lamp** — After 30 s of no activity the reaction on your message turns ⚠️ (extended thinking or context compression can be this quiet too); no message is posted to the thread (#473)
 - **Turn progress line** — When a turn goes quiet for 90 s, one subtext line appears (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), refreshes in place every 15 s, and disappears the moment real output returns; says `⏳ 待機中` when even tool activity has stopped. Never posted outside a turn. Opt out with `CLORD_TURN_PROGRESS=0` (#539)
 - **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541)
 
