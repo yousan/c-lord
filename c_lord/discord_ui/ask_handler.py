@@ -40,6 +40,7 @@ from .ask_bus import (
     CLOSE_INTERRUPTED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
+    ChosenOption,
 )
 from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
@@ -283,6 +284,22 @@ async def _report_answer_delivery(
         await thread.send(_answer_undeliverable_notice(selected))
 
 
+def _option_index(question: AskQuestion, answer: str) -> int | None:
+    """Which option of *question* *answer* is, or None when it is free text (#674).
+
+    A click carries its index (:class:`ChosenOption`), and that is the
+    identity: a label is display text, and display text gets cut (Discord's
+    80-character limit), stripped, and duplicated (two ``""`` labels when #579's
+    parser could not read two options). Only an answer without an index —
+    ✏️ Other, a typed sentence — is compared with the labels, so a sentence that
+    spells an option exactly still picks it, as it always has.
+    """
+    if isinstance(answer, ChosenOption) and 0 <= answer.option_index < len(question.options):
+        return answer.option_index
+    labels = [opt.label for opt in question.options]
+    return labels.index(answer) if answer in labels else None
+
+
 async def send_answer_keystrokes(
     runner: TmuxClaudeRunner, question: AskQuestion, selected: list[str]
 ) -> bool | None:
@@ -296,19 +313,20 @@ async def send_answer_keystrokes(
     - multiSelect toggles each chosen index then Submits (#418); ``answer_menu``
       here dropped all but the first choice;
     - a single choice navigates ``Down × index`` — which is why the option ORDER
-      matters far more than the label text;
+      matters far more than the label text, and why a click is identified by
+      the index it carries rather than by its label (#674);
     - free text goes to whichever affordance this menu has (a "Type something."
       row, or a preview menu's ``Notes:`` field).
 
     Returns the runner's own delivery verdict: ``False`` means the keystrokes
     reached no window at all (#600).
     """
-    labels = [opt.label for opt in question.options]
-    indices = [labels.index(s) for s in selected if s in labels]
+    indices = [i for i in (_option_index(question, s) for s in selected) if i is not None]
     if question.multi_select and indices:
         return await runner.answer_menu_multi(indices, len(question.options))
-    if selected and selected[0] in labels:
-        return await runner.answer_menu(labels.index(selected[0]))
+    first = _option_index(question, selected[0]) if selected else None
+    if first is not None:
+        return await runner.answer_menu(first)
     return await runner.answer_menu_text(
         len(question.options), selected[0] if selected else "", mode=question.free_text_mode
     )

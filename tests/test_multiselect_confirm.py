@@ -62,24 +62,36 @@ def _select_of(view: AskView) -> discord.ui.Select:
     )
 
 
-def _message_with_defaults(custom_id: str, labels: list[str], chosen: list[str]) -> MagicMock:
+def _values(view: AskView, *labels: str) -> list[str]:
+    """The values Discord echoes back when the options labelled *labels* are
+    picked — read off the rendered Select, since an option is identified by its
+    index rather than its label (#674)."""
+    by_label = {o.label: o.value for o in _select_of(view).options}
+    return [by_label[lb] for lb in labels]
+
+
+def _message_with_defaults(
+    view: AskView, chosen: list[str], extra: list[tuple[str, str]] | None = None
+) -> MagicMock:
     """A ``discord.Message`` stand-in whose components carry *chosen* as defaults.
 
     Built from a real Discord components payload through ``ActionRow`` so the
     test exercises the same object graph the gateway produces, not a mock shape
-    invented here.
+    invented here. *extra* adds ``(label, value)`` options the View never drew.
     """
+    select = _select_of(view)
+    rendered = [(o.label, o.value) for o in select.options] + (extra or [])
     payload: Any = {
         "type": 1,
         "components": [
             {
                 "type": 3,
-                "custom_id": custom_id,
+                "custom_id": select.custom_id,
                 "min_values": 1,
-                "max_values": len(labels),
+                "max_values": len(rendered),
                 "options": [
-                    {"label": lb, "value": lb, **({"default": True} if lb in chosen else {})}
-                    for lb in labels
+                    {"label": lb, "value": v, **({"default": True} if lb in chosen else {})}
+                    for lb, v in rendered
                 ],
             }
         ],
@@ -107,10 +119,10 @@ class TestSelectionIsStoredOnTheMessage:
         select = _select_of(view)
 
         sel = _interaction()
-        sel.data = {"values": ["残骸ウィンドウ9枚の掃除", "放置スレッドの棚卸し"]}
+        sel.data = {"values": _values(view, "残骸ウィンドウ9枚の掃除", "放置スレッドの棚卸し")}
         await view._multi_select_record(sel)
 
-        marked = [o.value for o in select.options if o.default]
+        marked = [o.label for o in select.options if o.default]
         assert marked == ["残骸ウィンドウ9枚の掃除", "放置スレッドの棚卸し"], (
             "the chosen options must be marked default=True so the selection "
             "lives on the message, not only in this View instance"
@@ -121,7 +133,7 @@ class TestSelectionIsStoredOnTheMessage:
         view = AskView(_question(), thread_id=672_0002, q_idx=0)
 
         sel = _interaction()
-        sel.data = {"values": ["いまはやらない"]}
+        sel.data = {"values": _values(view, "いまはやらない")}
         await view._multi_select_record(sel)
 
         await_args = sel.response.edit_message.await_args
@@ -138,14 +150,14 @@ class TestSelectionIsStoredOnTheMessage:
         select = _select_of(view)
 
         first = _interaction()
-        first.data = {"values": ["残骸ウィンドウ9枚の掃除"]}
+        first.data = {"values": _values(view, "残骸ウィンドウ9枚の掃除")}
         await view._multi_select_record(first)
 
         second = _interaction()
-        second.data = {"values": ["いまはやらない"]}
+        second.data = {"values": _values(view, "いまはやらない")}
         await view._multi_select_record(second)
 
-        assert [o.value for o in select.options if o.default] == ["いまはやらない"]
+        assert [o.label for o in select.options if o.default] == ["いまはやらない"]
 
 
 class TestConfirmRecoversTheSelection:
@@ -154,18 +166,16 @@ class TestConfirmRecoversTheSelection:
     @pytest.mark.asyncio
     async def test_fresh_view_confirms_using_the_message_components(self) -> None:
         """The exact shape of #671 / #633: the View that receives the confirm is
-        not the one that recorded the choice, so ``_selected_values`` is empty."""
+        not the one that recorded the choice, so ``_selected_indices`` is empty."""
         q = _question()
         tid = 672_0010
         recorded = ["残骸ウィンドウ9枚の掃除", "古い Open PR 3本の始末", "放置スレッドの棚卸し"]
 
         # A different instance entirely — a restored view, or a re-bridge.
         view = AskView(q, thread_id=tid, q_idx=0)
-        assert view._selected_values == []
+        assert view._selected_indices == []
 
-        message = _message_with_defaults(
-            _select_of(view).custom_id, [o.label for o in q.options], recorded
-        )
+        message = _message_with_defaults(view, recorded)
         queue = cast("asyncio.Queue[list[str]]", ask_bus.register(tid))
         try:
             await view._confirm_callback(_interaction(message))
@@ -184,7 +194,7 @@ class TestConfirmRecoversTheSelection:
         view = AskView(q, thread_id=tid, q_idx=0)
 
         sel = _interaction()
-        sel.data = {"values": ["いまはやらない"]}
+        sel.data = {"values": _values(view, "いまはやらない")}
         await view._multi_select_record(sel)
 
         queue = cast("asyncio.Queue[list[str]]", ask_bus.register(tid))
@@ -202,9 +212,7 @@ class TestConfirmRecoversTheSelection:
         q = _question()
         tid = 672_0012
         view = AskView(q, thread_id=tid, q_idx=0)
-        message = _message_with_defaults(
-            _select_of(view).custom_id, [o.label for o in q.options], []
-        )
+        message = _message_with_defaults(view, [])
 
         queue = cast("asyncio.Queue[list[str]]", ask_bus.register(tid))
         try:
@@ -229,7 +237,7 @@ class TestConfirmIsNoLongerSilent:
         tid = 672_0020
         view = AskView(_question(), thread_id=tid, q_idx=0)
         sel = _interaction()
-        sel.data = {"values": ["放置スレッドの棚卸し"]}
+        sel.data = {"values": _values(view, "放置スレッドの棚卸し")}
         await view._multi_select_record(sel)
 
         queue = cast("asyncio.Queue[list[str]]", ask_bus.register(tid))
@@ -272,9 +280,9 @@ class TestRecoveryIsBoundedByTheOptionSet:
         tid = 672_0030
         view = AskView(q, thread_id=tid, q_idx=0)
         message = _message_with_defaults(
-            _select_of(view).custom_id,
-            [o.label for o in q.options] + ["よそから来た選択肢"],
+            view,
             ["放置スレッドの棚卸し", "よそから来た選択肢"],
+            extra=[("よそから来た選択肢", "option:9")],
         )
 
         queue = cast("asyncio.Queue[list[str]]", ask_bus.register(tid))

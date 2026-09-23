@@ -284,7 +284,10 @@ class TestMultiSelectPending:
         )
         view = AskView(q, thread_id=536_0030, q_idx=0)
         interaction = _interaction()
-        interaction.data = {"values": ["A", "C"]}
+        # The values the rendered options carry — options are identified by
+        # index, not label (#674).
+        select = next(c for c in view.children if hasattr(c, "options"))
+        interaction.data = {"values": [o.value for o in select.options if o.label in ("A", "C")]}
 
         await view._multi_select_record(interaction)
 
