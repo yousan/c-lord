@@ -108,6 +108,41 @@ verified with the bot's actual `answer_menu` selecting the intended option.
 While the bridge waits for the click, the runner is suspended at its `yield`,
 so the pane is not re-polled and the menu is not re-detected (natural dedup).
 
+### Which option was chosen — by index, never by label (#674)
+
+**A click is identified by the option's position, not its text.** Labels are
+display text, and display text gets altered on the way to Discord: cut to the
+80-character label limit, `.strip()`ped, or replaced by the TUI's own number
+when the pane parser could not read it (#579 — two such options both have the
+label `""`).
+
+| where | what identifies the option |
+|---|---|
+| Select option `value` | `option:{index}` (`ask_view.py::_option_value`) |
+| button | the index bound by `_make_button_callback(view, index)` |
+| the ask bus | a `ChosenOption` — the option's **full** label as a `str`, carrying `option_index` (`ask_bus.py`) |
+| `send_answer_keystrokes` | `option_index` when present; label matching **only** for text with no index (✏️ Other, a typed sentence — so a sentence that spells an option exactly still picks it) |
+
+It used to be the label end to end: the Select `value` was the label cut to 80
+characters, and `send_answer_keystrokes` matched it against the untruncated
+labels. An option longer than 80 characters therefore matched nothing and fell
+through to the free-text path — **Claude received its first 80 characters as a
+sentence the user had typed**. Buttons were spared only because their callback
+happened to carry the untruncated label.
+
+The multi-select marks (#672 below) use the same `value`, so `_mark_selected`
+writes and `_recover_selection` reads the same key — changing one without the
+other would break recovery. A menu posted **before** #674 still carries the
+labels as its values; `AskView._index_of` resolves those too, because the deploy
+that ships this restarts the bot and #671 re-arms every menu still on screen.
+A value that names no option of the menu is refused with an ephemeral notice and
+a log line — it is never delivered as an empty answer, which is the #315
+pre-emption signal and would Esc the menu away.
+
+Because what travels is still the full label, everything that only *shows* the
+answer (the ⏳ / ✅ embeds, the non-tmux answer prompt) now shows the whole
+option rather than its first 80 characters.
+
 ## How a multi-select is answered (#418)
 
 `answer_menu(index)` is single-select only — it sends `Down×index + Enter`, so a
@@ -161,7 +196,7 @@ on every message edit, so a recorded choice used to vanish from the dropdown and
 read as "my selection did not take" — now it stays checked.
 
 > Interaction with #671: a restored view starts with an empty
-> `_selected_values`, so this fallback is what lets it confirm correctly. The
+> `_selected_indices`, so this fallback is what lets it confirm correctly. The
 > selection needs no DB column — it is already on the message.
 
 ## How free text (`✏️ Other`) is answered (#172, #650)
@@ -855,4 +890,5 @@ from Claude Code v2.1.252.
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
 | Multi-select choice stored on the message | `ask_view.py::AskView._mark_selected` / `_recover_selection` (#672) |
+| Option identified by index, not label (#674) | `ask_view.py::_option_value` / `AskView._index_of` / `_answers`, `ask_bus.py::ChosenOption`, `ask_handler.py::_option_index` |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |

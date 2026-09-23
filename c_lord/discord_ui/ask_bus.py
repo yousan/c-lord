@@ -32,12 +32,37 @@ _CLOSE_NOTE_TTL = 86_400.0
 _MAX_CLOSE_NOTES = 512
 
 
+class ChosenOption(str):
+    """An answer that IS option ``option_index`` of its menu (#674).
+
+    An answer on the bus is a list of strings, and a string used to be matched
+    back to its option by comparing it with the labels. That broke whenever the
+    string was not the label verbatim: a Select value cut to Discord's
+    80-character display limit matched nothing, so the pick was typed into the
+    pane as free text — "chose it, got a different answer". A choice made on a
+    button or in a Select therefore carries the index it was made at, and only
+    text with no index (✏️ Other, a typed sentence) is matched by label.
+
+    It is still the option's full label as a string, so everything that only
+    *shows* an answer — the embeds, the logs, the non-tmux answer prompt —
+    reads it unchanged. (``option_index``, not ``index``: that would shadow
+    ``str.index``.)
+    """
+
+    option_index: int
+
+    def __new__(cls, label: str, option_index: int) -> ChosenOption:
+        choice = super().__new__(cls, label)
+        choice.option_index = option_index
+        return choice
+
+
 class AskAnswerBus:
     """Routes button/select interactions to the coroutine awaiting an answer.
 
     One instance is shared across all active sessions (module-level singleton).
     Each waiting session registers a Queue keyed by thread_id; AskView callbacks
-    post the chosen labels into that Queue.
+    post the chosen options (as :class:`ChosenOption`) into that Queue.
     """
 
     def __init__(self) -> None:

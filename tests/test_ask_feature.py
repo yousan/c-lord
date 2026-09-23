@@ -394,7 +394,10 @@ class TestAskViewMultiSelectConfirm:
         try:
             # 1) Select fires — must record only, not deliver.
             sel = MagicMock()
-            sel.data = {"values": ["A", "C"]}
+            # The values the rendered options carry — options are identified
+            # by index, not label (#674).
+            select = next(c for c in view.children if hasattr(c, "options"))
+            sel.data = {"values": [o.value for o in select.options if o.label in ("A", "C")]}
             sel.response.edit_message = AsyncMock()
             await view._multi_select_record(sel)
             assert queue.empty(), "selection must not deliver before confirm"
