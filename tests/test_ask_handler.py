@@ -37,6 +37,17 @@ def _multi_question() -> AskQuestion:
     )
 
 
+@pytest.fixture(autouse=True)
+async def _drain_late_watchers():
+    """#746: an unconfirmed answer leaves a background transcript watcher —
+    cancel it so it cannot outlive its test and edit a later test's mocks."""
+    yield
+    tasks = list(ask_handler._late_confirmations)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _thread(thread_id: int) -> tuple[MagicMock, MagicMock]:
     thread = MagicMock()
     thread.id = thread_id

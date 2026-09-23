@@ -43,10 +43,9 @@ from typing import TYPE_CHECKING, Any
 
 from .claude.types import AskQuestion, ask_question_from_dict
 from .discord_ui.ask_handler import (
-    _finalize_menu_message,
     _transcript_dir,
-    _verify_answer_reached_claude,
     send_answer_keystrokes,
+    settle_answer,
 )
 from .discord_ui.ask_view import AskView
 from .transcript.ask_result import ASK_ANSWERED, latest_ask_tool_use
@@ -206,9 +205,18 @@ class PaneMenuAnswerer:
             # 12s poll would be pure latency. The keys went out; say so.
             return True, ""
 
-        outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
+        # #746: same settling as a live bridge — including the late watcher, since
+        # a restored menu is as likely to be one question of several.
+        outcome = await settle_answer(
+            message,
+            self._question,
+            selected,
+            runner,
+            project_dir,
+            ask_ref,
+            thread_id=self._thread_id,
+        )
         logger.info("%s restart recovery: outcome=%s for %r (#671)", ctx, outcome, loggable)
-        await _finalize_menu_message(message, self._question, selected, outcome)
         return True, "" if outcome == ASK_ANSWERED else REASON_UNCONFIRMED
 
 

@@ -35,6 +35,7 @@ from ..transcript.ask_result import (
     latest_ask_tool_use,
     read_ask_result,
 )
+from ..utils.logger import log_ctx
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
@@ -48,6 +49,7 @@ from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
 from .embeds import (
     ask_answered_embed,
+    ask_confirming_embed,
     ask_embed,
     ask_unconfirmed_embed,
     ask_undelivered_embed,
@@ -80,6 +82,27 @@ _PANE_RESOLVE_MISSES = 2
 # for a busy host, not an expected wait.
 _ANSWER_CONFIRM_TIMEOUT = 12.0
 _ANSWER_CONFIRM_POLL = 0.5
+
+# #746: the window above cannot be the last word. One AskUserQuestion may carry
+# several questions, and the CLI writes its tool_result only once the LAST one
+# is answered — production measured +198s and +53min — so every earlier answer
+# timed out as ❔ over an answer Claude went on to use. The window cannot simply
+# grow: the bridge holds the thread's menu claim while it waits, and the next
+# question of the same ask is already on screen needing to be bridged. So the
+# window ends on time and a background watcher keeps reading the transcript,
+# correcting the menu when the result lands.
+#
+# Bounded by how long the rest of the ask can stay open: an unanswered question
+# is Esc'd after ASK_ANSWER_TIMEOUT, and that too writes a tool_result (a "no
+# answer" one), which the watcher reports as such. The poll backs off because
+# it re-reads one session file that can be megabytes.
+_LATE_CONFIRM_TIMEOUT = float(ASK_ANSWER_TIMEOUT + 3_600)
+_LATE_CONFIRM_POLL_MIN = 1.0
+_LATE_CONFIRM_POLL_MAX = 10.0
+
+# Strong references to the running watchers: the event loop only keeps weak
+# ones, and a collected task would silently stop correcting its menu.
+_late_confirmations: set[asyncio.Task[None]] = set()
 
 # #399: the prose context above the menu is posted as its own message(s).
 # Up to _CONTEXT_MAX_MSGS sequential chunks deliver the text IN FULL — clipping
@@ -222,14 +245,13 @@ async def _verify_answer_reached_claude(
        but far better than the pre-#651 answer of not checking at all.
 
     Polling is bounded by ``_ANSWER_CONFIRM_TIMEOUT`` because the ✅ waits on it.
+    An ``unknown`` here is not a verdict — :func:`settle_answer` hands it on to
+    the late watcher (#746).
     """
     deadline = asyncio.get_running_loop().time() + _ANSWER_CONFIRM_TIMEOUT
     while True:
         if project_dir is not None and ask_ref is not None:
-            tool_use_id, session_path = ask_ref
-            outcome = classify_ask_result(
-                await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path)
-            )
+            outcome = await _read_outcome(project_dir, ask_ref)
             if outcome != ASK_UNKNOWN:
                 return outcome
         elif await _menu_is_gone(runner) is True:
@@ -238,6 +260,138 @@ async def _verify_answer_reached_claude(
         if asyncio.get_running_loop().time() >= deadline:
             return ASK_UNKNOWN
         await asyncio.sleep(_ANSWER_CONFIRM_POLL)
+
+
+async def _read_outcome(project_dir: Path, ask_ref: tuple[str, Path]) -> AskOutcome:
+    """One read of the menu's ``tool_result`` from its session file."""
+    tool_use_id, session_path = ask_ref
+    return classify_ask_result(
+        await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path)
+    )
+
+
+async def _await_late_outcome(project_dir: Path, ask_ref: tuple[str, Path]) -> AskOutcome:
+    """Keep reading the transcript until it records the menu's result (#746).
+
+    ``unknown`` only when ``_LATE_CONFIRM_TIMEOUT`` passes with nothing written —
+    by then the rest of the ask has been Esc'd, which writes a result of its own,
+    so reaching the bound means the session itself is gone.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _LATE_CONFIRM_TIMEOUT
+    delay = _LATE_CONFIRM_POLL_MIN
+    while True:
+        outcome = await _read_outcome(project_dir, ask_ref)
+        if outcome != ASK_UNKNOWN or loop.time() >= deadline:
+            return outcome
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, _LATE_CONFIRM_POLL_MAX)
+
+
+async def _confirm_late(
+    msg,
+    question: AskQuestion,
+    selected: list[str],
+    project_dir: Path,
+    ask_ref: tuple[str, Path],
+    thread_id: int,
+) -> None:
+    """Background half of :func:`settle_answer`: correct the menu when the result lands."""
+    ctx = log_ctx(thread_id=thread_id)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        outcome = await _await_late_outcome(project_dir, ask_ref)
+    except asyncio.CancelledError:
+        # Shutdown. The menu keeps saying 確認中 — true when it was written, and
+        # carrying no advice that could hurt — but it must not go unrecorded.
+        logger.info(
+            "%s ask answer: stopped watching the transcript for %s (bot stopping) — "
+            "the menu stays at 確認中 (#746)",
+            ctx,
+            ask_ref[0],
+        )
+        raise
+    except Exception:  # pragma: no cover - defensive: a watcher must never be loud
+        logger.warning("%s ask answer: late confirmation failed (#746)", ctx, exc_info=True)
+        outcome = ASK_UNKNOWN
+    waited = loop.time() - started
+    if outcome == ASK_ANSWERED:
+        logger.info(
+            "%s ask answer confirmed late: the transcript recorded it %.0fs after the "
+            "confirm window closed (#746)",
+            ctx,
+            waited,
+        )
+    else:
+        # The one line production greps for (#746 AC6): from here it means the
+        # answer really did not arrive, or really could not be confirmed.
+        logger.warning(
+            "%s ask answer outcome=%s after watching the transcript for %.0fs "
+            "(selected=%r) (#651/#746)",
+            ctx,
+            outcome,
+            waited,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
+
+
+async def settle_answer(
+    msg,
+    question: AskQuestion,
+    selected: list[str],
+    runner: TmuxClaudeRunner,
+    project_dir: Path | None,
+    ask_ref: tuple[str, Path] | None,
+    *,
+    thread_id: int,
+) -> AskOutcome:
+    """Write what became of an answer onto its menu message (#651/#746).
+
+    Returns within the confirm window, always — the caller is usually holding
+    the thread's menu claim, and the next question of the same ask is waiting
+    for it. What cannot be decided by then is decided later:
+
+    - confirmed in the window → ✅ / ⚠️ now, as before;
+    - not yet, with a transcript to read → ⏳ 確認中 now, and a background
+      watcher turns it ✅ / ⚠️ when the ``tool_result`` lands;
+    - not yet, with nothing but the pane to go on → ❔. The pane cannot tell a
+      later question of the same ask from this one, so there is nothing a
+      longer watch could learn.
+
+    Returns the outcome known when it returns (``unknown`` while watching).
+    """
+    outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
+    if outcome == ASK_UNKNOWN and project_dir is not None and ask_ref is not None:
+        logger.info(
+            "%s ask answer not in the transcript within %.0fs — showing 確認中 and "
+            "watching for %s (a multi-question ask records it after its last answer) (#746)",
+            log_ctx(thread_id=thread_id),
+            _ANSWER_CONFIRM_TIMEOUT,
+            ask_ref[0],
+        )
+        with contextlib.suppress(Exception):
+            await msg.edit(
+                content=None,
+                embed=ask_confirming_embed(question.question, question.header, selected),
+                view=None,
+            )
+        task = asyncio.create_task(
+            _confirm_late(msg, question, selected, project_dir, ask_ref, thread_id)
+        )
+        _late_confirmations.add(task)
+        task.add_done_callback(_late_confirmations.discard)
+        return outcome
+    if outcome != ASK_ANSWERED:
+        logger.warning(
+            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
+            outcome,
+            thread_id,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
+    return outcome
 
 
 async def _finalize_menu_message(
@@ -641,15 +795,7 @@ async def _bridge_claimed_menu(
     if delivered is False:
         await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
         return
-    outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
-    if outcome != ASK_ANSWERED:
-        logger.warning(
-            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
-            outcome,
-            thread.id,
-            selected,
-        )
-    await _finalize_menu_message(msg, question, selected, outcome)
+    await settle_answer(msg, question, selected, runner, project_dir, ask_ref, thread_id=thread.id)
 
 
 async def collect_ask_answers(

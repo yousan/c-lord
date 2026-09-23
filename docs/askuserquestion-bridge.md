@@ -590,14 +590,47 @@ the final state after the keystrokes, from the best evidence available:
 |---|---|
 | answered | `✅` with the question and the answer (as before) |
 | not answered | `⚠️` naming it: 「キーは送れましたが、Claude 側には『回答なし』として渡りました」 |
-| not confirmed within the bound | `❔ 回答の結果を確認できませんでした` — neither claim is made |
+| not in the transcript yet (#746) | `⏳ … Claude の受け取りを確認中です` — then corrected to ✅ / ⚠️ when the result lands |
+| never confirmed | `❔ 回答の結果を確認できませんでした` — neither claim is made, and no advice to re-send |
 
-**The bound is deliberate.** `_ANSWER_CONFIRM_TIMEOUT = 12s`, polled every
-`_ANSWER_CONFIRM_POLL = 0.5s`. The ✅ waits on this, so it is latency the user
-sees; measured on staging the `tool_result` lands about a second after the keys,
-so 12s is slack for a busy host rather than an expected wait. Timing out is
-reported as ❔, never as ✅: silence is not evidence of success — and it is not
-evidence of failure either, so it is not reported as ⚠️.
+**The window is deliberate.** `_ANSWER_CONFIRM_TIMEOUT = 12s`, polled every
+`_ANSWER_CONFIRM_POLL = 0.5s`. The bridge holds the thread's menu claim while it
+waits, and the next question of the same ask is already on screen needing to be
+bridged — so this cannot grow. For a single-question ask the `tool_result` lands
+about a second after the keys (measured on staging), and the window decides.
+
+**But the window is not the last word (#746).** One AskUserQuestion may carry
+several questions, and the CLI writes its `tool_result` only once the **last**
+one is answered — production measured +198s and +53min. Every earlier answer
+therefore cannot be confirmed in the window. What happens instead:
+
+1. at the end of the window the menu reads **`⏳ 確認中`** (`ask_confirming_embed`),
+   and the bridge returns — the thread is free for the next question;
+2. a background watcher (`ask_handler._confirm_late`) keeps reading that one
+   session file, backing off from 1s to 10s between reads;
+3. when the result lands the menu is corrected to ✅ (or ⚠️ for "no answer" —
+   late is not the same as successful);
+4. only if nothing is written for `ASK_ANSWER_TIMEOUT + 1h` does it settle on ❔.
+   By then the rest of the ask has been Esc'd (which writes a result of its own),
+   so reaching the bound means the session itself is gone.
+
+Neither ⏳ nor ❔ tells the user to send the answer again. It used to
+(「同じ内容をスレッドにもう一度送ってください」) — over answers that had landed —
+and a re-sent answer is an ordinary message, which **interrupts** the turn that
+is using it (#631's shape). The ❔ now points at where the truth shows up: Claude's
+next reply.
+
+`ask answer outcome=unknown` is logged only from step 4 (or when there is no
+transcript to read at all), so a production grep for it finds answers that
+really could not be confirmed — not answers that were merely late.
+
+**Known limit:** the watcher lives in the bot process. A restart while a menu
+reads ⏳ leaves it at ⏳ (true when written, and carrying no advice that could
+hurt); the stop is logged at INFO.
+
+When there is no transcript to read (the pane is the only evidence), there is no
+watcher: the pane cannot tell a later question of the same ask from this one, so
+a longer watch would learn nothing. The window's ❔ is final there.
 
 ## Answering by typing (#536 AC7)
 
@@ -839,7 +872,8 @@ from Claude Code v2.1.252.
 | Why a menu closed / what a late click is told (#536) | `ask_bus.py::note_closed`, `ask_view.py::_undeliverable_reason` |
 | Answered / undelivered embeds (#536) | `embeds.py::ask_answered_embed`, `ask_undelivered_embed` |
 | Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
-| Interim / unconfirmed embeds (#651) | `embeds.py::ask_sending_embed`, `ask_unconfirmed_embed` |
+| Interim / unconfirmed embeds (#651/#746) | `embeds.py::ask_sending_embed`, `ask_confirming_embed`, `ask_unconfirmed_embed` |
+| Correcting the menu when the result lands late (#746) | `ask_handler.py::settle_answer` / `_confirm_late` |
 | Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |
 | 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
