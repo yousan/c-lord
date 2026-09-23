@@ -46,6 +46,7 @@
 | [command-ownership.md](./command-ownership.md) | テキストコマンドの担当と認可 | 同居する c-lord のうち担当1台だけが `!コマンド` に応じ、他は黙る。webhook は owner 設定でも弾かれない |
 | [session-status-board.md](./session-status-board.md) | チャンネルの 📊 Session Status ボード | 板はチャンネルに1枚だけ。再起動しても増えず、既にある板を引き継いで書き換える。📌 はいつも生きている板を指す |
 | [context-footer.md](./context-footer.md) | ターン末尾の 📊 フッタ | 出る値はどれも「そのターンの実測」。CLI 版数は transcript から取り、bot 起動時の値を憶え続けない |
+| [gateway-backfill.md](./gateway-backfill.md) | Discord と切れていた間の投稿 | 接続が戻ったら、切れていた間にスレッドへ届いた依頼を拾って実行する（理由を 1 行添えて）。二重には実行しない (#745) |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
 
