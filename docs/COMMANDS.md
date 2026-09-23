@@ -406,10 +406,19 @@ automatically (see `tests/e2e/test_text_command_twins.py`).
 > marker, so the line no longer starts with `/` and the TUI does not treat it as
 > a slash command. Use the `!`/mention twin instead.
 
-> **Auth note.** A webhook author is not a real guild member, so commands gated
-> by an allowlist/role (e.g. `!skill`) are denied for webhook callers when an
-> allowlist is configured. Staging runs with an open allowlist so E2E works;
-> production auth is unchanged.
+> **Auth note.** The text twins that act on a session — `!clord`, `!attach`,
+> `!clord-reattach`, `!clear`, `!skill`, `!clord-init`, `!clord-thread-init` —
+> are authorized by the message-backed rule in `c_lord/command_gate.py`
+> (`is_message_authorized`, #507 / #508 / #405):
+>
+> - a **webhook** message is allowed — holding the webhook URL is the grant, and
+>   it is what keeps the E2E harness working with `DISCORD_OWNER_ID` set;
+> - a bot listed in `CLORD_TRUSTED_BOT_IDS` is allowed; any other bot is denied;
+> - a **human** must pass the same allowlist as the slash command
+>   ([Access Control](#access-control)).
+>
+> The slash twins use the human allowlist only — Discord never lets a webhook
+> send an application command.
 
 ---
 
@@ -429,6 +438,11 @@ startup log says who ended up allowed.
 3. **Everyone, explicitly** — `CLORD_ALLOW_ANYONE=1` restores the pre-#713
    behavior where any member of the server can drive the bot. c-lord logs a
    warning at startup when it is set.
+
+A user who is not allowed gets `You are not authorized to use this command.` and
+nothing happens. That includes `/clear` / `!clear` (#405): it kills the runner and
+the tmux window and resets the session, so a stranger in the thread must not be
+able to run it on someone else's conversation.
 
 See [specs/authorization-default.md](specs/authorization-default.md).
 
