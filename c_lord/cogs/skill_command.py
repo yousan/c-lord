@@ -32,6 +32,7 @@ from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
 from ..discord_ui.authorization import Authorizer
+from ..discord_ui.slash_io import slash_io
 from ..thread_settings import resolve_auto_archive_duration
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -371,29 +372,10 @@ class SkillCommandCog(commands.Cog):
         args: str | None = None,
     ) -> None:
         """Run a Claude Code skill by name, optionally with arguments."""
-        state = {"acked": False}
-
-        async def ack() -> None:
-            state["acked"] = True
-            await interaction.response.defer()
-
-        async def respond(
-            content: str | None = None,
-            *,
-            embed: discord.Embed | None = None,
-            ephemeral: bool = False,
-        ) -> None:
-            # Before defer, validation errors go on the initial response (instant,
-            # ephemeral).  After defer, everything goes through followup.
-            if state["acked"]:
-                if embed is not None:
-                    await interaction.followup.send(content or "", embed=embed, ephemeral=ephemeral)
-                else:
-                    await interaction.followup.send(content or "", ephemeral=ephemeral)
-            elif embed is not None:
-                await interaction.response.send_message(content, embed=embed, ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
+        # Before defer, validation errors go on the initial response (instant,
+        # ephemeral). After defer, everything goes through followup — and an
+        # ephemeral one stays ephemeral (#748, see slash_io).
+        respond, ack = slash_io(interaction)
 
         await self._run_skill_impl(
             channel=interaction.channel,
