@@ -126,13 +126,20 @@ The bot adds a single emoji reaction to your message to show the turn status:
 | 🟢 | Running — Claude is working (thinking or running tools) |
 | 🟡 | Waiting — the turn finished; it's your turn |
 | ❌ | The turn ended in an error |
-| ⚠️ | No activity for a while — possible stall (extended thinking or compaction) |
-| 🗜️ | Compacting context |
+| ⏳ | No activity for 10 seconds — Claude is probably still thinking |
+| ⚠️ | No activity for 30 seconds — possible stall (extended thinking or context compaction can also be this quiet) |
 
-The reaction flips 🟢 → 🟡 each turn. Because reactions and thread renames use
-different Discord rate limits, this lamp stays responsive even under heavy use;
-the 🟢/🟡 in the **thread name** is a slower, eventually-consistent sidebar view
-(#246).
+The reaction flips 🟢 → 🟡 each turn; ⏳ and ⚠️ are temporary and give way to 🟡
+when the turn ends. Because reactions and thread renames use different Discord rate
+limits, this lamp stays responsive even under heavy use.
+
+The **thread name** does not carry a 🟢/🟡 lamp by default (#329) — it shows only
+`W3 │ <topic>`. Set `CLORD_THREAD_LAMP=1` to turn the thread-name lamp on; it is a
+slower, eventually-consistent sidebar view (#246), so the reaction on your message
+stays the real-time signal. See [あるべき動き: 状態ランプ](specs/thread-lamp.md).
+
+Context compaction is not a reaction: when Claude Code compacts the context, the
+thread gets a one-line `🗜️ コンテキストを圧縮しました` notice (#628).
 
 ---
 

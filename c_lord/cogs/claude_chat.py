@@ -388,6 +388,21 @@ class ClaudeChatCog(commands.Cog):
         """
         return is_message_authorized(message, self._is_allowed)
 
+    def _authorize(
+        self, user: discord.Member | discord.User, message: discord.Message | None
+    ) -> bool:
+        """Allowlist for slash, the shared message-backed rule for text (#507, #405).
+
+        A slash command has no message and can never come from a webhook, so it
+        is the human allowlist. A text command can be driven by a webhook or a
+        trusted bot, whose pseudo-user is in no allowlist — those go through
+        :meth:`_is_message_authorized`. Either way the answer comes from the one
+        :class:`Authorizer`; this only picks which entry point to ask.
+        """
+        if message is None:
+            return self._is_allowed(user)
+        return self._is_message_authorized(message)
+
     def is_processing(self, thread_id: int) -> bool:
         """True while a Claude turn is actively running for ``thread_id``.
 
@@ -1158,10 +1173,7 @@ class ClaudeChatCog(commands.Cog):
         # ClaudeDiscordBot.process_commands lets them through — so a message-
         # backed invocation must use the same rule as on_message, not the
         # human-only allowlist (#507).
-        authorized = (
-            self._is_message_authorized(message) if message is not None else self._is_allowed(user)
-        )
-        if not authorized:
+        if not self._authorize(user, message):
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
@@ -1596,12 +1608,36 @@ class ClaudeChatCog(commands.Cog):
         else:
             await ctx.send(f"Window `{window}` not found in tmux.")
 
-    async def _clear_impl(self, channel: object, respond: _Responder) -> None:
+    async def _clear_impl(
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        user: discord.Member | discord.User,
+        message: discord.Message | None = None,
+    ) -> None:
         """Shared core for /clear and !clear (#209).
 
         Kills the active runner and tmux window, then resets the session row so
         the next message starts fresh.
+
+        ``message`` is the invoking message for ``!clear``, ``None`` for the
+        slash command. It decides which rule authorizes the call (#405) — see
+        :meth:`_authorize`: a webhook can still drive ``!clear`` (E2E), a
+        stranger in the thread cannot drive either.
         """
+        # #405: this wipes someone's conversation, so it is gated before
+        # anything is touched — the gate lives here, not in the two wrappers,
+        # so every entry point to the destruction goes through it.
+        if not self._authorize(user, message):
+            logger.info(
+                "%s /clear rejected: user %s is not authorized",
+                log_ctx(thread_id=getattr(channel, "id", None)),
+                getattr(user, "id", "?"),
+            )
+            await respond("You are not authorized to use this command.", ephemeral=True)
+            return
+
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
@@ -1641,7 +1677,7 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await interaction.response.send_message(content, ephemeral=ephemeral)
 
-        await self._clear_impl(interaction.channel, respond)
+        await self._clear_impl(interaction.channel, respond, user=interaction.user)
 
     @commands.command(name="clear")
     async def clear_text(self, ctx: commands.Context) -> None:
@@ -1655,7 +1691,7 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await ctx.send(content or "")
 
-        await self._clear_impl(ctx.channel, respond)
+        await self._clear_impl(ctx.channel, respond, user=ctx.author, message=ctx.message)
 
     async def _restart_impl(self, channel: object, respond: _Responder) -> None:
         """Shared core for /claude-restart and its /restart-claude alias (#440, #578).

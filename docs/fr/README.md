@@ -11,7 +11,7 @@
 
 **Exécutez plusieurs sessions Claude Code en parallèle — en toute sécurité — via Discord.**
 
-Chaque fil Discord devient une session Claude Code isolée. Lancez-en autant que nécessaire : travaillez sur une fonctionnalité dans un fil, révisez un PR dans un autre, exécutez une tâche planifiée dans un troisième. Le bridge gère automatiquement la coordination pour que les sessions simultanées ne se perturbent pas mutuellement.
+Chaque fil Discord devient une session Claude Code isolée. Lancez-en autant que nécessaire : travaillez sur une fonctionnalité dans un fil, révisez un PR dans un autre, exécutez une tâche planifiée dans un troisième. Chaque fil travaille dans son propre clone du dépôt, de sorte que les sessions ne modifient jamais le même arbre de travail.
 
 **[English](../../README.md)** | **[日本語](../ja/README.md)** | **[简体中文](../zh-CN/README.md)** | **[한국어](../ko/README.md)** | **[Español](../es/README.md)** | **[Português](../pt-BR/README.md)**
 
@@ -21,28 +21,28 @@ Chaque fil Discord devient une session Claude Code isolée. Lancez-en autant que
 
 ---
 
-## La Grande Idée : Des Sessions Parallèles Sans Crainte
+## La Grande Idée : Des Sessions Parallèles, Chacune dans Son Propre Clone
 
-Quand vous envoyez des tâches à Claude Code dans des fils Discord séparés, le bridge fait automatiquement trois choses :
+Chaque fil Discord est sa propre session Claude Code, exécutée dans sa propre fenêtre tmux sur votre serveur. Envoyez des tâches dans plusieurs fils et elles s'exécutent côte à côte ; fermez votre portable et elles continuent ; répondez dans un fil pour reprendre là où il s'était arrêté.
 
-1. **Injection d'avis de concurrence** — Le prompt système de chaque session inclut des instructions obligatoires : créez un git worktree, travaillez uniquement à l'intérieur, ne touchez jamais directement au répertoire de travail principal.
-
-2. **Registre des sessions actives** — Chaque session en cours d'exécution connaît les autres. Si deux sessions sont sur le point de toucher au même dépôt, elles peuvent se coordonner plutôt que d'entrer en conflit.
-
-3. **Canal de coordination** — Un canal Discord partagé où les sessions diffusent les événements de démarrage/fin. Claude et les humains peuvent voir d'un coup d'œil ce qui se passe dans tous les fils actifs.
+Ce qui empêche les sessions parallèles de se marcher dessus, c'est **l'isolation** : quand un canal est lié à un dépôt (`/clord-init`), chaque fil travaille dans son propre `git clone` indépendant. Les sessions ne partagent jamais d'arbre de travail, donc les modifications non commitées d'un fil ne peuvent jamais apparaître dans un autre. Elles ne se rencontrent que via le remote git — branches, push et PR — comme le feraient des contributeurs humains.
 
 ```
-Fil A (fonctionnalité) ──→  Claude Code (worktree-A)
-Fil B (révision PR)    ──→  Claude Code (worktree-B)
-Fil C (docs)           ──→  Claude Code (worktree-C)
-           ↓ événements de cycle de vie
-   #canal-coordination
-   "A : démarrage du refactor d'authentification"
-   "B : révision du PR #42"
-   "C : mise à jour du README"
+Fil A (fonctionnalité) ──→  Claude Code  (son propre clone)  ─┐
+Fil B (révision PR)    ──→  Claude Code  (son propre clone)   ├─→  remote git (branches · PR)
+Fil C (docs)           ──→  Claude Code  (son propre clone)  ─┘
 ```
 
-Sans race conditions. Sans travail perdu. Sans surprises au merge.
+**Aujourd'hui, les sessions ne se coordonnent pas entre elles.** Les versions précédentes de ce README décrivaient plusieurs mécanismes de coordination ; voici leur état réel ([#758](https://github.com/yousan/c-lord/issues/758)) :
+
+| Mécanisme | État réel |
+|---|---|
+| **Avis de concurrence** (instructions à Claude sur le travail en parallèle) | Construit à chaque tour mais **jamais transmis** — les sessions tournent dans le TUI tmux (#53), qui n'a pas de canal de prompt système par tour, donc le texte est abandonné |
+| **Registre des sessions actives** | Existe en mémoire et est utilisé par `/workspace-cleanup`, mais **les sessions ne le voient pas** (il voyage dans le même texte abandonné) |
+| **Canal de coordination** | **Désactivé par défaut.** Avec `COORDINATION_CHANNEL_ID` défini, il publie une notice d'une ligne quand le tour d'une session se termine ; il n'y a pas d'événement de démarrage |
+| **AI Lounge** | Les endpoints REST fonctionnent, mais **rien n'indique à Claude que le lounge existe**, donc en pratique rien n'y est publié ([#758](https://github.com/yousan/c-lord/issues/758)) |
+
+Autrement dit : des arbres de travail séparés, pas une coordination en direct. Tout ce qui se trouve hors des clones — la même branche distante, un port ou une base de données partagés, un bot de staging — peut encore entrer en collision. Donnez à chaque fil sa propre branche.
 
 ---
 
@@ -54,10 +54,10 @@ Utilisez Claude Code depuis n'importe où où Discord fonctionne — téléphone
 
 ### Développement Parallèle
 
-Ouvrez plusieurs fils simultanément. Chacun est une session Claude Code indépendante avec son propre contexte, répertoire de travail et git worktree. Schémas utiles :
+Ouvrez plusieurs fils simultanément. Chacun est une session Claude Code indépendante avec son propre contexte et son propre clone git du dépôt. Schémas utiles :
 
 - **Fonctionnalité + révision en parallèle** : Démarrez une fonctionnalité dans un fil pendant que Claude révise un PR dans un autre.
-- **Plusieurs contributeurs** : Différents membres de l'équipe ont chacun leur fil ; les sessions restent informées les unes des autres via le canal de coordination.
+- **Plusieurs contributeurs** : Différents membres de l'équipe ont chacun leur fil — et leur propre clone — donc leurs sessions ne modifient jamais les mêmes fichiers sur le disque.
 - **Expérimentez en toute sécurité** : Essayez une approche dans le fil A tout en maintenant le fil B sur du code stable.
 
 ### Tâches Planifiées (SchedulerCog)
@@ -138,12 +138,10 @@ Si le bot redémarre en cours de session, les sessions Claude interrompues repre
 - **Notification de blocage** — Message dans le fil après 30 s sans activité (réflexion étendue ou compression de contexte) ; réinitialise automatiquement quand Claude reprend
 
 ### Concurrence et Coordination
-- **Instructions de worktree auto-injectées** — Chaque session est invitée à utiliser `git worktree` avant de toucher à un fichier
-- **Nettoyage automatique de worktree** — Les worktrees de session (`wt-{thread_id}`) sont supprimés automatiquement à la fin de session et au démarrage du bot ; les worktrees avec des modifications ne sont jamais supprimés automatiquement (invariant de sécurité)
-- **Registre des sessions actives** — Registre en mémoire ; chaque session voit ce que font les autres
-- **AI Lounge** — Canal «salle de repos» partagée ; contexte injecté via `--append-system-prompt` (éphémère, ne s'accumule jamais dans l'historique) pour que les longues sessions n'atteignent jamais «Prompt is too long» ; les sessions publient leurs intentions, lisent le statut des autres et vérifient avant les opérations destructives ; les humains le voient comme un fil d'activité en temps réel
-- **Canal de coordination** — Canal partagé optionnel pour les diffusions de cycle de vie entre sessions
-- **Scripts de coordination** — Claude peut appeler `coord_post.py` / `coord_read.py` depuis une session pour publier et lire des événements
+- **Un clone git par fil** — Avec un canal lié à un dépôt (`/clord-init`), chaque fil travaille dans son propre `git clone` indépendant ; les sessions ne partagent rien d'autre que le remote git
+- **Registre des sessions actives** — Liste en mémoire des sessions en cours, utilisée par `/workspace-cleanup`. Les sessions elles-mêmes ne sont pas informées les unes des autres (#758)
+- **Endpoints AI Lounge** — `GET/POST /api/lounge` stockent de courtes notes et les relaient vers un canal Discord. **Non injectés dans les sessions** (#758) : Claude ne les utilise que si vous le lui demandez
+- **Canal de coordination** — Optionnel (`COORDINATION_CHANNEL_ID`, désactivé par défaut) : publie une notice d'une ligne quand le tour d'une session se termine
 
 ### Tâches Planifiées
 - **SchedulerCog** — Exécuteur de tâches périodiques avec support SQLite et une boucle maître de 30 secondes
@@ -165,7 +163,7 @@ Si le bot redémarre en cours de session, les sessions Claude interrompues repre
 - **Reprise au démarrage** — Les sessions interrompues redémarrent automatiquement après tout redémarrage du bot ; `AutoUpgradeCog` (redémarrages par mise à jour) et `ClaudeChatCog.cog_unload()` (tous les autres arrêts) les marquent automatiquement, ou utilisez `POST /api/mark-resume` manuellement
 - **Création programmatique** — `POST /api/spawn` crée un nouveau fil Discord + session Claude depuis n'importe quel script ou sous-processus Claude ; retourne un 201 non bloquant immédiatement après la création du fil
 - **Injection d'ID de fil** — La variable d'environnement `DISCORD_THREAD_ID` est passée à chaque sous-processus Claude, permettant aux sessions de créer des sessions enfants via `$CLORD_API_URL/api/spawn`
-- **Gestion des worktrees** — `/worktree-list` affiche tous les worktrees de session actifs avec leur statut propre/sale ; `/worktree-cleanup` supprime les worktrees propres orphelins (supporte la prévisualisation avec `dry_run`)
+- **Nettoyage des espaces de travail** — `/workspace-cleanup` récupère les répertoires de clone qu'aucune session en cours n'utilise (`dry_run` pour prévisualiser) ; un répertoire contenant des modifications non commitées n'est jamais supprimé
 
 ### Sécurité
 - **Pas d'injection shell** — Uniquement `asyncio.create_subprocess_exec`, jamais `shell=True`
@@ -245,9 +243,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `MAX_CONCURRENT_SESSIONS` | Nombre maximum de sessions parallèles | `3` |
 | `SESSION_TIMEOUT_SECONDS` | Timeout d'inactivité de session | `300` |
 | `DISCORD_OWNER_ID` | ID utilisateur à @mentionner quand Claude a besoin d'une saisie | (optionnel) |
-| `COORDINATION_CHANNEL_ID` | ID du canal pour les diffusions d'événements entre sessions | (optionnel) |
-| `CLORD_COORDINATION_CHANNEL_NAME` | Créer automatiquement un canal de coordination par nom | (optionnel) |
-| `WORKTREE_BASE_DIR` | Répertoire de base pour scanner les worktrees de session (active le nettoyage automatique) | (optionnel) |
+| `COORDINATION_CHANNEL_ID` | Canal qui reçoit une notice d'une ligne quand le tour d'une session se termine ; aussi le canal AI Lounge par défaut | (optionnel) |
 
 ---
 
@@ -458,7 +454,7 @@ c_lord/
   main.py                  # Point d'entrée autonome
   setup.py                 # setup_bridge() — câblage des Cogs en un appel
   bot.py                   # Classe Discord Bot
-  concurrency.py           # Instructions de worktree + registre des sessions actives
+  concurrency.py           # Registre des sessions actives (son avis de concurrence n'est pas transmis — #758)
   cogs/
     claude_chat.py         # Chat interactif (création de fils, gestion des messages)
     skill_command.py       # Commande slash /skill avec autocomplétion
@@ -474,7 +470,7 @@ c_lord/
     parser.py              # Parseur d'événements stream-json
     types.py               # Définitions de types pour les messages SDK
   coordination/
-    service.py             # Publie les événements de cycle de vie de session dans le canal partagé
+    service.py             # Notice optionnelle de fin de session dans un canal partagé
   database/
     models.py              # Schéma SQLite
     repository.py          # CRUD des sessions
@@ -496,7 +492,7 @@ c_lord/
     permission_view.py     # Boutons Autoriser/Refuser pour les demandes de permission d'outil
     elicitation_view.py    # Interface Discord pour MCP Elicitation (formulaire Modal ou bouton URL)
   session_sync.py          # Découverte et importation de sessions CLI
-  worktree.py              # WorktreeManager — cycle de vie sécurisé de git worktree
+  session_dir.py           # Un clone git par fil (ne supprime jamais un répertoire avec des modifications non commitées)
   ext/
     api_server.py          # API REST (optionnel, nécessite aiohttp)
   utils/
@@ -506,7 +502,7 @@ c_lord/
 ### Philosophie de Conception
 
 - **Invocation CLI, pas API** — Invoque `claude -p --output-format stream-json`, donnant les fonctionnalités complètes de Claude Code (CLAUDE.md, skills, outils, mémoire) sans les réimplémenter
-- **Concurrence d'abord** — Plusieurs sessions simultanées sont le cas attendu, pas un cas limite ; chaque session reçoit des instructions de worktree, le registre et le canal de coordination gèrent le reste
+- **Concurrence d'abord** — Plusieurs sessions simultanées sont le cas attendu, pas un cas limite ; chaque fil reçoit son propre clone git, donc l'isolation vient du système de fichiers plutôt que d'instructions données à Claude
 - **Discord comme colle** — Discord fournit UI, fils, réactions, webhooks et notifications persistantes ; pas de frontend personnalisé nécessaire
 - **Framework, pas application** — Installez comme paquet, ajoutez des Cogs à votre bot existant, configurez via le code
 - **Extensibilité sans code** — Ajoutez des tâches planifiées et des déclencheurs webhook sans toucher au code source
