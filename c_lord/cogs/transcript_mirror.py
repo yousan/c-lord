@@ -392,7 +392,9 @@ class TranscriptMirrorCog(commands.Cog):
             return await self._send_chunks(send, text, silent=silent_posts_enabled())
 
         async def edit(handle, text: str) -> None:
-            await handle.edit(content=text)
+            # discord.py's edit() defaults to suppress=False, which clears the
+            # flag the send set — a quoted URL would then unfurl (#372).
+            await handle.edit(content=text, suppress=not show_url_embeds_enabled())
 
         return post, edit
 

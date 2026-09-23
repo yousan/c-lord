@@ -1526,7 +1526,11 @@ async def test_repeat_counter_is_posted_silently_and_edited_in_place(
     assert kwargs.get("silent") is True
     assert kwargs.get("suppress_embeds") is True
     assert handle is message
-    message.edit.assert_awaited_once_with(content="-# 🔁 同じ発言が続いています — 57 回ぶん")
+    # discord.py's edit() defaults to suppress=False, which *clears* the flag the
+    # send set — seen on staging (flags 4100 → 4096) — so a quoted URL would unfurl.
+    message.edit.assert_awaited_once_with(
+        content="-# 🔁 同じ発言が続いています — 57 回ぶん", suppress=True
+    )
 
 
 async def test_start_for_wires_an_editable_repeat_counter(
