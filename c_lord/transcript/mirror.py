@@ -45,6 +45,7 @@ from ..usage_limit import (
 )
 from .formatter import RenderedEvent, render_event
 from .pane_echo import pane_echo
+from .repeat_fold import RepeatFold
 from .tail import tail_events
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,9 @@ class UserFileRequest:
 
 
 UserFileSink = Callable[[UserFileRequest], Awaitable[None]]
+# #747: posts the repeat counter and returns a handle to edit it with later.
+FoldPost = Callable[[str], Awaitable[object | None]]
+FoldEdit = Callable[[object, str], Awaitable[None]]
 
 # The harness tool whose "1 file delivered to user." goes to the harness's own
 # delivery channel — not to Discord (#233).
@@ -414,6 +418,8 @@ class TranscriptMirror:
         usage_limit_grace: float = USAGE_LIMIT_GRACE_SECONDS,
         ask_bridge_cb: AskBridgeCb | None = None,
         progress: TurnProgress | None = None,
+        fold_post: FoldPost | None = None,
+        fold_edit: FoldEdit | None = None,
     ) -> None:
         self.thread_id = thread_id
         self.project_dir = project_dir
@@ -422,6 +428,14 @@ class TranscriptMirror:
         # inert instance so the loop below never has to None-check it; the Cog
         # supplies a real one, so consumers get the feature by upgrading alone.
         self._progress = progress if progress is not None else _null_progress()
+        # #747: one message stands in for a loop's copies of the same lines.
+        # Without an editor (older consumers, tests) the counter goes out through
+        # the plain sink and simply cannot show a number — it still stops the flood.
+        self._fold = RepeatFold(
+            thread_id=thread_id,
+            post=self._fold_poster(sink, fold_post),
+            edit=fold_edit if fold_post is not None else None,
+        )
         self._reply_sink = reply_sink
         self._file_sink = file_sink
         # #233: delivers the files of a SendUserFile call. Optional so a mirror
@@ -584,7 +598,9 @@ class TranscriptMirror:
             nonlocal _pending_text, _pending_progress, _pending_uuid
             if _pending_text is None:
                 return
-            await self._try_sink(_pending_text)
+            # #747: a loop's copy is counted in one message instead of posted.
+            if not await self._fold.offer(_pending_text):
+                await self._try_sink(_pending_text)
             # #399: an intermediate text posted silently may be the prose above
             # a not-yet-bridged menu (the plan path flushes it BEFORE the menu).
             # Register it as source="mirror" so the later pane-bridge skips its
@@ -602,6 +618,8 @@ class TranscriptMirror:
             nonlocal _pending_text, _pending_progress, _pending_uuid, _delivered_uuid
             if _pending_text is None:
                 return
+            # #747: the answer is never folded, and it ends any loop before it.
+            await self._fold.reset()
             await self._flush_as_reply(_pending_text, _pending_progress)
             # This IS the final answer for the turn — the one delivery that may
             # advance the cursor (#553).
@@ -639,6 +657,8 @@ class TranscriptMirror:
                     # It is finer than the line's refresh interval, so no separate
                     # timer task (with a lifetime to keep in sync) is needed.
                     await self._progress.tick()
+                    # #747: a loop that stalled still shows its latest count.
+                    await self._fold.flush()
                     # Idle: no new JSONL event within the window. Flush any held
                     # final answer as a pinging reply — independent of whether a
                     # ``result`` / ``turn_duration`` marker was ever written.
@@ -683,6 +703,8 @@ class TranscriptMirror:
                         # before the final answer lands so it never trails
                         # below the answer.
                         await self._progress.end_turn()
+                        # #747: a loop never spans a turn boundary.
+                        await self._fold.reset()
                         # Turn boundary: flush pending as the final reply.
                         await _flush_pending_as_reply()
                         await _commit_cursor()
@@ -832,6 +854,7 @@ class TranscriptMirror:
                         # and arms the next one.
                         await self._progress.end_turn()
                         self._progress.begin_turn()
+                        await self._fold.reset()  # #747 (see turn_end)
                         # Human turn: previous assistant turn is over → flush as reply.
                         await _flush_pending_as_reply()
                         await _commit_cursor()
@@ -860,7 +883,25 @@ class TranscriptMirror:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _flush_pending_as_reply()
                     await _commit_cursor()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._fold.reset()
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
+
+    def _fold_poster(self, sink: Sink, fold_post: FoldPost | None) -> FoldPost:
+        """How the #747 counter reaches the thread.
+
+        A new message, like any other output, so the #539 filler steps aside
+        for it first and never ends up sitting below it.
+        """
+
+        async def post(text: str) -> object | None:
+            await self._progress.note_output()
+            if fold_post is not None:
+                return await fold_post(text)
+            await sink(text)
+            return None
+
+        return post
 
     async def _report_usage_limit(self, limit: UsageLimit | None, *, reported: bool) -> None:
         """Say once, in Japanese, that Claude is waiting on a plan limit (#631).

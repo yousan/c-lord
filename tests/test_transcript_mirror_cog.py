@@ -1498,3 +1498,47 @@ async def test_stop_for_releases_the_project_dir(
             await cog.cog_unload()
 
     assert not [r for r in caplog.records if "#719" in r.getMessage()], caplog.text
+
+
+# ---------------------------------------------------------------------------
+# #747: the repeat counter is posted like an intermediate message and edited
+# ---------------------------------------------------------------------------
+
+
+async def test_repeat_counter_is_posted_silently_and_edited_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLORD_SILENT_POSTS", raising=False)
+    monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
+    bot = MagicMock()
+    channel = MagicMock()
+    message = MagicMock()
+    message.edit = AsyncMock()
+    channel.send = AsyncMock(return_value=message)
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    post, edit = cog._make_fold(7)
+    handle = await post("-# 🔁 同じ発言が続いています")
+    await edit(handle, "-# 🔁 同じ発言が続いています — 57 回ぶん")
+
+    kwargs = channel.send.call_args.kwargs
+    assert kwargs.get("silent") is True
+    assert kwargs.get("suppress_embeds") is True
+    assert handle is message
+    message.edit.assert_awaited_once_with(content="-# 🔁 同じ発言が続いています — 57 回ぶん")
+
+
+async def test_start_for_wires_an_editable_repeat_counter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Zero-config: consumers get the live count by upgrading alone."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    try:
+        assert cog.start_for(9, str(tmp_path / "wd"))
+        mirror = cog._mirrors[9]
+        assert mirror._fold._edit is not None
+    finally:
+        await cog.cog_unload()
