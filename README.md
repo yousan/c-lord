@@ -550,6 +550,8 @@ await bot.add_cog(WebhookTriggerCog(
 
 **Security:** Prompts are defined server-side. Webhooks only select which trigger to fire — no arbitrary prompt injection.
 
+**What happens on a trigger:** the webhook message gets a thread, Claude runs in its own tmux window in the trigger's `working_dir` (or the runner's), and its answer is posted into that thread. If the window cannot be created (e.g. tmux is unavailable on the host), the run does not start: the thread says why, the webhook message gets ❌, and the bot owner is mentioned (#629).
+
 ### Example: Auto-Approve Owner PRs
 
 ```yaml
