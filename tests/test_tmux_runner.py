@@ -3469,6 +3469,188 @@ class TestUnknownPromptDedup:
         )
 
 
+# -- Regression tests for #695 (unnumbered TUI dialogs slip past every detector) --
+
+_BYPASS_FIXTURE = "bypass_permissions_dialog_v2_1_280.txt"
+
+
+def _bypass_pane() -> str:
+    return _normalize_capture(_load_fixture(_BYPASS_FIXTURE))
+
+
+class TestUnnumberedDialogDetection:
+    """#695: a dialog whose options carry no number went unseen by all three detectors.
+
+    The "Bypass Permissions mode" dialog (real capture, Claude Code 2.1.280) is
+    drawn as ``❯ No, exit`` / ``Yes, I accept`` over an ``Enter to confirm``
+    footer.  ``_INTERACTIVE_MENU_RE`` only knows ``❯ 1.``, and the footer on its
+    own used to count as a *trust* marker, so the fail-safe excluded the one
+    dialog it had to shout about.  The pane then sat still until the start
+    grace ran out and the turn ended in "応答がありませんでした" — with the
+    dialog, whose default is ``No, exit``, still open and unmentioned.
+    """
+
+    def test_real_bypass_dialog_is_flagged_unknown(self) -> None:
+        """RED: the real capture returned False, so no warning was ever posted."""
+        assert TmuxClaudeRunner._has_unknown_interactive(_bypass_pane()) is True
+
+    def test_real_bypass_dialog_is_not_auto_answered(self) -> None:
+        """Neither auto-accepting detector may claim it: both answer with Enter,
+        and Enter on this dialog confirms its default — ``No, exit``."""
+        pane = _bypass_pane()
+        assert TmuxClaudeRunner._has_trust_prompt(pane) is False
+        assert TmuxClaudeRunner._has_permission_prompt(pane) is False
+        assert TmuxClaudeRunner._is_yn_prompt(pane) is False
+
+    def test_signature_names_the_options(self) -> None:
+        """The #165 dedup signature must not come back empty for this shape, or
+        every unnumbered dialog would share one signature and all but the first
+        would be suppressed as a duplicate."""
+        signature = _unknown_prompt_signature(_bypass_pane())
+        assert "No, exit" in signature
+        assert "Yes, I accept" in signature
+
+    def test_signature_ignores_the_cursor_position(self) -> None:
+        """Moving the cursor is the same dialog, not a new one to alert about."""
+        moved = (
+            _bypass_pane()
+            .replace("❯ No, exit", "  No, exit")
+            .replace("  Yes, I accept", "❯ Yes, I accept")
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(moved) is True
+        assert _unknown_prompt_signature(moved) == _unknown_prompt_signature(_bypass_pane())
+
+    def test_synthetic_unnumbered_menu_is_flagged(self) -> None:
+        pane = (
+            "  Something new happened\n"
+            "\n"
+            "  ❯ Keep going\n"
+            "    Stop here\n"
+            "    Ask me later\n"
+            "\n"
+            "  Enter to confirm · Esc to cancel\n"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+    def test_cursor_line_without_footer_is_not_a_menu(self) -> None:
+        """``❯ <text>`` alone is the input box with something typed in it."""
+        pane = "● Done.\n\n────────\n❯ No, exit\n  Yes, I accept\n────────\n-- INSERT --"
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_quoted_dialog_above_the_input_box_is_not_a_menu(self) -> None:
+        """Claude may quote the dialog in its answer; the live input box and
+        chrome drawn under the footer mean the dialog is not what is on screen."""
+        pane = (
+            "● The dialog looks like this:\n"
+            "  ❯ No, exit\n"
+            "    Yes, I accept\n"
+            "  Enter to confirm · Esc to cancel\n"
+            "\n"
+            "────────\n❯ \n────────\n-- INSERT -- ⏵⏵ bypass permissions on"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_declined_dialog_corpse_is_not_a_menu(self) -> None:
+        """After ``No, exit`` the dialog stays printed with a shell prompt under
+        it.  That is a dead pane for the alive-check to handle, not a prompt."""
+        pane = _bypass_pane().rstrip("\n") + "\n\nyousan @ host in /tmp/x\n$ "
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_single_cursor_line_over_footer_is_not_a_menu(self) -> None:
+        """A menu has at least two options; one ``❯`` line is not enough."""
+        pane = "  Heads up\n\n  ❯ OK\n\n  Enter to confirm · Esc to cancel\n"
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            # The trust dialog is unnumbered too — it is handled (accepted) by
+            # _has_trust_prompt before the fail-safe runs, so it must stay quiet.
+            "trust_prompt_live_cursor_on_no.txt",
+            "trust_prompt_live_v2_1_252.txt",
+            "trust_prompt_unnumbered_cursor_on_yes.txt",
+            "trust_prompt_at_top.txt",
+            "trust_prompt_declined_corpse.txt",
+            "trust_prompt_residue_after_exit.txt",
+            "continue_trust_prompt_at_verdict.txt",
+            # AskUserQuestion — bridged to Discord buttons.
+            "ask_user_question_menu.txt",
+            "ask_user_question_3options.txt",
+            "ask_user_question_ansi_raw.txt",
+            "ask_multiselect_menu.txt",
+            "ask_preview_menu_v2_1_252.txt",
+            "ask_preview_pane_menu.txt",
+            "ask_rich_descriptions.txt",
+            "ask_submit_screen_blank_tail.txt",
+            "ask_user_question_submit_screen.txt",
+            # The limit menu is numbered and has the same footer; its handling
+            # (#631) must not change.
+            "usage_limit_choice_menu_v2_1_252.txt",
+            "usage_limit_choice_menu_4options.txt",
+            # Ordinary panes where ``❯`` is the input box or a quoted prompt.
+            "input_box_empty.txt",
+            "input_box_stuck_plain_text.txt",
+            "input_box_stuck_pasted_placeholder.txt",
+            "bug_62_ghost_text_real.txt",
+            "bug_156_yn_in_conversation.txt",
+            "i742_idle_after_turn_v2_1_271.txt",
+            "i742_running_mid_turn_v2_1_271.txt",
+            "vim_enabled_insert.txt",
+            "vim_enabled_normal.txt",
+            "running_spinner_above_footer.txt",
+        ],
+    )
+    def test_known_prompts_and_plain_panes_stay_quiet(self, fixture: str) -> None:
+        pane = _normalize_capture(_load_fixture(fixture))
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "plan_approval_menu.txt",
+            "plan_approval_menu_v2156.txt",
+            "plan_menu_tool_chrome_above.txt",
+        ],
+    )
+    def test_plan_menus_are_unchanged(self, fixture: str) -> None:
+        """Numbered menus keep their pre-#695 verdict.  Plan menus were already
+        True here on purpose (#251): the run loop bridges a *parsed* plan first,
+        and the fail-safe is only there for one the parser misses."""
+        pane = _normalize_capture(_load_fixture(fixture))
+        assert _parse_plan_from_pane(pane) is not None
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+    @pytest.mark.asyncio
+    async def test_run_loop_warns_once_and_presses_nothing(self, runner, tmux_manager) -> None:
+        """AC3: the dialog reaches Discord as the unknown-prompt warning, and no
+        key is sent to the pane — its default is ``No, exit``."""
+        tmux_manager.is_claude_running.return_value = True
+        bypass = _load_fixture(_BYPASS_FIXTURE)
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            return bypass if call_idx <= 12 else _DONE_PANE
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._UNKNOWN_ALERT_DELAY", 0.04),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.06),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("test"):
+                events.append(event)
+
+        unknown_events = [e for e in events if e.unknown_tui_prompt is not None]
+        assert len(unknown_events) == 1
+        assert "Bypass Permissions mode" in unknown_events[0].unknown_tui_prompt
+        tmux_manager.send_keys.assert_not_called()
+
+
 # -- Regression tests for the folder-trust dialog (Quick safety check) ---------
 
 
