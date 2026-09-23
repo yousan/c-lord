@@ -32,6 +32,7 @@ from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
 from ..discord_ui.authorization import Authorizer
+from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..thread_settings import resolve_auto_archive_duration
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -286,24 +287,26 @@ class SkillCommandCog(commands.Cog):
             await respond(f"Running {display} in this thread…")
 
             runner = self._make_runner(tmux, channel.id)
-            await run_claude_with_config(
-                RunConfig(
-                    thread=channel,
-                    runner=runner,
-                    repo=self.repo,
-                    prompt=prompt,
-                    session_id=session_id,
-                    registry=self._registry,
-                    session_dir_manager=sdm,
-                    tmux_manager=tmux,
-                    # #739: the views this run posts (ask menu / permission /
-                    # stop) are gated by this; without it they cannot see the
-                    # allowlist and fall back to the process-wide one.
-                    authorizer=self._authorizer,
-                    # #480: ping the invoking user if a question-mode pause blocks the skill.
-                    notify_user_id=user.id,
+            # #754: a /skill run is on 📊 Session Status while it runs.
+            async with board_turn(dashboard_of(self.bot), channel.id, prompt):
+                await run_claude_with_config(
+                    RunConfig(
+                        thread=channel,
+                        runner=runner,
+                        repo=self.repo,
+                        prompt=prompt,
+                        session_id=session_id,
+                        registry=self._registry,
+                        session_dir_manager=sdm,
+                        tmux_manager=tmux,
+                        # #739: the views this run posts (ask menu / permission /
+                        # stop) are gated by this; without it they cannot see the
+                        # allowlist and fall back to the process-wide one.
+                        authorizer=self._authorizer,
+                        # #480: ping the invoking user if a question-mode pause blocks the skill.
+                        notify_user_id=user.id,
+                    )
                 )
-            )
             return
 
         # New-thread mode: create a thread in the claude channel
@@ -341,22 +344,24 @@ class SkillCommandCog(commands.Cog):
         await respond(f"Running {display} → {thread.mention}")
 
         runner = self._make_runner(tmux, thread.id)
-        await run_claude_with_config(
-            RunConfig(
-                thread=thread,
-                runner=runner,
-                repo=self.repo,
-                prompt=prompt,
-                session_id=None,
-                registry=self._registry,
-                session_dir_manager=sdm,
-                tmux_manager=tmux,
-                # #739: see above — the run's buttons are gated by this.
-                authorizer=self._authorizer,
-                # #480: ping the invoking user if a question-mode pause blocks the skill.
-                notify_user_id=user.id,
+        # #754: see above.
+        async with board_turn(dashboard_of(self.bot), thread.id, prompt):
+            await run_claude_with_config(
+                RunConfig(
+                    thread=thread,
+                    runner=runner,
+                    repo=self.repo,
+                    prompt=prompt,
+                    session_id=None,
+                    registry=self._registry,
+                    session_dir_manager=sdm,
+                    tmux_manager=tmux,
+                    # #739: see above — the run's buttons are gated by this.
+                    authorizer=self._authorizer,
+                    # #480: ping the invoking user if a question-mode pause blocks the skill.
+                    notify_user_id=user.id,
+                )
             )
-        )
 
     @app_commands.command(name="skill", description="Run a Claude Code skill")
     @app_commands.describe(

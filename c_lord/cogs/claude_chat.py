@@ -46,6 +46,7 @@ from ..discord_ui.embeds import stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
+from ..discord_ui.thread_dashboard import safe_set_state as _safe_set_state
 from ..discord_ui.views import (
     STOP_MESSAGE_PREFIX,
     ReopenSessionView,
@@ -197,33 +198,6 @@ def _notify_target(requester: object, bot: object, *, kind: Kind) -> int | None:
     if requester is not None and not bool(getattr(requester, "bot", False)):
         return getattr(requester, "id", None)
     return owner_notify_id(bot, kind=kind)
-
-
-async def _safe_set_state(
-    dashboard: ThreadStatusDashboard,
-    thread_id: int,
-    state: ThreadState,
-    description: str,
-    **kwargs: object,
-) -> None:
-    """Update the dashboard, never letting its failure take the turn down (#632).
-
-    The dashboard embed is decoration: a closed aiohttp session, a revoked
-    permission or a Discord outage must not stop Claude from running or from
-    answering. Before #632 the PROCESSING update was the one un-guarded Discord
-    call on the turn path, so any of those killed the task before
-    ``run_claude_with_config`` was reached and the user's message vanished with
-    no reply, no ❌, nothing. Swallowed — but logged at WARNING, never silently.
-    """
-    try:
-        await dashboard.set_state(thread_id, state, description, **kwargs)  # type: ignore[arg-type]
-    except Exception:
-        logger.warning(
-            "%s dashboard set_state(%s) failed; continuing the turn",
-            log_ctx(thread_id=thread_id),
-            state.value,
-            exc_info=True,
-        )
 
 
 class ClaudeChatCog(commands.Cog):

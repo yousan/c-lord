@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands, tasks
 
+from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
@@ -249,7 +250,11 @@ class SchedulerCog(commands.Cog):
                 # success.
                 failure_notify_id=owner_notify_id(self.bot, kind="failure"),
             )
-            await run_claude_with_config(run_config)
+            # #754: a scheduled run is a live session like any other, so it is
+            # on 📊 Session Status while it runs. It used to be invisible there.
+            # Labelled by its (already public) name — the prompt stays private.
+            async with board_turn(dashboard_of(self.bot), thread.id, f"[Scheduled] {task['name']}"):
+                await run_claude_with_config(run_config)
 
             # #621: nobody is watching a scheduled thread, so a run that only
             # failed into a red embed used to leave the log looking like a
