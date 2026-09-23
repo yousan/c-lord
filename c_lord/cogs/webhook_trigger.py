@@ -23,6 +23,7 @@ from discord.ext import commands
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
+from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
@@ -180,28 +181,31 @@ class WebhookTriggerCog(commands.Cog):
 
         self._active_count += 1
         try:
-            session_id = await run_claude_with_config(
-                RunConfig(
-                    thread=thread,
-                    runner=runner,
-                    repo=None,
-                    prompt=trigger.prompt,
-                    session_id=None,
-                    status=None,
-                    registry=self._registry,
-                    # #739: a webhook turn's buttons are pressed by humans, so
-                    # they are gated by the human allowlist like any other run.
-                    authorizer=getattr(self.bot, "authorizer", None),
-                    # #480: no human poster on a webhook (CI/CD) turn — fall back
-                    # to the bot owner so a question-mode pause still pings someone
-                    # (#525: unless this deployment turned that fallback off).
-                    notify_user_id=owner_notify_id(self.bot, kind="blocked"),
-                    # #681: a webhook turn that dies at startup is the case
-                    # nobody notices — there is no human in the thread to see
-                    # the red embed. This is the ping that makes it visible.
-                    failure_notify_id=owner_notify_id(self.bot, kind="failure"),
+            # #754: a CI-triggered run belongs on 📊 Session Status too.
+            # Labelled by the public prefix — the prompt is server-side config.
+            async with board_turn(dashboard_of(self.bot), thread.id, prefix):
+                session_id = await run_claude_with_config(
+                    RunConfig(
+                        thread=thread,
+                        runner=runner,
+                        repo=None,
+                        prompt=trigger.prompt,
+                        session_id=None,
+                        status=None,
+                        registry=self._registry,
+                        # #739: a webhook turn's buttons are pressed by humans, so
+                        # they are gated by the human allowlist like any other run.
+                        authorizer=getattr(self.bot, "authorizer", None),
+                        # #480: no human poster on a webhook (CI/CD) turn — fall back
+                        # to the bot owner so a question-mode pause still pings someone
+                        # (#525: unless this deployment turned that fallback off).
+                        notify_user_id=owner_notify_id(self.bot, kind="blocked"),
+                        # #681: a webhook turn that dies at startup is the case
+                        # nobody notices — there is no human in the thread to see
+                        # the red embed. This is the ping that makes it visible.
+                        failure_notify_id=owner_notify_id(self.bot, kind="failure"),
+                    )
                 )
-            )
 
             if session_id:
                 await message.add_reaction("✅")
