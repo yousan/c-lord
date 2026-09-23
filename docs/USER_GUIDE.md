@@ -302,6 +302,14 @@ goes completely silent afterwards — in the default `jsonl` bridge mode the ans
 is delivered by the transcript mirror, so pane silence after an answer is the
 expected steady state, not a hang (#541).
 
+A turn that is waiting for **your answer to a question or plan-approval menu**
+never produces it either. The pane does not move until someone answers, which is
+exactly what it should do — however long you take. The buttons stay answerable
+after five minutes, and answering continues the session (#751). A pane frozen
+while Claude's working spinner is on screen is still reported: that spinner's
+timer redraws every second while Claude is healthy, so if it stops, Claude has
+stopped drawing.
+
 ### Interrupting
 
 Send a new message while Claude is working. The current operation is interrupted (SIGINT) and Claude starts with your new instruction. No need to `/stop` first.
