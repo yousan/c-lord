@@ -173,7 +173,7 @@ class TranscriptMirrorCog(commands.Cog):
                     row.thread_id,
                     exc_info=True,
                 )
-            if self.start_for(row.thread_id, row.working_dir):
+            if self.start_for(row.thread_id, row.working_dir, expect_turn=False):
                 started += 1
         logger.info(
             "TranscriptMirrorCog: started %d mirror(s) from %d session row(s) "
@@ -225,10 +225,18 @@ class TranscriptMirrorCog(commands.Cog):
         )
         return True
 
-    def start_for(self, thread_id: int, working_dir: str) -> bool:
+    def start_for(self, thread_id: int, working_dir: str, *, expect_turn: bool = True) -> bool:
         """Spawn a mirror for ``thread_id`` if one is not already running.
 
         Returns True if a new mirror was started, False if one already exists.
+
+        ``expect_turn`` says whether somebody is waiting on this mirror right
+        now, which is what decides whether "I cannot find this thread's
+        transcript" is worth telling the thread about (#773).  True for every
+        caller that is about to run a turn (chat, scheduler, webhook); the
+        ``on_ready`` restore passes False, because a workspace nobody has run
+        Claude in legitimately has nothing to read and there are hundreds of
+        them on this host.
 
         **At most one mirror per project dir** (#719).  A caller here is a
         thread whose turn is *starting*, so it is the session about to write
@@ -273,6 +281,7 @@ class TranscriptMirrorCog(commands.Cog):
             progress=self._make_progress(thread_id),
             fold_post=fold_post,
             fold_edit=fold_edit,
+            expect_turn=expect_turn,
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
