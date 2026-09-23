@@ -30,10 +30,21 @@ def _isolated_claude_home(tmp_path_factory, monkeypatch) -> None:
     tests started failing on a second run because an earlier test's claim turned
     their ``--continue`` into a ``--resume``.
 
-    Set through ``$HOME`` rather than by patching ``Path.home``, so a test that
-    wants its own home (``monkeypatch.setenv("HOME", ...)``) still wins.
+    Redirects ``Path.home()`` rather than ``$HOME``: the environment is
+    inherited by the real ``tmux`` server and shells that a few tests drive, and
+    a home that does not exist breaks them (``test_real_tmux_...`` typed into a
+    pane whose shell never came up).  A test that sets ``$HOME`` itself still
+    wins — that is a deliberate choice about where home is, and this fixture
+    only supplies the default.
     """
-    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    real_home = os.environ.get("HOME")
+    tmp_home = tmp_path_factory.mktemp("home")
+
+    def _home(cls: type[Path]) -> Path:
+        current = os.environ.get("HOME")
+        return tmp_home if current == real_home else Path(str(current))
+
+    monkeypatch.setattr(Path, "home", classmethod(_home))
 
 
 @pytest.fixture
