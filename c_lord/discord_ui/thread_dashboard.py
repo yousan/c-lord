@@ -86,12 +86,12 @@ _OFF_VALUES = {"0", "false", "no", "off"}
 
 # Threads older than this are pruned from the dashboard automatically.
 # Keeps the embed from accumulating stale entries after a long idle period.
-_STALE_HOURS = 4
+_STALE_HOURS = 0.05  # VERIFY ONLY (#754): 3 min instead of 4h — never merge
 
 #: How often the board looks for rows that went stale (#754). Pruning used to
 #: happen only inside a state change, so a day with no posts left 47-hour-old
 #: rows reading "0s ago". A tick that prunes nothing makes no Discord call.
-_PRUNE_INTERVAL_SECONDS = 300
+_PRUNE_INTERVAL_SECONDS = 20  # VERIFY ONLY (#754)
 
 
 def _sweep_enabled() -> bool:
