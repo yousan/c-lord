@@ -460,8 +460,8 @@ user never needs a header. Anything else gets `403`.
 | `POST` | `/api/spawn` | Create a new thread and start Claude Code |
 | `POST` | `/api/threads/{thread_id}/messages` | Post a message to a Discord thread |
 | `POST` | `/api/mark-resume` | Mark a thread for resumption after restart |
-| `GET` | `/api/lounge` | List recent AI Lounge messages |
-| `POST` | `/api/lounge` | Post a message to the AI Lounge |
+| `GET` | `/api/lounge` | List recent AI Lounge messages. Sessions are not told the lounge exists, so nothing posts here unless you set that up (#758) |
+| `POST` | `/api/lounge` | Post a message to the AI Lounge. No c-lord component calls this today — the lounge context is not delivered to sessions (#758) |
 
 ### Examples
 
