@@ -100,6 +100,15 @@ CREATE TABLE IF NOT EXISTS menu_bridges (
     last_bridged_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     PRIMARY KEY (thread_id, fingerprint)
 );
+
+-- #752: how far the startup sweep for dead buttons has read each thread. The
+-- next sweep starts after this message instead of re-reading a fixed window,
+-- which is what let residue sink out of reach under later messages.
+CREATE TABLE IF NOT EXISTS ui_sweep_cursors (
+    thread_id       INTEGER PRIMARY KEY,
+    last_message_id INTEGER NOT NULL,
+    swept_at        TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 # Migrations for existing databases that lack new columns.
@@ -113,6 +122,13 @@ _MIGRATIONS = [
         "first_bridged_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
         "last_bridged_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), "
         "PRIMARY KEY (thread_id, fingerprint))"
+    ),
+    # #752: per-thread read position of the startup sweep for dead buttons.
+    (
+        "CREATE TABLE IF NOT EXISTS ui_sweep_cursors ("
+        "thread_id INTEGER PRIMARY KEY, "
+        "last_message_id INTEGER NOT NULL, "
+        "swept_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
     ),
     # #671: the message a pending menu is drawn on (startup retires closed menus).
     "ALTER TABLE pending_asks ADD COLUMN message_id INTEGER",
