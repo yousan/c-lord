@@ -153,11 +153,21 @@ JSONL に出ない。`tmux capture-pane` でしか検出できない。誤検知
 
 | 項目 | 内容 |
 |------|------|
-| **トリガ** | `--dangerously-skip-permissions` フラグ使用時の起動直後 |
-| **画面シグネチャ** | `⚠ Caution: bypass permissions mode is on. ...` / `Press Enter to continue` |
-| **操作** | Enter |
+| **トリガ** | `--dangerously-skip-permissions` で起動し、その config dir でまだ一度も承諾していないとき（信頼ダイアログの直後に出る） |
+| **画面シグネチャ** | `WARNING: Claude Code running in Bypass Permissions mode` / `❯ No, exit` / `  Yes, I accept` / `Enter to confirm · Esc to cancel`（**番号なし・`No, exit` が既定**。実キャプチャ: `tests/fixtures/panes/bypass_permissions_dialog_v2_1_280.txt`、Claude Code 2.1.280） |
+| **操作** | Down + Enter で `Yes, I accept`。🔴 **素の Enter は `No, exit` を選び、claude は終了する** |
 | **JSONL** | ❌ TUI-only |
-| **現在の c-lord 対応** | ✅ `_handle_startup_prompts` の `Enter to confirm` マーカーで捕捉（信頼プロンプトと共通パス）。ステータスバーには `bypass permissions on` が常時表示 |
+| **現在の c-lord 対応** | ⚠️ **自動応答はしない**（権限の承諾なので人が決める — #695 のスコープ外）。未知プロンプトの安全網 `_has_unknown_interactive` が「番号の無い選択メニュー」として検出し、Discord に **⚠️ Unknown TUI prompt** の embed（ペインのスナップショット付き）を出す。キーは一切送らない。人は `/attach`（または tmux）で答える |
+
+> **番号の無いメニューの検出（#695）**: `❯ <label>` のカーソル行を含む2行以上の選択肢ブロックの直下に
+> `Enter to confirm` フッタがあり、**そのフッタがペイン最後の非空行**であること。フッタの下に入力欄や
+> シェルプロンプトが描かれていれば「本文中の引用」か「claude が終了した後の残骸」なので対象外。
+> 信頼ダイアログ（`Yes, I trust this folder`）は同じ形だが `_has_trust_prompt` が先に処理するので除外する。
+> 番号付きメニュー（`❯ 1.`）の判定はこれまでどおりで変わらない。
+>
+> 以前はこの表に「`_handle_startup_prompts` の `Enter to confirm` マーカーで捕捉（自動 Enter）」と
+> 書かれていたが、実装はそうなっていなかった（`_has_trust_prompt` は `Yes, I trust this folder` を要求する）。
+> 実際は3つの検出器すべてをすり抜け、警告も出ないまま `応答がありませんでした` で終わっていた（#695）。
 
 ### 3-4. 編集差分確認（Do you want to make this edit?）
 
@@ -251,7 +261,7 @@ JSONL に出ない。`tmux capture-pane` でしか検出できない。誤検知
 | Resume picker | ❌ | ✅ 回避（明示 ID） | `_run_helper.py` |
 | Update/restart | ❌ | ❌ 未対応 | — |
 | Model selection | ❌ | ❌ 未対応（起動時 --model で回避） | — |
-| Bypass-perm 警告 | ❌ | ✅ 自動 Enter（trust と共通） | `tmux_runner._handle_startup_prompts` |
+| Bypass-perm 警告 | ❌ | ⚠️ 検出して Discord に警告（自動応答しない — #695） | `tmux_runner._has_unknown_interactive` |
 
 ---
 

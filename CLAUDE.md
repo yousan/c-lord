@@ -183,7 +183,11 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
   古いビルドは「その機能はありません」と利用者に答えてしまうので、挙動が古く見えたらまずこれを見る
   - ビルドが 7 日以上前なら直後に `WARNING … this c-lord build is N days old (…)` が1行続く (#756)。
     📊 フッタの版数にも `(Nd)` が付く（`docs/specs/context-footer.md`）
-- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit` (Claude 実行 1 回ごと)
+- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit (outcome=…, 12.3s)` (Claude 実行 1 回ごと)。
+  **`exit` は `finally` で必ず出る** (#293) — `outcome` は `ok` / `error` / `preempted`(次のメッセージで割り込まれた) /
+  `cancelled`(割り込みで task ごと止めた) / `crashed`。だから **`enter` だけあって `exit` が無い = そのターンはまだ走っている**。
+  同じスレッドで次のターンが始まった時点で前の run がまだ走っていれば `run_claude: orphan — …` の WARNING、
+  割り込みで止めた前のターンが cancel 後も終わらなければ `prior turn is still running … (orphan run, #293)` の ERROR が出る
 - `cogs/scheduler.py:_run_task` — `_run_task: enter` / `_run_task: exit` (スケジュール実行ごと)
 - `cogs/scheduler.py:_master_loop` — `SchedulerCog: N task(s) due (ids=[...])` (30 秒ごと、due があるときのみ)
 - `cogs/webhook_trigger.py:on_message` — `Webhook trigger matched` (CI/CD webhook 着弾時)
@@ -216,7 +220,7 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 | 症状 | 最初に見るべき場所 | 典型的な原因 |
 |------|-----------------|------------|
 | スレッドが作られない | bot ログの `on_message` 周辺、`DISCORD_CHANNEL_ID` が一致しているか | Intent 不足 / channel ID 設定ミス |
-| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか | tmux window 作成失敗、Claude CLI hang、timeout |
+| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか（`exit` の `outcome=` がターンの終わり方）/ `orphan` の WARNING・ERROR が出ていないか | tmux window 作成失敗、Claude CLI hang、timeout |
 | 同一セッションのはずが別セッション扱い | `_run_helper` で `session_id=` ログを確認、DB の `sessions` テーブル | repository から session_id が読めていない |
 | Webhook trigger が無視される | `Webhook trigger matched` ログの有無 | webhook_id allowlist / channel_ids 不一致、prefix mismatch |
 | Scheduler が動かない | `SchedulerCog: N task(s) due` の有無 (30 秒間隔) | `next_run_at` が未来、`scheduled_tasks` が空 |

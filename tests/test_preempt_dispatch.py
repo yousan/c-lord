@@ -198,3 +198,61 @@ async def test_a_cancelled_turn_task_is_not_reported_as_an_error() -> None:
 
     # Must not raise (task.exception() on a cancelled task would).
     ClaudeChatCog._report_turn_task_outcome(4242, task)
+
+
+# --------------------------------------------------------------------------
+# #293 — a prior turn that will not die must not hold the thread hostage
+# --------------------------------------------------------------------------
+
+
+async def _ignores_cancel(release: asyncio.Event) -> None:
+    """A turn whose teardown outlives the cancel (e.g. a ``finally`` stuck on a
+    rate-limited Discord call): it swallows the first cancel and keeps going."""
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        await release.wait()
+
+
+@pytest.mark.asyncio
+async def test_drain_gives_up_on_a_turn_that_outlives_its_cancel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED: the drain awaited the cancelled task with no bound, under the
+    per-thread lock — so every later message in the thread queued behind it,
+    silently.  Now it waits a bounded time, says so, and lets the new turn go."""
+    release = asyncio.Event()
+    task = asyncio.create_task(_ignores_cancel(release))
+    await asyncio.sleep(0)
+    cog = _bare_cog()
+
+    try:
+        with caplog.at_level("ERROR", logger="c_lord.cogs.claude_chat"):
+            await asyncio.wait_for(
+                cog._drain_thread_task(task, grace=0.05, cancel_grace=0.1, thread_id=4242),
+                timeout=2.0,
+            )
+    finally:
+        task.cancel()
+        release.set()
+        with contextlib.suppress(BaseException):
+            await task
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("orphan" in m and "thread=4242" in m for m in errors), errors
+
+
+@pytest.mark.asyncio
+async def test_drain_still_waits_for_a_turn_that_ends_after_cancel() -> None:
+    """The bound is a backstop: a turn that unwinds promptly is still reaped."""
+    task = asyncio.create_task(_parked_turn())
+    await asyncio.sleep(0)
+
+    try:
+        await _bare_cog()._drain_thread_task(task, grace=0.05, cancel_grace=1.0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+
+    assert task.cancelled()

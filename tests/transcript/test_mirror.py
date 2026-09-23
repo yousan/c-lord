@@ -1638,6 +1638,94 @@ async def test_a_prompt_alone_arms_the_progress_line(tmp_path: Path) -> None:
     assert spy.posts, "a prompt-then-silence turn produced no progress line"
 
 
+def _tool_call(tool_id: str, name: str = "Bash", command: str = "sleep 150") -> dict:
+    d = _assistant_tool_use(name, command)
+    d["message"]["content"][0]["id"] = tool_id
+    return d
+
+
+def _tool_return(tool_id: str, output: str = "") -> dict:
+    d = _user_tool_result(output)
+    d["message"]["content"][0]["tool_use_id"] = tool_id
+    return d
+
+
+async def _progress_after_silence(tmp_path: Path, events: list[dict], silence: float) -> list[str]:
+    """Feed *events*, let *silence* seconds pass with nothing new, return the posts."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=757,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        for event in events:
+            _write_event(jsonl, event)
+        await asyncio.sleep(0.25)
+        clock.advance(silence)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+    return spy.posts
+
+
+async def test_progress_line_keeps_the_tool_name_while_one_long_tool_runs(
+    tmp_path: Path,
+) -> None:
+    """#757 AC1: a single 2-minute command is work in progress, not a stall.
+
+    RED before the fix: the mirror only counted events, and one long call writes
+    none between its ``tool_use`` and its ``tool_result`` — so at 60s the line
+    dropped the tool name it had and guessed "長考かコンテキスト圧縮".
+    """
+    posts = await _progress_after_silence(tmp_path, [_tool_call("toolu_757")], 120.0)
+
+    assert posts, "no progress line after 120s of silence"
+    assert "作業中" in posts[0], posts[0]
+    assert "sleep 150" in posts[0], posts[0]
+
+
+async def test_progress_line_falls_back_to_waiting_once_the_tool_returns(
+    tmp_path: Path,
+) -> None:
+    """#757 AC2: after the result, silence is silence again.
+
+    The result here is empty — ``sleep`` prints nothing — which the formatter
+    drops. The call must still count as finished, or the line would claim the
+    tool is running for the rest of the turn.
+    """
+    posts = await _progress_after_silence(
+        tmp_path, [_tool_call("toolu_757"), _tool_return("toolu_757")], 120.0
+    )
+
+    assert posts, "no progress line after 120s of silence"
+    assert "待機中" in posts[0], posts[0]
+
+
+async def test_progress_line_does_not_count_a_menu_as_running(tmp_path: Path) -> None:
+    """An open AskUserQuestion waits on the reader, not on a process (#757).
+
+    Its ``tool_result`` only arrives when someone answers, so treating it as a
+    running tool would say "作業中" under a menu nobody has touched.
+    """
+    ask = _tool_call("toolu_ask", name="AskUserQuestion")
+    ask["message"]["content"][0]["input"] = {"questions": []}
+    posts = await _progress_after_silence(tmp_path, [ask], 120.0)
+
+    assert posts, "no progress line after 120s of silence"
+    assert "作業中" not in posts[0], posts[0]
+
+
 # ---------------------------------------------------------------------------
 # #682: a menu's free-text answer must not come back as a 👤 bubble
 # ---------------------------------------------------------------------------
@@ -1950,3 +2038,171 @@ async def test_a_fold_that_cannot_be_replaced_still_delivers_the_markdown(
         "is left with a pointer to nothing"
     )
     fold_msg.delete.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# #747: the same line over and over must not flood the thread
+# ---------------------------------------------------------------------------
+
+
+def _loop_turn(jsonl: Path, line: str, times: int) -> None:
+    """*line* then a tool call, *times* over — the shape of every measured loop.
+
+    In all four looping threads of the week of 2026-09-15 the repeated line was
+    followed by a tool call (a ``Read`` of the Monitor output), so each copy was
+    an intermediate message posted on its own.
+    """
+    for _ in range(times):
+        _write_event(jsonl, _assistant_text(line))
+        _write_event(jsonl, _assistant_tool_use("Read", "tasks/x.output"))
+        _write_event(jsonl, _user_tool_result("(no new output)"))
+
+
+async def test_sixty_identical_lines_do_not_become_sixty_messages(tmp_path: Path) -> None:
+    """#747 AC4: RED before the fold — the sink was called once per copy (60)."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    sink_calls: list[str] = []
+    reply_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def reply_sink(text: str) -> None:
+        reply_calls.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _loop_turn(jsonl, "待機中。", 60)
+        _write_event(jsonl, _assistant_text("RED ラウンドが終わりました。"))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(1.0)
+    finally:
+        await mirror.stop()
+
+    assert len(sink_calls) <= 10, f"{len(sink_calls)} messages for one repeated line"
+    assert sink_calls.count("待機中。") < 60
+    # The real report after the loop is delivered, and delivered as the answer.
+    assert reply_calls == ["RED ラウンドが終わりました。"], reply_calls
+
+
+async def test_the_counter_message_is_edited_with_the_number_folded(tmp_path: Path) -> None:
+    """#747 AC1: with an editor wired (the Cog wires one), one message counts."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    sink_calls: list[str] = []
+    fold_posts: list[str] = []
+    fold_edits: list[str] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def reply_sink(text: str) -> None:
+        pass
+
+    async def fold_post(text: str) -> object:
+        fold_posts.append(text)
+        return "handle"
+
+    async def fold_edit(handle: object, text: str) -> None:
+        fold_edits.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        fold_post=fold_post,
+        fold_edit=fold_edit,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _loop_turn(jsonl, "待機中。", 60)
+        _write_event(jsonl, _assistant_text("RED ラウンドが終わりました。"))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(1.0)
+    finally:
+        await mirror.stop()
+
+    assert len(fold_posts) == 1, fold_posts
+    assert fold_edits, "the counter was never updated"
+    assert "57" in fold_edits[-1], fold_edits[-1]
+    assert sink_calls == ["待機中。"] * 3, sink_calls
+
+
+async def test_a_different_line_after_the_loop_is_posted_normally(tmp_path: Path) -> None:
+    """#747 AC2: folding the loop must not swallow what follows it."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    sink_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def reply_sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _loop_turn(jsonl, "待機中。", 20)
+        _loop_turn(jsonl, "CI が通りました。GREEN ラウンドに進みます。", 1)
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.8)
+    finally:
+        await mirror.stop()
+
+    assert "CI が通りました。GREEN ラウンドに進みます。" in sink_calls, sink_calls
+
+
+async def test_a_final_answer_is_never_folded(tmp_path: Path) -> None:
+    """The answer that ends the turn is delivered even if it repeats the loop line.
+
+    It is what pings the reader and what the turn is judged by; folding it into
+    a counter higher up the thread would be worse than the flood (#747).
+    """
+    project, jsonl = _fresh_jsonl(tmp_path)
+    reply_calls: list[str] = []
+
+    async def sink(text: str) -> None:
+        pass
+
+    async def reply_sink(text: str) -> None:
+        reply_calls.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=1,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        _loop_turn(jsonl, "待機中。", 10)
+        _write_event(jsonl, _assistant_text("待機中。"))
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.8)
+    finally:
+        await mirror.stop()
+
+    assert reply_calls == ["待機中。"], reply_calls
