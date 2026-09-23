@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS channel_repo_bindings (
 );
 """
 
+# Forges whose ``host/owner/repo`` shape we know. A browser address bar hides
+# the scheme, so ``github.com/owner/repo`` is what users paste — and git reads
+# a scheme-less string as a local path (#476). Other hosts are left alone: a
+# bare ``example.com/owner/repo`` could just as well be a relative directory.
+_SCHEMELESS_FORGE_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
+
 
 def normalize_repo_url(url: str) -> str:
     """Normalize a (possibly derived) repository URL to a clonable ``owner/repo.git``.
@@ -41,10 +47,13 @@ def normalize_repo_url(url: str) -> str:
         'git@github.com:owner/repo'                   → 'git@github.com:owner/repo.git'
         'git@github.com:owner/repo.git'               → 'git@github.com:owner/repo.git'
         'https://gitlab.com/owner/repo/-/merge_requests/3' → 'https://gitlab.com/owner/repo.git'
+        'github.com/owner/repo'                       → 'https://github.com/owner/repo.git'
 
-    Non-HTTP(S) inputs that are not ``git@host:`` SSH URLs (e.g. local paths) are
-    returned unchanged apart from whitespace stripping, since their structure is
-    unknown. Empty input is returned unchanged.
+    A scheme-less URL on a known forge (github.com / gitlab.com / bitbucket.org)
+    gets ``https://`` prepended, since that is what a browser address bar hands
+    over (#476). Other non-HTTP(S) inputs that are not ``git@host:`` SSH URLs
+    (e.g. local paths) are returned unchanged apart from whitespace stripping,
+    since their structure is unknown. Empty input is returned unchanged.
     """
     url = url.strip()
     if not url:
@@ -53,6 +62,9 @@ def normalize_repo_url(url: str) -> str:
     # SSH shorthand: git@host:owner/repo[.git] — only ensure a .git suffix.
     if url.startswith("git@") and ":" in url:
         return url if url.endswith(".git") else f"{url}.git"
+
+    if url.split("/", 1)[0].lower() in _SCHEMELESS_FORGE_HOSTS:
+        url = f"https://{url}"
 
     if url.startswith(("http://", "https://")):
         scheme, rest = url.split("://", 1)
