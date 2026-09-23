@@ -68,6 +68,12 @@ def _quote(line: str) -> str:
     return f"「{flat}」"
 
 
+def _for_log(line: str) -> str:
+    """The line as the log shows it: one short row, so a repeated paragraph cannot flood it."""
+    flat = " ".join(line.split())
+    return repr(flat if len(flat) <= 80 else flat[:79] + "…")
+
+
 def _render(counts: Counter[str], *, countable: bool) -> str:
     """The counter's text: one subtext line saying what repeats, and how often.
 
@@ -178,7 +184,7 @@ class RepeatFold:
             "%s repeat fold: folded %d repeated line(s) into one message (%s)",
             log_ctx(thread_id=self._thread_id),
             sum(self._counts.values()),
-            ", ".join(f"{line!r}×{n}" for line, n in self._counts.most_common()),
+            ", ".join(f"{_for_log(line)}×{n}" for line, n in self._counts.most_common()),
         )
         self._counts = Counter()
         self._handle = None
@@ -198,10 +204,10 @@ class RepeatFold:
 
     async def _open(self, line: str) -> None:
         logger.info(
-            "%s repeat fold: %r repeated %d time(s) in a row — folding further copies "
+            "%s repeat fold: %s repeated %d time(s) in a row — folding further copies "
             "into one message",
             log_ctx(thread_id=self._thread_id),
-            line,
+            _for_log(line),
             self._streak,
         )
         self._last_edit = self._clock()
