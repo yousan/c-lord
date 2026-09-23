@@ -179,6 +179,8 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
 - `setup.py:setup_bridge` — `c-lord version v1.4.183-bd80c47e-20260908` (#722)。**起動ログで最初に見る行**。
   「そのインスタンスがいつのビルドで走っているか」がここにしか無い（`grep -i version <log>`）。
   古いビルドは「その機能はありません」と利用者に答えてしまうので、挙動が古く見えたらまずこれを見る
+  - ビルドが 7 日以上前なら直後に `WARNING … this c-lord build is N days old (…)` が1行続く (#756)。
+    📊 フッタの版数にも `(Nd)` が付く（`docs/specs/context-footer.md`）
 - `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit` (Claude 実行 1 回ごと)
 - `cogs/scheduler.py:_run_task` — `_run_task: enter` / `_run_task: exit` (スケジュール実行ごと)
 - `cogs/scheduler.py:_master_loop` — `SchedulerCog: N task(s) due (ids=[...])` (30 秒ごと、due があるときのみ)
