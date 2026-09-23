@@ -477,24 +477,54 @@ def ask_sending_embed(
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
 
 
+def ask_confirming_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+) -> discord.Embed:
+    """The keys went out; Claude's transcript has not recorded the result yet (#746).
+
+    Not a failure and not a verdict. When one AskUserQuestion carries several
+    questions the CLI writes its ``tool_result`` only once the LAST one is
+    answered — production measured 198s and 53min — so an earlier answer cannot
+    be confirmed until then. The menu is corrected to ✅ when the result lands.
+
+    It must never suggest re-sending: a re-sent answer is an ordinary message,
+    and an ordinary message interrupts the running turn (#631's shape).
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"⏳ {header}" if header else "⏳ 回答の受け取りを確認中"
+    body = (
+        f"{question}\n\n"
+        f"**送った答え:** {answer}\n"
+        "-# Claude の受け取りを確認中です。確認でき次第、この表示が更新されます"
+        "（まとめて聞かれた質問は、最後の質問に答えた時点で確認されます）。"
+    )
+    return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
+
+
 def ask_unconfirmed_embed(
     question: str,
     header: str = "",
     selected: list[str] | None = None,
 ) -> discord.Embed:
-    """The outcome could not be confirmed either way within the bound (#651).
+    """The outcome could not be confirmed either way, and c-lord stopped looking (#651).
 
     Deliberately neither ✅ nor "届きませんでした": silence is not evidence of
     success, and telling someone their answer was lost when it may well have
     landed is its own way of being wrong. Say what is known.
+
+    #746: it used to add 「同じ内容をスレッドにもう一度送ってください」. The answer
+    had usually landed — and a re-sent answer is an interrupt of the turn that is
+    using it. Point at where the truth shows up instead.
     """
     answer = ", ".join(selected or []) or "（未選択）"
     title = f"❔ {header}" if header else "❔ 回答の結果を確認できませんでした"
     body = (
         f"{question}\n\n"
         f"**送った答え:** {answer}\n\n"
-        "回答は送りましたが、Claude が受け取ったかどうかを確認できませんでした。"
-        "続きが返ってこないときは、同じ内容をスレッドにもう一度送ってください。"
+        "回答は送りましたが、Claude が受け取ったかどうかは確認できませんでした。"
+        "Claude の続きの返信に、この答えが反映されているかを見てください。"
     )
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_TODO)
 

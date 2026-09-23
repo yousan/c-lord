@@ -258,3 +258,37 @@ class TestUnknownWordingIsAudible:
         assert len(caplog.records) == 1, (
             "one line per distinct wording — see LogSampler (#678): audible, not noisy"
         )
+
+
+class TestFirstAskAfter:
+    """#746: finding a menu whose tool_use was written only with its result."""
+
+    def test_the_earliest_ask_after_the_mark_not_the_newest(self, tmp_path: Path) -> None:
+        from c_lord.transcript.ask_result import first_ask_tool_use_after
+
+        _write(
+            tmp_path,
+            "s.jsonl",
+            [
+                _ask_use("toolu_old", "2026-09-23T11:54:12Z"),
+                _ask_use("toolu_mine", "2026-09-23T12:02:56Z"),
+                _ask_use("toolu_later", "2026-09-23T12:10:00Z"),
+            ],
+        )
+        found = first_ask_tool_use_after(tmp_path, "2026-09-23T11:54:12Z")
+        assert found is not None and found[0] == "toolu_mine", (
+            "a later question must never be mistaken for this one"
+        )
+
+    def test_nothing_written_yet(self, tmp_path: Path) -> None:
+        from c_lord.transcript.ask_result import first_ask_tool_use_after
+
+        _write(tmp_path, "s.jsonl", [_ask_use("toolu_old", "2026-09-23T11:54:12Z")])
+        assert first_ask_tool_use_after(tmp_path, "2026-09-23T11:54:12Z") is None
+
+    def test_no_mark_means_any(self, tmp_path: Path) -> None:
+        from c_lord.transcript.ask_result import first_ask_tool_use_after
+
+        _write(tmp_path, "s.jsonl", [_ask_use("toolu_first", "2026-09-23T11:54:12Z")])
+        found = first_ask_tool_use_after(tmp_path, None)
+        assert found is not None and found[0] == "toolu_first"

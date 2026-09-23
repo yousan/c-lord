@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,10 +32,12 @@ from ..transcript.ask_result import (
     ASK_NOT_ANSWERED,
     ASK_UNKNOWN,
     AskOutcome,
+    ask_tool_uses,
     classify_ask_result,
-    latest_ask_tool_use,
+    first_ask_tool_use_after,
     read_ask_result,
 )
+from ..utils.logger import log_ctx
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
@@ -48,6 +51,7 @@ from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
 from .embeds import (
     ask_answered_embed,
+    ask_confirming_embed,
     ask_embed,
     ask_unconfirmed_embed,
     ask_undelivered_embed,
@@ -80,6 +84,27 @@ _PANE_RESOLVE_MISSES = 2
 # for a busy host, not an expected wait.
 _ANSWER_CONFIRM_TIMEOUT = 12.0
 _ANSWER_CONFIRM_POLL = 0.5
+
+# #746: the window above cannot be the last word. One AskUserQuestion may carry
+# several questions, and the CLI writes its tool_result only once the LAST one
+# is answered — production measured +198s and +53min — so every earlier answer
+# timed out as ❔ over an answer Claude went on to use. The window cannot simply
+# grow: the bridge holds the thread's menu claim while it waits, and the next
+# question of the same ask is already on screen needing to be bridged. So the
+# window ends on time and a background watcher keeps reading the transcript,
+# correcting the menu when the result lands.
+#
+# Bounded by how long the rest of the ask can stay open: an unanswered question
+# is Esc'd after ASK_ANSWER_TIMEOUT, and that too writes a tool_result (a "no
+# answer" one), which the watcher reports as such. The poll backs off because
+# it re-reads one session file that can be megabytes.
+_LATE_CONFIRM_TIMEOUT = float(ASK_ANSWER_TIMEOUT + 3_600)
+_LATE_CONFIRM_POLL_MIN = 1.0
+_LATE_CONFIRM_POLL_MAX = 10.0
+
+# Strong references to the running watchers: the event loop only keeps weak
+# ones, and a collected task would silently stop correcting its menu.
+_late_confirmations: set[asyncio.Task[None]] = set()
 
 # #399: the prose context above the menu is posted as its own message(s).
 # Up to _CONTEXT_MAX_MSGS sequential chunks deliver the text IN FULL — clipping
@@ -175,6 +200,68 @@ async def _transcript_dir(runner: TmuxClaudeRunner) -> Path | None:
     return result if isinstance(result, Path) else None
 
 
+@dataclass
+class _MenuRef:
+    """Where in Claude's transcript one menu's outcome will be written (#651/#746).
+
+    *ask* is the menu's ``AskUserQuestion`` tool_use when it is already in the
+    transcript. When it is not — the CLI sometimes writes a menu's tool_use only
+    together with its result — *ask* is None and the menu is the first ask to be
+    written after the timestamp *after* (None: after nothing, i.e. any).
+    """
+
+    project_dir: Path
+    ask: tuple[str, Path] | None = None
+    after: str | None = None
+
+    def describe(self) -> str:
+        return self.ask[0] if self.ask is not None else "the next AskUserQuestion written"
+
+    async def outcome(self) -> AskOutcome:
+        """One read: the verdict so far, ``unknown`` until something is written."""
+        if self.ask is None:
+            self.ask = await asyncio.to_thread(
+                first_ask_tool_use_after, self.project_dir, self.after
+            )
+            if self.ask is None:
+                return ASK_UNKNOWN
+        tool_use_id, session_path = self.ask
+        return classify_ask_result(
+            await asyncio.to_thread(read_ask_result, self.project_dir, tool_use_id, session_path)
+        )
+
+
+async def _locate_menu(runner: TmuxClaudeRunner, question: AskQuestion) -> _MenuRef | None:
+    """Find the open menu in the transcript, BEFORE it is answered (#651).
+
+    Before: afterwards a newer menu may already be the newest. And the newest
+    ask is only this menu if it has no result yet — a menu that is still open
+    cannot have one. Found on staging (#746): 案B was Esc'd, 案C was asked, and
+    案C's tool_use was not in the file until 案C was answered; "the newest ask"
+    was 案B, so 案C's answer was judged by 案B's rejection — ``outcome=unknown``
+    over an answer Claude had received, and a late watcher on a result that
+    would never change.
+
+    None — the pane is the only evidence — when there is no transcript, and for
+    menus that are not ``AskUserQuestion`` at all: plan approval (#251,
+    ``allow_other=False``) writes no ask, so every ask in the transcript is some
+    earlier, finished one.
+    """
+    project_dir = await _transcript_dir(runner)
+    if project_dir is None:
+        return None
+    asks = await asyncio.to_thread(ask_tool_uses, project_dir)
+    after: str | None = None
+    if asks:
+        ts, tool_use_id, session_path = asks[-1]
+        if await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path) is None:
+            return _MenuRef(project_dir, ask=(tool_use_id, session_path))
+        after = ts
+    if not question.allow_other:
+        return None
+    return _MenuRef(project_dir, after=after)
+
+
 async def _menu_is_gone(runner: TmuxClaudeRunner) -> bool | None:
     """True/False if the pane says the menu closed, None when it cannot say.
 
@@ -204,9 +291,7 @@ async def _menu_is_gone(runner: TmuxClaudeRunner) -> bool | None:
 
 
 async def _verify_answer_reached_claude(
-    runner: TmuxClaudeRunner,
-    project_dir: Path | None,
-    ask_ref: tuple[str, Path] | None,
+    runner: TmuxClaudeRunner, menu: _MenuRef | None
 ) -> AskOutcome:
     """Did the answer actually reach Claude? (#651)
 
@@ -218,18 +303,18 @@ async def _verify_answer_reached_claude(
        the machinery around it. It is what distinguishes the #650 failure — keys
        delivered, menu closed, answer discarded — from a real answer.
     2. **The pane.** Where there is no transcript to read (no tmux pane path, a
-       non-tmux runner), "the menu is gone" is the best available proxy. Weaker,
-       but far better than the pre-#651 answer of not checking at all.
+       non-tmux runner, a menu that is not an ask), "the menu is gone" is the
+       best available proxy. Weaker, but far better than the pre-#651 answer of
+       not checking at all.
 
     Polling is bounded by ``_ANSWER_CONFIRM_TIMEOUT`` because the ✅ waits on it.
+    An ``unknown`` here is not a verdict — :func:`settle_answer` hands it on to
+    the late watcher (#746).
     """
     deadline = asyncio.get_running_loop().time() + _ANSWER_CONFIRM_TIMEOUT
     while True:
-        if project_dir is not None and ask_ref is not None:
-            tool_use_id, session_path = ask_ref
-            outcome = classify_ask_result(
-                await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path)
-            )
+        if menu is not None:
+            outcome = await menu.outcome()
             if outcome != ASK_UNKNOWN:
                 return outcome
         elif await _menu_is_gone(runner) is True:
@@ -238,6 +323,126 @@ async def _verify_answer_reached_claude(
         if asyncio.get_running_loop().time() >= deadline:
             return ASK_UNKNOWN
         await asyncio.sleep(_ANSWER_CONFIRM_POLL)
+
+
+async def _await_late_outcome(menu: _MenuRef) -> AskOutcome:
+    """Keep reading the transcript until it records the menu's result (#746).
+
+    ``unknown`` only when ``_LATE_CONFIRM_TIMEOUT`` passes with nothing written —
+    by then the rest of the ask has been Esc'd, which writes a result of its own,
+    so reaching the bound means the session itself is gone.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _LATE_CONFIRM_TIMEOUT
+    delay = _LATE_CONFIRM_POLL_MIN
+    while True:
+        outcome = await menu.outcome()
+        if outcome != ASK_UNKNOWN or loop.time() >= deadline:
+            return outcome
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, _LATE_CONFIRM_POLL_MAX)
+
+
+async def _confirm_late(
+    msg,
+    question: AskQuestion,
+    selected: list[str],
+    menu: _MenuRef,
+    thread_id: int,
+) -> None:
+    """Background half of :func:`settle_answer`: correct the menu when the result lands."""
+    ctx = log_ctx(thread_id=thread_id)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        outcome = await _await_late_outcome(menu)
+    except asyncio.CancelledError:
+        # Shutdown. The menu keeps saying 確認中 — true when it was written, and
+        # carrying no advice that could hurt — but it must not go unrecorded.
+        logger.info(
+            "%s ask answer: stopped watching the transcript for %s (bot stopping) — "
+            "the menu stays at 確認中 (#746)",
+            ctx,
+            menu.describe(),
+        )
+        raise
+    except Exception:  # pragma: no cover - defensive: a watcher must never be loud
+        logger.warning("%s ask answer: late confirmation failed (#746)", ctx, exc_info=True)
+        outcome = ASK_UNKNOWN
+    waited = loop.time() - started
+    if outcome == ASK_ANSWERED:
+        logger.info(
+            "%s ask answer confirmed late: the transcript recorded it %.0fs after the "
+            "confirm window closed (#746)",
+            ctx,
+            waited,
+        )
+    else:
+        # The one line production greps for (#746 AC6): from here it means the
+        # answer really did not arrive, or really could not be confirmed.
+        logger.warning(
+            "%s ask answer outcome=%s after watching the transcript for %.0fs "
+            "(selected=%r) (#651/#746)",
+            ctx,
+            outcome,
+            waited,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
+
+
+async def settle_answer(
+    msg,
+    question: AskQuestion,
+    selected: list[str],
+    runner: TmuxClaudeRunner,
+    menu: _MenuRef | None,
+    *,
+    thread_id: int,
+) -> AskOutcome:
+    """Write what became of an answer onto its menu message (#651/#746).
+
+    Returns within the confirm window, always — the caller is usually holding
+    the thread's menu claim, and the next question of the same ask is waiting
+    for it. What cannot be decided by then is decided later:
+
+    - confirmed in the window → ✅ / ⚠️ now, as before;
+    - not yet, with a transcript to read → ⏳ 確認中 now, and a background
+      watcher turns it ✅ / ⚠️ when the ``tool_result`` lands;
+    - not yet, with nothing but the pane to go on → ❔. The pane cannot tell a
+      later question of the same ask from this one, so there is nothing a
+      longer watch could learn.
+
+    Returns the outcome known when it returns (``unknown`` while watching).
+    """
+    outcome = await _verify_answer_reached_claude(runner, menu)
+    if outcome == ASK_UNKNOWN and menu is not None:
+        logger.info(
+            "%s ask answer not in the transcript within %.0fs — showing 確認中 and "
+            "watching for %s (a multi-question ask records it after its last answer) (#746)",
+            log_ctx(thread_id=thread_id),
+            _ANSWER_CONFIRM_TIMEOUT,
+            menu.describe(),
+        )
+        with contextlib.suppress(Exception):
+            await msg.edit(
+                content=None,
+                embed=ask_confirming_embed(question.question, question.header, selected),
+                view=None,
+            )
+        task = asyncio.create_task(_confirm_late(msg, question, selected, menu, thread_id))
+        _late_confirmations.add(task)
+        task.add_done_callback(_late_confirmations.discard)
+        return outcome
+    if outcome != ASK_ANSWERED:
+        logger.warning(
+            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
+            outcome,
+            thread_id,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
+    return outcome
 
 
 async def _finalize_menu_message(
@@ -622,12 +827,7 @@ async def _bridge_claimed_menu(
     # #651: identify the menu in Claude's own transcript BEFORE answering it, so
     # the outcome can be read back from the authoritative place. Done up front
     # because after the answer a *new* menu may already be the newest one.
-    project_dir = await _transcript_dir(runner)
-    ask_ref = (
-        await asyncio.to_thread(latest_ask_tool_use, project_dir)
-        if project_dir is not None
-        else None
-    )
+    menu_ref = await _locate_menu(runner, question)
 
     delivered = await send_answer_keystrokes(runner, question, selected)
     # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
@@ -641,15 +841,7 @@ async def _bridge_claimed_menu(
     if delivered is False:
         await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
         return
-    outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
-    if outcome != ASK_ANSWERED:
-        logger.warning(
-            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
-            outcome,
-            thread.id,
-            selected,
-        )
-    await _finalize_menu_message(msg, question, selected, outcome)
+    await settle_answer(msg, question, selected, runner, menu_ref, thread_id=thread.id)
 
 
 async def collect_ask_answers(
