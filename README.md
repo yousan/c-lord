@@ -156,7 +156,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Token usage** — Cache hit rate and token counts shown in session-complete embed
 - **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
 - **Compact notice** — When Claude Code compacts the context, the thread gets a one-line `🗜️ コンテキストを圧縮しました` instead of the raw continuation summary (#628)
-- **Hard stall notification** — Thread message after 30 s of no activity (extended thinking or context compression); resets automatically when Claude resumes
+- **Hard stall lamp** — After 30 s of no activity the reaction on your message turns ⚠️ (extended thinking or context compression can be this quiet too); no message is posted to the thread (#473)
 - **Turn progress line** — When a turn goes quiet for 90 s, one subtext line appears (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), refreshes in place every 15 s, and disappears the moment real output returns; says `⏳ 待機中` when even tool activity has stopped. Never posted outside a turn. Opt out with `CLORD_TURN_PROGRESS=0` (#539)
 - **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541)
 
