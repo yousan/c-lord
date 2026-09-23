@@ -205,6 +205,41 @@ def _transcript_has_ask_result(project_dir: Path, tool_use_id: str) -> bool:
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
 
+# Tools that wait on the *reader*, not on a process. Their ``tool_result`` only
+# lands once someone answers the menu, so counting one as "running" would keep
+# the progress line on 作業中 under a menu nobody has touched (#757).
+_WAITS_ON_READER = frozenset({"AskUserQuestion", "ExitPlanMode"})
+
+
+def _tool_call_ids(event: dict) -> tuple[list[str], list[str]]:
+    """Return the tool-call ids *event* opens and closes (#757).
+
+    Read from the raw event, not the rendering: a call that printed nothing
+    (``sleep 150``) renders to ``None``, and missing its ``tool_result`` would
+    leave the call looking open for the rest of the turn. Like every helper run
+    on each tailed event, it never assumes a shape.
+    """
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return [], []
+    opened: list[str] = []
+    closed: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "tool_use" and block.get("name") not in _WAITS_ON_READER:
+            tool_id = block.get("id")
+            if isinstance(tool_id, str):
+                opened.append(tool_id)
+        elif kind == "tool_result":
+            tool_id = block.get("tool_use_id")
+            if isinstance(tool_id, str):
+                closed.append(tool_id)
+    return opened, closed
+
+
 # #631 AC8: the pane reader and this mirror witness the same limit, and the
 # reader's ⏳ embed is the message that should survive — it names the scope, the
 # reset time and what the reader can do about it.  Which one reaches Discord
@@ -751,10 +786,18 @@ class TranscriptMirror:
                 # the gap being filled. Arming here (not only on user_input) also
                 # covers turns started outside Discord (scheduler / webhook / the
                 # tmux pane).
-                if rendered is not None and rendered.kind in _BUFFERED_KINDS:
+                # #757: the ids tell a call that is still running (no result
+                # yet) from a turn that has genuinely gone quiet.
+                opened, closed = _tool_call_ids(event)
+                is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
+                if is_tool or opened or closed:
                     self._progress.begin_turn()
                     self._progress.note_activity(
-                        rendered.body if rendered.kind == "tool_use" else None
+                        rendered.body
+                        if rendered is not None and rendered.kind == "tool_use"
+                        else None,
+                        started=opened,
+                        finished=closed,
                     )
                 await self._progress.tick()
 
