@@ -395,6 +395,51 @@ def _format_body(rendered: RenderedEvent) -> str:
     return f"{prefix}{rendered.body}"
 
 
+def _unresolved_notice(report: UnresolvedTranscript) -> str:
+    """What to tell the thread when its transcript cannot be found (#773).
+
+    The two cases need different advice, and getting that wrong wastes the
+    reader's time:
+
+    * **c-lord named this session** (a claim exists) — the transcript should be
+      there.  Restarting Claude re-names it, and ``/claude-restart`` keeps the
+      conversation.
+    * **c-lord never named it** — the session predates #773 (it was started by
+      an older c-lord, or it is still running from before the upgrade).  A
+      ``/claude-restart`` will **not** help: it resumes with ``--continue``,
+      which reuses the very transcript nothing can recognise and names nothing.
+      Only a new session gets a name, and that is ``/clear``.  The workspace —
+      the checkout, the branch, the files — is untouched; the conversation is
+      what does not carry over, and saying so is the honest trade.
+    """
+    if report.candidates == 0:
+        detail = "このワークスペースには transcript がまだ 1 つもありません。"
+    else:
+        detail = (
+            f"transcript は {report.candidates} 本ありますが、"
+            "どれもこのスレッドのセッションのものと確認できません。"
+        )
+    if report.claimed_session_id:
+        recovery = (
+            "`/claude-restart` で Claude を立て直してください（会話の文脈は引き継がれます）。"
+        )
+    else:
+        recovery = (
+            "このセッションは c-lord がセッションに名前を付けるようになる前"
+            "（#773 以前）に起動したものです。`/claude-restart` では直りません"
+            "（`--continue` は名前の無いセッションをそのまま開き直すため）。"
+            "`/clear` で新しいセッションを始めてください — 作業ディレクトリ"
+            "（チェックアウト・ブランチ・ファイル）はそのままで、会話の文脈だけが"
+            "引き継がれません。"
+        )
+    return (
+        "⚠️ このスレッドの transcript が見つからないため、Claude の返事を "
+        f"Discord に転送できていません（{report.seconds:.0f} 秒間）。\n"
+        f"{detail}\n"
+        f"{recovery}"
+    )
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -496,20 +541,7 @@ class TranscriptMirror:
         if not self._turn_active or self._unresolved_told:
             return
         self._unresolved_told = True
-        if report.candidates == 0:
-            detail = "このワークスペースには transcript がまだ 1 つもありません。"
-        else:
-            detail = (
-                f"transcript は {report.candidates} 本ありますが、"
-                "どれもこのスレッドのセッションのものと確認できません。"
-            )
-        await self._try_sink(
-            "⚠️ このスレッドの transcript が見つからないため、Claude の返事を "
-            f"Discord に転送できていません（{report.seconds:.0f} 秒間）。\n"
-            f"{detail}\n"
-            "`/claude-restart` で Claude を立て直すと、c-lord が新しいセッションに "
-            "名前を付け直して復旧します（作業内容は残ります）。"
-        )
+        await self._try_sink(_unresolved_notice(report))
 
     def start(self) -> None:
         """Spawn the tail task.  Idempotent."""

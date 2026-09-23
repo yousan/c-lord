@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from c_lord.transcript.mirror import TranscriptMirror
+from c_lord.transcript.mirror import TranscriptMirror, _unresolved_notice
 from c_lord.transcript.tail import UnresolvedTranscript, tail_events
 
 from .helpers import clord_transcript
@@ -156,3 +156,37 @@ async def test_the_reader_is_told_at_most_once_per_turn(tmp_path: Path) -> None:
         await mirror.stop()
 
     assert len(posted) == 1, posted
+
+
+# ── the advice has to be the advice that works ───────────────────────────
+
+
+def _report(**kw) -> UnresolvedTranscript:
+    base = dict(
+        project_dir=Path("/tmp/p"), seconds=120.0, candidates=2, claimed_session_id=None
+    )
+    base.update(kw)
+    return UnresolvedTranscript(**base)  # type: ignore[arg-type]
+
+
+def test_an_unnamed_session_is_not_sent_to_claude_restart() -> None:
+    """``/claude-restart`` resumes with ``--continue``, which names nothing.
+
+    Telling the reader to run it would cost them a restart and change nothing —
+    the session that predates #773 has no name, and only a *new* session gets
+    one.
+    """
+    text = _unresolved_notice(_report(claimed_session_id=None))
+    assert "/clear" in text
+    assert "`/claude-restart` では直りません" in text
+
+
+def test_a_named_session_is_sent_to_claude_restart() -> None:
+    """Here the conversation can be kept, so do not throw it away."""
+    text = _unresolved_notice(_report(claimed_session_id="a" * 8))
+    assert "/claude-restart" in text
+    assert "/clear" not in text
+
+
+def test_an_empty_workspace_says_so() -> None:
+    assert "1 つもありません" in _unresolved_notice(_report(candidates=0))
