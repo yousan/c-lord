@@ -42,7 +42,7 @@ from ..discord_ui.authorization import (
     resolve_fallback_owner_ids,
     set_default_authorizer,
 )
-from ..discord_ui.embeds import stopped_embed
+from ..discord_ui.embeds import error_embed, stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
@@ -78,6 +78,7 @@ from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
+from ..workspace_failure import describe_workspace_failure
 from ..workspace_notice import restored_devenv_notice
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -2001,11 +2002,15 @@ class ClaudeChatCog(commands.Cog):
             raise
         # Run Claude in the background so /api/spawn returns immediately.
         # The caller gets the thread reference without waiting for Claude to finish.
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._run_claude(
                 seed_message, thread, prompt, session_id=session_id, requester=requester
             )
         )
+        # #477: the reply path has had this since #565; the spawn path did not,
+        # so a spawned turn (/clord, /api/spawn) that died early — once parked
+        # in ``_active_tasks``, never collected — left no trace at all.
+        task.add_done_callback(partial(self._report_turn_task_outcome, thread.id))
         return thread
 
     async def cog_unload(self) -> None:
@@ -2757,6 +2762,54 @@ class ClaudeChatCog(commands.Cog):
         with contextlib.suppress(discord.HTTPException):
             await thread.send(f"⚠️ 次の添付は Claude に渡せませんでした:\n{body}")
 
+    async def _abort_turn_on_workspace_failure(
+        self,
+        thread: discord.Thread,
+        exc: BaseException,
+        *,
+        status: StatusManager,
+        failure_notify_id: int | None,
+        dashboard: ThreadStatusDashboard | None,
+        description: str,
+        current_task: asyncio.Task | None,
+    ) -> None:
+        """End a turn whose checkout or tmux window could not be set up (#477).
+
+        The thread is told why — git's own stderr, "authentication is needed"
+        when that is what git said, what to check for tmux — the lamp goes to
+        ❌, and the requester is mentioned (#681: an embed alone never
+        pushes). Every step is guarded: this is already the failure path, and
+        a second, silent failure here is exactly what #477 was.
+        """
+        logger.error(
+            "%s workspace setup failed — the turn cannot run: %s",
+            log_ctx(thread_id=thread.id),
+            exc,
+            exc_info=exc,
+        )
+        try:
+            await thread.send(
+                content=f"<@{failure_notify_id}>" if failure_notify_id is not None else None,
+                embed=error_embed(describe_workspace_failure(exc)),
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=failure_notify_id is not None
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "%s could not post the workspace failure to the thread",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+        with contextlib.suppress(Exception):
+            await status.set_error()
+        if self._active_tasks.get(thread.id) is current_task:
+            self._active_tasks.pop(thread.id, None)
+        if dashboard is not None:
+            await _safe_set_state(
+                dashboard, thread.id, ThreadState.WAITING_INPUT, description, thread=thread
+            )
+
     async def _run_claude(
         self,
         user_message: discord.Message,
@@ -2901,11 +2954,25 @@ class ClaudeChatCog(commands.Cog):
                 # commit hook can credit them as a Co-authored-by. #520: that is
                 # the requester, not the trigger message's author — a /clord
                 # seed message is authored by the bot itself.
-                session_dir = await _asyncio.to_thread(
-                    session_dir_manager.create_session_dir,
-                    thread.id,
-                    requester,
-                )
+                try:
+                    session_dir = await _asyncio.to_thread(
+                        session_dir_manager.create_session_dir,
+                        thread.id,
+                        requester,
+                    )
+                except Exception as exc:
+                    # #477: a clone that fails used to escape from here, before
+                    # the turn's ``try`` — 🟢 forever, nothing in the thread.
+                    await self._abort_turn_on_workspace_failure(
+                        thread,
+                        exc,
+                        status=status,
+                        failure_notify_id=failure_notify_id,
+                        dashboard=dashboard,
+                        description=description,
+                        current_task=current_task,
+                    )
+                    return
                 working_dir = session_dir
                 logger.info("Session dir for thread %d: %s", thread.id, session_dir)
 
@@ -2916,9 +2983,22 @@ class ClaudeChatCog(commands.Cog):
 
             window_name: str | None = None
             if tmux_manager is not None:
-                window_name = await _asyncio.to_thread(
-                    tmux_manager.create_session, thread.id, working_dir or "."
-                )
+                try:
+                    window_name = await _asyncio.to_thread(
+                        tmux_manager.create_session, thread.id, working_dir or "."
+                    )
+                except Exception as exc:
+                    # #477: same for tmux itself refusing (e.g. not installed).
+                    await self._abort_turn_on_workspace_failure(
+                        thread,
+                        exc,
+                        status=status,
+                        failure_notify_id=failure_notify_id,
+                        dashboard=dashboard,
+                        description=description,
+                        current_task=current_task,
+                    )
+                    return
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
 
                 # Issue #95: redesigned thread naming.

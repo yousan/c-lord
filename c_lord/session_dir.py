@@ -65,6 +65,22 @@ def _is_local_repo(source: str) -> bool:
     return source.startswith("/") or source.startswith(".")
 
 
+class GitCloneError(RuntimeError):
+    """``git clone`` of a session dir failed (#477).
+
+    Still a ``RuntimeError`` whose text starts ``git clone failed:`` — what this
+    used to raise — so existing callers are unaffected. It additionally carries
+    the repo and git's own stderr, which is what the thread needs to be told:
+    :func:`c_lord.workspace_failure.describe_workspace_failure` turns them into
+    a message the user can act on.
+    """
+
+    def __init__(self, *, repo: str, stderr: str) -> None:
+        self.repo = repo
+        self.stderr = stderr
+        super().__init__(f"git clone failed: {stderr.strip()}")
+
+
 @dataclass(frozen=True)
 class SessionDirInfo:
     """Snapshot of a single session directory."""
@@ -179,7 +195,7 @@ class SessionDirManager:
                     thread_id,
                     result.stderr.strip(),
                 )
-                raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
+                raise GitCloneError(repo=self._source_repo, stderr=result.stderr)
 
             logger.info("Created session dir for thread %d: %s", thread_id, target)
         else:
