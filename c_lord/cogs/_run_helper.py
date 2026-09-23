@@ -57,7 +57,7 @@ from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: 
 from ..lounge import build_lounge_prompt
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
-from ..version import runtime_version
+from ..version import label_with_age, runtime_version
 from .event_processor import EventProcessor
 from .run_config import RunConfig  # noqa: F401
 
@@ -372,7 +372,10 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         # what actually ran this turn.
         resolved = runtime_version()
         # 知らないことは黙る — never render "c-lord unknown".
-        clord_version = resolved if resolved != "unknown" else None
+        # #756: a stale build also says how old it is — ``(10d)``. The age is
+        # today's, computed per turn: the build is pinned at boot but the bot
+        # keeps running for days, and that is exactly when it goes stale.
+        clord_version = label_with_age(resolved) if resolved != "unknown" else None
 
     cost_usd: float | None = None
     if await _context_footer_enabled(settings_repo, "cost"):

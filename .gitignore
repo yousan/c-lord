@@ -38,6 +38,7 @@ tmux.sh
 
 # Version file generated at build time by hatch-vcs (source of truth = git tags)
 c_lord/_version.py
+c_lord/_build_info.py
 .staging-lease
 
 # Fuzz harness run artifacts (#377) — keep the dir (.gitkeep), ignore the runs.
