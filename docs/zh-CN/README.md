@@ -11,7 +11,7 @@
 
 **通过 Discord 安全地并行运行多个 Claude Code 会话。**
 
-每个 Discord 线程都成为一个隔离的 Claude Code 会话。按需启动任意数量的会话：在一个线程中开发功能，在另一个线程中审查 PR，在第三个线程中运行计划任务。桥接器自动处理协调，确保并发会话不会相互干扰。
+每个 Discord 线程都成为一个隔离的 Claude Code 会话。按需启动任意数量的会话：在一个线程中开发功能，在另一个线程中审查 PR，在第三个线程中运行计划任务。每个线程都在自己的仓库克隆中工作，因此各会话永远不会编辑同一个工作树。
 
 **[English](../../README.md)** | **[日本語](../ja/README.md)** | **[한국어](../ko/README.md)** | **[Español](../es/README.md)** | **[Português](../pt-BR/README.md)** | **[Français](../fr/README.md)**
 
@@ -21,30 +21,28 @@
 
 ---
 
-## 核心理念：无忧并行会话
+## 核心理念：并行会话，各自拥有独立克隆
 
-当你在不同 Discord 线程中向 Claude Code 发送任务时，桥接器会自动完成四件事：
+每个 Discord 线程都是一个独立的 Claude Code 会话，在你服务器上各自的 tmux 窗口中运行。向多个线程发送任务，它们会并排运行；合上笔记本电脑，它们仍会继续；在线程中回复，即可从中断处继续。
 
-1. **并发通知注入** — 每个会话的系统提示中都包含强制指令：创建 git worktree，仅在其中工作，绝不直接修改主工作目录。
-
-2. **活跃会话注册表** — 每个运行中的会话都能了解其他会话的情况。如果两个会话即将操作同一个仓库，它们可以协调而非冲突。
-
-3. **协调频道** — 一个共享的 Discord 频道，会话在此广播启动/结束事件。Claude 和人类都可以一目了然地看到所有活跃线程的状态。
-
-4. **AI Lounge** — 注入每个会话提示的「控え室」频道。开始工作前，每个会话会读取最近的 Lounge 消息来了解其他会话的动态。进行破坏性操作（force push、bot 重启、DB 操作等）前，会话会先确认 Lounge 内容，避免踩踏彼此的工作。
+让并行会话互不干扰的是**隔离**：当频道绑定到仓库（`/clord-init`）后，每个线程都在自己独立的 `git clone` 中工作。会话之间从不共享工作树，因此一个线程未提交的修改永远不会出现在另一个线程中。它们只通过 git 远程仓库交汇——分支、推送和 PR——就像人类贡献者一样。
 
 ```
-线程 A (功能开发)  ──→  Claude Code (worktree-A)  ─┐
-线程 B (PR 审查)   ──→  Claude Code (worktree-B)   ├─→  #ai-lounge
-线程 C (文档)      ──→  Claude Code (worktree-C)  ─┘    "A: auth 重构进行中"
-           ↓ 生命周期事件                                "B: PR #42 审查完成"
-   #协调频道                                             "C: README 更新中"
-   "A: 开始认证重构"
-   "B: 审查 PR #42"
-   "C: 更新 README"
+线程 A (功能开发)  ──→  Claude Code  (独立克隆)  ─┐
+线程 B (PR 审查)   ──→  Claude Code  (独立克隆)   ├─→  git 远程仓库（分支 · PR）
+线程 C (文档)      ──→  Claude Code  (独立克隆)  ─┘
 ```
 
-无竞争条件。无工作丢失。无合并意外。
+**目前各会话之间并不相互协调。** 本 README 的早期版本描述了四种协调机制；以下是它们的实际状态（[#758](https://github.com/yousan/c-lord/issues/758)）：
+
+| 机制 | 实际状态 |
+|---|---|
+| **并发通知**（告知 Claude 如何并行工作的指令） | 每轮都会构建，但**不会送达**——会话运行在 tmux TUI 中（#53），没有逐轮传递系统提示的通道，因此该文本被丢弃 |
+| **活跃会话注册表** | 存在于内存中，并被 `/workspace-cleanup` 使用，但**会话本身看不到它**（它随同一段被丢弃的文本传递） |
+| **协调频道** | **默认关闭。** 设置 `COORDINATION_CHANNEL_ID` 后，会在会话的一轮结束时发布一行通知；不存在启动事件 |
+| **AI Lounge** | REST 端点可用，但**没有任何机制告诉 Claude Lounge 的存在**，因此实际上没有任何消息被发布——参见下文「AI Lounge（未送达会话）」一节 |
+
+也就是说：工作树彼此独立，但并没有实时协调。克隆之外的任何东西——同一个远程分支、共享的端口或数据库、staging bot——仍可能发生冲突。请为每个线程使用独立的分支。
 
 ---
 
@@ -56,10 +54,10 @@
 
 ### 并行开发
 
-同时打开多个线程。每个都是独立的 Claude Code 会话，有自己的上下文、工作目录和 git worktree。实用模式：
+同时打开多个线程。每个都是独立的 Claude Code 会话，有自己的上下文和自己的仓库 git 克隆。实用模式：
 
 - **功能 + 审查并行**：在一个线程开发功能的同时，让 Claude 在另一个线程审查 PR。
-- **多人协作**：不同团队成员各有自己的线程；会话通过协调频道相互感知。
+- **多人协作**：不同团队成员各有自己的线程——以及自己的克隆——因此他们的会话永远不会编辑磁盘上的同一批文件。
 - **安全实验**：在线程 A 尝试某种方案，同时线程 B 保持在稳定代码上。
 
 ### 计划任务（SchedulerCog）
@@ -88,23 +86,21 @@ GitHub PR ←── git push ←── Claude Code ─────────�
 
 已在直接使用 Claude Code CLI？通过 `/sync-sessions` 将现有终端会话同步到 Discord 线程。回填近期对话消息，让你无需丢失上下文即可从手机继续 CLI 会话。
 
-### AI Lounge
+### AI Lounge（未送达会话）
 
-所有并行会话共享的「控え室」频道——会话在此互相告知动态、读取彼此的更新，并在进行破坏性操作前先行确认。
+> **状态：未接通**（[#758](https://github.com/yousan/c-lord/issues/758)）。Lounge 原本设计为以临时系统上下文的形式注入每个会话。由于会话运行在 tmux TUI 中（#53），没有逐轮传递的通道，c-lord 构建了该文本后便将其丢弃：Claude 从未被告知 Lounge 的存在，实际上也没有任何消息被发布。
 
-每个 Claude 会话都会在系统提示中自动收到 Lounge 上下文：来自其他会话的最近消息，以及进行破坏性操作前必须确认的规则。
+REST 端点仍然可用，因此你可以自行使用 Lounge——例如在你仓库的 `CLAUDE.md` 中描述它：
 
 ```bash
-# 会话在开始前发布意图：
-curl -X POST "$CLORD_API_URL/api/lounge" \
+# 发布一条消息（存储在 SQLite 中；同时转发到 Lounge 频道，默认为 COORDINATION_CHANNEL_ID）
+curl -X POST "http://localhost:8080/api/lounge" \
   -H "Content-Type: application/json" \
-  -d '{"message": "feature/oauth 上开始 auth 重构 — worktree-A", "label": "功能开发"}'
+  -d '{"message": "feature/oauth 上开始 auth 重构", "label": "功能开发"}'
 
-# 读取最近的 Lounge 消息（也会自动注入每个会话）：
-curl "$CLORD_API_URL/api/lounge"
+# 读取最近的消息
+curl "http://localhost:8080/api/lounge"
 ```
-
-Lounge 频道同时也是人类可见的活动动态——在 Discord 中打开它，即可一眼看清所有活跃 Claude 会话当前在做什么。
 
 ### 程序化会话创建
 
@@ -158,12 +154,10 @@ Claude 子进程将 `DISCORD_THREAD_ID` 作为环境变量接收，因此运行�
 - **长期停滞通知** — 30 秒无活动（扩展思考或上下文压缩）后发送线程消息；Claude 恢复时自动重置
 
 ### 并发与协调
-- **Worktree 指令自动注入** — 每个会话在操作任何文件前都会收到使用 `git worktree` 的提示
-- **自动 worktree 清理** — 会话 worktree（`wt-{thread_id}`）在会话结束时和 bot 启动时自动清理；有未提交更改的 worktree 永远不会被自动删除（安全不变量）
-- **活跃会话注册表** — 内存注册表；每个会话都能看到其他会话的状态
-- **AI Lounge** — 注入每个会话提示的共享「控え室」频道；会话发布意图、互相确认状态，并在破坏性操作前先行检查；对人类来说是实时活动动态
-- **协调频道** — 可选的跨会话生命周期广播共享频道
-- **协调脚本** — Claude 可在会话中调用 `coord_post.py` / `coord_read.py` 发布和读取事件
+- **每个线程一个 git 克隆** — 频道绑定到仓库（`/clord-init`）后，每个线程都在自己独立的 `git clone` 中工作；会话之间只共享 git 远程仓库
+- **活跃会话注册表** — 正在运行的会话的内存列表，供 `/workspace-cleanup` 使用。会话本身不会被告知彼此的存在（#758）
+- **AI Lounge 端点** — `GET/POST /api/lounge` 存储简短消息并转发到 Discord 频道。**不会注入会话**（#758）：只有在你告诉 Claude 时它才会使用
+- **协调频道** — 可选（`COORDINATION_CHANNEL_ID`，默认关闭）：在会话的一轮结束时发布一行通知
 
 ### 计划任务
 - **SchedulerCog** — SQLite 支持的定期任务执行器，含 30 秒主循环
@@ -185,7 +179,7 @@ Claude 子进程将 `DISCORD_THREAD_ID` 作为环境变量接收，因此运行�
 - **启动恢复** — 中断的会话在任意 bot 重启后自动恢复；`AutoUpgradeCog`（升级重启）和 `ClaudeChatCog.cog_unload()`（其他关闭）自动标记，或通过 `POST /api/mark-resume` 手动标记
 - **程序化创建** — `POST /api/spawn` 从任意脚本或 Claude 子进程创建新 Discord 线程 + Claude 会话；创建线程后立即返回非阻塞 201
 - **线程 ID 注入** — `DISCORD_THREAD_ID` 环境变量传递给每个 Claude 子进程，使会话可通过 `$CLORD_API_URL/api/spawn` 创建子会话
-- **Worktree 管理** — `/worktree-list` 显示所有活跃会话 worktree 的干净/脏状态；`/worktree-cleanup` 清理孤立的干净 worktree（支持 `dry_run` 预览）
+- **工作区清理** — `/workspace-cleanup` 回收没有任何运行中会话使用的克隆目录（`dry_run` 可预览）；有未提交更改的目录永远不会被删除
 
 ### 安全性
 - **无 Shell 注入** — 仅使用 `asyncio.create_subprocess_exec`，从不使用 `shell=True`
@@ -266,9 +260,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_MAX_RESIDENT_WORKSPACES` | 同时持有 `claude` 的工作区数上限。超过后从最久未使用的开始休眠；新建工作区永不被阻塞。默认由 `MemTotal` 自动计算（`docs/specs/resident-cap.md`） | 自动计算 |
 | `SESSION_TIMEOUT_SECONDS` | 会话非活动超时 | `300` |
 | `DISCORD_OWNER_ID` | Claude 需要输入时 @提及的用户 ID | （可选） |
-| `COORDINATION_CHANNEL_ID` | 跨会话事件广播的频道 ID | （可选） |
-| `CLORD_COORDINATION_CHANNEL_NAME` | 按名称自动创建协调频道 | （可选） |
-| `WORKTREE_BASE_DIR` | 扫描会话 worktree 的基础目录（启用自动清理） | （可选） |
+| `COORDINATION_CHANNEL_ID` | 会话的一轮结束时接收一行通知的频道；也是 AI Lounge 的默认频道 | （可选） |
 
 ---
 
@@ -455,8 +447,8 @@ uv add "c-lord[api]"
 | PATCH | `/api/tasks/{id}` | 更新任务（启用/禁用，修改计划） |
 | POST | `/api/spawn` | 创建新 Discord 线程并启动 Claude Code 会话（非阻塞） |
 | POST | `/api/mark-resume` | 标记线程在下次 bot 启动时自动恢复 |
-| GET | `/api/lounge` | 获取 AI Lounge 的最近消息 |
-| POST | `/api/lounge` | 向 AI Lounge 发布消息（`label` 可选） |
+| GET | `/api/lounge` | 获取 AI Lounge 的最近消息（会话不会被告知 Lounge 的存在，因此除非你自行设置，否则不会有消息发布到这里——#758） |
+| POST | `/api/lounge` | 向 AI Lounge 发布消息（`label` 可选）——c-lord 的会话不会主动调用（#758） |
 
 ```bash
 # 发送通知
@@ -481,7 +473,7 @@ c_lord/
   main.py                  # 独立入口点
   setup.py                 # setup_bridge() — 一键 Cog 连接
   bot.py                   # Discord Bot 类
-  concurrency.py           # Worktree 指令 + 活跃会话注册表
+  concurrency.py           # 活跃会话注册表（其并发通知不会送达——#758）
   cogs/
     claude_chat.py         # 交互式聊天（线程创建，消息处理）
     skill_command.py       # /skill 斜杠命令，含自动补全
@@ -497,7 +489,7 @@ c_lord/
     parser.py              # stream-json 事件解析器
     types.py               # SDK 消息类型定义
   coordination/
-    service.py             # 向共享频道发布会话生命周期事件
+    service.py             # 向共享频道发布可选的会话结束通知
   database/
     models.py              # SQLite 模式
     repository.py          # 会话 CRUD
@@ -519,7 +511,7 @@ c_lord/
     permission_view.py     # 工具权限请求允许/拒绝按钮
     elicitation_view.py    # MCP Elicitation 的 Discord UI（Modal 表单或 URL 按钮）
   session_sync.py          # CLI 会话发现和导入
-  worktree.py              # WorktreeManager — 安全 git worktree 生命周期（会话结束和启动时清理）
+  session_dir.py           # 每个线程一个 git 克隆（从不删除有未提交更改的目录）
   ext/
     api_server.py          # REST API（可选，需要 aiohttp）
   utils/
@@ -529,7 +521,7 @@ c_lord/
 ### 设计理念
 
 - **CLI 调用而非 API** — 调用 `claude -p --output-format stream-json`，免费获得完整 Claude Code 功能（CLAUDE.md、技能、工具、内存），无需重新实现
-- **并发优先** — 多个同时会话是预期场景而非边缘情况；每个会话都有 worktree 指令，注册表和协调频道处理其余部分
+- **并发优先** — 多个同时会话是预期场景而非边缘情况；每个线程都有自己的 git 克隆，因此隔离来自文件系统，而不是来自给 Claude 的指令
 - **Discord 作为粘合剂** — Discord 提供 UI、线程、反应、webhook 和持久通知；无需自定义前端
 - **框架而非应用** — 作为包安装，向现有 bot 添加 Cog，通过代码配置
 - **零代码扩展性** — 无需修改源代码即可添加计划任务和 webhook 触发器

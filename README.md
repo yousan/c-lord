@@ -4,16 +4,16 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Run multiple Claude Code sessions in parallel from Discord — each in its own git worktree, coordinating through a shared lounge so they never clobber each other.**
+**Run multiple Claude Code sessions in parallel from Discord — each thread in its own git clone, so sessions never share a working tree.**
 
-<!-- TODO(#100): replace this placeholder with a ~30s demo GIF showing parent → parallel child sessions → shared lounge → consolidated reply. -->
+<!-- TODO(#100): replace this placeholder with a ~30s demo GIF showing parent → parallel child sessions → consolidated reply. -->
 <p align="center">
   <a href="https://github.com/yousan/c-lord/issues/100">
     <img src="docs/assets/demo-placeholder.svg" alt="c-lord demo (coming soon)" width="720">
   </a>
 </p>
 
-Each Discord thread becomes a fully isolated Claude Code session. Work on a feature in one thread, review a PR in another, and run a background task in a third — simultaneously, from your phone, tablet, or desktop. The bridge handles all the coordination so sessions never clobber each other.
+Each Discord thread becomes a fully isolated Claude Code session. Work on a feature in one thread, review a PR in another, and run a background task in a third — simultaneously, from your phone, tablet, or desktop. Each thread works in its own clone of the repository, so sessions never edit the same working tree.
 
 **[日本語](docs/ja/README.md)** | **[简体中文](docs/zh-CN/README.md)** | **[한국어](docs/ko/README.md)** | **[Español](docs/es/README.md)** | **[Português](docs/pt-BR/README.md)** | **[Français](docs/fr/README.md)**
 
@@ -25,30 +25,28 @@ Each Discord thread becomes a fully isolated Claude Code session. Work on a feat
 
 ---
 
-## The Big Idea: Parallel Sessions Without Fear
+## The Big Idea: Parallel Sessions, Each in Its Own Clone
 
-When you send tasks to Claude Code in separate Discord threads, the bridge does four things automatically:
+Each Discord thread is its own Claude Code session, running in its own tmux window on your server. Send tasks to several threads and they run side by side; close your laptop and they keep going; reply in a thread to pick up where it left off.
 
-1. **Concurrency notice injection** — Every session's system prompt includes mandatory instructions: create a git worktree, work only inside it, never touch the main working directory directly.
-
-2. **Active session registry** — Each running session knows about the others. If two sessions are about to touch the same repo, they can coordinate rather than conflict.
-
-3. **Coordination channel** — A shared Discord channel where sessions broadcast start/end events. Both Claude and humans can see at a glance what's happening across all active threads.
-
-4. **AI Lounge** — A session-to-session "breakroom" injected into every prompt. Before starting, each session reads recent lounge messages to see what other sessions are doing. Before disruptive operations (force push, bot restart, DB drop), sessions check the lounge first so they don't stomp on each other's work.
+What keeps parallel sessions from clobbering each other is **isolation**: when a channel is bound to a repository (`/clord-init`), every thread works in its own independent `git clone`. Sessions never share a working tree, so one thread's uncommitted edits can never show up in another's. They meet only through the git remote — branches, pushes and PRs — like human contributors do.
 
 ```
-Thread A (feature)   ──→  Claude Code (worktree-A)  ─┐
-Thread B (PR review) ──→  Claude Code (worktree-B)   ├─→  #ai-lounge
-Thread C (docs)      ──→  Claude Code (worktree-C)  ─┘    "A: auth refactor in progress"
-           ↓ lifecycle events                              "B: PR #42 review done"
-   #coordination channel                                   "C: updating README"
-   "A: started on auth refactor"
-   "B: reviewing PR #42"
-   "C: updating README"
+Thread A (feature)   ──→  Claude Code  (own clone)  ─┐
+Thread B (PR review) ──→  Claude Code  (own clone)   ├─→  git remote (branches · PRs)
+Thread C (docs)      ──→  Claude Code  (own clone)  ─┘
 ```
 
-No race conditions. No lost work. No merge surprises.
+**Sessions do not coordinate with each other today.** Earlier versions of this README described four coordination mechanisms; this is their actual state ([#758](https://github.com/yousan/c-lord/issues/758)):
+
+| Mechanism | Actual state |
+|---|---|
+| **Concurrency notice** (instructions to Claude about working in parallel) | Built every turn but **not delivered** — sessions run in the tmux TUI (#53), which has no per-turn system-prompt channel, so the text is dropped |
+| **Active session registry** | Exists in memory and is used by `/workspace-cleanup`, but **sessions don't see it** (it travels in the same dropped text) |
+| **Coordination channel** | **Off by default.** With `COORDINATION_CHANNEL_ID` set, it posts a one-line notice when a session's turn ends; there is no start event |
+| **AI Lounge** | The REST endpoints work, but **nothing tells Claude the lounge exists**, so in practice nothing is posted — see [AI Lounge](#ai-lounge-not-delivered-to-sessions) |
+
+So: separate working trees, not live coordination. Anything outside the clones — the same remote branch, a shared port or database, a staging bot — can still collide. Give each thread its own branch.
 
 ---
 
@@ -60,10 +58,10 @@ Use Claude Code from anywhere Discord runs — phone, tablet, or desktop. Each m
 
 ### Parallel Development
 
-Open multiple threads simultaneously. Each is an independent Claude Code session with its own context, working directory, and git worktree. Useful patterns:
+Open multiple threads simultaneously. Each is an independent Claude Code session with its own context and its own git clone of the repository. Useful patterns:
 
 - **Feature + review in parallel**: Start a feature in one thread while Claude reviews a PR in another.
-- **Multiple contributors**: Different team members each get their own thread; sessions stay aware of each other via the coordination channel.
+- **Multiple contributors**: Different team members each get their own thread — and their own clone — so their sessions never edit the same files on disk.
 - **Experiment safely**: Try an approach in thread A while keeping thread B on stable code.
 
 ### Scheduled Tasks (SchedulerCog)
@@ -88,23 +86,21 @@ GitHub PR ←── git push ←── Claude Code ─────────�
 
 **Real example:** On every push to `main`, Claude analyzes the diff, updates English + Japanese documentation, creates a bilingual PR, and enables auto-merge. Zero human interaction.
 
-### AI Lounge
+### AI Lounge (not delivered to sessions)
 
-A shared "breakroom" channel where all concurrent sessions announce themselves, read each other's updates, and coordinate before disruptive operations.
+> **Status: not wired up** ([#758](https://github.com/yousan/c-lord/issues/758)). The lounge was designed to be injected into every session as ephemeral system context. Since sessions run in the tmux TUI (#53) there is no per-turn channel for that, so c-lord builds the text and drops it: Claude is never told the lounge exists, and in practice nothing gets posted.
 
-Each Claude session receives the lounge context automatically via `--append-system-prompt` — injected as ephemeral system context rather than as part of the conversation history. This prevents the context from accumulating across turns, which would otherwise cause "Prompt is too long" errors in long-running sessions. The injected context includes: recent messages from other sessions, plus the rule to check before doing anything destructive.
+The REST endpoints still work, so you can use the lounge yourself — for example by describing it in your repository's `CLAUDE.md`:
 
 ```bash
-# Sessions post their intentions before starting:
-curl -X POST "$CLORD_API_URL/api/lounge" \
+# Post a note (stored in SQLite; also forwarded to the lounge channel, which defaults to COORDINATION_CHANNEL_ID)
+curl -X POST "http://localhost:8080/api/lounge" \
   -H "Content-Type: application/json" \
-  -d '{"message": "Starting auth refactor on feature/oauth — worktree-A", "label": "feature dev"}'
+  -d '{"message": "Starting auth refactor on feature/oauth", "label": "feature dev"}'
 
-# Read recent lounge messages (also injected into each session automatically):
-curl "$CLORD_API_URL/api/lounge"
+# Read recent notes
+curl "http://localhost:8080/api/lounge"
 ```
-
-The lounge channel doubles as a human-visible activity feed — open it in Discord to see at a glance what every active Claude session is currently doing.
 
 ### Programmatic Session Creation
 
@@ -170,12 +166,10 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Hot reload** — New skills added to `~/.claude/skills/` are picked up automatically (60s refresh, no restart)
 
 ### Concurrency & Coordination
-- **Worktree instructions auto-injected** — Every session prompted to use `git worktree` before touching any file
-- **Automatic worktree cleanup** — Session worktrees (`wt-{thread_id}`) are removed automatically at session end and on bot startup; dirty worktrees are never auto-removed (safety invariant)
-- **Active session registry** — In-memory registry; each session sees what the others are doing
-- **AI Lounge** — Shared "breakroom" channel; context injected via `--append-system-prompt` (ephemeral, never accumulates in history) so long sessions never hit "Prompt is too long"; sessions post intentions, read each other's status, and check before disruptive operations; humans see it as a live activity feed
-- **Coordination channel** — Optional shared channel for cross-session lifecycle broadcasts
-- **Coordination scripts** — Claude can call `coord_post.py` / `coord_read.py` from within a session to post and read events
+- **One git clone per thread** — With a channel bound to a repo (`/clord-init`), each thread works in its own independent `git clone`; sessions share nothing but the git remote
+- **Active session registry** — In-memory list of running sessions, used by `/workspace-cleanup`. Sessions themselves are not told about each other (#758)
+- **AI Lounge endpoints** — `GET/POST /api/lounge` store short notes and relay them to a Discord channel. **Not injected into sessions** (#758): Claude uses them only if you tell it to
+- **Coordination channel** — Optional (`COORDINATION_CHANNEL_ID`, off by default): posts a one-line notice when a session's turn ends
 
 ### Scheduled Tasks
 - **SchedulerCog** — SQLite-backed periodic task executor with a 30-second master loop
@@ -196,7 +190,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Startup resume** — Interrupted sessions restart automatically after any bot reboot; `AutoUpgradeCog` (upgrade restarts) and `ClaudeChatCog.cog_unload()` (all other shutdowns) mark them automatically, or use `POST /api/mark-resume` manually
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
-- **Worktree management** — `/worktree-list` shows all active session worktrees with clean/dirty status; `/worktree-cleanup` removes orphaned clean worktrees (supports `dry_run` preview)
+- **Workspace cleanup** — `/workspace-cleanup` reclaims clone directories that no running session is using (`dry_run` to preview); a directory with uncommitted changes is never removed
 - **Runtime model switching** — `/model-show` displays the current global model and per-thread session model; `/model-set` changes the model for all new sessions without restart
 - **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; the thread each one belonged to gets a 🧹 notice saying so and what survived on disk (#554). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
 
@@ -389,9 +383,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_ALLOWED_ROLE` | Discord role name whose members may drive the bot (OR with `DISCORD_OWNER_ID`) | (optional) |
 | `CLORD_ALLOW_ANYONE` | `1` lets **every** member of the server drive the bot — which means running shell commands on the host. Warned about at startup | `false` |
 | `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end 🟡 + pauses + failures), `blocked` (pauses + failures — quiet when it works, loud when it breaks), `off` (never, failures included) | `blocked` |
-| `COORDINATION_CHANNEL_ID` | Channel ID for cross-session event broadcasts | (optional) |
-| `CLORD_COORDINATION_CHANNEL_NAME` | Auto-create coordination channel by name | (optional) |
-| `WORKTREE_BASE_DIR` | Base directory to scan for session worktrees (enables automatic cleanup) | (optional) |
+| `COORDINATION_CHANNEL_ID` | Channel that gets a one-line notice when a session's turn ends; also the default AI Lounge channel | (optional) |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
 | `CLORD_AUTO_TOPIC` | Set to `1`/`true`/`yes`/`on` to let c-lord summarise a **new** thread's name with an LLM (haiku) on its first message — the pre-#705 behaviour. Off by default: the thread keeps the name it was opened with, and `/thread-rename` (sonnet) re-summarises on demand. | `false` |
@@ -696,8 +688,8 @@ have them send `Authorization: Bearer …`. See [docs/SECURITY.md](docs/SECURITY
 | PATCH | `/api/tasks/{id}` | Update a task (enable/disable, change schedule) |
 | POST | `/api/spawn` | Create a new Discord thread and start a Claude Code session (non-blocking) |
 | POST | `/api/mark-resume` | Mark a thread for automatic resume on next bot startup |
-| GET | `/api/lounge` | Read recent AI Lounge messages |
-| POST | `/api/lounge` | Post a message to the AI Lounge (with optional `label`) |
+| GET | `/api/lounge` | Read recent AI Lounge messages (sessions aren't told about the lounge, so nothing posts here unless you set that up — #758) |
+| POST | `/api/lounge` | Post a message to the AI Lounge (with optional `label`) — not called by c-lord's sessions on their own (#758) |
 
 ```bash
 # Send notification
@@ -737,7 +729,7 @@ c_lord/
   main.py                  # Standalone entry point
   setup.py                 # setup_bridge() — one-call Cog wiring
   bot.py                   # Discord Bot class
-  concurrency.py           # Worktree instructions + active session registry
+  concurrency.py           # Active session registry (its concurrency notice is not delivered — #758)
   cogs/
     claude_chat.py         # Interactive chat (thread creation, message handling)
     skill_command.py       # /skill slash command with autocomplete
@@ -756,7 +748,7 @@ c_lord/
     context_usage.py       # Context-window usage parsing
     types.py               # Type definitions for SDK messages
   coordination/
-    service.py             # Posts session lifecycle events to shared channel
+    service.py             # Optional session-end notice to a shared channel
   database/
     models.py              # SQLite schema
     repository.py          # Session CRUD
@@ -776,7 +768,7 @@ c_lord/
     plan_view.py           # Approve/Cancel buttons for Plan Mode (ExitPlanMode)
     permission_view.py     # Allow/Deny buttons for tool permission requests
     elicitation_view.py    # Discord UI for MCP elicitation (Modal form or URL button)
-  worktree.py              # WorktreeManager — safe git worktree lifecycle (cleanup at session end + startup)
+  session_dir.py           # One git clone per thread (never removes a dir with uncommitted changes)
   ext/
     api_server.py          # REST API (optional, requires aiohttp)
   utils/
@@ -786,7 +778,7 @@ c_lord/
 ### Design Philosophy
 
 - **CLI spawn, not API** — Invokes `claude -p --output-format stream-json`, giving full Claude Code features (CLAUDE.md, skills, tools, memory) without reimplementing them
-- **Concurrency first** — Multiple simultaneous sessions are the expected case, not an edge case; every session gets worktree instructions, the registry and coordination channel handle the rest
+- **Concurrency first** — Multiple simultaneous sessions are the expected case, not an edge case; each thread gets its own git clone, so isolation comes from the filesystem rather than from instructions to Claude
 - **Discord as glue** — Discord provides UI, threading, reactions, webhooks, and persistent notifications; no custom frontend needed
 - **Framework, not application** — Install as a package, add Cogs to your existing bot, configure via code
 - **Zero-code extensibility** — Add scheduled tasks and webhook triggers without touching source
