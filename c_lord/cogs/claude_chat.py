@@ -96,6 +96,12 @@ logger = logging.getLogger(__name__)
 # a pick from a short menu.
 _MENU_TEXT_ANSWER_MAX = 500
 
+# How long a pre-empted turn gets to unwind after it was cancelled (#293). Its
+# teardown is a handful of Discord calls that normally take well under a second;
+# the bound only matters when one of them never returns, and then it is what
+# keeps the next message in the thread from waiting behind it forever.
+_PREEMPT_CANCEL_GRACE = 10.0
+
 # Posts a reply the way the caller needs (interaction response vs ctx.send),
 # letting /stop, /clear and their !text twins share one implementation (#209).
 _Responder = Callable[..., Awaitable[None]]
@@ -2614,9 +2620,16 @@ class ClaudeChatCog(commands.Cog):
         # No-op unless the turn is parked on a bridged menu; then it unblocks
         # bridge_pane_ask so the run can wind down instead of waiting on a click.
         ask_bus.post_answer(thread.id, [])
-        await self._drain_thread_task(prev_task)
+        await self._drain_thread_task(prev_task, thread_id=thread.id)
 
-    async def _drain_thread_task(self, task: asyncio.Task, *, grace: float = 5.0) -> None:
+    async def _drain_thread_task(
+        self,
+        task: asyncio.Task,
+        *,
+        grace: float = 5.0,
+        cancel_grace: float = _PREEMPT_CANCEL_GRACE,
+        thread_id: int | None = None,
+    ) -> None:
         """Tear down a prior turn so a new one can start cleanly (#315).
 
         Waits up to ``grace`` seconds for ``task`` to finish on its own (the
@@ -2642,10 +2655,29 @@ class ClaudeChatCog(commands.Cog):
         including its ``CancelledError`` — as a value.  A genuine cancellation of
         *this* coroutine still propagates from both, which is what keeps the
         #315 teardown honest.
+
+        #293: the wait after the cancel is bounded by ``cancel_grace``. This runs
+        under the per-thread lock, so a prior turn whose teardown never finishes
+        (its ``finally`` stuck on a Discord call, say) used to hold every later
+        message in the thread behind it — silently, with the new message's
+        ``dispatching run_claude`` never logged. Past the bound the prior turn is
+        left to finish on its own (it has been cancelled, and its outcome is
+        still reported by ``_report_turn_task_outcome``), an ERROR names it as an
+        orphan, and the new message goes ahead.
         """
         _done, pending = await asyncio.wait({task}, timeout=grace)
         if pending:
             task.cancel()
+            _done, pending = await asyncio.wait({task}, timeout=cancel_grace)
+        if pending:
+            logger.error(
+                "%s prior turn is still running %.0fs after it was cancelled — not "
+                "waiting for it any longer, so this message is not blocked behind it "
+                "(orphan run, #293)",
+                log_ctx(thread_id=thread_id),
+                cancel_grace,
+            )
+            return
         await asyncio.gather(task, return_exceptions=True)
 
     async def _build_prompt(self, message: discord.Message) -> str:

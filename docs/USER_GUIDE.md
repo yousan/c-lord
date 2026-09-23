@@ -313,6 +313,8 @@ expected steady state, not a hang (#541).
 
 Send a new message while Claude is working. The current operation is interrupted (SIGINT) and Claude starts with your new instruction. No need to `/stop` first.
 
+A turn that does not wind down on its own within a few seconds is cancelled. If even that does not finish it within 10 seconds, c-lord stops waiting for it and starts your new instruction anyway — a stuck turn can no longer hold the thread's later messages behind it (#293). The bot log records it as an `orphan run`.
+
 ### Bot Restart
 
 If the bot restarts (upgrade, maintenance, etc.), active sessions are automatically marked for resume. When the bot comes back online, sessions pick up where they left off.
