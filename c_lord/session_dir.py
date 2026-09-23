@@ -14,6 +14,8 @@ Cleanup is triggered at three points:
   3. Manual — via /session-dirs and /session-cleanup Discord commands
 
 Safety invariant: a directory with uncommitted changes is NEVER auto-removed.
+Files c-lord writes into the dir itself (the injected ``discord-read`` skill)
+are not the user's changes and do not count (#749).
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from typing import Any
 
 from .coauthor import install_coauthor_hook
 from .git_mirrors import ensure_mirror, mirrors_root_for
+from .skills.injector import LEGACY_SKILL_NAMES, READ_SKILL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +47,114 @@ def _run(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess
     )
 
 
-def _is_clean(path: str) -> bool:
-    """Return True if the directory has no uncommitted changes."""
-    result = _run(["git", "status", "--porcelain"], cwd=path)
-    if result.returncode != 0:
+#: Files c-lord itself writes into every session dir (#749). They show up in
+#: ``git status`` — the clone's ``.gitignore`` has never heard of them — and
+#: until #749 that alone made the dir "dirty": the sweeps refused to delete 60
+#: orphans (9.6 GB) whose only change was the injected SKILL.md, and told their
+#: threads 「書きかけの成果物が残っています」.
+#:
+#: Exact files, not ``.claude/``: that directory is the user's too (settings,
+#: their own skills), and anything else in it stays work.
+_CLORD_FILES: frozenset[str] = frozenset({f".claude/skills/{READ_SKILL_NAME}/SKILL.md"})
+
+#: Whole directories: c-lord ``rmtree``s these on every turn
+#: (``remove_legacy_skills``, #712), so nothing placed there can outlive the
+#: next turn anyway.
+_CLORD_DIRS: tuple[str, ...] = tuple(f".claude/skills/{name}/" for name in LEGACY_SKILL_NAMES)
+
+#: Claude Code's own sub-agent worktrees. Not c-lord's — so never ignored
+#: outright: each one is opened and must itself be clean (see
+#: :func:`worktree_status`).
+_WORKTREE_ENTRY_RE = re.compile(r"^\.claude/worktrees/(?!\.\.?/)[^/]+/$")
+
+#: A worktree inside a worktree inside ... is followed this far and no further;
+#: past it the entry counts as work (i.e. the dir is kept).
+_MAX_WORKTREE_DEPTH = 2
+
+
+@dataclass(frozen=True)
+class WorktreeStatus:
+    """What ``git status`` found, split into the user's changes and c-lord's.
+
+    Entries are porcelain lines (``"?? path"``, ``" M path"``) so a log line can
+    show exactly why a directory was kept.
+    """
+
+    #: ``False`` when git could not answer — not a repo, or git failed.
+    #: Cleanliness then cannot be established, so the dir is never clean.
+    is_repo: bool
+    #: Changes that count as work. One is enough to keep the directory.
+    user_changes: tuple[str, ...] = ()
+    #: Changes c-lord made itself (or clean Claude Code worktrees) — not work.
+    clord_files: tuple[str, ...] = ()
+
+    @property
+    def clean(self) -> bool:
+        return self.is_repo and not self.user_changes
+
+
+def _is_clord_change(xy: str, rel: str) -> bool:
+    """Is this porcelain entry c-lord's own write rather than the user's?
+
+    Untracked, or a tracked copy c-lord overwrote/removed in the working tree
+    only (index still equals HEAD — c-lord's own repo tracks the injected
+    SKILL.md since it slipped into a commit). A *staged* change is someone's
+    decision and always counts.
+    """
+    owned = rel in _CLORD_FILES or rel.startswith(_CLORD_DIRS)
+    if not owned:
         return False
-    return result.stdout.strip() == ""
+    return xy == "??" or (xy[0] == " " and xy[1] in "MDT")
+
+
+def _is_clean_worktree(path: str, xy: str, rel: str, depth: int) -> bool:
+    """Is this entry a Claude Code worktree with nothing uncommitted inside?
+
+    The parent's ``git status`` shows a nested checkout as one line and never
+    looks in, so the worktree is opened and judged by the same rules.
+    """
+    if xy != "??" or not _WORKTREE_ENTRY_RE.match(rel) or depth >= _MAX_WORKTREE_DEPTH:
+        return False
+    return worktree_status(str(Path(path) / rel), _depth=depth + 1).clean
+
+
+def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
+    """Classify ``git status`` of *path* into the user's changes and c-lord's (#749).
+
+    Safety invariant (module docstring): anything that *might* be the user's
+    uncommitted work lands in ``user_changes``. Only files c-lord writes itself
+    are set aside, and a Claude Code worktree only when it is itself clean.
+    """
+    # -uall: a wholly untracked ``.claude/`` must be listed file by file, or the
+    # injected SKILL.md and a user's own file would hide behind one line.
+    # -z: paths come back unquoted, so spaces and non-ASCII names parse as-is.
+    result = _run(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=path)
+    if result.returncode != 0:
+        return WorktreeStatus(is_repo=False)
+
+    user: list[str] = []
+    clord: list[str] = []
+    fields = iter(result.stdout.split("\0"))
+    for entry in fields:
+        if not entry.strip():
+            continue
+        xy, rel = entry[:2], entry[3:]
+        if "R" in xy or "C" in xy:
+            next(fields, None)  # the source path of a rename/copy
+        line = f"{xy} {rel}"
+        if _is_clord_change(xy, rel) or _is_clean_worktree(path, xy, rel, _depth):
+            clord.append(line)
+        else:
+            user.append(line)
+    return WorktreeStatus(is_repo=True, user_changes=tuple(user), clord_files=tuple(clord))
+
+
+def _is_clean(path: str) -> bool:
+    """Return True if the directory has no uncommitted changes of the user's.
+
+    Files c-lord wrote itself do not count (#749) — see :func:`worktree_status`.
+    """
+    return worktree_status(path).clean
 
 
 def _get_commit(path: str) -> str:

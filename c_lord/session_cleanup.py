@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .retention import claude_transcript_retention_days
-from .session_dir import _is_clean
+from .session_dir import WorktreeStatus, worktree_status
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
 if TYPE_CHECKING:
@@ -171,6 +171,25 @@ class DirOutcome(Enum):
     ABSENT = "absent"
 
 
+#: How many changed paths a "keeping" log line names before it abbreviates.
+_MAX_LOGGED_CHANGES = 5
+
+
+def describe_changes(status: WorktreeStatus) -> str:
+    """Why a directory is being kept, for the INFO line (#749).
+
+    Names the entries, because "uncommitted work" alone read as 80 dirs of user
+    work when 60 of them held nothing but c-lord's own SKILL.md.
+    """
+    if not status.is_repo:
+        return "not a git repo (cannot tell work from leftovers)"
+    shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
+    more = len(status.user_changes) - _MAX_LOGGED_CHANGES
+    if more > 0:
+        shown += f" (+{more} more)"
+    return f"uncommitted user work: {shown}"
+
+
 #: A session dir is always ``<base>/<channel_id>/<thread_id>`` — at least three
 #: path components deep. A ``working_dir`` shallower than this is a corrupt row,
 #: not a workspace, and deleting it could take out a home directory.
@@ -194,7 +213,9 @@ def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
     """Delete *record*'s working directory when it is safe to. Never raises.
 
     Safe means: the path looks like a session directory, it exists, and ``git``
-    reports no uncommitted or untracked changes. Anything else is kept.
+    reports no uncommitted or untracked changes other than the files c-lord
+    wrote there itself (#749 — see :func:`c_lord.session_dir.worktree_status`).
+    Anything else is kept.
 
     Losing a half-finished change to a background sweep nobody asked for is
     unrecoverable, so every uncertainty resolves to *keep* — including "this is
@@ -218,10 +239,12 @@ def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
     except (OSError, ValueError):
         return DirOutcome.ABSENT
 
-    if not _is_clean(str(path)):
+    status = worktree_status(str(path))
+    if not status.clean:
         logger.info(
-            "session cleanup: keeping %s — uncommitted work or not a git repo (thread=%s)",
+            "session cleanup: keeping %s — %s (thread=%s)",
             path,
+            describe_changes(status),
             record.thread_id,
         )
         return DirOutcome.KEPT_DIRTY
