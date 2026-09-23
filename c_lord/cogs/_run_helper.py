@@ -2,7 +2,9 @@
 
 Both ClaudeChatCog and SkillCommandCog need to run Claude and post results.
 This module is the thin orchestration layer that:
-1. Builds ephemeral system context (lounge + concurrency notice) via --append-system-prompt
+1. Registers the session in the concurrency registry. It also builds the lounge +
+   concurrency notice text, but that text is not delivered: the tmux TUI has no
+   per-turn --append-system-prompt, so the string is dropped (#758)
 2. Delegates event processing to EventProcessor
 3. Handles AskUserQuestion flow (recursive resume)
 
@@ -134,10 +136,10 @@ def _truncate_result(content: str) -> str:
 async def _build_system_context(config: RunConfig) -> str | None:
     """Build ephemeral system context from AI Lounge and concurrency notice.
 
-    Returns a string to inject via --append-system-prompt, or None if no context
-    is available. Injecting as a system prompt (rather than prepending to the user
-    message) prevents this ephemeral metadata from accumulating in session history,
-    which would otherwise cause "Prompt is too long" errors over long conversations.
+    Returns the context string, or None if no context is available. It was meant to
+    be injected via --append-system-prompt (so it would not accumulate in session
+    history), but the tmux TUI has no per-turn channel for that: the only caller
+    keeps this for the registry side effect and drops the string (#758).
     """
     parts: list[str] = []
 
