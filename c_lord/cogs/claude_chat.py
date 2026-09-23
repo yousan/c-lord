@@ -2803,7 +2803,7 @@ class ClaudeChatCog(commands.Cog):
         if session_dir_manager is None and tmux_manager is None:
             await thread.send(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
-                "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。"
+                "先に `/clord-init repo:<URL>` で設定してください。"
             )
             return
 
