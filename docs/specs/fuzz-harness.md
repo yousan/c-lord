@@ -26,7 +26,7 @@ bot health 確認（--restart-if-down なら down 時に staging を再起動）
 claude CLI で N 件の自然言語シナリオを生成（生成 raw を artifact 保存）
    ▼
 各シナリオを注入（既定 /api/spawn = シナリオごとに fresh thread）
-   ├─ 返信本文（c-lord が /api/reply で出す最終回答）を polling
+   ├─ 返信本文（c-lord が jsonl ミラーで出す最終回答）を polling
    └─ seed メッセージの状態リアクション（🟢🟡❌⏳⚠️）を wait 中ずっと union 収集
    ▼
 oracle が各観測からアノマリ候補を検出
@@ -57,7 +57,7 @@ release lease（finally で必ず）
   多ターン投入する代替（session 継続のテスト用）。
 - **オラクルの信号源は seed メッセージのリアクション。** `spawn_session` は seed に `StatusManager` の
   状態リアクションを付ける。❌/⏳/⚠️ は override で 🟡 に置換されうるので、wait 中に**union 収集**して
-  transient を取りこぼさない。最終回答は `/api/reply` の plain 本文なので、tool-use embed や `-#` 始まりの
+  transient を取りこぼさない。最終回答は jsonl ミラーが投稿する plain 本文なので、tool-use embed や `-#` 始まりの
   CLI 入力行を除外して拾う。
 
 ## アノマリ・カタログ（`scripts/fuzz/oracle.py`）
