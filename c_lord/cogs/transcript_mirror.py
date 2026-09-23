@@ -259,6 +259,7 @@ class TranscriptMirrorCog(commands.Cog):
         reply_sink = self._make_reply_sink(thread_id)
         file_sink = self._make_file_sink(thread_id)
         reply_cursor_sink = self._make_cursor_sink(thread_id)
+        fold_post, fold_edit = self._make_fold(thread_id)
         mirror = TranscriptMirror(
             thread_id=thread_id,
             project_dir=project_dir,
@@ -270,6 +271,8 @@ class TranscriptMirrorCog(commands.Cog):
             verbosity=verbosity_mode(),
             ask_bridge_cb=self._make_ask_bridge(thread_id),
             progress=self._make_progress(thread_id),
+            fold_post=fold_post,
+            fold_edit=fold_edit,
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -371,6 +374,29 @@ class TranscriptMirrorCog(commands.Cog):
             delete=delete,
             quiet_seconds=turn_progress_quiet_seconds(),
         )
+
+    def _make_fold(self, thread_id: int):
+        """Post/edit for the #747 repeat counter: one message that keeps the count.
+
+        Wired here so an upgrade alone turns it on (Zero-Config Principle). Sent
+        like any intermediate message — silent, no link cards — because it
+        stands in for exactly those messages.
+        """
+        bot = self.bot
+
+        async def post(text: str):
+            channel = await self._resolve_channel(bot, thread_id)
+            send = getattr(channel, "send", None) if channel is not None else None
+            if send is None:
+                return None
+            return await self._send_chunks(send, text, silent=silent_posts_enabled())
+
+        async def edit(handle, text: str) -> None:
+            # discord.py's edit() defaults to suppress=False, which clears the
+            # flag the send set — a quoted URL would then unfurl (#372).
+            await handle.edit(content=text, suppress=not show_url_embeds_enabled())
+
+        return post, edit
 
     def _make_cursor_sink(self, thread_id: int):
         """Return an awaitable that records the delivered final-answer uuid.
