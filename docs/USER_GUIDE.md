@@ -310,6 +310,16 @@ Send a new message while Claude is working. The current operation is interrupted
 
 If the bot restarts (upgrade, maintenance, etc.), active sessions are automatically marked for resume. When the bot comes back online, sessions pick up where they left off.
 
+### Messages sent while the bot was disconnected from Discord
+
+If the bot loses its connection to Discord (host network or DNS trouble), messages you
+post in a c-lord thread meanwhile are not lost. When the connection comes back, c-lord
+reads them back from the thread and runs them, with one line explaining the delay
+(`-# 🔌 05:16〜11:52 の間 Discord と接続できておらず、この依頼を受け取れていませんでした。いまから処理します。`).
+Several messages in one thread run together as one turn; nothing runs twice. Text
+commands (`!stop` …) are not replayed. This covers a lost connection, not a bot restart
+(#745). See [specs/gateway-backfill.md](specs/gateway-backfill.md).
+
 ---
 
 ## Observability
