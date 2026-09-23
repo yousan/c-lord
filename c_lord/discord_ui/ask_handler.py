@@ -35,6 +35,7 @@ from ..transcript.ask_result import (
     latest_ask_tool_use,
     read_ask_result,
 )
+from ..utils.logger import log_ctx
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
@@ -127,6 +128,62 @@ async def _close(
     if ask_repo is not None:
         with contextlib.suppress(Exception):
             await ask_repo.delete(thread_id)
+
+
+# #752: written over the buttons of a menu a newer question has replaced. Only
+# the buttons go — the embed keeps what was asked (and any answer it recorded).
+_SUPERSEDED_NOTE = (
+    "-# ↪️ このあと新しい質問が出たため、この質問はもう受け付けていません（このボタンは無効です）。"
+)
+
+
+async def _retire_superseded_menus(
+    thread: discord.Thread, current: object, superseded_id: int | None
+) -> None:
+    """Strip the buttons of every earlier menu in *thread* (#752).
+
+    A thread shows one answerable menu at a time — the CLI draws one, and a new
+    one means the previous closed. Its message did not know that: the ledger
+    row that would have let restart recovery re-arm or retire it had just been
+    overwritten by this menu's row (``pending_asks`` is keyed by thread), so it
+    kept looking pressable, and after the next restart pressing it answered
+    "This interaction failed". Production: 43 such menus, the oldest 99 days.
+
+    Two places can hold such a message: the row's ``superseded_id`` (a menu an
+    earlier process drew) and this process's own registry of live copies.
+    Never raises, and never quietly: what could not be retired is said at INFO
+    (#678) — the startup sweep gets another go at it after the next restart.
+    """
+    current_id = getattr(current, "id", None)
+    ctx = log_ctx(thread_id=thread.id)
+    stale: list[object] = list(_ask_menus.pop_others(thread.id, current_id))
+    stale_ids = {getattr(m, "id", None) for m in stale}
+    if superseded_id is not None and superseded_id != current_id and superseded_id not in stale_ids:
+        try:
+            stale.append(await thread.fetch_message(superseded_id))
+        except Exception as exc:  # deleted, or no access — nothing left to press
+            logger.info(
+                "%s could not fetch the superseded menu %s to retire it: %s (#752)",
+                ctx,
+                superseded_id,
+                exc,
+            )
+    for message in stale:
+        try:
+            await message.edit(content=_SUPERSEDED_NOTE, view=None)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.info(
+                "%s could not retire the superseded menu %s — it still looks pressable: %s (#752)",
+                ctx,
+                getattr(message, "id", "?"),
+                exc,
+            )
+        else:
+            logger.info(
+                "%s retired the superseded menu %s — a newer question replaced it (#752)",
+                ctx,
+                getattr(message, "id", "?"),
+            )
 
 
 def _mention(user_id: int | None) -> str | None:
@@ -499,7 +556,14 @@ async def _bridge_claimed_menu(
     # in the log. Suppressed on failure: a ledger write must never be able to
     # take down a menu that is otherwise working.
     recoverable = False
+    superseded_id: int | None = None
     if ask_repo is not None:
+        # #752: the row about to be overwritten may be the only record of the
+        # previous menu's message. Read it first — once the save lands, nothing
+        # remembers that message, and its buttons stay up forever.
+        with contextlib.suppress(Exception):
+            previous = await ask_repo.get(thread.id)
+            superseded_id = getattr(previous, "message_id", None)
         with contextlib.suppress(Exception):
             await ask_repo.save(
                 thread_id=thread.id,
@@ -511,6 +575,7 @@ async def _bridge_claimed_menu(
                 message_id=getattr(msg, "id", None),
             )
             recoverable = True
+    await _retire_superseded_menus(thread, msg, superseded_id)
     # #717: tell the menu ledger the same thing. That ledger is what the #359
     # watchdog reads to decide whether a menu open in the pane has ever reached
     # Discord — and until now only the watchdog's OWN posts were written to it,

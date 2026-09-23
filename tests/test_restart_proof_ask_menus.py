@@ -394,7 +394,7 @@ class TestOneStartupEntryPoint:
 
         swept = AsyncMock(return_value=0)
         recovered = AsyncMock(return_value=0)
-        monkeypatch.setattr(sr, "sweep_dead_stop_buttons", swept)
+        monkeypatch.setattr(sr, "sweep_dead_buttons", swept)
         monkeypatch.setattr(sr, "recover_ask_menus", recovered)
 
         await sr.run_startup_recovery(MagicMock(), MagicMock(), MagicMock())
