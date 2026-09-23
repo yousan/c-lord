@@ -16,6 +16,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "staging.sh"
 
 
@@ -425,3 +427,128 @@ class TestInstanceCounting:
         finally:
             self._kill(p1)
             self._kill(p2)
+
+
+class TestRestartReturnsToCaller:
+    """restart は呼び出し元へ必ず return し、自分のプロセスを居残らせない (#401).
+
+    旧起動行 ``(cd … && setsid env … nohup python … >log 2>&1 &)`` では、``&`` が
+    作るサブシェル (cmdline は ``bash scripts/staging.sh restart …`` のまま) が
+    bot の親として **bot の寿命いっぱい** ``wait`` し続け、しかもリダイレクトが
+    nohup にしか掛かっていないため**呼び出し元の stdout/stderr を握ったまま**だった。
+    staging.sh 本体は ``OK`` まで出して終わるのに、``$(…)`` やパイプで出力を
+    読み切る呼び出し元には EOF が来ない — これが「restart が return しない」の正体。
+    ``pgrep -af 'staging.sh restart'`` に残り続けたのもこのサブシェル。
+
+    偽 bot (cwd=clone, cmdline に ``c_lord.main``, ログイン行を出して眠るだけ) を
+    ``.venv/bin/python3`` に置き、本物の Discord 接続なしで launch 経路を通す。
+    find_pids は cwd で絞るので、ホスト上の実 bot には触れない。
+    """
+
+    FAKE_BOT = (
+        "#!/usr/bin/env python3\n"
+        "import time\n"
+        'print("[INFO] c_lord.bot: Logged in as Fake#0001 (ID: 42)", flush=True)\n'
+        "time.sleep(300)\n"
+    )
+    FAKE_BOT_DIES = "#!/usr/bin/env python3\nraise SystemExit(1)\n"
+
+    def _clone(self, tmp_path: Path, fake_bot: str) -> Path:
+        # 名前はログ名 (/tmp/clord-bot-<name>-*.log) になるので一意にし、後で消す
+        clone = tmp_path / f"i401-{tmp_path.name}"
+        (clone / ".venv" / "bin").mkdir(parents=True)
+        (clone / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\nEXPECTED_BOT_USER_ID=42\n",
+            encoding="utf-8",
+        )
+        py = clone / ".venv" / "bin" / "python3"
+        py.write_text(fake_bot, encoding="utf-8")
+        py.chmod(0o755)
+        run_script(["borrow", "--owner", "sess-R", "--purpose", "#401 test"], cwd=clone)
+        return clone
+
+    @staticmethod
+    def _procs_in(clone: Path) -> dict[int, str]:
+        """cwd が clone のプロセス → cmdline。staging.sh の残骸も偽 bot も拾う。"""
+        found: dict[int, str] = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            with contextlib.suppress(OSError):
+                if os.readlink(entry / "cwd") != str(clone):
+                    continue
+                raw = (entry / "cmdline").read_bytes()
+                found[int(entry.name)] = raw.replace(b"\0", b" ").decode(errors="replace")
+        return found
+
+    def _cleanup(self, clone: Path) -> None:
+        run_script(["stop", "--owner", "sess-R"], cwd=clone)
+        for pid in self._procs_in(clone):  # stop が取りこぼした分 (この clone の中だけ)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        for log in Path("/tmp").glob(f"clord-bot-{clone.name}*.log"):
+            log.unlink(missing_ok=True)
+
+    def test_restart_returns_to_a_caller_reading_stdout_to_eof(self, tmp_path: Path) -> None:
+        """AC1: ``$(…)`` / パイプで待つ呼び出し元にも有限時間で EOF が届く。
+
+        capture_output は stdout/stderr を EOF まで読む = ``$(bash staging.sh restart)``
+        と同じ待ち方。bot を握ったサブシェルが stdout を持ち続けると timeout する。
+        """
+        clone = self._clone(tmp_path, self.FAKE_BOT)
+        try:
+            try:
+                result = subprocess.run(
+                    ["bash", str(SCRIPT), "restart", "--owner", "sess-R"],
+                    cwd=clone,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            except subprocess.TimeoutExpired as exc:
+                pytest.fail(
+                    "restart did not return to a caller reading its stdout within 20s "
+                    f"(#401); output so far: {exc.stdout!r}"
+                )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert "OK" in result.stdout
+        finally:
+            self._cleanup(clone)
+
+    def test_restart_leaves_no_staging_process_behind(self, tmp_path: Path) -> None:
+        """AC2: restart の後に ``staging.sh`` のプロセスが残らず、bot だけが生きている。"""
+        clone = self._clone(tmp_path, self.FAKE_BOT)
+        try:
+            with (tmp_path / "restart.out").open("w") as out:
+                result = subprocess.run(
+                    ["bash", str(SCRIPT), "restart", "--owner", "sess-R"],
+                    cwd=clone,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    timeout=30,
+                )
+            assert result.returncode == 0, (tmp_path / "restart.out").read_text()
+
+            procs = self._procs_in(clone)
+            leftovers = {p: c for p, c in procs.items() if "staging.sh" in c}
+            assert leftovers == {}, f"staging.sh が居残っている (#401): {leftovers}"
+            bots = [p for p, c in procs.items() if "c_lord.main" in c]
+            assert len(bots) == 1, f"bot は 1 つ生きているはず: {procs}"
+        finally:
+            self._cleanup(clone)
+
+    def test_restart_returns_when_bot_dies_at_startup(self, tmp_path: Path) -> None:
+        """AC1 (失敗時): bot が起動直後に死んでも、非 0 で有限時間に return する。"""
+        clone = self._clone(tmp_path, self.FAKE_BOT_DIES)
+        try:
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "restart", "--owner", "sess-R"],
+                cwd=clone,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            assert result.returncode != 0
+            assert "起動直後に終了" in result.stderr
+        finally:
+            self._cleanup(clone)
