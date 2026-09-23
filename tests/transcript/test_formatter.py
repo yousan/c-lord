@@ -521,3 +521,19 @@ def test_a_block_quoted_inside_a_code_fence_is_left_alone() -> None:
     out = render_event(_assistant_text(text))
     assert out is not None
     assert out.body == text
+
+
+def test_role_word_on_its_own_line_goes_with_the_block() -> None:
+    """Seen on staging (2026-09-23): ``user`` on its own line, then the tag.
+
+    The role word is the echoed turn boundary either way; leaving it behind
+    would put a stray ``user`` line in the reply.
+    """
+    text = _ECHOED_REMINDER.replace("user<system-reminder>", "user\n<system-reminder>")
+    out = render_event(_assistant_text(text))
+    assert out is not None
+    assert out.body == (
+        "待機中。\n\n"
+        '-# ⏹ バックグラウンド: Background command "Watch for yousan\'s click" completed '
+        "(exit code 0)"
+    )

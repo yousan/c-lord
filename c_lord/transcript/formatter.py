@@ -188,10 +188,12 @@ def _render_task_notification(text: str, session_id: str | None) -> RenderedEven
 # - the block is closed by its own closing tag — an unclosed one is left alone,
 # - it is not inside a fenced code block, where it is being quoted on purpose.
 #
-# The model also glues the role word onto the tag (``user<system-reminder>``),
-# echoing the turn boundary it was shown; that word belongs to the echo.
+# The model also writes the role word in front of the tag, echoing the turn
+# boundary it was shown — glued on (``user<system-reminder>``, production) or on
+# a line of its own (staging, 2026-09-23).  Either way it belongs to the echo.
 _ECHOED_BLOCK_RE = re.compile(
-    r"^(?:user|human|assistant)?<(system-reminder|task-notification)>[ \t]*\n.*?</\1>[ \t]*",
+    r"^(?:(?:user|human|assistant)[ \t]*\n?)?"
+    r"<(system-reminder|task-notification)>[ \t]*\n.*?</\1>[ \t]*",
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 _TASK_BLOCK_RE = re.compile(r"<task-notification>.*?</task-notification>", re.DOTALL)
