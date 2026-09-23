@@ -378,3 +378,59 @@ async def test_setup_bridge_logs_clord_version(
     assert hits, "startup log must contain a line matching `grep -i version`"
     assert any("v1.4.183-bd80c47e-20260908" in h for h in hits), hits
     assert any(h.startswith("c-lord version ") for h in hits), hits
+
+
+async def _boot_log(tmp_path: object, caplog: pytest.LogCaptureFixture, monkeypatch, version: str):
+    from c_lord.version import runtime_version
+
+    monkeypatch.setattr("c_lord.version.resolve_version", lambda: version)
+    runtime_version.cache_clear()
+    try:
+        with caplog.at_level("INFO", logger="c_lord.setup"):
+            await setup_bridge(
+                _make_bot(),
+                _make_runner(),
+                session_db_path=str(tmp_path / "sessions.db"),  # type: ignore[operator]
+                enable_scheduler=False,
+            )
+    finally:
+        runtime_version.cache_clear()
+    return [r for r in caplog.records if r.levelname == "WARNING" and "days old" in r.getMessage()]
+
+
+def _days_ago(days: int) -> str:
+    from datetime import date, timedelta
+
+    return (date.today() - timedelta(days=days)).strftime("%Y%m%d")
+
+
+@pytest.mark.asyncio
+async def test_setup_bridge_warns_when_build_is_stale(
+    tmp_path: object, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#756 AC1: a build 7+ days old says so at boot, with its age.
+
+    Regression for 2026-09-10..18: instances ran builds up to 18 releases
+    behind and users kept hitting bugs already fixed on main. The boot log
+    named the build (#722) but nobody computes "how many days ago" from
+    ``-20260908`` — so the log has to.
+    """
+    warnings = await _boot_log(tmp_path, caplog, monkeypatch, f"v1.4.183-bd80c47e-{_days_ago(17)}")
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+    assert "17 days old" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_setup_bridge_quiet_when_build_is_fresh(
+    tmp_path: object, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#756 AC1: under 7 days, no warning."""
+    assert not await _boot_log(tmp_path, caplog, monkeypatch, f"v1.4.197-b3f06814-{_days_ago(6)}")
+
+
+@pytest.mark.asyncio
+async def test_setup_bridge_quiet_when_build_is_undatable(
+    tmp_path: object, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#756 AC4: no date in the version → nothing, never ``None days old``."""
+    assert not await _boot_log(tmp_path, caplog, monkeypatch, "unknown")
