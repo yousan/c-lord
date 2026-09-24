@@ -615,6 +615,33 @@ and the thread gets a **「これは新しい指示でした」** button
 (`views.py::TextAnsweredMenuView`) that re-dispatches the message as an
 instruction — the old behaviour, one click away.
 
+### Consumed has to mean delivered (#804)
+
+`ask_bus.post_answer()` only queues the answer in this process. Saying
+「送りました」 from its return value is the same optimism #651 took out of the
+button path, and on 2026-09-24 it cost a whole exchange: the pane was gone, the
+keystrokes reached nothing two seconds later, and because the sentence had
+already been consumed as a menu answer, Claude recorded
+`User declined to answer questions` and ended the turn. Three rules now hold:
+
+1. **The pane is checked first.** No tmux window ⇒ the menu died with the
+   process that drew it. The workspace is restored (`wake_workspace`, #642) with
+   a line saying so, and the sentence goes as an ordinary **instruction** — a
+   restored Claude is back at its prompt, and a prompt can still take the
+   answer; menu keystrokes typed at it could not.
+2. **The claim waits for a verdict.** The bridge reports what became of the
+   answer on the bus (`ask_bus.note_delivery`, one of `DELIVERY_*`), taken from
+   the same evidence #651 uses — keystroke delivery, then Claude's own
+   transcript. The thread shows `-# ⏳ …送っています` meanwhile and **that same
+   message is rewritten** with the outcome, so one answer can never produce two
+   contradictory messages.
+3. **An answer that did not land is handed back.** `_maybe_answer_open_menu`
+   returns False, so the caller runs the sentence as an instruction. Nothing is
+   consumed by a menu that could not take it.
+
+A click arms nothing on the bus, so the button path is untouched — its feedback
+is still the menu message being rewritten with the verified outcome.
+
 Guessing "answer" is the right default because the two mistakes are not
 symmetric: a mis-read instruction costs one button, while a dropped answer costs
 the whole exchange (and, before #535, the user had usually already tried the
