@@ -96,6 +96,14 @@ logger = logging.getLogger(__name__)
 # a pick from a short menu.
 _MENU_TEXT_ANSWER_MAX = 500
 
+# How long the typed-answer path waits to be told what became of the answer
+# (#804). It has to cover the keystrokes (≈2s of _MENU_NAV_DELAY) plus the
+# transcript confirmation the bridge does before it calls a menu answered
+# (_ANSWER_CONFIRM_TIMEOUT, 12s), with slack for a busy host. Running out is not
+# a failure — it means nobody could tell us, and that is said out loud rather
+# than guessed at in either direction.
+_ANSWER_DELIVERY_WAIT = 25.0
+
 # How long a pre-empted turn gets to unwind after it was cancelled (#293). Its
 # teardown is a handful of Discord calls that normally take well under a second;
 # the bound only matters when one of them never returns, and then it is what
@@ -2369,7 +2377,9 @@ class ClaudeChatCog(commands.Cog):
         """Deliver *message*'s text as the open menu's answer (#536 AC7).
 
         Returns True when the message was consumed as an answer, so the caller
-        must NOT run it as a new instruction.
+        must NOT run it as a new instruction. **False therefore means the
+        sentence is still owed a delivery**, and the caller's ordinary
+        instruction path is what pays it (#804).
 
         Decision (recorded in issue #536): the sentence IS the answer. Before
         this, typing while a menu was open silently discarded the question and
@@ -2383,8 +2393,24 @@ class ClaudeChatCog(commands.Cog):
         ✏️ Other modal accepts (past that length it is a request, not a pick
         from a three-option menu), and a menu with no free-text row (plan
         approval — typing there would mis-send keystrokes).
+
+        #804: consumed has to mean *delivered*. This path used to announce
+        「送りました」 the instant ``post_answer`` returned — which only says a
+        coroutine in this process is listening, not that a single keystroke was
+        sent (the same optimism #651 took out of the button path). On
+        2026-09-24 the pane was gone, the keystrokes reached nothing two seconds
+        later, and the sentence had already been consumed: Claude recorded
+        ``User declined to answer questions`` and ended the turn with the
+        answer nowhere. So now the menu is only used when it can actually be
+        reached, the claim waits for the bridge's verdict, and an answer that
+        did not land is handed back to the instruction path rather than
+        swallowed.
         """
-        from ..discord_ui.ask_bus import ask_bus
+        from ..discord_ui.ask_bus import (
+            DELIVERY_DELIVERED,
+            DELIVERY_UNCONFIRMED,
+            ask_bus,
+        )
         from ..discord_ui.ask_menus import disable_stale_copies
 
         text = (message.content or "").strip()
@@ -2392,13 +2418,78 @@ class ClaudeChatCog(commands.Cog):
             return False
         if not ask_bus.accepts_free_text(thread.id):
             return False
-        if not ask_bus.post_answer(thread.id, [text]):
+
+        # #804 ②: the menu lives in a tmux pane, so no pane means no menu — the
+        # Claude that drew it died with the window, and there is nothing for the
+        # keystrokes to land on. Restore the workspace (#642) and let the
+        # sentence go as an ordinary instruction: a restored Claude is back at
+        # its prompt, and a prompt can still take the answer. Menu keystrokes
+        # typed at it could not, which is why this does not just wake and send.
+        if await self._menu_window_is_gone(thread):
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(
+                    "-# 🔄 この質問が出ていたワークスペースが停止していました。"
+                    "復元してから、いただいた文章を新しい指示として送ります。"
+                )
+            try:
+                woken = await self.wake_workspace(thread)
+            except Exception:
+                logger.warning(
+                    "%s wake before answering the open menu failed (#804)",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
+                )
+                woken = False
+            logger.info(
+                "%s the open menu had no tmux window — restored=%s, delivering the "
+                "text as a new instruction instead (#804)",
+                log_ctx(thread_id=thread.id),
+                woken,
+            )
             return False
 
-        logger.info(
-            "%s message delivered as the open menu's answer (#536 AC7)",
-            log_ctx(thread_id=thread.id),
-        )
+        report = ask_bus.watch_delivery(thread.id)
+        try:
+            if not ask_bus.post_answer(thread.id, [text]):
+                return False
+            logger.info(
+                "%s message routed to the open menu — waiting for the delivery "
+                "verdict (#536 AC7, #804)",
+                log_ctx(thread_id=thread.id),
+            )
+            # The wait below is bounded but not instant, and silence in the
+            # meantime reads exactly like the message being ignored — the very
+            # thing #536 exists to prevent. Say what is happening, then rewrite
+            # this same message with what actually happened, so the thread can
+            # never hold two accounts of one answer (#804 AC4).
+            notice = None
+            with contextlib.suppress(discord.HTTPException):
+                notice = await thread.send(
+                    content=(
+                        f"-# ⏳ この文章を、開いていた質問への回答として送っています: {text[:150]}"
+                    )
+                )
+            verdict = await self._await_answer_verdict(report, thread.id)
+        finally:
+            ask_bus.unwatch_delivery(thread.id)
+
+        logger.info("%s typed menu answer verdict=%s (#804)", log_ctx(thread_id=thread.id), verdict)
+        if verdict not in (DELIVERY_DELIVERED, DELIVERY_UNCONFIRMED):
+            # The answer did not reach Claude. The bridge has already said so and
+            # rewritten the menu; what is left is to make sure the sentence still
+            # gets there — as an instruction, which is a path that restores its
+            # own workspace (#700) and cannot be recorded as a refusal.
+            await self._replace_notice(
+                thread,
+                notice,
+                content=(
+                    "⚠️ **この文章は、開いていた質問への回答として届きませんでした:** "
+                    f"{text[:150]}\n"
+                    "-# このまま新しい指示として送り直します。"
+                ),
+            )
+            return False
+
         # The answer came from outside the view, so no interaction edits the
         # menu — blank every live copy here instead.
         with contextlib.suppress(Exception):
@@ -2414,16 +2505,91 @@ class ClaudeChatCog(commands.Cog):
             await self._handle_thread_reply(message)
 
         view = TextAnsweredMenuView(_rerun, authorizer=self._authorizer)
-        with contextlib.suppress(discord.HTTPException):
-            await thread.send(
-                content=(
-                    f"✏️ **この文章を、開いていた質問への回答として送りました:** {text[:150]}\n"
-                    "-# 質問への回答ではなく新しい指示のつもりだった場合は、"
-                    "下のボタンを押してください。"
-                ),
-                view=view,
-            )
+        tail = (
+            "-# 質問への回答ではなく新しい指示のつもりだった場合は、下のボタンを押してください。"
+            if verdict == DELIVERY_DELIVERED
+            else "-# ただし Claude が受け取ったかどうかは確認できていません。"
+            "続きが返ってこないときは、同じ内容をもう一度送ってください。"
+        )
+        await self._replace_notice(
+            thread,
+            notice,
+            content=(
+                f"✏️ **この文章を、開いていた質問への回答として送りました:** {text[:150]}\n{tail}"
+            ),
+            view=view,
+        )
         return True
+
+    async def _menu_window_is_gone(self, thread: discord.Thread) -> bool:
+        """True when this thread has no tmux window for its menu to live in (#804).
+
+        Deliberately conservative: "cannot tell" is False. True is read as "the
+        menu is a ghost", and mistaking a live menu for a ghost turns a perfectly
+        good answer into an interrupting instruction — so only a manager that
+        answers, and answers ``None``, counts as evidence. It is the same lookup
+        ``send_keys`` does, so a False here is also the prediction that the
+        keystrokes have somewhere to go.
+        """
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        try:
+            tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+            if tmux_manager is None:
+                return False
+            window = await asyncio.to_thread(tmux_manager.window_name, thread.id)
+        except Exception:
+            logger.debug(
+                "%s could not check the open menu's tmux window",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            return False
+        return window is None
+
+    async def _await_answer_verdict(self, report: asyncio.Queue[str], thread_id: int) -> str:
+        """Wait for the bridge to say what became of a typed answer (#804)."""
+        from ..discord_ui.ask_bus import DELIVERY_UNCONFIRMED
+
+        try:
+            return await asyncio.wait_for(report.get(), timeout=_ANSWER_DELIVERY_WAIT)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — 3.10: the two differ
+            logger.warning(
+                "%s nobody reported what became of the typed answer within %.0fs — "
+                "saying so rather than claiming it landed (#804)",
+                log_ctx(thread_id=thread_id),
+                _ANSWER_DELIVERY_WAIT,
+            )
+            return DELIVERY_UNCONFIRMED
+
+    @staticmethod
+    async def _replace_notice(
+        thread: discord.Thread,
+        notice: object | None,
+        *,
+        content: str,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        """Rewrite the interim line with the outcome, or post it if that failed (#804).
+
+        One message per answer, start to finish: an answer whose story is told
+        by two messages is how 「送りました」 and 「届けられませんでした」 came to
+        sit two seconds apart in the same thread.
+        """
+        edit = getattr(notice, "edit", None)
+        if edit is not None:
+            try:
+                if view is not None:
+                    await edit(content=content, view=view)
+                else:
+                    await edit(content=content)
+                return
+            except Exception:
+                logger.debug("could not rewrite the answer notice — posting instead")
+        with contextlib.suppress(discord.HTTPException):
+            if view is not None:
+                await thread.send(content=content, view=view)
+            else:
+                await thread.send(content=content)
 
     async def wake_workspace(self, thread: discord.Thread) -> bool:
         """Restore a stopped workspace without running a turn — #642.
