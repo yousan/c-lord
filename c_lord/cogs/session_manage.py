@@ -25,6 +25,7 @@ from ..database.settings_repo import SettingsRepository
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
+from ..discord_ui.slash_io import slash_io
 from ..session_close import (
     apply_closed_name,
     apply_open_name,
@@ -214,41 +215,9 @@ class SessionManageCog(commands.Cog):
     # serves both the slash command and its !text twin.
 
     def _slash_io(self, interaction: discord.Interaction) -> tuple[_Responder, _Acknowledger]:
-        state = {"acked": False}
-
-        async def ack(*, ephemeral: bool = False) -> None:
-            state["acked"] = True
-            await interaction.response.defer(ephemeral=ephemeral)
-
-        async def respond(
-            content: str | None = None,
-            *,
-            embed: discord.Embed | None = None,
-            file: discord.File | None = None,
-            ephemeral: bool = False,
-        ) -> None:
-            if file is not None:
-                embed_arg = embed if embed is not None else discord.utils.MISSING
-                if state["acked"]:
-                    await interaction.followup.send(
-                        content or "", embed=embed_arg, file=file, ephemeral=ephemeral
-                    )
-                else:
-                    await interaction.response.send_message(
-                        content, embed=embed_arg, file=file, ephemeral=ephemeral
-                    )
-                return
-            if state["acked"]:
-                if embed is not None:
-                    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-                else:
-                    await interaction.followup.send(content or "", ephemeral=ephemeral)
-            elif embed is not None:
-                await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        return respond, ack
+        # #748: shared with every other slash command, so an ``ephemeral=True``
+        # reply after a public ``ack()`` is really ephemeral (see slash_io).
+        return slash_io(interaction)
 
     def _ctx_io(self, ctx: commands.Context) -> tuple[_Responder, _Acknowledger]:
         async def ack(*, ephemeral: bool = False) -> None:

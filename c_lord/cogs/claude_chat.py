@@ -44,6 +44,7 @@ from ..discord_ui.authorization import (
 )
 from ..discord_ui.embeds import error_embed, stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
+from ..discord_ui.slash_io import slash_io
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.views import (
@@ -1366,19 +1367,9 @@ class ClaudeChatCog(commands.Cog):
         self, interaction: discord.Interaction, prompt: str, repo: str | None = None
     ) -> None:
         """Start a new Claude Code session or continue in an existing thread."""
-        state = {"acked": False}
-
-        async def ack(*_args: object, **_kwargs: object) -> None:
-            state["acked"] = True
-            await interaction.response.defer()
-
-        async def respond(
-            content: str | None = None, *, ephemeral: bool = False, silent: bool = False
-        ) -> None:
-            if state["acked"]:
-                await interaction.followup.send(content or "", ephemeral=ephemeral, silent=silent)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
+        # #748: the post-ack "only for you" replies (#443 / #75 permission help)
+        # must not replace the public "thinking…" placeholder.
+        respond, ack = slash_io(interaction)
 
         await self._clord_impl(
             channel=interaction.channel,

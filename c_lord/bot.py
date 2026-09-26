@@ -17,6 +17,7 @@ from .concurrency import SessionRegistry
 from .coordination.service import CoordinationService
 from .discord_ui.authorization import Authorizer
 from .discord_ui.permission_help import command_error_help
+from .discord_ui.slash_io import followup_ephemeral
 
 if TYPE_CHECKING:
     from .database.ask_repo import PendingAskRepository
@@ -153,7 +154,9 @@ class ClaudeDiscordBot(commands.Bot):
         message = command_error_help(error)
         with contextlib.suppress(discord.HTTPException):
             if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
+                # #748: after a public ack() this must not become the public
+                # "thinking…" placeholder.
+                await followup_ephemeral(interaction, message)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
 
