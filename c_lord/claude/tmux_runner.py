@@ -380,11 +380,19 @@ _PERMISSION_PROMPT_MARKERS = (
 # PATH (``command not found``).  When the pane shows one of these and no
 # response was ever produced, the runner surfaces it to Discord as an error
 # instead of silently reporting a normal completion (#366).  Matched
-# case-insensitively as substrings of a single pane line.
-_STARTUP_ERROR_MARKERS = (
-    "native binary not installed",
-    "command not found: claude",
-    "claude: command not found",
+# case-insensitively against a single pane line.
+#
+# ``claude`` must be the whole command name (#453).  A plain substring match
+# also fired on ``command not found: claude-metrics-exporter`` — a Bash tool
+# inside a live session failing on some other ``claude-*`` command — and ended
+# that turn with "Claude failed to start".  The lookarounds reject a name that
+# merely starts or ends with ``claude`` (``claude-code``, ``claude2``,
+# ``my-claude``) while still matching ``claude`` itself.
+_STARTUP_ERROR_RE = re.compile(
+    r"native binary not installed"
+    r"|command not found: claude(?![-\w])"
+    r"|(?<![-\w])claude: command not found",
+    re.IGNORECASE,
 )
 
 
@@ -403,7 +411,7 @@ def _extract_startup_error(pane: str) -> str | None:
         return None
     for line in pane.splitlines():
         stripped = line.strip()
-        if any(marker in stripped.lower() for marker in _STARTUP_ERROR_MARKERS):
+        if _STARTUP_ERROR_RE.search(stripped):
             return stripped[:300]
     return None
 
