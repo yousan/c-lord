@@ -92,6 +92,13 @@ per-run ログ → `Logged in as` を待って identity を検証(mismatch な�
 `… restart 2>&1 | tail` のように出力を読み切る呼び出し方でもそこで止まらない。bot の親は `systemd --user` になり、
 `pgrep -af '^bash scripts/staging.sh restart'` に restart の残骸は出ない。
 
+**止まりきらない bot は SIGKILL で落とす**(#699)。`stop`(と `restart` の停止段)は SIGTERM のあと
+`CLORD_STOP_GRACE_SECONDS`(既定 15)秒待ち、まだ生きていれば **`/proc/<pid>/cwd` を照合し直したうえで
+PID 直指定の SIGKILL** に進む。その事実は標準エラーと **bot の per-run ログ**の両方に
+`staging.sh: pid <pid> が SIGTERM から 15 秒で終了しないため SIGKILL します (#699)` と残る。以前はここで
+`ERROR: プロセスが 15 秒で終了しない` と中断し、`restart` が起動まで到達せず**本番が止まったまま**になっていた。
+bot 側にも shutdown watchdog があり(既定 10 秒、下記トラブルシュート)、通常はそちらが先に終わらせる。
+
 `restart <branch>` は起動前に **`git fetch origin <branch>` → checkout → `git merge --ff-only origin/<branch>`** まで行い、
 ローカルブランチを **origin の最新に確実に同期**する(#436)。単なる `checkout` は fetch 済みでも
 ローカルブランチを古い HEAD のまま切り替えるだけなので、これが無いと「最新の fix を回したつもりで
@@ -342,4 +349,5 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 | `instances: 2+` | `staging.sh status` | 二重起動 — `stop` → `restart`。手動 kill 禁止事項を守ったか確認 |
 | 起動直後に死ぬ | per-run ログ末尾 | LoginFailure(token 不正)/ DB スキーマ不整合(古いブランチ — idle は main) |
 | `API server not listening` | per-run ログの `REST API could not bind` | ポート衝突。その clone の `CLORD_API_PORT` を空き番号に(#712 以降 API は常時起動する) |
+| per-run ログ末尾に `shutdown did not finish within 10s of the stop signal` と `Thread 0x…` のスタックが並ぶ | そのスタック(`Current thread` 以外で `join` / `select` / `subprocess` に居るスレッド) | 停止中に何かが返ってこなかった。bot の shutdown watchdog(#699)が全スレッドのスタックを書いて exit 70 で終わらせた — **本番は止まったままにならない**。スタックが原因の一次資料なので Issue に貼る。期限は `CLORD_SHUTDOWN_TIMEOUT_SECONDS`(既定 10、`0` で無効) |
 | `restart` が `OK` まで出したのに返らない / `pgrep -af 'staging.sh restart'` に残る | その clone の `scripts/staging.sh` に `exec setsid` があるか | #401 修正前のスクリプト。旧版は bot を起動したサブシェルが bot の親として居座り、呼び出し元の stdout を握り続けた。**1 回 `restart` すると新しいスクリプトに入れ替わる**(その 1 回は旧スクリプトで走るので、出力はファイルへ向けておく)。残骸は旧 bot が止まると一緒に消える |
