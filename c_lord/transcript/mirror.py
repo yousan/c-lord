@@ -518,6 +518,26 @@ def _unresolved_notice(report: UnresolvedTranscript) -> str:
     )
 
 
+# #815: the mirror currently tailing each thread, so the run that ends a turn
+# can reach it (see :func:`note_run_ended`).  Kept by the mirrors themselves —
+# ``start`` adds, ``stop`` removes — so every consumer gets it without wiring.
+_LIVE_MIRRORS: dict[int, TranscriptMirror] = {}
+
+
+async def note_run_ended(thread_id: int) -> None:
+    """Tell *thread_id*'s mirror that c-lord's run for its turn is over (#815).
+
+    The mirror otherwise learns that a turn ended only from the transcript —
+    the turn-end marker, the next prompt, the final answer.  A claude that dies
+    mid-turn writes none of them, so its "⏳ 待機中" line kept counting for
+    twelve hours after the turn had already ended in ❌ Error.  A no-op when no
+    mirror is tailing the thread.
+    """
+    mirror = _LIVE_MIRRORS.get(thread_id)
+    if mirror is not None:
+        await mirror.note_run_ended()
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -651,6 +671,7 @@ class TranscriptMirror:
         if self._task is not None and not self._task.done():
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
+        _LIVE_MIRRORS[self.thread_id] = self
 
     async def stop(self) -> None:
         """Cancel the tail task and wait for it to settle.  Safe to call repeatedly."""
@@ -661,9 +682,20 @@ class TranscriptMirror:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
         self._task = None
+        if _LIVE_MIRRORS.get(self.thread_id) is self:
+            del _LIVE_MIRRORS[self.thread_id]
         with contextlib.suppress(Exception):
             await self._progress.end_turn()
         await self._cancel_ask_bridge()
+
+    async def note_run_ended(self) -> None:
+        """c-lord's run for this turn is over; take the progress line away (#815).
+
+        The tail keeps running — only the line goes.  If Claude is in fact
+        still working (a completion the pane read too early, background work),
+        its next tool event re-arms the line, as it does for any turn.
+        """
+        await self._progress.end_turn()
 
     async def _cancel_ask_bridge(self) -> None:
         t = self._ask_bridge_task

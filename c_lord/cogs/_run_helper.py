@@ -59,6 +59,7 @@ from ..discord_ui.embeds import (
 )
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..lounge import build_lounge_prompt
+from ..transcript.mirror import note_run_ended
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from ..version import label_with_age, runtime_version
@@ -515,6 +516,19 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             outcome,
             time.monotonic() - run.started,
         )
+        # #815: the turn is over, so its progress line must stop — the mirror
+        # only hears that from the transcript, and a claude that died mid-turn
+        # writes nothing there. Not on ``preempted`` / ``cancelled``: the next
+        # message already restarted the line for its own turn.
+        if outcome in ("ok", "error", "crashed"):
+            try:
+                await note_run_ended(thread_id)
+            except Exception:
+                logger.warning(
+                    "%s could not end the progress line",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
 
 
 async def _run_turn(config: RunConfig, ctx: str) -> str | None:
