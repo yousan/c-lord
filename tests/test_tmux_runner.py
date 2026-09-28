@@ -1526,6 +1526,95 @@ class TestAnsweredTurnDoesNotFalseTimeout:
         assert "exited without producing a response" in result_events[0].error
 
 
+class TestMenuWaitDoesNotFalseTimeout:
+    """#751: a turn waiting on the user's menu answer is not a hung turn.
+
+    When another bridge (the transcript mirror, the #359 watchdog) posted the
+    AskUserQuestion / plan menu first, the runner's own ``pane_ask`` is declined
+    (#535) and it keeps polling a pane that — correctly — does not move until a
+    person answers.  Five minutes later the inactivity backstop fired and told
+    the user "⏱️ Session timed out … /clear to start fresh" about a session that
+    was simply waiting for them; following that advice throws the work away.
+    Every traced occurrence (2026-09-04 ×2 on staging, 2026-09-12 #988 in
+    production) was this.
+
+    A frozen pane is still a hang when no menu is open — including a pane
+    frozen mid-spinner, because the live spinner's timer redraws every second
+    while claude is healthy (#541 ``test_frozen_mid_generation_still_times_out``).
+    """
+
+    # Real capture: staging-3, Claude Code v2.1.280, AskUserQuestion open and
+    # already bridged by the transcript mirror (2026-09-23).
+    _MENU_FIXTURE = "i751_ask_menu_open_v2_1_280.txt"
+
+    @staticmethod
+    def _working(t: int) -> str:
+        return f"✻ Generating… ({t}s · ↑ 2.1k tokens · esc to interrupt)"
+
+    async def _run_until_backstop(self, runner, tmux_manager, then: str) -> list:
+        """Generate for a few polls, then freeze on *then* until the backstop fires."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            return self._working(call_idx) if call_idx <= 4 else then
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            # Only the inactivity backstop may end the loop.
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 100.0),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("q"):
+                events.append(event)
+        return [e for e in events if e.is_complete]
+
+    def test_fixture_is_an_open_menu_not_a_running_pane(self) -> None:
+        pane = _normalize_capture(_load_fixture(self._MENU_FIXTURE))
+        assert _parse_ask_from_pane(pane) is not None
+        assert not TmuxClaudeRunner._is_idle_at_prompt(pane)
+
+    @pytest.mark.asyncio
+    async def test_open_menu_at_backstop_is_not_reported_as_timeout(
+        self, runner, tmux_manager, caplog
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="c_lord.claude.tmux_runner"):
+            results = await self._run_until_backstop(
+                runner, tmux_manager, _load_fixture(self._MENU_FIXTURE)
+            )
+
+        assert len(results) == 1
+        assert results[0].error is None, f"menu wait reported as: {results[0].error!r}"
+        # #678: the decision not to report is itself logged at INFO.
+        assert any("#751" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_frozen_mid_turn_real_pane_still_times_out(self, runner, tmux_manager) -> None:
+        """A real mid-turn pane that stops redrawing is a hang — no menu, no pass."""
+        frozen = _load_fixture("i742_running_mid_turn_v2_1_271.txt")
+        results = await self._run_until_backstop(runner, tmux_manager, frozen)
+
+        assert len(results) == 1
+        assert results[0].error is not None
+        assert "Timed out" in results[0].error
+
+    @pytest.mark.asyncio
+    async def test_idle_real_pane_still_silent(self, runner, tmux_manager) -> None:
+        """#541 is unchanged: a finished turn at its idle prompt reports nothing."""
+        idle = _load_fixture("i742_idle_after_turn_v2_1_271.txt")
+        results = await self._run_until_backstop(runner, tmux_manager, idle)
+
+        assert len(results) == 1
+        assert results[0].error is None
+
+
 class TestTurnThatNeverStarted:
     """#562: a turn with no response at all must not report "finished".
 
