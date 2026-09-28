@@ -79,7 +79,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 
 | Module | Class | Role |
 |--------|-------|------|
-| `claude_chat.py` | `ClaudeChatCog` | Core message handler. Listens for `on_message` in the configured channel and its child threads. Creates threads for new conversations, resumes sessions for thread replies. Manages concurrency via `asyncio.Semaphore`. Provides `/clear` slash command to reset sessions. |
+| `claude_chat.py` | `ClaudeChatCog` | Core message handler. Listens for `on_message` in the configured channel and its child threads. Creates threads for new conversations, resumes sessions for thread replies. Manages concurrency via `asyncio.Semaphore`. Provides `/clear` slash command, which types Claude Code's own `/clear` into the pane (#803). |
 | `skill_command.py` | `SkillCommandCog` | Provides `/skill` and `/skills` slash commands. Scans `~/.claude/skills/` at startup, parses YAML frontmatter from `SKILL.md` files, offers Discord autocomplete. Creates a thread and delegates to `_run_helper`. |
 | `_run_helper.py` | `run_claude_in_thread()` | Shared function extracted to avoid duplicating the Claude CLI streaming logic between ClaudeChatCog and SkillCommandCog. Handles the full event loop: session init, tool use embeds, status updates, text accumulation, chunked response posting, error handling, and session persistence. |
 

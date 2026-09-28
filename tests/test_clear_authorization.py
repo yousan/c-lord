@@ -1,8 +1,7 @@
 """``/clear`` and ``!clear`` must be gated like every other command that drives c-lord (#405).
 
-``/clear`` is the most destructive command in the chat cog: it kills the active
-runner, kills the thread's tmux window unconditionally and resets the session
-row — the conversation is gone.  The neighbouring ``/clord-attach`` /
+``/clear`` is the most destructive command in the chat cog: it stops the running
+turn and types ``/clear`` into Claude Code (#803) — the conversation is gone.  The neighbouring ``/clord-attach`` /
 ``!attach`` were gated, ``/clear`` / ``!clear`` were not, so anyone who could
 type in a thread could wipe somebody else's session.
 
@@ -17,11 +16,12 @@ The gate is the shared one, not a new rule:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
 
+from c_lord.cogs import claude_chat as claude_chat_module
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.discord_ui.authorization import Authorizer
 
@@ -38,6 +38,7 @@ def _make_cog() -> tuple[ClaudeChatCog, MagicMock, MagicMock]:
     bot.settings_repo = None
     repo = MagicMock()
     repo.reset = AsyncMock(return_value=True)
+    repo.get = AsyncMock(return_value=MagicMock(closed_at=None))
     cog = ClaudeChatCog(
         bot=bot,
         repo=repo,
@@ -46,9 +47,13 @@ def _make_cog() -> tuple[ClaudeChatCog, MagicMock, MagicMock]:
     )
     tmux_manager = MagicMock()
     tmux_manager.kill_session = MagicMock(return_value=True)
+    tmux_manager.is_claude_running = MagicMock(return_value=True)
+    tmux_manager.send_literal = MagicMock(return_value=True)
+    tmux_manager.project_dir_for = MagicMock(return_value=None)
     cog._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
     runner = MagicMock()
     runner.kill = AsyncMock()
+    runner.interrupt = AsyncMock()
     cog._active_runners[THREAD_ID] = runner
     return cog, tmux_manager, runner
 
@@ -74,6 +79,9 @@ def _interaction(user_id: int) -> MagicMock:
     interaction.user = _member(user_id)
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
     return interaction
 
 
@@ -116,16 +124,25 @@ def _bot_message(user_id: int) -> MagicMock:
 def _assert_untouched(cog: ClaudeChatCog, tmux_manager: MagicMock, runner: MagicMock) -> None:
     """Nothing about the session may have been destroyed (#405 AC3)."""
     runner.kill.assert_not_called()
+    runner.interrupt.assert_not_called()
+    tmux_manager.send_literal.assert_not_called()
     assert cog._active_runners.get(THREAD_ID) is runner
     tmux_manager.kill_session.assert_not_called()
     cog.repo.reset.assert_not_called()
 
 
 def _assert_cleared(cog: ClaudeChatCog, tmux_manager: MagicMock, runner: MagicMock) -> None:
-    runner.kill.assert_called_once()
-    assert THREAD_ID not in cog._active_runners
-    tmux_manager.kill_session.assert_called_once_with(THREAD_ID)
-    cog.repo.reset.assert_called_once_with(THREAD_ID)
+    """#803: the running turn is stopped and ``/clear`` is typed — nothing is killed."""
+    runner.interrupt.assert_called_once()
+    tmux_manager.send_literal.assert_called_once_with(THREAD_ID, "/clear")
+    tmux_manager.kill_session.assert_not_called()
+    cog.repo.reset.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def _pane_returns_to_prompt():
+    with patch.object(claude_chat_module, "wait_for_idle_prompt", AsyncMock(return_value=True)):
+        yield
 
 
 class TestSlashClear:

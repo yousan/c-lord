@@ -3416,3 +3416,32 @@ def _clean_tui_lines(lines: list[str]) -> str:
         cleaned.pop()
 
     return "\n".join(cleaned)
+
+
+async def wait_for_idle_prompt(
+    tmux: TmuxSessionManager,
+    thread_id: int,
+    *,
+    timeout: float,
+    interval: float = _POLL_INTERVAL,
+) -> bool:
+    """Wait until *thread_id*'s Claude is back at an idle input box (#803).
+
+    Used after interrupting a running turn, before typing a slash command at it:
+    a ``/clear`` typed while the turn is still unwinding would be queued behind
+    it (or land in the middle of it) instead of running.  "Idle" is the same
+    test the turn loop uses — input box on screen, no generation indicator —
+    plus a live ``claude`` process, so a shell prompt left in a dead pane never
+    counts.  Returns False when the pane does not settle within ``timeout``.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        pane = _normalize_capture(await asyncio.to_thread(tmux.capture_pane, thread_id))
+        if TmuxClaudeRunner._is_idle_at_prompt(pane) and await asyncio.to_thread(
+            tmux.is_claude_running, thread_id
+        ):
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(interval)

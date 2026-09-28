@@ -2255,6 +2255,25 @@ class TmuxSessionManager:
         logger.info("start_claude: sent command to %s", target)
         return True
 
+    def project_dir_for(self, thread_id: int) -> Path | None:
+        """Where *thread_id*'s Claude Code writes its transcripts, or None (#803).
+
+        Derived from the pane's cwd the same way :meth:`_session_flags` does when
+        it claims a session, so ``/clear`` moves the claim in the directory the
+        claim was written to.
+        """
+        if not self._check_available():
+            return None
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return None
+        pane_path = self._pane_path(self._target(window))
+        if not pane_path:
+            return None
+        from .transcript.resolver import derive_project_dir
+
+        return derive_project_dir(pane_path)
+
     def _pane_path(self, target: str) -> str | None:
         """Current working directory of *target*'s pane, or None if unknown."""
         result = _run(["tmux", "display-message", "-p", "-t", target, "#{pane_current_path}"])
