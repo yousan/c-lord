@@ -1551,10 +1551,15 @@ class TmuxClaudeRunner:
         6. Detect completion (input prompt reappears or idle timeout).
         7. Yield a final RESULT event with ``is_complete=True``.
         """
-        self._stopped = False
-        # #583: ``preempted`` is read after the run, so a stale flag from a
-        # previous turn must not survive into this one.
-        self._silent_stop = False
+        # #800: the stop flags are NOT reset here. The runner is registered as
+        # the thread's active runner before this generator starts, so the next
+        # message can interrupt it while the turn is still being prepared. The
+        # reset that used to sit here erased that interrupt, and the cancelled
+        # request was typed into the pane anyway. A runner is built per turn,
+        # so the constructor's ``False`` is the only reset it needs.
+        if (stopped := self._stopped_before_delivery()) is not None:
+            yield stopped
+            return
 
         # #701: which tmux server this turn began on.  Read before anything
         # touches tmux, because every failure exit below — start, delivery, and
@@ -1592,6 +1597,9 @@ class TmuxClaudeRunner:
                 )
                 await self.cancel_menu()
                 await asyncio.sleep(_MENU_NAV_DELAY)
+            if (stopped := self._stopped_before_delivery()) is not None:
+                yield stopped
+                return
             self._take_send_failure()  # #809: only this send's refusal may explain it
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
@@ -1640,6 +1648,9 @@ class TmuxClaudeRunner:
                 )
                 return
         else:
+            if (stopped := self._stopped_before_delivery()) is not None:
+                yield stopped
+                return
             self._take_send_failure()  # #809: only this start's refusal may explain it
             if self._try_continue:
                 # Restart-resume path only (on_ready → pending_resumes).
@@ -2624,6 +2635,29 @@ class TmuxClaudeRunner:
         """
         return self._stopped and self._silent_stop
 
+    def _stopped_before_delivery(self) -> StreamEvent | None:
+        """The turn's RESULT when it was interrupted before its prompt was sent (#800).
+
+        Checked on entry to :meth:`run` and again right before the prompt is
+        delivered, because every ``await`` in between is a gap the next message
+        can land in. The C-c that :meth:`interrupt` sent went to an idle prompt
+        and did nothing, so this flag is the only thing that still says "do not
+        run this". ``None`` means the turn goes ahead.
+        """
+        if not self._stopped:
+            return None
+        logger.info(
+            "Turn for thread %d was interrupted before its prompt was sent; "
+            "not delivering it (#800)",
+            self._thread_id,
+        )
+        return StreamEvent(
+            raw={},
+            message_type=MessageType.RESULT,
+            is_complete=True,
+            error=None if self._silent_stop else "Stopped by user",
+        )
+
     async def interrupt(self, *, silent: bool = False) -> None:
         """Send C-c to the tmux pane (graceful interrupt).
 
@@ -2637,6 +2671,17 @@ class TmuxClaudeRunner:
         self._stopped = True
         self._silent_stop = silent
         await asyncio.to_thread(self._tmux.send_interrupt, self._thread_id)
+
+    def withdraw(self, *, silent: bool = False) -> None:
+        """Stop a turn that has not delivered its prompt yet, without C-c (#800).
+
+        Same outcome as :meth:`interrupt` for a runner whose :meth:`run` has not
+        sent anything — :meth:`run` then ends without touching the pane. No C-c
+        is sent: the pane is idle, and a second C-c on an idle prompt exits
+        Claude Code.
+        """
+        self._stopped = True
+        self._silent_stop = silent
 
     async def kill(self) -> None:
         """Kill the tmux window entirely."""

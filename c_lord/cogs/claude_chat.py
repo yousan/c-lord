@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from datetime import datetime, timedelta
 from functools import partial
@@ -356,6 +357,9 @@ class ClaudeChatCog(commands.Cog):
         # Used by _handle_thread_reply to wait for an interrupted session
         # to fully clean up before starting the replacement session.
         self._active_tasks: dict[int, asyncio.Task] = {}
+        # #800: turns the next message replaced before they had registered a
+        # runner — the runner they register later must start out stopped.
+        self._preempted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
         # Dashboard may be None until bot is ready; resolved lazily in _get_dashboard()
         self._dashboard = dashboard
         # Coordination service resolved lazily from bot if not supplied directly
@@ -3421,7 +3425,13 @@ class ClaudeChatCog(commands.Cog):
         """
         from ..discord_ui.ask_bus import ask_bus
 
+        # #800: a turn still preparing (cloning, waiting for a slot) has no
+        # runner to interrupt yet. Remember it, so the runner it registers later
+        # never delivers the request this message just replaced.
+        self._preempted_tasks.add(prev_task)
         await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
+        # Looked up again: the runner may have registered while we posted.
+        prev_runner = self._active_runners.get(thread.id) or prev_runner
         if prev_runner is not None:
             with contextlib.suppress(Exception):
                 await prev_runner.interrupt(silent=True)
@@ -3429,6 +3439,19 @@ class ClaudeChatCog(commands.Cog):
         # bridge_pane_ask so the run can wind down instead of waiting on a click.
         ask_bus.post_answer(thread.id, [])
         await self._drain_thread_task(prev_task, thread_id=thread.id)
+
+    def _register_runner(
+        self, thread_id: int, runner: TmuxClaudeRunner, task: asyncio.Task | None
+    ) -> None:
+        """Make ``runner`` the thread's active runner (#800).
+
+        A turn the next message already replaced gets a runner that is stopped
+        before it starts, so its prompt never reaches the pane.
+        """
+        self._active_runners[thread_id] = runner
+        preempted = getattr(self, "_preempted_tasks", None)
+        if task is not None and preempted is not None and task in preempted:
+            runner.withdraw(silent=True)
 
     async def _drain_thread_task(
         self,
@@ -3882,7 +3905,7 @@ class ClaudeChatCog(commands.Cog):
                 effort=self.runner.effort,
             )
 
-            self._active_runners[thread.id] = runner
+            self._register_runner(thread.id, runner, current_task)
 
             # Issue #71: kick off a per-thread transcript mirror so JSONL
             # events flow to this Discord thread. This is the delivery path

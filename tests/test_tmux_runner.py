@@ -1869,6 +1869,65 @@ class TestTmuxClaudeRunnerInterrupt:
         assert result_events[0].text is None
 
 
+class TestInterruptBeforeRun:
+    """#800: an interrupt that lands while the turn is still being prepared.
+
+    ``ClaudeChatCog`` registers the runner before ``run()`` starts, so the next
+    message can interrupt it in that gap. The prompt it was going to deliver
+    must then never reach the pane — before #800 ``run()`` cleared the stop
+    flag on entry and typed the cancelled request in anyway.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("claude_running", [True, False])
+    async def test_interrupted_runner_never_delivers_the_prompt(
+        self, runner, tmux_manager, claude_running
+    ) -> None:
+        tmux_manager.is_claude_running.return_value = claude_running
+        await runner.interrupt(silent=True)
+
+        events = [e async for e in runner.run("rm -rf something")]
+
+        tmux_manager.send_input.assert_not_called()
+        tmux_manager.start_claude.assert_not_called()
+        results = [e for e in events if e.is_complete]
+        assert len(results) == 1
+        assert results[0].error is None
+        assert runner.preempted is True
+
+    @pytest.mark.asyncio
+    async def test_loud_interrupt_before_run_reports_stopped(self, runner, tmux_manager) -> None:
+        tmux_manager.is_claude_running.return_value = True
+        await runner.interrupt()
+
+        events = [e async for e in runner.run("q")]
+
+        tmux_manager.send_input.assert_not_called()
+        results = [e for e in events if e.is_complete]
+        assert [r.error for r in results] == ["Stopped by user"]
+        assert runner.preempted is False
+
+    @pytest.mark.asyncio
+    async def test_interrupt_during_pre_delivery_checks_still_blocks_delivery(
+        self, runner, tmux_manager
+    ) -> None:
+        """The gap does not end at ``run()``'s first line: the liveness probe
+        before delivery is a thread hop the next message can land in."""
+
+        def running_then_interrupted(_tid):
+            # The interrupt arrives while run() is asking whether claude is up.
+            runner._stopped = True
+            runner._silent_stop = True
+            return True
+
+        tmux_manager.is_claude_running.side_effect = running_then_interrupted
+
+        events = [e async for e in runner.run("q")]
+
+        tmux_manager.send_input.assert_not_called()
+        assert [e.error for e in events if e.is_complete] == [None]
+
+
 # -- Tests for _is_generating ------------------------------------------------
 
 
