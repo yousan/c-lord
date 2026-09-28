@@ -170,7 +170,7 @@ class TestDeadStopButtonsAreSweptOnStartup:
         — leaving a clickable button wired to a runner that no longer exists.
         """
         from c_lord.discord_ui.views import STOP_MESSAGE_PREFIX
-        from c_lord.stale_stop_buttons import sweep_dead_stop_buttons
+        from c_lord.stale_stop_buttons import sweep_dead_buttons
 
         stale = _Msg(
             author_id=42,
@@ -189,7 +189,7 @@ class TestDeadStopButtonsAreSweptOnStartup:
         repo = MagicMock()
         repo.list_alive = AsyncMock(return_value=[_record()])
 
-        removed = await sweep_dead_stop_buttons(bot, repo)
+        removed = await sweep_dead_buttons(bot, repo)
 
         assert removed == 1
         assert stale.deleted is True
@@ -200,7 +200,7 @@ class TestDeadStopButtonsAreSweptOnStartup:
     async def test_a_stop_message_without_buttons_is_left_alone(self) -> None:
         """No components → nothing to click → nothing to clean up."""
         from c_lord.discord_ui.views import STOP_MESSAGE_PREFIX
-        from c_lord.stale_stop_buttons import sweep_dead_stop_buttons
+        from c_lord.stale_stop_buttons import sweep_dead_buttons
 
         plain = _Msg(author_id=42, content=STOP_MESSAGE_PREFIX, msg_id=1)
         thread = _thread_with([plain])
@@ -211,14 +211,14 @@ class TestDeadStopButtonsAreSweptOnStartup:
         repo = MagicMock()
         repo.list_alive = AsyncMock(return_value=[_record()])
 
-        assert await sweep_dead_stop_buttons(bot, repo) == 0
+        assert await sweep_dead_buttons(bot, repo) == 0
         assert plain.deleted is False
 
     @pytest.mark.asyncio
     async def test_one_unreadable_thread_does_not_stop_the_sweep(self) -> None:
         """A thread we cannot read must not strand the residue in every other."""
         from c_lord.discord_ui.views import STOP_MESSAGE_PREFIX
-        from c_lord.stale_stop_buttons import sweep_dead_stop_buttons
+        from c_lord.stale_stop_buttons import sweep_dead_buttons
 
         stale = _Msg(author_id=42, content=STOP_MESSAGE_PREFIX, components=[MagicMock()], msg_id=1)
         good = _thread_with([stale])
@@ -230,7 +230,7 @@ class TestDeadStopButtonsAreSweptOnStartup:
         repo = MagicMock()
         repo.list_alive = AsyncMock(return_value=[_record(1), _record(2)])
 
-        assert await sweep_dead_stop_buttons(bot, repo) == 1
+        assert await sweep_dead_buttons(bot, repo) == 1
         assert stale.deleted is True
 
 

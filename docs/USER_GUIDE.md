@@ -126,13 +126,20 @@ The bot adds a single emoji reaction to your message to show the turn status:
 | 🟢 | Running — Claude is working (thinking or running tools) |
 | 🟡 | Waiting — the turn finished; it's your turn |
 | ❌ | The turn ended in an error |
-| ⚠️ | No activity for a while — possible stall (extended thinking or compaction) |
-| 🗜️ | Compacting context |
+| ⏳ | No activity for 10 seconds — Claude is probably still thinking |
+| ⚠️ | No activity for 30 seconds — possible stall (extended thinking or context compaction can also be this quiet) |
 
-The reaction flips 🟢 → 🟡 each turn. Because reactions and thread renames use
-different Discord rate limits, this lamp stays responsive even under heavy use;
-the 🟢/🟡 in the **thread name** is a slower, eventually-consistent sidebar view
-(#246).
+The reaction flips 🟢 → 🟡 each turn; ⏳ and ⚠️ are temporary and give way to 🟡
+when the turn ends. Because reactions and thread renames use different Discord rate
+limits, this lamp stays responsive even under heavy use.
+
+The **thread name** does not carry a 🟢/🟡 lamp by default (#329) — it shows only
+`W3 │ <topic>`. Set `CLORD_THREAD_LAMP=1` to turn the thread-name lamp on; it is a
+slower, eventually-consistent sidebar view (#246), so the reaction on your message
+stays the real-time signal. See [あるべき動き: 状態ランプ](specs/thread-lamp.md).
+
+Context compaction is not a reaction: when Claude Code compacts the context, the
+thread gets a one-line `🗜️ コンテキストを圧縮しました` notice (#628).
 
 ---
 
@@ -259,6 +266,13 @@ tmux session gone (killed together with the bot / tmux-server death):
               conversation from the on-disk transcript (claude --continue),
               announced with "🔄 …会話を復元して続けます" so the replayed
               context reads as a restore, not a broken bot (#464).
+    ↓
+Host reboot (tmux and every Claude go down with it):
+              on startup, threads whose Claude was cut off mid-turn get one
+              line — "⚠️ ホストの再起動で、作業の途中で Claude が止まりました…"
+              — decided from the last entry of Claude's own transcript. No
+              mention, no button, no auto-resume; post 「続けて」 to continue
+              (#807, see specs/host-restart-notice.md).
 ```
 
 ### Threads c-lord has no record of
@@ -302,9 +316,19 @@ goes completely silent afterwards — in the default `jsonl` bridge mode the ans
 is delivered by the transcript mirror, so pane silence after an answer is the
 expected steady state, not a hang (#541).
 
+A turn that is waiting for **your answer to a question or plan-approval menu**
+never produces it either. The pane does not move until someone answers, which is
+exactly what it should do — however long you take. The buttons stay answerable
+after five minutes, and answering continues the session (#751). A pane frozen
+while Claude's working spinner is on screen is still reported: that spinner's
+timer redraws every second while Claude is healthy, so if it stops, Claude has
+stopped drawing.
+
 ### Interrupting
 
 Send a new message while Claude is working. The current operation is interrupted (SIGINT) and Claude starts with your new instruction. No need to `/stop` first.
+
+A turn that does not wind down on its own within a few seconds is cancelled. If even that does not finish it within 10 seconds, c-lord stops waiting for it and starts your new instruction anyway — a stuck turn can no longer hold the thread's later messages behind it (#293). The bot log records it as an `orphan run`.
 
 ### Bot Restart
 

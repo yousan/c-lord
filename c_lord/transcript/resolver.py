@@ -14,8 +14,10 @@ one line was enough to hijack the thread's mirror.  Its private conversation
 was then posted into the user's thread, ``user``-role events included, i.e.
 with a 👤 marker saying the user had said things they never said.
 
-:class:`ThreadSessionResolver` answers the real question instead — see
-:data:`CLORD_INPUT_MARKER`.
+:class:`ThreadSessionResolver` answers the real question instead: **the
+transcript c-lord named itself** (``--session-id``, recorded by
+:mod:`c_lord.transcript.claim`), falling back to the older
+:data:`CLORD_INPUT_MARKER` probe for sessions that predate #773.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .claim import claimed_transcript, clear_successor, cleared_at, read_claim, write_claim
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +165,20 @@ class ThreadSessionResolver:
     Answers "which transcript belongs to this thread", where
     :func:`latest_session_jsonl` only answered "who wrote last" (#627).
 
-    Three rules, in order:
+    Four rules, in order:
 
-    1. **Only c-lord-driven transcripts are eligible** (:data:`CLORD_INPUT_MARKER`).
-       A ``claude -p`` sub-invocation writing into the same working copy can no
-       longer capture the mirror.
+    0. **The transcript c-lord named is ours** (#773).  ``start_claude`` passes
+       ``--session-id <uuid>`` and records the uuid beside the transcripts
+       (:mod:`c_lord.transcript.claim`), so ownership is a name c-lord chose —
+       not something read out of the file and therefore not something the CLI's
+       input handling can take away.  This rule alone decides every session
+       c-lord started; the rest are the fallback for sessions that predate it.
+    1. **Otherwise, only c-lord-driven transcripts are eligible**
+       (:data:`CLORD_INPUT_MARKER`).  A ``claude -p`` sub-invocation writing into
+       the same working copy can no longer capture the mirror.  **Claude Code
+       2.1.278+ strips that marker** from interactive input, so this rule alone
+       is not enough any more — it is kept because a marker that *is* there was
+       put there by c-lord, so it is never a false positive (#773).
     2. **Only a *successor* may take over.**  Once a transcript is pinned, the
        pin moves only to a file that **appeared after** it was pinned — which is
        what a ``/clear`` produces.  A file that was already sitting in the
@@ -174,8 +187,11 @@ class ThreadSessionResolver:
        back over a transcript it has already read and re-post it (#627 AC3).
     3. **Nothing eligible → ``None``.**  The mirror posts nothing and says so
        once in the log.  Silence is the safe failure: reading somebody else's
-       conversation is the bug (#627 AC4).  It heals by itself — the next turn
-       c-lord drives writes the marker into that thread's transcript.
+       conversation is the bug (#627 AC4).  Silence is **not** a safe failure
+       for the reader, though, so a mirror whose turn is running also says so in
+       the thread (#773/#585) — #627's "it heals by itself on the next turn"
+       stopped being true the moment the marker stopped surviving, and nothing
+       noticed for three days.
 
     Cheap enough to call twice a second per mirror (#537): the directory is
     re-listed only when it has actually changed (appending to a transcript does
@@ -194,6 +210,22 @@ class ThreadSessionResolver:
     # successor is a candidate that is *not* in here (rule 2).
     _known_at_pin: set[Path] = field(default_factory=set)
     _warned_none: bool = False
+    # The session id c-lord claimed for this project dir, as of the last
+    # resolve.  Reported to the reader when nothing resolves (#773), so the
+    # message can say whether c-lord even got as far as naming a session.
+    _claimed_session_id: str | None = None
+    # path -> (size when probed, when the /clear that opens it ran) — #803
+    _clear_times: dict[Path, tuple[int, float | None]] = field(default_factory=dict)
+
+    @property
+    def claimed_session_id(self) -> str | None:
+        """The session id c-lord last started here, as of the last resolve (#773)."""
+        return self._claimed_session_id
+
+    @property
+    def candidate_count(self) -> int:
+        """How many jsonl files the last listing saw — diagnosis, not a decision."""
+        return len(self._candidates)
 
     def resolve(self) -> Path | None:
         """Return the jsonl to read, or ``None`` when none is eligible.
@@ -201,6 +233,35 @@ class ThreadSessionResolver:
         Blocking (``stat`` / listing / bounded reads): callers on the event loop
         must run it in a worker thread (#537).
         """
+        # Rule 0 (#773): the transcript c-lord named for itself.  Checked before
+        # the listing because it needs neither — two stats answer it — and
+        # because it must win over a *marked* leftover from an earlier session
+        # in the same workspace, however new that file looks.
+        claimed = claimed_transcript(self.project_dir)
+        self._claimed_session_id = read_claim(self.project_dir)
+        if claimed is not None:
+            # #803: a ``/clear`` — typed by c-lord or by a human in the pane —
+            # starts a new transcript under a new name.  Follow it, and move the
+            # claim with it so a later ``--resume`` opens the cleared session.
+            successor = self._clear_successor(claimed.stem)
+            if successor is not None:
+                claimed = successor
+                self._claimed_session_id = successor.stem
+            if claimed != self._pinned:
+                if self._pinned is not None:
+                    logger.info(
+                        "TranscriptMirror: following the session c-lord started, %s (was %s)",
+                        claimed.name,
+                        self._pinned.name,
+                    )
+                self._pinned = claimed
+                # Rule 2 is about *successors* of a pin we guessed at; a claimed
+                # pin is not a guess, so seed the baseline from the directory as
+                # it is now and let a later claim (a restart) move it instead.
+                self._known_at_pin = set(self._candidates)
+            self._warned_none = False
+            return claimed
+
         try:
             dir_mtime = self.project_dir.stat().st_mtime
         except OSError:
@@ -246,13 +307,60 @@ class ThreadSessionResolver:
                 self._warned_none = True
                 logger.warning(
                     "TranscriptMirror: no c-lord-driven transcript in %s "
-                    "(%d jsonl file(s) present) — posting nothing rather than "
-                    "mirroring another session's conversation (#627)",
+                    "(%d jsonl file(s) present, claimed session id %s) — posting "
+                    "nothing rather than mirroring another session's conversation "
+                    "(#627/#773)",
                     self.project_dir,
                     len(self._candidates),
+                    self._claimed_session_id or "none",
                 )
             return None
         return self._pinned
+
+    def _clear_successor(self, claimed_id: str) -> Path | None:
+        """The transcript a ``/clear`` of the claimed session started, if any (#803).
+
+        Looked for only when the directory listing changed — a ``/clear``
+        creates a file — so an idle poll still costs a stat.  The claim is
+        rewritten here: the resolver is the one place that sees a ``/clear``
+        typed straight into the pane, and without the claim a later
+        ``--resume`` would reopen the conversation that was cleared.
+        """
+        try:
+            dir_mtime = self.project_dir.stat().st_mtime
+        except OSError:
+            return None
+        if not self._listing_is_stale(dir_mtime):
+            return None
+        try:
+            self._candidates = [p for p in self.project_dir.glob("*.jsonl") if p.is_file()]
+        except OSError:
+            return None
+        self._dir_mtime = dir_mtime
+        self._listed_at = time.time()
+        successor_id = clear_successor(self.project_dir, claimed_id, probe=self._cleared_at)
+        if successor_id is None or not write_claim(self.project_dir, successor_id):
+            return None
+        logger.info(
+            "TranscriptMirror: /clear started session %s (was %s) — following it and "
+            "moving the claim (#803)",
+            successor_id,
+            claimed_id,
+        )
+        return self.project_dir / f"{successor_id}.jsonl"
+
+    def _cleared_at(self, path: Path) -> float | None:
+        """:func:`cleared_at`, cached until the file's size changes."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        cached = self._clear_times.get(path)
+        if cached is not None and cached[0] == size:
+            return cached[1]
+        at = cleared_at(path)
+        self._clear_times[path] = (size, at)
+        return at
 
     def _listing_is_stale(self, dir_mtime: float) -> bool:
         """Whether the cached directory listing has to be rebuilt.

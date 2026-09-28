@@ -108,6 +108,41 @@ verified with the bot's actual `answer_menu` selecting the intended option.
 While the bridge waits for the click, the runner is suspended at its `yield`,
 so the pane is not re-polled and the menu is not re-detected (natural dedup).
 
+### Which option was chosen — by index, never by label (#674)
+
+**A click is identified by the option's position, not its text.** Labels are
+display text, and display text gets altered on the way to Discord: cut to the
+80-character label limit, `.strip()`ped, or replaced by the TUI's own number
+when the pane parser could not read it (#579 — two such options both have the
+label `""`).
+
+| where | what identifies the option |
+|---|---|
+| Select option `value` | `option:{index}` (`ask_view.py::_option_value`) |
+| button | the index bound by `_make_button_callback(view, index)` |
+| the ask bus | a `ChosenOption` — the option's **full** label as a `str`, carrying `option_index` (`ask_bus.py`) |
+| `send_answer_keystrokes` | `option_index` when present; label matching **only** for text with no index (✏️ Other, a typed sentence — so a sentence that spells an option exactly still picks it) |
+
+It used to be the label end to end: the Select `value` was the label cut to 80
+characters, and `send_answer_keystrokes` matched it against the untruncated
+labels. An option longer than 80 characters therefore matched nothing and fell
+through to the free-text path — **Claude received its first 80 characters as a
+sentence the user had typed**. Buttons were spared only because their callback
+happened to carry the untruncated label.
+
+The multi-select marks (#672 below) use the same `value`, so `_mark_selected`
+writes and `_recover_selection` reads the same key — changing one without the
+other would break recovery. A menu posted **before** #674 still carries the
+labels as its values; `AskView._index_of` resolves those too, because the deploy
+that ships this restarts the bot and #671 re-arms every menu still on screen.
+A value that names no option of the menu is refused with an ephemeral notice and
+a log line — it is never delivered as an empty answer, which is the #315
+pre-emption signal and would Esc the menu away.
+
+Because what travels is still the full label, everything that only *shows* the
+answer (the ⏳ / ✅ embeds, the non-tmux answer prompt) now shows the whole
+option rather than its first 80 characters.
+
 ## How a multi-select is answered (#418)
 
 `answer_menu(index)` is single-select only — it sends `Down×index + Enter`, so a
@@ -161,7 +196,7 @@ on every message edit, so a recorded choice used to vanish from the dropdown and
 read as "my selection did not take" — now it stays checked.
 
 > Interaction with #671: a restored view starts with an empty
-> `_selected_values`, so this fallback is what lets it confirm correctly. The
+> `_selected_indices`, so this fallback is what lets it confirm correctly. The
 > selection needs no DB column — it is already on the message.
 
 ## How free text (`✏️ Other`) is answered (#172, #650)
@@ -582,6 +617,14 @@ the final state after the keystrokes, from the best evidence available:
    The menu's `tool_use` id is looked up **before** answering (afterwards a newer
    menu may already exist), and the pane's cwd gives the project dir
    (`TmuxClaudeRunner.transcript_project_dir`).
+   **The newest ask is this menu only if it has no result yet** (#746, found on
+   staging). The CLI sometimes writes a menu's `tool_use` only together with its
+   result; the newest ask in the file is then an earlier, finished one, and
+   judging this answer by *its* result (a rejection, say) is wrong. So when the
+   newest ask already has a result, the menu is the **first ask written after
+   it** (`first_ask_tool_use_after` — the earliest, never a later question), read
+   once it appears. Plan approval (`allow_other=False`) writes no ask at all, so
+   for it the pane is the evidence (`ask_handler._locate_menu`).
 2. **The pane**, when there is no transcript to read: "the menu is gone". Weaker
    — it cannot tell a real answer from a discarded one — but far better than the
    pre-#651 answer of not looking at all.
@@ -590,14 +633,47 @@ the final state after the keystrokes, from the best evidence available:
 |---|---|
 | answered | `✅` with the question and the answer (as before) |
 | not answered | `⚠️` naming it: 「キーは送れましたが、Claude 側には『回答なし』として渡りました」 |
-| not confirmed within the bound | `❔ 回答の結果を確認できませんでした` — neither claim is made |
+| not in the transcript yet (#746) | `⏳ … Claude の受け取りを確認中です` — then corrected to ✅ / ⚠️ when the result lands |
+| never confirmed | `❔ 回答の結果を確認できませんでした` — neither claim is made, and no advice to re-send |
 
-**The bound is deliberate.** `_ANSWER_CONFIRM_TIMEOUT = 12s`, polled every
-`_ANSWER_CONFIRM_POLL = 0.5s`. The ✅ waits on this, so it is latency the user
-sees; measured on staging the `tool_result` lands about a second after the keys,
-so 12s is slack for a busy host rather than an expected wait. Timing out is
-reported as ❔, never as ✅: silence is not evidence of success — and it is not
-evidence of failure either, so it is not reported as ⚠️.
+**The window is deliberate.** `_ANSWER_CONFIRM_TIMEOUT = 12s`, polled every
+`_ANSWER_CONFIRM_POLL = 0.5s`. The bridge holds the thread's menu claim while it
+waits, and the next question of the same ask is already on screen needing to be
+bridged — so this cannot grow. For a single-question ask the `tool_result` lands
+about a second after the keys (measured on staging), and the window decides.
+
+**But the window is not the last word (#746).** One AskUserQuestion may carry
+several questions, and the CLI writes its `tool_result` only once the **last**
+one is answered — production measured +198s and +53min. Every earlier answer
+therefore cannot be confirmed in the window. What happens instead:
+
+1. at the end of the window the menu reads **`⏳ 確認中`** (`ask_confirming_embed`),
+   and the bridge returns — the thread is free for the next question;
+2. a background watcher (`ask_handler._confirm_late`) keeps reading that one
+   session file, backing off from 1s to 10s between reads;
+3. when the result lands the menu is corrected to ✅ (or ⚠️ for "no answer" —
+   late is not the same as successful);
+4. only if nothing is written for `ASK_ANSWER_TIMEOUT + 1h` does it settle on ❔.
+   By then the rest of the ask has been Esc'd (which writes a result of its own),
+   so reaching the bound means the session itself is gone.
+
+Neither ⏳ nor ❔ tells the user to send the answer again. It used to
+(「同じ内容をスレッドにもう一度送ってください」) — over answers that had landed —
+and a re-sent answer is an ordinary message, which **interrupts** the turn that
+is using it (#631's shape). The ❔ now points at where the truth shows up: Claude's
+next reply.
+
+`ask answer outcome=unknown` is logged only from step 4 (or when there is no
+transcript to read at all), so a production grep for it finds answers that
+really could not be confirmed — not answers that were merely late.
+
+**Known limit:** the watcher lives in the bot process. A restart while a menu
+reads ⏳ leaves it at ⏳ (true when written, and carrying no advice that could
+hurt); the stop is logged at INFO.
+
+When there is no transcript to read (the pane is the only evidence), there is no
+watcher: the pane cannot tell a later question of the same ask from this one, so
+a longer watch would learn nothing. The window's ❔ is final there.
 
 ## Answering by typing (#536 AC7)
 
@@ -614,6 +690,33 @@ the ✏️ Other modal. The menu's copies are blanked to `✏️ 文章で回答
 and the thread gets a **「これは新しい指示でした」** button
 (`views.py::TextAnsweredMenuView`) that re-dispatches the message as an
 instruction — the old behaviour, one click away.
+
+### Consumed has to mean delivered (#804)
+
+`ask_bus.post_answer()` only queues the answer in this process. Saying
+「送りました」 from its return value is the same optimism #651 took out of the
+button path, and on 2026-09-24 it cost a whole exchange: the pane was gone, the
+keystrokes reached nothing two seconds later, and because the sentence had
+already been consumed as a menu answer, Claude recorded
+`User declined to answer questions` and ended the turn. Three rules now hold:
+
+1. **The pane is checked first.** No tmux window ⇒ the menu died with the
+   process that drew it. The workspace is restored (`wake_workspace`, #642) with
+   a line saying so, and the sentence goes as an ordinary **instruction** — a
+   restored Claude is back at its prompt, and a prompt can still take the
+   answer; menu keystrokes typed at it could not.
+2. **The claim waits for a verdict.** The bridge reports what became of the
+   answer on the bus (`ask_bus.note_delivery`, one of `DELIVERY_*`), taken from
+   the same evidence #651 uses — keystroke delivery, then Claude's own
+   transcript. The thread shows `-# ⏳ …送っています` meanwhile and **that same
+   message is rewritten** with the outcome, so one answer can never produce two
+   contradictory messages.
+3. **An answer that did not land is handed back.** `_maybe_answer_open_menu`
+   returns False, so the caller runs the sentence as an instruction. Nothing is
+   consumed by a menu that could not take it.
+
+A click arms nothing on the bus, so the button path is untouched — its feedback
+is still the menu message being rewritten with the verified outcome.
 
 Guessing "answer" is the right default because the two mistakes are not
 symmetric: a mis-read instruction costs one button, while a dropped answer costs
@@ -838,8 +941,9 @@ from Claude Code v2.1.252.
 | One-owner-per-thread menu arbitration (#535) | `c_lord/discord_ui/ask_bus.py::AskAnswerBus.register` |
 | Why a menu closed / what a late click is told (#536) | `ask_bus.py::note_closed`, `ask_view.py::_undeliverable_reason` |
 | Answered / undelivered embeds (#536) | `embeds.py::ask_answered_embed`, `ask_undelivered_embed` |
-| Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
-| Interim / unconfirmed embeds (#651) | `embeds.py::ask_sending_embed`, `ask_unconfirmed_embed` |
+| Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_locate_menu` / `_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
+| Interim / unconfirmed embeds (#651/#746) | `embeds.py::ask_sending_embed`, `ask_confirming_embed`, `ask_unconfirmed_embed` |
+| Correcting the menu when the result lands late (#746) | `ask_handler.py::settle_answer` / `_confirm_late` |
 | Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |
 | 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
@@ -855,4 +959,5 @@ from Claude Code v2.1.252.
 | Send selection keystrokes | `tmux_runner.py::answer_menu` / `answer_menu_multi` (#418) / `answer_menu_text` |
 | Multi-select confirm button | `ask_view.py::AskView` (`_multi_select_record` + `_confirm_callback`, #418) |
 | Multi-select choice stored on the message | `ask_view.py::AskView._mark_selected` / `_recover_selection` (#672) |
+| Option identified by index, not label (#674) | `ask_view.py::_option_value` / `AskView._index_of` / `_answers`, `ask_bus.py::ChosenOption`, `ask_handler.py::_option_index` |
 | Regression fixtures | `tests/fixtures/panes/ask_user_question_*.txt` |
