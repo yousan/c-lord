@@ -453,6 +453,39 @@ def extract_login_required(pane: str) -> str | None:
     return found[-1] if found else None
 
 
+def _login_refusal_after_prompt(pane: str, prompt: str) -> str | None:
+    """The login refusal drawn under THIS turn's prompt, else None (#812).
+
+    Claude refuses in 0s, so the refusal is often on screen before the runner's
+    first capture — a count taken then already includes it, and never grows.
+    Anchoring on the echo of this prompt tells this turn's refusal apart from
+    one redrawn from an earlier turn (``--resume`` shows the conversation tail),
+    whichever capture sees it first.  None when the echo is not on the pane
+    (e.g. a prompt too long to fit), where the count below is the fallback.
+    """
+    from ..transcript.formatter import ZWSP_MARKER
+
+    def _squash(text: str) -> str:
+        return "".join(text.split()).replace(ZWSP_MARKER, "")
+
+    first = next((ln for ln in prompt.splitlines() if ln.strip()), "")
+    key = _squash(first)[:16]
+    if not key or not pane:
+        return None
+    lines = pane.splitlines()
+    echo = None
+    for i, line in enumerate(lines):
+        if _squash(line).lstrip("❯>").startswith(key):
+            echo = i
+    if echo is None:
+        return None
+    for line in lines[echo + 1 :]:
+        m = _LOGIN_REQUIRED_RE.search(line)
+        if m:
+            return m.group("line")
+    return None
+
+
 def _count_login_required(pane: str) -> int:
     """How many login refusals *pane* shows (#812).
 
@@ -1810,8 +1843,11 @@ class TmuxClaudeRunner:
             if not baseline_login_captured:
                 baseline_login_captured = True
                 baseline_login_count = login_count
-            if login_count > baseline_login_count:
-                login_required = extract_login_required(current)
+            refusal = _login_refusal_after_prompt(current, prompt)
+            if refusal is None and login_count > baseline_login_count:
+                refusal = extract_login_required(current)
+            if refusal is not None:
+                login_required = refusal
                 logger.warning(
                     "%s Claude Code login required, aborting poll: %s",
                     log_ctx(thread_id=self._thread_id),

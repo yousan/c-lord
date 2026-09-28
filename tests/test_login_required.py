@@ -90,7 +90,12 @@ def runner(tmux_manager: MagicMock) -> TmuxClaudeRunner:
 
 
 async def _run(
-    runner: TmuxClaudeRunner, captures: list[str], final: str, *, idle: float = 30.0
+    runner: TmuxClaudeRunner,
+    captures: list[str],
+    final: str,
+    *,
+    idle: float = 30.0,
+    prompt: str = "hello",
 ) -> list:
     def _capture(*_a: object, **_k: object) -> str:
         return captures.pop(0) if captures else final
@@ -105,7 +110,7 @@ async def _run(
     ):
 
         async def _drain() -> list:
-            return [e async for e in runner.run("hello")]
+            return [e async for e in runner.run(prompt)]
 
         events = await asyncio.wait_for(_drain(), timeout=8)
     return [e for e in events if e.is_complete]
@@ -149,7 +154,45 @@ class TestRunnerReportsLogin:
     ) -> None:
         """A resumed session redraws yesterday's refusal; today's turn is not refused."""
         runner.timeout_seconds = 1  # a frozen residual pane only ends at the backstop
-        result = await _run(runner, [LOGIN_PANE, LOGIN_PANE], LOGIN_PANE, idle=0.3)
+        result = await _run(
+            runner, [LOGIN_PANE, LOGIN_PANE], LOGIN_PANE, idle=0.3, prompt="次の依頼"
+        )
+        assert len(result) == 1
+        assert not (result[0].error or "").startswith(LOGIN_REQUIRED_ERROR_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_refusal_drawn_before_the_first_poll_is_caught(
+        self, runner: TmuxClaudeRunner
+    ) -> None:
+        """Claude refuses in 0s, so the refusal can beat the first capture.
+
+        Staging GREEN attempt 1 missed exactly this: the old refusal plus the new
+        one were both on the first capture, the count never "grew", and the turn
+        ended as a normal answer. The refusal right under THIS prompt's echo is
+        what identifies it.
+        """
+        pane = (
+            "❯ 前の依頼\n\n● Login expired · Please run /login\n\n"
+            "❯ \u200b次の依頼です\n\n● Login expired · Please run /login\n\n"
+            "✻ Cooked for 0s\n────\n❯ \n────\n"
+        )
+        result = await _run(runner, [], pane, idle=0.3, prompt="次の依頼です")
+        assert len(result) == 1
+        assert (result[0].error or "").startswith(LOGIN_REQUIRED_ERROR_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_resumed_refusal_above_this_prompt_is_not_this_turn(
+        self, runner: TmuxClaudeRunner
+    ) -> None:
+        """After /login, a cold --resume redraws the old refusal above the new prompt."""
+        runner._tmux.is_claude_running.return_value = False  # type: ignore[attr-defined]
+        runner.timeout_seconds = 1
+        pane = (
+            "❯ 前の依頼\n\n● Login expired · Please run /login\n\n"
+            "❯ 前の依頼\n\n● はい、起動しました。\n\n────\n❯ \n────\n"
+        )
+        with patch.object(TmuxClaudeRunner, "_handle_startup_prompts", AsyncMock()):
+            result = await _run(runner, [], pane, idle=0.3, prompt="前の依頼")
         assert len(result) == 1
         assert not (result[0].error or "").startswith(LOGIN_REQUIRED_ERROR_PREFIX)
 
