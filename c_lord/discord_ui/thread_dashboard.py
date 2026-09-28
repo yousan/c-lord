@@ -82,9 +82,20 @@ _SWEEP_MAX_FAILURES = 5
 _SWEEP_ENV_FLAG = "CLORD_DASHBOARD_SWEEP"
 _OFF_VALUES = {"0", "false", "no", "off"}
 
+#: Opt in to the board itself (#761). Off by default: every start used to post
+#: or rewrite the board in the channel, and development restarts the bot many
+#: times a day. The turn-end ping is NOT governed by this — only the board.
+_BOARD_ENV_FLAG = "CLORD_SESSION_STATUS_BOARD"
+_ON_VALUES = {"1", "true", "yes", "on"}
+
 # Threads older than this are pruned from the dashboard automatically.
 # Keeps the embed from accumulating stale entries after a long idle period.
 _STALE_HOURS = 4
+
+
+def board_enabled() -> bool:
+    """Whether this deployment shows the 📊 Session Status board (#761, opt-in)."""
+    return os.getenv(_BOARD_ENV_FLAG, "").strip().lower() in _ON_VALUES
 
 
 def _sweep_enabled() -> bool:
@@ -209,8 +220,12 @@ class ThreadStatusDashboard:
         channel: discord.TextChannel,
         owner_id: int | None = None,
         bot_user_id: int | None = None,
+        board: bool | None = None,
     ) -> None:
         self._channel = channel
+        # #761: None → ``CLORD_SESSION_STATUS_BOARD`` decides (off by default).
+        self._board_enabled = board_enabled() if board is None else board
+        self._retired = False
         self._bot_user_id = bot_user_id
         self._sweep_task: asyncio.Task[None] | None = None
         self._owner_id = owner_id
@@ -235,6 +250,10 @@ class ThreadStatusDashboard:
         behind. The dead boards of earlier processes are deleted in the
         background (opt out with ``CLORD_DASHBOARD_SWEEP=0``).
         """
+        if not self._board_enabled:
+            await self._retire_boards()
+            return
+
         stale: list[discord.Message] = []
         async with self._lock:
             if self._dashboard_message is not None:
@@ -264,6 +283,28 @@ class ThreadStatusDashboard:
             # and must never hold up on_ready. Keep the reference so the task
             # is not garbage collected mid-flight.
             self._sweep_task = asyncio.create_task(self._sweep_dead_boards(stale))
+
+    async def _retire_boards(self) -> None:
+        """Board off (#761): post nothing, and sweep the boards earlier starts left.
+
+        A board nobody updates any more is the #754 lie — rows reading
+        "0s ago" for days — so it goes, under the same rules as the #720 sweep
+        (only our own boards; ``CLORD_DASHBOARD_SWEEP=0`` keeps them). Done
+        once per process: ``on_ready`` fires again on every reconnect.
+        """
+        if self._retired:
+            return
+        self._retired = True
+        boards = await self._find_own_boards()
+        logger.info(
+            "Session Status board is off (set %s=1 to show it) — %d board(s) from "
+            "earlier starts to retire in channel %s",
+            _BOARD_ENV_FLAG,
+            len(boards),
+            getattr(self._channel, "id", "?"),
+        )
+        if boards:
+            self._sweep_task = asyncio.create_task(self._sweep_dead_boards(boards))
 
     async def _adopt(self, candidate: discord.Message, embed: discord.Embed) -> bool:
         """Try to take over *candidate* as the live board. True when adopted."""

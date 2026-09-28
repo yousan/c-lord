@@ -158,6 +158,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Compact notice** — When Claude Code compacts the context, the thread gets a one-line `🗜️ コンテキストを圧縮しました` instead of the raw continuation summary (#628)
 - **Hard stall lamp** — After 30 s of no activity the reaction on your message turns ⚠️ (extended thinking or context compression can be this quiet too); no message is posted to the thread (#473)
 - **Turn progress line** — When a turn goes quiet for 90 s, one subtext line appears (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), refreshes in place every 15 s, and disappears the moment real output returns; says `⏳ 待機中` when even tool activity has stopped. Never posted outside a turn. Opt out with `CLORD_TURN_PROGRESS=0` (#539)
+- **📊 Session Status board** — Off by default (#761). Set `CLORD_SESSION_STATUS_BOARD=1` to keep one live board in `DISCORD_CHANNEL_ID` listing each session as 🟢 Auto-processing / 🟡 Waiting for input. While it is off, a starting bot posts nothing to the channel and retires any board earlier starts left behind; the turn-end `🟡 Claude has finished … @you` ping in the thread is unaffected. See `docs/specs/session-status-board.md`
 - **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541), and neither does a question/plan menu left waiting for your answer (#751)
 
 #### 🔌 Input & Skills
@@ -387,6 +388,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
 | `CLORD_AUTO_TOPIC` | Set to `1`/`true`/`yes`/`on` to let c-lord summarise a **new** thread's name with an LLM (haiku) on its first message — the pre-#705 behaviour. Off by default: the thread keeps the name it was opened with, and `/thread-rename` (sonnet) re-summarises on demand. | `false` |
+| `CLORD_SESSION_STATUS_BOARD` | Set to `1`/`true`/`yes`/`on` to show the 📊 Session Status board in `DISCORD_CHANNEL_ID` (#761). Off by default: a start posts nothing there and retires boards earlier starts left. The turn-end ping in the thread is not affected. | `false` |
 | `CLORD_THREAD_RETITLE` | Set to `1`/`true`/`yes`/`on` to re-title a thread mid-conversation when an LLM judges the work changed (#121). Off by default (#414) — it renamed threads too eagerly. | `false` |
 
 ### URL Link Previews (CLORD_SHOW_URL_EMBEDS)
