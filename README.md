@@ -139,7 +139,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Thread names stay yours** — c-lord never re-summarises a thread's name on its own. A thread keeps the name it was opened with (only the `W<N> │` prefix and the `#<issue>` number are added around it); run `/thread-rename` in the thread when you want a fresh summary of the recent conversation (sonnet). `CLORD_AUTO_TOPIC=1` restores the old auto-summary (#705)
 
 #### 📡 Real-time Feedback
-- **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⚠️ if it stalls). Reactions stay responsive under heavy use; the thread-name lamp is the slower, eventually-consistent sidebar view (#246)
+- **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⏳ / ⚠️ if it goes quiet for 10 s / 30 s). Reactions stay responsive under heavy use. A 🟢/🟡 lamp in the thread name is off by default (#329); set `CLORD_THREAD_LAMP=1` for that slower, eventually-consistent sidebar view (#246)
 - **Streaming text** — Intermediate assistant text appears as Claude works
 - **Tool result embeds** — Live tool call results with elapsed time ticking up every 10s
 - **Extended thinking** — Reasoning shown as spoiler-tagged embeds (click to reveal)
@@ -155,8 +155,8 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 #### 📊 Observability
 - **Token usage** — Cache hit rate and token counts shown in session-complete embed
 - **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
-- **Compact detection** — Notifies in-thread when context compaction occurs (trigger type + token count before compact)
-- **Hard stall notification** — Thread message after 30 s of no activity (extended thinking or context compression); resets automatically when Claude resumes
+- **Compact notice** — When Claude Code compacts the context, the thread gets a one-line `🗜️ コンテキストを圧縮しました` instead of the raw continuation summary (#628)
+- **Hard stall lamp** — After 30 s of no activity the reaction on your message turns ⚠️ (extended thinking or context compression can be this quiet too); no message is posted to the thread (#473)
 - **Turn progress line** — When a turn goes quiet for 90 s, one subtext line appears (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), refreshes in place every 15 s, and disappears the moment real output returns; says `⏳ 待機中` when even tool activity has stopped. Never posted outside a turn. Opt out with `CLORD_TURN_PROGRESS=0` (#539)
 - **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541), and neither does a question/plan menu left waiting for your answer (#751)
 
@@ -399,6 +399,8 @@ When enabled, Markdown pipe tables in Claude's responses are rendered as PNG ima
 
 **Every message the mirror posts is covered — progress updates as well as the final answer** (#683). Discord draws no Markdown tables at all, so a table it does not render is a column of raw `|` characters, and intermediate messages stay in the thread after the turn ends. Applying this only to the final answer therefore left the reader unable to predict which tables would be readable.
 
+**The image rides on the message the table is in.** A reply longer than 2000 characters is split into several messages; each table's PNG is attached to the message that contains that table (a table the split cuts between two rows is drawn whole, on the message where it starts). Before #750 every image went to the *last* message, so a table in the first half stayed as raw pipes there while its picture hung under an unrelated paragraph further down. `progress.txt` still goes on the last message.
+
 **At most 10 tables per message become images.** That is Discord's attachment ceiling, and exceeding it fails the whole send — text included — so tables past the tenth stay as raw markdown rather than costing the message. The limit is per message, not per turn: each progress message carries its own allowance. When the reply also carries `progress.txt`, that file takes one slot and the tables get the other nine.
 
 **Inline markdown inside cells is collapsed to plain text** before drawing — the image cannot be made interactive, so leaving the raw syntax in would just leak noise. `[label](url)` / `![alt](url)` become `label` (the URL is unclickable in an image and only adds clutter), and `**bold**` / `*italic*` / `` `code` `` keep only their inner text. Underscore emphasis (`_x_`, `__x__`) is intentionally left untouched so identifiers such as `_is_allowed` / `__init__` are not mangled.
@@ -549,6 +551,8 @@ await bot.add_cog(WebhookTriggerCog(
 ```
 
 **Security:** Prompts are defined server-side. Webhooks only select which trigger to fire — no arbitrary prompt injection.
+
+**What happens on a trigger:** the webhook message gets a thread, Claude runs in its own tmux window in the trigger's `working_dir` (or the runner's), and its answer is posted into that thread. If the window cannot be created (e.g. tmux is unavailable on the host), the run does not start: the thread says why, the webhook message gets ❌, and the bot owner is mentioned (#629).
 
 ### Example: Auto-Approve Owner PRs
 

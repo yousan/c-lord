@@ -26,6 +26,17 @@ CLOSE_TERMINAL = "terminal"  # answered/cancelled directly in the tmux pane
 CLOSE_TIMEOUT = "timeout"  # nobody answered within ASK_ANSWER_TIMEOUT
 CLOSE_INTERRUPTED = "interrupted"  # a new instruction pre-empted the turn (#315)
 
+# What became of an answer the bus routed to the TUI (#804).  The bus itself
+# only ever queues an answer, so "post_answer returned True" means "someone is
+# listening", never "Claude got it" — announcing the second from the first is
+# how a typed answer came to be reported as 送りました while Claude recorded it
+# as a refusal.  The bridge that actually types the keystrokes reports one of
+# these, and whoever needs to speak to the user waits for it.
+DELIVERY_DELIVERED = "delivered"  # keystrokes landed AND Claude recorded the answer
+DELIVERY_UNDELIVERED = "undelivered"  # the keystrokes reached no window at all (#600)
+DELIVERY_NOT_ANSWERED = "not_answered"  # keys landed, Claude recorded "no answer" (#650)
+DELIVERY_UNCONFIRMED = "unconfirmed"  # keys landed, the outcome could not be read (#651)
+
 # Closure notes are only useful while a stale copy of the menu can still be
 # clicked; the ask-menu answer timeout (24h) is that horizon.
 _CLOSE_NOTE_TTL = 86_400.0
@@ -47,6 +58,8 @@ class AskAnswerBus:
         # thread_id -> may a typed sentence be delivered as this menu's answer?
         # (#536 AC7) False for plan-approval menus, which have no free-text row.
         self._free_text: dict[int, bool] = {}
+        # thread_id -> where to report what became of this thread's answer (#804)
+        self._delivery: dict[int, asyncio.Queue[str]] = {}
 
     def register(
         self, thread_id: int, *, allow_free_text: bool = False
@@ -117,6 +130,39 @@ class AskAnswerBus:
         instruction rather than becoming stray keystrokes.
         """
         return bool(self._free_text.get(thread_id, False)) and thread_id in self._waiters
+
+    def watch_delivery(self, thread_id: int) -> asyncio.Queue[str]:
+        """Arm a channel for the verdict on *thread_id*'s next answer (#804).
+
+        Armed by whoever is about to :meth:`post_answer` and needs to tell the
+        user what happened — today that is the typed-sentence path in
+        ``ClaudeChatCog``.  A click does not arm it: the button already has its
+        own feedback (the menu message is rewritten with the verified outcome by
+        the bridge), and arming from there would change a path #651 settled.
+
+        Always call :meth:`unwatch_delivery` when done, or a verdict meant for
+        the next answer lands in a queue nobody reads.
+        """
+        q: asyncio.Queue[str] = asyncio.Queue()
+        self._delivery[thread_id] = q
+        return q
+
+    def note_delivery(self, thread_id: int, verdict: str) -> None:
+        """Report what became of *thread_id*'s answer — one of ``DELIVERY_*`` (#804).
+
+        A no-op when nobody armed a channel, which is the normal case (clicks).
+        Reporting is therefore always safe to do, and the bridge does it on
+        every exit that consumed an answer.
+        """
+        q = self._delivery.get(thread_id)
+        if q is None:
+            return
+        q.put_nowait(verdict)
+        logger.debug("AskAnswerBus: delivery verdict %s for thread %d", verdict, thread_id)
+
+    def unwatch_delivery(self, thread_id: int) -> None:
+        """Stop listening for *thread_id*'s delivery verdict (#804)."""
+        self._delivery.pop(thread_id, None)
 
     def unregister(self, thread_id: int) -> None:
         """Remove the waiter for *thread_id* (called after answer or timeout)."""

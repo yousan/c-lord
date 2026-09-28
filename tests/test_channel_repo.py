@@ -279,6 +279,41 @@ class TestNormalizeRepoUrl:
             == "https://github.com/owner/repo.git"
         )
 
+    # --- #476: scheme-less URLs copied from a browser address bar ---
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("github.com/owner/repo", "https://github.com/owner/repo.git"),
+            ("github.com/owner/repo.git", "https://github.com/owner/repo.git"),
+            ("github.com/owner/repo/pull/2", "https://github.com/owner/repo.git"),
+            (
+                "github.com/sakana1235/NiyaReco.love",
+                "https://github.com/sakana1235/NiyaReco.love.git",
+            ),
+            ("GitHub.com/owner/repo", "https://GitHub.com/owner/repo.git"),
+            ("gitlab.com/owner/repo", "https://gitlab.com/owner/repo.git"),
+            ("gitlab.com/owner/repo/-/merge_requests/3", "https://gitlab.com/owner/repo.git"),
+            ("bitbucket.org/owner/repo", "https://bitbucket.org/owner/repo.git"),
+            ("  github.com/owner/repo/  ", "https://github.com/owner/repo.git"),
+        ],
+    )
+    def test_schemeless_known_host_gets_https(self, url: str, expected: str) -> None:
+        assert normalize_repo_url(url) == expected
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "/home/user/repos/github.com/owner/repo",
+            "./github.com/owner/repo",
+            "repos/my-project",
+            "example.com/owner/repo",
+        ],
+    )
+    def test_schemeless_unknown_form_unchanged(self, url: str) -> None:
+        # Anything that is not a known forge host keeps the pre-#476 behavior.
+        assert normalize_repo_url(url) == url
+
 
 # ===========================================================================
 # Bind handlers normalize the URL before persisting (#88)
@@ -317,6 +352,32 @@ class TestBindNormalizesUrl:
         binding = await thread_repo.get(200)
         assert binding is not None
         assert binding["source_repo"] == "https://github.com/owner/repo.git"
+
+    async def test_clord_init_schemeless_url_is_clonable(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        # #476: this exact value was stored in production and `git clone` refused it.
+        respond = AsyncMock()
+        await cog._clord_init_impl(
+            channel_id=100,
+            user=MagicMock(),
+            repo="github.com/sakana1235/NiyaReco.love",
+            remove=False,
+            respond=respond,
+        )
+        binding = await repo.get(100)
+        assert binding is not None
+        assert binding["source_repo"] == "https://github.com/sakana1235/NiyaReco.love.git"
+
+    async def test_bind_thread_schemeless_url_is_clonable(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        # `/clord repo:` (#514) goes through bind_thread, not _clord_init_impl.
+        bound = await cog.bind_thread(300, "gitlab.com/owner/repo", channel_id=100)
+        assert bound == "https://gitlab.com/owner/repo.git"
+        binding = await thread_repo.get(300)
+        assert binding is not None
+        assert binding["source_repo"] == "https://gitlab.com/owner/repo.git"
 
 
 # ===========================================================================

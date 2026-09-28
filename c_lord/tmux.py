@@ -2063,6 +2063,60 @@ class TmuxSessionManager:
 
     # ── Claude execution API ────────────────────────────────────────
 
+    def _session_flags(self, pane_path: str | None, *, try_continue: bool) -> list[str]:
+        """Which Claude Code session this launch is, as command-line flags (#773).
+
+        c-lord **names the session it starts** (``--session-id <uuid>``) and
+        records the name beside the transcripts, so the mirror can recognise its
+        own jsonl by a name c-lord chose rather than by a marker inside the file.
+        Claude Code 2.1.278 began stripping that marker from interactive input,
+        which silently cost every thread on this host its delivery path for
+        three days (#773) — an identifier the CLI never touches cannot fail that
+        way.
+
+        A resume must land back in the transcript the mirror already follows, so
+        it uses ``--resume <claimed id>`` rather than ``--continue``: ``--continue``
+        reopens whatever wrote last in the working copy, which may be a ``claude
+        -p`` sub-invocation (#627's hazard, one layer down).  ``--session-id``
+        is deliberately **not** added there — the CLI refuses it with ``--resume``
+        unless ``--fork-session`` is given, and forking copies the whole history
+        into a new transcript, which the mirror would have to re-read.
+
+        Falls back to the old behaviour whenever the claim cannot be made (no
+        pane path, unwritable directory): the thread then relies on the
+        :data:`~c_lord.transcript.resolver.CLORD_INPUT_MARKER` rule, exactly as
+        before this change.
+        """
+        if not pane_path:
+            logger.warning(
+                "start_claude: tmux would not say where the pane is, so this session "
+                "cannot be named (#773) — the mirror falls back to the marker rule"
+            )
+            return ["--continue"] if try_continue else []
+
+        from .transcript.claim import new_session_id, read_claim, write_claim
+        from .transcript.resolver import derive_project_dir
+
+        project_dir = derive_project_dir(pane_path)
+        if try_continue:
+            claimed = read_claim(project_dir)
+            if claimed is not None:
+                return ["--resume", claimed]
+            return ["--continue"]
+
+        session_id = new_session_id()
+        if not write_claim(project_dir, session_id):
+            # Without the claim, naming the session would only hide the problem:
+            # the mirror would look for a file it was never told about.
+            return []
+        logger.info(
+            "start_claude: session %s claims transcript %s.jsonl in %s (#773)",
+            session_id,
+            session_id,
+            project_dir,
+        )
+        return ["--session-id", session_id]
+
     def start_claude(
         self,
         thread_id: int,
@@ -2119,15 +2173,17 @@ class TmuxSessionManager:
         cmd_parts = ["env", "-u", "CLAUDECODE"]
         for key in SENSITIVE_ENV_KEYS:
             cmd_parts.extend(["-u", key])
+        # Asked once: it labels the telemetry *and* decides where this session's
+        # transcript is claimed (#773).
+        pane_path = self._pane_path(target)
         # Label the telemetry with the working directory and its repository so
         # cost/token metrics can be attributed per project instead of piling up
         # in one unlabelled bucket.
-        otel_attributes = _otel_resource_attributes(self._pane_path(target))
+        otel_attributes = _otel_resource_attributes(pane_path)
         if otel_attributes:
             cmd_parts.append(f"OTEL_RESOURCE_ATTRIBUTES='{otel_attributes}'")
         cmd_parts.append("claude")
-        if try_continue:
-            cmd_parts.append("--continue")
+        cmd_parts.extend(self._session_flags(pane_path, try_continue=try_continue))
         cmd_parts.extend(["--model", model])
         if dangerously_skip_permissions:
             cmd_parts.append("--dangerously-skip-permissions")

@@ -40,6 +40,10 @@ from .ask_bus import (
     CLOSE_INTERRUPTED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
+    DELIVERY_DELIVERED,
+    DELIVERY_NOT_ANSWERED,
+    DELIVERY_UNCONFIRMED,
+    DELIVERY_UNDELIVERED,
 )
 from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
@@ -240,6 +244,20 @@ async def _verify_answer_reached_claude(
         await asyncio.sleep(_ANSWER_CONFIRM_POLL)
 
 
+def _delivery_verdict(outcome: AskOutcome) -> str:
+    """Translate a verified outcome into the bus verdict callers wait on (#804).
+
+    The menu message already says all of this (#651), but the person who
+    answered by *typing* never looked at a button — their feedback is a line in
+    the thread, and it must not claim a delivery the transcript did not confirm.
+    """
+    if outcome == ASK_ANSWERED:
+        return DELIVERY_DELIVERED
+    if outcome == ASK_NOT_ANSWERED:
+        return DELIVERY_NOT_ANSWERED
+    return DELIVERY_UNCONFIRMED
+
+
 async def _finalize_menu_message(
     msg, question: AskQuestion, selected: list[str], outcome: AskOutcome, reason: str = ""
 ) -> None:
@@ -252,11 +270,21 @@ async def _finalize_menu_message(
     if outcome == ASK_ANSWERED:
         embed = ask_answered_embed(question.question, question.header, selected)
     elif outcome == ASK_NOT_ANSWERED:
+        # #804: carry the options. This edit REPLACES the menu, and on a failure
+        # the reader's next job is to answer again — from a message that used to
+        # show only the answer that did not land, with the four choices it was
+        # picked from gone from the thread entirely.
         embed = ask_undelivered_embed(
-            question.question, question.header, selected, reason or _NOT_ANSWERED_REASON
+            question.question,
+            question.header,
+            selected,
+            reason or _NOT_ANSWERED_REASON,
+            options=question.options,
         )
     else:
-        embed = ask_unconfirmed_embed(question.question, question.header, selected)
+        embed = ask_unconfirmed_embed(
+            question.question, question.header, selected, options=question.options
+        )
     # Never let the report itself break the turn: a menu stuck in its interim
     # state is worse than the missing check this replaces.
     with contextlib.suppress(Exception):
@@ -639,9 +667,15 @@ async def _bridge_claimed_menu(
     # "(No answer provided)". Confirm before the menu is allowed to read as
     # answered.
     if delivered is False:
+        # #804: whoever answered by typing is waiting to be told what happened.
+        # They get one line in the thread and nothing else, so it has to be this
+        # verdict and not "the bus accepted it" — that optimism is what printed
+        # 送りました two seconds before 届けられませんでした.
+        _ask_bus.note_delivery(thread.id, DELIVERY_UNDELIVERED)
         await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
         return
     outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
+    _ask_bus.note_delivery(thread.id, _delivery_verdict(outcome))
     if outcome != ASK_ANSWERED:
         logger.warning(
             "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
@@ -754,6 +788,9 @@ async def collect_ask_answers(
         # #651: on this path the answer needs no verification — it is returned
         # from here and injected as Claude's next prompt, so it cannot be lost
         # in a menu. Say so, rather than leaving the click's interim ⏳ standing.
+        # #804: and report it, so every path that consumes an answer ends in a
+        # verdict — a path that stays silent leaves its waiter timing out.
+        _ask_bus.note_delivery(thread.id, DELIVERY_DELIVERED)
         await _finalize_menu_message(msg, q, selected, ASK_ANSWERED)
 
         answer_text = ", ".join(selected)
