@@ -215,6 +215,8 @@ class SkillCommandCog(commands.Cog):
             timeout_seconds=self.runner.timeout_seconds,
             dangerously_skip_permissions=True,
             effort=self.runner.effort,
+            # #762: a /skill prompt is ``/<name> …`` — a command, not a message.
+            slash_command=True,
         )
 
     def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:

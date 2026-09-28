@@ -1370,6 +1370,7 @@ class TmuxClaudeRunner:
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
         effort: str | None = None,
+        slash_command: bool = False,
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
@@ -1379,6 +1380,9 @@ class TmuxClaudeRunner:
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
         self._effort = effort
+        # #762: the prompt is a slash command (/skill) — start_claude must hand
+        # it over unmarked or Claude Code never submits it.
+        self._slash_command = slash_command
         # True only for the restart-resume path (on_ready → pending_resumes).
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
@@ -1650,6 +1654,7 @@ class TmuxClaudeRunner:
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=True,
                     effort=self._effort,
+                    as_command=self._slash_command,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -1678,6 +1683,7 @@ class TmuxClaudeRunner:
                         dangerously_skip_permissions=self._dangerously_skip_permissions,
                         try_continue=False,
                         effort=self._effort,
+                        as_command=self._slash_command,
                     )
                     if not ok:
                         yield StreamEvent(
@@ -1702,6 +1708,7 @@ class TmuxClaudeRunner:
                     dangerously_skip_permissions=self._dangerously_skip_permissions,
                     try_continue=False,
                     effort=self._effort,
+                    as_command=self._slash_command,
                 )
                 if not ok:
                     yield StreamEvent(
@@ -2055,6 +2062,7 @@ class TmuxClaudeRunner:
                         dangerously_skip_permissions=self._dangerously_skip_permissions,
                         try_continue=False,
                         effort=self._effort,
+                        as_command=self._slash_command,
                     )
                     trust_answered = False
                     continue

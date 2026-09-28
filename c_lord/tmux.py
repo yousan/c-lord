@@ -2131,6 +2131,7 @@ class TmuxSessionManager:
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
         effort: str | None = None,
+        as_command: bool = False,
     ) -> bool:
         """Start Claude Code inside the tmux window for *thread_id*.
 
@@ -2220,7 +2221,12 @@ class TmuxSessionManager:
             # short message, a dozen messages burying the answer for a big one.
             from .transcript.formatter import ZWSP_MARKER
 
-            marked_prompt = f"{ZWSP_MARKER}{prompt}"
+            # #762: except for a prompt that *is* a slash command (/skill).
+            # Claude Code leaves a marked ``\u200b/cmd …`` argument sitting in
+            # the input box and never submits it, so the turn ran nothing. The
+            # marker is only a supplementary echo signal (#808) — and a command
+            # is recorded as <command-message> anyway, which it cannot mark.
+            marked_prompt = prompt if as_command else f"{ZWSP_MARKER}{prompt}"
 
             # #529: hand the prompt over in a file rather than typing it. Anything
             # typed at the pane's prompt goes through zsh's line editor, and
