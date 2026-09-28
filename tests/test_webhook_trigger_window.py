@@ -218,9 +218,7 @@ _COGS_DIR = Path(__file__).parent.parent / "c_lord" / "cogs"
 
 #: Paths known to start Claude without creating a window first. Each entry must
 #: name the Issue that tracks it; fixing the path means deleting its entry here.
-_KNOWN_WINDOWLESS: dict[tuple[str, str], str] = {
-    ("skill_command.py", "_run_skill_impl"): "#762",
-}
+_KNOWN_WINDOWLESS: dict[tuple[str, str], str] = {}
 
 
 def _functions_that_start_claude() -> list[tuple[str, str, bool]]:
@@ -230,9 +228,21 @@ def _functions_that_start_claude() -> list[tuple[str, str, bool]]:
         if path.name in {"_run_helper.py", "run_config.py", "__init__.py"}:
             continue
         tree = ast.parse(path.read_text())
-        for fn in ast.walk(tree):
-            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
+        functions = [
+            fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        # #762: a path may create its window through a helper of its own Cog
+        # (``self._prepare_workspace(...)``). Only helpers in the same file that
+        # themselves call ``create_session`` count — a call to anything else
+        # proves nothing about the window.
+        window_makers = {
+            fn.name
+            for fn in functions
+            if any(
+                isinstance(n, ast.Attribute) and n.attr == "create_session" for n in ast.walk(fn)
+            )
+        }
+        for fn in functions:
             runs = [
                 n.lineno
                 for n in ast.walk(fn)
@@ -245,7 +255,15 @@ def _functions_that_start_claude() -> list[tuple[str, str, bool]]:
             creates = [
                 n.lineno
                 for n in ast.walk(fn)
-                if isinstance(n, ast.Attribute) and n.attr == "create_session"
+                if isinstance(n, ast.Attribute)
+                and (
+                    n.attr == "create_session"
+                    or (
+                        n.attr in window_makers
+                        and isinstance(n.value, ast.Name)
+                        and n.value.id == "self"
+                    )
+                )
             ]
             found.append((path.name, fn.name, bool(creates) and min(creates) < min(runs)))
     return found

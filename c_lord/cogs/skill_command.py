@@ -15,6 +15,8 @@ Skills are lazily reloaded every 60 seconds so new skills appear without restart
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -36,6 +38,7 @@ from ..discord_ui.slash_io import slash_io
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
+from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
@@ -200,13 +203,15 @@ class SkillCommandCog(commands.Cog):
             choices.append(app_commands.Choice(name=label[:100], value=s["name"]))
         return choices
 
-    def _make_runner(self, tmux: TmuxSessionManager, thread_id: int) -> TmuxClaudeRunner:
+    def _make_runner(
+        self, tmux: TmuxSessionManager, thread_id: int, working_dir: str | None = None
+    ) -> TmuxClaudeRunner:
         """Create a TmuxClaudeRunner from the stored config and resolved tmux manager."""
         return TmuxClaudeRunner(
             tmux_manager=tmux,
             thread_id=thread_id,
             model=self.runner.model,
-            working_dir=self.runner.working_dir,
+            working_dir=working_dir or self.runner.working_dir,
             timeout_seconds=self.runner.timeout_seconds,
             dangerously_skip_permissions=True,
             effort=self.runner.effort,
@@ -215,6 +220,70 @@ class SkillCommandCog(commands.Cog):
     def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:
         """Check if the channel is a thread under the configured claude channel."""
         return isinstance(channel, discord.Thread) and channel.parent_id == self.claude_channel_id
+
+    async def _prepare_workspace(
+        self,
+        *,
+        thread: discord.Thread,
+        tmux: TmuxSessionManager,
+        sdm: SessionDirManager | None,
+        recorded_dir: str | None,
+        requester: discord.Member | discord.User,
+    ) -> tuple[bool, str | None]:
+        """Checkout + tmux window + transcript mirror for a /skill run (#762).
+
+        ``run_claude_with_config`` types into a window it does not create, so a
+        caller that skips this starts Claude at nothing — #621 (scheduler) and
+        #629 (webhook) each forgot, and so did /skill: every run ended in a
+        thread holding a single ❌. Same order as a chat turn: the thread's own
+        checkout (the one a reply will continue in), the window in it, then the
+        mirror — the only path Claude's answer takes back to Discord (#712).
+
+        Returns ``(ready, working_dir)``. ``ready`` is False when there is no
+        window to start Claude in — the caller must then stop; this has already
+        said so in the log and the thread. ``working_dir`` may be ``None`` (no
+        binding and no configured default), which is not a failure.
+        """
+        working_dir = recorded_dir if isinstance(recorded_dir, str) and recorded_dir else None
+        ctx = log_ctx(thread_id=thread.id)
+        if working_dir is None and sdm is not None:
+            try:
+                made = await asyncio.to_thread(sdm.create_session_dir, thread.id, requester)
+            except Exception:
+                # #477: a failed clone must end the run visibly, not escape it.
+                logger.exception("%s could not prepare the checkout for /skill", ctx)
+                with contextlib.suppress(discord.HTTPException):
+                    await thread.send("❌ この /skill の作業ディレクトリを用意できませんでした。")
+                return False, None
+            working_dir = made if isinstance(made, str) and made else None
+        working_dir = working_dir or self.runner.working_dir
+
+        window = await asyncio.to_thread(tmux.create_session, thread.id, working_dir or ".")
+        # create_session also returns a name when tmux itself is unavailable,
+        # so only an existing window proves Claude has somewhere to start.
+        if not await asyncio.to_thread(tmux.session_exists, thread.id):
+            logger.error("%s could not create a tmux window for /skill — aborting the run", ctx)
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(
+                    "❌ この /skill を動かす tmux ウィンドウを作れませんでした。"
+                    "ホストで tmux が使えるか、チャンネルが `/clord-init` で repo に"
+                    "紐づいているかを確認してください。"
+                )
+            return False, working_dir
+        logger.info("%s tmux window for /skill: %s (dir=%s)", ctx, window, working_dir)
+
+        mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
+        if mirror_cog is not None and working_dir:
+            try:
+                mirror_cog.start_for(thread.id, working_dir)
+            except Exception:
+                logger.warning(
+                    "%s could not start the transcript mirror (dir=%s)",
+                    ctx,
+                    working_dir,
+                    exc_info=True,
+                )
+        return True, working_dir
 
     async def _run_skill_impl(
         self,
@@ -293,7 +362,16 @@ class SkillCommandCog(commands.Cog):
             display = f"`/{name} {args}`" if args else f"`/{name}`"
             await respond(f"Running {display} in this thread…")
 
-            runner = self._make_runner(tmux, channel.id)
+            ready, working_dir = await self._prepare_workspace(
+                thread=channel,
+                tmux=tmux,
+                sdm=sdm,
+                recorded_dir=record.working_dir if record else None,
+                requester=user,
+            )
+            if not ready:
+                return
+            runner = self._make_runner(tmux, channel.id, working_dir)
             # #754: a /skill run is on 📊 Session Status while it runs.
             async with board_turn(dashboard_of(self.bot), channel.id, prompt):
                 await run_claude_with_config(
@@ -306,6 +384,7 @@ class SkillCommandCog(commands.Cog):
                         registry=self._registry,
                         session_dir_manager=sdm,
                         tmux_manager=tmux,
+                        working_dir=working_dir,
                         # #739: the views this run posts (ask menu / permission /
                         # stop) are gated by this; without it they cannot see the
                         # allowlist and fall back to the process-wide one.
@@ -350,7 +429,12 @@ class SkillCommandCog(commands.Cog):
         display = f"`/{name} {args}`" if args else f"`/{name}`"
         await respond(f"Running {display} → {thread.mention}")
 
-        runner = self._make_runner(tmux, thread.id)
+        ready, working_dir = await self._prepare_workspace(
+            thread=thread, tmux=tmux, sdm=sdm, recorded_dir=None, requester=user
+        )
+        if not ready:
+            return
+        runner = self._make_runner(tmux, thread.id, working_dir)
         # #754: see above.
         async with board_turn(dashboard_of(self.bot), thread.id, prompt):
             await run_claude_with_config(
@@ -363,6 +447,7 @@ class SkillCommandCog(commands.Cog):
                     registry=self._registry,
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
+                    working_dir=working_dir,
                     # #739: see above — the run's buttons are gated by this.
                     authorizer=self._authorizer,
                     # #480: ping the invoking user if a question-mode pause blocks the skill.
