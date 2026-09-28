@@ -51,9 +51,9 @@ def _user(content, **extra) -> dict:
 TEXT = {"type": "text", "text": "done"}
 TOOL_USE = {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
 TOOL_RESULT = [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
-# What Claude Code appends after the last message — never a turn boundary.
+# What Claude Code appends after the last message — bookkeeping, not a turn boundary.
+TURN_END = {"type": "system", "subtype": "turn_duration", "durationMs": 10}
 META = [
-    {"type": "system", "subtype": "turn_duration", "durationMs": 10},
     {"type": "attachment", "attachment": {}},
     {"type": "last-prompt", "lastPrompt": "x"},
     {"type": "cost-state"},
@@ -72,7 +72,7 @@ def _write(path: Path, events: list[dict]) -> Path:
     [
         # Finished and waiting — the usual case: say nothing.
         ([_user("hi"), _assistant("end_turn", TEXT)], False),
-        ([_user("hi"), _assistant("end_turn", TEXT), *META], False),
+        ([_user("hi"), _assistant("end_turn", TEXT), TURN_END, *META], False),
         # A synthetic API-error reply also ends the turn; Claude is waiting.
         ([_user("hi"), _assistant("stop_sequence", TEXT, isApiErrorMessage=True), *META], False),
         # Cut off while working.
@@ -107,6 +107,13 @@ def _write(path: Path, events: list[dict]) -> Path:
             ],
             False,
         ),
+        # Claude Code closes every finished turn with a turn-end marker; one
+        # after the last message settles it whatever that message looks like.
+        (
+            [_user("hi"), _assistant(None, TEXT), {"type": "system", "subtype": "turn_duration"}],
+            False,
+        ),
+        ([_user("hi"), _assistant(None, TEXT), {"type": "result"}], False),
         # Nothing to judge.
         ([], False),
         (META, False),

@@ -88,8 +88,20 @@ def _is_message(event: object) -> TypeGuard[dict[str, Any]]:
     return isinstance(event.get("message"), dict)
 
 
+def _is_turn_end(event: object) -> bool:
+    """Claude Code's own "this turn is over" marker (same rule as #215 recovery)."""
+    if not isinstance(event, dict):
+        return False
+    kind = event.get("type")
+    return kind == "result" or (kind == "system" and event.get("subtype") == "turn_duration")
+
+
 def _last_message(path: Path) -> dict[str, Any] | None:
-    """The last conversation row in ``path``, reading from the end. Blocking."""
+    """The last conversation row in ``path``, reading from the end. Blocking.
+
+    ``None`` also when a turn-end marker comes after it: that turn finished,
+    whatever its last message looks like.
+    """
     try:
         with path.open("rb") as f:
             f.seek(0, 2)
@@ -107,11 +119,13 @@ def _last_message(path: Path) -> dict[str, Any] | None:
                 partial = lines.pop(0) if pos > 0 else b""
                 for raw in reversed(lines):
                     event = _parse(raw)
+                    if _is_turn_end(event):
+                        return None
                     if _is_message(event):
                         return event
             if pos == 0 and partial:
                 event = _parse(partial)
-                if _is_message(event):
+                if not _is_turn_end(event) and _is_message(event):
                     return event
     except OSError:
         return None
@@ -144,6 +158,7 @@ def _user_text(content: object) -> str | None:
 def transcript_stopped_mid_turn(path: Path) -> bool:
     """Whether the last entry of ``path`` is a turn that never finished.
 
+    - a turn-end marker after the last message → finished, waiting;
     - assistant, ``end_turn`` (or any other final stop) → finished, waiting;
     - assistant asking for a tool / a streamed block with no stop yet → mid-turn;
     - ``tool_result`` → mid-turn (Claude had not seen it yet);
