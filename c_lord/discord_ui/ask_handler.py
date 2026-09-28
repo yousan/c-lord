@@ -34,6 +34,7 @@ from ..transcript.ask_result import (
     AskOutcome,
     ask_tool_uses,
     classify_ask_result,
+    find_ask_for_question,
     first_ask_tool_use_after,
     read_ask_result,
 )
@@ -283,16 +284,29 @@ class _MenuRef:
     project_dir: Path
     ask: tuple[str, Path] | None = None
     after: str | None = None
+    question: str | None = None
+    """#786: a menu re-found after a restart is identified by its question text
+    (drawn at *after*) rather than by being the next ask written."""
 
     def describe(self) -> str:
-        return self.ask[0] if self.ask is not None else "the next AskUserQuestion written"
+        if self.ask is not None:
+            return self.ask[0]
+        if self.question is not None:
+            return "the AskUserQuestion carrying this question"
+        return "the next AskUserQuestion written"
 
     async def outcome(self) -> AskOutcome:
         """One read: the verdict so far, ``unknown`` until something is written."""
         if self.ask is None:
-            self.ask = await asyncio.to_thread(
-                first_ask_tool_use_after, self.project_dir, self.after
-            )
+            if self.question is not None:
+                found = await asyncio.to_thread(
+                    find_ask_for_question, self.project_dir, self.question, self.after or ""
+                )
+                self.ask = (found.tool_use_id, found.session_path) if found else None
+            else:
+                self.ask = await asyncio.to_thread(
+                    first_ask_tool_use_after, self.project_dir, self.after
+                )
             if self.ask is None:
                 return ASK_UNKNOWN
         tool_use_id, session_path = self.ask
