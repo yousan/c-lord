@@ -118,7 +118,7 @@ def _record(thread_id: int, *, closed: bool = False) -> SessionRecord:
     return SessionRecord(
         thread_id=thread_id,
         session_id=f"tmux-{thread_id}",
-        working_dir="/tmp/x",
+        working_dir=None,
         model=None,
         origin="chat",
         summary=None,

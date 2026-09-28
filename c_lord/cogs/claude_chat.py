@@ -79,6 +79,7 @@ from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_aut
 from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..transcript.claim import adopt_cleared_session, list_transcripts
+from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
@@ -252,6 +253,17 @@ async def _safe_set_state(
             state.value,
             exc_info=True,
         )
+
+
+def _ever_ran_claude(working_dir: str | None) -> bool:
+    """Whether Claude Code ever wrote a transcript for ``working_dir`` (#806).
+
+    ``None`` (a row that never recorded one) is given the benefit of the doubt:
+    the wake then decides, as it did before this check existed.  Blocking.
+    """
+    if not working_dir:
+        return True
+    return latest_session_jsonl(derive_project_dir(working_dir)) is not None
 
 
 class ClaudeChatCog(commands.Cog):
@@ -1800,9 +1812,19 @@ class ClaudeChatCog(commands.Cog):
                     "`/claude-restart` で Claude を再起動してください。"
                 )
         elif not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
-            verdict = classify(await self.repo.get(thread_id))
+            record = await self.repo.get(thread_id)
+            verdict = classify(record)
             if verdict is not ThreadResume.RESUMES:
                 return stopped_hint(verdict)
+            if record is not None and not await asyncio.to_thread(
+                _ever_ran_claude, record.working_dir
+            ):
+                # Waking would start an empty Claude only to run the command on
+                # nothing (#806 AC5).
+                return (
+                    "ℹ️ このスレッドにはまだ Claude との会話の記録がないため、"
+                    f"`{command.split()[0]}` は送りませんでした。"
+                )
             if ack is not None:
                 await ack()
             with contextlib.suppress(discord.HTTPException):
@@ -1998,9 +2020,14 @@ class ClaudeChatCog(commands.Cog):
         await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
 
     async def _compact_impl(
-        self, channel: object, respond: _Responder, *, instructions: str = ""
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        instructions: str = "",
+        ack: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        """Shared core for /compact and !compact (#278).
+        """Shared core for /compact and !compact (#278, #806).
 
         Fires the Claude Code TUI's built-in ``/compact`` slash command in the
         thread's tmux window to compress (summarize) the session context,
@@ -2009,9 +2036,13 @@ class ClaudeChatCog(commands.Cog):
         Sent via ``send_literal`` (NOT ``send_input``): ``send_input`` prepends
         a zero-width-space marker, so the line would no longer start with ``/``
         and the TUI would not treat it as a slash command (see
-        docs/COMMANDS.md). This mirrors the
-        existing ``/context`` probe in ``tmux_runner.py``. Enter is sent
-        separately via ``send_keys`` since ``send_literal`` does not submit.
+        docs/COMMANDS.md). Enter is sent separately since ``send_literal`` does
+        not submit.
+
+        A stopped workspace is restored first (#806) — :meth:`_deliver_slash_command`
+        — rather than refused with "no running session": whether the Claude is
+        asleep is c-lord's business, not the user's, and the refusal read as the
+        conversation being gone.
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
@@ -2024,21 +2055,12 @@ class ClaudeChatCog(commands.Cog):
             await respond("tmux is not configured for this thread.", ephemeral=True)
             return
 
-        if not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
-            await respond("No running Claude session in this thread to compact.", ephemeral=True)
-            return
-
         instructions = instructions.strip()
         command = f"/compact {instructions}" if instructions else "/compact"
-
-        # send_literal (not send_input): no ZWSP prefix so the leading "/" is
-        # preserved and the TUI recognises it as a slash command.
-        ok = await asyncio.to_thread(tmux_manager.send_literal, thread_id, command)
-        if not ok:
-            await respond("Failed to send /compact to the session.", ephemeral=True)
+        refusal = await self._deliver_slash_command(channel, tmux_manager, command, ack=ack)
+        if refusal is not None:
+            await respond(refusal, ephemeral=True)
             return
-        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
-
         await respond("\U0001f5dc️ Compacting context… (`/compact` sent)")
 
     @app_commands.command(
@@ -2053,10 +2075,8 @@ class ClaudeChatCog(commands.Cog):
     ) -> None:
         """Trigger the TUI ``/compact`` for the current thread's session."""
 
-        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        await self._compact_impl(interaction.channel, respond, instructions=instructions)
+        respond, ack = self._deferrable_responder(interaction)
+        await self._compact_impl(interaction.channel, respond, instructions=instructions, ack=ack)
 
     @commands.command(name="compact")
     async def compact_text(self, ctx: commands.Context, *, instructions: str = "") -> None:
