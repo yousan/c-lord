@@ -10,7 +10,7 @@ Answer routing uses :mod:`ask_bus` (an in-process asyncio.Queue per thread).
 The waiting side (``_collect_ask_answers`` in _run_helper.py) calls
 ``ask_bus.register(thread_id)`` and awaits ``queue.get()`` with a 24-hour
 timeout instead of the old 5-minute hard limit.
-AskView callbacks call ``ask_bus.post_answer(thread_id, labels)``; if the
+AskView callbacks call ``ask_bus.post_answer(thread_id, answers)``; if the
 session is gone after a restart, post_answer returns False and the view shows
 a clear "session ended" message instead of silently failing.
 
@@ -18,6 +18,11 @@ custom_id format:  ``ask_{thread_id}_{q_idx}_{slot}``
   - slot = 0..3 for regular buttons
   - slot = ``select`` for the Select menu
   - slot = ``other`` for the free-text button
+
+Options are identified by **index**, never by label (#674): a Select option's
+``value`` is ``option:{index}``, a button is bound to its index, and what goes
+on the bus is a :class:`~.ask_bus.ChosenOption` — the full label, carrying the
+index it was chosen at.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from .ask_bus import (
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
     AskAnswerBus,
+    ChosenOption,
 )
 from .ask_bus import ask_bus as _default_ask_bus
 from .ask_menus import ask_menus, disable_stale_copies
@@ -43,7 +49,7 @@ from .embeds import ask_sending_embed, ask_undelivered_embed
 from .error_reporting import ErrorReportingViewMixin
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from ..claude.types import AskQuestion
     from ..database.ask_repo import PendingAskRepository
@@ -92,6 +98,19 @@ def _button_label(label: str, index: int) -> str:
     """
     text = (label or "").strip()
     return text[:80] if text else f"{index + 1}."
+
+
+# #674: a Select option's ``value`` names the option by its index. It used to be
+# the display label — cut to 80 characters, which then matched none of the real
+# labels, so the pick was typed into the pane as free text. The prefix is what
+# tells it apart from a menu posted before #674, whose values WERE the labels: a
+# label can well be "2"; it is never "option:2".
+_OPTION_VALUE_PREFIX = "option:"
+
+
+def _option_value(index: int) -> str:
+    """The Select ``value`` for the option at *index* (#674)."""
+    return f"{_OPTION_VALUE_PREFIX}{index}"
 
 
 class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
@@ -144,7 +163,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # multiSelect records the choice in the Select and submits via the
         # ✅ confirm button (#418); single-select delivers immediately.
         self._multi_select = question.multi_select
-        self._selected_values: list[str] = []
+        # Option indices, not labels (#674).
+        self._selected_indices: list[int] = []
         # #672: the Select is kept so a recorded choice can be written back into
         # it as ``default=True`` — see _multi_select_record.
         self._select: discord.ui.Select | None = None
@@ -162,7 +182,7 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
                     discord.SelectOption(
                         label=_button_label(opt.label, i)[:100],
                         description=opt.description[:100] if opt.description else None,
-                        value=_button_label(opt.label, i)[:100],
+                        value=_option_value(i),
                     )
                     for i, opt in enumerate(options[:25])
                 ],
@@ -181,7 +201,7 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
                     custom_id=f"ask_{thread_id}_{q_idx}_{i}",
                     row=0,
                 )
-                btn.callback = _make_button_callback(self, opt.label)
+                btn.callback = _make_button_callback(self, i)
                 self.add_item(btn)
 
         # multiSelect needs an explicit submit affordance — the Select only
@@ -214,6 +234,44 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _index_of(self, value: str) -> int | None:
+        """The option a Select *value* names, or None when it names none (#674).
+
+        Also reads a menu posted before #674, whose values were the display
+        labels themselves: the deploy that ships this restarts the bot, and #671
+        re-arms every menu still on screen — a press on one of those must still
+        pick the option it shows.
+        """
+        options = self._question.options[:25]
+        if value.startswith(_OPTION_VALUE_PREFIX):
+            number = value[len(_OPTION_VALUE_PREFIX) :]
+            if number.isdecimal() and int(number) < len(options):
+                return int(number)
+            return None
+        for i, opt in enumerate(options):
+            if _button_label(opt.label, i)[:100] == value:
+                return i
+        return None
+
+    def _indices_of(self, values: Iterable[str]) -> list[int]:
+        """The options *values* name, in order, each once.
+
+        Once: two old-style values can name the same option, and a multiSelect
+        toggles — choosing an option twice would un-choose it.
+        """
+        indices: list[int] = []
+        for value in values:
+            index = self._index_of(value)
+            if index is not None and index not in indices:
+                indices.append(index)
+        return indices
+
+    def _answers(self, indices: list[int]) -> list[str]:
+        """What goes on the bus for *indices*: each option's full label, tagged
+        with its index — the index is what the pane is answered with (#674)."""
+        options = self._question.options
+        return [ChosenOption(options[i].label, i) for i in indices]
 
     def _undeliverable_reason(self, interaction: discord.Interaction) -> str:
         """Explain, in the user's words, why *this* click could not be delivered.
@@ -334,14 +392,31 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
 
     async def _select_callback(self, interaction: discord.Interaction) -> None:
         values: list[str] = interaction.data.get("values", [])  # type: ignore[union-attr]
-        await self._deliver(interaction, values)
+        indices = self._indices_of(values)
+        if not indices:
+            # Never deliver an empty answer: that is the #315 pre-emption signal,
+            # and the bridge would Esc the menu away. The values are the bot's
+            # own (option keys or labels), so they are safe to log.
+            logger.warning(
+                "AskView: Select value(s) %r name no option of this menu for thread %d "
+                "— nothing delivered (#674)",
+                values,
+                self._thread_id,
+            )
+            await interaction.response.send_message(
+                "選んだ選択肢がこの質問の中に見つからなかったため、送信しませんでした。"
+                "もう一度選び直してください。",
+                ephemeral=True,
+            )
+            return
+        await self._deliver(interaction, self._answers(indices))
 
     async def _multi_select_record(self, interaction: discord.Interaction) -> None:
         """Record a multiSelect choice WITHOUT delivering — the user submits via
         the ✅ confirm button (#418).
 
         The choice is written **into the message** as ``default=True`` on the
-        chosen options, not just into ``self._selected_values`` (#672).  An
+        chosen options, not just into ``self._selected_indices`` (#672).  An
         instance attribute is reachable only from the one View object in the one
         process that rendered the menu, and three ordinary routes reach ✅ 確定
         without it: a dropdown whose interaction never fired (a mobile sheet
@@ -354,12 +429,17 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         the Select on every edit, so a recorded choice used to disappear from
         the dropdown and read as "my selection did not take".
         """
-        self._selected_values = list(interaction.data.get("values", []))  # type: ignore[union-attr]
-        self._mark_selected(self._selected_values)
-        chosen = ", ".join(self._selected_values) or "（未選択）"
+        values = interaction.data.get("values", [])  # type: ignore[union-attr]
+        self._selected_indices = self._indices_of(values)
+        self._mark_selected(self._selected_indices)
+        options = self._question.options
+        chosen = (
+            ", ".join(_button_label(options[i].label, i) for i in self._selected_indices)
+            or "（未選択）"
+        )
         logger.info(
-            "AskView: recorded multiSelect choice %r for thread %d (#672)",
-            self._selected_values,
+            "AskView: recorded multiSelect choice (options %r) for thread %d (#672)",
+            self._selected_indices,
             self._thread_id,
         )
         # Full-size, not Discord's grey ``-#`` small text (#536): "picked but not
@@ -376,15 +456,16 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             view=self,
         )
 
-    def _mark_selected(self, values: list[str]) -> None:
-        """Mark exactly *values* as ``default`` on this View's Select (#672)."""
+    def _mark_selected(self, indices: list[int]) -> None:
+        """Mark exactly the options at *indices* as ``default`` on this View's
+        Select (#672) — under the same value :meth:`_recover_selection` reads."""
         if self._select is None:
             return
-        chosen = set(values)
+        chosen = {_option_value(i) for i in indices}
         for option in self._select.options:
             option.default = option.value in chosen
 
-    def _recover_selection(self, interaction: discord.Interaction) -> list[str]:
+    def _recover_selection(self, interaction: discord.Interaction) -> list[int]:
         """The choice recorded on the message, when this View does not hold it (#672).
 
         Discord echoes a message's components back on every interaction it
@@ -399,17 +480,16 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # are bot-authored (a user cannot edit a bot message's components), but
         # the answer they feed becomes keystrokes in a live pane, so the option
         # set stays the authority rather than whatever the message happens to
-        # carry.
-        offered = {option.value for option in self._select.options}
+        # carry — ``_indices_of`` drops any value that names none of it.
         for row in getattr(message, "components", None) or ():
             for child in getattr(row, "children", None) or ():
                 if getattr(child, "custom_id", None) != self._select.custom_id:
                     continue
-                return [
+                return self._indices_of(
                     option.value
                     for option in getattr(child, "options", None) or ()
-                    if getattr(option, "default", False) and option.value in offered
-                ]
+                    if getattr(option, "default", False)
+                )
         return []
 
     async def _confirm_callback(self, interaction: discord.Interaction) -> None:
@@ -420,8 +500,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         is logged: the silence of this path is what hid the incident, because
         the only trace was the *absence* of a keystroke log downstream (#585).
         """
-        values = self._selected_values or self._recover_selection(interaction)
-        if not values:
+        indices = self._selected_indices or self._recover_selection(interaction)
+        if not indices:
             logger.info(
                 "AskView: ✅ confirm pressed with nothing selected for thread %d "
                 "— nothing delivered (#672)",
@@ -433,7 +513,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
                 ephemeral=True,
             )
             return
-        recovered = not self._selected_values
+        recovered = not self._selected_indices
+        values = self._answers(indices)
         logger.info(
             "AskView: ✅ confirm pressed for thread %d — delivering %r%s (#672)",
             self._thread_id,
@@ -511,16 +592,20 @@ class AskModal(discord.ui.Modal):
         self.stop()
 
 
-def _make_button_callback(view: AskView, label: str):
-    """Factory that creates a button callback with *view* and *label* bound.
+def _make_button_callback(view: AskView, index: int):
+    """Factory that creates a button callback with *view* and option *index* bound.
 
     Passing *view* explicitly (instead of capturing a Future) means:
     - ``view._deliver()`` is called, which routes via ask_bus and calls
       ``view.stop()`` — fixing the 300-second hang of the old design.
     - The restart-recovery path is handled uniformly with select/other.
+
+    Bound to the index, not the label (#674): two options the pane parser could
+    not read both have the label ``""`` (#579), and matching by label always
+    answered with the first of them.
     """
 
     async def callback(interaction: discord.Interaction) -> None:
-        await view._deliver(interaction, [label])
+        await view._deliver(interaction, view._answers([index]))
 
     return callback
