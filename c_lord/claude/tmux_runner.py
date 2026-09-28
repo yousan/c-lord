@@ -126,6 +126,13 @@ _ALIVE_RECHECK_INTERVAL = 2.0
 # one of them gets better if you send the message again.
 USAGE_LIMIT_ERROR_PREFIX = "Usage limit —"
 
+# Prefix of the RESULT error for "Claude Code is not logged in" (#812).  The
+# same shape as USAGE_LIMIT: an empty turn whose cause is on the pane, and whose
+# only cure is outside the thread — here someone has to run ``/login`` on the
+# host.  Reporting it as NO_RESPONSE told the reader to send it again, which
+# fails identically until then.
+LOGIN_REQUIRED_ERROR_PREFIX = "Login required —"
+
 # Prefix of the RESULT error for "the tmux server this pane lived in was
 # replaced while the turn was running" (#701).  The one outcome here that is
 # not about this thread at all: the fleet's tmux went down under it, so every
@@ -414,6 +421,46 @@ def _extract_startup_error(pane: str) -> str | None:
         if _STARTUP_ERROR_RE.search(stripped):
             return stripped[:300]
     return None
+
+
+# -- Claude Code login (#812) ---------------------------------------------------
+#
+# With its credentials gone, Claude Code answers every prompt with one line and
+# goes idle (2.1.282, captured in tests/fixtures/panes/login_expired.txt):
+#
+#     ❯ hello
+#     ● Login expired · Please run /login
+#
+# Other auth failures ("Invalid API key", ...) end in the same "· Please run
+# /login", so the suffix is what is matched, not the reason in front of it.  The
+# status line's own hint ("Not logged in · Run /login") is deliberately NOT
+# matched: it is on screen before any turn, so it cannot say this turn was
+# refused.  Anchored to a line holding nothing but gutter + message, so a
+# sentence that quotes the message — c-lord threads discuss this very issue —
+# does not match (the #156 / #184 false-positive class).
+_LOGIN_REQUIRED_RE = re.compile(
+    r"^(?:[^\S\n]|[●⏺⎿╰│┃|>*•-])*"
+    r"(?P<line>[A-Z][^`「」\"\n·]{1,80}?[^\S\n]·[^\S\n]Please run /login)[^\S\n]*$",
+    re.MULTILINE,
+)
+
+
+def extract_login_required(pane: str) -> str | None:
+    """Return the last "… · Please run /login" refusal on *pane*, else None (#812)."""
+    if not pane:
+        return None
+    found = _LOGIN_REQUIRED_RE.findall(pane)
+    return found[-1] if found else None
+
+
+def _count_login_required(pane: str) -> int:
+    """How many login refusals *pane* shows (#812).
+
+    Counted for the same reason as the usage-limit banner (#631): a resumed
+    session redraws the tail of the conversation, so a refusal from an earlier
+    turn is on screen when this one starts, and it says nothing about this one.
+    """
+    return len(_LOGIN_REQUIRED_RE.findall(pane)) if pane else 0
 
 
 # -- Claude plan/usage limits (#631) --------------------------------------------
@@ -1656,6 +1703,12 @@ class TmuxClaudeRunner:
         # is checked alongside it.
         baseline_limit_count = 0
         baseline_limit_captured = False
+        # #812: Claude Code's "… · Please run /login" refusal, and how many of
+        # them were already on the pane when this turn began (same baseline rule
+        # as the limit banner above).
+        login_required: str | None = None
+        baseline_login_count = 0
+        baseline_login_captured = False
 
         # #365: Gate completion on the NEW turn actually having started. When a
         # follow-up message is delivered to an already-running Claude
@@ -1745,6 +1798,26 @@ class TmuxClaudeRunner:
                     )
                     await self._dismiss_usage_limit_menu(current)
                     break
+
+            # #812: Claude Code is not logged in.  It refused the turn with one
+            # line and went idle, so — as with the limit — there is nothing to
+            # wait for.  NOT gated on ``not last_response``: the refusal is
+            # drawn as an assistant message, so it is often the very text the
+            # scrape returns, and gating would let the turn finish as a normal
+            # answer ("🟡 Claude has finished").  The anchored pattern and the
+            # baseline count are what keep prose and old turns out.
+            login_count = _count_login_required(current)
+            if not baseline_login_captured:
+                baseline_login_captured = True
+                baseline_login_count = login_count
+            if login_count > baseline_login_count:
+                login_required = extract_login_required(current)
+                logger.warning(
+                    "%s Claude Code login required, aborting poll: %s",
+                    log_ctx(thread_id=self._thread_id),
+                    login_required,
+                )
+                break
 
             # Auto-accept the folder-trust dialog ("Quick safety check…").  Every
             # thread runs in a freshly-cloned session dir with no trusted ancestor,
@@ -2117,6 +2190,16 @@ class TmuxClaudeRunner:
         timed_out = raw_static_seconds >= self.timeout_seconds
         if self._stopped:
             error = None if self._silent_stop else "Stopped by user"
+        elif login_required is not None:
+            # #812: above the whole ladder, because the ladder only runs for a
+            # turn with no scraped answer — and here the refusal IS the scraped
+            # answer. Below it, this turn read as "finished" or "never started,
+            # send it again"; neither is true, and resending cannot help.
+            error = (
+                f'{LOGIN_REQUIRED_ERROR_PREFIX} Claude Code replied "{login_required}" '
+                "and did not run this turn. Someone has to run /login in claude on "
+                "the host; until then every message gets the same reply."
+            )
         elif timed_out or not last_response:
             # Reached completion without a usable response — either the hard
             # inactivity backstop fired (``timed_out``) or we never extracted

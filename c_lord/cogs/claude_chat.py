@@ -3894,6 +3894,9 @@ class ClaudeChatCog(commands.Cog):
                         # reset time instead of asking for a resend that cannot
                         # work until the limit resets.
                         usage_limit=run_config.outcome.usage_limit,
+                        # #812: and when Claude Code is logged out, say that —
+                        # only /login on the host can fix it.
+                        login_required=run_config.outcome.login_required,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply
