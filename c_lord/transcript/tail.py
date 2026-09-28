@@ -31,7 +31,8 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncGenerator
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,33 @@ from typing import Any
 from .resolver import ThreadSessionResolver
 
 logger = logging.getLogger(__name__)
+
+# How long the resolver may come back empty before the reader is told (#773).
+#
+# Generous on purpose: Claude Code takes seconds to start and write its first
+# line, and a thread that is merely starting up must not be accused of being
+# broken.  Two minutes is far shorter than the three days #773 went unnoticed
+# and far longer than any healthy cold start.
+UNRESOLVED_NOTICE_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class UnresolvedTranscript:
+    """ "This mirror has had nothing to read for a while" — the #773 alarm.
+
+    Carries what a reader needs to tell the two cases apart: nothing has been
+    written here at all (``candidates == 0``), versus transcripts exist but none
+    of them is this thread's (``candidates > 0``) — which is what a change in
+    the CLI's input handling looks like from the outside.
+    """
+
+    project_dir: Path
+    seconds: float
+    candidates: int
+    claimed_session_id: str | None
+
+
+UnresolvedCb = Callable[[UnresolvedTranscript], Awaitable[None]]
 
 # Read the seeding baseline in bounded slices instead of one ``read(offset)``:
 # a production transcript reaches ~100 MB and the seeding of every session now
@@ -172,6 +200,9 @@ class _FollowState:
     # rather than sleeping, so falling behind is not also made slow.
     more_to_read: bool = False
     seen_uuids: set[str] = field(default_factory=set)
+    # Whether the last poll had a transcript to read at all (#773).  Starts
+    # True so a tail that has not polled yet is never reported as broken.
+    resolved: bool = True
 
 
 def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
@@ -239,6 +270,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     state.more_to_read = False
 
     active = state.resolver.resolve()
+    state.resolved = active is not None
     if active is None:
         return []
 
@@ -310,6 +342,8 @@ async def tail_events(
     *,
     poll_interval: float = 0.5,
     from_start: bool = False,
+    on_unresolved: UnresolvedCb | None = None,
+    unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield JSONL events as they appear under ``project_dir``.
 
@@ -324,6 +358,13 @@ async def tail_events(
         When ``True``, replay the current file from byte 0 before following.
         Useful for catching up to an existing session.  Default ``False`` —
         only newly appended lines are yielded.
+    on_unresolved
+        Called when no transcript has been eligible for ``unresolved_after``
+        seconds, and then at most once per interval for as long as that lasts
+        (#773).  The tail keeps polling either way — this is a report, not a
+        stop — and the caller decides whether anyone should hear about it.
+    unresolved_after
+        How long the resolver may come back empty before that call.
     """
     # Issue #433: events already yielded (or present at start) must not be
     # re-emitted when the read offset is reset to 0 (truncation / in-place
@@ -333,12 +374,43 @@ async def tail_events(
     # they are intentionally not deduplicated (avoids collapsing two distinct
     # uuid-less records that happen to serialise identically).
     state = await _run_off_loop(_open_initial_state, project_dir, from_start)
+    # When the current run of "nothing to read" began, or None while healthy.
+    unresolved_since: float | None = None
 
     while True:
         # The whole cycle — glob, stat, read, parse — in one worker-thread hop.
         # Splitting it would put the loop back in the middle of the syscalls.
         for event in await _run_off_loop(_poll_once, state):
             yield event
+
+        if not state.resolved:
+            now = time.monotonic()
+            if unresolved_since is None:
+                unresolved_since = now
+            elif on_unresolved is not None and now - unresolved_since >= unresolved_after:
+                report = UnresolvedTranscript(
+                    project_dir=project_dir,
+                    seconds=now - unresolved_since,
+                    candidates=state.resolver.candidate_count,
+                    claimed_session_id=state.resolver.claimed_session_id,
+                )
+                # Re-armed rather than latched: an outage that outlives a turn
+                # should be reportable again to the next one, and the caller —
+                # which is the only one that knows whether anybody is waiting —
+                # does the rate limiting.
+                unresolved_since = now
+                try:
+                    await on_unresolved(report)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "tail_events: unresolved-transcript callback failed for %s",
+                        project_dir,
+                        exc_info=True,
+                    )
+        else:
+            unresolved_since = None
 
         if state.more_to_read:
             # Catching up on a backlog: go straight round again rather than

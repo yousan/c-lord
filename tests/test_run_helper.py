@@ -1374,3 +1374,62 @@ class TestFooterClordVersion:
         finally:
             runtime_version.cache_clear()
         assert "c-lord v1.4.183-bd80c47e-20260908" in cfg.thread.send.await_args.args[0]
+
+    @staticmethod
+    def _footer_for(monkeypatch, days_old: int) -> str:
+        from datetime import date, timedelta
+
+        from c_lord.version import runtime_version
+
+        built = (date.today() - timedelta(days=days_old)).strftime("%Y%m%d")
+        rh = TestFooterClordVersion._patch(monkeypatch, version=f"v1.4.183-bd80c47e-{built}")
+        cfg = TestFooterClordVersion._config()
+        try:
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+        finally:
+            runtime_version.cache_clear()
+        return cfg.thread.send.await_args.args[0]
+
+    def test_stale_build_shows_its_age(self, monkeypatch) -> None:
+        """#756 AC2: 7+ days old → ``c-lord v… (Nd)`` in the footer."""
+        line = self._footer_for(monkeypatch, 10)
+        assert "-bd80c47e-" in line
+        assert line.split("c-lord ", 1)[1].split(" · ")[0].endswith(" (10d)"), line
+
+    def test_fresh_build_shows_no_age(self, monkeypatch) -> None:
+        """#756 AC2: under 7 days the item is unchanged."""
+        line = self._footer_for(monkeypatch, 6)
+        assert "d)" not in line.split("c-lord ", 1)[1].split(" · ")[0], line
+
+    def test_age_is_measured_per_turn_not_at_boot(self, monkeypatch) -> None:
+        """#756: the process can run for days — the age is today's, not boot's.
+
+        Production ran from 09-15 without a restart; a build that was fresh at
+        boot must start showing its age once it crosses the line.
+        """
+        from datetime import date, timedelta
+
+        from c_lord.version import runtime_version
+
+        built = date(2026, 9, 15)
+        rh = self._patch(monkeypatch, version="v1.4.197-b3f06814-20260915")
+        cfg = self._config()
+
+        class _Day(date):
+            now = built + timedelta(days=1)
+
+            @classmethod
+            def today(cls):  # type: ignore[override]
+                return cls.now
+
+        monkeypatch.setattr("c_lord.version.date", _Day)
+        try:
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+            first = cfg.thread.send.await_args.args[0]
+            _Day.now = built + timedelta(days=8)
+            asyncio.run(rh._post_context_usage(cfg, "s"))
+            later = cfg.thread.send.await_args.args[0]
+        finally:
+            runtime_version.cache_clear()
+        assert "(1d)" not in first and "d)" not in first.split("c-lord ", 1)[1].split(" · ")[0]
+        assert "c-lord v1.4.197-b3f06814-20260915 (8d)" in later

@@ -18,7 +18,9 @@
 * シンボリックリンクは辿らない。リンク先を消して本体を失うのが最悪の事故
 * git でないディレクトリは消さない。クリーンかどうかを確かめる手段が無く、
   「残骸」と「誰かの生成物」を区別できない
-* 未コミットの変更が1つでもあれば残す
+* 未コミットの変更が1つでもあれば残す。ただし **c-lord が自分で置いたファイル**
+  （注入した ``discord-read`` skill 等）は利用者の変更に数えない (#749) — 数えて
+  いた頃は 105 回連続で 0 バイトしか回収できなかった
 
 期間を Claude Code の ``cleanupPeriodDays`` から読まないのは意図的。#575 の行
 スイープは「Claude が会話を忘れたらチェックアウトも役目を終える」という対応
@@ -31,11 +33,11 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .session_cleanup import _MIN_PATH_DEPTH, DirOutcome
-from .session_dir import _is_clean
+from .session_cleanup import _MIN_PATH_DEPTH, DirOutcome, describe_changes
+from .session_dir import WorktreeStatus, worktree_status
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,13 @@ class OrphanSweepResult:
     removed: int
     kept: int
     reclaimed_bytes: int = 0
+    #: ``removed`` のうち、c-lord 自身のファイルしか無かったもの (#749)。
+    #: #749 以前はこれが全部「作業がある」として残っていた。
+    removed_clord_only: int = 0
+    #: ``kept`` の内訳 (#749)。一括りにすると c-lord の残骸や git でない
+    #: ディレクトリが「利用者の作業」に見える。
+    kept_user_work: int = 0
+    kept_not_repo: int = 0
     #: 持ち主のいない docker コンテナの名前 (#612)。**止めはしない** — 中身は
     #: 誰かのデータで、勝手に落とす判断はディレクトリの削除より重い。まず
     #: 「在ることが分かる」状態にする。
@@ -207,29 +216,46 @@ def remove_orphan_dir(path: Path | str) -> DirOutcome:
     持たないディレクトリに対して行う。判定を書き直さないのは意図的 — 「消して
     よいか」の定義が2つに分かれた瞬間に、片方だけが緩む。
     """
+    return _remove_orphan_dir(path)[0]
+
+
+def _remove_orphan_dir(path: Path | str) -> tuple[DirOutcome, WorktreeStatus | None]:
+    """:func:`remove_orphan_dir` の本体。サマリの内訳のために判定結果も返す。
+
+    残す理由は **INFO** に出す (#749/#678)。DEBUG に落としていた間、掃除が
+    105 回連続で何も消していないことに誰も気づけなかった。
+    """
     import shutil
 
     try:
         target = Path(path)
         if len([p for p in target.parts if p not in ("/", "")]) < _MIN_PATH_DEPTH:
             logger.warning("orphan sweep: refusing suspiciously shallow path %r", str(target))
-            return DirOutcome.KEPT_UNSAFE
+            return DirOutcome.KEPT_UNSAFE, None
         if target.is_symlink() or not target.is_dir():
-            return DirOutcome.ABSENT
+            return DirOutcome.ABSENT, None
     except (OSError, ValueError):
-        return DirOutcome.ABSENT
+        return DirOutcome.ABSENT, None
 
-    if not _is_clean(str(target)):
-        logger.debug("orphan sweep: keeping %s — uncommitted work or not a git repo", target)
-        return DirOutcome.KEPT_DIRTY
+    status = worktree_status(str(target))
+    if not status.clean:
+        logger.info("orphan sweep: keeping %s — %s", target, describe_changes(status))
+        return DirOutcome.KEPT_DIRTY, status
 
     try:
         shutil.rmtree(target)
     except OSError as exc:
         logger.warning("orphan sweep: failed to remove %s: %s", target, exc)
-        return DirOutcome.KEPT_DIRTY
-    logger.info("orphan sweep: removed %s (no sessions row)", target)
-    return DirOutcome.REMOVED
+        return DirOutcome.KEPT_DIRTY, None
+    if status.clord_files:
+        logger.info(
+            "orphan sweep: removed %s (no sessions row; only c-lord's own files: %s)",
+            target,
+            ", ".join(status.clord_files),
+        )
+    else:
+        logger.info("orphan sweep: removed %s (no sessions row)", target)
+    return DirOutcome.REMOVED, status
 
 
 def _size_of(path: Path) -> int:
@@ -263,26 +289,48 @@ async def sweep_orphan_dirs(
         find_orphan_dirs, root, known_dirs, min_idle_days=min_idle_days
     )
     removed = kept = 0
+    removed_clord_only = kept_user_work = kept_not_repo = 0
     reclaimed = 0
     for candidate in candidates:
         if removed >= max_per_pass:
             break
         size = await asyncio.to_thread(_size_of, candidate.path)
-        outcome = await asyncio.to_thread(remove_orphan_dir, candidate.path)
+        outcome, status = await asyncio.to_thread(_remove_orphan_dir, candidate.path)
         if outcome is DirOutcome.REMOVED:
             removed += 1
             reclaimed += size
+            if status is not None and status.clord_files:
+                removed_clord_only += 1
         elif outcome in (DirOutcome.KEPT_DIRTY, DirOutcome.KEPT_UNSAFE):
             kept += 1
+            if status is not None and not status.is_repo:
+                kept_not_repo += 1
+            elif status is not None:
+                kept_user_work += 1
 
     if removed or kept:
+        # 「kept N with work in them」の一行だけだった頃 (#749 以前)、80 件の
+        # うち 60 件は c-lord 自身の SKILL.md だった。内訳を分けて出す。
         logger.info(
-            "orphan sweep: removed %d directory(ies) (%.1f GB), kept %d with work in them",
+            "orphan sweep: removed %d directory(ies) (%.1f GB; %d held only c-lord's own "
+            "files), kept %d (%d with uncommitted user work, %d not a git repo, "
+            "%d unsafe or failed to remove)",
             removed,
             reclaimed / 1024**3,
+            removed_clord_only,
             kept,
+            kept_user_work,
+            kept_not_repo,
+            kept - kept_user_work - kept_not_repo,
         )
-    return OrphanSweepResult(removed=removed, kept=kept, reclaimed_bytes=reclaimed)
+    return OrphanSweepResult(
+        removed=removed,
+        kept=kept,
+        reclaimed_bytes=reclaimed,
+        removed_clord_only=removed_clord_only,
+        kept_user_work=kept_user_work,
+        kept_not_repo=kept_not_repo,
+    )
 
 
 class OrphanSweepLoop:
@@ -374,12 +422,7 @@ class OrphanSweepLoop:
                 len(names),
                 ", ".join(names),
             )
-        return OrphanSweepResult(
-            removed=result.removed,
-            kept=result.kept,
-            reclaimed_bytes=result.reclaimed_bytes,
-            orphan_containers=names,
-        )
+        return replace(result, orphan_containers=names)
 
     async def _scan_containers(self, known: set[str]) -> tuple[str, ...]:
         """持ち主のいないコンテナの名前。docker が無い環境では常に空。

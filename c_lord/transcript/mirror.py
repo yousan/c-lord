@@ -35,6 +35,7 @@ from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
 from ..discord_ui.pane_context import replace_pane_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
+from ..log_sampler import LogSampler
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import (
     banner_only,
@@ -43,11 +44,20 @@ from ..usage_limit import (
     is_refusal_shaped,
     usage_limit_notices,
 )
-from .formatter import RenderedEvent, render_event
+from .formatter import ZWSP_MARKER, RenderedEvent, render_event
 from .pane_echo import pane_echo
-from .tail import tail_events
+from .repeat_fold import RepeatFold
+from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
 logger = logging.getLogger(__name__)
+
+# #810: an idle mirror with nothing to read is not an outage — nobody is waiting
+# on it, and ``on_ready`` restores one for every open session. The tail reports
+# every ``unresolved_after`` seconds for as long as that lasts, which made this
+# one line 99.99% of production ERRORs and buried the real ones. The fact still
+# has to stay findable per thread (#678), so it is a WARNING once an hour per
+# thread, carrying the count of the reports it stands for.
+_idle_unresolved_log = LogSampler(3600.0)
 
 Sink = Callable[[str], Awaitable[None]]
 FileSink = Callable[[str, str], Awaitable[None]]
@@ -70,6 +80,9 @@ class UserFileRequest:
 
 
 UserFileSink = Callable[[UserFileRequest], Awaitable[None]]
+# #747: posts the repeat counter and returns a handle to edit it with later.
+FoldPost = Callable[[str], Awaitable[object | None]]
+FoldEdit = Callable[[object, str], Awaitable[None]]
 
 # The harness tool whose "1 file delivered to user." goes to the harness's own
 # delivery channel — not to Discord (#233).
@@ -200,6 +213,41 @@ def _transcript_has_ask_result(project_dir: Path, tool_use_id: str) -> bool:
 
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
+
+# Tools that wait on the *reader*, not on a process. Their ``tool_result`` only
+# lands once someone answers the menu, so counting one as "running" would keep
+# the progress line on 作業中 under a menu nobody has touched (#757).
+_WAITS_ON_READER = frozenset({"AskUserQuestion", "ExitPlanMode"})
+
+
+def _tool_call_ids(event: dict) -> tuple[list[str], list[str]]:
+    """Return the tool-call ids *event* opens and closes (#757).
+
+    Read from the raw event, not the rendering: a call that printed nothing
+    (``sleep 150``) renders to ``None``, and missing its ``tool_result`` would
+    leave the call looking open for the rest of the turn. Like every helper run
+    on each tailed event, it never assumes a shape.
+    """
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return [], []
+    opened: list[str] = []
+    closed: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "tool_use" and block.get("name") not in _WAITS_ON_READER:
+            tool_id = block.get("id")
+            if isinstance(tool_id, str):
+                opened.append(tool_id)
+        elif kind == "tool_result":
+            tool_id = block.get("tool_use_id")
+            if isinstance(tool_id, str):
+                closed.append(tool_id)
+    return opened, closed
+
 
 # #631 AC8: the pane reader and this mirror witness the same limit, and the
 # reader's ⏳ embed is the message that should survive — it names the scope, the
@@ -349,8 +397,8 @@ def _is_user_prompt(event: dict) -> bool:
     """Return True for "Claude read an instruction" — the start of a turn (#583).
 
     A ``user`` event whose content is a plain string is an instruction: c-lord's
-    own (which carries the zero-width-space marker and is never rendered — see
-    :func:`c_lord.transcript.formatter._render_user`), or one typed straight
+    own (never rendered — recognised by the zero-width-space marker or, since
+    CLI 2.1.278 strips that, by the ``pane_echo`` record — #808), or one typed straight
     into the pane.  Tool results are ``user`` events too, but their content is a
     list of blocks, and counting one as the start of a turn would hand this turn
     the ending of the turn it displaced.
@@ -361,6 +409,21 @@ def _is_user_prompt(event: dict) -> bool:
         return False
     content = (event.get("message") or {}).get("content")
     return isinstance(content, str) and bool(content.strip())
+
+
+def _retire_marked_echo(thread_id: int, event: dict) -> None:
+    """Spend the ``pane_echo`` record of a prompt whose ZWSP survived (#808).
+
+    On a CLI that keeps the marker, the formatter drops the echo on its own and
+    the record :meth:`~c_lord.tmux.TmuxSessionManager.send_input` made is never
+    asked for. Left alone it would linger for hours and silence a person who
+    later types the same words into the pane.
+    """
+    if event.get("type") != "user":
+        return
+    content = (event.get("message") or {}).get("content")
+    if isinstance(content, str) and content.startswith(ZWSP_MARKER):
+        pane_echo.consume_match(thread_id, content)
 
 
 def _event_time(event: dict) -> datetime | None:
@@ -395,6 +458,66 @@ def _format_body(rendered: RenderedEvent) -> str:
     return f"{prefix}{rendered.body}"
 
 
+def _unresolved_notice(report: UnresolvedTranscript) -> str:
+    """What to tell the thread when its transcript cannot be found (#773).
+
+    The two cases need different advice, and getting that wrong wastes the
+    reader's time:
+
+    * **c-lord named this session** (a claim exists) — the transcript should be
+      there.  Restarting Claude re-names it, and ``/claude-restart`` keeps the
+      conversation.
+    * **c-lord never named it** — the session predates #773 (it was started by
+      an older c-lord, or it is still running from before the upgrade).  Here
+      the advice is ordered by what it costs the reader, cheapest first:
+
+      ``/claude-restart`` keeps the conversation and *may* be enough, because
+      the next process is started fresh: on a CLI that still writes c-lord's
+      input marker it becomes recognisable again by the old rule, and on any
+      resume that finds no conversation at all c-lord falls through to a fresh
+      **named** start.  What it cannot promise is the middle case — a resume
+      that succeeds on a CLI that strips the marker reopens the same unnamed
+      transcript and names nothing (``--session-id`` is refused with
+      ``--continue``).
+
+      So ``/clear`` is named as the one that always works: a new session is a
+      named session.  The workspace — the checkout, the branch, the files — is
+      untouched; the conversation is what does not carry over, and saying so is
+      the honest trade.
+
+    Deliberately not decided here by reading the CLI's version: what matters is
+    what the *next* process will do, the reader can try the cheap option first
+    either way, and a notice that is wrong about a version it guessed at is
+    worse than one that is honest about the order.
+    """
+    if report.candidates == 0:
+        detail = "このワークスペースには transcript がまだ 1 つもありません。"
+    else:
+        detail = (
+            f"transcript は {report.candidates} 本ありますが、"
+            "どれもこのスレッドのセッションのものと確認できません。"
+        )
+    if report.claimed_session_id:
+        recovery = (
+            "`/claude-restart` で Claude を立て直してください（会話の文脈は引き継がれます）。"
+        )
+    else:
+        recovery = (
+            "このセッションは c-lord がセッションに名前を付けるようになる前"
+            "（#773 以前）に起動したものです。\n"
+            "1. まず `/claude-restart`（会話の文脈は残ります）。これで直ることがあります\n"
+            "2. 直らなければ `/clear` — 新しいセッションには必ず名前が付くので確実に復旧します。"
+            "作業ディレクトリ（チェックアウト・ブランチ・ファイル）はそのままで、"
+            "会話の文脈だけが引き継がれません"
+        )
+    return (
+        "⚠️ このスレッドの transcript が見つからないため、Claude の返事を "
+        f"Discord に転送できていません（{report.seconds:.0f} 秒間）。\n"
+        f"{detail}\n"
+        f"{recovery}"
+    )
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -414,6 +537,10 @@ class TranscriptMirror:
         usage_limit_grace: float = USAGE_LIMIT_GRACE_SECONDS,
         ask_bridge_cb: AskBridgeCb | None = None,
         progress: TurnProgress | None = None,
+        fold_post: FoldPost | None = None,
+        fold_edit: FoldEdit | None = None,
+        expect_turn: bool = False,
+        unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
     ) -> None:
         self.thread_id = thread_id
         self.project_dir = project_dir
@@ -422,6 +549,14 @@ class TranscriptMirror:
         # inert instance so the loop below never has to None-check it; the Cog
         # supplies a real one, so consumers get the feature by upgrading alone.
         self._progress = progress if progress is not None else _null_progress()
+        # #747: one message stands in for a loop's copies of the same lines.
+        # Without an editor (older consumers, tests) the counter goes out through
+        # the plain sink and simply cannot show a number — it still stops the flood.
+        self._fold = RepeatFold(
+            thread_id=thread_id,
+            post=self._fold_poster(sink, fold_post),
+            edit=fold_edit if fold_post is not None else None,
+        )
         self._reply_sink = reply_sink
         self._file_sink = file_sink
         # #233: delivers the files of a SendUserFile call. Optional so a mirror
@@ -447,6 +582,16 @@ class TranscriptMirror:
         # folding the banner ourselves.  A knob only so tests need not sleep.
         self._usage_limit_grace = usage_limit_grace
         self._task: asyncio.Task[None] | None = None
+        # #773: is somebody waiting on this mirror right now?  Only then is
+        # "I cannot find this thread's transcript" news worth posting — a mirror
+        # restored at startup for an idle workspace has nothing to read by
+        # design, and ``on_ready`` restores one for every open session on the
+        # host.
+        self._turn_active = expect_turn
+        self._unresolved_after = unresolved_after
+        # One notice per turn: the tail keeps reporting for as long as the
+        # outage lasts, which is what lets the *next* turn be told too.
+        self._unresolved_told = False
 
     def note_turn_started(self) -> None:
         """Tell the progress line a turn just began (#539).
@@ -456,6 +601,50 @@ class TranscriptMirror:
         the reader has been waiting for all of it.
         """
         self._progress.begin_turn(restart=True)
+        # #773: from here on, silence is a symptom rather than an idle thread.
+        self._turn_active = True
+        self._unresolved_told = False
+
+    async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
+        """Say out loud that this thread's transcript cannot be found (#773/#585).
+
+        The jsonl mirror is the only delivery path there is (#712), so a mirror
+        that resolves nothing is a thread that receives nothing — and #627 made
+        that failure *silent* on purpose, to avoid the worse failure of posting
+        a stranger's conversation.  Silence is still the right thing to post; it
+        is the wrong thing to *say*, which is why this exists.  In #773 the
+        fleet was mute for three days and the only trace was one log line per
+        mirror.
+        """
+        detail = (
+            self.thread_id,
+            report.project_dir,
+            report.seconds,
+            report.candidates,
+            report.claimed_session_id or "none",
+        )
+        if not self._turn_active:
+            # #810: idle — nothing is being lost right now, so not an ERROR.
+            sample = _idle_unresolved_log.sample(self.thread_id)
+            if sample.emit:
+                logger.warning(
+                    "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
+                    "(%d jsonl file(s) present, claimed session id %s) while idle — "
+                    "a turn started here would not reach Discord (#773/#810)%s",
+                    *detail,
+                    sample.suffix,
+                )
+            return
+        logger.error(
+            "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
+            "(%d jsonl file(s) present, claimed session id %s) — Claude's replies "
+            "cannot reach this thread (#773)",
+            *detail,
+        )
+        if self._unresolved_told:
+            return
+        self._unresolved_told = True
+        await self._try_sink(_unresolved_notice(report))
 
     def start(self) -> None:
         """Spawn the tail task.  Idempotent."""
@@ -584,7 +773,9 @@ class TranscriptMirror:
             nonlocal _pending_text, _pending_progress, _pending_uuid
             if _pending_text is None:
                 return
-            await self._try_sink(_pending_text)
+            # #747: a loop's copy is counted in one message instead of posted.
+            if not await self._fold.offer(_pending_text):
+                await self._try_sink(_pending_text)
             # #399: an intermediate text posted silently may be the prose above
             # a not-yet-bridged menu (the plan path flushes it BEFORE the menu).
             # Register it as source="mirror" so the later pane-bridge skips its
@@ -602,6 +793,8 @@ class TranscriptMirror:
             nonlocal _pending_text, _pending_progress, _pending_uuid, _delivered_uuid
             if _pending_text is None:
                 return
+            # #747: the answer is never folded, and it ends any loop before it.
+            await self._fold.reset()
             await self._flush_as_reply(_pending_text, _pending_progress)
             # This IS the final answer for the turn — the one delivery that may
             # advance the cursor (#553).
@@ -618,7 +811,12 @@ class TranscriptMirror:
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _producer() -> None:
-            async for event in tail_events(self.project_dir, poll_interval=self._poll_interval):
+            async for event in tail_events(
+                self.project_dir,
+                poll_interval=self._poll_interval,
+                on_unresolved=self._on_unresolved,
+                unresolved_after=self._unresolved_after,
+            ):
                 await queue.put(event)
 
         producer = asyncio.create_task(_producer(), name=f"transcript-tail-{self.thread_id}")
@@ -639,6 +837,8 @@ class TranscriptMirror:
                     # It is finer than the line's refresh interval, so no separate
                     # timer task (with a lifetime to keep in sync) is needed.
                     await self._progress.tick()
+                    # #747: a loop that stalled still shows its latest count.
+                    await self._fold.flush()
                     # Idle: no new JSONL event within the window. Flush any held
                     # final answer as a pinging reply — independent of whether a
                     # ``result`` / ``turn_duration`` marker was ever written.
@@ -668,6 +868,8 @@ class TranscriptMirror:
                     usage_limit_notices.clear_thread(self.thread_id)
 
                 if _is_turn_end(event):
+                    # #773: nobody is waiting on this mirror until the next turn.
+                    self._turn_active = False
                     # #631: a limit reported for the turn that just ended says
                     # nothing about the next one — the limit may well have reset
                     # in between, and a thread that silently stops explaining why
@@ -683,6 +885,8 @@ class TranscriptMirror:
                         # before the final answer lands so it never trails
                         # below the answer.
                         await self._progress.end_turn()
+                        # #747: a loop never spans a turn boundary.
+                        await self._fold.reset()
                         # Turn boundary: flush pending as the final reply.
                         await _flush_pending_as_reply()
                         await _commit_cursor()
@@ -703,19 +907,23 @@ class TranscriptMirror:
 
                 rendered = render_event(event)
 
-                # #682: the other half of the ZWSP echo test. A menu answer is
-                # typed with ``send_literal``, which leaves the marker off on
-                # purpose (#172/#650), so the formatter cannot tell this event
-                # from human pane input — but c-lord recorded what it typed, so
-                # ask. Dropped exactly like a marked echo (no turn bookkeeping):
+                # #682/#808: the other half of the ZWSP echo test. A menu answer
+                # is typed with ``send_literal``, which leaves the marker off on
+                # purpose (#172/#650), and CLI 2.1.278+ strips it from every
+                # prompt (#808) — so the formatter cannot tell this event from
+                # human pane input. But c-lord recorded what it typed, so ask.
+                # Dropped exactly like a marked echo (no turn bookkeeping):
                 # Discord already has the sentence the user wrote.
-                if (
-                    rendered is not None
-                    and rendered.kind == "user_input"
-                    and pane_echo.consume_match(self.thread_id, rendered.body)
+                if rendered is None:
+                    # A marker that survived (older CLI) already dropped the
+                    # echo; spend its record so it cannot later swallow the same
+                    # words typed by a person in the pane.
+                    _retire_marked_echo(self.thread_id, event)
+                elif rendered.kind == "user_input" and pane_echo.consume_match(
+                    self.thread_id, rendered.body
                 ):
                     logger.info(
-                        "TranscriptMirror: suppressed unmarked c-lord pane echo thread=%d",
+                        "TranscriptMirror: suppressed c-lord pane echo (no ZWSP) thread=%d",
                         self.thread_id,
                     )
                     rendered = None
@@ -729,10 +937,18 @@ class TranscriptMirror:
                 # the gap being filled. Arming here (not only on user_input) also
                 # covers turns started outside Discord (scheduler / webhook / the
                 # tmux pane).
-                if rendered is not None and rendered.kind in _BUFFERED_KINDS:
+                # #757: the ids tell a call that is still running (no result
+                # yet) from a turn that has genuinely gone quiet.
+                opened, closed = _tool_call_ids(event)
+                is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
+                if is_tool or opened or closed:
                     self._progress.begin_turn()
                     self._progress.note_activity(
-                        rendered.body if rendered.kind == "tool_use" else None
+                        rendered.body
+                        if rendered is not None and rendered.kind == "tool_use"
+                        else None,
+                        started=opened,
+                        finished=closed,
                     )
                 await self._progress.tick()
 
@@ -832,6 +1048,7 @@ class TranscriptMirror:
                         # and arms the next one.
                         await self._progress.end_turn()
                         self._progress.begin_turn()
+                        await self._fold.reset()  # #747 (see turn_end)
                         # Human turn: previous assistant turn is over → flush as reply.
                         await _flush_pending_as_reply()
                         await _commit_cursor()
@@ -860,7 +1077,25 @@ class TranscriptMirror:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _flush_pending_as_reply()
                     await _commit_cursor()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._fold.reset()
             logger.info("TranscriptMirror stopped: thread=%d", self.thread_id)
+
+    def _fold_poster(self, sink: Sink, fold_post: FoldPost | None) -> FoldPost:
+        """How the #747 counter reaches the thread.
+
+        A new message, like any other output, so the #539 filler steps aside
+        for it first and never ends up sitting below it.
+        """
+
+        async def post(text: str) -> object | None:
+            await self._progress.note_output()
+            if fold_post is not None:
+                return await fold_post(text)
+            await sink(text)
+            return None
+
+        return post
 
     async def _report_usage_limit(self, limit: UsageLimit | None, *, reported: bool) -> None:
         """Say once, in Japanese, that Claude is waiting on a plan limit (#631).
