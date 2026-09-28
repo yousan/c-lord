@@ -1526,6 +1526,95 @@ class TestAnsweredTurnDoesNotFalseTimeout:
         assert "exited without producing a response" in result_events[0].error
 
 
+class TestMenuWaitDoesNotFalseTimeout:
+    """#751: a turn waiting on the user's menu answer is not a hung turn.
+
+    When another bridge (the transcript mirror, the #359 watchdog) posted the
+    AskUserQuestion / plan menu first, the runner's own ``pane_ask`` is declined
+    (#535) and it keeps polling a pane that — correctly — does not move until a
+    person answers.  Five minutes later the inactivity backstop fired and told
+    the user "⏱️ Session timed out … /clear to start fresh" about a session that
+    was simply waiting for them; following that advice throws the work away.
+    Every traced occurrence (2026-09-04 ×2 on staging, 2026-09-12 #988 in
+    production) was this.
+
+    A frozen pane is still a hang when no menu is open — including a pane
+    frozen mid-spinner, because the live spinner's timer redraws every second
+    while claude is healthy (#541 ``test_frozen_mid_generation_still_times_out``).
+    """
+
+    # Real capture: staging-3, Claude Code v2.1.280, AskUserQuestion open and
+    # already bridged by the transcript mirror (2026-09-23).
+    _MENU_FIXTURE = "i751_ask_menu_open_v2_1_280.txt"
+
+    @staticmethod
+    def _working(t: int) -> str:
+        return f"✻ Generating… ({t}s · ↑ 2.1k tokens · esc to interrupt)"
+
+    async def _run_until_backstop(self, runner, tmux_manager, then: str) -> list:
+        """Generate for a few polls, then freeze on *then* until the backstop fires."""
+        tmux_manager.is_claude_running.return_value = True
+        call_idx = 0
+
+        def capture_fn(tid):
+            nonlocal call_idx
+            call_idx += 1
+            return self._working(call_idx) if call_idx <= 4 else then
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        runner.timeout_seconds = 0.2
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            # Only the inactivity backstop may end the loop.
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 100.0),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_FALLBACK", 100.0),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("q"):
+                events.append(event)
+        return [e for e in events if e.is_complete]
+
+    def test_fixture_is_an_open_menu_not_a_running_pane(self) -> None:
+        pane = _normalize_capture(_load_fixture(self._MENU_FIXTURE))
+        assert _parse_ask_from_pane(pane) is not None
+        assert not TmuxClaudeRunner._is_idle_at_prompt(pane)
+
+    @pytest.mark.asyncio
+    async def test_open_menu_at_backstop_is_not_reported_as_timeout(
+        self, runner, tmux_manager, caplog
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="c_lord.claude.tmux_runner"):
+            results = await self._run_until_backstop(
+                runner, tmux_manager, _load_fixture(self._MENU_FIXTURE)
+            )
+
+        assert len(results) == 1
+        assert results[0].error is None, f"menu wait reported as: {results[0].error!r}"
+        # #678: the decision not to report is itself logged at INFO.
+        assert any("#751" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_frozen_mid_turn_real_pane_still_times_out(self, runner, tmux_manager) -> None:
+        """A real mid-turn pane that stops redrawing is a hang — no menu, no pass."""
+        frozen = _load_fixture("i742_running_mid_turn_v2_1_271.txt")
+        results = await self._run_until_backstop(runner, tmux_manager, frozen)
+
+        assert len(results) == 1
+        assert results[0].error is not None
+        assert "Timed out" in results[0].error
+
+    @pytest.mark.asyncio
+    async def test_idle_real_pane_still_silent(self, runner, tmux_manager) -> None:
+        """#541 is unchanged: a finished turn at its idle prompt reports nothing."""
+        idle = _load_fixture("i742_idle_after_turn_v2_1_271.txt")
+        results = await self._run_until_backstop(runner, tmux_manager, idle)
+
+        assert len(results) == 1
+        assert results[0].error is None
+
+
 class TestTurnThatNeverStarted:
     """#562: a turn with no response at all must not report "finished".
 
@@ -3790,6 +3879,41 @@ class TestExtractStartupError:
         assert result is not None
         assert "command not found" in result.lower()
 
+    def test_detects_bash_style_command_not_found(self) -> None:
+        pane = "$ claude --model opus 'hi'\nbash: claude: command not found\n$\n"
+        result = _extract_startup_error(pane)
+        assert result is not None
+        assert "claude: command not found" in result
+
+    def test_bash_tool_error_for_claude_prefixed_command_is_not_startup_error(self) -> None:
+        """#453: a Bash tool failing on ``claude-<something>`` is not claude failing.
+
+        Real Claude Code v2.1.280 pane (``--verbose``, which shows tool output):
+        Claude ran ``claude-metrics-exporter --help`` and the shell answered
+        ``(eval):1: command not found: claude-metrics-exporter``. The session is
+        alive and mid-turn; the old substring match read the line as "claude is
+        not installed" and ended the turn with "Claude failed to start".
+        """
+        pane = _normalize_capture(_load_fixture("i453_bash_error_claude_prefixed_cmd_v2_1_280.txt"))
+        assert "command not found: claude-metrics-exporter" in pane  # the trap is there
+        assert _extract_startup_error(pane) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "  ⎿  (eval):1: command not found: claude-metrics-exporter",
+            "zsh: command not found: claude-code",
+            "zsh: command not found: claude_helper",
+            "zsh: command not found: claude2",
+            "bash: claude-foo: command not found",
+            "bash: my-claude: command not found",
+            "bash: xclaude: command not found",
+        ],
+    )
+    def test_other_commands_named_like_claude_are_not_startup_errors(self, line: str) -> None:
+        """#453: only a missing ``claude`` itself is a startup failure."""
+        assert _extract_startup_error(line) is None
+
     def test_healthy_response_pane_returns_none(self) -> None:
         pane = _make_pane(["● Sure, here is the fix."], with_input_prompt=True)
         assert _extract_startup_error(pane) is None
@@ -3824,6 +3948,32 @@ class TestRunStartupErrorSurfacing:
         assert len(result_events) == 1
         assert result_events[0].error is not None
         assert "native binary not installed" in result_events[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_bash_tool_error_does_not_end_live_turn_as_failed_start(
+        self, runner, tmux_manager
+    ) -> None:
+        """#453: the real pane of a live turn whose Bash tool hit a ``claude-*``
+        command must not be reported as "Claude failed to start"."""
+        tmux_manager.capture_pane.return_value = _load_fixture(
+            "i453_bash_error_claude_prefixed_cmd_v2_1_280.txt"
+        )
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("run claude-metrics-exporter --help"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert not (result_events[0].error or "").startswith("Claude failed to start")
 
     @pytest.mark.asyncio
     async def test_no_response_claude_exited_yields_error(self, runner, tmux_manager) -> None:

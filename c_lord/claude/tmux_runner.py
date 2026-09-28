@@ -380,11 +380,19 @@ _PERMISSION_PROMPT_MARKERS = (
 # PATH (``command not found``).  When the pane shows one of these and no
 # response was ever produced, the runner surfaces it to Discord as an error
 # instead of silently reporting a normal completion (#366).  Matched
-# case-insensitively as substrings of a single pane line.
-_STARTUP_ERROR_MARKERS = (
-    "native binary not installed",
-    "command not found: claude",
-    "claude: command not found",
+# case-insensitively against a single pane line.
+#
+# ``claude`` must be the whole command name (#453).  A plain substring match
+# also fired on ``command not found: claude-metrics-exporter`` — a Bash tool
+# inside a live session failing on some other ``claude-*`` command — and ended
+# that turn with "Claude failed to start".  The lookarounds reject a name that
+# merely starts or ends with ``claude`` (``claude-code``, ``claude2``,
+# ``my-claude``) while still matching ``claude`` itself.
+_STARTUP_ERROR_RE = re.compile(
+    r"native binary not installed"
+    r"|command not found: claude(?![-\w])"
+    r"|(?<![-\w])claude: command not found",
+    re.IGNORECASE,
 )
 
 
@@ -403,7 +411,7 @@ def _extract_startup_error(pane: str) -> str | None:
         return None
     for line in pane.splitlines():
         stripped = line.strip()
-        if any(marker in stripped.lower() for marker in _STARTUP_ERROR_MARKERS):
+        if _STARTUP_ERROR_RE.search(stripped):
             return stripped[:300]
     return None
 
@@ -2119,7 +2127,8 @@ class TmuxClaudeRunner:
             #      without answering (crash / unrecognised fatal error).
             #   3. ``claude`` is alive but NOT idle at its prompt → it really is
             #      wedged mid-turn; a frozen pane for the whole timeout window is
-            #      a genuine hang, so report the timeout.
+            #      a genuine hang, so report the timeout — unless the pane is an
+            #      open menu waiting on the user's answer (#751), which is not.
             #   4. ``claude`` is alive and idle at its prompt → the turn is over
             #      and the answer went out through the jsonl mirror / reply skill
             #      (#541).  Stay silent rather than posting a false error embed.
@@ -2240,7 +2249,31 @@ class TmuxClaudeRunner:
                     "Send the message again, or check the tmux pane."
                 )
             elif timed_out and not self._is_idle_at_prompt(current):
-                error = f"Timed out after {self.timeout_seconds} seconds"
+                # #751: a menu waiting on the user's answer is not a hang. When
+                # another bridge (transcript mirror / #359 watchdog) posted the
+                # menu first, this runner's own pane_ask is declined (#535) and
+                # it keeps polling a pane that correctly does not move until a
+                # person answers — so the backstop fires on it. "No input box"
+                # then read as "wedged", and the user was told to /clear a
+                # session that was only waiting for them (all three traced
+                # cases, incl. production #988). The menu stays answerable
+                # after this run ends; the answer continues the session.
+                #
+                # Deliberately NOT exempted: a pane frozen mid-spinner. The
+                # live spinner's timer redraws every second while claude is
+                # healthy, so a spinner that has not moved for the whole
+                # window means the TUI stopped drawing — a real hang (#541).
+                waiting_on = _parse_ask_from_pane(current) or _parse_plan_from_pane(current)
+                if waiting_on is not None:
+                    logger.info(
+                        "%s inactivity backstop: pane is a menu waiting for the user's "
+                        "answer (%r), not a hang — not reporting a timeout (#751)",
+                        log_ctx(thread_id=self._thread_id),
+                        waiting_on.header or waiting_on.question[:80],
+                    )
+                    error = None
+                else:
+                    error = f"Timed out after {self.timeout_seconds} seconds"
             else:
                 error = None
         else:
