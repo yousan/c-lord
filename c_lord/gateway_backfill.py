@@ -23,6 +23,14 @@ This module is the bookkeeping for going back. It does not talk to Discord —
   picked up from history is recorded too, so a late gateway delivery of the
   same message is not run a second time. This is what makes the generous
   ``since`` above safe.
+* :class:`Startup` / :func:`last_mark_before` — **the restart gap (#776).** A
+  new process IDENTIFYs, so what was posted while no process was running is
+  never delivered either — and ``SeenMessages`` starts empty, so it cannot
+  tell what the previous process already ran. That is read off Discord
+  instead: every turn leaves a reaction on its trigger message and every
+  other way of handling a message posts in the thread, so a request newer
+  than the previous process's last such mark is one it never saw. No DB
+  state is kept for it.
 * :func:`missed_notice` / :func:`merge_missed_prompt` — **what to say.** One
   line in the thread explaining the delay, and — when several messages were
   missed in one thread — one prompt carrying all of them, because replaying
@@ -55,7 +63,14 @@ SEEN_CAPACITY = 10_000
 # than this while we were away is logged as such rather than paged through.
 HISTORY_LIMIT = 100
 
+# How far back the first connect of a process reads (#776). A restart leaves
+# a gap of seconds, a crash waiting on its supervisor minutes. Past an hour the
+# message is no longer "a moment ago" — and a thread whose tail is an unmarked
+# request that old is more likely one c-lord deliberately left alone.
+STARTUP_LOOKBACK = timedelta(hours=1)
+
 Outcome = Literal["run", "held", "superseded"]
+Cause = Literal["gateway", "restart"]
 
 
 class SeenMessages:
@@ -116,10 +131,30 @@ class GatewayWatch:
 
     clock: Callable[[], datetime] = field(default=discord.utils.utcnow)
     margin: timedelta = MARGIN
+    started_at: datetime | None = None
+    """When this process came up (#776). Anything the bot posted before it was
+    posted by the previous process. Defaults to the moment of construction."""
     _first_up: datetime | None = None
     _last_alive: datetime | None = None
     _down_at: datetime | None = None
     _alive_at_down: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.started_at is None:
+            self.started_at = self.clock()
+
+    def first_connect(self, now: datetime | None = None) -> Startup | None:
+        """Record ``ready`` if it is this process's first (#776).
+
+        The gap to read back after a restart — or ``None`` when the process
+        was already up, which is what :meth:`connected` is for.
+        """
+        if self._first_up is not None:
+            return None
+        now = now or self.clock()
+        self.connected(now)
+        started_at = self.started_at or now
+        return Startup(started_at=started_at, up_at=now, since=started_at - STARTUP_LOOKBACK)
 
     def seen(self, at: datetime) -> None:
         """The gateway delivered something created at *at*."""
@@ -162,6 +197,45 @@ class GatewayWatch:
 
 
 @dataclass(frozen=True)
+class Startup:
+    """The first connect of a process: what it may have missed (#776)."""
+
+    started_at: datetime
+    """When this process came up. The bot's marks from before it are the
+    previous process's; later ones are this process's own."""
+
+    up_at: datetime
+    """When the first ``on_ready`` fired. Later messages are delivered live."""
+
+    since: datetime
+    """Where to start reading: :data:`STARTUP_LOOKBACK` before ``started_at``."""
+
+
+def last_mark_before(
+    history: Sequence[discord.Message], *, bot_id: int | None, before: datetime
+) -> int | None:
+    """Id of the newest message showing the previous process was here (#776).
+
+    A mark is a message the bot posted, or a message carrying the bot's own
+    reaction — the per-turn lamp (#246) sits on every trigger message, and a
+    message handled without a turn (menu answer, closed notice, slot wait, ⚡)
+    is followed by a post. Only marks from before *before* (this process's
+    start) count: this process's transcript mirror may already have posted in
+    the thread by the time it is read.
+    """
+    newest: int | None = None
+    for m in history:
+        if m.created_at >= before:
+            continue
+        author = getattr(m, "author", None)
+        own_post = bot_id is not None and getattr(author, "id", None) == bot_id
+        own_reaction = any(getattr(r, "me", False) for r in getattr(m, "reactions", None) or ())
+        if (own_post or own_reaction) and (newest is None or m.id > newest):
+            newest = m.id
+    return newest
+
+
+@dataclass(frozen=True)
 class MissedEntry:
     """One missed message, as it goes into a merged prompt."""
 
@@ -185,6 +259,7 @@ def missed_notice(
     first_missed_at: datetime,
     count: int,
     outcome: Outcome,
+    cause: Cause = "gateway",
     tz: tzinfo | None = None,
 ) -> str:
     """The one line posted in a thread whose messages were picked up late.
@@ -200,6 +275,9 @@ def missed_notice(
       answer with its closed notice, so this line promises nothing.
     * ``"superseded"`` — the sender already posted again after the reconnect;
       running the old one now would interrupt the new one.
+
+    ``cause`` says why it was missed: the gateway was down (#745), or c-lord
+    itself was restarting (#776).
     """
     start = min(down_at, first_missed_at)
     with_date = start.astimezone(tz).date() != back_at.astimezone(tz).date()
@@ -208,7 +286,8 @@ def missed_notice(
         f"〜{_clock_text(back_at, tz=tz, with_date=with_date)}"
     )
     what = "この依頼" if count == 1 else f"この間に届いた {count} 件の依頼"
-    head = f"-# 🔌 {span} の間 Discord と接続できておらず、{what}を受け取れていませんでした。"
+    why = "c-lord が再起動しており" if cause == "restart" else "Discord と接続できておらず"
+    head = f"-# 🔌 {span} の間 {why}、{what}を受け取れていませんでした。"
     if outcome == "run":
         return head + ("いまから処理します。" if count == 1 else "まとめていまから処理します。")
     if outcome == "superseded":
@@ -229,7 +308,7 @@ def merge_missed_prompt(entries: Sequence[MissedEntry], *, tz: tzinfo | None = N
     n = len(entries)
     last_day = entries[-1].created_at.astimezone(tz).date() if entries else None
     parts = [
-        f"（Discord と接続できていなかった間に、このスレッドへ {n} 件のメッセージが"
+        f"（c-lord がメッセージを受け取れていなかった間に、このスレッドへ {n} 件のメッセージが"
         "届いていました。古い順に並べます。）"
     ]
     for i, entry in enumerate(entries, 1):

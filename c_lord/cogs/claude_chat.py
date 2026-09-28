@@ -14,11 +14,11 @@ import asyncio
 import contextlib
 import logging
 import os
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import discord
 from discord import app_commands
@@ -56,11 +56,14 @@ from ..discord_ui.views import (
 )
 from ..gateway_backfill import (
     HISTORY_LIMIT,
+    Cause,
     GatewayWatch,
     MissedEntry,
     Outage,
     Outcome,
     SeenMessages,
+    Startup,
+    last_mark_before,
     merge_missed_prompt,
     missed_notice,
 )
@@ -2566,8 +2569,21 @@ class ClaudeChatCog(commands.Cog):
         """Start reading back what the outage that just ended kept from us (#745).
 
         Fire-and-forget: ``on_ready`` must not wait on a walk over threads. The
-        first connect of the process is not an outage and starts nothing.
+        first connect of the process is not an outage — but it follows a gap in
+        which no process was listening at all, and that is read back too (#776).
         """
+        startup = self._gateway.first_connect()
+        if startup is not None:
+            logger.info(
+                "Discord gateway up (%s) at %s — process started %s; reading back messages "
+                "posted while c-lord was not running, from %s (#776)",
+                via,
+                _local_stamp(startup.up_at),
+                _local_stamp(startup.started_at),
+                _local_stamp(startup.since),
+            )
+            self._start_backfill(self._backfill_startup(startup))
+            return
         outage = self._gateway.connected()
         if outage is None:
             return
@@ -2581,10 +2597,41 @@ class ClaudeChatCog(commands.Cog):
             _local_stamp(outage.last_alive_at),
             _local_stamp(outage.since),
         )
-        task = asyncio.create_task(self._backfill_outage(outage, via))
+        self._start_backfill(self._backfill_outage(outage, via))
+
+    def _start_backfill(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(work)
         self._backfill_tasks.add(task)
         task.add_done_callback(self._backfill_tasks.discard)
         self._backfill_task = task
+
+    async def _backfill_startup(self, startup: Startup) -> None:
+        """Read back and run what the restart gap kept from us (#776). Never raises."""
+        async with self._backfill_lock:
+            try:
+                picked, threads_hit, read_back = await self._pick_up_missed(
+                    since=startup.since,
+                    down_at=startup.up_at,
+                    back_at=startup.up_at,
+                    cause="restart",
+                    startup=startup,
+                )
+            except Exception:
+                logger.exception(
+                    "Startup pick-up %s → %s: reading back missed messages failed (#776)",
+                    _local_stamp(startup.since),
+                    _local_stamp(startup.up_at),
+                )
+                return
+            logger.info(
+                "Startup pick-up %s → %s: picked up %d message(s) in %d thread(s) posted "
+                "while c-lord was not running; %d thread(s) read back (#776)",
+                _local_stamp(startup.since),
+                _local_stamp(startup.up_at),
+                picked,
+                threads_hit,
+                read_back,
+            )
 
     async def _backfill_outage(self, outage: Outage, via: str) -> None:
         """Read back and run what *outage* kept from us. Never raises.
@@ -2594,7 +2641,12 @@ class ClaudeChatCog(commands.Cog):
         """
         async with self._backfill_lock:
             try:
-                picked, threads_hit, read_back = await self._pick_up_missed(outage)
+                picked, threads_hit, read_back = await self._pick_up_missed(
+                    since=outage.since,
+                    down_at=outage.down_at,
+                    back_at=outage.back_at,
+                    cause="gateway",
+                )
             except Exception:
                 logger.exception(
                     "Gateway outage %s → %s: reading back missed messages failed (#745)",
@@ -2614,10 +2666,18 @@ class ClaudeChatCog(commands.Cog):
                 read_back,
             )
 
-    async def _pick_up_missed(self, outage: Outage) -> tuple[int, int, int]:
+    async def _pick_up_missed(
+        self,
+        *,
+        since: datetime,
+        down_at: datetime,
+        back_at: datetime,
+        cause: Cause,
+        startup: Startup | None = None,
+    ) -> tuple[int, int, int]:
         """(messages picked up, threads they were in, threads read back)."""
         picked = threads_hit = read_back = 0
-        for thread in await self._threads_active_since(outage.since):
+        for thread in await self._threads_active_since(since):
             # Ours = a thread this instance holds a session for — the rule
             # on_message applies (accepts_message). A shared guild is full of
             # other instances' threads; they read back their own.
@@ -2626,7 +2686,15 @@ class ClaudeChatCog(commands.Cog):
                 continue
             read_back += 1
             try:
-                count = await self._pick_up_thread(thread, record, outage)
+                count = await self._pick_up_thread(
+                    thread,
+                    record,
+                    since=since,
+                    down_at=down_at,
+                    back_at=back_at,
+                    cause=cause,
+                    startup=startup,
+                )
             except Exception:
                 logger.warning(
                     "%s could not read back messages missed while disconnected (#745)",
@@ -2667,30 +2735,49 @@ class ClaudeChatCog(commands.Cog):
         return threads
 
     async def _pick_up_thread(
-        self, thread: discord.Thread, record: SessionRecord | None, outage: Outage
+        self,
+        thread: discord.Thread,
+        record: SessionRecord | None,
+        *,
+        since: datetime,
+        down_at: datetime,
+        back_at: datetime,
+        cause: Cause,
+        startup: Startup | None = None,
     ) -> int:
         """Run what *thread* received while we were away. Returns how many.
 
         Everything the gateway did deliver is skipped (``_gateway_seen``), and
         what is picked up here is marked before anything awaits, so a late
         gateway delivery of it — or the next reconnect — does not run it again.
+
+        After a restart (*startup*, #776) ``_gateway_seen`` knows nothing of the
+        previous process, so what it handled is read off the thread instead:
+        only requests newer than its last mark (a post or a reaction by the
+        bot, :func:`last_mark_before`) are missed.
         """
         ctx = log_ctx(thread_id=thread.id)
         history = [
-            m
-            async for m in thread.history(
-                limit=HISTORY_LIMIT, after=outage.since, oldest_first=True
-            )
+            m async for m in thread.history(limit=HISTORY_LIMIT, after=since, oldest_first=True)
         ]
         if len(history) >= HISTORY_LIMIT:
             logger.warning(
                 "%s read back only the first %d messages posted since %s (#745)",
                 ctx,
                 HISTORY_LIMIT,
-                _local_stamp(outage.since),
+                _local_stamp(since),
             )
         requests = [m for m in history if await self._is_runnable_request(m)]
         missed = [m for m in requests if m.id not in self._gateway_seen]
+        if startup is not None:
+            bot_user = getattr(self.bot, "user", None)
+            mark = last_mark_before(
+                history, bot_id=getattr(bot_user, "id", None), before=startup.started_at
+            )
+            # Anything posted after READY is delivered live.
+            missed = [
+                m for m in missed if (mark is None or m.id > mark) and m.created_at <= startup.up_at
+            ]
         if not missed:
             return 0
         newest = missed[-1]
@@ -2708,9 +2795,10 @@ class ClaudeChatCog(commands.Cog):
         else:
             outcome = "run"
         logger.info(
-            "%s picked up %d message(s) posted while the gateway was down (%s → %s): %s (#745)",
+            "%s picked up %d message(s) posted while %s (%s → %s): %s (#745/#776)",
             ctx,
             len(missed),
+            "c-lord was not running" if cause == "restart" else "the gateway was down",
             _local_stamp(missed[0].created_at),
             _local_stamp(newest.created_at),
             outcome,
@@ -2718,11 +2806,12 @@ class ClaudeChatCog(commands.Cog):
         with contextlib.suppress(discord.HTTPException):
             await thread.send(
                 missed_notice(
-                    down_at=outage.down_at,
-                    back_at=outage.back_at,
+                    down_at=down_at,
+                    back_at=back_at,
                     first_missed_at=missed[0].created_at,
                     count=len(missed),
                     outcome=outcome,
+                    cause=cause,
                 )
             )
         if outcome != "superseded":
