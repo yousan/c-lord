@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .claim import claimed_transcript, read_claim
+from .claim import claimed_transcript, clear_successor, cleared_at, read_claim, write_claim
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +214,8 @@ class ThreadSessionResolver:
     # resolve.  Reported to the reader when nothing resolves (#773), so the
     # message can say whether c-lord even got as far as naming a session.
     _claimed_session_id: str | None = None
+    # path -> (size when probed, when the /clear that opens it ran) — #803
+    _clear_times: dict[Path, tuple[int, float | None]] = field(default_factory=dict)
 
     @property
     def claimed_session_id(self) -> str | None:
@@ -238,6 +240,13 @@ class ThreadSessionResolver:
         claimed = claimed_transcript(self.project_dir)
         self._claimed_session_id = read_claim(self.project_dir)
         if claimed is not None:
+            # #803: a ``/clear`` — typed by c-lord or by a human in the pane —
+            # starts a new transcript under a new name.  Follow it, and move the
+            # claim with it so a later ``--resume`` opens the cleared session.
+            successor = self._clear_successor(claimed.stem)
+            if successor is not None:
+                claimed = successor
+                self._claimed_session_id = successor.stem
             if claimed != self._pinned:
                 if self._pinned is not None:
                     logger.info(
@@ -307,6 +316,51 @@ class ThreadSessionResolver:
                 )
             return None
         return self._pinned
+
+    def _clear_successor(self, claimed_id: str) -> Path | None:
+        """The transcript a ``/clear`` of the claimed session started, if any (#803).
+
+        Looked for only when the directory listing changed — a ``/clear``
+        creates a file — so an idle poll still costs a stat.  The claim is
+        rewritten here: the resolver is the one place that sees a ``/clear``
+        typed straight into the pane, and without the claim a later
+        ``--resume`` would reopen the conversation that was cleared.
+        """
+        try:
+            dir_mtime = self.project_dir.stat().st_mtime
+        except OSError:
+            return None
+        if not self._listing_is_stale(dir_mtime):
+            return None
+        try:
+            self._candidates = [p for p in self.project_dir.glob("*.jsonl") if p.is_file()]
+        except OSError:
+            return None
+        self._dir_mtime = dir_mtime
+        self._listed_at = time.time()
+        successor_id = clear_successor(self.project_dir, claimed_id, probe=self._cleared_at)
+        if successor_id is None or not write_claim(self.project_dir, successor_id):
+            return None
+        logger.info(
+            "TranscriptMirror: /clear started session %s (was %s) — following it and "
+            "moving the claim (#803)",
+            successor_id,
+            claimed_id,
+        )
+        return self.project_dir / f"{successor_id}.jsonl"
+
+    def _cleared_at(self, path: Path) -> float | None:
+        """:func:`cleared_at`, cached until the file's size changes."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        cached = self._clear_times.get(path)
+        if cached is not None and cached[0] == size:
+            return cached[1]
+        at = cleared_at(path)
+        self._clear_times[path] = (size, at)
+        return at
 
     def _listing_is_stale(self, dir_mtime: float) -> bool:
         """Whether the cached directory listing has to be rebuilt.

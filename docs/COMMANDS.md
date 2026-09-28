@@ -137,7 +137,17 @@ The option autocompletes with the channel's default (shown first) and every repo
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
 
+**`/clear`** types Claude Code's own `/clear` into this thread's pane (#803) — the same `send_literal` path as `/compact`. The Claude process stays; only the conversation is emptied, and your next message goes to that same process. It works in any state:
+
+- **Claude is idle** → `/clear` is typed straight away.
+- **A turn is running** → the turn is stopped first (like `/stop`, not a kill), then `/clear` is typed.
+- **The workspace is stopped** (slept after 4 hours, host restart) → it is restored first, with `-# 🔄 停止していたワークスペースを復元してから `/clear` を送ります。` in the thread, then cleared. A `[終了]` thread is not restored — you get the usual hint instead.
+
+Claude Code answers `/clear` with a **new transcript file**, and c-lord follows it: the post-clear answers keep arriving in Discord, and a later restore reopens the *cleared* conversation, not the old one. The same happens when someone types `/clear` directly in the tmux pane (the mirror notices the new transcript by itself). Before #803 the command killed the window and stamped the session row as "start fresh", which only one thread per host could hold — every `/clear` after the first failed with 「予期せぬエラー」.
+
 **`/compact`** fires the Claude Code TUI's built-in `/compact` for this thread's session, compressing the conversation history into a summary so the context window is freed **without losing continuity** (unlike `/clear`, which discards the session). Pass optional `instructions` to focus the summary (e.g. `/compact keep the open tasks and decisions`). Note: a plain `/compact` typed as a normal message does **not** work (the leading-slash note below) — this command exists precisely because it sends `/compact` via the zero-width-space-free `send_literal` path.
+
+It works in the same states as `/clear` (#806): a running turn is stopped first, and a **stopped workspace is restored first** (`--resume` of the recorded session, so the conversation to compact comes back) with `-# 🔄 停止していたワークスペースを復元してから `/compact` を送ります。` in the thread. Before #806 a stopped thread answered `No running Claude session in this thread to compact.`, which read as the conversation being lost. A thread with no c-lord record, a `[終了]` thread, or one where Claude never wrote a transcript is refused in words instead of being woken — there is nothing to compact.
 
 **`/clord-attach`** links a thread to a tmux window so you can interact with the same Claude Code session from both Discord and the terminal.
 
@@ -325,7 +335,7 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 | 表示だけがおかしい | `/resync` | 繋ぎ直す | そのまま | そのまま | 残る | 動いたまま |
 | いま走っているターンを止めたい | `/stop` | そのまま | **中断** | そのまま | 残る | 動いたまま |
 | プロセスが固まって入力を受け付けない | `/claude-restart` | そのまま | 落とす | **再起動** | 残る（`--continue`） | 動いたまま |
-| 文脈を捨ててやり直したい | `/clear` | そのまま | 落とす | 落とす | **消える** | 動いたまま |
+| 文脈を捨ててやり直したい | `/clear` | そのまま（新しい会話に追従） | 止める | そのまま（`/clear` を打つ） | **消える** | 動いたまま |
 | このスレッドの作業を畳みたい | `/workspace-stop` | そのまま | 落とす | 落とす | 残る | **停止** |
 | ディスクも返したい | `/workspace-delete` | そのまま | 落とす | 落とす | 残る | 停止（作業ディレクトリも削除） |
 
@@ -442,8 +452,8 @@ startup log says who ended up allowed.
    warning at startup when it is set.
 
 A user who is not allowed gets `You are not authorized to use this command.` and
-nothing happens. That includes `/clear` / `!clear` (#405): it kills the runner and
-the tmux window and resets the session, so a stranger in the thread must not be
+nothing happens. That includes `/clear` / `!clear` (#405): it throws the conversation
+away (#803: by typing `/clear` into Claude Code), so a stranger in the thread must not be
 able to run it on someone else's conversation.
 
 See [specs/authorization-default.md](specs/authorization-default.md).

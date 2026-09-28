@@ -43,7 +43,7 @@ from ..usage_limit import (
     is_refusal_shaped,
     usage_limit_notices,
 )
-from .formatter import RenderedEvent, render_event
+from .formatter import ZWSP_MARKER, RenderedEvent, render_event
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
@@ -388,8 +388,8 @@ def _is_user_prompt(event: dict) -> bool:
     """Return True for "Claude read an instruction" — the start of a turn (#583).
 
     A ``user`` event whose content is a plain string is an instruction: c-lord's
-    own (which carries the zero-width-space marker and is never rendered — see
-    :func:`c_lord.transcript.formatter._render_user`), or one typed straight
+    own (never rendered — recognised by the zero-width-space marker or, since
+    CLI 2.1.278 strips that, by the ``pane_echo`` record — #808), or one typed straight
     into the pane.  Tool results are ``user`` events too, but their content is a
     list of blocks, and counting one as the start of a turn would hand this turn
     the ending of the turn it displaced.
@@ -400,6 +400,21 @@ def _is_user_prompt(event: dict) -> bool:
         return False
     content = (event.get("message") or {}).get("content")
     return isinstance(content, str) and bool(content.strip())
+
+
+def _retire_marked_echo(thread_id: int, event: dict) -> None:
+    """Spend the ``pane_echo`` record of a prompt whose ZWSP survived (#808).
+
+    On a CLI that keeps the marker, the formatter drops the echo on its own and
+    the record :meth:`~c_lord.tmux.TmuxSessionManager.send_input` made is never
+    asked for. Left alone it would linger for hours and silence a person who
+    later types the same words into the pane.
+    """
+    if event.get("type") != "user":
+        return
+    content = (event.get("message") or {}).get("content")
+    if isinstance(content, str) and content.startswith(ZWSP_MARKER):
+        pane_echo.consume_match(thread_id, content)
 
 
 def _event_time(event: dict) -> datetime | None:
@@ -868,19 +883,23 @@ class TranscriptMirror:
 
                 rendered = render_event(event)
 
-                # #682: the other half of the ZWSP echo test. A menu answer is
-                # typed with ``send_literal``, which leaves the marker off on
-                # purpose (#172/#650), so the formatter cannot tell this event
-                # from human pane input — but c-lord recorded what it typed, so
-                # ask. Dropped exactly like a marked echo (no turn bookkeeping):
+                # #682/#808: the other half of the ZWSP echo test. A menu answer
+                # is typed with ``send_literal``, which leaves the marker off on
+                # purpose (#172/#650), and CLI 2.1.278+ strips it from every
+                # prompt (#808) — so the formatter cannot tell this event from
+                # human pane input. But c-lord recorded what it typed, so ask.
+                # Dropped exactly like a marked echo (no turn bookkeeping):
                 # Discord already has the sentence the user wrote.
-                if (
-                    rendered is not None
-                    and rendered.kind == "user_input"
-                    and pane_echo.consume_match(self.thread_id, rendered.body)
+                if rendered is None:
+                    # A marker that survived (older CLI) already dropped the
+                    # echo; spend its record so it cannot later swallow the same
+                    # words typed by a person in the pane.
+                    _retire_marked_echo(self.thread_id, event)
+                elif rendered.kind == "user_input" and pane_echo.consume_match(
+                    self.thread_id, rendered.body
                 ):
                     logger.info(
-                        "TranscriptMirror: suppressed unmarked c-lord pane echo thread=%d",
+                        "TranscriptMirror: suppressed c-lord pane echo (no ZWSP) thread=%d",
                         self.thread_id,
                     )
                     rendered = None

@@ -27,7 +27,7 @@ from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
-from ..claude.tmux_runner import TmuxClaudeRunner
+from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
 from ..command_gate import is_message_authorized, owns
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
@@ -68,14 +68,18 @@ from ..session_resume import (
     NOT_A_CLORD_THREAD,
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
+    ThreadResume,
     accepts_message,
     classify,
     is_clord_thread,
     resume_notice,
+    stopped_hint,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_auto_enabled
 from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
+from ..transcript.claim import adopt_cleared_session, list_transcripts
+from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
@@ -103,6 +107,16 @@ _MENU_TEXT_ANSWER_MAX = 500
 # a failure — it means nobody could tell us, and that is said out loud rather
 # than guessed at in either direction.
 _ANSWER_DELIVERY_WAIT = 25.0
+
+# Slash commands typed into the TUI (#803/#806). An interrupted turn usually
+# lets go of the pane within a second or two; a turn that has not after this long
+# is not going to, and typing at it would queue the command behind it.
+_SLASH_IDLE_TIMEOUT = 20.0
+# How long ``/clear`` waits for Claude Code to start the new transcript it
+# answers with (measured: immediately on submit). Missing it costs the mirror
+# its successor, so it is logged, but the clear itself has already happened.
+_CLEAR_ADOPT_TIMEOUT = 10.0
+_SLASH_POLL_INTERVAL = 0.5
 
 # How long a pre-empted turn gets to unwind after it was cancelled (#293). Its
 # teardown is a handful of Discord calls that normally take well under a second;
@@ -239,6 +253,17 @@ async def _safe_set_state(
             state.value,
             exc_info=True,
         )
+
+
+def _ever_ran_claude(working_dir: str | None) -> bool:
+    """Whether Claude Code ever wrote a transcript for ``working_dir`` (#806).
+
+    ``None`` (a row that never recorded one) is given the benefit of the doubt:
+    the wake then decides, as it did before this check existed.  Blocking.
+    """
+    if not working_dir:
+        return True
+    return latest_session_jsonl(derive_project_dir(working_dir)) is not None
 
 
 class ClaudeChatCog(commands.Cog):
@@ -1630,11 +1655,22 @@ class ClaudeChatCog(commands.Cog):
         *,
         user: discord.Member | discord.User,
         message: discord.Message | None = None,
+        ack: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        """Shared core for /clear and !clear (#209).
+        """Shared core for /clear and !clear (#209, #803).
 
-        Kills the active runner and tmux window, then resets the session row so
-        the next message starts fresh.
+        Types Claude Code's own ``/clear`` into the thread's pane — the way
+        ``/compact`` already works (#278) — instead of killing the window and
+        stamping ``session_id = ''`` on the row as a "start fresh" mark. That
+        mark could only ever be held by one row (``session_id`` is UNIQUE), so
+        every ``/clear`` after the first one on a host failed (#803). The row is
+        not touched at all now; the process that answers the next message is the
+        same one, holding an empty conversation.
+
+        What does have to move is the claim (#773): ``/clear`` starts a new
+        transcript, and both the mirror and a later ``--resume`` follow the
+        claimed uuid — so it is re-pointed at the successor
+        (:func:`~c_lord.transcript.claim.adopt_cleared_session`).
 
         ``message`` is the invoking message for ``!clear``, ``None`` for the
         slash command. It decides which rule authorizes the call (#405) — see
@@ -1658,41 +1694,169 @@ class ClaudeChatCog(commands.Cog):
             return
 
         thread_id = channel.id
+        if await self.repo.get(thread_id) is None:
+            await respond("No active session found for this thread.", ephemeral=True)
+            return
 
-        # Kill active runner if any
-        runner = self._active_runners.get(thread_id)
-        if runner:
-            await runner.kill()
-            del self._active_runners[thread_id]
-
-        # Kill the tmux window unconditionally — even for idle sessions where the
-        # runner has already been removed from _active_runners (issue #123).
-        # This ensures `is_claude_running` returns False next time, preventing
-        # old context from being resumed via send_input.
         parent_id = getattr(channel, "parent_id", None) or thread_id
         tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
-        if tmux_manager is not None:
-            await asyncio.to_thread(tmux_manager.kill_session, thread_id)
+        if tmux_manager is None:
+            await respond("tmux is not configured for this thread.", ephemeral=True)
+            return
 
-        reset = await self.repo.reset(thread_id)
-        if reset:
-            await respond("\U0001f504 Session cleared. Next message will start a fresh session.")
-        else:
-            await respond("No active session found for this thread.", ephemeral=True)
+        before: set[str] = set()
+        project_dir: Path | None = None
+
+        async def _snapshot() -> None:
+            # Taken after any wake (a restore must not count as the successor)
+            # and before the keystrokes, so the only new ``/clear`` transcript
+            # can be the one this command produced.
+            nonlocal before, project_dir
+            project_dir = await asyncio.to_thread(tmux_manager.project_dir_for, thread_id)
+            if project_dir is not None:
+                before = await asyncio.to_thread(list_transcripts, project_dir)
+
+        refusal = await self._deliver_slash_command(
+            channel, tmux_manager, "/clear", ack=ack, before_send=_snapshot
+        )
+        if refusal is not None:
+            await respond(refusal, ephemeral=True)
+            return
+
+        adopted = await self._adopt_cleared_session(thread_id, project_dir, before)
+        logger.info(
+            "%s /clear typed into the TUI (#803) — new session %s",
+            log_ctx(thread_id=thread_id),
+            adopted or "not found",
+        )
+        await respond(
+            "\U0001f504 Session cleared (`/clear` sent). "
+            "Your next message starts a fresh conversation."
+        )
+
+    async def _adopt_cleared_session(
+        self, thread_id: int, project_dir: Path | None, before: set[str]
+    ) -> str | None:
+        """Move the claim to the transcript ``/clear`` started (#803); its id or None."""
+        if project_dir is None:
+            logger.warning(
+                "%s /clear: could not tell where the transcripts are — the mirror "
+                "may stay on the pre-clear transcript (#803)",
+                log_ctx(thread_id=thread_id),
+            )
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CLEAR_ADOPT_TIMEOUT
+        while True:
+            adopted = await asyncio.to_thread(adopt_cleared_session, project_dir, before)
+            if adopted is not None:
+                return adopted
+            if loop.time() >= deadline:
+                logger.error(
+                    "%s /clear: no new transcript appeared in %s within %.0fs — the "
+                    "mirror stays on the pre-clear transcript (#803)",
+                    log_ctx(thread_id=thread_id),
+                    project_dir,
+                    _CLEAR_ADOPT_TIMEOUT,
+                )
+                return None
+            await asyncio.sleep(_SLASH_POLL_INTERVAL)
+
+    async def _deliver_slash_command(
+        self,
+        thread: discord.Thread,
+        tmux_manager: TmuxSessionManager,
+        command: str,
+        *,
+        ack: Callable[[], Awaitable[None]] | None = None,
+        before_send: Callable[[], Awaitable[None]] | None = None,
+    ) -> str | None:
+        """Type a TUI slash command at this thread's Claude, whatever state it is in.
+
+        Shared by ``/clear`` (#803) and ``/compact`` (#806). The command has to
+        reach a Claude that is **sitting at its input box**, so:
+
+        * a turn is running → interrupt it (the ⏹ Stop path, not a kill — the
+          conversation stays) and wait for the prompt to come back; typed into a
+          running turn, the command would be queued behind it instead;
+        * no Claude in the pane (slept after 4 hours, host restart) → restore it
+          the way ``/tmux-screenshot`` does (#642) and say so in the thread, but
+          only where a message would have restored it too — 終了 is the user's
+          choice and an untracked thread has nothing to restore (#538);
+        * otherwise → type it.
+
+        ``ack`` is called before anything slow, so a slash interaction is
+        answered inside Discord's 3-second window. Returns None once the command
+        was typed and submitted, else the sentence to tell the user.
+        """
+        thread_id = thread.id
+        runner = self._active_runners.get(thread_id)
+        if runner is not None:
+            if ack is not None:
+                await ack()
+            await runner.interrupt(silent=True)
+            if not await wait_for_idle_prompt(
+                tmux_manager,
+                thread_id,
+                timeout=_SLASH_IDLE_TIMEOUT,
+                interval=_SLASH_POLL_INTERVAL,
+            ):
+                logger.warning(
+                    "%s %s: the interrupted turn did not return to the prompt (#803)",
+                    log_ctx(thread_id=thread_id),
+                    command,
+                )
+                return (
+                    f"⚠️ 実行中の作業が止まりませんでした。`{command}` は送っていません。\n"
+                    "少し待ってからもう一度試すか、"
+                    "`/claude-restart` で Claude を再起動してください。"
+                )
+        elif not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
+            record = await self.repo.get(thread_id)
+            verdict = classify(record)
+            if verdict is not ThreadResume.RESUMES:
+                return stopped_hint(verdict)
+            if record is not None and not await asyncio.to_thread(
+                _ever_ran_claude, record.working_dir
+            ):
+                # Waking would start an empty Claude only to run the command on
+                # nothing (#806 AC5).
+                return (
+                    "ℹ️ このスレッドにはまだ Claude との会話の記録がないため、"
+                    f"`{command.split()[0]}` は送りませんでした。"
+                )
+            if ack is not None:
+                await ack()
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(
+                    f"-# 🔄 停止していたワークスペースを復元してから `{command}` を送ります。"
+                )
+            if not await self.wake_workspace(thread):
+                logger.warning(
+                    "%s %s: could not restore the stopped workspace (#806)",
+                    log_ctx(thread_id=thread_id),
+                    command,
+                )
+                return (
+                    "⚠️ 停止していたワークスペースの復元に失敗したため、"
+                    f"`{command}` を送れませんでした。\n"
+                    "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
+                )
+
+        if before_send is not None:
+            await before_send()
+        # send_literal (not send_input): no ZWSP prefix, so the leading "/" is
+        # preserved and the TUI recognises it as a slash command (#278).
+        if not await asyncio.to_thread(tmux_manager.send_literal, thread_id, command):
+            return f"Failed to send {command.split()[0]} to the session."
+        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
+        return None
 
     @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
     async def clear_session(self, interaction: discord.Interaction) -> None:
         """Reset the session for the current thread."""
-
-        async def respond(
-            content: str | None = None,
-            *,
-            embed: discord.Embed | None = None,
-            ephemeral: bool = False,
-        ) -> None:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        await self._clear_impl(interaction.channel, respond, user=interaction.user)
+        respond, ack = self._deferrable_responder(interaction)
+        await self._clear_impl(interaction.channel, respond, user=interaction.user, ack=ack)
 
     @commands.command(name="clear")
     async def clear_text(self, ctx: commands.Context) -> None:
@@ -1772,6 +1936,38 @@ class ClaudeChatCog(commands.Cog):
         return respond
 
     @staticmethod
+    def _deferrable_responder(
+        interaction: discord.Interaction,
+    ) -> tuple[_Responder, Callable[[], Awaitable[None]]]:
+        """A text responder plus an ``ack`` for commands that may take a while.
+
+        A wake or an interrupt can run past Discord's 3-second answer window
+        (#803/#806). ``ack`` defers the interaction; after that, answers go out
+        as a follow-up. State is kept here rather than read back from
+        ``interaction.response.is_done()`` so the rule is the same in tests.
+        """
+        deferred = False
+
+        async def ack() -> None:
+            nonlocal deferred
+            if not deferred:
+                deferred = True
+                await interaction.response.defer()
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            if deferred:
+                await interaction.followup.send(content or "", ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        return respond, ack
+
+    @staticmethod
     def _ctx_text_responder(ctx: commands.Context) -> _Responder:
         """Responder that answers a text/mention command with plain text."""
 
@@ -1824,9 +2020,14 @@ class ClaudeChatCog(commands.Cog):
         await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
 
     async def _compact_impl(
-        self, channel: object, respond: _Responder, *, instructions: str = ""
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        instructions: str = "",
+        ack: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        """Shared core for /compact and !compact (#278).
+        """Shared core for /compact and !compact (#278, #806).
 
         Fires the Claude Code TUI's built-in ``/compact`` slash command in the
         thread's tmux window to compress (summarize) the session context,
@@ -1835,9 +2036,13 @@ class ClaudeChatCog(commands.Cog):
         Sent via ``send_literal`` (NOT ``send_input``): ``send_input`` prepends
         a zero-width-space marker, so the line would no longer start with ``/``
         and the TUI would not treat it as a slash command (see
-        docs/COMMANDS.md). This mirrors the
-        existing ``/context`` probe in ``tmux_runner.py``. Enter is sent
-        separately via ``send_keys`` since ``send_literal`` does not submit.
+        docs/COMMANDS.md). Enter is sent separately since ``send_literal`` does
+        not submit.
+
+        A stopped workspace is restored first (#806) — :meth:`_deliver_slash_command`
+        — rather than refused with "no running session": whether the Claude is
+        asleep is c-lord's business, not the user's, and the refusal read as the
+        conversation being gone.
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
@@ -1850,21 +2055,12 @@ class ClaudeChatCog(commands.Cog):
             await respond("tmux is not configured for this thread.", ephemeral=True)
             return
 
-        if not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
-            await respond("No running Claude session in this thread to compact.", ephemeral=True)
-            return
-
         instructions = instructions.strip()
         command = f"/compact {instructions}" if instructions else "/compact"
-
-        # send_literal (not send_input): no ZWSP prefix so the leading "/" is
-        # preserved and the TUI recognises it as a slash command.
-        ok = await asyncio.to_thread(tmux_manager.send_literal, thread_id, command)
-        if not ok:
-            await respond("Failed to send /compact to the session.", ephemeral=True)
+        refusal = await self._deliver_slash_command(channel, tmux_manager, command, ack=ack)
+        if refusal is not None:
+            await respond(refusal, ephemeral=True)
             return
-        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
-
         await respond("\U0001f5dc️ Compacting context… (`/compact` sent)")
 
     @app_commands.command(
@@ -1879,10 +2075,8 @@ class ClaudeChatCog(commands.Cog):
     ) -> None:
         """Trigger the TUI ``/compact`` for the current thread's session."""
 
-        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        await self._compact_impl(interaction.channel, respond, instructions=instructions)
+        respond, ack = self._deferrable_responder(interaction)
+        await self._compact_impl(interaction.channel, respond, instructions=instructions, ack=ack)
 
     @commands.command(name="compact")
     async def compact_text(self, ctx: commands.Context, *, instructions: str = "") -> None:
