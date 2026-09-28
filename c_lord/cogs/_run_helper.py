@@ -34,6 +34,7 @@ from ..claude.context_usage import (
 from ..claude.tmux_runner import (
     CLAUDE_VANISHED_ERROR_PREFIX,
     FLEET_TMUX_RESTART_ERROR_PREFIX,
+    LOGIN_REQUIRED_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
@@ -49,6 +50,7 @@ from ..discord_ui.embeds import (
     claude_vanished_embed,
     error_embed,
     fleet_tmux_restart_embed,
+    login_required_embed,
     no_response_embed,
     timeout_embed,
     trust_start_failed_embed,
@@ -118,6 +120,11 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # and on this path that is an inference, not an observation.
     if error.startswith(CLAUDE_VANISHED_ERROR_PREFIX):
         return claude_vanished_embed(error)
+    # #812: Claude Code refused the turn because it is not logged in. Its own
+    # embed because the "no response" one below advises sending it again,
+    # which cannot work until someone runs /login on the host.
+    if error.startswith(LOGIN_REQUIRED_ERROR_PREFIX):
+        return login_required_embed(error)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))

@@ -50,6 +50,10 @@ class RunOutcome:
     # needs it because "もう一度送ってください" is the wrong thing to say to
     # someone who is rate limited — it cannot work until the limit resets.
     usage_limit: UsageLimit | None = None
+    # #812: Claude Code refused this turn because it is not logged in. Same
+    # reason as ``usage_limit``: "send it again" cannot work until someone runs
+    # /login on the host.
+    login_required: bool = False
 
 
 @dataclass

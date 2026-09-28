@@ -239,6 +239,28 @@ def no_response_embed(detail: str) -> discord.Embed:
     )
 
 
+def login_required_embed(detail: str) -> discord.Embed:
+    """Embed for a turn Claude Code refused because it is not logged in (#812).
+
+    Deliberately NOT :func:`no_response_embed`: that one says the turn never
+    started and advises sending it again. Claude did answer — with "Please run
+    /login" — and every resend gets the same answer until someone logs in on
+    the host. Login is host-wide, so other threads are likely stopped too.
+    """
+    return discord.Embed(
+        title="\U0001f511 Claude Code のログインが切れています",
+        description=(
+            f"{detail}\n\n"
+            "Claude Code がログインを求めたため、このターンは実行されていません。\n"
+            "**ログインするまでは、同じ内容を送り直しても同じ結果になります。**\n\n"
+            "**できること:**\n"
+            "\u2022 ホストで `claude` を開き `/login` する\n"
+            "\u2022 ログインはホスト全体で共通です。他のスレッドも止まっている可能性があります"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def trust_stuck_embed(detail: str) -> discord.Embed:
     """Embed for a turn blocked on a folder-trust dialog that would not close (#630).
 
