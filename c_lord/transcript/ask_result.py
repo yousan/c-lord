@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from ..log_sampler import LogSampler
 
@@ -126,6 +127,53 @@ def ask_tool_uses(project_dir: Path) -> list[tuple[str, str, Path]]:
                 found.append((ts, block["id"], path))
     found.sort(key=lambda item: item[0])
     return found
+
+
+@dataclass(frozen=True)
+class FoundAsk:
+    """An ``AskUserQuestion`` tool_use, with the one question looked for (#786)."""
+
+    tool_use_id: str
+    session_path: Path
+    question: dict[str, Any]
+
+
+def find_ask_for_question(project_dir: Path, question: str, menu_at: str) -> FoundAsk | None:
+    """The ask whose menu showed *question*, drawn at timestamp *menu_at* (#786).
+
+    For a menu found in Discord after a restart, with no tool_use id to go on.
+    Normally the ask is written before its menu is drawn, so it is the newest
+    ask carrying the question from before *menu_at*; when the CLI wrote it only
+    together with its result (#746), the earliest one after. ``None`` while
+    neither exists yet.
+    """
+    before: FoundAsk | None = None
+    after: FoundAsk | None = None
+    before_ts = after_ts = ""
+    for path, event in _iter_events(project_dir, _ASK_TOOL_NAME):
+        ts = str(event.get("timestamp") or "")
+        for block in _blocks(event):
+            if not (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == _ASK_TOOL_NAME
+                and isinstance(block.get("id"), str)
+            ):
+                continue
+            questions = (block.get("input") or {}).get("questions") or []
+            match = next(
+                (q for q in questions if isinstance(q, dict) and q.get("question") == question),
+                None,
+            )
+            if match is None:
+                continue
+            found = FoundAsk(block["id"], path, match)
+            if ts <= menu_at:
+                if before is None or ts >= before_ts:
+                    before, before_ts = found, ts
+            elif after is None or ts < after_ts:
+                after, after_ts = found, ts
+    return before or after
 
 
 def latest_ask_tool_use(project_dir: Path) -> tuple[str, Path] | None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import discord
 
 from ..claude.types import AskOption, TodoItem, ToolCategory, ToolUseEvent, UsageLimit
@@ -514,15 +516,49 @@ def ask_confirming_embed(
     It must never suggest re-sending: a re-sent answer is an ordinary message,
     and an ordinary message interrupts the running turn (#631's shape).
     """
-    answer = ", ".join(selected or []) or "（未選択）"
-    title = f"⏳ {header}" if header else "⏳ 回答の受け取りを確認中"
+    answer = ", ".join(selected or []) or _NO_ANSWER
+    title = f"⏳ {header}" if header else _CONFIRMING_TITLE
     body = (
-        f"{question}\n\n"
-        f"**送った答え:** {answer}\n"
-        "-# Claude の受け取りを確認中です。確認でき次第、この表示が更新されます"
+        f"{question}{_CONFIRMING_ANSWER}{answer}\n"
+        f"{_CONFIRMING_NOTE}確認でき次第、この表示が更新されます"
         "（まとめて聞かれた質問は、最後の質問に答えた時点で確認されます）。"
     )
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
+
+
+_NO_ANSWER = "（未選択）"
+_CONFIRMING_TITLE = "⏳ 回答の受け取りを確認中"
+_CONFIRMING_ANSWER = "\n\n**送った答え:** "
+_CONFIRMING_NOTE = "-# Claude の受け取りを確認中です。"
+
+
+@dataclass(frozen=True)
+class ConfirmingMenu:
+    """What a ⏳ 確認中 menu says, read back off Discord (#786)."""
+
+    question: str
+    header: str
+    selected: list[str]
+
+
+def parse_confirming_embed(embed: discord.Embed) -> ConfirmingMenu | None:
+    """Read :func:`ask_confirming_embed` back, or None for any other embed (#786).
+
+    The menu message is the only record of a watch that a restart killed —
+    nothing else is stored — so its wording is what the next process reads.
+    A question long enough to be clipped at 4096 characters does not parse.
+    """
+    title = embed.title or ""
+    body = embed.description or ""
+    if not title.startswith("⏳ ") or _CONFIRMING_ANSWER not in body:
+        return None
+    question, _, rest = body.partition(_CONFIRMING_ANSWER)
+    answer, sep, note = rest.partition("\n")
+    if not sep or not note.startswith(_CONFIRMING_NOTE):
+        return None
+    header = "" if title == _CONFIRMING_TITLE else title[len("⏳ ") :]
+    selected = [] if answer == _NO_ANSWER else answer.split(", ")
+    return ConfirmingMenu(question=question, header=header, selected=selected)
 
 
 def _asked_options(options: list[AskOption] | None) -> str:
