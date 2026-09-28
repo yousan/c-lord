@@ -90,7 +90,7 @@ View に `_authorizer` を渡し忘れた場合は、**プロセスが実際に�
 
 ### `/clear`・`!clear` も同じ規則を通る (#405)
 
-`/clear` は runner を kill し、tmux window を無条件に kill し、セッション行をリセットする
+`/clear` は走っているターンを止めて Claude Code に `/clear` を打ち込む（#803。以前は runner と tmux window を kill してセッション行をリセットしていた）
 — **会話が消える、チャットの中で一番破壊的なコマンド**。それなのに隣の `/clord-attach` は
 ゲートされていて、`/clear` だけ権限チェックが無かった（スレッドに書き込める人なら誰でも
 他人の会話を消せた）。
