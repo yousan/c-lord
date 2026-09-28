@@ -144,7 +144,7 @@ async def setup_bridge(
     from .database.thread_repo import ThreadRepository
     from .discord_ui.authorization import Authorizer
     from .legacy_env import warn_removed_delivery_env
-    from .version import runtime_version
+    from .version import runtime_version, stale_build_age
 
     # #722: the first thing a startup log should answer is "which build is
     # this?". Until now nothing did — 30+ lines of INFO and ``grep -i version``
@@ -152,7 +152,21 @@ async def setup_bridge(
     # user a shipped feature "does not exist" with no way for anyone to
     # notice. Logged here rather than in main() so instance repos that call
     # setup_bridge() themselves get it too (Zero-Config).
-    logger.info("c-lord version %s", runtime_version())
+    version = runtime_version()
+    logger.info("c-lord version %s", version)
+    # #756: …and whether it is old. The line above names the build, but nobody
+    # turns "-20260908" into "two weeks ago", so instances ran far behind main
+    # while their users kept hitting bugs already fixed there. Judged from the
+    # version string and today's date only — no network (Zero-Config: works,
+    # and stays quiet, wherever it cannot reach one).
+    age = stale_build_age(version)
+    if age is not None:
+        logger.warning(
+            "this c-lord build is %d days old (%s): fixes merged upstream since then "
+            "are not running here — upgrade and restart to pick them up",
+            age,
+            version,
+        )
 
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:

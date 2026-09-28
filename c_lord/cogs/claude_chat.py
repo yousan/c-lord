@@ -42,7 +42,7 @@ from ..discord_ui.authorization import (
     resolve_fallback_owner_ids,
     set_default_authorizer,
 )
-from ..discord_ui.embeds import stopped_embed
+from ..discord_ui.embeds import error_embed, stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
@@ -78,6 +78,7 @@ from ..thread_origin import inspect_origin
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
+from ..workspace_failure import describe_workspace_failure
 from ..workspace_notice import restored_devenv_notice
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -94,6 +95,20 @@ logger = logging.getLogger(__name__)
 # two ways, and past this length the message reads as a new request rather than
 # a pick from a short menu.
 _MENU_TEXT_ANSWER_MAX = 500
+
+# How long the typed-answer path waits to be told what became of the answer
+# (#804). It has to cover the keystrokes (≈2s of _MENU_NAV_DELAY) plus the
+# transcript confirmation the bridge does before it calls a menu answered
+# (_ANSWER_CONFIRM_TIMEOUT, 12s), with slack for a busy host. Running out is not
+# a failure — it means nobody could tell us, and that is said out loud rather
+# than guessed at in either direction.
+_ANSWER_DELIVERY_WAIT = 25.0
+
+# How long a pre-empted turn gets to unwind after it was cancelled (#293). Its
+# teardown is a handful of Discord calls that normally take well under a second;
+# the bound only matters when one of them never returns, and then it is what
+# keeps the next message in the thread from waiting behind it forever.
+_PREEMPT_CANCEL_GRACE = 10.0
 
 # Posts a reply the way the caller needs (interaction response vs ctx.send),
 # letting /stop, /clear and their !text twins share one implementation (#209).
@@ -387,6 +402,21 @@ class ClaudeChatCog(commands.Cog):
         apply (#508) are the same rule, not two copies of it.
         """
         return is_message_authorized(message, self._is_allowed)
+
+    def _authorize(
+        self, user: discord.Member | discord.User, message: discord.Message | None
+    ) -> bool:
+        """Allowlist for slash, the shared message-backed rule for text (#507, #405).
+
+        A slash command has no message and can never come from a webhook, so it
+        is the human allowlist. A text command can be driven by a webhook or a
+        trusted bot, whose pseudo-user is in no allowlist — those go through
+        :meth:`_is_message_authorized`. Either way the answer comes from the one
+        :class:`Authorizer`; this only picks which entry point to ask.
+        """
+        if message is None:
+            return self._is_allowed(user)
+        return self._is_message_authorized(message)
 
     def is_processing(self, thread_id: int) -> bool:
         """True while a Claude turn is actively running for ``thread_id``.
@@ -1158,10 +1188,7 @@ class ClaudeChatCog(commands.Cog):
         # ClaudeDiscordBot.process_commands lets them through — so a message-
         # backed invocation must use the same rule as on_message, not the
         # human-only allowlist (#507).
-        authorized = (
-            self._is_message_authorized(message) if message is not None else self._is_allowed(user)
-        )
-        if not authorized:
+        if not self._authorize(user, message):
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
@@ -1596,12 +1623,36 @@ class ClaudeChatCog(commands.Cog):
         else:
             await ctx.send(f"Window `{window}` not found in tmux.")
 
-    async def _clear_impl(self, channel: object, respond: _Responder) -> None:
+    async def _clear_impl(
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        user: discord.Member | discord.User,
+        message: discord.Message | None = None,
+    ) -> None:
         """Shared core for /clear and !clear (#209).
 
         Kills the active runner and tmux window, then resets the session row so
         the next message starts fresh.
+
+        ``message`` is the invoking message for ``!clear``, ``None`` for the
+        slash command. It decides which rule authorizes the call (#405) — see
+        :meth:`_authorize`: a webhook can still drive ``!clear`` (E2E), a
+        stranger in the thread cannot drive either.
         """
+        # #405: this wipes someone's conversation, so it is gated before
+        # anything is touched — the gate lives here, not in the two wrappers,
+        # so every entry point to the destruction goes through it.
+        if not self._authorize(user, message):
+            logger.info(
+                "%s /clear rejected: user %s is not authorized",
+                log_ctx(thread_id=getattr(channel, "id", None)),
+                getattr(user, "id", "?"),
+            )
+            await respond("You are not authorized to use this command.", ephemeral=True)
+            return
+
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
@@ -1641,7 +1692,7 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await interaction.response.send_message(content, ephemeral=ephemeral)
 
-        await self._clear_impl(interaction.channel, respond)
+        await self._clear_impl(interaction.channel, respond, user=interaction.user)
 
     @commands.command(name="clear")
     async def clear_text(self, ctx: commands.Context) -> None:
@@ -1655,7 +1706,7 @@ class ClaudeChatCog(commands.Cog):
         ) -> None:
             await ctx.send(content or "")
 
-        await self._clear_impl(ctx.channel, respond)
+        await self._clear_impl(ctx.channel, respond, user=ctx.author, message=ctx.message)
 
     async def _restart_impl(self, channel: object, respond: _Responder) -> None:
         """Shared core for /claude-restart and its /restart-claude alias (#440, #578).
@@ -1965,11 +2016,15 @@ class ClaudeChatCog(commands.Cog):
             raise
         # Run Claude in the background so /api/spawn returns immediately.
         # The caller gets the thread reference without waiting for Claude to finish.
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._run_claude(
                 seed_message, thread, prompt, session_id=session_id, requester=requester
             )
         )
+        # #477: the reply path has had this since #565; the spawn path did not,
+        # so a spawned turn (/clord, /api/spawn) that died early — once parked
+        # in ``_active_tasks``, never collected — left no trace at all.
+        task.add_done_callback(partial(self._report_turn_task_outcome, thread.id))
         return thread
 
     async def cog_unload(self) -> None:
@@ -2322,7 +2377,9 @@ class ClaudeChatCog(commands.Cog):
         """Deliver *message*'s text as the open menu's answer (#536 AC7).
 
         Returns True when the message was consumed as an answer, so the caller
-        must NOT run it as a new instruction.
+        must NOT run it as a new instruction. **False therefore means the
+        sentence is still owed a delivery**, and the caller's ordinary
+        instruction path is what pays it (#804).
 
         Decision (recorded in issue #536): the sentence IS the answer. Before
         this, typing while a menu was open silently discarded the question and
@@ -2336,8 +2393,24 @@ class ClaudeChatCog(commands.Cog):
         ✏️ Other modal accepts (past that length it is a request, not a pick
         from a three-option menu), and a menu with no free-text row (plan
         approval — typing there would mis-send keystrokes).
+
+        #804: consumed has to mean *delivered*. This path used to announce
+        「送りました」 the instant ``post_answer`` returned — which only says a
+        coroutine in this process is listening, not that a single keystroke was
+        sent (the same optimism #651 took out of the button path). On
+        2026-09-24 the pane was gone, the keystrokes reached nothing two seconds
+        later, and the sentence had already been consumed: Claude recorded
+        ``User declined to answer questions`` and ended the turn with the
+        answer nowhere. So now the menu is only used when it can actually be
+        reached, the claim waits for the bridge's verdict, and an answer that
+        did not land is handed back to the instruction path rather than
+        swallowed.
         """
-        from ..discord_ui.ask_bus import ask_bus
+        from ..discord_ui.ask_bus import (
+            DELIVERY_DELIVERED,
+            DELIVERY_UNCONFIRMED,
+            ask_bus,
+        )
         from ..discord_ui.ask_menus import disable_stale_copies
 
         text = (message.content or "").strip()
@@ -2345,13 +2418,78 @@ class ClaudeChatCog(commands.Cog):
             return False
         if not ask_bus.accepts_free_text(thread.id):
             return False
-        if not ask_bus.post_answer(thread.id, [text]):
+
+        # #804 ②: the menu lives in a tmux pane, so no pane means no menu — the
+        # Claude that drew it died with the window, and there is nothing for the
+        # keystrokes to land on. Restore the workspace (#642) and let the
+        # sentence go as an ordinary instruction: a restored Claude is back at
+        # its prompt, and a prompt can still take the answer. Menu keystrokes
+        # typed at it could not, which is why this does not just wake and send.
+        if await self._menu_window_is_gone(thread):
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(
+                    "-# 🔄 この質問が出ていたワークスペースが停止していました。"
+                    "復元してから、いただいた文章を新しい指示として送ります。"
+                )
+            try:
+                woken = await self.wake_workspace(thread)
+            except Exception:
+                logger.warning(
+                    "%s wake before answering the open menu failed (#804)",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
+                )
+                woken = False
+            logger.info(
+                "%s the open menu had no tmux window — restored=%s, delivering the "
+                "text as a new instruction instead (#804)",
+                log_ctx(thread_id=thread.id),
+                woken,
+            )
             return False
 
-        logger.info(
-            "%s message delivered as the open menu's answer (#536 AC7)",
-            log_ctx(thread_id=thread.id),
-        )
+        report = ask_bus.watch_delivery(thread.id)
+        try:
+            if not ask_bus.post_answer(thread.id, [text]):
+                return False
+            logger.info(
+                "%s message routed to the open menu — waiting for the delivery "
+                "verdict (#536 AC7, #804)",
+                log_ctx(thread_id=thread.id),
+            )
+            # The wait below is bounded but not instant, and silence in the
+            # meantime reads exactly like the message being ignored — the very
+            # thing #536 exists to prevent. Say what is happening, then rewrite
+            # this same message with what actually happened, so the thread can
+            # never hold two accounts of one answer (#804 AC4).
+            notice = None
+            with contextlib.suppress(discord.HTTPException):
+                notice = await thread.send(
+                    content=(
+                        f"-# ⏳ この文章を、開いていた質問への回答として送っています: {text[:150]}"
+                    )
+                )
+            verdict = await self._await_answer_verdict(report, thread.id)
+        finally:
+            ask_bus.unwatch_delivery(thread.id)
+
+        logger.info("%s typed menu answer verdict=%s (#804)", log_ctx(thread_id=thread.id), verdict)
+        if verdict not in (DELIVERY_DELIVERED, DELIVERY_UNCONFIRMED):
+            # The answer did not reach Claude. The bridge has already said so and
+            # rewritten the menu; what is left is to make sure the sentence still
+            # gets there — as an instruction, which is a path that restores its
+            # own workspace (#700) and cannot be recorded as a refusal.
+            await self._replace_notice(
+                thread,
+                notice,
+                content=(
+                    "⚠️ **この文章は、開いていた質問への回答として届きませんでした:** "
+                    f"{text[:150]}\n"
+                    "-# このまま新しい指示として送り直します。"
+                ),
+            )
+            return False
+
         # The answer came from outside the view, so no interaction edits the
         # menu — blank every live copy here instead.
         with contextlib.suppress(Exception):
@@ -2367,16 +2505,91 @@ class ClaudeChatCog(commands.Cog):
             await self._handle_thread_reply(message)
 
         view = TextAnsweredMenuView(_rerun, authorizer=self._authorizer)
-        with contextlib.suppress(discord.HTTPException):
-            await thread.send(
-                content=(
-                    f"✏️ **この文章を、開いていた質問への回答として送りました:** {text[:150]}\n"
-                    "-# 質問への回答ではなく新しい指示のつもりだった場合は、"
-                    "下のボタンを押してください。"
-                ),
-                view=view,
-            )
+        tail = (
+            "-# 質問への回答ではなく新しい指示のつもりだった場合は、下のボタンを押してください。"
+            if verdict == DELIVERY_DELIVERED
+            else "-# ただし Claude が受け取ったかどうかは確認できていません。"
+            "続きが返ってこないときは、同じ内容をもう一度送ってください。"
+        )
+        await self._replace_notice(
+            thread,
+            notice,
+            content=(
+                f"✏️ **この文章を、開いていた質問への回答として送りました:** {text[:150]}\n{tail}"
+            ),
+            view=view,
+        )
         return True
+
+    async def _menu_window_is_gone(self, thread: discord.Thread) -> bool:
+        """True when this thread has no tmux window for its menu to live in (#804).
+
+        Deliberately conservative: "cannot tell" is False. True is read as "the
+        menu is a ghost", and mistaking a live menu for a ghost turns a perfectly
+        good answer into an interrupting instruction — so only a manager that
+        answers, and answers ``None``, counts as evidence. It is the same lookup
+        ``send_keys`` does, so a False here is also the prediction that the
+        keystrokes have somewhere to go.
+        """
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        try:
+            tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+            if tmux_manager is None:
+                return False
+            window = await asyncio.to_thread(tmux_manager.window_name, thread.id)
+        except Exception:
+            logger.debug(
+                "%s could not check the open menu's tmux window",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            return False
+        return window is None
+
+    async def _await_answer_verdict(self, report: asyncio.Queue[str], thread_id: int) -> str:
+        """Wait for the bridge to say what became of a typed answer (#804)."""
+        from ..discord_ui.ask_bus import DELIVERY_UNCONFIRMED
+
+        try:
+            return await asyncio.wait_for(report.get(), timeout=_ANSWER_DELIVERY_WAIT)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — 3.10: the two differ
+            logger.warning(
+                "%s nobody reported what became of the typed answer within %.0fs — "
+                "saying so rather than claiming it landed (#804)",
+                log_ctx(thread_id=thread_id),
+                _ANSWER_DELIVERY_WAIT,
+            )
+            return DELIVERY_UNCONFIRMED
+
+    @staticmethod
+    async def _replace_notice(
+        thread: discord.Thread,
+        notice: object | None,
+        *,
+        content: str,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        """Rewrite the interim line with the outcome, or post it if that failed (#804).
+
+        One message per answer, start to finish: an answer whose story is told
+        by two messages is how 「送りました」 and 「届けられませんでした」 came to
+        sit two seconds apart in the same thread.
+        """
+        edit = getattr(notice, "edit", None)
+        if edit is not None:
+            try:
+                if view is not None:
+                    await edit(content=content, view=view)
+                else:
+                    await edit(content=content)
+                return
+            except Exception:
+                logger.debug("could not rewrite the answer notice — posting instead")
+        with contextlib.suppress(discord.HTTPException):
+            if view is not None:
+                await thread.send(content=content, view=view)
+            else:
+                await thread.send(content=content)
 
     async def wake_workspace(self, thread: discord.Thread) -> bool:
         """Restore a stopped workspace without running a turn — #642.
@@ -2573,9 +2786,16 @@ class ClaudeChatCog(commands.Cog):
         # No-op unless the turn is parked on a bridged menu; then it unblocks
         # bridge_pane_ask so the run can wind down instead of waiting on a click.
         ask_bus.post_answer(thread.id, [])
-        await self._drain_thread_task(prev_task)
+        await self._drain_thread_task(prev_task, thread_id=thread.id)
 
-    async def _drain_thread_task(self, task: asyncio.Task, *, grace: float = 5.0) -> None:
+    async def _drain_thread_task(
+        self,
+        task: asyncio.Task,
+        *,
+        grace: float = 5.0,
+        cancel_grace: float = _PREEMPT_CANCEL_GRACE,
+        thread_id: int | None = None,
+    ) -> None:
         """Tear down a prior turn so a new one can start cleanly (#315).
 
         Waits up to ``grace`` seconds for ``task`` to finish on its own (the
@@ -2601,10 +2821,29 @@ class ClaudeChatCog(commands.Cog):
         including its ``CancelledError`` — as a value.  A genuine cancellation of
         *this* coroutine still propagates from both, which is what keeps the
         #315 teardown honest.
+
+        #293: the wait after the cancel is bounded by ``cancel_grace``. This runs
+        under the per-thread lock, so a prior turn whose teardown never finishes
+        (its ``finally`` stuck on a Discord call, say) used to hold every later
+        message in the thread behind it — silently, with the new message's
+        ``dispatching run_claude`` never logged. Past the bound the prior turn is
+        left to finish on its own (it has been cancelled, and its outcome is
+        still reported by ``_report_turn_task_outcome``), an ERROR names it as an
+        orphan, and the new message goes ahead.
         """
         _done, pending = await asyncio.wait({task}, timeout=grace)
         if pending:
             task.cancel()
+            _done, pending = await asyncio.wait({task}, timeout=cancel_grace)
+        if pending:
+            logger.error(
+                "%s prior turn is still running %.0fs after it was cancelled — not "
+                "waiting for it any longer, so this message is not blocked behind it "
+                "(orphan run, #293)",
+                log_ctx(thread_id=thread_id),
+                cancel_grace,
+            )
+            return
         await asyncio.gather(task, return_exceptions=True)
 
     async def _build_prompt(self, message: discord.Message) -> str:
@@ -2721,6 +2960,54 @@ class ClaudeChatCog(commands.Cog):
         with contextlib.suppress(discord.HTTPException):
             await thread.send(f"⚠️ 次の添付は Claude に渡せませんでした:\n{body}")
 
+    async def _abort_turn_on_workspace_failure(
+        self,
+        thread: discord.Thread,
+        exc: BaseException,
+        *,
+        status: StatusManager,
+        failure_notify_id: int | None,
+        dashboard: ThreadStatusDashboard | None,
+        description: str,
+        current_task: asyncio.Task | None,
+    ) -> None:
+        """End a turn whose checkout or tmux window could not be set up (#477).
+
+        The thread is told why — git's own stderr, "authentication is needed"
+        when that is what git said, what to check for tmux — the lamp goes to
+        ❌, and the requester is mentioned (#681: an embed alone never
+        pushes). Every step is guarded: this is already the failure path, and
+        a second, silent failure here is exactly what #477 was.
+        """
+        logger.error(
+            "%s workspace setup failed — the turn cannot run: %s",
+            log_ctx(thread_id=thread.id),
+            exc,
+            exc_info=exc,
+        )
+        try:
+            await thread.send(
+                content=f"<@{failure_notify_id}>" if failure_notify_id is not None else None,
+                embed=error_embed(describe_workspace_failure(exc)),
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=failure_notify_id is not None
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "%s could not post the workspace failure to the thread",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+        with contextlib.suppress(Exception):
+            await status.set_error()
+        if self._active_tasks.get(thread.id) is current_task:
+            self._active_tasks.pop(thread.id, None)
+        if dashboard is not None:
+            await _safe_set_state(
+                dashboard, thread.id, ThreadState.WAITING_INPUT, description, thread=thread
+            )
+
     async def _run_claude(
         self,
         user_message: discord.Message,
@@ -2767,7 +3054,7 @@ class ClaudeChatCog(commands.Cog):
         if session_dir_manager is None and tmux_manager is None:
             await thread.send(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
-                "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。"
+                "先に `/clord-init repo:<URL>` で設定してください。"
             )
             return
 
@@ -2865,11 +3152,25 @@ class ClaudeChatCog(commands.Cog):
                 # commit hook can credit them as a Co-authored-by. #520: that is
                 # the requester, not the trigger message's author — a /clord
                 # seed message is authored by the bot itself.
-                session_dir = await _asyncio.to_thread(
-                    session_dir_manager.create_session_dir,
-                    thread.id,
-                    requester,
-                )
+                try:
+                    session_dir = await _asyncio.to_thread(
+                        session_dir_manager.create_session_dir,
+                        thread.id,
+                        requester,
+                    )
+                except Exception as exc:
+                    # #477: a clone that fails used to escape from here, before
+                    # the turn's ``try`` — 🟢 forever, nothing in the thread.
+                    await self._abort_turn_on_workspace_failure(
+                        thread,
+                        exc,
+                        status=status,
+                        failure_notify_id=failure_notify_id,
+                        dashboard=dashboard,
+                        description=description,
+                        current_task=current_task,
+                    )
+                    return
                 working_dir = session_dir
                 logger.info("Session dir for thread %d: %s", thread.id, session_dir)
 
@@ -2880,9 +3181,22 @@ class ClaudeChatCog(commands.Cog):
 
             window_name: str | None = None
             if tmux_manager is not None:
-                window_name = await _asyncio.to_thread(
-                    tmux_manager.create_session, thread.id, working_dir or "."
-                )
+                try:
+                    window_name = await _asyncio.to_thread(
+                        tmux_manager.create_session, thread.id, working_dir or "."
+                    )
+                except Exception as exc:
+                    # #477: same for tmux itself refusing (e.g. not installed).
+                    await self._abort_turn_on_workspace_failure(
+                        thread,
+                        exc,
+                        status=status,
+                        failure_notify_id=failure_notify_id,
+                        dashboard=dashboard,
+                        description=description,
+                        current_task=current_task,
+                    )
+                    return
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
 
                 # Issue #95: redesigned thread naming.

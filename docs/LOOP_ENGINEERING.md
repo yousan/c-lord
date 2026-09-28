@@ -32,7 +32,7 @@ loop engineering における役割分担。**この線を踏み越えたら理�
 |---|---|---|
 | **いつ回すか（when）** | **c-lord** | cron / interval（`SchedulerCog`）、イベント起点（`webhook_trigger`）、Claude 自走（`/loop`）の受け皿 |
 | **どこで回すか（where）** | **c-lord** | fresh thread 生成（`/api/spawn`）、tmux window、thread=session の対応 |
-| **どう見えるか（visibility）** | **c-lord** | 最終回答（`/api/reply`）、状態リアクション 🟢🟡❌、thread lamp、異常報告（monitor） |
+| **どう見えるか（visibility）** | **c-lord** | 最終回答（jsonl ミラー — `transcript/mirror.py`）、状態リアクション 🟢🟡❌、thread lamp、異常報告（monitor） |
 | **状態の永続・継続** | **c-lord** | `scheduled_tasks`（SQLite）、`--resume`、bot 再起動をまたぐ継続 |
 | **何をするか（what）** | **Claude** | プロンプト本体、ツールの選択、ドメインロジック |
 | **いつ止めるか（停止条件）** | **Claude** | 「N 回連続グリーンで停止」「異常0なら黙る」などの判断 |
@@ -60,7 +60,7 @@ loop engineering における役割分担。**この線を踏み越えたら理�
         │                                                              │
  [when] トリガ              [where] 実行場所           [visibility] 見える化
    cron/interval   ──▶   fresh thread (/api/spawn)  ──▶  状態リアクション 🟢🟡
-   (SchedulerCog)         tmux window                    最終回答 (/api/reply)
+   (SchedulerCog)         tmux window                    最終回答 (jsonl ミラー)
    webhook (event)        thread = session              thread lamp / monitor 報告
    /loop (Claude自走)                                    エラー時の❌
         │                        │                             │
@@ -94,7 +94,7 @@ c-lord に既にあるループ的資産。「プロダクト側（利用者の�
 | `webhook_trigger` | Cog | イベント（CI/CD webhook 着弾） | when（イベント起点） | design #10 |
 | `/api/spawn` | REST | 呼ばれた時 | where（fresh thread 生成） | `ext/api_server.py` |
 | `/api/tasks`（CRUD） | REST | Claude が登録/更新 | when の宣言 | design #7 |
-| `/api/reply` | REST | 各ターン末尾 | visibility（最終回答） | #53 |
+| `TranscriptMirrorCog`（jsonl ミラー） | Cog | Claude が jsonl に書くたび | visibility（最終回答。唯一の配信経路） | #71, #712 |
 | 状態リアクション 🟢🟡❌ | discord_ui | 毎ターン | visibility | #246 |
 | thread lamp / thread name | thread_state_sync | poll | visibility（一覧の俯瞰） | #95, #241 |
 

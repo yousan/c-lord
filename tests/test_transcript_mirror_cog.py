@@ -1334,6 +1334,172 @@ async def test_file_sink_reserves_an_attachment_slot_for_progress_txt(
     assert "progress.txt" in filenames
 
 
+# ---------------------------------------------------------------------------
+# Issue #750: a split reply attaches each table image to the chunk holding it
+# ---------------------------------------------------------------------------
+
+_T750_TABLE = (
+    "| 設定 | 値 | 意味 | 備注 |\n"
+    "|---|---|---|---|\n"
+    "| max_players | 0 | 無制限 | 既定 |\n"
+    "| visibility | public | 公開 | |\n"
+    "| require_user_verification | true | 認証必須 | 荒らし対策 |\n"
+    "| autosave_interval | 10 | 分 | |\n"
+    "| afk_autokick_interval | 0 | 無効 | |\n"
+)
+
+
+def _t750_prose(tag: str, lines: int) -> str:
+    return "\n".join(f"{tag} {i}: " + "説明の文章が続きます。" * 6 for i in range(lines))
+
+
+def _t750_body(*, table_first: bool = True) -> str:
+    """~2600 chars that the chunker splits in two, with the table in one half."""
+    head = _t750_prose("前半", 12)
+    tail = _t750_prose("後半・別の話題", 12)
+    if table_first:
+        return f"{head}\n\n{_T750_TABLE}\n{tail}"
+    return f"{head}\n\n{tail}\n\n{_t750_prose('結び', 6)}\n\n{_T750_TABLE}"
+
+
+def _t750_filenames(call) -> list[str]:
+    return [getattr(f, "filename", "") for f in (call.kwargs.get("files") or [])]
+
+
+def _t750_channel_bot() -> tuple[MagicMock, MagicMock]:
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+    return bot, channel
+
+
+def test_t750_fixture_really_splits_with_the_table_in_the_first_chunk() -> None:
+    from c_lord.discord_ui.reply_chunker import chunk_discord_content
+
+    chunks = chunk_discord_content(_t750_body())
+    assert len(chunks) == 2
+    assert "| max_players |" in chunks[0]
+    assert "| max_players |" not in chunks[1]
+
+    last = chunk_discord_content(_t750_body(table_first=False))
+    assert len(last) == 2
+    assert "| max_players |" not in last[0]
+    assert "| max_players |" in last[1]
+
+
+async def test_reply_sink_attaches_table_image_to_the_chunk_with_the_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#750 AC1/AC2/AC6: the PNG rides on the message holding the table.
+
+    RED before the fix: every table image landed on the LAST chunk — here the
+    one about a different topic — while the table itself stayed raw pipes above.
+    """
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+    bot, channel = _t750_channel_bot()
+    reply_sink = TranscriptMirrorCog(bot, session_repo=_make_repo([]))._make_reply_sink(42)
+
+    with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+        await reply_sink(_t750_body())
+
+    calls = channel.send.call_args_list
+    assert len(calls) == 2
+    assert _t750_filenames(calls[0]) == ["table_1.png"]
+    assert _t750_filenames(calls[1]) == []
+
+
+async def test_file_sink_keeps_progress_txt_last_and_the_table_with_its_chunk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#750 AC1/AC2/AC3: table image on chunk 1, progress.txt still on the last."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    bot, channel = _t750_channel_bot()
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+    file_sink = TranscriptMirrorCog(bot, session_repo=_make_repo([]))._make_file_sink(42)
+
+    with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+        await file_sink(_t750_body(), str(progress_file))
+
+    calls = channel.send.call_args_list
+    assert len(calls) == 2
+    assert _t750_filenames(calls[0]) == ["table_1.png"]
+    assert _t750_filenames(calls[1]) == ["progress.txt"]
+
+
+async def test_file_sink_table_in_the_last_chunk_shares_it_with_progress_txt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#750 AC2/AC3: a table in the final chunk still rides there, after the log."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    bot, channel = _t750_channel_bot()
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+    file_sink = TranscriptMirrorCog(bot, session_repo=_make_repo([]))._make_file_sink(42)
+
+    with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+        await file_sink(_t750_body(table_first=False), str(progress_file))
+
+    calls = channel.send.call_args_list
+    assert len(calls) == 2
+    assert _t750_filenames(calls[0]) == []
+    assert _t750_filenames(calls[1]) == ["progress.txt", "table_1.png"]
+
+
+async def test_sink_attaches_table_image_to_the_chunk_with_the_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#750 AC1: the silent intermediate path splits the same way."""
+    from unittest.mock import patch
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    bot, channel = _t750_channel_bot()
+    sink = TranscriptMirrorCog(bot, session_repo=_make_repo([]))._make_sink(42)
+
+    with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+        await sink(_t750_body())
+
+    calls = channel.send.call_args_list
+    assert len(calls) == 2
+    assert _t750_filenames(calls[0]) == ["table_1.png"]
+    assert _t750_filenames(calls[1]) == []
+
+
+async def test_file_sink_many_tables_in_one_chunk_stay_under_the_attachment_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#750 AC5: >10 tables in the first chunk never push a send past 10 files."""
+    from unittest.mock import patch
+
+    from c_lord.discord_ui.reply_chunker import chunk_discord_content
+    from c_lord.discord_ui.table_renderer import MAX_TABLE_IMAGES
+
+    monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+    body = f"{_many_tables(14)}\n{_t750_prose('後半', 30)}"
+    assert len(chunk_discord_content(body)) >= 2
+    bot, channel = _t750_channel_bot()
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+    file_sink = TranscriptMirrorCog(bot, session_repo=_make_repo([]))._make_file_sink(42)
+
+    with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"\x89PNG"):
+        await file_sink(body, str(progress_file))
+
+    calls = channel.send.call_args_list
+    for call in calls:
+        assert len(call.kwargs.get("files") or []) <= MAX_TABLE_IMAGES
+    assert len(_t750_filenames(calls[0])) == MAX_TABLE_IMAGES
+    assert _t750_filenames(calls[-1]) == ["progress.txt"]
+
+
 # ── Issue #719: one transcript, one mirror ────────────────────────────
 
 
@@ -1498,3 +1664,51 @@ async def test_stop_for_releases_the_project_dir(
             await cog.cog_unload()
 
     assert not [r for r in caplog.records if "#719" in r.getMessage()], caplog.text
+
+
+# ---------------------------------------------------------------------------
+# #747: the repeat counter is posted like an intermediate message and edited
+# ---------------------------------------------------------------------------
+
+
+async def test_repeat_counter_is_posted_silently_and_edited_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLORD_SILENT_POSTS", raising=False)
+    monkeypatch.delenv("CLORD_SHOW_URL_EMBEDS", raising=False)
+    bot = MagicMock()
+    channel = MagicMock()
+    message = MagicMock()
+    message.edit = AsyncMock()
+    channel.send = AsyncMock(return_value=message)
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    post, edit = cog._make_fold(7)
+    handle = await post("-# 🔁 同じ発言が続いています")
+    await edit(handle, "-# 🔁 同じ発言が続いています — 57 回ぶん")
+
+    kwargs = channel.send.call_args.kwargs
+    assert kwargs.get("silent") is True
+    assert kwargs.get("suppress_embeds") is True
+    assert handle is message
+    # discord.py's edit() defaults to suppress=False, which *clears* the flag the
+    # send set — seen on staging (flags 4100 → 4096) — so a quoted URL would unfurl.
+    message.edit.assert_awaited_once_with(
+        content="-# 🔁 同じ発言が続いています — 57 回ぶん", suppress=True
+    )
+
+
+async def test_start_for_wires_an_editable_repeat_counter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Zero-config: consumers get the live count by upgrading alone."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bot = MagicMock()
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    try:
+        assert cog.start_for(9, str(tmp_path / "wd"))
+        mirror = cog._mirrors[9]
+        assert mirror._fold._edit is not None
+    finally:
+        await cog.cog_unload()
