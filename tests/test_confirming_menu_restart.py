@@ -143,6 +143,37 @@ class TestFindAskForQuestion:
         found = find_ask_for_question(tmp_path, Q1, "2026-09-28T14:10:00.000Z")
         assert found is not None and found.tool_use_id == "toolu_late"
 
+    def test_an_ask_resolved_before_the_menu_was_drawn_is_not_its_ask(
+        self, tmp_path: Path
+    ) -> None:
+        """Found on staging: the same question asked again, its ask not written
+        yet (#746's lazy write). The previous ask — answered minutes before this
+        menu existed — must not be taken for it, or the menu turns ✅ with the
+        previous answer's verdict before this one was even given."""
+        _append(
+            tmp_path,
+            _use("toolu_prev", "2026-09-28T14:00:00.000Z"),
+            _result("toolu_prev", "2026-09-28T14:01:00.000Z", ANSWERED),
+        )
+        assert find_ask_for_question(tmp_path, Q1, "2026-09-28T14:10:00.000Z") is None
+
+        _append(
+            tmp_path,
+            _use("toolu_now", "2026-09-28T14:40:00.000Z"),
+            _result("toolu_now", "2026-09-28T14:40:00.000Z", ANSWERED),
+        )
+        found = find_ask_for_question(tmp_path, Q1, "2026-09-28T14:10:00.000Z")
+        assert found is not None and found.tool_use_id == "toolu_now"
+
+    def test_an_ask_resolved_after_the_menu_was_drawn_is_its_ask(self, tmp_path: Path) -> None:
+        _append(
+            tmp_path,
+            _use("toolu_now", "2026-09-28T14:09:58.000Z"),
+            _result("toolu_now", "2026-09-28T14:35:00.000Z", ANSWERED),
+        )
+        found = find_ask_for_question(tmp_path, Q1, "2026-09-28T14:10:00.000Z")
+        assert found is not None and found.tool_use_id == "toolu_now"
+
     def test_none_when_no_ask_carries_it(self, tmp_path: Path) -> None:
         _append(tmp_path, _use("toolu_a", "2026-09-28T14:09:58.000Z"))
         assert find_ask_for_question(tmp_path, "別の質問", "2026-09-28T14:10:00.000Z") is None

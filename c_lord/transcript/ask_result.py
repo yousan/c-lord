@@ -143,13 +143,16 @@ def find_ask_for_question(project_dir: Path, question: str, menu_at: str) -> Fou
 
     For a menu found in Discord after a restart, with no tool_use id to go on.
     Normally the ask is written before its menu is drawn, so it is the newest
-    ask carrying the question from before *menu_at*; when the CLI wrote it only
-    together with its result (#746), the earliest one after. ``None`` while
-    neither exists yet.
+    ask carrying the question from before *menu_at* — **unless that ask's result
+    was already written before *menu_at***: an ask that had been answered cannot
+    have drawn a menu afterwards. That is the same question asked again, whose
+    own ask the CLI writes only together with its result (#746); then it is the
+    earliest one after *menu_at*. ``None`` while neither exists yet — found on
+    staging, where taking the earlier ask turned the new menu ✅ with the
+    previous answer's verdict.
     """
-    before: FoundAsk | None = None
-    after: FoundAsk | None = None
-    before_ts = after_ts = ""
+    earlier: list[tuple[str, FoundAsk]] = []
+    later: list[tuple[str, FoundAsk]] = []
     for path, event in _iter_events(project_dir, _ASK_TOOL_NAME):
         ts = str(event.get("timestamp") or "")
         for block in _blocks(event):
@@ -165,15 +168,28 @@ def find_ask_for_question(project_dir: Path, question: str, menu_at: str) -> Fou
                 (q for q in questions if isinstance(q, dict) and q.get("question") == question),
                 None,
             )
-            if match is None:
-                continue
-            found = FoundAsk(block["id"], path, match)
-            if ts <= menu_at:
-                if before is None or ts >= before_ts:
-                    before, before_ts = found, ts
-            elif after is None or ts < after_ts:
-                after, after_ts = found, ts
-    return before or after
+            if match is not None:
+                (earlier if ts <= menu_at else later).append(
+                    (ts, FoundAsk(block["id"], path, match))
+                )
+    for _ts, found in sorted(earlier, key=lambda item: item[0], reverse=True):
+        resolved_at = _result_timestamp(project_dir, found.tool_use_id, found.session_path)
+        if resolved_at is None or resolved_at > menu_at:
+            return found
+    return min(later, key=lambda item: item[0])[1] if later else None
+
+
+def _result_timestamp(project_dir: Path, tool_use_id: str, session_path: Path) -> str | None:
+    """When the ``tool_result`` for *tool_use_id* was written, or None if it was not."""
+    for _path, event in _iter_events(project_dir, tool_use_id, only=session_path):
+        for block in _blocks(event):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id") == tool_use_id
+            ):
+                return str(event.get("timestamp") or "")
+    return None
 
 
 def latest_ask_tool_use(project_dir: Path) -> tuple[str, Path] | None:
