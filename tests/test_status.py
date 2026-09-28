@@ -13,6 +13,7 @@ from c_lord.discord_ui.status import (
     EMOJI_ERROR,
     EMOJI_RUNNING,
     EMOJI_STALL_HARD,
+    EMOJI_STALL_SOFT,
     EMOJI_WAITING,
     STALL_HARD_SECONDS,
     StatusManager,
@@ -332,3 +333,51 @@ class TestStallOverrideIsTemporary:
 
         assert msg.reactions == [EMOJI_WAITING]
         await sm.cleanup()
+
+
+class TestTurnThatEndsWithoutAFinalLamp:
+    """#799: a turn cancelled by the next message never calls set_done/set_error.
+
+    ``_preempt_prior_turn`` cancels the prior turn's task, and a CancelledError
+    skips every place that paints the final lamp. The stall monitor used to
+    outlive the turn and paint ⚠️ ("stuck") on a request that had already ended.
+    """
+
+    @staticmethod
+    async def _cancelled_turn(msg: MagicMock) -> StatusManager:
+        holder: list[StatusManager] = []
+
+        async def turn() -> None:
+            sm = StatusManager(msg)
+            holder.append(sm)
+            await sm.set_running()
+            await asyncio.sleep(3600)  # the run, until the next message cancels it
+
+        task = asyncio.create_task(turn())
+        while not holder or holder[0]._current_emoji is None:
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return holder[0]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_gets_no_stall_lamp(self) -> None:
+        msg = _make_message()
+        sm = await self._cancelled_turn(msg)
+        # 60 s after the turn ended, as far as the stall clock can tell.
+        sm._last_activity = asyncio.get_running_loop().time() - 60
+        await asyncio.sleep(2.5)
+
+        painted = [c.args[0] for c in msg.add_reaction.await_args_list]
+        assert EMOJI_STALL_HARD not in painted
+        assert EMOJI_STALL_SOFT not in painted
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_settles_to_waiting(self) -> None:
+        msg = _make_message()
+        sm = await self._cancelled_turn(msg)
+        await asyncio.sleep(2.5)
+
+        assert sm._current_emoji == EMOJI_WAITING
+        assert sm._stall_task is None
+        msg.add_reaction.assert_awaited_with(EMOJI_WAITING)

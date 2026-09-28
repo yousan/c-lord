@@ -57,6 +57,10 @@ class StatusManager:
         self._message = message
         self._current_emoji: str | None = None
         self._stall_task: asyncio.Task | None = None
+        # #799: the task running the turn. A turn cancelled by the next message
+        # never reaches set_done()/set_error(), so the monitor watches this to
+        # learn that the turn is over.
+        self._turn_task: asyncio.Task | None = None
         self._turn_active = False
         self._lock = asyncio.Lock()
         self._last_activity = asyncio.get_running_loop().time()
@@ -147,6 +151,7 @@ class StatusManager:
         await self._stop_stall_timer()
         self._last_activity = asyncio.get_running_loop().time()
         self._turn_active = True
+        self._turn_task = asyncio.current_task()
         self._stall_task = asyncio.create_task(self._stall_monitor())
 
     def _reset_stall_timer(self) -> None:
@@ -177,6 +182,16 @@ class StatusManager:
         while True:
             await asyncio.sleep(2)
             if not self._turn_active:
+                return
+            if self._turn_task is not None and self._turn_task.done():
+                # #799: the turn ended without painting its final lamp — it was
+                # cancelled (the next message replaced it) or died. It is over,
+                # so it reads 🟡, never ⚠️ ("stuck").
+                logger.info(
+                    "Turn ended without a final lamp (cancelled=%s); showing it as finished",
+                    self._turn_task.cancelled(),
+                )
+                await self.set_waiting()
                 return
             elapsed = asyncio.get_running_loop().time() - self._last_activity
 
