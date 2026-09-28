@@ -7,6 +7,7 @@ import os
 import shutil
 from pathlib import Path
 
+from ..git_exclude import add_git_exclude
 from .discord_read import render_discord_read_skill
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,11 @@ def inject_read_skill(
     Idempotent (overwrites). Only the ``.env`` *path* is baked in — never the
     token value.
 
+    The SKILL.md is also listed in the clone's ``.git/info/exclude`` (#779):
+    the user's ``.gitignore`` does not know about it, so it used to show up
+    untracked and ride along in Claude's next ``git add -A`` — host path and
+    all. That is how it got into c-lord's own repository (#704).
+
     Args:
         session_dir: Path to the per-thread session directory.
         env_path: Absolute path to c-lord's ``.env``. Defaults to the
@@ -54,6 +60,11 @@ def inject_read_skill(
     read_path.write_text(
         render_discord_read_skill(env_path=env_path),
         encoding="utf-8",
+    )
+    add_git_exclude(
+        session_dir,
+        f"/.claude/skills/{READ_SKILL_NAME}/SKILL.md",
+        "injected discord-read skill (#779)",
     )
     logger.info(
         "Injected discord-read skill at %s (env_path=%s)",

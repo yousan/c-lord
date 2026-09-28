@@ -56,6 +56,10 @@ This means the bot token is **readable by the Claude session** (it `grep`s the
   working tree, where a literal token could be `git commit`-ed and pushed). The
   token is read into a shell variable at runtime, so it does not appear in the
   command text that the transcript mirror (#71) echoes to Discord.
+- The `SKILL.md` itself — with this host's `.env` *path* in it — is kept out of
+  the user's commits: the injector lists it in the clone's `.git/info/exclude`
+  (#779), so `git add -A` does not pick it up. Before #779 it was committed
+  into c-lord's own public repository by an unrelated PR (#704).
 
 > Note: the env stripping described under "Environment Isolation" below **is**
 > implemented (#353, closing the #458 drift), but it does **not** make the token

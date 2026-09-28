@@ -57,6 +57,25 @@ def _clone(path: Path) -> Path:
     return path
 
 
+def _inject_before_779(ws: Path, env_path: str | None = None) -> None:
+    """The skill as a workspace created before #779 has it: no ``info/exclude`` line.
+
+    Since #779 the injector hides the SKILL.md from git, so it never shows up
+    as ``??`` in a new workspace. The workspaces created before that — and any
+    repository where it already got committed — still show it, and they are
+    what these classification tests are about.
+    """
+    inject_read_skill(ws, env_path=env_path)
+    exclude = ws / ".git" / "info" / "exclude"
+    if exclude.exists():
+        kept = [
+            line
+            for line in exclude.read_text().splitlines()
+            if "discord-read" not in line and "(#779)" not in line
+        ]
+        exclude.write_text("\n".join(kept) + "\n")
+
+
 def _legacy_skill(ws: Path, name: str) -> None:
     """What a pre-#712 session dir still has on disk."""
     d = ws / ".claude" / "skills" / name
@@ -137,7 +156,7 @@ def test_a_tracked_skill_overwritten_by_the_injector_is_clean(tmp_path: Path) ->
     結果で、そこに置いた未コミットの編集は次のターンで必ず消える。
     """
     ws = _clone(tmp_path / "ws")
-    inject_read_skill(ws, env_path="/old/.env")
+    _inject_before_779(ws, env_path="/old/.env")
     _git(ws, "add", "-A")
     _git(ws, "commit", "-qm", "oops: injected skill got committed")
     inject_read_skill(ws, env_path="/new/.env")
@@ -148,7 +167,7 @@ def test_a_tracked_skill_overwritten_by_the_injector_is_clean(tmp_path: Path) ->
 def test_a_staged_change_to_the_skill_is_work(tmp_path: Path) -> None:
     """``git add`` したのは誰かの判断。index に載った変更は数える。"""
     ws = _clone(tmp_path / "ws")
-    inject_read_skill(ws, env_path="/old/.env")
+    _inject_before_779(ws, env_path="/old/.env")
     _git(ws, "add", "-A")
     _git(ws, "commit", "-qm", "tracked")
     inject_read_skill(ws, env_path="/new/.env")
@@ -191,7 +210,7 @@ def test_a_plain_directory_under_worktrees_is_work(tmp_path: Path) -> None:
 def test_a_path_that_needs_quoting_is_still_classified(tmp_path: Path) -> None:
     """空白や非 ASCII を含むパスで判定が崩れない（``-z`` で読む）。"""
     ws = _clone(tmp_path / "ws")
-    inject_read_skill(ws)
+    _inject_before_779(ws)
     (ws / "下書き と メモ.md").write_text("wip\n")
 
     status = worktree_status(str(ws))
@@ -272,7 +291,7 @@ async def test_summary_separates_clord_leftovers_from_user_work(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     only_clord = _clone(tmp_path / "111" / "1")
-    inject_read_skill(only_clord)
+    _inject_before_779(only_clord)
     plain_clean = _clone(tmp_path / "111" / "2")
     user_work = _clone(tmp_path / "111" / "3")
     inject_read_skill(user_work)

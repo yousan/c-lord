@@ -20,6 +20,8 @@ import re
 import unicodedata
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from .git_exclude import add_git_exclude
+
 logger = logging.getLogger(__name__)
 
 # Kept under a dotted directory of our own rather than loose in the checkout,
@@ -103,19 +105,4 @@ def ensure_git_excluded(session_dir: str) -> None:
     is not modified. Best effort — never raises.
     """
     top_level = ATTACHMENT_SUBDIR.split("/", 1)[0]
-    entry = f"/{top_level}/"
-    exclude = Path(session_dir) / ".git" / "info" / "exclude"
-    try:
-        if not (Path(session_dir) / ".git").exists():
-            return
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if entry in existing.splitlines():
-            return
-        prefix = "" if existing.endswith("\n") or not existing else "\n"
-        exclude.write_text(
-            f"{existing}{prefix}# c-lord: Discord attachments (#528)\n{entry}\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        logger.warning("Could not git-exclude %s in %s: %s", entry, session_dir, exc)
+    add_git_exclude(session_dir, f"/{top_level}/", "Discord attachments (#528)")
