@@ -17,6 +17,7 @@ design.
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 from pathlib import Path
 
@@ -191,3 +192,72 @@ def test_a_named_session_is_sent_to_claude_restart() -> None:
 
 def test_an_empty_workspace_says_so() -> None:
     assert "1 つもありません" in _unresolved_notice(_report(candidates=0))
+
+
+# ── #810: an idle mirror must not flood ERROR ─────────────────────────────
+
+
+async def _report_n_times(mirror: TranscriptMirror, n: int) -> None:
+    for _ in range(n):
+        await mirror._on_unresolved(_report(candidates=1))
+
+
+def _mirror_records(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "c_lord.transcript.mirror"
+        and r.levelno == level
+        and "nothing to read" in r.getMessage()
+    ]
+
+
+@pytest.fixture
+def _fresh_idle_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    from c_lord.log_sampler import LogSampler
+    from c_lord.transcript import mirror as mirror_mod
+
+    monkeypatch.setattr(mirror_mod, "_idle_unresolved_log", LogSampler(3600.0), raising=False)
+
+
+@pytest.mark.usefixtures("_fresh_idle_sampler")
+async def test_idle_mirror_does_not_log_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AC1: nobody is waiting, so nothing is broken — no ERROR, however often."""
+    caplog.set_level(logging.DEBUG, logger="c_lord.transcript.mirror")
+    posted: list[str] = []
+    mirror = _mirror(tmp_path, posted)  # idle: expect_turn=False, no turn started
+    await _report_n_times(mirror, 5)
+
+    assert _mirror_records(caplog, logging.ERROR) == []
+    assert posted == []
+
+
+@pytest.mark.usefixtures("_fresh_idle_sampler")
+async def test_idle_mirror_still_leaves_one_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AC2: quiet is not silent (#678) — one WARNING per thread per window."""
+    caplog.set_level(logging.DEBUG, logger="c_lord.transcript.mirror")
+    mirror = _mirror(tmp_path, [])
+    await _report_n_times(mirror, 5)
+
+    warnings = _mirror_records(caplog, logging.WARNING)
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "thread=1" in warnings[0].getMessage()
+
+
+@pytest.mark.usefixtures("_fresh_idle_sampler")
+async def test_running_turn_still_logs_error_and_tells_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AC3: a turn someone is waiting on is a real outage — ERROR, and one notice."""
+    caplog.set_level(logging.DEBUG, logger="c_lord.transcript.mirror")
+    posted: list[str] = []
+    mirror = _mirror(tmp_path, posted)
+    mirror.note_turn_started()
+    await _report_n_times(mirror, 3)
+
+    assert len(_mirror_records(caplog, logging.ERROR)) == 3
+    assert len(posted) == 1
