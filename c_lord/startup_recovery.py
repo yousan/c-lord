@@ -11,7 +11,9 @@ which is exactly how one of them ran for a month while the other never ran once:
   wrote to;
 - dead buttons a shutdown could not remove — ``⏹ Stop`` (#634), swept from
   ``ClaudeChatCog``, and since #752 every ❓ menu that re-arming did not bring
-  back.
+  back;
+- answered menus left at ⏳ 確認中 whose watcher died with the process (#786) —
+  their watch is started again.
 
 Keeping them together is the point of this module: adding a third kind of dead
 UI should mean one more line here, not a third startup hook nobody knows about.
@@ -27,6 +29,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING
 
+from .ask_confirm_recovery import resume_confirming_menus
 from .ask_menu_recovery import recover_ask_menus
 from .database.sweep_cursor_repo import SweepCursorRepository
 from .stale_stop_buttons import KeepMenu, sweep_dead_buttons
@@ -92,6 +95,9 @@ async def run_startup_recovery(
     """
     with contextlib.suppress(Exception):
         await recover_ask_menus(bot, ask_repo)
+    # #786: answered menus whose ⏳ 確認中 watch died with the last process.
+    with contextlib.suppress(Exception):
+        await resume_confirming_menus(bot, session_repo)
     keep_menu = await _rearmed_menus(ask_repo)
     with contextlib.suppress(Exception):
         await sweep_dead_buttons(

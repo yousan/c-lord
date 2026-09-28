@@ -667,9 +667,16 @@ next reply.
 transcript to read at all), so a production grep for it finds answers that
 really could not be confirmed — not answers that were merely late.
 
-**Known limit:** the watcher lives in the bot process. A restart while a menu
-reads ⏳ leaves it at ⏳ (true when written, and carrying no advice that could
-hurt); the stop is logged at INFO.
+**Across a restart (#786).** The watcher lives in the bot process, so a restart
+stops it (logged at INFO: `stopped watching the transcript … (bot stopping)`).
+The next process picks it up again on startup without anything having been
+stored: it looks in the threads active within the watch's lifetime for its own
+⏳ menus (the embed carries the question and the answer sent), finds the ask
+carrying that question in the thread's transcript, and starts the same watcher.
+A result written while no process was running corrects the menu at once; one
+written later corrects it when it lands; a second restart finds the menu again.
+Logged as `confirming-menu recovery: watching N ⏳ menu(s) …` (`c_lord/ask_confirm_recovery.py`).
+A menu in a thread that has since been archived is not revisited.
 
 When there is no transcript to read (the pane is the only evidence), there is no
 watcher: the pane cannot tell a later question of the same ask from this one, so
@@ -944,6 +951,7 @@ from Claude Code v2.1.252.
 | Confirming the answer reached Claude (#651) | `c_lord/transcript/ask_result.py`, `ask_handler.py::_locate_menu` / `_verify_answer_reached_claude` / `_finalize_menu_message`, `tmux_runner.py::transcript_project_dir`, `tmux.py::pane_working_dir` |
 | Interim / unconfirmed embeds (#651/#746) | `embeds.py::ask_sending_embed`, `ask_confirming_embed`, `ask_unconfirmed_embed` |
 | Correcting the menu when the result lands late (#746) | `ask_handler.py::settle_answer` / `_confirm_late` |
+| Resuming that correction after a restart (#786) | `ask_confirm_recovery.py::resume_confirming_menus` |
 | Disabling other live copies (#536) | `c_lord/discord_ui/ask_menus.py` |
 | 文章での回答 / 誤爆の取り消し (#536 AC7) | `cogs/claude_chat.py::_maybe_answer_open_menu`, `views.py::TextAnsweredMenuView` |
 | Order-independent context dedup (#399) | `c_lord/discord_ui/bridged_context.py` |
