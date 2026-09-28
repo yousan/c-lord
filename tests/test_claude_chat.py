@@ -260,27 +260,26 @@ class TestClearTextCommand:
         ctx.send.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_resets_session(self) -> None:
-        cog = _make_cog()
-        cog.repo.reset = AsyncMock(return_value=True)
-        cog._resolve_tmux_manager = AsyncMock(return_value=None)
-        ctx = _make_thread_ctx(thread_id=12345)
-        await cog.clear_text.callback(cog, ctx)
-        cog.repo.reset.assert_called_once_with(12345)
-        ctx.send.assert_called_once()
+    async def test_types_clear_and_leaves_the_row_alone(self) -> None:
+        """#803: ``!clear`` types ``/clear`` into the TUI; the session row is not reset.
 
-    @pytest.mark.asyncio
-    async def test_kills_active_runner(self) -> None:
+        The full behaviour (wake / interrupt / claim) lives in
+        ``tests/test_clear_via_tui.py``.
+        """
         cog = _make_cog()
+        cog.repo.get = AsyncMock(return_value=MagicMock(closed_at=None))
         cog.repo.reset = AsyncMock(return_value=True)
-        cog._resolve_tmux_manager = AsyncMock(return_value=None)
+        tmux_manager = MagicMock()
+        tmux_manager.is_claude_running = MagicMock(return_value=True)
+        tmux_manager.send_literal = MagicMock(return_value=True)
+        tmux_manager.project_dir_for = MagicMock(return_value=None)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_manager)
         ctx = _make_thread_ctx(thread_id=12345)
-        mock_runner = MagicMock()
-        mock_runner.kill = AsyncMock()
-        cog._active_runners[12345] = mock_runner
         await cog.clear_text.callback(cog, ctx)
-        mock_runner.kill.assert_called_once()
-        assert 12345 not in cog._active_runners
+        tmux_manager.send_literal.assert_called_once_with(12345, "/clear")
+        tmux_manager.kill_session.assert_not_called()
+        cog.repo.reset.assert_not_called()
+        ctx.send.assert_called_once()
 
 
 class TestRestartClaudeCommand:
@@ -2090,52 +2089,24 @@ class TestClearCommand:
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
     @pytest.mark.asyncio
-    async def test_clear_kills_active_runner(self) -> None:
-        """/clear kills an active runner when one is present."""
+    async def test_clear_does_not_kill_the_window(self) -> None:
+        """#803 replaces #123's kill: ``/clear`` is typed, the window stays up."""
         tmux_manager = MagicMock()
-        tmux_manager.kill_session = MagicMock(return_value=True)
+        tmux_manager.is_claude_running = MagicMock(return_value=True)
+        tmux_manager.send_literal = MagicMock(return_value=True)
+        tmux_manager.project_dir_for = MagicMock(return_value=None)
         channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
         cog = _make_cog(channel_cog=channel_cog)
-        thread_id = 12345
-
-        runner = AsyncMock()
-        cog._active_runners[thread_id] = runner
+        cog.repo.get = AsyncMock(return_value=MagicMock(closed_at=None))
         cog.repo.reset = AsyncMock(return_value=True)
-
-        interaction = _make_thread_interaction(thread_id)
-        thread = interaction.channel
-        thread.parent_id = 999
+        interaction = _make_thread_interaction(12345)
+        interaction.channel.parent_id = 999
 
         await cog.clear_session.callback(cog, interaction)
 
-        runner.kill.assert_called_once()
-        assert thread_id not in cog._active_runners
-
-    @pytest.mark.asyncio
-    async def test_clear_kills_tmux_window_for_idle_session(self) -> None:
-        """Issue #123: /clear on idle thread (no active runner) must still kill the tmux window.
-
-        Before the fix, kill_session was only called when runner was in _active_runners.
-        After the fix, it is called unconditionally when tmux_manager is available.
-        """
-        tmux_manager = MagicMock()
-        tmux_manager.kill_session = MagicMock(return_value=True)
-        channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
-        cog = _make_cog(channel_cog=channel_cog)
-        thread_id = 12345
-
-        # No active runner — this is the "idle session" case
-        assert thread_id not in cog._active_runners
-        cog.repo.reset = AsyncMock(return_value=True)
-
-        interaction = _make_thread_interaction(thread_id)
-        thread = interaction.channel
-        thread.parent_id = 999
-
-        await cog.clear_session.callback(cog, interaction)
-
-        # tmux window must be killed even though there was no active runner
-        tmux_manager.kill_session.assert_called_once_with(thread_id)
+        tmux_manager.send_literal.assert_called_once_with(12345, "/clear")
+        tmux_manager.kill_session.assert_not_called()
+        cog.repo.reset.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_clear_no_session_sends_ephemeral(self) -> None:
