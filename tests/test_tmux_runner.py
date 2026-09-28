@@ -3790,6 +3790,41 @@ class TestExtractStartupError:
         assert result is not None
         assert "command not found" in result.lower()
 
+    def test_detects_bash_style_command_not_found(self) -> None:
+        pane = "$ claude --model opus 'hi'\nbash: claude: command not found\n$\n"
+        result = _extract_startup_error(pane)
+        assert result is not None
+        assert "claude: command not found" in result
+
+    def test_bash_tool_error_for_claude_prefixed_command_is_not_startup_error(self) -> None:
+        """#453: a Bash tool failing on ``claude-<something>`` is not claude failing.
+
+        Real Claude Code v2.1.280 pane (``--verbose``, which shows tool output):
+        Claude ran ``claude-metrics-exporter --help`` and the shell answered
+        ``(eval):1: command not found: claude-metrics-exporter``. The session is
+        alive and mid-turn; the old substring match read the line as "claude is
+        not installed" and ended the turn with "Claude failed to start".
+        """
+        pane = _normalize_capture(_load_fixture("i453_bash_error_claude_prefixed_cmd_v2_1_280.txt"))
+        assert "command not found: claude-metrics-exporter" in pane  # the trap is there
+        assert _extract_startup_error(pane) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "  ⎿  (eval):1: command not found: claude-metrics-exporter",
+            "zsh: command not found: claude-code",
+            "zsh: command not found: claude_helper",
+            "zsh: command not found: claude2",
+            "bash: claude-foo: command not found",
+            "bash: my-claude: command not found",
+            "bash: xclaude: command not found",
+        ],
+    )
+    def test_other_commands_named_like_claude_are_not_startup_errors(self, line: str) -> None:
+        """#453: only a missing ``claude`` itself is a startup failure."""
+        assert _extract_startup_error(line) is None
+
     def test_healthy_response_pane_returns_none(self) -> None:
         pane = _make_pane(["● Sure, here is the fix."], with_input_prompt=True)
         assert _extract_startup_error(pane) is None
@@ -3824,6 +3859,32 @@ class TestRunStartupErrorSurfacing:
         assert len(result_events) == 1
         assert result_events[0].error is not None
         assert "native binary not installed" in result_events[0].error.lower()
+
+    @pytest.mark.asyncio
+    async def test_bash_tool_error_does_not_end_live_turn_as_failed_start(
+        self, runner, tmux_manager
+    ) -> None:
+        """#453: the real pane of a live turn whose Bash tool hit a ``claude-*``
+        command must not be reported as "Claude failed to start"."""
+        tmux_manager.capture_pane.return_value = _load_fixture(
+            "i453_bash_error_claude_prefixed_cmd_v2_1_280.txt"
+        )
+        tmux_manager.is_claude_running.return_value = True
+
+        runner.timeout_seconds = 60
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.02),
+            patch("c_lord.claude.tmux_runner._IDLE_TIMEOUT", 0.2),
+            patch("c_lord.claude.tmux_runner._STARTUP_TIMEOUT", 0.04),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("run claude-metrics-exporter --help"):
+                events.append(event)
+
+        result_events = [e for e in events if e.is_complete]
+        assert len(result_events) == 1
+        assert not (result_events[0].error or "").startswith("Claude failed to start")
 
     @pytest.mark.asyncio
     async def test_no_response_claude_exited_yields_error(self, runner, tmux_manager) -> None:
