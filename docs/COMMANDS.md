@@ -147,6 +147,8 @@ Claude Code answers `/clear` with a **new transcript file**, and c-lord follows 
 
 **`/compact`** fires the Claude Code TUI's built-in `/compact` for this thread's session, compressing the conversation history into a summary so the context window is freed **without losing continuity** (unlike `/clear`, which discards the session). Pass optional `instructions` to focus the summary (e.g. `/compact keep the open tasks and decisions`). Note: a plain `/compact` typed as a normal message does **not** work (the leading-slash note below) — this command exists precisely because it sends `/compact` via the zero-width-space-free `send_literal` path.
 
+It works in the same states as `/clear` (#806): a running turn is stopped first, and a **stopped workspace is restored first** (`--resume` of the recorded session, so the conversation to compact comes back) with `-# 🔄 停止していたワークスペースを復元してから `/compact` を送ります。` in the thread. Before #806 a stopped thread answered `No running Claude session in this thread to compact.`, which read as the conversation being lost. A thread with no c-lord record, a `[終了]` thread, or one where Claude never wrote a transcript is refused in words instead of being woken — there is nothing to compact.
+
 **`/clord-attach`** links a thread to a tmux window so you can interact with the same Claude Code session from both Discord and the terminal.
 
 ### Skills

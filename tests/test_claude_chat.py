@@ -2173,7 +2173,7 @@ class TestCompactCommand:
 
     @pytest.mark.asyncio
     async def test_compact_not_running_sends_ephemeral(self) -> None:
-        """/compact when Claude is not running sends an ephemeral notice (no send)."""
+        """/compact on a stopped, untracked thread sends an ephemeral notice (no send, #806)."""
         tmux_manager = self._running_tmux()
         tmux_manager.is_claude_running = MagicMock(return_value=False)
         channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
