@@ -245,6 +245,34 @@ def _missing_window(action: str, thread_id: int) -> str:
     )
 
 
+REASON_NO_WINDOW = "スレッドの tmux ウィンドウが見つかりませんでした"
+REASON_UNDELIVERED_UNKNOWN = (
+    "tmux ウィンドウはありますが、キー入力が届きませんでした（原因は特定できていません）"
+)
+
+
+def _tmux_refused_reason(error: str) -> str:
+    """Why a menu answer did not land, when tmux itself refused it (#809)."""
+    return f"tmux がキー入力を受け付けませんでした（ウィンドウはあります / tmux: {error[:200]}）"
+
+
+def _tmux_refused(action: str, prompt: str, error: str) -> str:
+    """User-facing text for "tmux refused the keystrokes, and said why" (#809).
+
+    The #527 wording blamed a dead pane and sent people to ``/claude-restart``.
+    When tmux returns an error the pane is alive — tmux looked at the command
+    and said no — so restarting would lose the session and change nothing.
+    Quote tmux, keep the reader away from the restart.
+    """
+    size = len(prompt.encode("utf-8"))
+    return (
+        f"{action}に失敗しました — tmux がこの入力を受け付けませんでした "
+        f"(入力 {size:,} bytes / tmux: `{error[:200]}`)。"
+        "ペインが落ちているのではないので、`/claude-restart` では直りません。"
+        "この表示を添えて c-lord の不具合として報告してください。"
+    )
+
+
 def _ambiguous_window(action: str, thread_id: int, session: str, names: list[str]) -> str:
     """User-facing text for "the tmux target does not identify one window" (#649).
 
@@ -1358,6 +1386,52 @@ class TmuxClaudeRunner:
         self._stopped = False
         self._silent_stop = False
         self._last_capture: str = ""
+        # #809: why the last menu answer did not reach the TUI, in words the
+        # thread can be shown. Empty until an answer fails.
+        self.undelivered_reason: str = ""
+
+    def _take_send_failure(self) -> str | None:
+        """tmux's error for this thread's last refused keystrokes, or None (#809)."""
+        try:
+            error = self._tmux.take_send_failure(self._thread_id)
+        except Exception:
+            return None
+        return error if isinstance(error, str) and error else None
+
+    async def _explain_undelivered(self) -> None:
+        """Record why a menu answer did not land — asked of tmux, not assumed (#809).
+
+        #600 wrote "no tmux window" for every failure. On 2026-09-24 the window
+        was there and tmux had refused ``send-keys -l - …`` as an invalid flag;
+        the user was told to look for a window that existed and re-sent the same
+        sentence twenty minutes later.
+        """
+        error = self._take_send_failure()
+        if error is not None:
+            logger.warning(
+                "answer keystrokes were not delivered — tmux refused them for thread %d: %s (#809)",
+                self._thread_id,
+                error,
+            )
+            self.undelivered_reason = _tmux_refused_reason(error)
+            return
+        try:
+            has_window = bool(await asyncio.to_thread(self._tmux.session_exists, self._thread_id))
+        except Exception:
+            has_window = False
+        if has_window:
+            logger.warning(
+                "answer keystrokes were not delivered for thread %d although its tmux "
+                "window exists — cause unknown (#809)",
+                self._thread_id,
+            )
+            self.undelivered_reason = REASON_UNDELIVERED_UNKNOWN
+            return
+        logger.warning(
+            "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
+            self._thread_id,
+        )
+        self.undelivered_reason = REASON_NO_WINDOW
 
     async def _duplicate_window_names(self) -> list[str]:
         """Ambiguous window names in this thread's session, or ``[]`` (#649).
@@ -1448,6 +1522,8 @@ class TmuxClaudeRunner:
                 return _ambiguous_window(
                     "Claude の起動", self._thread_id, self._tmux.session_name, dupes
                 )
+            if (refused := self._take_send_failure()) is not None:
+                return _tmux_refused("Claude の起動", prompt, refused)
             return _delivery_failure("Claude の起動", prompt)
         logger.error(
             "start_claude failed with no tmux window for thread %d — "
@@ -1512,8 +1588,10 @@ class TmuxClaudeRunner:
                 )
                 await self.cancel_menu()
                 await asyncio.sleep(_MENU_NAV_DELAY)
+            self._take_send_failure()  # #809: only this send's refusal may explain it
             ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
             if not ok:
+                refused = self._take_send_failure()
                 # #560: two very different failures reach this branch. Either the
                 # pane never took the input (#527), or the text is typed in and
                 # simply will not submit. Telling the second case to
@@ -1522,6 +1600,15 @@ class TmuxClaudeRunner:
                 stuck = await asyncio.to_thread(self._tmux.input_box_holds, self._thread_id, prompt)
                 if stuck:
                     reason = _stuck_in_input_box(prompt)
+                elif refused is not None:
+                    # #809: tmux said no, and said why. The pane is fine —
+                    # /claude-restart would not change tmux's answer.
+                    logger.error(
+                        "send_input for thread %d was refused by tmux: %s (#809)",
+                        self._thread_id,
+                        refused,
+                    )
+                    reason = _tmux_refused("メッセージの送信", prompt, refused)
                 elif dupes := await self._duplicate_window_names():
                     # #649: not stuck and not dead — the keystrokes were typed
                     # into a window this thread does not own.
@@ -1549,6 +1636,7 @@ class TmuxClaudeRunner:
                 )
                 return
         else:
+            self._take_send_failure()  # #809: only this start's refusal may explain it
             if self._try_continue:
                 # Restart-resume path only (on_ready → pending_resumes).
                 # Try --continue first; if Claude exits immediately (no session),
@@ -2980,6 +3068,7 @@ class TmuxClaudeRunner:
         fast — the TUI drops the Down navigations and Enter selects the wrong
         (first) option.
         """
+        self._take_send_failure()  # #809: a stale reason must not explain this answer
         delivered = True
         for _ in range(max(0, index)):
             if not await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"):
@@ -2988,13 +3077,10 @@ class TmuxClaudeRunner:
         if not await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"):
             delivered = False
         if not delivered:
-            # #600: send_keys returns False when the thread has no tmux window —
-            # the answer went nowhere. Reporting it is what stops the menu from
-            # sitting open and being re-posted on every restart.
-            logger.warning(
-                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
-                self._thread_id,
-            )
+            # #600: the answer went nowhere. Reporting it is what stops the menu
+            # from sitting open and being re-posted on every restart — and #809:
+            # say why, because "no window" was only ever one of the reasons.
+            await self._explain_undelivered()
         return delivered
 
     async def answer_menu(self, index: int) -> bool:
@@ -3033,6 +3119,7 @@ class TmuxClaudeRunner:
         """
         # #600: every keystroke reports whether it reached a window; an
         # undelivered answer must not read as an answered menu.
+        self._take_send_failure()  # #809: a stale reason must not explain this answer
         _delivered = True
 
         def _ok(sent: object) -> None:
@@ -3063,10 +3150,7 @@ class TmuxClaudeRunner:
         # Confirm the review screen (cursor defaults to "Submit answers").
         _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
         if not _delivered:
-            logger.warning(
-                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
-                self._thread_id,
-            )
+            await self._explain_undelivered()
         return _delivered
 
     async def answer_menu_text(
@@ -3112,6 +3196,7 @@ class TmuxClaudeRunner:
         """
         # #600: every keystroke reports whether it reached a window; an
         # undelivered answer must not read as an answered menu.
+        self._take_send_failure()  # #809: a stale reason must not explain this answer
         _delivered = True
 
         def _ok(sent: object) -> None:
@@ -3133,15 +3218,17 @@ class TmuxClaudeRunner:
                 _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down"))
                 await asyncio.sleep(_MENU_NAV_DELAY)
         # Type the free text onto the highlighted row / into the notes field.
-        _ok(await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text))
-        await asyncio.sleep(_MENU_NAV_DELAY)
-        # Confirm — records the typed text as the AskUserQuestion answer.
-        _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        typed = await asyncio.to_thread(self._tmux.send_literal, self._thread_id, text)
+        _ok(typed)
+        if typed:
+            await asyncio.sleep(_MENU_NAV_DELAY)
+            # Confirm — records the typed text as the AskUserQuestion answer.
+            _ok(await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter"))
+        # #809: otherwise leave the menu open. Enter on the untouched "Type
+        # something." row is recorded as a refusal, which is what swallowed the
+        # 2026-09-24 answer; an open menu can still take the next attempt.
         if not _delivered:
-            logger.warning(
-                "answer keystrokes were not delivered — no tmux window for thread %d (#600)",
-                self._thread_id,
-            )
+            await self._explain_undelivered()
         return _delivered
 
     async def transcript_project_dir(self) -> Path | None:
