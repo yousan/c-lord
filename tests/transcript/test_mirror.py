@@ -1638,6 +1638,94 @@ async def test_a_prompt_alone_arms_the_progress_line(tmp_path: Path) -> None:
     assert spy.posts, "a prompt-then-silence turn produced no progress line"
 
 
+def _tool_call(tool_id: str, name: str = "Bash", command: str = "sleep 150") -> dict:
+    d = _assistant_tool_use(name, command)
+    d["message"]["content"][0]["id"] = tool_id
+    return d
+
+
+def _tool_return(tool_id: str, output: str = "") -> dict:
+    d = _user_tool_result(output)
+    d["message"]["content"][0]["tool_use_id"] = tool_id
+    return d
+
+
+async def _progress_after_silence(tmp_path: Path, events: list[dict], silence: float) -> list[str]:
+    """Feed *events*, let *silence* seconds pass with nothing new, return the posts."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=757,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        for event in events:
+            _write_event(jsonl, event)
+        await asyncio.sleep(0.25)
+        clock.advance(silence)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+    return spy.posts
+
+
+async def test_progress_line_keeps_the_tool_name_while_one_long_tool_runs(
+    tmp_path: Path,
+) -> None:
+    """#757 AC1: a single 2-minute command is work in progress, not a stall.
+
+    RED before the fix: the mirror only counted events, and one long call writes
+    none between its ``tool_use`` and its ``tool_result`` — so at 60s the line
+    dropped the tool name it had and guessed "長考かコンテキスト圧縮".
+    """
+    posts = await _progress_after_silence(tmp_path, [_tool_call("toolu_757")], 120.0)
+
+    assert posts, "no progress line after 120s of silence"
+    assert "作業中" in posts[0], posts[0]
+    assert "sleep 150" in posts[0], posts[0]
+
+
+async def test_progress_line_falls_back_to_waiting_once_the_tool_returns(
+    tmp_path: Path,
+) -> None:
+    """#757 AC2: after the result, silence is silence again.
+
+    The result here is empty — ``sleep`` prints nothing — which the formatter
+    drops. The call must still count as finished, or the line would claim the
+    tool is running for the rest of the turn.
+    """
+    posts = await _progress_after_silence(
+        tmp_path, [_tool_call("toolu_757"), _tool_return("toolu_757")], 120.0
+    )
+
+    assert posts, "no progress line after 120s of silence"
+    assert "待機中" in posts[0], posts[0]
+
+
+async def test_progress_line_does_not_count_a_menu_as_running(tmp_path: Path) -> None:
+    """An open AskUserQuestion waits on the reader, not on a process (#757).
+
+    Its ``tool_result`` only arrives when someone answers, so treating it as a
+    running tool would say "作業中" under a menu nobody has touched.
+    """
+    ask = _tool_call("toolu_ask", name="AskUserQuestion")
+    ask["message"]["content"][0]["input"] = {"questions": []}
+    posts = await _progress_after_silence(tmp_path, [ask], 120.0)
+
+    assert posts, "no progress line after 120s of silence"
+    assert "作業中" not in posts[0], posts[0]
+
+
 # ---------------------------------------------------------------------------
 # #682: a menu's free-text answer must not come back as a 👤 bubble
 # ---------------------------------------------------------------------------

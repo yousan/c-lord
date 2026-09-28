@@ -46,7 +46,7 @@ from ..usage_limit import (
 from .formatter import RenderedEvent, render_event
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
-from .tail import tail_events
+from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +204,41 @@ def _transcript_has_ask_result(project_dir: Path, tool_use_id: str) -> bool:
 
 # Kinds that are buffered (not posted individually) in minimal mode.
 _BUFFERED_KINDS = frozenset({"tool_use", "tool_result"})
+
+# Tools that wait on the *reader*, not on a process. Their ``tool_result`` only
+# lands once someone answers the menu, so counting one as "running" would keep
+# the progress line on 作業中 under a menu nobody has touched (#757).
+_WAITS_ON_READER = frozenset({"AskUserQuestion", "ExitPlanMode"})
+
+
+def _tool_call_ids(event: dict) -> tuple[list[str], list[str]]:
+    """Return the tool-call ids *event* opens and closes (#757).
+
+    Read from the raw event, not the rendering: a call that printed nothing
+    (``sleep 150``) renders to ``None``, and missing its ``tool_result`` would
+    leave the call looking open for the rest of the turn. Like every helper run
+    on each tailed event, it never assumes a shape.
+    """
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return [], []
+    opened: list[str] = []
+    closed: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "tool_use" and block.get("name") not in _WAITS_ON_READER:
+            tool_id = block.get("id")
+            if isinstance(tool_id, str):
+                opened.append(tool_id)
+        elif kind == "tool_result":
+            tool_id = block.get("tool_use_id")
+            if isinstance(tool_id, str):
+                closed.append(tool_id)
+    return opened, closed
+
 
 # #631 AC8: the pane reader and this mirror witness the same limit, and the
 # reader's ⏳ embed is the message that should survive — it names the scope, the
@@ -399,6 +434,66 @@ def _format_body(rendered: RenderedEvent) -> str:
     return f"{prefix}{rendered.body}"
 
 
+def _unresolved_notice(report: UnresolvedTranscript) -> str:
+    """What to tell the thread when its transcript cannot be found (#773).
+
+    The two cases need different advice, and getting that wrong wastes the
+    reader's time:
+
+    * **c-lord named this session** (a claim exists) — the transcript should be
+      there.  Restarting Claude re-names it, and ``/claude-restart`` keeps the
+      conversation.
+    * **c-lord never named it** — the session predates #773 (it was started by
+      an older c-lord, or it is still running from before the upgrade).  Here
+      the advice is ordered by what it costs the reader, cheapest first:
+
+      ``/claude-restart`` keeps the conversation and *may* be enough, because
+      the next process is started fresh: on a CLI that still writes c-lord's
+      input marker it becomes recognisable again by the old rule, and on any
+      resume that finds no conversation at all c-lord falls through to a fresh
+      **named** start.  What it cannot promise is the middle case — a resume
+      that succeeds on a CLI that strips the marker reopens the same unnamed
+      transcript and names nothing (``--session-id`` is refused with
+      ``--continue``).
+
+      So ``/clear`` is named as the one that always works: a new session is a
+      named session.  The workspace — the checkout, the branch, the files — is
+      untouched; the conversation is what does not carry over, and saying so is
+      the honest trade.
+
+    Deliberately not decided here by reading the CLI's version: what matters is
+    what the *next* process will do, the reader can try the cheap option first
+    either way, and a notice that is wrong about a version it guessed at is
+    worse than one that is honest about the order.
+    """
+    if report.candidates == 0:
+        detail = "このワークスペースには transcript がまだ 1 つもありません。"
+    else:
+        detail = (
+            f"transcript は {report.candidates} 本ありますが、"
+            "どれもこのスレッドのセッションのものと確認できません。"
+        )
+    if report.claimed_session_id:
+        recovery = (
+            "`/claude-restart` で Claude を立て直してください（会話の文脈は引き継がれます）。"
+        )
+    else:
+        recovery = (
+            "このセッションは c-lord がセッションに名前を付けるようになる前"
+            "（#773 以前）に起動したものです。\n"
+            "1. まず `/claude-restart`（会話の文脈は残ります）。これで直ることがあります\n"
+            "2. 直らなければ `/clear` — 新しいセッションには必ず名前が付くので確実に復旧します。"
+            "作業ディレクトリ（チェックアウト・ブランチ・ファイル）はそのままで、"
+            "会話の文脈だけが引き継がれません"
+        )
+    return (
+        "⚠️ このスレッドの transcript が見つからないため、Claude の返事を "
+        f"Discord に転送できていません（{report.seconds:.0f} 秒間）。\n"
+        f"{detail}\n"
+        f"{recovery}"
+    )
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -420,6 +515,8 @@ class TranscriptMirror:
         progress: TurnProgress | None = None,
         fold_post: FoldPost | None = None,
         fold_edit: FoldEdit | None = None,
+        expect_turn: bool = False,
+        unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
     ) -> None:
         self.thread_id = thread_id
         self.project_dir = project_dir
@@ -461,6 +558,16 @@ class TranscriptMirror:
         # folding the banner ourselves.  A knob only so tests need not sleep.
         self._usage_limit_grace = usage_limit_grace
         self._task: asyncio.Task[None] | None = None
+        # #773: is somebody waiting on this mirror right now?  Only then is
+        # "I cannot find this thread's transcript" news worth posting — a mirror
+        # restored at startup for an idle workspace has nothing to read by
+        # design, and ``on_ready`` restores one for every open session on the
+        # host.
+        self._turn_active = expect_turn
+        self._unresolved_after = unresolved_after
+        # One notice per turn: the tail keeps reporting for as long as the
+        # outage lasts, which is what lets the *next* turn be told too.
+        self._unresolved_told = False
 
     def note_turn_started(self) -> None:
         """Tell the progress line a turn just began (#539).
@@ -470,6 +577,35 @@ class TranscriptMirror:
         the reader has been waiting for all of it.
         """
         self._progress.begin_turn(restart=True)
+        # #773: from here on, silence is a symptom rather than an idle thread.
+        self._turn_active = True
+        self._unresolved_told = False
+
+    async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
+        """Say out loud that this thread's transcript cannot be found (#773/#585).
+
+        The jsonl mirror is the only delivery path there is (#712), so a mirror
+        that resolves nothing is a thread that receives nothing — and #627 made
+        that failure *silent* on purpose, to avoid the worse failure of posting
+        a stranger's conversation.  Silence is still the right thing to post; it
+        is the wrong thing to *say*, which is why this exists.  In #773 the
+        fleet was mute for three days and the only trace was one log line per
+        mirror.
+        """
+        logger.error(
+            "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
+            "(%d jsonl file(s) present, claimed session id %s) — Claude's replies "
+            "cannot reach this thread (#773)",
+            self.thread_id,
+            report.project_dir,
+            report.seconds,
+            report.candidates,
+            report.claimed_session_id or "none",
+        )
+        if not self._turn_active or self._unresolved_told:
+            return
+        self._unresolved_told = True
+        await self._try_sink(_unresolved_notice(report))
 
     def start(self) -> None:
         """Spawn the tail task.  Idempotent."""
@@ -636,7 +772,12 @@ class TranscriptMirror:
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _producer() -> None:
-            async for event in tail_events(self.project_dir, poll_interval=self._poll_interval):
+            async for event in tail_events(
+                self.project_dir,
+                poll_interval=self._poll_interval,
+                on_unresolved=self._on_unresolved,
+                unresolved_after=self._unresolved_after,
+            ):
                 await queue.put(event)
 
         producer = asyncio.create_task(_producer(), name=f"transcript-tail-{self.thread_id}")
@@ -688,6 +829,8 @@ class TranscriptMirror:
                     usage_limit_notices.clear_thread(self.thread_id)
 
                 if _is_turn_end(event):
+                    # #773: nobody is waiting on this mirror until the next turn.
+                    self._turn_active = False
                     # #631: a limit reported for the turn that just ended says
                     # nothing about the next one — the limit may well have reset
                     # in between, and a thread that silently stops explaining why
@@ -751,10 +894,18 @@ class TranscriptMirror:
                 # the gap being filled. Arming here (not only on user_input) also
                 # covers turns started outside Discord (scheduler / webhook / the
                 # tmux pane).
-                if rendered is not None and rendered.kind in _BUFFERED_KINDS:
+                # #757: the ids tell a call that is still running (no result
+                # yet) from a turn that has genuinely gone quiet.
+                opened, closed = _tool_call_ids(event)
+                is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
+                if is_tool or opened or closed:
                     self._progress.begin_turn()
                     self._progress.note_activity(
-                        rendered.body if rendered.kind == "tool_use" else None
+                        rendered.body
+                        if rendered is not None and rendered.kind == "tool_use"
+                        else None,
+                        started=opened,
+                        finished=closed,
                     )
                 await self._progress.tick()
 

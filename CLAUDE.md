@@ -36,6 +36,8 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
    - **なぜ scrape ではないのか**: かつては `tmux capture-pane` の出力を投稿していたため、TUI の chrome が Discord に漏れるバグが繰り返し出た (#23, #27, #28, #29, #30, #32, #34, #35, #39, #41, #43, #45, #49, #50)。**TUI テキストから Discord へ至る経路がもう存在しない**ので、chrome 要素が増えても漏れようがない。
    - **なぜ skill push ではないのか**: #53 は各 session dir に `discord-reply` skill を注入し、Claude 自身に `curl POST /api/reply` させていた (経路A)。これは **Claude が投稿を忘れるとターンが丸ごと届かない** (#491)。jsonl ミラーは「Claude が既に書いたもの」を読むので、忘れようがない。#216 でこちらを本命と決め、#492 で既定にし、**#712 で経路A を削除**した（`CLORD_BRIDGE_MODE` / `USE_SKILL_REPLY` という選択肢ごと無くした — 踏める地雷を残さない）。旧 env を .env に残したまま起動しても、**起動時に警告を出して jsonl で動く**（`c_lord/legacy_env.py`）。
    - **c-lord が Claude に打ち込む入力には zero-width-space マーカーが付く** (`c_lord/tmux.py`)。ミラーはこれを見て「人がペインに打った入力」と区別し、打ち返さない (#71)。だから普通のメッセージは `/` 始まりでもスラッシュコマンドにならない（`/compact` 等が専用コマンドとして存在する理由 — `send_literal` 経由）。
+   - **「どの jsonl がこのスレッドのものか」はマーカーでは決めない** (#773): `start_claude` が `--session-id <uuid>` を渡して**自分の transcript に自分で名前を付け**、その uuid を `<project_dir>/.clord-session` に記録する (`c_lord/transcript/claim.py`)。**CLI 2.1.278 以降は対話モードの入力から ZWSP を取り除いて transcript に書く**ので、#627 のマーカー判定は全スレッドで偽になり、2026-09-20〜23 に**フリート全体が無言になった**（作業スレッド 17 本が丸一日、開始通知のまま）。マーカー判定は「付いていれば c-lord 由来」という偽陽性の無い後方互換ルールとして残っているが、**これ単独には二度と依存しない**。resume も `--continue` ではなく `--resume <記録した uuid>` を使う。あるべき動きは [`docs/specs/transcript-mirror-replay-safety.md`](docs/specs/transcript-mirror-replay-safety.md)。
+   - **transcript が 1 本も見つからないとき、ミラーは黙るが黙っていることは隠さない** (#773/#585): ターンが走っているスレッドには「転送できていない」と 1 ターン 1 回投稿し、ログには `ERROR` を出す。アイドルのスレッド（`on_ready` で復元されたミラー）には出さない。
    - **REST API (`ext/api_server.py`) は配信経路ではなく制御面**なので、bridge とは無関係に**常に起動する** (#712/#543)。ポートが埋まっていれば WARNING を出して API 無しで動き続ける（bot 本体は落とさない）。
    - 残っている非等価性: reply 層の装飾 (quote-reply / cli-prefix / prompt-choice) が経路A にあって経路B にまだ無い (#237)。添付ファイルは #233 で解消済み — ミラーが harness の `SendUserFile` `tool_use` を jsonl から読んで自分で添付する (`docs/specs/user-file-delivery.md`)。
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
@@ -181,7 +183,11 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
   古いビルドは「その機能はありません」と利用者に答えてしまうので、挙動が古く見えたらまずこれを見る
   - ビルドが 7 日以上前なら直後に `WARNING … this c-lord build is N days old (…)` が1行続く (#756)。
     📊 フッタの版数にも `(Nd)` が付く（`docs/specs/context-footer.md`）
-- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit` (Claude 実行 1 回ごと)
+- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit (outcome=…, 12.3s)` (Claude 実行 1 回ごと)。
+  **`exit` は `finally` で必ず出る** (#293) — `outcome` は `ok` / `error` / `preempted`(次のメッセージで割り込まれた) /
+  `cancelled`(割り込みで task ごと止めた) / `crashed`。だから **`enter` だけあって `exit` が無い = そのターンはまだ走っている**。
+  同じスレッドで次のターンが始まった時点で前の run がまだ走っていれば `run_claude: orphan — …` の WARNING、
+  割り込みで止めた前のターンが cancel 後も終わらなければ `prior turn is still running … (orphan run, #293)` の ERROR が出る
 - `cogs/scheduler.py:_run_task` — `_run_task: enter` / `_run_task: exit` (スケジュール実行ごと)
 - `cogs/scheduler.py:_master_loop` — `SchedulerCog: N task(s) due (ids=[...])` (30 秒ごと、due があるときのみ)
 - `cogs/webhook_trigger.py:on_message` — `Webhook trigger matched` (CI/CD webhook 着弾時)
@@ -214,7 +220,7 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 | 症状 | 最初に見るべき場所 | 典型的な原因 |
 |------|-----------------|------------|
 | スレッドが作られない | bot ログの `on_message` 周辺、`DISCORD_CHANNEL_ID` が一致しているか | Intent 不足 / channel ID 設定ミス |
-| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか | tmux window 作成失敗、Claude CLI hang、timeout |
+| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか（`exit` の `outcome=` がターンの終わり方）/ `orphan` の WARNING・ERROR が出ていないか | tmux window 作成失敗、Claude CLI hang、timeout |
 | 同一セッションのはずが別セッション扱い | `_run_helper` で `session_id=` ログを確認、DB の `sessions` テーブル | repository から session_id が読めていない |
 | Webhook trigger が無視される | `Webhook trigger matched` ログの有無 | webhook_id allowlist / channel_ids 不一致、prefix mismatch |
 | Scheduler が動かない | `SchedulerCog: N task(s) due` の有無 (30 秒間隔) | `next_run_at` が未来、`scheduled_tasks` が空 |

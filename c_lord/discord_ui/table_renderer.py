@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import unicodedata
+from collections.abc import Sequence
 from io import BytesIO
 from typing import TYPE_CHECKING
 
@@ -489,6 +490,10 @@ def render_table_image(table_md: str) -> bytes | None:
     return buf.read()
 
 
+def _rendering_enabled() -> bool:
+    return os.getenv("CLORD_RENDER_TABLE_IMAGES", "").lower() in ("1", "true", "yes")
+
+
 def get_table_images(content: str, *, limit: int = MAX_TABLE_IMAGES) -> list[tuple[str, bytes]]:
     """Return (filename, png_bytes) pairs for the tables in *content*.
 
@@ -503,7 +508,7 @@ def get_table_images(content: str, *, limit: int = MAX_TABLE_IMAGES) -> list[tup
     attach a file of their own (``progress.txt``) pass a smaller limit to leave
     room for it.
     """
-    if os.getenv("CLORD_RENDER_TABLE_IMAGES", "").lower() not in ("1", "true", "yes"):
+    if not _rendering_enabled():
         return []
     if limit <= 0:
         return []
@@ -522,4 +527,74 @@ def get_table_images(content: str, *, limit: int = MAX_TABLE_IMAGES) -> list[tup
         img_bytes = render_table_image(table_md)
         if img_bytes:
             result.append((f"table_{i}.png", img_bytes))
+    return result
+
+
+def _find_line(chunks: Sequence[str], line: str, chunk: int, offset: int) -> tuple[int, int] | None:
+    """Return ``(chunk, offset)`` of the next occurrence of *line* at a line start.
+
+    The search starts at *offset* in *chunk* and moves forward only, so tables
+    are placed in reading order even when two of them share a header line.
+    """
+    for ci in range(chunk, len(chunks)):
+        text = chunks[ci]
+        at = text.find(line, offset if ci == chunk else 0)
+        while at > 0 and text[at - 1] != "\n":
+            at = text.find(line, at + 1)
+        if at != -1:
+            return ci, at
+    return None
+
+
+def get_table_images_per_chunk(
+    content: str, chunks: Sequence[str], *, limits: Sequence[int]
+) -> list[list[tuple[str, bytes]]]:
+    """Like :func:`get_table_images`, but grouped by the chunk holding each table.
+
+    A reply longer than Discord's 2000 characters goes out as several messages
+    (``reply_chunker``).  The image of a table has to ride on the message the
+    table is *in*: attaching every image to the last message left the table as
+    raw pipes in one message and its picture under an unrelated paragraph in
+    another (#750).
+
+    Tables are detected in the full *content*, not per chunk, so a table the
+    chunker cut between two rows is still drawn whole — on the chunk where it
+    starts, which is where the reader meets it.  *limits* is each chunk's own
+    attachment budget (Discord's 10 is per message, #683); a table beyond its
+    chunk's budget stays as raw markdown, exactly as in :func:`get_table_images`.
+    Filenames number the tables across the whole reply (``table_3.png`` is the
+    third table of the reply, whichever message carries it).
+    """
+    result: list[list[tuple[str, bytes]]] = [[] for _ in chunks]
+    if not chunks or not _rendering_enabled():
+        return result
+    tables = detect_tables(content)
+    last = len(chunks) - 1
+    chunk, offset = 0, 0
+    dropped = 0
+    for i, table_md in enumerate(tables, start=1):
+        header = table_md.split("\n", 1)[0].rstrip("\r")
+        found = _find_line(chunks, header, chunk, offset)
+        if found is None:
+            # Not expected (the chunker only splits between lines, and a header
+            # line is far shorter than a chunk), but the old behaviour — last
+            # message — beats losing the image.
+            owner = last
+        else:
+            owner, at = found
+            chunk, offset = owner, at + len(header)
+        if len(result[owner]) >= limits[owner]:
+            dropped += 1
+            continue
+        img_bytes = render_table_image(table_md)
+        if img_bytes:
+            result[owner].append((f"table_{i}.png", img_bytes))
+    if dropped:
+        logger.info(
+            "table_renderer: %d of %d table(s) in a %d-char body exceed their message's "
+            "attachment budget — they stay as raw markdown (#683/#750)",
+            dropped,
+            len(tables),
+            len(content),
+        )
     return result

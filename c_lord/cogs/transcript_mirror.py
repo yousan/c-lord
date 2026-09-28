@@ -173,7 +173,7 @@ class TranscriptMirrorCog(commands.Cog):
                     row.thread_id,
                     exc_info=True,
                 )
-            if self.start_for(row.thread_id, row.working_dir):
+            if self.start_for(row.thread_id, row.working_dir, expect_turn=False):
                 started += 1
         logger.info(
             "TranscriptMirrorCog: started %d mirror(s) from %d session row(s) "
@@ -225,10 +225,18 @@ class TranscriptMirrorCog(commands.Cog):
         )
         return True
 
-    def start_for(self, thread_id: int, working_dir: str) -> bool:
+    def start_for(self, thread_id: int, working_dir: str, *, expect_turn: bool = True) -> bool:
         """Spawn a mirror for ``thread_id`` if one is not already running.
 
         Returns True if a new mirror was started, False if one already exists.
+
+        ``expect_turn`` says whether somebody is waiting on this mirror right
+        now, which is what decides whether "I cannot find this thread's
+        transcript" is worth telling the thread about (#773).  True for every
+        caller that is about to run a turn (chat, scheduler, webhook); the
+        ``on_ready`` restore passes False, because a workspace nobody has run
+        Claude in legitimately has nothing to read and there are hundreds of
+        them on this host.
 
         **At most one mirror per project dir** (#719).  A caller here is a
         thread whose turn is *starting*, so it is the session about to write
@@ -273,6 +281,7 @@ class TranscriptMirrorCog(commands.Cog):
             progress=self._make_progress(thread_id),
             fold_post=fold_post,
             fold_edit=fold_edit,
+            expect_turn=expect_turn,
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -492,7 +501,7 @@ class TranscriptMirrorCog(commands.Cog):
                     send,
                     text,
                     silent=silent_posts_enabled(),
-                    files=self._table_files(text) or None,
+                    tables=True,
                 )
             except discord.HTTPException as exc:
                 logger.warning(
@@ -521,12 +530,9 @@ class TranscriptMirrorCog(commands.Cog):
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            table_files = self._table_files(text)
             reference = await self._build_trigger_reference(thread_id)
             try:
-                last_msg = await self._send_chunks(
-                    send, text, reference=reference, files=table_files or None
-                )
+                last_msg = await self._send_chunks(send, text, reference=reference, tables=True)
             except discord.HTTPException as exc:
                 logger.warning(
                     "TranscriptMirror reply_sink failed: thread=%d body_len=%d status=%s — %s",
@@ -559,16 +565,18 @@ class TranscriptMirrorCog(commands.Cog):
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            # progress.txt takes one of the 10 attachment slots, so the tables
-            # get one fewer — the turn log must never be the thing dropped (#683).
-            table_files = self._table_files(text, reserved=1)
-            files = [discord.File(file_path, filename="progress.txt")] + table_files
+            # progress.txt rides on the last message and takes one of its 10
+            # attachment slots; _send_chunks gives that message's tables one
+            # fewer — the turn log must never be the thing dropped (#683).
+            files = [discord.File(file_path, filename="progress.txt")]
             reference = await self._build_trigger_reference(thread_id)
 
             from ..skills.reply_tracker import record_reply_message
 
             try:
-                last_msg = await self._send_chunks(send, text, reference=reference, files=files)
+                last_msg = await self._send_chunks(
+                    send, text, reference=reference, files=files, tables=True
+                )
                 if last_msg is not None:
                     record_reply_message(thread_id, last_msg)
                 return
@@ -759,21 +767,28 @@ class TranscriptMirrorCog(commands.Cog):
         return f"{status}: {text}" if status else str(text)
 
     @staticmethod
-    def _table_files(text: str, *, reserved: int = 0) -> list[discord.File]:
-        """Render every GFM table in *text* to a ``discord.File``, capped (#683).
+    def _table_files(
+        text: str, chunks: list[str], *, reserved: int = 0
+    ) -> list[list[discord.File]]:
+        """Render every GFM table in *text* to a ``discord.File``, per chunk (#683/#750).
 
-        Shared by all three sinks so that whether a table becomes an image never
-        depends on which sink happened to post it. *reserved* is the number of
-        attachment slots the caller needs for files of its own (``progress.txt``);
-        the tables get what is left of Discord's 10-per-message allowance.
+        Shared by all three sinks (through :meth:`_send_chunks`) so that whether
+        a table becomes an image never depends on which sink happened to post
+        it. Entry ``i`` holds the images for the tables in ``chunks[i]`` — the
+        message the reader sees the table in (#750). Each message gets Discord's
+        10-per-message allowance; *reserved* is the number of slots the last
+        message needs for files of its own (``progress.txt``).
         """
         from io import BytesIO
 
-        from ..discord_ui.table_renderer import MAX_TABLE_IMAGES, get_table_images
+        from ..discord_ui.table_renderer import MAX_TABLE_IMAGES, get_table_images_per_chunk
 
+        limits = [MAX_TABLE_IMAGES] * len(chunks)
+        if limits:
+            limits[-1] -= reserved
         return [
-            discord.File(BytesIO(img), filename=fname)
-            for fname, img in get_table_images(text, limit=MAX_TABLE_IMAGES - reserved)
+            [discord.File(BytesIO(img), filename=fname) for fname, img in images]
+            for images in get_table_images_per_chunk(text, chunks, limits=limits)
         ]
 
     async def _build_trigger_reference(self, thread_id: int) -> discord.MessageReference | None:
@@ -798,25 +813,33 @@ class TranscriptMirrorCog(commands.Cog):
             fail_if_not_exists=False,
         )
 
-    @staticmethod
+    @classmethod
     async def _send_chunks(
+        cls,
         send,
         text: str,
         *,
         silent: bool = False,
         reference: discord.MessageReference | None = None,
         files: list[discord.File] | None = None,
+        tables: bool = False,
     ) -> discord.Message | None:
         """Send ``text`` split into Discord-sendable chunks (Issue #235).
 
         Long bodies are split instead of truncated. The quote-reply
         ``reference`` rides on the first chunk; ``files`` ride on the last.
+        With ``tables=True`` each GFM table is also attached as a PNG to the
+        chunk that contains it (#683), not to the last one (#750).
         Returns the last sent ``Message`` (so callers can track it for
         in-place edits — e.g. the context-usage line).
         """
         from ..discord_ui.reply_chunker import chunk_discord_content
 
         chunks = chunk_discord_content(text)
+        extra = list(files or [])
+        table_files = (
+            cls._table_files(text, chunks, reserved=len(extra)) if tables else [[] for _ in chunks]
+        )
         # #372: suppress URL OGP/link-preview cards on Claude's posts by default.
         # This is the production (jsonl-bridge) reply path, so the flag must be
         # honored here — not just in ext/api_server.py's skill-reply path.
@@ -830,8 +853,9 @@ class TranscriptMirrorCog(commands.Cog):
             if idx == 0 and reference is not None:
                 kwargs["reference"] = reference
                 kwargs["mention_author"] = False
-            if idx == last and files:
-                kwargs["files"] = files
+            attach = (extra if idx == last else []) + table_files[idx]
+            if attach:
+                kwargs["files"] = attach
             last_sent = await send(**kwargs)
         return last_sent
 

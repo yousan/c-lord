@@ -21,6 +21,8 @@ import asyncio
 import contextlib
 import logging
 import re
+import time
+from dataclasses import dataclass
 
 import discord
 
@@ -406,18 +408,110 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
         await config.thread.send(line, suppress_embeds=suppress_embeds)
 
 
+@dataclass
+class _InFlightRun:
+    """A run that has logged ``run_claude: enter`` and not yet ``exit`` (#293)."""
+
+    task: asyncio.Task | None
+    started: float
+
+
+# #293: every run that has logged ``enter`` and not yet ``exit``, per thread.
+# ``exit`` is now logged on every way out of a run (return, error, cancel), so
+# an ``enter`` without an ``exit`` means exactly one thing: the run is still in
+# flight. This ledger is how that becomes visible at the moment it matters —
+# when the next run for the same thread starts on top of it.
+_IN_FLIGHT: dict[int, list[_InFlightRun]] = {}
+
+
+def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
+    """Say so when *run* starts while an earlier run for its thread never exited.
+
+    The AskUserQuestion resume is not one: it is a nested call inside the same
+    turn (same task), and its outer run exits right after it.
+
+    An earlier run whose task has already ended can never log its ``exit`` —
+    it is dropped from the ledger after being reported, so it is reported once.
+    A still-running one is left alone: tearing down a turn is the caller's job
+    (``ClaudeChatCog._drain_thread_task``), and this is a log line, not a kill.
+    """
+    runs = _IN_FLIGHT.get(thread_id)
+    if not runs:
+        return
+    for other in list(runs):
+        if other.task is run.task:
+            continue
+        ended = other.task is not None and other.task.done()
+        logger.warning(
+            "%s run_claude: orphan — an earlier run for this thread entered %.0fs ago "
+            "and never logged exit (%s) (#293)",
+            ctx,
+            run.started - other.started,
+            "its task has already ended" if ended else "it is still running",
+        )
+        if ended:
+            runs.remove(other)
+    if not runs:
+        _IN_FLIGHT.pop(thread_id, None)
+
+
 async def run_claude_with_config(config: RunConfig) -> str | None:
     """Execute Claude Code CLI and stream results to a Discord thread.
 
     This is the primary entry point. All Cogs should create a RunConfig and
     pass it here, rather than using the legacy run_claude_in_thread() shim.
 
+    #293: ``run_claude: enter`` and ``run_claude: exit`` are logged here and
+    nowhere else, and ``exit`` is logged in a ``finally`` — so every ``enter``
+    gets its ``exit``, whether the turn finished, failed, was pre-empted by the
+    next message or was cancelled outright. The line says which
+    (``outcome=ok|error|preempted|cancelled|crashed``) and how long the turn ran.
+    ``exit`` used to sit at the end of the turn body, where a cancel, an
+    exception or the AskUserQuestion resume all skipped it — and an ``enter``
+    with no ``exit`` read as a hang every time.
+
     Returns:
         The final session_id, or None if the run failed.
     """
-    ctx = log_ctx(thread_id=config.thread.id, session_id=config.session_id)
+    thread_id = config.thread.id
+    ctx = log_ctx(thread_id=thread_id, session_id=config.session_id)
     logger.info("%s run_claude: enter (prompt=%d chars)", ctx, len(config.prompt))
 
+    run = _InFlightRun(task=asyncio.current_task(), started=time.monotonic())
+    _note_orphans(thread_id, run, ctx)
+    _IN_FLIGHT.setdefault(thread_id, []).append(run)
+
+    outcome = "crashed"
+    session_id = config.session_id
+    try:
+        session_id = await _run_turn(config, ctx)
+        if config.outcome.error:
+            outcome = "error"
+        elif getattr(config.runner, "preempted", False) is True:
+            outcome = "preempted"
+        else:
+            outcome = "ok"
+        return session_id
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    finally:
+        runs = _IN_FLIGHT.get(thread_id)
+        if runs is not None:
+            with contextlib.suppress(ValueError):
+                runs.remove(run)
+            if not runs:
+                _IN_FLIGHT.pop(thread_id, None)
+        logger.info(
+            "%s run_claude: exit (outcome=%s, %.1fs)",
+            log_ctx(thread_id=thread_id, session_id=session_id),
+            outcome,
+            time.monotonic() - run.started,
+        )
+
+
+async def _run_turn(config: RunConfig, ctx: str) -> str | None:
+    """The body of :func:`run_claude_with_config`, which owns the enter/exit log."""
     # Build system context for side effects (session registry, lounge prompt).
     # The context string itself is not injected — tmux TUI mode does not
     # support --append-system-prompt.
@@ -514,10 +608,6 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     if not run_errored and not getattr(runner, "preempted", False):
         await _post_context_usage(config, processor.session_id)
 
-    logger.info(
-        "%s run_claude: exit",
-        log_ctx(thread_id=config.thread.id, session_id=processor.session_id),
-    )
     return processor.session_id
 
 
