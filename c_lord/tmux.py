@@ -701,6 +701,36 @@ def server_fingerprint(socket_name: str | None = None) -> str | None:
     return result.stdout.strip() or None
 
 
+# #790: the window option naming which c-lord instance made a window. Several
+# instances (production + stagings, or any two bots on one box) routinely share
+# one tmux server, and each one's startup reaper only knows *its own* in-flight
+# turns — so another instance's window in the seconds between ``new-window`` and
+# ``claude`` starting looked exactly like an orphan, and got killed.
+OWNER_OPTION = "@clord_owner"
+# Explicit override for the (unusual) case of two instances sharing one cwd.
+INSTANCE_ID_ENV = "CLORD_INSTANCE_ID"
+
+_instance_owner: str | None = None
+
+
+def instance_owner() -> str:
+    """This c-lord process's identity on a shared tmux server (#790).
+
+    ``$CLORD_INSTANCE_ID`` when set, else the real path of the directory the
+    bot was started in — what already tells two instances apart on one host
+    (each runs from its own checkout / instance repo), with nothing to
+    configure. Resolved once per process, so a later ``chdir`` cannot make the
+    bot disown its own windows.
+    """
+    global _instance_owner
+    if _instance_owner is None:
+        explicit = os.environ.get(INSTANCE_ID_ENV, "").strip()
+        # tmux reads an argv element *ending* in ``;`` as a command separator,
+        # and :meth:`TmuxSessionManager._tag_window` chains two commands.
+        _instance_owner = (explicit or os.path.realpath(os.getcwd())).rstrip(";") or "clord"
+    return _instance_owner
+
+
 class TmuxSessionManager:
     """Manages tmux windows for Claude Code Discord threads.
 
@@ -1533,7 +1563,7 @@ class TmuxSessionManager:
 
         # Tag before moving: windows that lost @thread_id to a tmux restart were
         # matched by path, and later lookups need the option to be there.
-        _run(["tmux", "set-option", "-w", "-t", window_id, "@thread_id", str(thread_id)])
+        self._tag_window(window_id, thread_id)
 
         result = _run(
             [
@@ -1616,17 +1646,7 @@ class TmuxSessionManager:
             # is added and no re-sort is needed.
             adopted = self._find_window_by_working_dir(working_dir)
             if adopted is not None:
-                _run(
-                    [
-                        "tmux",
-                        "set-option",
-                        "-w",
-                        "-t",
-                        adopted,
-                        "@thread_id",
-                        str(thread_id),
-                    ]
-                )
+                self._tag_window(adopted, thread_id)
                 self._thread_to_window[thread_id] = adopted
                 adopted_name = self._window_name(adopted)
                 logger.info(
@@ -1692,18 +1712,8 @@ class TmuxSessionManager:
                 )
                 window_id = window_name
 
-            # Store thread_id as a window option
-            _run(
-                [
-                    "tmux",
-                    "set-option",
-                    "-w",
-                    "-t",
-                    self._target(window_id),
-                    "@thread_id",
-                    str(thread_id),
-                ]
-            )
+            # Store thread_id (and, #790, which instance owns it) as window options
+            self._tag_window(window_id, thread_id)
 
             # Fit the new (manual-sized) window to the attached client while it
             # is still empty, so it looks right and then stays fixed (#403).
@@ -2040,7 +2050,8 @@ class TmuxSessionManager:
                 "-t",
                 self.session_name,
                 "-F",
-                "#{window_name}\t#{@thread_id}\t#{window_id}\t#{pane_current_path}",
+                "#{window_name}\t#{@thread_id}\t#{window_id}\t#{@clord_owner}"
+                "\t#{pane_current_path}",
             ]
         )
         if result.returncode != 0:
@@ -2058,8 +2069,10 @@ class TmuxSessionManager:
                     # #649: callers that go on to *act* on a row need the unique
                     # id — the name may be shared with another window.
                     "window_id": parts[2] if len(parts) > 2 else "",
+                    # #790: which c-lord instance made it ("" = unknown/legacy).
+                    "owner": parts[3] if len(parts) > 3 else "",
                     # Last field, so it absorbs any tab a path might contain.
-                    "working_dir": "\t".join(parts[3:]),
+                    "working_dir": "\t".join(parts[4:]),
                 }
             )
 
@@ -3186,6 +3199,43 @@ class TmuxSessionManager:
             return False
         return True
 
+    def _tag_window(self, target: str, thread_id: int) -> None:
+        """Set ``@thread_id`` and this instance's ``@clord_owner`` on *target*.
+
+        One tmux invocation for both (#790): a window must never carry a thread
+        tag without an owner, because the reaper reads "tagged, no owner" as a
+        window from before #790 and may take it.
+        """
+        window = self._target(target)
+        _run(
+            [
+                "tmux",
+                "set-option",
+                "-w",
+                "-t",
+                window,
+                OWNER_OPTION,
+                instance_owner(),
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                window,
+                "@thread_id",
+                str(thread_id),
+            ]
+        )
+
+    def _owned_by_another_instance(self, window: dict[str, str]) -> bool:
+        """Whether another c-lord instance made this window (#790).
+
+        An empty owner is a window from before #790 (or one tmux-resurrect
+        restored — it keeps no window options): nobody claims it, so the
+        existing #570/#677 rules decide, exactly as before.
+        """
+        owner = window.get("owner", "")
+        return bool(owner) and owner != instance_owner()
+
     def _log_reaped(self, *, window: dict[str, str], reason: str) -> None:
         """AC5 of #677 — record *what* was reaped, not just how many.
 
@@ -3249,6 +3299,16 @@ class TmuxSessionManager:
             # whether a live Claude gets killed.
             target = window.get("window_id") or window.get("window_name", "")
             tid_str = window.get("thread_id", "")
+
+            if self._owned_by_another_instance(window):
+                # #790: its turns are in *that* bot's memory, not ours, so
+                # "not in active_thread_ids" says nothing about it.
+                logger.debug(
+                    "cleanup_orphaned: %s belongs to instance %s — keeping",
+                    self._describe(target) if target else "?",
+                    window.get("owner"),
+                )
+                continue
 
             if not tid_str.isdigit():
                 if self._is_reapable_untagged(window, target) and self._kill_window(target):

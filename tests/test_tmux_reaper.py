@@ -35,6 +35,7 @@ class FakeTmux:
         thread_ids: dict[str, str] | None = None,
         pane_commands: dict[str, str] | None = None,
         pane_paths: dict[str, str] | None = None,
+        owners: dict[str, str] | None = None,
     ) -> None:
         self.sessions = sessions if sessions is not None else ["clord"]
         self.windows = windows or {}
@@ -46,6 +47,8 @@ class FakeTmux:
         # one (every orphan on the production host, after resurrect restored it
         # into tmux's default dir).
         self.pane_paths = pane_paths or {}
+        # #790: ``@clord_owner`` — which c-lord instance made the window.
+        self.owners = owners or {}
         self.killed: list[str] = []
         # #649: tmux targets are ``window_id``s now. Test data stays keyed by the
         # readable ``session:name``; this gives every window a stable id and
@@ -77,6 +80,7 @@ class FakeTmux:
                     ("#{window_id}", wid),
                     ("#{window_name}", name),
                     ("#{@thread_id}", self.thread_ids.get(key, "")),
+                    ("#{@clord_owner}", self.owners.get(key, "")),
                     ("#{pane_current_path}", self.pane_paths.get(key, f"/work/{name}")),
                 ):
                     row = row.replace(token, value)
@@ -502,3 +506,130 @@ class TestReaperLogsWhatItKilled:
         assert "c-lord" in line
         assert "w1" in line
         assert "111" in line
+
+
+class TestReaperLeavesOtherInstancesAlone:
+    """#790: one tmux server, several c-lord instances.
+
+    Every instance reaps on startup, and only knows *its own* in-flight turns.
+    A window another instance created a second ago — tagged, Claude not
+    started yet — looked exactly like an orphan, so restarting staging-4 killed
+    staging-2's brand-new thread before its first turn ran.
+    """
+
+    def test_window_owned_by_another_instance_survives(self) -> None:
+        """AC1: foreign owner + no Claude + not in our active set → kept."""
+        fake = FakeTmux(
+            windows={"Hello-World": ["w1"]},
+            thread_ids={"Hello-World:w1": "1552283000962814042"},
+            pane_commands={"Hello-World:w1": "zsh"},
+            owners={"Hello-World:w1": "/home/someone/other-clord"},
+        )
+        mgr = _manager("Hello-World")
+
+        with (
+            patch("c_lord.tmux._run", side_effect=fake),
+            patch("c_lord.tmux.instance_owner", return_value="/home/someone/this-clord"),
+        ):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 0
+        assert fake.killed == []
+
+    def test_across_sessions_only_own_orphans_are_reaped(self) -> None:
+        """AC1 + AC2 through the entry point ``bot.py`` actually calls."""
+        from c_lord.tmux import cleanup_orphaned_all_sessions
+
+        fake = FakeTmux(
+            sessions=["Hello-World"],
+            windows={"Hello-World": ["w1", "w2"]},
+            thread_ids={"Hello-World:w1": "111", "Hello-World:w2": "222"},
+            pane_commands={"Hello-World:w1": "zsh", "Hello-World:w2": "zsh"},
+            owners={"Hello-World:w1": "/other", "Hello-World:w2": "/me"},
+        )
+
+        with (
+            patch("c_lord.tmux._run", side_effect=fake),
+            patch("c_lord.tmux._tmux_available", return_value=True),
+            patch("c_lord.tmux.instance_owner", return_value="/me"),
+        ):
+            killed = cleanup_orphaned_all_sessions(active_thread_ids=set())
+
+        assert killed == 1
+        assert fake.killed == ["Hello-World:w2"]
+
+    def test_window_without_owner_is_still_reaped(self) -> None:
+        """AC2: windows made before #790 carry no owner — reaped as before (#570)."""
+        fake = FakeTmux(
+            windows={"clord": ["w1"]},
+            thread_ids={"clord:w1": "111"},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        mgr = _manager()
+
+        with (
+            patch("c_lord.tmux._run", side_effect=fake),
+            patch("c_lord.tmux.instance_owner", return_value="/me"),
+        ):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 1
+
+    def test_untagged_window_owned_by_another_instance_survives(self) -> None:
+        """Between ``new-window`` and the ``@thread_id`` tag, the window is an
+        untagged ``w{N}`` idle shell — the #677 branch must not take it either."""
+        fake = FakeTmux(
+            windows={"clord": ["w1"]},
+            pane_commands={"clord:w1": "zsh"},
+            owners={"clord:w1": "/other"},
+        )
+        mgr = _manager()
+
+        with (
+            patch("c_lord.tmux._run", side_effect=fake),
+            patch("c_lord.tmux.instance_owner", return_value="/me"),
+        ):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert killed == 0
+
+    def test_new_window_is_tagged_with_owner_and_thread_in_one_call(self) -> None:
+        """The owner goes on together with ``@thread_id``, so no reaper can ever
+        see a thread tag without an owner on a window made after #790."""
+        mgr = _manager()
+        with (
+            patch("c_lord.tmux._run") as run,
+            patch("c_lord.tmux.instance_owner", return_value="/me"),
+        ):
+            run.return_value = MagicMock(returncode=0, stdout="")
+            mgr._tag_window("@5", 111)
+
+        argv = run.call_args.args[0]
+        assert argv.count("set-option") == 2
+        assert argv[argv.index("@clord_owner") + 1] == "/me"
+        assert argv[argv.index("@thread_id") + 1] == "111"
+        assert ";" in argv
+
+
+class TestInstanceOwner:
+    def test_defaults_to_the_real_cwd(self, tmp_path, monkeypatch) -> None:
+        import c_lord.tmux as tmux_mod
+
+        monkeypatch.delenv("CLORD_INSTANCE_ID", raising=False)
+        monkeypatch.setattr(tmux_mod, "_instance_owner", None)
+        monkeypatch.chdir(tmp_path)
+        assert tmux_mod.instance_owner() == str(tmp_path.resolve())
+
+    def test_env_overrides(self, monkeypatch) -> None:
+        import c_lord.tmux as tmux_mod
+
+        monkeypatch.setenv("CLORD_INSTANCE_ID", "prod-a")
+        monkeypatch.setattr(tmux_mod, "_instance_owner", None)
+        assert tmux_mod.instance_owner() == "prod-a"
+
+    def test_trailing_semicolon_cannot_split_the_tmux_command(self, monkeypatch) -> None:
+        import c_lord.tmux as tmux_mod
+
+        monkeypatch.setenv("CLORD_INSTANCE_ID", "prod;")
+        monkeypatch.setattr(tmux_mod, "_instance_owner", None)
+        assert tmux_mod.instance_owner() == "prod"
