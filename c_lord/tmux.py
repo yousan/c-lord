@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -3291,6 +3292,66 @@ def _claude_panes_by_thread() -> dict[int, str]:
         if tid.isdigit() and "claude" in command.strip().lower():
             panes[int(tid)] = pane_id
     return panes
+
+
+# What tmux says when there is no server to ask — a host reboot's normal state,
+# not a failure to read one (#807).
+_NO_SERVER_RE = re.compile(r"no server running|error connecting to", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LiveClaude:
+    """Every pane running claude right now: by ``@thread_id`` tag and by cwd (#807)."""
+
+    thread_ids: frozenset[int]
+    paths: frozenset[str]
+
+    def covers(self, thread_id: int, working_dir: str) -> bool:
+        """Whether this thread's Claude is still alive in some pane."""
+        if thread_id in self.thread_ids:
+            return True
+        return os.path.realpath(working_dir) in self.paths or working_dir in self.paths
+
+
+def live_claude_panes() -> LiveClaude | None:
+    """Which Claudes survived — or ``None`` when tmux could not be asked (#807).
+
+    **No server at all is an answer, not an error**: after a host reboot the
+    fleet's tmux server simply is not there, and "nobody is alive" is exactly
+    what the startup notice needs to hear. Anything else that stops tmux from
+    answering (not installed, a permission problem) is ``None`` — "could not
+    tell" must never be read as "everything died" (``fleet-tmux-restart.md``).
+
+    Panes are matched by ``@thread_id`` and, for a window made before tagging
+    existed, by the pane's cwd. Only panes positively running claude count.
+    """
+    if not _tmux_available():
+        return None
+    result = _run(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{@thread_id}\t#{pane_current_command}\t#{pane_current_path}",
+        ]
+    )
+    if result.returncode != 0:
+        if _NO_SERVER_RE.search(result.stderr or ""):
+            return LiveClaude(frozenset(), frozenset())
+        return None
+    thread_ids: set[int] = set()
+    paths: set[str] = set()
+    for line in result.stdout.splitlines():
+        tid, _, rest = line.partition("\t")
+        command, _, path = rest.partition("\t")
+        if "claude" not in command.strip().lower():
+            continue
+        if tid.strip().isdigit():
+            thread_ids.add(int(tid.strip()))
+        if path.strip():
+            paths.add(path.strip())
+    return LiveClaude(frozenset(thread_ids), frozenset(paths))
 
 
 def resident_thread_ids() -> set[int]:

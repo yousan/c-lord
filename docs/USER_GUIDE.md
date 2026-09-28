@@ -266,6 +266,13 @@ tmux session gone (killed together with the bot / tmux-server death):
               conversation from the on-disk transcript (claude --continue),
               announced with "🔄 …会話を復元して続けます" so the replayed
               context reads as a restore, not a broken bot (#464).
+    ↓
+Host reboot (tmux and every Claude go down with it):
+              on startup, threads whose Claude was cut off mid-turn get one
+              line — "⚠️ ホストの再起動で、作業の途中で Claude が止まりました…"
+              — decided from the last entry of Claude's own transcript. No
+              mention, no button, no auto-resume; post 「続けて」 to continue
+              (#807, see specs/host-restart-notice.md).
 ```
 
 ### Threads c-lord has no record of
@@ -326,6 +333,16 @@ A turn that does not wind down on its own within a few seconds is cancelled. If 
 ### Bot Restart
 
 If the bot restarts (upgrade, maintenance, etc.), active sessions are automatically marked for resume. When the bot comes back online, sessions pick up where they left off.
+
+### Messages sent while the bot was disconnected from Discord
+
+If the bot loses its connection to Discord (host network or DNS trouble), messages you
+post in a c-lord thread meanwhile are not lost. When the connection comes back, c-lord
+reads them back from the thread and runs them, with one line explaining the delay
+(`-# 🔌 05:16〜11:52 の間 Discord と接続できておらず、この依頼を受け取れていませんでした。いまから処理します。`).
+Several messages in one thread run together as one turn; nothing runs twice. Text
+commands (`!stop` …) are not replayed. This covers a lost connection, not a bot restart
+(#745). See [specs/gateway-backfill.md](specs/gateway-backfill.md).
 
 ---
 

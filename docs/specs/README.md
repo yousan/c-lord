@@ -43,11 +43,13 @@
 | [tmux-window-identity.md](./tmux-window-identity.md) | 1 スレッド = 1 ウィンドウ | 同時に何本立てても全部そのまま起動し、あるスレッド宛のキーが別スレッドの作業ディレクトリに入ることはない |
 | [tmux-window-reaping.md](./tmux-window-reaping.md) | 作業ウィンドウの後片付け | 役目を終えた窓は放っておいても消える。何かが動いている窓と、人が手で作った窓は消えない |
 | [fleet-tmux-restart.md](./fleet-tmux-restart.md) | フリートの tmux が落ちたとき | 巻き添えで止まったスレッドには「あなたのせいではない・作業は残っている」と理由が出る（原因不明のクラッシュ表示にしない） |
+| [host-restart-notice.md](./host-restart-notice.md) | ホスト再起動で作業途中の Claude が止まったとき | 起動時に、Claude が落ちていて会話記録の最後が「ターンの途中」のスレッドにだけ一文が出る。メンション・ボタン・自動再開なし、何度再起動しても1回 (#807) |
 | [workspace-setup-failure.md](./workspace-setup-failure.md) | 作業場所を用意できなかったとき | クローン／tmux の失敗は ❌ と git 自身のエラー・次に確かめることがスレッドに出る。認証が要る失敗はそう分かる文言で（黙って 🟢 のまま止まらない） |
 | [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
 | [command-ownership.md](./command-ownership.md) | テキストコマンドの担当と認可 | 同居する c-lord のうち担当1台だけが `!コマンド` に応じ、他は黙る。webhook は owner 設定でも弾かれない |
 | [session-status-board.md](./session-status-board.md) | チャンネルの 📊 Session Status ボード | 板はチャンネルに1枚だけ。再起動しても増えず、既にある板を引き継いで書き換える。📌 はいつも生きている板を指す |
 | [context-footer.md](./context-footer.md) | ターン末尾の 📊 フッタ | 出る値はどれも「そのターンの実測」。CLI 版数は transcript から取り、bot 起動時の値を憶え続けない |
+| [gateway-backfill.md](./gateway-backfill.md) | Discord と切れていた間の投稿 | 接続が戻ったら、切れていた間にスレッドへ届いた依頼を拾って実行する（理由を 1 行添えて）。二重には実行しない (#745) |
 
 > まだ数機能だけです。困りごとの大きいものから順に増やします（残りは別 Issue）。
 
