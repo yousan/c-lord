@@ -380,11 +380,19 @@ _PERMISSION_PROMPT_MARKERS = (
 # PATH (``command not found``).  When the pane shows one of these and no
 # response was ever produced, the runner surfaces it to Discord as an error
 # instead of silently reporting a normal completion (#366).  Matched
-# case-insensitively as substrings of a single pane line.
-_STARTUP_ERROR_MARKERS = (
-    "native binary not installed",
-    "command not found: claude",
-    "claude: command not found",
+# case-insensitively against a single pane line.
+#
+# ``claude`` must be the whole command name (#453).  A plain substring match
+# also fired on ``command not found: claude-metrics-exporter`` — a Bash tool
+# inside a live session failing on some other ``claude-*`` command — and ended
+# that turn with "Claude failed to start".  The lookarounds reject a name that
+# merely starts or ends with ``claude`` (``claude-code``, ``claude2``,
+# ``my-claude``) while still matching ``claude`` itself.
+_STARTUP_ERROR_RE = re.compile(
+    r"native binary not installed"
+    r"|command not found: claude(?![-\w])"
+    r"|(?<![-\w])claude: command not found",
+    re.IGNORECASE,
 )
 
 
@@ -403,7 +411,7 @@ def _extract_startup_error(pane: str) -> str | None:
         return None
     for line in pane.splitlines():
         stripped = line.strip()
-        if any(marker in stripped.lower() for marker in _STARTUP_ERROR_MARKERS):
+        if _STARTUP_ERROR_RE.search(stripped):
             return stripped[:300]
     return None
 
@@ -514,6 +522,12 @@ _YN_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]", re.IGNORECASE)
 # Used to detect interactive menus regardless of whether the question text is known.
 _INTERACTIVE_MENU_RE = re.compile(r"^\s*❯\s+\d+\.", re.MULTILINE)
 
+# The cursor line of an UNNUMBERED choice menu: "❯ No, exit" (#695).  Claude
+# Code draws some modal dialogs this way — the folder-trust dialog since 2.1.248
+# and the Bypass Permissions warning — and ``_INTERACTIVE_MENU_RE`` above only
+# knows the numbered shape, so the fail-safe could not see them at all.
+_UNNUMBERED_MENU_CURSOR_RE = re.compile(r"^[^\S\n]*❯[^\S\n]+(?!\d+\.)\S")
+
 # Number of lines from the bottom of the pane to scan for interactive prompts.
 # Real Claude Code prompts always appear right before the input area (❯) at the
 # bottom of the terminal.  Conversation text higher up in the scrollback must
@@ -558,16 +572,62 @@ def _permission_zone(text: str) -> str:
 _MENU_ITEM_RE = re.compile(r"^\s*❯?\s*(\d+\..*\S)\s*$", re.MULTILINE)
 
 
+def _unnumbered_menu_options(zone: str) -> list[str]:
+    """Option labels of a live unnumbered choice menu at the foot of *zone* (#695).
+
+    The shape is the one Claude Code's modal dialogs share::
+
+          ❯ No, exit
+            Yes, I accept
+
+          Enter to confirm · Esc to cancel
+
+    Three things are required, each for a reason:
+
+    * the ``Enter to confirm`` footer is the **last** line with content.  An
+      input box with text in it is also ``❯ <text>``; the footer is what says
+      "modal menu".  And being last is what says *live*: a dialog Claude merely
+      quotes has the input box and status chrome drawn under it, and a dialog
+      whose ``claude`` already exited has the shell prompt under it (#630).
+    * the option block right above the footer holds a ``❯`` cursor line that is
+      NOT numbered — numbered menus stay with ``_INTERACTIVE_MENU_RE``, so their
+      verdicts cannot change here.
+    * the block has at least two lines: one option is a notice, not a choice.
+
+    Returns the labels with the cursor stripped (so moving the cursor does not
+    look like a new menu), or ``[]`` when there is no such menu.
+    """
+    lines = zone.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or _TRUST_CONFIRM_FOOTER not in lines[-1]:
+        return []
+    i = len(lines) - 2
+    while i >= 0 and not lines[i].strip():
+        i -= 1
+    block: list[str] = []
+    while i >= 0 and lines[i].strip():
+        block.append(lines[i])
+        i -= 1
+    block.reverse()
+    if len(block) < 2 or not any(_UNNUMBERED_MENU_CURSOR_RE.match(line) for line in block):
+        return []
+    return [line.strip().removeprefix("❯").strip() for line in block]
+
+
 def _unknown_prompt_signature(text: str) -> str:
     """Stable identity of an unknown interactive prompt, ignoring volatile chrome.
 
     The pane's spinner, elapsed-seconds and cost rows change on every poll, so
     comparing raw captures would defeat dedup.  We key on the menu's option
     lines (cursor stripped) plus any inline [y/N] line — the parts that stay
-    constant while the same menu lingers (#165).
+    constant while the same menu lingers (#165).  An unnumbered menu (#695)
+    contributes its option labels the same way; without them its signature
+    would be empty, and every such dialog would dedup against the first.
     """
     zone = _permission_zone(text)
     sig_lines = [m.strip() for m in _MENU_ITEM_RE.findall(zone)]
+    sig_lines.extend(_unnumbered_menu_options(zone))
     for line in zone.splitlines():
         if _YN_PROMPT_RE.search(line):
             sig_lines.append(line.strip())
@@ -2067,7 +2127,8 @@ class TmuxClaudeRunner:
             #      without answering (crash / unrecognised fatal error).
             #   3. ``claude`` is alive but NOT idle at its prompt → it really is
             #      wedged mid-turn; a frozen pane for the whole timeout window is
-            #      a genuine hang, so report the timeout.
+            #      a genuine hang, so report the timeout — unless the pane is an
+            #      open menu waiting on the user's answer (#751), which is not.
             #   4. ``claude`` is alive and idle at its prompt → the turn is over
             #      and the answer went out through the jsonl mirror / reply skill
             #      (#541).  Stay silent rather than posting a false error embed.
@@ -2188,7 +2249,31 @@ class TmuxClaudeRunner:
                     "Send the message again, or check the tmux pane."
                 )
             elif timed_out and not self._is_idle_at_prompt(current):
-                error = f"Timed out after {self.timeout_seconds} seconds"
+                # #751: a menu waiting on the user's answer is not a hang. When
+                # another bridge (transcript mirror / #359 watchdog) posted the
+                # menu first, this runner's own pane_ask is declined (#535) and
+                # it keeps polling a pane that correctly does not move until a
+                # person answers — so the backstop fires on it. "No input box"
+                # then read as "wedged", and the user was told to /clear a
+                # session that was only waiting for them (all three traced
+                # cases, incl. production #988). The menu stays answerable
+                # after this run ends; the answer continues the session.
+                #
+                # Deliberately NOT exempted: a pane frozen mid-spinner. The
+                # live spinner's timer redraws every second while claude is
+                # healthy, so a spinner that has not moved for the whole
+                # window means the TUI stopped drawing — a real hang (#541).
+                waiting_on = _parse_ask_from_pane(current) or _parse_plan_from_pane(current)
+                if waiting_on is not None:
+                    logger.info(
+                        "%s inactivity backstop: pane is a menu waiting for the user's "
+                        "answer (%r), not a hang — not reporting a timeout (#751)",
+                        log_ctx(thread_id=self._thread_id),
+                        waiting_on.header or waiting_on.question[:80],
+                    )
+                    error = None
+                else:
+                    error = f"Timed out after {self.timeout_seconds} seconds"
             else:
                 error = None
         else:
@@ -2600,9 +2685,10 @@ class TmuxClaudeRunner:
     def _has_unknown_interactive(text: str) -> bool:
         """Return True if the pane shows an interactive menu not covered by known markers.
 
-        Detects numbered-menu cursors (❯ 1. ...) and [y/N] prompts that do NOT
-        match any known trust or permission marker. Used to surface unknown prompts
-        to Discord rather than letting the session stall silently.
+        Detects numbered-menu cursors (❯ 1. ...), [y/N] prompts and unnumbered
+        modal menus (❯ <label> over an ``Enter to confirm`` footer, #695) that do
+        NOT match any known trust or permission marker. Used to surface unknown
+        prompts to Discord rather than letting the session stall silently.
 
         Only scans the bottom N lines (_PERMISSION_SCAN_LINES) to avoid false
         positives from conversation text (#156).
@@ -2612,7 +2698,20 @@ class TmuxClaudeRunner:
         zone = _permission_zone(text)
         has_menu = bool(_INTERACTIVE_MENU_RE.search(zone)) or bool(_YN_PROMPT_RE.search(zone))
         if not has_menu:
-            return False
+            # #695: an unnumbered menu has to be judged on its own terms.  The
+            # numbered path below excludes anything carrying ``Enter to confirm``
+            # (a trust marker), and that footer is exactly what an unnumbered
+            # modal dialog draws — so the Bypass Permissions dialog, default
+            # ``No, exit``, was excluded by the check meant to shout about it.
+            # Here only the dialogs something else already answers are excluded:
+            # the trust dialog (``_has_trust_prompt``, earlier in the poll loop)
+            # and permission prompts.  Everything else goes to a human — never an
+            # automatic Enter, which on these dialogs confirms the default.
+            if not _unnumbered_menu_options(zone):
+                return False
+            if _TRUST_PROMPT_RE.search(zone):
+                return False
+            return not any(marker in zone for marker in _PERMISSION_PROMPT_MARKERS)
         # Exclude already-handled prompts so they don't double-fire.
         if any(marker in zone for marker in _TRUST_PROMPT_MARKERS):
             return False

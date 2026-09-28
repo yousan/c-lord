@@ -36,12 +36,14 @@
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
 | [usage-limit.md](./usage-limit.md) | 利用上限（クォータ）に当たったとき | 上限は上限として、回復時刻つきで出す。「もう一度送ってください」とは言わない（送っても通らないため） |
 | [mirrored-events.md](./mirrored-events.md) | スレッドに流れるイベントの選別 | 👤 はその人が実際に打ったものだけ。ハーネス内部の通知は progress.txt に畳み、内部パスは出さない |
+| [repeat-fold.md](./repeat-fold.md) | 同じ発言の繰り返し | 同じ文が延々続いたら4回目からは1通にまとめ、何回ぶんかをその1通で数える。別の文・ターン最後の返事はまとめない |
 | [scheduled-tasks.md](./scheduled-tasks.md) | スケジュール実行（定期タスク） | 時間になるとスレッドが立ち、Claude が実際に起動して応答が投稿される。失敗したら本当の理由が出てログにも残る |
 | [tmux-layout.md](./tmux-layout.md) | tmux のセッションとウィンドウの割り当て | セッションは**リポジトリ**ごと（チャンネルごとではない）。スレッドは紐づくリポジトリのセッションのウィンドウに入る |
 | [trust-prompt.md](./trust-prompt.md) | 作業ディレクトリの信頼ダイアログ | 1つのダイアログにつき承認は1回。閉じないときは数回でやめて理由を出す（黙って撃ち続けない） |
 | [tmux-window-identity.md](./tmux-window-identity.md) | 1 スレッド = 1 ウィンドウ | 同時に何本立てても全部そのまま起動し、あるスレッド宛のキーが別スレッドの作業ディレクトリに入ることはない |
 | [tmux-window-reaping.md](./tmux-window-reaping.md) | 作業ウィンドウの後片付け | 役目を終えた窓は放っておいても消える。何かが動いている窓と、人が手で作った窓は消えない |
 | [fleet-tmux-restart.md](./fleet-tmux-restart.md) | フリートの tmux が落ちたとき | 巻き添えで止まったスレッドには「あなたのせいではない・作業は残っている」と理由が出る（原因不明のクラッシュ表示にしない） |
+| [workspace-setup-failure.md](./workspace-setup-failure.md) | 作業場所を用意できなかったとき | クローン／tmux の失敗は ❌ と git 自身のエラー・次に確かめることがスレッドに出る。認証が要る失敗はそう分かる文言で（黙って 🟢 のまま止まらない） |
 | [turn-resilience.md](./turn-resilience.md) | 飾りの表示とターンの関係 | ダッシュボード・Stop ボタン等の表示が失敗しても、依頼は必ず Claude に届く（黙って消えない） |
 | [command-ownership.md](./command-ownership.md) | テキストコマンドの担当と認可 | 同居する c-lord のうち担当1台だけが `!コマンド` に応じ、他は黙る。webhook は owner 設定でも弾かれない |
 | [session-status-board.md](./session-status-board.md) | チャンネルの 📊 Session Status ボード | 板はチャンネルに1枚だけ。再起動しても増えず、既にある板を引き継いで書き換える。📌 はいつも生きている板を指す |
