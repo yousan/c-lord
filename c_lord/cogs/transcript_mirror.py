@@ -27,7 +27,9 @@ import discord
 from discord.ext import commands
 
 from ..discord_ui.turn_progress import TurnProgress
+from ..host_restart_notice import notify_host_restart_stops
 from ..notify_policy import owner_notify_id
+from ..tmux import live_claude_panes
 from ..transcript.mirror import (
     TranscriptMirror,
     UserFileRequest,
@@ -137,6 +139,7 @@ class TranscriptMirrorCog(commands.Cog):
         # same project dir is last run's thread; restoring a mirror (or a #215
         # recovery post) for it is what replays this run's work into it.
         claimed: dict[Path, int] = {}
+        owners: list[tuple[int, str]] = []
         for row in rows:
             if not row.working_dir:
                 continue
@@ -161,6 +164,7 @@ class TranscriptMirrorCog(commands.Cog):
                 )
                 continue
             claimed[project_dir] = row.thread_id
+            owners.append((row.thread_id, row.working_dir))
             # Issue #215: re-deliver a final answer that was written to the
             # jsonl while the bot was down (mirror not tailing). The resumed
             # mirror tails from EOF and would otherwise skip it forever.
@@ -185,6 +189,27 @@ class TranscriptMirrorCog(commands.Cog):
             duplicate,
             recovered,
         )
+        await self._notify_host_restart_stops(owners)
+
+    async def _notify_host_restart_stops(self, owners: list[tuple[int, str]]) -> None:
+        """#807: say so in threads whose Claude died mid-turn (a host reboot).
+
+        Asked of tmux *after* the walk above, so the answer is as fresh as it can
+        be. Only the owners of each transcript (#719) and only open threads — the
+        same set that gets a mirror. Never raises: this is a courtesy, and a
+        failure here must not take the mirrors down with it.
+        """
+        try:
+            live = await asyncio.to_thread(live_claude_panes)
+            sent = await notify_host_restart_stops(self.bot, owners, live=live)
+        except Exception:
+            logger.warning("TranscriptMirrorCog: host-restart notice failed", exc_info=True)
+            return
+        if sent:
+            logger.info(
+                "TranscriptMirrorCog: told %d thread(s) their Claude stopped mid-turn (#807)",
+                sent,
+            )
 
     async def _recover_final_answer(self, thread_id: int, working_dir: str, row) -> bool:
         """Re-deliver the last completed turn's final answer if it was dropped.

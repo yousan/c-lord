@@ -266,6 +266,13 @@ tmux session gone (killed together with the bot / tmux-server death):
               conversation from the on-disk transcript (claude --continue),
               announced with "🔄 …会話を復元して続けます" so the replayed
               context reads as a restore, not a broken bot (#464).
+    ↓
+Host reboot (tmux and every Claude go down with it):
+              on startup, threads whose Claude was cut off mid-turn get one
+              line — "⚠️ ホストの再起動で、作業の途中で Claude が止まりました…"
+              — decided from the last entry of Claude's own transcript. No
+              mention, no button, no auto-resume; post 「続けて」 to continue
+              (#807, see specs/host-restart-notice.md).
 ```
 
 ### Threads c-lord has no record of
