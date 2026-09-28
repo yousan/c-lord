@@ -255,8 +255,10 @@ cmd_stop() {
     echo "stopping pid $p"
     kill "$p" 2>/dev/null || true
   done
+  local grace="${CLORD_STOP_GRACE_SECONDS:-15}"
+  case "$grace" in '' | *[!0-9]*) grace=15 ;; esac
   waited=0
-  while [ $waited -lt 15 ]; do
+  while [ $waited -lt "$grace" ]; do
     sleep 1
     waited=$((waited + 1))
     pids="$(find_pids)"
@@ -265,7 +267,33 @@ cmd_stop() {
       return 0
     }
   done
-  die "プロセスが 15 秒で終了しない (残: $pids)。手動確認してください。"
+
+  # SIGTERM で止まりきらない (#699)。以前はここで die していたため restart が
+  # 起動まで到達せず、本番が「止まったまま」人手待ちになった。bot 側にも
+  # shutdown watchdog (c_lord/shutdown_watchdog.py, 既定 10 秒) があるので
+  # ここに来るのは古いコード or watchdog 自体が詰まったとき。
+  # kill は引き続き PID 直指定のみ。find_pids を取り直す = /proc/<pid>/cwd の
+  # 照合を SIGKILL の直前にもう一度通す (その間に pid が再利用されていても
+  # 別プロセスを撃たない)。エスカレーションした事実は bot のログにも残す。
+  local msg
+  pids="$(find_pids)"
+  for p in $pids; do
+    msg="staging.sh: pid $p が SIGTERM から ${grace} 秒で終了しないため SIGKILL します (#699)"
+    echo "WARNING: $msg" >&2
+    [ -e "$LOG_LINK" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [WARNING] $msg" >>"$LOG_LINK"
+    kill -KILL "$p" 2>/dev/null || true
+  done
+  waited=0
+  while [ $waited -lt 5 ]; do
+    pids="$(find_pids)"
+    [ -z "$pids" ] && {
+      echo "stopped (SIGKILL)."
+      return 0
+    }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  die "SIGKILL 後もプロセスが残っている (残: $pids)。手動確認してください。"
 }
 
 check_log_identity() {
