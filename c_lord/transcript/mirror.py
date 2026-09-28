@@ -35,6 +35,7 @@ from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
 from ..discord_ui.pane_context import replace_pane_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
+from ..log_sampler import LogSampler
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import (
     banner_only,
@@ -49,6 +50,14 @@ from .repeat_fold import RepeatFold
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
 logger = logging.getLogger(__name__)
+
+# #810: an idle mirror with nothing to read is not an outage — nobody is waiting
+# on it, and ``on_ready`` restores one for every open session. The tail reports
+# every ``unresolved_after`` seconds for as long as that lasts, which made this
+# one line 99.99% of production ERRORs and buried the real ones. The fact still
+# has to stay findable per thread (#678), so it is a WARNING once an hour per
+# thread, carrying the count of the reports it stands for.
+_idle_unresolved_log = LogSampler(3600.0)
 
 Sink = Callable[[str], Awaitable[None]]
 FileSink = Callable[[str, str], Awaitable[None]]
@@ -607,17 +616,32 @@ class TranscriptMirror:
         fleet was mute for three days and the only trace was one log line per
         mirror.
         """
-        logger.error(
-            "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
-            "(%d jsonl file(s) present, claimed session id %s) — Claude's replies "
-            "cannot reach this thread (#773)",
+        detail = (
             self.thread_id,
             report.project_dir,
             report.seconds,
             report.candidates,
             report.claimed_session_id or "none",
         )
-        if not self._turn_active or self._unresolved_told:
+        if not self._turn_active:
+            # #810: idle — nothing is being lost right now, so not an ERROR.
+            sample = _idle_unresolved_log.sample(self.thread_id)
+            if sample.emit:
+                logger.warning(
+                    "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
+                    "(%d jsonl file(s) present, claimed session id %s) while idle — "
+                    "a turn started here would not reach Discord (#773/#810)%s",
+                    *detail,
+                    sample.suffix,
+                )
+            return
+        logger.error(
+            "TranscriptMirror: nothing to read for thread=%d in %s after %.0fs "
+            "(%d jsonl file(s) present, claimed session id %s) — Claude's replies "
+            "cannot reach this thread (#773)",
+            *detail,
+        )
+        if self._unresolved_told:
             return
         self._unresolved_told = True
         await self._try_sink(_unresolved_notice(report))
