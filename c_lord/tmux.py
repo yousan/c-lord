@@ -2251,6 +2251,11 @@ class TmuxSessionManager:
         if result.returncode != 0:
             logger.warning("start_claude: send-keys Enter failed: %s", result.stderr.strip())
             return False
+        if prompt is not None:
+            # #808: as in send_input — the marker alone no longer survives.
+            from .transcript.pane_echo import PROMPT_TTL_SECONDS, pane_echo
+
+            pane_echo.register(thread_id, prompt, ttl=PROMPT_TTL_SECONDS)
 
         logger.info("start_claude: sent command to %s", target)
         return True
@@ -2600,6 +2605,11 @@ class TmuxSessionManager:
         payload = f"{ZWSP_MARKER}{text}"
         if not self._type_literal(target, payload, what="send_input"):
             return False
+        # #808: CLI 2.1.278+ strips the marker before writing the ``user``
+        # event, so the mirror cannot rely on it — record what was typed.
+        from .transcript.pane_echo import PROMPT_TTL_SECONDS, pane_echo
+
+        pane_echo.register(thread_id, text, ttl=PROMPT_TTL_SECONDS)
 
         # #560: a payload big enough to be treated as a paste is folded into a
         # ``[Pasted text …]`` placeholder, and an Enter arriving inside that
