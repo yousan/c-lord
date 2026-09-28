@@ -64,6 +64,7 @@ def _render_windows(fmt: str, rows: list[dict[str, str]]) -> str:
             ("#{window_id}", "id"),
             ("#{window_name}", "name"),
             ("#{@thread_id}", "tid"),
+            ("#{@clord_owner}", "owner"),
             ("#{pane_current_path}", "path"),
             ("#{window_index}", "index"),
             ("#{window_active}", "active"),
@@ -275,11 +276,11 @@ class TestTmuxSessionManager:
             # old per-row ``show-option -t session:NAME`` follow-up re-resolved
             # the name, so with duplicate names every duplicate reported the
             # first one's tag.
-            # name / @thread_id / window_id / path — the path goes LAST so a tab
-            # inside it cannot shift the other columns.
+            # name / @thread_id / window_id / @clord_owner (#790) / path — the
+            # path goes LAST so a tab inside it cannot shift the other columns.
             mock_run.return_value = MagicMock(
                 returncode=0,
-                stdout="work1\t111\t@1\t/work/a\nwork2\t222\t@2\t/work/b\n",
+                stdout="work1\t111\t@1\t/me\t/work/a\nwork2\t222\t@2\t\t/work/b\n",
             )
             windows = mgr.list_sessions()
 
@@ -289,6 +290,8 @@ class TestTmuxSessionManager:
         assert windows[0]["working_dir"] == "/work/a"
         assert windows[0]["thread_id"] == "111"
         assert windows[0]["window_id"] == "@1"
+        assert windows[0]["owner"] == "/me"
+        assert windows[1]["owner"] == ""
         assert windows[1]["window_name"] == "work2"
         assert windows[1]["working_dir"] == "/work/b"
         assert windows[1]["thread_id"] == "222"
@@ -329,6 +332,7 @@ class TestTmuxSessionManager:
                         ("#{window_id}", wid),
                         ("#{window_name}", name),
                         ("#{@thread_id}", tid),
+                        ("#{@clord_owner}", ""),
                         ("#{pane_current_path}", f"/work/{name}"),
                     ):
                         row = row.replace(token, value)
