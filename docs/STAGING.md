@@ -88,6 +88,9 @@ bash scripts/staging.sh restart <branch>   # branch を origin の最新に同�
 
 `restart` は: /proc/cwd で自分の bot だけを同定 → PID 直 kill → setsid + venv python で起動 →
 per-run ログ → `Logged in as` を待って identity を検証(mismatch なら非0で失敗)→ 単一インスタンス確認、まで自動で行う。
+`OK` を出したら**呼び出し元へ必ず return し、自分のプロセスを残さない**(#401)。`$(bash scripts/staging.sh restart)` や
+`… restart 2>&1 | tail` のように出力を読み切る呼び出し方でもそこで止まらない。bot の親は `systemd --user` になり、
+`pgrep -af '^bash scripts/staging.sh restart'` に restart の残骸は出ない。
 
 `restart <branch>` は起動前に **`git fetch origin <branch>` → checkout → `git merge --ff-only origin/<branch>`** まで行い、
 ローカルブランチを **origin の最新に確実に同期**する(#436)。単なる `checkout` は fetch 済みでも
@@ -339,3 +342,4 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 | `instances: 2+` | `staging.sh status` | 二重起動 — `stop` → `restart`。手動 kill 禁止事項を守ったか確認 |
 | 起動直後に死ぬ | per-run ログ末尾 | LoginFailure(token 不正)/ DB スキーマ不整合(古いブランチ — idle は main) |
 | `API server not listening` | per-run ログの `REST API could not bind` | ポート衝突。その clone の `CLORD_API_PORT` を空き番号に(#712 以降 API は常時起動する) |
+| `restart` が `OK` まで出したのに返らない / `pgrep -af 'staging.sh restart'` に残る | その clone の `scripts/staging.sh` に `exec setsid` があるか | #401 修正前のスクリプト。旧版は bot を起動したサブシェルが bot の親として居座り、呼び出し元の stdout を握り続けた。**1 回 `restart` すると新しいスクリプトに入れ替わる**(その 1 回は旧スクリプトで走るので、出力はファイルへ向けておく)。残骸は旧 bot が止まると一緒に消える |

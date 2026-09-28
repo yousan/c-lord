@@ -94,6 +94,8 @@ def slash_io(interaction: discord.Interaction) -> tuple[Responder, Acknowledger]
     state = {"acked": False}
 
     async def ack(*, ephemeral: bool = False) -> None:
+        if state["acked"]:
+            return  # a second ack would be a second defer — Discord refuses it
         state["acked"] = True
         interaction.extras[_PUBLIC_PLACEHOLDER] = not ephemeral
         await interaction.response.defer(ephemeral=ephemeral)

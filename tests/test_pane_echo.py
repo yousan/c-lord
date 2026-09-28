@@ -66,10 +66,10 @@ class TestPaneEchoRegistry:
 
     def test_per_thread_entries_are_capped(self) -> None:
         reg = PaneEchoRegistry()
-        for i in range(20):
+        for i in range(40):
             reg.register(1, f"answer-{i}")
         assert reg.consume_match(1, "answer-0") is False
-        assert reg.consume_match(1, "answer-19") is True
+        assert reg.consume_match(1, "answer-39") is True
 
     def test_clear_drops_everything(self) -> None:
         reg = PaneEchoRegistry()

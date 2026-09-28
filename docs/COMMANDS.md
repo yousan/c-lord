@@ -131,13 +131,23 @@ Before this, `/clord` checked only whether *a repository* was reachable from the
 /clord repo:git@github.com:yousan/dotclaude.git prompt:Claude 5 系に対応する
 ```
 
-The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root. The thread's tmux session follows the chosen repository too (#427).
+The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476). The thread's tmux session follows the chosen repository too (#427).
 
 `repo:` only applies when a thread is being **created**. Inside an existing thread it is refused with a pointer to `/clord-thread-init`, because that thread's working copy is already cloned and would not change.
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
 
+**`/clear`** types Claude Code's own `/clear` into this thread's pane (#803) — the same `send_literal` path as `/compact`. The Claude process stays; only the conversation is emptied, and your next message goes to that same process. It works in any state:
+
+- **Claude is idle** → `/clear` is typed straight away.
+- **A turn is running** → the turn is stopped first (like `/stop`, not a kill), then `/clear` is typed.
+- **The workspace is stopped** (slept after 4 hours, host restart) → it is restored first, with `-# 🔄 停止していたワークスペースを復元してから `/clear` を送ります。` in the thread, then cleared. A `[終了]` thread is not restored — you get the usual hint instead.
+
+Claude Code answers `/clear` with a **new transcript file**, and c-lord follows it: the post-clear answers keep arriving in Discord, and a later restore reopens the *cleared* conversation, not the old one. The same happens when someone types `/clear` directly in the tmux pane (the mirror notices the new transcript by itself). Before #803 the command killed the window and stamped the session row as "start fresh", which only one thread per host could hold — every `/clear` after the first failed with 「予期せぬエラー」.
+
 **`/compact`** fires the Claude Code TUI's built-in `/compact` for this thread's session, compressing the conversation history into a summary so the context window is freed **without losing continuity** (unlike `/clear`, which discards the session). Pass optional `instructions` to focus the summary (e.g. `/compact keep the open tasks and decisions`). Note: a plain `/compact` typed as a normal message does **not** work (the leading-slash note below) — this command exists precisely because it sends `/compact` via the zero-width-space-free `send_literal` path.
+
+It works in the same states as `/clear` (#806): a running turn is stopped first, and a **stopped workspace is restored first** (`--resume` of the recorded session, so the conversation to compact comes back) with `-# 🔄 停止していたワークスペースを復元してから `/compact` を送ります。` in the thread. Before #806 a stopped thread answered `No running Claude session in this thread to compact.`, which read as the conversation being lost. A thread with no c-lord record, a `[終了]` thread, or one where Claude never wrote a transcript is refused in words instead of being woken — there is nothing to compact.
 
 **`/clord-attach`** links a thread to a tmux window so you can interact with the same Claude Code session from both Discord and the terminal.
 
@@ -161,6 +171,8 @@ Skills are predefined prompts stored in `~/.claude/skills/`. The `name` paramete
 | `/clord-thread-init remove:True` | Remove the thread-level binding | Thread only |
 
 Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory. A thread-level binding set via `/clord-thread-init` takes precedence over the channel binding.
+
+The `repo` value is stored in clonable form. A PR / issue / file link is shrunk to the repository root (#88), and a URL pasted without its scheme — `github.com/owner/repo`, as a browser address bar shows it — gets `https://` put back for `github.com`, `gitlab.com` and `bitbucket.org` (#476); the reply shows the value that was actually stored (`https://github.com/owner/repo.git`). Any other scheme-less string is taken as a local path and stored as-is.
 
 `/clord-thread-init repo:<url>` **changes the repository of a thread that is already c-lord's** — it does not turn a thread into one (#551). Binding an ordinary conversation thread used to be step one of the takeover described under `/clord` above, so it is refused on the same test. To start on a different repository, use `/clord repo:<url> prompt:<...>` in the channel, which opens a new thread already bound to it. Showing the binding (no arguments) and `remove:True` still work anywhere — neither can turn a thread into a session.
 
@@ -323,7 +335,7 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 | 表示だけがおかしい | `/resync` | 繋ぎ直す | そのまま | そのまま | 残る | 動いたまま |
 | いま走っているターンを止めたい | `/stop` | そのまま | **中断** | そのまま | 残る | 動いたまま |
 | プロセスが固まって入力を受け付けない | `/claude-restart` | そのまま | 落とす | **再起動** | 残る（`--continue`） | 動いたまま |
-| 文脈を捨ててやり直したい | `/clear` | そのまま | 落とす | 落とす | **消える** | 動いたまま |
+| 文脈を捨ててやり直したい | `/clear` | そのまま（新しい会話に追従） | 止める | そのまま（`/clear` を打つ） | **消える** | 動いたまま |
 | このスレッドの作業を畳みたい | `/workspace-stop` | そのまま | 落とす | 落とす | 残る | **停止** |
 | ディスクも返したい | `/workspace-delete` | そのまま | 落とす | 落とす | 残る | 停止（作業ディレクトリも削除） |
 
@@ -406,10 +418,19 @@ automatically (see `tests/e2e/test_text_command_twins.py`).
 > marker, so the line no longer starts with `/` and the TUI does not treat it as
 > a slash command. Use the `!`/mention twin instead.
 
-> **Auth note.** A webhook author is not a real guild member, so commands gated
-> by an allowlist/role (e.g. `!skill`) are denied for webhook callers when an
-> allowlist is configured. Staging runs with an open allowlist so E2E works;
-> production auth is unchanged.
+> **Auth note.** Every text twin except the read-only `!version`,
+> `!model-show` and `!thread-archive-show` is authorized by the message-backed
+> rule in `c_lord/command_gate.py` (`is_message_authorized`, #507 / #508 / #405 /
+> #781):
+>
+> - a **webhook** message is allowed — holding the webhook URL is the grant, and
+>   it is what keeps the E2E harness working with `DISCORD_OWNER_ID` set;
+> - a bot listed in `CLORD_TRUSTED_BOT_IDS` is allowed; any other bot is denied;
+> - a **human** must pass the same allowlist as the slash command
+>   ([Access Control](#access-control)).
+>
+> The slash twins use the human allowlist only — Discord never lets a webhook
+> send an application command.
 
 ---
 
@@ -429,6 +450,18 @@ startup log says who ended up allowed.
 3. **Everyone, explicitly** — `CLORD_ALLOW_ANYONE=1` restores the pre-#713
    behavior where any member of the server can drive the bot. c-lord logs a
    warning at startup when it is set.
+
+A user who is not allowed gets `You are not authorized to use this command.` and
+nothing happens. That includes `/clear` / `!clear` (#405): it throws the conversation
+away (#803: by typing `/clear` into Claude Code), so a stranger in the thread must not be
+able to run it on someone else's conversation.
+
+The same goes for **every** command except `/version`, `/model show` and
+`/thread-archive show` (and their `!` twins), which only display harmless
+settings (#781). Before #781, `/workspace-delete`, `/model set`, `/stop`,
+`/compact`, `/upgrade` and ~30 others ran for anyone who could type in the
+thread. `tests/test_command_authorization_coverage.py` fails CI if a new command
+skips the gate.
 
 See [specs/authorization-default.md](specs/authorization-default.md).
 
@@ -460,8 +493,8 @@ user never needs a header. Anything else gets `403`.
 | `POST` | `/api/spawn` | Create a new thread and start Claude Code |
 | `POST` | `/api/threads/{thread_id}/messages` | Post a message to a Discord thread |
 | `POST` | `/api/mark-resume` | Mark a thread for resumption after restart |
-| `GET` | `/api/lounge` | List recent AI Lounge messages |
-| `POST` | `/api/lounge` | Post a message to the AI Lounge |
+| `GET` | `/api/lounge` | List recent AI Lounge messages. Sessions are not told the lounge exists, so nothing posts here unless you set that up (#758) |
+| `POST` | `/api/lounge` | Post a message to the AI Lounge. No c-lord component calls this today — the lounge context is not delivered to sessions (#758) |
 
 ### Examples
 

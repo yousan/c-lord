@@ -35,11 +35,14 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
 1. **Claude's answer is read out of Claude Code's own transcript, not scraped from the TUI and not pushed by Claude** (#71/#216, 単一化は #712): `TranscriptMirrorCog` (`c_lord/cogs/transcript_mirror.py`, `c_lord/transcript/mirror.py`) が Claude Code 自身の `~/.claude/projects/<slug>/*.jsonl` を tail し、スレッドへ転送する。**これが唯一の配信経路**。
    - **なぜ scrape ではないのか**: かつては `tmux capture-pane` の出力を投稿していたため、TUI の chrome が Discord に漏れるバグが繰り返し出た (#23, #27, #28, #29, #30, #32, #34, #35, #39, #41, #43, #45, #49, #50)。**TUI テキストから Discord へ至る経路がもう存在しない**ので、chrome 要素が増えても漏れようがない。
    - **なぜ skill push ではないのか**: #53 は各 session dir に `discord-reply` skill を注入し、Claude 自身に `curl POST /api/reply` させていた (経路A)。これは **Claude が投稿を忘れるとターンが丸ごと届かない** (#491)。jsonl ミラーは「Claude が既に書いたもの」を読むので、忘れようがない。#216 でこちらを本命と決め、#492 で既定にし、**#712 で経路A を削除**した（`CLORD_BRIDGE_MODE` / `USE_SKILL_REPLY` という選択肢ごと無くした — 踏める地雷を残さない）。旧 env を .env に残したまま起動しても、**起動時に警告を出して jsonl で動く**（`c_lord/legacy_env.py`）。
-   - **c-lord が Claude に打ち込む入力には zero-width-space マーカーが付く** (`c_lord/tmux.py`)。ミラーはこれを見て「人がペインに打った入力」と区別し、打ち返さない (#71)。だから普通のメッセージは `/` 始まりでもスラッシュコマンドにならない（`/compact` 等が専用コマンドとして存在する理由 — `send_literal` 経由）。
+   - **c-lord が Claude に打ち込む入力には zero-width-space マーカーが付く** (`c_lord/tmux.py`)。ミラーはこれを見て「人がペインに打った入力」と区別し、打ち返さない (#71)。だから普通のメッセージは `/` 始まりでもスラッシュコマンドにならない（`/compact` 等が専用コマンドとして存在する理由 — `send_literal` 経由）。**ただし CLI 2.1.278 以降はこの印を消して transcript に書くので、印は「付いていれば c-lord 由来」の補助に過ぎない** — 主判定は c-lord が打った本文の控え (`c_lord/transcript/pane_echo.py`、`send_input` / `start_claude` / `send_literal` が登録) との完全一致 (#682/#808、`docs/specs/mirrored-events.md`)。
+   - **「どの jsonl がこのスレッドのものか」はマーカーでは決めない** (#773): `start_claude` が `--session-id <uuid>` を渡して**自分の transcript に自分で名前を付け**、その uuid を `<project_dir>/.clord-session` に記録する (`c_lord/transcript/claim.py`)。**CLI 2.1.278 以降は対話モードの入力から ZWSP を取り除いて transcript に書く**ので、#627 のマーカー判定は全スレッドで偽になり、2026-09-20〜23 に**フリート全体が無言になった**（作業スレッド 17 本が丸一日、開始通知のまま）。マーカー判定は「付いていれば c-lord 由来」という偽陽性の無い後方互換ルールとして残っているが、**これ単独には二度と依存しない**。resume も `--continue` ではなく `--resume <記録した uuid>` を使う。あるべき動きは [`docs/specs/transcript-mirror-replay-safety.md`](docs/specs/transcript-mirror-replay-safety.md)。
+   - **transcript が 1 本も見つからないとき、ミラーは黙るが黙っていることは隠さない** (#773/#585): ターンが走っているスレッドには「転送できていない」と 1 ターン 1 回投稿し、ログには `ERROR` を出す。アイドルのスレッド（`on_ready` で復元されたミラー）には投稿せず、ログも `ERROR` ではなく**スレッドごとに 1 時間 1 行の `WARNING`**（#810 — アイドル分が本番 ERROR の 99.99% を占めて本物を埋めていた）。
    - **REST API (`ext/api_server.py`) は配信経路ではなく制御面**なので、bridge とは無関係に**常に起動する** (#712/#543)。ポートが埋まっていれば WARNING を出して API 無しで動き続ける（bot 本体は落とさない）。
    - 残っている非等価性: reply 層の装飾 (quote-reply / cli-prefix / prompt-choice) が経路A にあって経路B にまだ無い (#237)。添付ファイルは #233 で解消済み — ミラーが harness の `SendUserFile` `tool_use` を jsonl から読んで自分で添付する (`docs/specs/user-file-delivery.md`)。
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
-3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall / 🗜️ compact as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now the slow, poll-driven sidebar view. See `docs/specs/thread-lamp.md`.
+3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now a slow, poll-driven sidebar view that is **off by default** (#329 — opt in with `CLORD_THREAD_LAMP=1`). See `docs/specs/thread-lamp.md`.
+   - **🗜️ compact のリアクションは出ない** (#753): `StatusManager.set_compact()` と `EventProcessor._on_system` の compaction 分岐はコードに残っているが、`StreamEvent.is_compact` をセットする箇所が無い (`grep -rn "is_compact=" c_lord/` が 0 件) ので**到達しない**（実測: 2026-06-10〜09-18 のリアクション 1,493 個に 🗜️ は 0 件）。文脈圧縮が利用者に見えるのは、ミラーが出す `🗜️ コンテキストを圧縮しました` の1行だけ (#628)。到達不能なコードは**まだ残している**（消すかどうかは別判断）。触る前に「では誰が `is_compact` をセットするのか」を確かめること。
 4. **ツールの実行状況は embed ではなく jsonl ミラー由来の 2 か所に出る** (#723): `tmux_runner.py` はいまも `capture-pane` を polling しているが、**yield するイベントは SYSTEM と RESULT の 2 種だけ**。SYSTEM は (a) session_id を DB に保存させる合成イベント、(b) TUI のメニューを Discord のボタンへ橋渡しする `pane_ask` (#166/#251)、(c) 未知の対話プロンプトを知らせる `unknown_tui_prompt` の 3 用途。RESULT はターン完了 / エラー / usage limit。**`tool_use` / `todo_list` / `permission_request` / `elicitation` をセットする箇所はコードのどこにも無い** (`grep -rn "tool_use=" c_lord/` が 0 件) ので、`tool_use_embed()` / `discord_ui/tool_timer.py` / `EventProcessor._handle_tool_use()` は**本番で一度も呼ばれていない**（実測: 2026-06-05〜2026-09-11 の bot メッセージ 10,607 通に tool-use embed は 0 件）。
    - **いまツールの様子が見えるのは 2 か所**、どちらも供給元は tmux イベントではなく **jsonl ミラー**: ターンが 90 秒沈黙したときに出る turn progress line (`-# ⚙️ 作業中 5:56 · 🔧 Bash: … · ツール 61 件`、`discord_ui/turn_progress.py`) と、返信に添付される `progress.txt` (`transcript/formatter.py` が `🔧 Bash: …` の形に畳む)。
    - **permission プロンプトは Discord に出ない** — `tmux_runner._accept_permission_prompt()` がペイン内で自動承認する。**plan 承認 (ExitPlanMode) と AskUserQuestion は同じ `pane_ask` の ask bridge** を通って Discord のボタンになる (#166/#251、`discord_ui/ask_handler.py`)。ステータス絵文字はターン開始と SYSTEM / RESULT から駆動される (決定 3)。
@@ -178,7 +181,13 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
 - `setup.py:setup_bridge` — `c-lord version v1.4.183-bd80c47e-20260908` (#722)。**起動ログで最初に見る行**。
   「そのインスタンスがいつのビルドで走っているか」がここにしか無い（`grep -i version <log>`）。
   古いビルドは「その機能はありません」と利用者に答えてしまうので、挙動が古く見えたらまずこれを見る
-- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit` (Claude 実行 1 回ごと)
+  - ビルドが 7 日以上前なら直後に `WARNING … this c-lord build is N days old (…)` が1行続く (#756)。
+    📊 フッタの版数にも `(Nd)` が付く（`docs/specs/context-footer.md`）
+- `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit (outcome=…, 12.3s)` (Claude 実行 1 回ごと)。
+  **`exit` は `finally` で必ず出る** (#293) — `outcome` は `ok` / `error` / `preempted`(次のメッセージで割り込まれた) /
+  `cancelled`(割り込みで task ごと止めた) / `crashed`。だから **`enter` だけあって `exit` が無い = そのターンはまだ走っている**。
+  同じスレッドで次のターンが始まった時点で前の run がまだ走っていれば `run_claude: orphan — …` の WARNING、
+  割り込みで止めた前のターンが cancel 後も終わらなければ `prior turn is still running … (orphan run, #293)` の ERROR が出る
 - `cogs/scheduler.py:_run_task` — `_run_task: enter` / `_run_task: exit` (スケジュール実行ごと)
 - `cogs/scheduler.py:_master_loop` — `SchedulerCog: N task(s) due (ids=[...])` (30 秒ごと、due があるときのみ)
 - `cogs/webhook_trigger.py:on_message` — `Webhook trigger matched` (CI/CD webhook 着弾時)
@@ -211,7 +220,7 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 | 症状 | 最初に見るべき場所 | 典型的な原因 |
 |------|-----------------|------------|
 | スレッドが作られない | bot ログの `on_message` 周辺、`DISCORD_CHANNEL_ID` が一致しているか | Intent 不足 / channel ID 設定ミス |
-| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか | tmux window 作成失敗、Claude CLI hang、timeout |
+| 応答が返ってこない | `grep "thread=<ID>"` で `run_claude: enter` はあるか / `exit` まで届くか（`exit` の `outcome=` がターンの終わり方）/ `orphan` の WARNING・ERROR が出ていないか | tmux window 作成失敗、Claude CLI hang、timeout |
 | 同一セッションのはずが別セッション扱い | `_run_helper` で `session_id=` ログを確認、DB の `sessions` テーブル | repository から session_id が読めていない |
 | Webhook trigger が無視される | `Webhook trigger matched` ログの有無 | webhook_id allowlist / channel_ids 不一致、prefix mismatch |
 | Scheduler が動かない | `SchedulerCog: N task(s) due` の有無 (30 秒間隔) | `next_run_at` が未来、`scheduled_tasks` が空 |

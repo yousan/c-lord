@@ -56,6 +56,10 @@ This means the bot token is **readable by the Claude session** (it `grep`s the
   working tree, where a literal token could be `git commit`-ed and pushed). The
   token is read into a shell variable at runtime, so it does not appear in the
   command text that the transcript mirror (#71) echoes to Discord.
+- The `SKILL.md` itself — with this host's `.env` *path* in it — is kept out of
+  the user's commits: the injector lists it in the clone's `.git/info/exclude`
+  (#779), so `git add -A` does not pick it up. Before #779 it was committed
+  into c-lord's own public repository by an unrelated PR (#704).
 
 > Note: the env stripping described under "Environment Isolation" below **is**
 > implemented (#353, closing the #458 drift), but it does **not** make the token
@@ -172,8 +176,12 @@ class ClaudeChatCog(commands.Cog):
   be configured for the bot to be usable *by you* and unusable by everyone else
   (#713). Until the bot has logged in and asked Discord, nobody passes.
 - `CLORD_ALLOW_ANYONE=1` restores "anyone in the server", with a startup warning
-- The same check applies to `SkillCommandCog` and `ChannelRepoCog` — they hold
-  the same `Authorizer` instance rather than a copy of the rule
+- The same check applies to `SkillCommandCog`, `ChannelRepoCog` and
+  `SessionManageCog` — they hold the same `Authorizer` instance rather than a
+  copy of the rule. Every slash / text command goes through it except the
+  read-only `/version`, `/model show`, `/thread-archive show`; an AST test
+  (`tests/test_command_authorization_coverage.py`) fails CI for a new command
+  that skips it (#781)
 
 **Why the default is not "everyone"**: being able to talk to c-lord is being
 able to run shell commands on the host that runs it. A fail-open default means

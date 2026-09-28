@@ -334,7 +334,16 @@ cmd_restart() {
   # env -u による消毒は #324 (override=True) が入った現行コードでは冗長だが、
   # **対象 clone が古いコードのときの最後の砦**なので外さない (2026-06-10 の
   # 検証で実証: 消毒なし + 旧コード = 本番 identity 再現)。
-  (cd "$CLONE_DIR" && setsid env \
+  #
+  # `exec` とサブシェル全体へのリダイレクトは外さない (#401)。旧形
+  # `(cd … && setsid … nohup py >log 2>&1 &)` では `&` が作るサブシェル
+  # (cmdline は "bash scripts/staging.sh restart" のまま) が bot の親として
+  # bot の寿命いっぱい wait し、リダイレクトが nohup にしか掛からないため
+  # **呼び出し元の stdout/stderr を握り続けた**。本体は OK まで出して終わる
+  # のに、`$(…)` やパイプで待つ呼び出し元には EOF が来ない = restart が
+  # return しない。exec でサブシェル自体を bot に置き換え、fd も丸ごと
+  # ログへ向けることで、呼び出し元の fd を持つプロセスが残らない。
+  (cd "$CLONE_DIR" && exec setsid env \
     -u DISCORD_BOT_TOKEN -u DISCORD_CHANNEL_ID -u DISCORD_OWNER_ID \
     -u CLAUDE_COMMAND -u CLAUDE_MODEL -u CLAUDE_PERMISSION_MODE -u CLAUDE_WORKING_DIR \
     -u SESSION_DIR_BASE -u SESSION_SOURCE_REPO -u SESSION_TIMEOUT_SECONDS \
@@ -343,7 +352,7 @@ cmd_restart() {
     -u CLORD_MIRROR_VERBOSITY -u CLORD_TRUSTED_BOT_IDS -u CLORD_ALLOWED_ROLE \
     -u COORDINATION_CHANNEL_ID -u EXPECTED_BOT_USER_ID \
     -u E2E_TEST_THREAD_ID -u E2E_TEST_WEBHOOK_URL -u VIRTUAL_ENV \
-    nohup "$VENV_PY" -m c_lord.main >"$log" 2>&1 </dev/null &)
+    nohup "$VENV_PY" -m c_lord.main) >"$log" 2>&1 </dev/null &
   ln -sf "$log" "$LOG_LINK"
   echo "launched -> $log"
 

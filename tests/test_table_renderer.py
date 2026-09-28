@@ -510,3 +510,136 @@ class TestGetTableImagesLimit:
 
         monkeypatch.delenv("CLORD_RENDER_TABLE_IMAGES", raising=False)
         assert get_table_images(self._body(3)) == []
+
+
+# ---------------------------------------------------------------------------
+# get_table_images_per_chunk — the image rides with its own table (#750)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTableImagesPerChunk:
+    """A reply split into several messages must carry each table's PNG on the
+    message that holds the table — not on whichever message happens to be last.
+    """
+
+    @staticmethod
+    def _table(tag: str, rows: int = 2) -> str:
+        body = "".join(f"| {tag}{r} | x |\n" for r in range(rows))
+        return f"| {tag} | h |\n|---|---|\n{body}"
+
+    @staticmethod
+    def _enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLORD_RENDER_TABLE_IMAGES", "true")
+
+    def test_each_table_goes_to_the_chunk_that_holds_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import get_table_images_per_chunk
+
+        self._enabled(monkeypatch)
+        first = f"intro\n\n{self._table('A')}\nprose"
+        second = "other topic, no table"
+        third = f"closing\n\n{self._table('B')}"
+        content = "\n".join([first, second, third])
+        with patch(
+            "c_lord.discord_ui.table_renderer.render_table_image",
+            side_effect=lambda md: md.encode(),
+        ):
+            per_chunk = get_table_images_per_chunk(
+                content, [first, second, third], limits=[10, 10, 10]
+            )
+
+        assert [[name for name, _ in imgs] for imgs in per_chunk] == [
+            ["table_1.png"],
+            [],
+            ["table_2.png"],
+        ]
+        assert b"| A |" in per_chunk[0][0][1]
+        assert b"| B |" in per_chunk[2][0][1]
+
+    def test_a_table_cut_by_the_split_is_drawn_whole_on_its_first_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The chunker can cut a long table between rows. The reader meets the
+        table in the first chunk, so the image goes there — and it shows every
+        row, not just the half that fitted."""
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import get_table_images_per_chunk
+
+        self._enabled(monkeypatch)
+        table = self._table("T", rows=6)
+        lines = table.rstrip("\n").split("\n")
+        first = "intro\n" + "\n".join(lines[:4])
+        second = "\n".join(lines[4:]) + "\ntrailing prose"
+        content = f"{first}\n{second}"
+        with patch(
+            "c_lord.discord_ui.table_renderer.render_table_image",
+            side_effect=lambda md: md.encode(),
+        ):
+            per_chunk = get_table_images_per_chunk(content, [first, second], limits=[10, 10])
+
+        assert [len(imgs) for imgs in per_chunk] == [1, 0]
+        drawn = per_chunk[0][0][1].decode()
+        assert "| T5 | x |" in drawn  # the row that landed in the second chunk
+
+    def test_repeated_header_text_is_placed_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two tables with an identical header must not both be pinned to the
+        first chunk that contains that header line."""
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import get_table_images_per_chunk
+
+        self._enabled(monkeypatch)
+        first = f"{self._table('S')}\nbetween"
+        second = f"again\n{self._table('S')}"
+        with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"PNG"):
+            per_chunk = get_table_images_per_chunk(
+                f"{first}\n{second}", [first, second], limits=[10, 10]
+            )
+
+        assert [[name for name, _ in imgs] for imgs in per_chunk] == [
+            ["table_1.png"],
+            ["table_2.png"],
+        ]
+
+    def test_each_chunk_has_its_own_attachment_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#683's cap is per message: 14 tables in one chunk still give that
+        message at most its limit, and the other chunk keeps its own."""
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import MAX_TABLE_IMAGES, get_table_images_per_chunk
+
+        self._enabled(monkeypatch)
+        first = "\n".join(self._table(f"a{i}") for i in range(14))
+        second = f"tail\n{self._table('z')}"
+        with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"PNG"):
+            per_chunk = get_table_images_per_chunk(
+                f"{first}\n{second}", [first, second], limits=[MAX_TABLE_IMAGES, 9]
+            )
+
+        assert len(per_chunk[0]) == MAX_TABLE_IMAGES
+        assert [name for name, _ in per_chunk[1]] == ["table_15.png"]
+
+    def test_zero_budget_chunk_gets_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import patch
+
+        from c_lord.discord_ui.table_renderer import get_table_images_per_chunk
+
+        self._enabled(monkeypatch)
+        body = self._table("q")
+        with patch("c_lord.discord_ui.table_renderer.render_table_image", return_value=b"PNG"):
+            assert get_table_images_per_chunk(body, [body], limits=[0]) == [[]]
+
+    def test_disabled_flag_returns_an_empty_list_per_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from c_lord.discord_ui.table_renderer import get_table_images_per_chunk
+
+        monkeypatch.delenv("CLORD_RENDER_TABLE_IMAGES", raising=False)
+        body = self._table("q")
+        assert get_table_images_per_chunk(body, [body, "x"], limits=[10, 10]) == [[], []]

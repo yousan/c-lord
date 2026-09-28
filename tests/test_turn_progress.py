@@ -241,6 +241,91 @@ class TestWorkingVsWaiting:
         assert "91" in rec.posts[0]
 
     @pytest.mark.asyncio
+    async def test_a_tool_still_running_keeps_saying_working(self) -> None:
+        """#757 AC1/AC3(a): one long tool call writes nothing until it returns.
+
+        ``tool_use`` lands when it starts and ``tool_result`` when it ends, so a
+        150s ``sleep`` is 150s of transcript silence. The call is still open,
+        though — that is not a stall, and the line must keep naming it.
+        """
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+        p.note_activity("🔧 Bash: `sleep 150`", started=["toolu_1"])
+
+        clock.advance(120.0)  # past the 60s stall window, no event since
+        await p.tick()
+
+        assert len(rec.posts) == 1
+        body = rec.posts[0]
+        assert "作業中" in body, body
+        assert "Bash: sleep 150" in body, body
+        assert "長考" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_finished_tool_falls_back_to_waiting(self) -> None:
+        """#757 AC2/AC3(b): once the result is in, silence means waiting again."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+        p.note_activity("🔧 Bash: `sleep 150`", started=["toolu_1"])
+        p.note_activity(finished=["toolu_1"])
+
+        clock.advance(120.0)
+        await p.tick()
+
+        assert "待機中" in rec.posts[0], rec.posts[0]
+        assert "120" in rec.posts[0]
+
+    @pytest.mark.asyncio
+    async def test_the_idle_count_starts_when_the_tool_returns(self) -> None:
+        """#757 AC2: "直近の動きから N 秒" measures from the result, not the start."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+        p.note_activity("🔧 Bash: `sleep 150`", started=["toolu_1"])
+        clock.advance(150.0)
+        p.note_activity(finished=["toolu_1"])
+        clock.advance(61.0)
+        await p.tick()
+
+        assert "待機中" in rec.posts[0], rec.posts[0]
+        assert "61 秒" in rec.posts[0], rec.posts[0]
+
+    @pytest.mark.asyncio
+    async def test_parallel_calls_name_the_one_still_running(self) -> None:
+        """Two calls in flight, the later one returns: name the one still open."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+        p.note_activity("🔧 Bash: `gh pr checks 704 --watch`", started=["toolu_a"])
+        p.note_activity("🔧 Read: `a.py`", started=["toolu_b"])
+        p.note_activity(finished=["toolu_b"])
+
+        clock.advance(120.0)
+        await p.tick()
+
+        body = rec.posts[0]
+        assert "作業中" in body, body
+        assert "gh pr checks 704" in body, body
+        assert "a.py" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_new_turn_forgets_calls_left_open(self) -> None:
+        """A call whose result never came must not keep the next turn "作業中"."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+        p.note_activity("🔧 Bash: `sleep 150`", started=["toolu_1"])
+        await p.end_turn()
+
+        p.begin_turn(restart=True)
+        clock.advance(120.0)
+        await p.tick()
+
+        assert "待機中" in rec.posts[0], rec.posts[0]
+
+    @pytest.mark.asyncio
     async def test_rendered_as_discord_subtext(self) -> None:
         """The line must be subtext so it stays visually quiet."""
         rec, clock = _Recorder(), _Clock()

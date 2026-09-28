@@ -29,6 +29,7 @@ Issue: https://github.com/yousan/c-lord/issues/67
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -40,6 +41,7 @@ import discord
 
 from ..claude.types import UsageLimit
 from ..notify_policy import owner_fallback_allowed
+from ..utils.logger import log_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +84,25 @@ _SWEEP_MAX_FAILURES = 5
 _SWEEP_ENV_FLAG = "CLORD_DASHBOARD_SWEEP"
 _OFF_VALUES = {"0", "false", "no", "off"}
 
+#: Opt in to the board itself (#761). Off by default: every start used to post
+#: or rewrite the board in the channel, and development restarts the bot many
+#: times a day. The turn-end ping is NOT governed by this — only the board.
+_BOARD_ENV_FLAG = "CLORD_SESSION_STATUS_BOARD"
+_ON_VALUES = {"1", "true", "yes", "on"}
+
 # Threads older than this are pruned from the dashboard automatically.
 # Keeps the embed from accumulating stale entries after a long idle period.
 _STALE_HOURS = 4
+
+#: How often the board looks for rows that went stale (#754). Pruning used to
+#: happen only inside a state change, so a day with no posts left 47-hour-old
+#: rows reading "0s ago". A tick that prunes nothing makes no Discord call.
+_PRUNE_INTERVAL_SECONDS = 300
+
+
+def board_enabled() -> bool:
+    """Whether this deployment shows the 📊 Session Status board (#761, opt-in)."""
+    return os.getenv(_BOARD_ENV_FLAG, "").strip().lower() in _ON_VALUES
 
 
 def _sweep_enabled() -> bool:
@@ -106,8 +124,9 @@ def _completion_text(
     mention_id: int,
     no_response: bool,
     usage_limit: UsageLimit | None = None,
+    login_required: bool = False,
 ) -> str:
-    """The turn-end ping. Says what actually happened (#562, #631).
+    """The turn-end ping. Says what actually happened (#562, #631, #812).
 
     "終わりました" is a summons: the user drops what they are doing and comes to
     look. When the turn produced nothing at all, that summons is a lie, and a
@@ -119,6 +138,9 @@ def _completion_text(
     a lie when the account is rate limited, because sending it again cannot
     work until the limit resets. A limited turn therefore reports the limit and
     its reset time, and says nothing about resending.
+
+    #812 is the same lie for a logged-out Claude Code: nothing in the thread can
+    fix it, only ``/login`` on the host can.
 
     The mention trails the text either way so Discord's push preview leads with
     the message rather than "@you" (#495).
@@ -132,6 +154,12 @@ def _completion_text(
         return (
             f"⏳ Claude の{usage_limit.scope}（上限）に達したため、このターンは実行されていません。"
             f"{when}。それまでは送り直しても同じ結果になります。 <@{mention_id}>"
+        )
+    if login_required:
+        return (
+            "🔑 Claude Code のログインが切れているため、このターンは実行されていません。"
+            "ホストで `claude` を開いて `/login` してください。"
+            f"ログインするまでは送り直しても同じ結果になります。 <@{mention_id}>"
         )
     if no_response:
         return (
@@ -172,7 +200,11 @@ class ThreadStatusDashboard:
     1. Call ``await dashboard.initialize()`` once after the bot is ready.
     2. Call ``await dashboard.set_state(...)`` on every state transition.
     3. Call ``await dashboard.remove(thread_id)`` when a thread is no longer
-       relevant (optional — stale entries are auto-pruned after ``_STALE_HOURS``).
+       relevant (optional — stale entries are auto-pruned after ``_STALE_HOURS``,
+       by a timer that ``initialize()`` starts, even when no state changes: #754).
+    4. Turns nobody posted for (scheduler / webhook / ``/skill``) go through
+       :func:`board_turn`; ``ClaudeChatCog`` calls ``set_state`` itself because
+       its turn-end transition also carries the completion ping.
 
     One board per channel (#720)
     ----------------------------
@@ -199,10 +231,15 @@ class ThreadStatusDashboard:
         channel: discord.TextChannel,
         owner_id: int | None = None,
         bot_user_id: int | None = None,
+        board: bool | None = None,
     ) -> None:
         self._channel = channel
+        # #761: None → ``CLORD_SESSION_STATUS_BOARD`` decides (off by default).
+        self._board_enabled = board_enabled() if board is None else board
+        self._retired = False
         self._bot_user_id = bot_user_id
         self._sweep_task: asyncio.Task[None] | None = None
+        self._prune_task: asyncio.Task[None] | None = None
         self._owner_id = owner_id
         self._threads: dict[int, _ThreadInfo] = {}
         self._dashboard_message: discord.Message | None = None
@@ -225,7 +262,12 @@ class ThreadStatusDashboard:
         behind. The dead boards of earlier processes are deleted in the
         background (opt out with ``CLORD_DASHBOARD_SWEEP=0``).
         """
+        if not self._board_enabled:
+            await self._retire_boards()
+            return
+
         stale: list[discord.Message] = []
+        self._start_prune_timer()
         async with self._lock:
             if self._dashboard_message is not None:
                 # Already live in this process — refresh it, do not add one.
@@ -254,6 +296,28 @@ class ThreadStatusDashboard:
             # and must never hold up on_ready. Keep the reference so the task
             # is not garbage collected mid-flight.
             self._sweep_task = asyncio.create_task(self._sweep_dead_boards(stale))
+
+    async def _retire_boards(self) -> None:
+        """Board off (#761): post nothing, and sweep the boards earlier starts left.
+
+        A board nobody updates any more is the #754 lie — rows reading
+        "0s ago" for days — so it goes, under the same rules as the #720 sweep
+        (only our own boards; ``CLORD_DASHBOARD_SWEEP=0`` keeps them). Done
+        once per process: ``on_ready`` fires again on every reconnect.
+        """
+        if self._retired:
+            return
+        self._retired = True
+        boards = await self._find_own_boards()
+        logger.info(
+            "Session Status board is off (set %s=1 to show it) — %d board(s) from "
+            "earlier starts to retire in channel %s",
+            _BOARD_ENV_FLAG,
+            len(boards),
+            getattr(self._channel, "id", "?"),
+        )
+        if boards:
+            self._sweep_task = asyncio.create_task(self._sweep_dead_boards(boards))
 
     async def _adopt(self, candidate: discord.Message, embed: discord.Embed) -> bool:
         """Try to take over *candidate* as the live board. True when adopted."""
@@ -403,6 +467,7 @@ class ThreadStatusDashboard:
         no_response: bool = False,
         usage_limit: UsageLimit | None = None,
         preempted: bool = False,
+        login_required: bool = False,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -476,7 +541,9 @@ class ThreadStatusDashboard:
                 # leads with "Claude has finished…" instead of "@you". A user
                 # mention pings anywhere in the content, so trailing it does not
                 # weaken the notification.
-                await thread.send(_completion_text(mention_id, no_response, usage_limit))
+                await thread.send(
+                    _completion_text(mention_id, no_response, usage_limit, login_required)
+                )
             except discord.HTTPException:
                 logger.debug(
                     "Failed to send completion mention in thread %d", thread_id, exc_info=True
@@ -487,6 +554,52 @@ class ThreadStatusDashboard:
         async with self._lock:
             self._threads.pop(thread_id, None)
             await self._refresh_dashboard()
+
+    async def prune_stale_rows(self) -> None:
+        """Drop rows idle for ``_STALE_HOURS`` and repaint — no state change needed (#754).
+
+        Edits the board only when a row actually went, so the periodic tick
+        costs nothing on a board that has nothing to drop.
+        """
+        async with self._lock:
+            if self._prune_stale():
+                await self._refresh_dashboard()
+
+    async def aclose(self) -> None:
+        """Stop the periodic prune. The board itself stays in the channel."""
+        task, self._prune_task = self._prune_task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    # ------------------------------------------------------------------
+    # Periodic prune (#754)
+    # ------------------------------------------------------------------
+
+    def _start_prune_timer(self) -> None:
+        """Start the prune loop once. ``initialize()`` runs on every reconnect."""
+        if self._prune_task is not None and not self._prune_task.done():
+            return
+        self._prune_task = asyncio.create_task(
+            self._prune_loop(), name="clord-session-status-prune"
+        )
+
+    async def _prune_loop(self) -> None:
+        """Prune on a timer, so the board empties even on a day nobody posts."""
+        while True:
+            await asyncio.sleep(_PRUNE_INTERVAL_SECONDS)
+            try:
+                await self.prune_stale_rows()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The board is decoration (#632): one failed tick must not end
+                # the timer, or the board freezes again — the bug this fixes.
+                logger.warning(
+                    "Session Status prune tick failed; retrying next tick", exc_info=True
+                )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -515,13 +628,23 @@ class ThreadStatusDashboard:
         except discord.HTTPException:
             logger.debug("Failed to edit dashboard message", exc_info=True)
 
-    def _prune_stale(self) -> None:
-        """Remove threads that haven't changed state in ``_STALE_HOURS`` hours."""
+    def _prune_stale(self) -> list[int]:
+        """Remove threads that haven't changed state in ``_STALE_HOURS`` hours.
+
+        Returns the ids it removed.
+        """
         cutoff = time.monotonic() - _STALE_HOURS * 3600
         stale = [tid for tid, info in self._threads.items() if info.state_changed_at < cutoff]
         for tid in stale:
-            logger.debug("Pruning stale dashboard entry for thread %d", tid)
             del self._threads[tid]
+        if stale:
+            logger.info(
+                "Session Status: dropped %d row(s) idle for %dh (threads=%s)",
+                len(stale),
+                _STALE_HOURS,
+                stale,
+            )
+        return stale
 
     def _build_embed(self) -> discord.Embed:
         """Construct the Discord embed reflecting current thread states."""
@@ -554,3 +677,70 @@ class ThreadStatusDashboard:
 
         embed.set_footer(text="Updates automatically · stale entries removed after 4h")
         return embed
+
+
+# ----------------------------------------------------------------------
+# Putting a turn on the board (#754)
+# ----------------------------------------------------------------------
+
+
+def dashboard_of(bot: object) -> ThreadStatusDashboard | None:
+    """The bot's Session Status board, or None when it has none (yet)."""
+    dashboard = getattr(bot, "thread_dashboard", None)
+    return dashboard if isinstance(dashboard, ThreadStatusDashboard) else None
+
+
+async def safe_set_state(
+    dashboard: ThreadStatusDashboard,
+    thread_id: int,
+    state: ThreadState,
+    description: str,
+    **kwargs: object,
+) -> None:
+    """Update the dashboard, never letting its failure take the turn down (#632).
+
+    The dashboard embed is decoration: a closed aiohttp session, a revoked
+    permission or a Discord outage must not stop Claude from running or from
+    answering. Before #632 the PROCESSING update was the one un-guarded Discord
+    call on the turn path, so any of those killed the task before
+    ``run_claude_with_config`` was reached and the user's message vanished with
+    no reply, no ❌, nothing. Swallowed — but logged at WARNING, never silently.
+    """
+    try:
+        await dashboard.set_state(thread_id, state, description, **kwargs)  # type: ignore[arg-type]
+    except Exception:
+        logger.warning(
+            "%s dashboard set_state(%s) failed; continuing the turn",
+            log_ctx(thread_id=thread_id),
+            state.value,
+            exc_info=True,
+        )
+
+
+@contextlib.asynccontextmanager
+async def board_turn(
+    dashboard: ThreadStatusDashboard | None, thread_id: int, label: str
+) -> AsyncIterator[None]:
+    """🟢 on the board while the block runs, 🟡 after — however it ends (#754).
+
+    For the turns nobody posted for: the scheduler, webhook triggers and
+    ``/skill``. Before #754 only ``ClaudeChatCog`` touched the board, so a
+    scheduled run was live while the board said nothing was.
+
+    *label* is what the row says — pass something already public (the task
+    name, the trigger prefix, the ``/skill`` line), **not** a server-side
+    prompt: those never reached Discord before, and the board is in the main
+    channel.
+
+    Only the board changes. No ``thread`` is passed, so the turn-end
+    "Claude has finished" ping stays exactly as it was for these paths (none).
+    """
+    if dashboard is None:
+        yield
+        return
+    description = label[:100].replace("\n", " ")
+    await safe_set_state(dashboard, thread_id, ThreadState.PROCESSING, description)
+    try:
+        yield
+    finally:
+        await safe_set_state(dashboard, thread_id, ThreadState.WAITING_INPUT, description)

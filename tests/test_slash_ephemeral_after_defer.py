@@ -329,3 +329,21 @@ class TestErrorAfterAck:
 
         assert fake.thread() == [], _text(fake.thread())
         assert fake.only_for_invoker()
+
+
+class TestDeferrableResponder:
+    """``/clear`` / ``/compact`` (#803/#806) grew a fourth copy of the plumbing."""
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_after_ack_and_double_ack(self) -> None:
+        fake = FakeDiscord()
+        interaction = fake.interaction(_thread())
+        respond, ack = ClaudeChatCog._deferrable_responder(interaction)
+
+        await ack()
+        await ack()  # the impls may ack more than once — must not defer twice
+        await respond("only for you", ephemeral=True)
+
+        interaction.response.defer.assert_awaited_once()
+        assert fake.thread() == []
+        assert _text(fake.only_for_invoker()) == "only for you"

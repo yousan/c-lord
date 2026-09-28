@@ -27,6 +27,12 @@ from c_lord.discord_ui.thread_dashboard import (
 _BOT_ID = 4242
 
 
+@pytest.fixture(autouse=True)
+def _board_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the board itself, which is opt-in since #761."""
+    monkeypatch.setenv("CLORD_SESSION_STATUS_BOARD", "1")
+
+
 async def _aiter(items: list[MagicMock]) -> AsyncIterator[MagicMock]:
     """Async iterator over *items* — stands in for ``channel.history()``."""
     for item in items:

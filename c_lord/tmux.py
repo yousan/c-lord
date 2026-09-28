@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -728,6 +729,9 @@ class TmuxSessionManager:
         self._next_work_id: int = 1
         # thread_id -> tmux ``window_id`` (``@218``), never a window name (#649).
         self._thread_to_window: dict[int, str] = {}
+        # #809: thread_id -> tmux's stderr for the last keystrokes it refused.
+        # Read (and cleared) by :meth:`take_send_failure`.
+        self._send_failures: dict[int, str] = {}
         # #353: the session's secret-removal mark is issued once per manager,
         # not once per turn — it is a property of the session, not of the call.
         self._env_stripped: bool = False
@@ -2063,6 +2067,60 @@ class TmuxSessionManager:
 
     # ── Claude execution API ────────────────────────────────────────
 
+    def _session_flags(self, pane_path: str | None, *, try_continue: bool) -> list[str]:
+        """Which Claude Code session this launch is, as command-line flags (#773).
+
+        c-lord **names the session it starts** (``--session-id <uuid>``) and
+        records the name beside the transcripts, so the mirror can recognise its
+        own jsonl by a name c-lord chose rather than by a marker inside the file.
+        Claude Code 2.1.278 began stripping that marker from interactive input,
+        which silently cost every thread on this host its delivery path for
+        three days (#773) — an identifier the CLI never touches cannot fail that
+        way.
+
+        A resume must land back in the transcript the mirror already follows, so
+        it uses ``--resume <claimed id>`` rather than ``--continue``: ``--continue``
+        reopens whatever wrote last in the working copy, which may be a ``claude
+        -p`` sub-invocation (#627's hazard, one layer down).  ``--session-id``
+        is deliberately **not** added there — the CLI refuses it with ``--resume``
+        unless ``--fork-session`` is given, and forking copies the whole history
+        into a new transcript, which the mirror would have to re-read.
+
+        Falls back to the old behaviour whenever the claim cannot be made (no
+        pane path, unwritable directory): the thread then relies on the
+        :data:`~c_lord.transcript.resolver.CLORD_INPUT_MARKER` rule, exactly as
+        before this change.
+        """
+        if not pane_path:
+            logger.warning(
+                "start_claude: tmux would not say where the pane is, so this session "
+                "cannot be named (#773) — the mirror falls back to the marker rule"
+            )
+            return ["--continue"] if try_continue else []
+
+        from .transcript.claim import new_session_id, read_claim, write_claim
+        from .transcript.resolver import derive_project_dir
+
+        project_dir = derive_project_dir(pane_path)
+        if try_continue:
+            claimed = read_claim(project_dir)
+            if claimed is not None:
+                return ["--resume", claimed]
+            return ["--continue"]
+
+        session_id = new_session_id()
+        if not write_claim(project_dir, session_id):
+            # Without the claim, naming the session would only hide the problem:
+            # the mirror would look for a file it was never told about.
+            return []
+        logger.info(
+            "start_claude: session %s claims transcript %s.jsonl in %s (#773)",
+            session_id,
+            session_id,
+            project_dir,
+        )
+        return ["--session-id", session_id]
+
     def start_claude(
         self,
         thread_id: int,
@@ -2119,15 +2177,17 @@ class TmuxSessionManager:
         cmd_parts = ["env", "-u", "CLAUDECODE"]
         for key in SENSITIVE_ENV_KEYS:
             cmd_parts.extend(["-u", key])
+        # Asked once: it labels the telemetry *and* decides where this session's
+        # transcript is claimed (#773).
+        pane_path = self._pane_path(target)
         # Label the telemetry with the working directory and its repository so
         # cost/token metrics can be attributed per project instead of piling up
         # in one unlabelled bucket.
-        otel_attributes = _otel_resource_attributes(self._pane_path(target))
+        otel_attributes = _otel_resource_attributes(pane_path)
         if otel_attributes:
             cmd_parts.append(f"OTEL_RESOURCE_ATTRIBUTES='{otel_attributes}'")
         cmd_parts.append("claude")
-        if try_continue:
-            cmd_parts.append("--continue")
+        cmd_parts.extend(self._session_flags(pane_path, try_continue=try_continue))
         cmd_parts.extend(["--model", model])
         if dangerously_skip_permissions:
             cmd_parts.append("--dangerously-skip-permissions")
@@ -2176,12 +2236,14 @@ class TmuxSessionManager:
                     exc,
                 )
                 safe_prompt = marked_prompt.replace("'", "'\\''")
-                cmd_parts.append(f"'{safe_prompt}'")
+                cmd_parts.extend(["--", f"'{safe_prompt}'"])
             else:
                 # Read it into a variable and delete the file *before* claude runs,
                 # so no prompt text sits on disk for the life of the session.
                 prelude = f'CLORD_PROMPT="$(cat {prompt_path})"; rm -f {prompt_path}; '
-                cmd_parts.append('"$CLORD_PROMPT"')
+                # ``--``: the prompt is a positional argument, never a flag
+                # (CLAUDE.md Security; #809).
+                cmd_parts.extend(["--", '"$CLORD_PROMPT"'])
 
         # Prefix with unalias to bypass any shell alias (e.g. --continue).
         cmd = f"unalias claude 2>/dev/null; {prelude}{' '.join(cmd_parts)}"
@@ -2189,15 +2251,41 @@ class TmuxSessionManager:
         # Typed literally and in pieces: the prompt rides on this command line,
         # so a long attachment/paste would otherwise blow past tmux's imsg cap
         # and the whole turn would be lost (#527).
-        if not self._type_literal(target, cmd, what="start_claude"):
+        errors: list[str] = []
+        if not self._type_literal(target, cmd, what="start_claude", errors=errors):
+            self._note_send_failure(thread_id, errors)
             return False
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         if result.returncode != 0:
             logger.warning("start_claude: send-keys Enter failed: %s", result.stderr.strip())
             return False
+        if prompt is not None:
+            # #808: as in send_input — the marker alone no longer survives.
+            from .transcript.pane_echo import PROMPT_TTL_SECONDS, pane_echo
+
+            pane_echo.register(thread_id, prompt, ttl=PROMPT_TTL_SECONDS)
 
         logger.info("start_claude: sent command to %s", target)
         return True
+
+    def project_dir_for(self, thread_id: int) -> Path | None:
+        """Where *thread_id*'s Claude Code writes its transcripts, or None (#803).
+
+        Derived from the pane's cwd the same way :meth:`_session_flags` does when
+        it claims a session, so ``/clear`` moves the claim in the directory the
+        claim was written to.
+        """
+        if not self._check_available():
+            return None
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return None
+        pane_path = self._pane_path(self._target(window))
+        if not pane_path:
+            return None
+        from .transcript.resolver import derive_project_dir
+
+        return derive_project_dir(pane_path)
 
     def _pane_path(self, target: str) -> str | None:
         """Current working directory of *target*'s pane, or None if unknown."""
@@ -2206,7 +2294,9 @@ class TmuxSessionManager:
             return None
         return result.stdout.strip() or None
 
-    def _type_literal(self, target: str, text: str, *, what: str) -> bool:
+    def _type_literal(
+        self, target: str, text: str, *, what: str, errors: list[str] | None = None
+    ) -> bool:
         """Type *text* into *target* with ``send-keys -l``, split for tmux's cap.
 
         One ``send-keys`` carrying more than ~16KB is refused outright by the
@@ -2217,20 +2307,30 @@ class TmuxSessionManager:
         continuous stream of characters.
 
         Returns True only if **every** chunk was accepted; the caller must not
-        press Enter on a partially typed payload.
+        press Enter on a partially typed payload.  When a chunk is refused,
+        tmux's own error text is appended to *errors* so the caller can report
+        the real cause instead of guessing one (#809).
         """
         chunks = _chunk_for_send_keys(text)
         for index, chunk in enumerate(chunks, start=1):
-            result = _run(["tmux", "send-keys", "-l", "-t", target, chunk])
+            # #809: ``--`` or a chunk starting with ``-`` is parsed as options —
+            # ``- 箇条書き`` fails with "invalid flag -" and ``-R`` "succeeds" by
+            # resetting the terminal and typing nothing. The first chunk of a
+            # bulleted menu answer and any later chunk of a long message can both
+            # start with ``-``.
+            result = _run(["tmux", "send-keys", "-l", "-t", target, "--", chunk])
             if result.returncode != 0:
+                error = result.stderr.strip()
                 logger.warning(
                     "%s: send-keys -l failed on chunk %d/%d (%d bytes): %s",
                     what,
                     index,
                     len(chunks),
                     len(chunk.encode("utf-8")),
-                    result.stderr.strip(),
+                    error,
                 )
+                if errors is not None:
+                    errors.append(error or f"send-keys exited {result.returncode}")
                 if index > 1:
                     # Best effort: wipe the half-typed payload. Left in the box
                     # it would prepend itself to whatever the user sends next —
@@ -2523,8 +2623,15 @@ class TmuxSessionManager:
             self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
         payload = f"{ZWSP_MARKER}{text}"
-        if not self._type_literal(target, payload, what="send_input"):
+        errors: list[str] = []
+        if not self._type_literal(target, payload, what="send_input", errors=errors):
+            self._note_send_failure(thread_id, errors)
             return False
+        # #808: CLI 2.1.278+ strips the marker before writing the ``user``
+        # event, so the mirror cannot rely on it — record what was typed.
+        from .transcript.pane_echo import PROMPT_TTL_SECONDS, pane_echo
+
+        pane_echo.register(thread_id, text, ttl=PROMPT_TTL_SECONDS)
 
         # #560: a payload big enough to be treated as a paste is folded into a
         # ``[Pasted text …]`` placeholder, and an Enter arriving inside that
@@ -2671,7 +2778,10 @@ class TmuxSessionManager:
             return False
 
         target = self._target(window)
-        ok = self._type_literal(target, text, what="send_literal")
+        errors: list[str] = []
+        ok = self._type_literal(target, text, what="send_literal", errors=errors)
+        if not ok:
+            self._note_send_failure(thread_id, errors)
         if ok:
             # After the keystrokes land, so nothing is registered for text that
             # never reached the pane and could not produce an echo.
@@ -2717,11 +2827,30 @@ class TmuxSessionManager:
             return False
 
         target = self._target(window)
-        result = _run(["tmux", "send-keys", "-t", target, *keys])
+        # ``--``: a key name is never an option (#809).
+        result = _run(["tmux", "send-keys", "-t", target, "--", *keys])
         if result.returncode != 0:
-            logger.warning("send_keys: send-keys failed: %s", result.stderr.strip())
+            error = result.stderr.strip()
+            logger.warning("send_keys: send-keys failed: %s", error)
+            self._note_send_failure(thread_id, [error or f"send-keys exited {result.returncode}"])
             return False
         return True
+
+    def _note_send_failure(self, thread_id: int, errors: list[str]) -> None:
+        """Remember why tmux refused *thread_id*'s keystrokes (#809)."""
+        if errors:
+            self._send_failures[thread_id] = errors[-1]
+
+    def take_send_failure(self, thread_id: int) -> str | None:
+        """tmux's error for *thread_id*'s last refused send, once, or None (#809).
+
+        None means no keystroke was *refused by tmux* since the last call —
+        a failure that returns None happened before tmux was asked (typically:
+        there is no window). The two need opposite advice, and the caller used
+        to tell every one of them "the window was not found" (#600 wording) or
+        "the pane is dead, /claude-restart" (#527 wording).
+        """
+        return self._send_failures.pop(thread_id, None)
 
     def capture_pane(self, thread_id: int, history_lines: int = 500) -> str:
         """Capture the current pane text from the tmux window.
@@ -3206,6 +3335,66 @@ def _claude_panes_by_thread() -> dict[int, str]:
         if tid.isdigit() and "claude" in command.strip().lower():
             panes[int(tid)] = pane_id
     return panes
+
+
+# What tmux says when there is no server to ask — a host reboot's normal state,
+# not a failure to read one (#807).
+_NO_SERVER_RE = re.compile(r"no server running|error connecting to", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LiveClaude:
+    """Every pane running claude right now: by ``@thread_id`` tag and by cwd (#807)."""
+
+    thread_ids: frozenset[int]
+    paths: frozenset[str]
+
+    def covers(self, thread_id: int, working_dir: str) -> bool:
+        """Whether this thread's Claude is still alive in some pane."""
+        if thread_id in self.thread_ids:
+            return True
+        return os.path.realpath(working_dir) in self.paths or working_dir in self.paths
+
+
+def live_claude_panes() -> LiveClaude | None:
+    """Which Claudes survived — or ``None`` when tmux could not be asked (#807).
+
+    **No server at all is an answer, not an error**: after a host reboot the
+    fleet's tmux server simply is not there, and "nobody is alive" is exactly
+    what the startup notice needs to hear. Anything else that stops tmux from
+    answering (not installed, a permission problem) is ``None`` — "could not
+    tell" must never be read as "everything died" (``fleet-tmux-restart.md``).
+
+    Panes are matched by ``@thread_id`` and, for a window made before tagging
+    existed, by the pane's cwd. Only panes positively running claude count.
+    """
+    if not _tmux_available():
+        return None
+    result = _run(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{@thread_id}\t#{pane_current_command}\t#{pane_current_path}",
+        ]
+    )
+    if result.returncode != 0:
+        if _NO_SERVER_RE.search(result.stderr or ""):
+            return LiveClaude(frozenset(), frozenset())
+        return None
+    thread_ids: set[int] = set()
+    paths: set[str] = set()
+    for line in result.stdout.splitlines():
+        tid, _, rest = line.partition("\t")
+        command, _, path = rest.partition("\t")
+        if "claude" not in command.strip().lower():
+            continue
+        if tid.strip().isdigit():
+            thread_ids.add(int(tid.strip()))
+        if path.strip():
+            paths.add(path.strip())
+    return LiveClaude(frozenset(thread_ids), frozenset(paths))
 
 
 def resident_thread_ids() -> set[int]:

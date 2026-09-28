@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,15 +32,22 @@ from ..transcript.ask_result import (
     ASK_NOT_ANSWERED,
     ASK_UNKNOWN,
     AskOutcome,
+    ask_tool_uses,
     classify_ask_result,
-    latest_ask_tool_use,
+    first_ask_tool_use_after,
     read_ask_result,
 )
+from ..utils.logger import log_ctx
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
+    DELIVERY_DELIVERED,
+    DELIVERY_NOT_ANSWERED,
+    DELIVERY_UNCONFIRMED,
+    DELIVERY_UNDELIVERED,
+    ChosenOption,
 )
 from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
@@ -48,6 +56,7 @@ from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
 from .embeds import (
     ask_answered_embed,
+    ask_confirming_embed,
     ask_embed,
     ask_unconfirmed_embed,
     ask_undelivered_embed,
@@ -80,6 +89,27 @@ _PANE_RESOLVE_MISSES = 2
 # for a busy host, not an expected wait.
 _ANSWER_CONFIRM_TIMEOUT = 12.0
 _ANSWER_CONFIRM_POLL = 0.5
+
+# #746: the window above cannot be the last word. One AskUserQuestion may carry
+# several questions, and the CLI writes its tool_result only once the LAST one
+# is answered — production measured +198s and +53min — so every earlier answer
+# timed out as ❔ over an answer Claude went on to use. The window cannot simply
+# grow: the bridge holds the thread's menu claim while it waits, and the next
+# question of the same ask is already on screen needing to be bridged. So the
+# window ends on time and a background watcher keeps reading the transcript,
+# correcting the menu when the result lands.
+#
+# Bounded by how long the rest of the ask can stay open: an unanswered question
+# is Esc'd after ASK_ANSWER_TIMEOUT, and that too writes a tool_result (a "no
+# answer" one), which the watcher reports as such. The poll backs off because
+# it re-reads one session file that can be megabytes.
+_LATE_CONFIRM_TIMEOUT = float(ASK_ANSWER_TIMEOUT + 3_600)
+_LATE_CONFIRM_POLL_MIN = 1.0
+_LATE_CONFIRM_POLL_MAX = 10.0
+
+# Strong references to the running watchers: the event loop only keeps weak
+# ones, and a collected task would silently stop correcting its menu.
+_late_confirmations: set[asyncio.Task[None]] = set()
 
 # #399: the prose context above the menu is posted as its own message(s).
 # Up to _CONTEXT_MAX_MSGS sequential chunks deliver the text IN FULL — clipping
@@ -129,6 +159,62 @@ async def _close(
             await ask_repo.delete(thread_id)
 
 
+# #752: written over the buttons of a menu a newer question has replaced. Only
+# the buttons go — the embed keeps what was asked (and any answer it recorded).
+_SUPERSEDED_NOTE = (
+    "-# ↪️ このあと新しい質問が出たため、この質問はもう受け付けていません（このボタンは無効です）。"
+)
+
+
+async def _retire_superseded_menus(
+    thread: discord.Thread, current: object, superseded_id: int | None
+) -> None:
+    """Strip the buttons of every earlier menu in *thread* (#752).
+
+    A thread shows one answerable menu at a time — the CLI draws one, and a new
+    one means the previous closed. Its message did not know that: the ledger
+    row that would have let restart recovery re-arm or retire it had just been
+    overwritten by this menu's row (``pending_asks`` is keyed by thread), so it
+    kept looking pressable, and after the next restart pressing it answered
+    "This interaction failed". Production: 43 such menus, the oldest 99 days.
+
+    Two places can hold such a message: the row's ``superseded_id`` (a menu an
+    earlier process drew) and this process's own registry of live copies.
+    Never raises, and never quietly: what could not be retired is said at INFO
+    (#678) — the startup sweep gets another go at it after the next restart.
+    """
+    current_id = getattr(current, "id", None)
+    ctx = log_ctx(thread_id=thread.id)
+    stale: list[object] = list(_ask_menus.pop_others(thread.id, current_id))
+    stale_ids = {getattr(m, "id", None) for m in stale}
+    if superseded_id is not None and superseded_id != current_id and superseded_id not in stale_ids:
+        try:
+            stale.append(await thread.fetch_message(superseded_id))
+        except Exception as exc:  # deleted, or no access — nothing left to press
+            logger.info(
+                "%s could not fetch the superseded menu %s to retire it: %s (#752)",
+                ctx,
+                superseded_id,
+                exc,
+            )
+    for message in stale:
+        try:
+            await message.edit(content=_SUPERSEDED_NOTE, view=None)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.info(
+                "%s could not retire the superseded menu %s — it still looks pressable: %s (#752)",
+                ctx,
+                getattr(message, "id", "?"),
+                exc,
+            )
+        else:
+            logger.info(
+                "%s retired the superseded menu %s — a newer question replaced it (#752)",
+                ctx,
+                getattr(message, "id", "?"),
+            )
+
+
 def _mention(user_id: int | None) -> str | None:
     """Message content that pings *user_id*, or None (#480).
 
@@ -138,17 +224,20 @@ def _mention(user_id: int | None) -> str | None:
     return f"<@{user_id}>" if user_id is not None else None
 
 
-def _answer_undeliverable_notice(selected: list[str]) -> str:
+def _answer_undeliverable_notice(selected: list[str], reason: str | None = None) -> str:
     """Told to the thread when the chosen answer never reached Claude (#600).
 
     Echo the choice back: the menu is gone from Discord's side, so without this
     the person's decision is simply lost and they have to guess what they picked.
+    *reason* is the runner's own account (#809) — "no window" was only one of
+    the causes, and saying it of a window that existed sent people looking for
+    the wrong problem.
     """
     choice = " / ".join(s for s in selected if s) or "(選択なし)"
     return (
         "-# ⚠️ 選んだ回答を Claude に届けられませんでした"
         f"（選択: {choice}）。"
-        "スレッドの tmux ウィンドウが見つかりませんでした。"
+        f"{reason or _NO_WINDOW_REASON}。"
         "もう一度送るか、`/tmux-screenshot` でセッションの状態を確認してください。"
     )
 
@@ -158,6 +247,12 @@ _NOT_ANSWERED_REASON = (
     "（メニューが回答を受け取らずに閉じています）"
 )
 _NO_WINDOW_REASON = "スレッドの tmux ウィンドウが見つかりませんでした"
+
+
+def _undelivered_reason(runner: object) -> str:
+    """The runner's account of why an answer did not land, or the #600 default (#809)."""
+    reason = getattr(runner, "undelivered_reason", None)
+    return reason if isinstance(reason, str) and reason else _NO_WINDOW_REASON
 
 
 async def _transcript_dir(runner: TmuxClaudeRunner) -> Path | None:
@@ -173,6 +268,68 @@ async def _transcript_dir(runner: TmuxClaudeRunner) -> Path | None:
         logger.debug("could not resolve the transcript dir for verification", exc_info=True)
         return None
     return result if isinstance(result, Path) else None
+
+
+@dataclass
+class _MenuRef:
+    """Where in Claude's transcript one menu's outcome will be written (#651/#746).
+
+    *ask* is the menu's ``AskUserQuestion`` tool_use when it is already in the
+    transcript. When it is not — the CLI sometimes writes a menu's tool_use only
+    together with its result — *ask* is None and the menu is the first ask to be
+    written after the timestamp *after* (None: after nothing, i.e. any).
+    """
+
+    project_dir: Path
+    ask: tuple[str, Path] | None = None
+    after: str | None = None
+
+    def describe(self) -> str:
+        return self.ask[0] if self.ask is not None else "the next AskUserQuestion written"
+
+    async def outcome(self) -> AskOutcome:
+        """One read: the verdict so far, ``unknown`` until something is written."""
+        if self.ask is None:
+            self.ask = await asyncio.to_thread(
+                first_ask_tool_use_after, self.project_dir, self.after
+            )
+            if self.ask is None:
+                return ASK_UNKNOWN
+        tool_use_id, session_path = self.ask
+        return classify_ask_result(
+            await asyncio.to_thread(read_ask_result, self.project_dir, tool_use_id, session_path)
+        )
+
+
+async def _locate_menu(runner: TmuxClaudeRunner, question: AskQuestion) -> _MenuRef | None:
+    """Find the open menu in the transcript, BEFORE it is answered (#651).
+
+    Before: afterwards a newer menu may already be the newest. And the newest
+    ask is only this menu if it has no result yet — a menu that is still open
+    cannot have one. Found on staging (#746): 案B was Esc'd, 案C was asked, and
+    案C's tool_use was not in the file until 案C was answered; "the newest ask"
+    was 案B, so 案C's answer was judged by 案B's rejection — ``outcome=unknown``
+    over an answer Claude had received, and a late watcher on a result that
+    would never change.
+
+    None — the pane is the only evidence — when there is no transcript, and for
+    menus that are not ``AskUserQuestion`` at all: plan approval (#251,
+    ``allow_other=False``) writes no ask, so every ask in the transcript is some
+    earlier, finished one.
+    """
+    project_dir = await _transcript_dir(runner)
+    if project_dir is None:
+        return None
+    asks = await asyncio.to_thread(ask_tool_uses, project_dir)
+    after: str | None = None
+    if asks:
+        ts, tool_use_id, session_path = asks[-1]
+        if await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path) is None:
+            return _MenuRef(project_dir, ask=(tool_use_id, session_path))
+        after = ts
+    if not question.allow_other:
+        return None
+    return _MenuRef(project_dir, after=after)
 
 
 async def _menu_is_gone(runner: TmuxClaudeRunner) -> bool | None:
@@ -204,9 +361,7 @@ async def _menu_is_gone(runner: TmuxClaudeRunner) -> bool | None:
 
 
 async def _verify_answer_reached_claude(
-    runner: TmuxClaudeRunner,
-    project_dir: Path | None,
-    ask_ref: tuple[str, Path] | None,
+    runner: TmuxClaudeRunner, menu: _MenuRef | None
 ) -> AskOutcome:
     """Did the answer actually reach Claude? (#651)
 
@@ -218,18 +373,18 @@ async def _verify_answer_reached_claude(
        the machinery around it. It is what distinguishes the #650 failure — keys
        delivered, menu closed, answer discarded — from a real answer.
     2. **The pane.** Where there is no transcript to read (no tmux pane path, a
-       non-tmux runner), "the menu is gone" is the best available proxy. Weaker,
-       but far better than the pre-#651 answer of not checking at all.
+       non-tmux runner, a menu that is not an ask), "the menu is gone" is the
+       best available proxy. Weaker, but far better than the pre-#651 answer of
+       not checking at all.
 
     Polling is bounded by ``_ANSWER_CONFIRM_TIMEOUT`` because the ✅ waits on it.
+    An ``unknown`` here is not a verdict — :func:`settle_answer` hands it on to
+    the late watcher (#746).
     """
     deadline = asyncio.get_running_loop().time() + _ANSWER_CONFIRM_TIMEOUT
     while True:
-        if project_dir is not None and ask_ref is not None:
-            tool_use_id, session_path = ask_ref
-            outcome = classify_ask_result(
-                await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path)
-            )
+        if menu is not None:
+            outcome = await menu.outcome()
             if outcome != ASK_UNKNOWN:
                 return outcome
         elif await _menu_is_gone(runner) is True:
@@ -238,6 +393,140 @@ async def _verify_answer_reached_claude(
         if asyncio.get_running_loop().time() >= deadline:
             return ASK_UNKNOWN
         await asyncio.sleep(_ANSWER_CONFIRM_POLL)
+
+
+async def _await_late_outcome(menu: _MenuRef) -> AskOutcome:
+    """Keep reading the transcript until it records the menu's result (#746).
+
+    ``unknown`` only when ``_LATE_CONFIRM_TIMEOUT`` passes with nothing written —
+    by then the rest of the ask has been Esc'd, which writes a result of its own,
+    so reaching the bound means the session itself is gone.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _LATE_CONFIRM_TIMEOUT
+    delay = _LATE_CONFIRM_POLL_MIN
+    while True:
+        outcome = await menu.outcome()
+        if outcome != ASK_UNKNOWN or loop.time() >= deadline:
+            return outcome
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, _LATE_CONFIRM_POLL_MAX)
+
+
+async def _confirm_late(
+    msg,
+    question: AskQuestion,
+    selected: list[str],
+    menu: _MenuRef,
+    thread_id: int,
+) -> None:
+    """Background half of :func:`settle_answer`: correct the menu when the result lands."""
+    ctx = log_ctx(thread_id=thread_id)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        outcome = await _await_late_outcome(menu)
+    except asyncio.CancelledError:
+        # Shutdown. The menu keeps saying 確認中 — true when it was written, and
+        # carrying no advice that could hurt — but it must not go unrecorded.
+        logger.info(
+            "%s ask answer: stopped watching the transcript for %s (bot stopping) — "
+            "the menu stays at 確認中 (#746)",
+            ctx,
+            menu.describe(),
+        )
+        raise
+    except Exception:  # pragma: no cover - defensive: a watcher must never be loud
+        logger.warning("%s ask answer: late confirmation failed (#746)", ctx, exc_info=True)
+        outcome = ASK_UNKNOWN
+    waited = loop.time() - started
+    if outcome == ASK_ANSWERED:
+        logger.info(
+            "%s ask answer confirmed late: the transcript recorded it %.0fs after the "
+            "confirm window closed (#746)",
+            ctx,
+            waited,
+        )
+    else:
+        # The one line production greps for (#746 AC6): from here it means the
+        # answer really did not arrive, or really could not be confirmed.
+        logger.warning(
+            "%s ask answer outcome=%s after watching the transcript for %.0fs "
+            "(selected=%r) (#651/#746)",
+            ctx,
+            outcome,
+            waited,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
+
+
+async def settle_answer(
+    msg,
+    question: AskQuestion,
+    selected: list[str],
+    runner: TmuxClaudeRunner,
+    menu: _MenuRef | None,
+    *,
+    thread_id: int,
+) -> AskOutcome:
+    """Write what became of an answer onto its menu message (#651/#746).
+
+    Returns within the confirm window, always — the caller is usually holding
+    the thread's menu claim, and the next question of the same ask is waiting
+    for it. What cannot be decided by then is decided later:
+
+    - confirmed in the window → ✅ / ⚠️ now, as before;
+    - not yet, with a transcript to read → ⏳ 確認中 now, and a background
+      watcher turns it ✅ / ⚠️ when the ``tool_result`` lands;
+    - not yet, with nothing but the pane to go on → ❔. The pane cannot tell a
+      later question of the same ask from this one, so there is nothing a
+      longer watch could learn.
+
+    Returns the outcome known when it returns (``unknown`` while watching).
+    """
+    outcome = await _verify_answer_reached_claude(runner, menu)
+    if outcome == ASK_UNKNOWN and menu is not None:
+        logger.info(
+            "%s ask answer not in the transcript within %.0fs — showing 確認中 and "
+            "watching for %s (a multi-question ask records it after its last answer) (#746)",
+            log_ctx(thread_id=thread_id),
+            _ANSWER_CONFIRM_TIMEOUT,
+            menu.describe(),
+        )
+        with contextlib.suppress(Exception):
+            await msg.edit(
+                content=None,
+                embed=ask_confirming_embed(question.question, question.header, selected),
+                view=None,
+            )
+        task = asyncio.create_task(_confirm_late(msg, question, selected, menu, thread_id))
+        _late_confirmations.add(task)
+        task.add_done_callback(_late_confirmations.discard)
+        return outcome
+    if outcome != ASK_ANSWERED:
+        logger.warning(
+            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
+            outcome,
+            thread_id,
+            selected,
+        )
+    await _finalize_menu_message(msg, question, selected, outcome)
+    return outcome
+
+
+def _delivery_verdict(outcome: AskOutcome) -> str:
+    """Translate a verified outcome into the bus verdict callers wait on (#804).
+
+    The menu message already says all of this (#651), but the person who
+    answered by *typing* never looked at a button — their feedback is a line in
+    the thread, and it must not claim a delivery the transcript did not confirm.
+    """
+    if outcome == ASK_ANSWERED:
+        return DELIVERY_DELIVERED
+    if outcome == ASK_NOT_ANSWERED:
+        return DELIVERY_NOT_ANSWERED
+    return DELIVERY_UNCONFIRMED
 
 
 async def _finalize_menu_message(
@@ -252,11 +541,21 @@ async def _finalize_menu_message(
     if outcome == ASK_ANSWERED:
         embed = ask_answered_embed(question.question, question.header, selected)
     elif outcome == ASK_NOT_ANSWERED:
+        # #804: carry the options. This edit REPLACES the menu, and on a failure
+        # the reader's next job is to answer again — from a message that used to
+        # show only the answer that did not land, with the four choices it was
+        # picked from gone from the thread entirely.
         embed = ask_undelivered_embed(
-            question.question, question.header, selected, reason or _NOT_ANSWERED_REASON
+            question.question,
+            question.header,
+            selected,
+            reason or _NOT_ANSWERED_REASON,
+            options=question.options,
         )
     else:
-        embed = ask_unconfirmed_embed(question.question, question.header, selected)
+        embed = ask_unconfirmed_embed(
+            question.question, question.header, selected, options=question.options
+        )
     # Never let the report itself break the turn: a menu stuck in its interim
     # state is worse than the missing check this replaces.
     with contextlib.suppress(Exception):
@@ -264,7 +563,7 @@ async def _finalize_menu_message(
 
 
 async def _report_answer_delivery(
-    thread: discord.Thread, *, delivered: bool, selected: list[str]
+    thread: discord.Thread, *, delivered: bool, selected: list[str], reason: str | None = None
 ) -> None:
     """Say something only when the answer did not land (#600).
 
@@ -280,7 +579,23 @@ async def _report_answer_delivery(
         selected,
     )
     with contextlib.suppress(Exception):
-        await thread.send(_answer_undeliverable_notice(selected))
+        await thread.send(_answer_undeliverable_notice(selected, reason))
+
+
+def _option_index(question: AskQuestion, answer: str) -> int | None:
+    """Which option of *question* *answer* is, or None when it is free text (#674).
+
+    A click carries its index (:class:`ChosenOption`), and that is the
+    identity: a label is display text, and display text gets cut (Discord's
+    80-character limit), stripped, and duplicated (two ``""`` labels when #579's
+    parser could not read two options). Only an answer without an index —
+    ✏️ Other, a typed sentence — is compared with the labels, so a sentence that
+    spells an option exactly still picks it, as it always has.
+    """
+    if isinstance(answer, ChosenOption) and 0 <= answer.option_index < len(question.options):
+        return answer.option_index
+    labels = [opt.label for opt in question.options]
+    return labels.index(answer) if answer in labels else None
 
 
 async def send_answer_keystrokes(
@@ -296,19 +611,20 @@ async def send_answer_keystrokes(
     - multiSelect toggles each chosen index then Submits (#418); ``answer_menu``
       here dropped all but the first choice;
     - a single choice navigates ``Down × index`` — which is why the option ORDER
-      matters far more than the label text;
+      matters far more than the label text, and why a click is identified by
+      the index it carries rather than by its label (#674);
     - free text goes to whichever affordance this menu has (a "Type something."
       row, or a preview menu's ``Notes:`` field).
 
     Returns the runner's own delivery verdict: ``False`` means the keystrokes
     reached no window at all (#600).
     """
-    labels = [opt.label for opt in question.options]
-    indices = [labels.index(s) for s in selected if s in labels]
+    indices = [i for i in (_option_index(question, s) for s in selected) if i is not None]
     if question.multi_select and indices:
         return await runner.answer_menu_multi(indices, len(question.options))
-    if selected and selected[0] in labels:
-        return await runner.answer_menu(labels.index(selected[0]))
+    first = _option_index(question, selected[0]) if selected else None
+    if first is not None:
+        return await runner.answer_menu(first)
     return await runner.answer_menu_text(
         len(question.options), selected[0] if selected else "", mode=question.free_text_mode
     )
@@ -499,7 +815,14 @@ async def _bridge_claimed_menu(
     # in the log. Suppressed on failure: a ledger write must never be able to
     # take down a menu that is otherwise working.
     recoverable = False
+    superseded_id: int | None = None
     if ask_repo is not None:
+        # #752: the row about to be overwritten may be the only record of the
+        # previous menu's message. Read it first — once the save lands, nothing
+        # remembers that message, and its buttons stay up forever.
+        with contextlib.suppress(Exception):
+            previous = await ask_repo.get(thread.id)
+            superseded_id = getattr(previous, "message_id", None)
         with contextlib.suppress(Exception):
             await ask_repo.save(
                 thread_id=thread.id,
@@ -511,6 +834,7 @@ async def _bridge_claimed_menu(
                 message_id=getattr(msg, "id", None),
             )
             recoverable = True
+    await _retire_superseded_menus(thread, msg, superseded_id)
     # #717: tell the menu ledger the same thing. That ledger is what the #359
     # watchdog reads to decide whether a menu open in the pane has ever reached
     # Discord — and until now only the watchdog's OWN posts were written to it,
@@ -622,34 +946,35 @@ async def _bridge_claimed_menu(
     # #651: identify the menu in Claude's own transcript BEFORE answering it, so
     # the outcome can be read back from the authoritative place. Done up front
     # because after the answer a *new* menu may already be the newest one.
-    project_dir = await _transcript_dir(runner)
-    ask_ref = (
-        await asyncio.to_thread(latest_ask_tool_use, project_dir)
-        if project_dir is not None
-        else None
-    )
+    menu_ref = await _locate_menu(runner, question)
 
     delivered = await send_answer_keystrokes(runner, question, selected)
     # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
     # is what keeps the menu from silently staying open and being re-posted.
-    await _report_answer_delivery(thread, delivered=delivered is not False, selected=selected)
+    reason = _undelivered_reason(runner) if delivered is False else None
+    await _report_answer_delivery(
+        thread, delivered=delivered is not False, selected=selected, reason=reason
+    )
 
     # #651: keystrokes accepted by tmux is NOT the same as the answer reaching
     # Claude — #650 delivered every key, closed the menu, and still recorded
     # "(No answer provided)". Confirm before the menu is allowed to read as
     # answered.
     if delivered is False:
-        await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
-        return
-    outcome = await _verify_answer_reached_claude(runner, project_dir, ask_ref)
-    if outcome != ASK_ANSWERED:
-        logger.warning(
-            "ask answer outcome=%s for thread=%d (selected=%r) (#651)",
-            outcome,
-            thread.id,
-            selected,
+        # #804: whoever answered by typing is waiting to be told what happened.
+        # They get one line in the thread and nothing else, so it has to be this
+        # verdict and not "the bus accepted it" — that optimism is what printed
+        # 送りました two seconds before 届けられませんでした.
+        _ask_bus.note_delivery(thread.id, DELIVERY_UNDELIVERED)
+        await _finalize_menu_message(
+            msg, question, selected, ASK_NOT_ANSWERED, _undelivered_reason(runner)
         )
-    await _finalize_menu_message(msg, question, selected, outcome)
+        return
+    outcome = await settle_answer(msg, question, selected, runner, menu_ref, thread_id=thread.id)
+    # #804: the typed-answer line takes the verdict known at the end of the
+    # window. ``unknown`` there (#746: ⏳ 確認中, corrected on the menu later)
+    # maps to UNCONFIRMED, which #804 already treats as "do not re-send".
+    _ask_bus.note_delivery(thread.id, _delivery_verdict(outcome))
 
 
 async def collect_ask_answers(
@@ -754,6 +1079,9 @@ async def collect_ask_answers(
         # #651: on this path the answer needs no verification — it is returned
         # from here and injected as Claude's next prompt, so it cannot be lost
         # in a menu. Say so, rather than leaving the click's interim ⏳ standing.
+        # #804: and report it, so every path that consumes an answer ends in a
+        # verdict — a path that stays silent leaves its waiter timing out.
+        _ask_bus.note_delivery(thread.id, DELIVERY_DELIVERED)
         await _finalize_menu_message(msg, q, selected, ASK_ANSWERED)
 
         answer_text = ", ".join(selected)

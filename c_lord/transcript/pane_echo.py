@@ -1,4 +1,4 @@
-"""#682: registry of text c-lord typed into the pane *without* the ZWSP marker.
+"""#682/#808: registry of the text c-lord itself typed into a thread's pane.
 
 The mirror decides whether a ``user`` event is c-lord's own echo by looking for
 the zero-width space :data:`~c_lord.transcript.formatter.ZWSP_MARKER` that
@@ -19,6 +19,19 @@ So the marker gets a companion rather than a replacement: what
 about any ``user`` event that carried no marker. The answer text itself is
 never touched — that is the whole point (#682 AC3).
 
+#808 made the companion the main rule. Claude Code 2.1.278+ strips the ZWSP
+from input before writing the ``user`` event, so the marker test became false
+for *every* message and each Discord message came back as a 👤 line in every
+thread. ``send_input`` and ``start_claude`` now record what they type here too,
+so "did c-lord type this?" no longer depends on what the CLI does to its input
+(the #773 lesson). The marker is still honoured where it survives; the mirror
+then retires the matching record so it cannot outlive the echo it stood for.
+
+A prompt is recorded with a longer lifetime than a menu answer
+(:data:`PROMPT_TTL_SECONDS`): a message sent while a turn is running is queued
+by the CLI and only written to the transcript when it is dequeued, i.e. after
+that turn — which routinely takes far longer than five minutes.
+
 Design (a false positive here swallows a real message, so it is deliberately
 conservative — see also :mod:`c_lord.discord_ui.bridged_context`, the same
 pattern for the pre-menu prose):
@@ -33,7 +46,8 @@ pattern for the pre-menu prose):
   same short string in the pane within the TTL — is one 👤 line not mirrored,
   once;
 - entries are **one-shot** (consumed on first match), expire after
-  :data:`_TTL_SECONDS`, and at most :data:`_MAX_PER_THREAD` are kept per thread;
+  :data:`_TTL_SECONDS` (menu answers) or :data:`PROMPT_TTL_SECONDS` (prompts),
+  and at most :data:`_MAX_PER_THREAD` are kept per thread;
 - the store is in-memory: a bot restart between the keystrokes and the flush
   loses the entry, so the echo is posted as it is today. The degraded mode is a
   duplicate, never a lost message.
@@ -53,7 +67,12 @@ logger = logging.getLogger(__name__)
 # keystrokes. A longer window would only widen the chance of colliding with a
 # genuine, identical human line.
 _TTL_SECONDS = 300.0
-_MAX_PER_THREAD = 8
+# #808: a prompt typed during a running turn reaches the transcript only when
+# the CLI dequeues it, after that turn ends. Long turns are normal, and the
+# match is exact and one-shot, so a long window costs little.
+PROMPT_TTL_SECONDS = 6 * 3600.0
+# Enough for a burst of messages queued behind one long turn (#808).
+_MAX_PER_THREAD = 32
 
 
 def _normalize(text: str) -> str:
@@ -63,14 +82,18 @@ def _normalize(text: str) -> str:
 
 
 class PaneEchoRegistry:
-    """Per-thread, one-shot, TTL-bound store of unmarked c-lord pane input."""
+    """Per-thread, one-shot, TTL-bound store of c-lord's own pane input."""
 
     def __init__(self) -> None:
-        # thread_id -> [(registered_at_monotonic, normalized_text), ...]
+        # thread_id -> [(expires_at_monotonic, normalized_text), ...]
         self._entries: dict[int, list[tuple[float, str]]] = {}
 
-    def register(self, thread_id: int, text: str) -> None:
-        """Record *text* as typed into *thread_id*'s pane by c-lord itself."""
+    def register(self, thread_id: int, text: str, *, ttl: float = _TTL_SECONDS) -> None:
+        """Record *text* as typed into *thread_id*'s pane by c-lord itself.
+
+        *ttl* is how long the echo may take to reach the transcript — see
+        :data:`PROMPT_TTL_SECONDS` for why a prompt gets longer than a menu answer.
+        """
         norm = _normalize(text)
         if not norm:
             return
@@ -80,11 +103,11 @@ class PaneEchoRegistry:
         # of the process.
         for tid in list(self._entries):
             bucket = self._entries[tid]
-            bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
+            bucket[:] = [e for e in bucket if now < e[0]]
             if not bucket:
                 del self._entries[tid]
         bucket = self._entries.setdefault(thread_id, [])
-        bucket.append((now, norm))
+        bucket.append((now + ttl, norm))
         del bucket[:-_MAX_PER_THREAD]
 
     def consume_match(self, thread_id: int, text: str) -> bool:
@@ -93,7 +116,7 @@ class PaneEchoRegistry:
         if not bucket:
             return False
         now = time.monotonic()
-        bucket[:] = [e for e in bucket if now - e[0] < _TTL_SECONDS]
+        bucket[:] = [e for e in bucket if now < e[0]]
         norm = _normalize(text)
         for i, (_, cand) in enumerate(bucket):
             if cand == norm:

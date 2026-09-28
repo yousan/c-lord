@@ -106,17 +106,14 @@ def _blocks(event: dict) -> list:
     return content if isinstance(content, list) else []
 
 
-def latest_ask_tool_use(project_dir: Path) -> tuple[str, Path] | None:
-    """The most recent ``AskUserQuestion`` tool_use: ``(id, session file)``.
+def ask_tool_uses(project_dir: Path) -> list[tuple[str, str, Path]]:
+    """Every ``AskUserQuestion`` tool_use in *project_dir*, oldest first.
 
-    "Most recent" is the menu currently on screen — the bridge looks this up
-    while the menu is still open, so nothing newer can exist yet.
-
-    The file is returned along with the id so the outcome can later be polled
-    from that one file: a ``tool_result`` always lands in the same session
-    transcript as its ``tool_use``.
+    ``(timestamp, id, session file)`` — the file comes along so the outcome can
+    later be polled from that one file: a ``tool_result`` always lands in the
+    same session transcript as its ``tool_use``.
     """
-    best: tuple[str, str, Path] | None = None  # (timestamp, id, path)
+    found: list[tuple[str, str, Path]] = []
     for path, event in _iter_events(project_dir, _ASK_TOOL_NAME):
         ts = str(event.get("timestamp") or "")
         for block in _blocks(event):
@@ -124,11 +121,37 @@ def latest_ask_tool_use(project_dir: Path) -> tuple[str, Path] | None:
                 isinstance(block, dict)
                 and block.get("type") == "tool_use"
                 and block.get("name") == _ASK_TOOL_NAME
+                and isinstance(block.get("id"), str)
             ):
-                tool_use_id = block.get("id")
-                if isinstance(tool_use_id, str) and (best is None or ts >= best[0]):
-                    best = (ts, tool_use_id, path)
-    return (best[1], best[2]) if best else None
+                found.append((ts, block["id"], path))
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def latest_ask_tool_use(project_dir: Path) -> tuple[str, Path] | None:
+    """The most recent ``AskUserQuestion`` tool_use: ``(id, session file)``.
+
+    Beware: this is not always the menu on screen. The CLI sometimes writes a
+    menu's ``tool_use`` only together with its result, i.e. after the menu is
+    answered — and then the most recent ask is an *earlier*, finished one
+    (#746, found on staging). ``ask_handler._locate_menu`` checks for that.
+    """
+    found = ask_tool_uses(project_dir)
+    return (found[-1][1], found[-1][2]) if found else None
+
+
+def first_ask_tool_use_after(project_dir: Path, after: str | None) -> tuple[str, Path] | None:
+    """The earliest ``AskUserQuestion`` tool_use written after timestamp *after*.
+
+    For a menu whose ``tool_use`` was not in the transcript yet when it was
+    answered (#746): it is the first ask to appear after the newest one that
+    *was* there. The earliest, not the newest — a later question must never be
+    mistaken for this one. ``None`` for *after* means "any".
+    """
+    for ts, tool_use_id, path in ask_tool_uses(project_dir):
+        if after is None or ts > after:
+            return tool_use_id, path
+    return None
 
 
 def latest_ask_tool_use_id(project_dir: Path) -> str | None:

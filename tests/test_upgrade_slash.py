@@ -17,6 +17,7 @@ import discord
 from discord.ext import commands
 
 from c_lord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
+from c_lord.discord_ui.authorization import Authorizer
 
 _PATCH_EXEC = "asyncio.create_subprocess_exec"
 _PATCH_WAIT = "asyncio.wait_for"
@@ -27,6 +28,10 @@ def _make_bot() -> MagicMock:
     bot.cogs = {}
     bot.user = MagicMock()
     bot.user.id = 1
+    # #781: /upgrade asks the process's allowlist. These tests are about the
+    # pipeline, so the invoker is allowed; the refusal is tested in
+    # tests/test_command_authorization.py.
+    bot.authorizer = Authorizer(allow_anyone=True)
     return bot
 
 

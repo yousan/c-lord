@@ -239,6 +239,28 @@ def no_response_embed(detail: str) -> discord.Embed:
     )
 
 
+def login_required_embed(detail: str) -> discord.Embed:
+    """Embed for a turn Claude Code refused because it is not logged in (#812).
+
+    Deliberately NOT :func:`no_response_embed`: that one says the turn never
+    started and advises sending it again. Claude did answer — with "Please run
+    /login" — and every resend gets the same answer until someone logs in on
+    the host. Login is host-wide, so other threads are likely stopped too.
+    """
+    return discord.Embed(
+        title="\U0001f511 Claude Code のログインが切れています",
+        description=(
+            f"{detail}\n\n"
+            "Claude Code がログインを求めたため、このターンは実行されていません。\n"
+            "**ログインするまでは、同じ内容を送り直しても同じ結果になります。**\n\n"
+            "**できること:**\n"
+            "\u2022 ホストで `claude` を開き `/login` する\n"
+            "\u2022 ログインはホスト全体で共通です。他のスレッドも止まっている可能性があります"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def trust_stuck_embed(detail: str) -> discord.Embed:
     """Embed for a turn blocked on a folder-trust dialog that would not close (#630).
 
@@ -477,24 +499,72 @@ def ask_sending_embed(
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
 
 
-def ask_unconfirmed_embed(
+def ask_confirming_embed(
     question: str,
     header: str = "",
     selected: list[str] | None = None,
 ) -> discord.Embed:
-    """The outcome could not be confirmed either way within the bound (#651).
+    """The keys went out; Claude's transcript has not recorded the result yet (#746).
+
+    Not a failure and not a verdict. When one AskUserQuestion carries several
+    questions the CLI writes its ``tool_result`` only once the LAST one is
+    answered — production measured 198s and 53min — so an earlier answer cannot
+    be confirmed until then. The menu is corrected to ✅ when the result lands.
+
+    It must never suggest re-sending: a re-sent answer is an ordinary message,
+    and an ordinary message interrupts the running turn (#631's shape).
+    """
+    answer = ", ".join(selected or []) or "（未選択）"
+    title = f"⏳ {header}" if header else "⏳ 回答の受け取りを確認中"
+    body = (
+        f"{question}\n\n"
+        f"**送った答え:** {answer}\n"
+        "-# Claude の受け取りを確認中です。確認でき次第、この表示が更新されます"
+        "（まとめて聞かれた質問は、最後の質問に答えた時点で確認されます）。"
+    )
+    return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
+
+
+def _asked_options(options: list[AskOption] | None) -> str:
+    """The choices this menu offered, for an embed that replaces it (#804).
+
+    A menu message is edited in place when it resolves, so whatever the
+    replacement leaves out is gone from the thread. That was fine for ✅ (the
+    answer is the point) and wrong for every failure: the reader's next job is
+    to answer again, and 2026-09-24 left them a question with its four options
+    deleted and no way to see what they had been.
+    """
+    labels = [o.label for o in (options or []) if o.label]
+    if not labels:
+        return ""
+    return "**聞かれた選択肢:** " + " / ".join(labels) + "\n"
+
+
+def ask_unconfirmed_embed(
+    question: str,
+    header: str = "",
+    selected: list[str] | None = None,
+    options: list[AskOption] | None = None,
+) -> discord.Embed:
+    """The outcome could not be confirmed either way, and c-lord stopped looking (#651).
 
     Deliberately neither ✅ nor "届きませんでした": silence is not evidence of
     success, and telling someone their answer was lost when it may well have
     landed is its own way of being wrong. Say what is known.
+
+    #746: it used to add 「同じ内容をスレッドにもう一度送ってください」. The answer
+    had usually landed — and a re-sent answer is an interrupt of the turn that is
+    using it. Point at where the truth shows up instead.
     """
     answer = ", ".join(selected or []) or "（未選択）"
     title = f"❔ {header}" if header else "❔ 回答の結果を確認できませんでした"
     body = (
         f"{question}\n\n"
-        f"**送った答え:** {answer}\n\n"
-        "回答は送りましたが、Claude が受け取ったかどうかを確認できませんでした。"
-        "続きが返ってこないときは、同じ内容をスレッドにもう一度送ってください。"
+        f"**送った答え:** {answer}\n"
+        f"{_asked_options(options)}"
+        "\n"
+        "回答は送りましたが、Claude が受け取ったかどうかは確認できませんでした。"
+        "Claude の続きの返信に、この答えが反映されているかを見てください。"
     )
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_TODO)
 
@@ -504,6 +574,7 @@ def ask_undelivered_embed(
     header: str = "",
     selected: list[str] | None = None,
     reason: str = "",
+    options: list[AskOption] | None = None,
 ) -> discord.Embed:
     """Embed shown when a click could NOT be delivered to Claude (#536).
 
@@ -516,7 +587,9 @@ def ask_undelivered_embed(
     body = (
         f"{question}\n\n"
         f"**選ばれた答え:** {answer}\n"
-        f"**届かなかった理由:** {reason}\n\n"
+        f"**届かなかった理由:** {reason}\n"
+        f"{_asked_options(options)}"
+        "\n"
         "この選択は Claude に伝わっていません。続けるにはスレッドに"
         "メッセージを送ってください。"
     )
