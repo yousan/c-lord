@@ -45,6 +45,7 @@ from ..discord_ui.authorization import (
 )
 from ..discord_ui.embeds import error_embed, stopped_embed
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
+from ..discord_ui.slash_io import slash_io
 from ..discord_ui.status import StatusManager
 from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.thread_dashboard import safe_set_state as _safe_set_state
@@ -1468,19 +1469,9 @@ class ClaudeChatCog(commands.Cog):
         self, interaction: discord.Interaction, prompt: str, repo: str | None = None
     ) -> None:
         """Start a new Claude Code session or continue in an existing thread."""
-        state = {"acked": False}
-
-        async def ack(*_args: object, **_kwargs: object) -> None:
-            state["acked"] = True
-            await interaction.response.defer()
-
-        async def respond(
-            content: str | None = None, *, ephemeral: bool = False, silent: bool = False
-        ) -> None:
-            if state["acked"]:
-                await interaction.followup.send(content or "", ephemeral=ephemeral, silent=silent)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
+        # #748: the post-ack "only for you" replies (#443 / #75 permission help)
+        # must not replace the public "thinking…" placeholder.
+        respond, ack = slash_io(interaction)
 
         await self._clord_impl(
             channel=interaction.channel,
@@ -2085,29 +2076,10 @@ class ClaudeChatCog(commands.Cog):
 
         A wake or an interrupt can run past Discord's 3-second answer window
         (#803/#806). ``ack`` defers the interaction; after that, answers go out
-        as a follow-up. State is kept here rather than read back from
-        ``interaction.response.is_done()`` so the rule is the same in tests.
+        as a follow-up — through :func:`slash_io`, so an ``ephemeral=True``
+        answer after the defer really is only for the invoker (#748).
         """
-        deferred = False
-
-        async def ack() -> None:
-            nonlocal deferred
-            if not deferred:
-                deferred = True
-                await interaction.response.defer()
-
-        async def respond(
-            content: str | None = None,
-            *,
-            embed: discord.Embed | None = None,
-            ephemeral: bool = False,
-        ) -> None:
-            if deferred:
-                await interaction.followup.send(content or "", ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        return respond, ack
+        return slash_io(interaction)
 
     @staticmethod
     def _ctx_text_responder(ctx: commands.Context) -> _Responder:
