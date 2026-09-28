@@ -328,6 +328,8 @@ stopped drawing.
 
 Send a new message while Claude is working. The current operation is interrupted (SIGINT) and Claude starts with your new instruction. No need to `/stop` first.
 
+This also holds when the earlier message has not reached Claude yet (c-lord is still preparing it — cloning, waiting for a session slot). That earlier message is then never sent to Claude at all: only your new instruction runs (#800).
+
 A turn that does not wind down on its own within a few seconds is cancelled. If even that does not finish it within 10 seconds, c-lord stops waiting for it and starts your new instruction anyway — a stuck turn can no longer hold the thread's later messages behind it (#293). The bot log records it as an `orphan run`.
 
 ### Bot Restart
