@@ -552,3 +552,58 @@ class TestRestartReturnsToCaller:
             assert "起動直後に終了" in result.stderr
         finally:
             self._cleanup(clone)
+
+
+class TestStopEscalation(TestRestartReturnsToCaller):
+    """#699: a bot that ignores SIGTERM is SIGKILLed by PID, and that is logged.
+
+    Before, ``cmd_stop`` waited 15 s and ``die``d — ``restart`` then never
+    reached the launch, leaving production stopped until a human killed it.
+    Inherits the fake-bot helpers from :class:`TestRestartReturnsToCaller` (#401).
+    """
+
+    FAKE_BOT_IGNORES_TERM = (
+        "#!/usr/bin/env python3\n"
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        'print("[INFO] c_lord.bot: Logged in as Fake#0001 (ID: 42)", flush=True)\n'
+        "time.sleep(300)\n"
+    )
+
+    # Only the test cases below; don't re-run the inherited #401 cases here.
+    test_restart_returns_to_a_caller_reading_stdout_to_eof = None  # type: ignore[assignment]
+    test_restart_leaves_no_staging_process_behind = None  # type: ignore[assignment]
+    test_restart_returns_when_bot_dies_at_startup = None  # type: ignore[assignment]
+
+    def test_stop_escalates_to_sigkill_and_logs_it(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path, self.FAKE_BOT_IGNORES_TERM)
+        env = {**os.environ, "CLORD_STOP_GRACE_SECONDS": "2"}
+        try:
+            started = subprocess.run(
+                ["bash", str(SCRIPT), "restart", "--owner", "sess-R"],
+                cwd=clone,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            assert started.returncode == 0, started.stdout + started.stderr
+            log = Path(f"/tmp/clord-bot-{clone.name}.log").resolve()
+
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "stop", "--owner", "sess-R"],
+                cwd=clone,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            output = result.stdout + result.stderr
+            assert result.returncode == 0, output
+            assert "SIGKILL" in output
+            bots = [p for p, c in self._procs_in(clone).items() if "c_lord.main" in c]
+            assert bots == [], f"bot survived stop: {bots}"
+            # AC4: the bot's own log records that it was killed, not stopped.
+            assert "SIGKILL" in log.read_text(encoding="utf-8")
+        finally:
+            self._cleanup(clone)
