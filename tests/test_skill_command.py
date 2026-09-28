@@ -452,6 +452,28 @@ class TestInThreadMode:
             assert call_kwargs.session_id is None
 
     @pytest.mark.asyncio
+    async def test_other_clords_thread_is_not_taken_over(self) -> None:
+        """#811: /skill picked from the wrong bot names the owner and runs nothing."""
+        other = 1517328788164182116
+        cog = _make_cog(skills=[{"name": "recall", "description": ""}])
+        self._setup_in_thread_cog(cog)
+        cog.bot.user.id = 1475105094071750818
+        cog.bot.get_user = MagicMock(return_value=MagicMock(bot=True))
+        thread = _make_thread(thread_id=5555, parent_id=999)
+        thread.owner_id = other
+        interaction = _make_interaction(channel=thread)
+        cog.repo.get = AsyncMock(return_value=None)
+
+        with patch(
+            "c_lord.cogs.skill_command.run_claude_with_config", new_callable=AsyncMock
+        ) as mock_run:
+            await cog.run_skill.callback(cog, interaction, name="recall", args=None)
+            mock_run.assert_not_called()
+        sent = [str(c) for c in interaction.followup.send.call_args_list]
+        sent += [str(c) for c in interaction.response.send_message.call_args_list]
+        assert any(f"<@{other}>" in s for s in sent), sent
+
+    @pytest.mark.asyncio
     async def test_non_claude_thread_creates_new(self) -> None:
         """A thread not under the claude channel creates a new thread."""
         cog = _make_cog(skills=[{"name": "test", "description": ""}])

@@ -1496,6 +1496,44 @@ class TestStartSessionCommand:
         assert "c-lord のスレッドではない" in said, said
 
     @pytest.mark.asyncio
+    async def test_other_clords_thread_names_the_owner(self) -> None:
+        """#811: another c-lord's thread is a c-lord thread — just not this bot's.
+
+        Saying 「c-lord のスレッドではない」 there is false; the owner is named
+        instead, and nothing is taken over.
+        """
+        other = 1517328788164182116
+        cc = _make_channel_cog_mock(session_dir_manager=MagicMock())
+        cog = _make_cog(channel_cog=cc)
+        cog.bot.user.id = 1475105094071750818
+        cog.bot.get_user = MagicMock(return_value=MagicMock(bot=True))
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 42
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        thread.owner_id = other
+        thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        interaction.channel = thread
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+        cog.repo.get = AsyncMock(return_value=None)
+        cog._run_claude = AsyncMock()
+        cog._was_ever_our_thread = AsyncMock(return_value=False)
+
+        await cog.start_session.callback(cog, interaction, prompt="start fresh")
+
+        cog._run_claude.assert_not_called()
+        thread.send.assert_not_called()
+        said = str(interaction.response.send_message.call_args.args[0])
+        assert f"<@{other}>" in said, said
+        assert "c-lord のスレッドではない" not in said, said
+
+    @pytest.mark.asyncio
     async def test_any_channel_allowed(self) -> None:
         """/clord works in any channel, not just the bot's configured channel."""
         cc = _make_channel_cog_mock(tmux_manager=MagicMock())

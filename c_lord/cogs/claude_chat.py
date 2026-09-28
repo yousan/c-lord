@@ -77,6 +77,7 @@ from ..session_resume import (
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_auto_enabled
 from ..thread_origin import inspect_origin
+from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
 from ..transcript.claim import adopt_cleared_session, list_transcripts
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
@@ -1083,6 +1084,13 @@ class ClaudeChatCog(commands.Cog):
         nothing at all and the prompt had to be retyped after the click.
         """
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        # #811: another c-lord's thread is a c-lord thread, just not this bot's —
+        # 「c-lord のスレッドではない」 would be false. Name the owner instead.
+        foreign = await foreign_owner_notice_for(self.bot, self.repo, thread)
+        if foreign is not None:
+            logger.info("%s /clord refused — another bot's thread (#811)", ctx)
+            await respond(foreign, ephemeral=True)
+            return False
         if not await self._was_ever_our_thread(thread, parent_channel_id):
             logger.info("%s /clord refused — never a c-lord thread (#551)", ctx)
             await respond(NOT_A_CLORD_THREAD, ephemeral=True)
@@ -1462,6 +1470,20 @@ class ClaudeChatCog(commands.Cog):
             repo=repo,
         )
 
+    async def _answered_as_foreign_thread(self, channel: object, respond: _Responder) -> bool:
+        """Answer 「<@owner> の担当です」 when ``channel`` is another bot's thread — #811.
+
+        With two c-lords in a guild every slash command is listed twice, and the
+        one picked may belong to the bot that never saw this thread. Without this
+        it answers from its own empty ``sessions`` table — or, where both bots
+        share a tmux server and repo, reaches for a window that is not its own.
+        """
+        notice = await foreign_owner_notice_for(self.bot, self.repo, channel)
+        if notice is None:
+            return False
+        await respond(notice, ephemeral=True)
+        return True
+
     async def _stop_impl(self, channel: object, respond: _Responder) -> None:
         """Shared core for /stop and !stop (#209).
 
@@ -1471,6 +1493,9 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         runner = self._active_runners.get(channel.id)
@@ -1508,6 +1533,11 @@ class ClaudeChatCog(commands.Cog):
             await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
+            return
+
+        foreign = await foreign_owner_notice_for(self.bot, self.repo, channel)
+        if foreign is not None:
+            await interaction.response.send_message(foreign, ephemeral=True)
             return
 
         existing = await self.repo.get(channel.id)
@@ -1691,6 +1721,9 @@ class ClaudeChatCog(commands.Cog):
 
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         thread_id = channel.id
@@ -1891,6 +1924,9 @@ class ClaudeChatCog(commands.Cog):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
 
+        if await self._answered_as_foreign_thread(channel, respond):
+            return
+
         thread_id = channel.id
 
         # A session must exist to restart-and-resume; without one there is
@@ -2046,6 +2082,9 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         thread_id = channel.id
