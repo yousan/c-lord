@@ -159,6 +159,8 @@ It works in the same states as `/clear` (#806): a running turn is stopped first,
 
 Skills are predefined prompts stored in `~/.claude/skills/`. The `name` parameter supports autocomplete — start typing to filter available skills.
 
+In a channel, `/skill` opens a new thread and runs there; inside a c-lord thread it continues that thread's session. Either way the skill runs in the thread's own workspace (the channel's `/clord-init` checkout, the same one a normal message uses), and its answer arrives in the thread like any other reply. If no tmux window can be made for it, the thread says so (❌) instead of silently failing (#762).
+
 ### Channel Configuration
 
 | Command | Description | Where |

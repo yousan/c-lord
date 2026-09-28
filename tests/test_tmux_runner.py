@@ -1118,6 +1118,7 @@ class TestTmuxClaudeRunnerRun:
             dangerously_skip_permissions=False,
             try_continue=False,
             effort=None,
+            as_command=False,
         )
         assert any(e.message_type == MessageType.RESULT and e.is_complete for e in events)
 
@@ -2316,6 +2317,7 @@ class TestContinueFallback:
             dangerously_skip_permissions=False,
             try_continue=True,
             effort=None,
+            as_command=False,
         )
 
     @pytest.mark.asyncio
@@ -2403,6 +2405,7 @@ class TestContinueFallback:
             dangerously_skip_permissions=False,
             try_continue=False,
             effort=None,
+            as_command=False,
         )
         # The post-continue liveness check must not have happened.  The probe
         # *count* stopped being a proxy for that once #541 added a final probe
