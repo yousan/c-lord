@@ -43,6 +43,11 @@ from .ask_bus import (
     CLOSE_INTERRUPTED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
+    DELIVERY_DELIVERED,
+    DELIVERY_NOT_ANSWERED,
+    DELIVERY_UNCONFIRMED,
+    DELIVERY_UNDELIVERED,
+    ChosenOption,
 )
 from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
@@ -152,6 +157,62 @@ async def _close(
     if ask_repo is not None:
         with contextlib.suppress(Exception):
             await ask_repo.delete(thread_id)
+
+
+# #752: written over the buttons of a menu a newer question has replaced. Only
+# the buttons go — the embed keeps what was asked (and any answer it recorded).
+_SUPERSEDED_NOTE = (
+    "-# ↪️ このあと新しい質問が出たため、この質問はもう受け付けていません（このボタンは無効です）。"
+)
+
+
+async def _retire_superseded_menus(
+    thread: discord.Thread, current: object, superseded_id: int | None
+) -> None:
+    """Strip the buttons of every earlier menu in *thread* (#752).
+
+    A thread shows one answerable menu at a time — the CLI draws one, and a new
+    one means the previous closed. Its message did not know that: the ledger
+    row that would have let restart recovery re-arm or retire it had just been
+    overwritten by this menu's row (``pending_asks`` is keyed by thread), so it
+    kept looking pressable, and after the next restart pressing it answered
+    "This interaction failed". Production: 43 such menus, the oldest 99 days.
+
+    Two places can hold such a message: the row's ``superseded_id`` (a menu an
+    earlier process drew) and this process's own registry of live copies.
+    Never raises, and never quietly: what could not be retired is said at INFO
+    (#678) — the startup sweep gets another go at it after the next restart.
+    """
+    current_id = getattr(current, "id", None)
+    ctx = log_ctx(thread_id=thread.id)
+    stale: list[object] = list(_ask_menus.pop_others(thread.id, current_id))
+    stale_ids = {getattr(m, "id", None) for m in stale}
+    if superseded_id is not None and superseded_id != current_id and superseded_id not in stale_ids:
+        try:
+            stale.append(await thread.fetch_message(superseded_id))
+        except Exception as exc:  # deleted, or no access — nothing left to press
+            logger.info(
+                "%s could not fetch the superseded menu %s to retire it: %s (#752)",
+                ctx,
+                superseded_id,
+                exc,
+            )
+    for message in stale:
+        try:
+            await message.edit(content=_SUPERSEDED_NOTE, view=None)  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.info(
+                "%s could not retire the superseded menu %s — it still looks pressable: %s (#752)",
+                ctx,
+                getattr(message, "id", "?"),
+                exc,
+            )
+        else:
+            logger.info(
+                "%s retired the superseded menu %s — a newer question replaced it (#752)",
+                ctx,
+                getattr(message, "id", "?"),
+            )
 
 
 def _mention(user_id: int | None) -> str | None:
@@ -445,6 +506,20 @@ async def settle_answer(
     return outcome
 
 
+def _delivery_verdict(outcome: AskOutcome) -> str:
+    """Translate a verified outcome into the bus verdict callers wait on (#804).
+
+    The menu message already says all of this (#651), but the person who
+    answered by *typing* never looked at a button — their feedback is a line in
+    the thread, and it must not claim a delivery the transcript did not confirm.
+    """
+    if outcome == ASK_ANSWERED:
+        return DELIVERY_DELIVERED
+    if outcome == ASK_NOT_ANSWERED:
+        return DELIVERY_NOT_ANSWERED
+    return DELIVERY_UNCONFIRMED
+
+
 async def _finalize_menu_message(
     msg, question: AskQuestion, selected: list[str], outcome: AskOutcome, reason: str = ""
 ) -> None:
@@ -457,11 +532,21 @@ async def _finalize_menu_message(
     if outcome == ASK_ANSWERED:
         embed = ask_answered_embed(question.question, question.header, selected)
     elif outcome == ASK_NOT_ANSWERED:
+        # #804: carry the options. This edit REPLACES the menu, and on a failure
+        # the reader's next job is to answer again — from a message that used to
+        # show only the answer that did not land, with the four choices it was
+        # picked from gone from the thread entirely.
         embed = ask_undelivered_embed(
-            question.question, question.header, selected, reason or _NOT_ANSWERED_REASON
+            question.question,
+            question.header,
+            selected,
+            reason or _NOT_ANSWERED_REASON,
+            options=question.options,
         )
     else:
-        embed = ask_unconfirmed_embed(question.question, question.header, selected)
+        embed = ask_unconfirmed_embed(
+            question.question, question.header, selected, options=question.options
+        )
     # Never let the report itself break the turn: a menu stuck in its interim
     # state is worse than the missing check this replaces.
     with contextlib.suppress(Exception):
@@ -488,6 +573,22 @@ async def _report_answer_delivery(
         await thread.send(_answer_undeliverable_notice(selected))
 
 
+def _option_index(question: AskQuestion, answer: str) -> int | None:
+    """Which option of *question* *answer* is, or None when it is free text (#674).
+
+    A click carries its index (:class:`ChosenOption`), and that is the
+    identity: a label is display text, and display text gets cut (Discord's
+    80-character limit), stripped, and duplicated (two ``""`` labels when #579's
+    parser could not read two options). Only an answer without an index —
+    ✏️ Other, a typed sentence — is compared with the labels, so a sentence that
+    spells an option exactly still picks it, as it always has.
+    """
+    if isinstance(answer, ChosenOption) and 0 <= answer.option_index < len(question.options):
+        return answer.option_index
+    labels = [opt.label for opt in question.options]
+    return labels.index(answer) if answer in labels else None
+
+
 async def send_answer_keystrokes(
     runner: TmuxClaudeRunner, question: AskQuestion, selected: list[str]
 ) -> bool | None:
@@ -501,19 +602,20 @@ async def send_answer_keystrokes(
     - multiSelect toggles each chosen index then Submits (#418); ``answer_menu``
       here dropped all but the first choice;
     - a single choice navigates ``Down × index`` — which is why the option ORDER
-      matters far more than the label text;
+      matters far more than the label text, and why a click is identified by
+      the index it carries rather than by its label (#674);
     - free text goes to whichever affordance this menu has (a "Type something."
       row, or a preview menu's ``Notes:`` field).
 
     Returns the runner's own delivery verdict: ``False`` means the keystrokes
     reached no window at all (#600).
     """
-    labels = [opt.label for opt in question.options]
-    indices = [labels.index(s) for s in selected if s in labels]
+    indices = [i for i in (_option_index(question, s) for s in selected) if i is not None]
     if question.multi_select and indices:
         return await runner.answer_menu_multi(indices, len(question.options))
-    if selected and selected[0] in labels:
-        return await runner.answer_menu(labels.index(selected[0]))
+    first = _option_index(question, selected[0]) if selected else None
+    if first is not None:
+        return await runner.answer_menu(first)
     return await runner.answer_menu_text(
         len(question.options), selected[0] if selected else "", mode=question.free_text_mode
     )
@@ -704,7 +806,14 @@ async def _bridge_claimed_menu(
     # in the log. Suppressed on failure: a ledger write must never be able to
     # take down a menu that is otherwise working.
     recoverable = False
+    superseded_id: int | None = None
     if ask_repo is not None:
+        # #752: the row about to be overwritten may be the only record of the
+        # previous menu's message. Read it first — once the save lands, nothing
+        # remembers that message, and its buttons stay up forever.
+        with contextlib.suppress(Exception):
+            previous = await ask_repo.get(thread.id)
+            superseded_id = getattr(previous, "message_id", None)
         with contextlib.suppress(Exception):
             await ask_repo.save(
                 thread_id=thread.id,
@@ -716,6 +825,7 @@ async def _bridge_claimed_menu(
                 message_id=getattr(msg, "id", None),
             )
             recoverable = True
+    await _retire_superseded_menus(thread, msg, superseded_id)
     # #717: tell the menu ledger the same thing. That ledger is what the #359
     # watchdog reads to decide whether a menu open in the pane has ever reached
     # Discord — and until now only the watchdog's OWN posts were written to it,
@@ -839,9 +949,18 @@ async def _bridge_claimed_menu(
     # "(No answer provided)". Confirm before the menu is allowed to read as
     # answered.
     if delivered is False:
+        # #804: whoever answered by typing is waiting to be told what happened.
+        # They get one line in the thread and nothing else, so it has to be this
+        # verdict and not "the bus accepted it" — that optimism is what printed
+        # 送りました two seconds before 届けられませんでした.
+        _ask_bus.note_delivery(thread.id, DELIVERY_UNDELIVERED)
         await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
         return
-    await settle_answer(msg, question, selected, runner, menu_ref, thread_id=thread.id)
+    outcome = await settle_answer(msg, question, selected, runner, menu_ref, thread_id=thread.id)
+    # #804: the typed-answer line takes the verdict known at the end of the
+    # window. ``unknown`` there (#746: ⏳ 確認中, corrected on the menu later)
+    # maps to UNCONFIRMED, which #804 already treats as "do not re-send".
+    _ask_bus.note_delivery(thread.id, _delivery_verdict(outcome))
 
 
 async def collect_ask_answers(
@@ -946,6 +1065,9 @@ async def collect_ask_answers(
         # #651: on this path the answer needs no verification — it is returned
         # from here and injected as Claude's next prompt, so it cannot be lost
         # in a menu. Say so, rather than leaving the click's interim ⏳ standing.
+        # #804: and report it, so every path that consumes an answer ends in a
+        # verdict — a path that stays silent leaves its waiter timing out.
+        _ask_bus.note_delivery(thread.id, DELIVERY_DELIVERED)
         await _finalize_menu_message(msg, q, selected, ASK_ANSWERED)
 
         answer_text = ", ".join(selected)

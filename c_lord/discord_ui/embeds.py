@@ -503,10 +503,26 @@ def ask_confirming_embed(
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ASK)
 
 
+def _asked_options(options: list[AskOption] | None) -> str:
+    """The choices this menu offered, for an embed that replaces it (#804).
+
+    A menu message is edited in place when it resolves, so whatever the
+    replacement leaves out is gone from the thread. That was fine for ✅ (the
+    answer is the point) and wrong for every failure: the reader's next job is
+    to answer again, and 2026-09-24 left them a question with its four options
+    deleted and no way to see what they had been.
+    """
+    labels = [o.label for o in (options or []) if o.label]
+    if not labels:
+        return ""
+    return "**聞かれた選択肢:** " + " / ".join(labels) + "\n"
+
+
 def ask_unconfirmed_embed(
     question: str,
     header: str = "",
     selected: list[str] | None = None,
+    options: list[AskOption] | None = None,
 ) -> discord.Embed:
     """The outcome could not be confirmed either way, and c-lord stopped looking (#651).
 
@@ -522,7 +538,9 @@ def ask_unconfirmed_embed(
     title = f"❔ {header}" if header else "❔ 回答の結果を確認できませんでした"
     body = (
         f"{question}\n\n"
-        f"**送った答え:** {answer}\n\n"
+        f"**送った答え:** {answer}\n"
+        f"{_asked_options(options)}"
+        "\n"
         "回答は送りましたが、Claude が受け取ったかどうかは確認できませんでした。"
         "Claude の続きの返信に、この答えが反映されているかを見てください。"
     )
@@ -534,6 +552,7 @@ def ask_undelivered_embed(
     header: str = "",
     selected: list[str] | None = None,
     reason: str = "",
+    options: list[AskOption] | None = None,
 ) -> discord.Embed:
     """Embed shown when a click could NOT be delivered to Claude (#536).
 
@@ -546,7 +565,9 @@ def ask_undelivered_embed(
     body = (
         f"{question}\n\n"
         f"**選ばれた答え:** {answer}\n"
-        f"**届かなかった理由:** {reason}\n\n"
+        f"**届かなかった理由:** {reason}\n"
+        f"{_asked_options(options)}"
+        "\n"
         "この選択は Claude に伝わっていません。続けるにはスレッドに"
         "メッセージを送ってください。"
     )

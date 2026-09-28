@@ -7,15 +7,23 @@ semver tag + short commit + commit date (https://qiita.com/yousan/items/cffa19f6
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import pytest
 
 from c_lord.version import (
+    STALE_BUILD_DAYS,
+    _baked_commit_date,
+    _installed_version,
+    build_date,
     bump_version,
     detect_bump_level,
     extract_changelog_section,
     format_version_string,
+    label_with_age,
     parse_local_version,
     runtime_version,
+    stale_build_age,
 )
 
 
@@ -191,3 +199,123 @@ class TestRuntimeVersion:
             assert runtime_version() == "unknown"
         finally:
             runtime_version.cache_clear()
+
+
+class TestBuildAge:
+    """#756: a build says how old it is once that age is worth saying.
+
+    Judged from the local version string and today's date alone (AC3 — no
+    network). The ``-YYYYMMDD`` tail is the commit date of the running build.
+    """
+
+    TODAY = date(2026, 9, 23)
+
+    def test_reads_the_date_tail(self) -> None:
+        assert build_date("v1.4.197-b3f06814-20260915") == date(2026, 9, 15)
+
+    def test_date_without_commit(self) -> None:
+        assert build_date("v1.4.197-20260915") == date(2026, 9, 15)
+
+    @pytest.mark.parametrize(
+        "version",
+        ["unknown", "", "v1.4.197", "v1.4.197-b3f06814", "v1.4.197-b3f06814-20261399"],
+    )
+    def test_no_usable_date_is_none(self, version: str) -> None:
+        assert build_date(version) is None
+
+    def test_threshold_is_seven_days(self) -> None:
+        assert STALE_BUILD_DAYS == 7
+
+    def test_six_days_is_not_stale(self) -> None:
+        assert stale_build_age("v1.4.197-b3f06814-20260917", today=self.TODAY) is None
+
+    def test_seven_days_is_stale(self) -> None:
+        assert stale_build_age("v1.4.197-b3f06814-20260916", today=self.TODAY) == 7
+
+    def test_reports_the_real_age(self) -> None:
+        assert stale_build_age("v1.4.183-bd80c47e-20260906", today=self.TODAY) == 17
+
+    @pytest.mark.parametrize("version", ["unknown", "v1.4.197", "v1.4.197-b3f06814"])
+    def test_undatable_build_says_nothing(self, version: str) -> None:
+        """AC4: no date → no age, never ``None days``."""
+        assert stale_build_age(version, today=self.TODAY) is None
+
+    def test_future_date_is_not_stale(self) -> None:
+        """A skewed clock must not turn into a negative or bogus age."""
+        assert stale_build_age("v1.4.197-b3f06814-20261001", today=self.TODAY) is None
+
+    def test_defaults_to_today(self) -> None:
+        old = (date.today() - timedelta(days=30)).strftime("%Y%m%d")
+        assert stale_build_age(f"v1.4.0-babcdef0-{old}") == 30
+
+
+class TestLabelWithAge:
+    """#756 AC2: the footer label gains ``(Nd)`` only once the build is stale."""
+
+    TODAY = date(2026, 9, 23)
+
+    def test_stale_build_gets_age(self) -> None:
+        assert (
+            label_with_age("v1.4.183-bd80c47e-20260913", today=self.TODAY)
+            == "v1.4.183-bd80c47e-20260913 (10d)"
+        )
+
+    def test_fresh_build_is_unchanged(self) -> None:
+        assert (
+            label_with_age("v1.4.197-b3f06814-20260917", today=self.TODAY)
+            == "v1.4.197-b3f06814-20260917"
+        )
+
+    def test_undatable_build_is_unchanged(self) -> None:
+        assert label_with_age("v1.4.197", today=self.TODAY) == "v1.4.197"
+
+
+class TestInstalledVersion:
+    """#756: an installed wheel must carry its commit date too.
+
+    hatch-vcs only puts a date in the local version of a *dirty* build, so a
+    clean ``uv tool install git+…`` reported ``v1.4.197`` — no date, so the age
+    check above could never fire for exactly the instances that fall behind.
+    The build hook (``hatch_build.py``) bakes the date into ``_build_info``.
+    """
+
+    def test_tagged_wheel_gets_the_baked_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("c_lord.version._distribution_version", lambda: "1.4.197")
+        monkeypatch.setattr("c_lord.version._baked_commit_date", lambda: "20260915")
+        assert _installed_version() == "v1.4.197-20260915"
+
+    def test_dev_wheel_keeps_its_commit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "c_lord.version._distribution_version", lambda: "1.4.198.dev1+g3f06814"
+        )
+        monkeypatch.setattr("c_lord.version._baked_commit_date", lambda: "20260915")
+        assert _installed_version() == "v1.4.198-b3f06814-20260915"
+
+    def test_date_in_the_local_version_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "c_lord.version._distribution_version", lambda: "1.4.198.dev1+g3f06814.d20260920"
+        )
+        monkeypatch.setattr("c_lord.version._baked_commit_date", lambda: "20260915")
+        assert _installed_version() == "v1.4.198-b3f06814-20260920"
+
+    def test_no_baked_date_leaves_the_version_undated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("c_lord.version._distribution_version", lambda: "1.4.197")
+        monkeypatch.setattr("c_lord.version._baked_commit_date", lambda: None)
+        assert _installed_version() == "v1.4.197"
+
+    def test_not_installed_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("c_lord.version._distribution_version", lambda: None)
+        assert _installed_version() is None
+
+    def test_baked_date_is_validated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+        import types
+
+        mod = types.ModuleType("c_lord._build_info")
+        mod.COMMIT_DATE = "not-a-date"  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "c_lord._build_info", mod)
+        assert _baked_commit_date() is None
+        mod.COMMIT_DATE = "20260915"  # type: ignore[attr-defined]
+        assert _baked_commit_date() == "20260915"

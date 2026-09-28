@@ -321,7 +321,7 @@ class SkillCommandCog(commands.Cog):
         if tmux is None:
             await respond(
                 "⚠️ このチャンネルにはリポジトリが紐づけられていません。\n"
-                "先に `/clord-init repo:<URL> branch:<branch>` で設定してください。",
+                "先に `/clord-init repo:<URL>` で設定してください。",
                 ephemeral=True,
             )
             return

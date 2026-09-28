@@ -131,7 +131,7 @@ Before this, `/clord` checked only whether *a repository* was reachable from the
 /clord repo:git@github.com:yousan/dotclaude.git prompt:Claude 5 系に対応する
 ```
 
-The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root. The thread's tmux session follows the chosen repository too (#427).
+The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476). The thread's tmux session follows the chosen repository too (#427).
 
 `repo:` only applies when a thread is being **created**. Inside an existing thread it is refused with a pointer to `/clord-thread-init`, because that thread's working copy is already cloned and would not change.
 
@@ -161,6 +161,8 @@ Skills are predefined prompts stored in `~/.claude/skills/`. The `name` paramete
 | `/clord-thread-init remove:True` | Remove the thread-level binding | Thread only |
 
 Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory. A thread-level binding set via `/clord-thread-init` takes precedence over the channel binding.
+
+The `repo` value is stored in clonable form. A PR / issue / file link is shrunk to the repository root (#88), and a URL pasted without its scheme — `github.com/owner/repo`, as a browser address bar shows it — gets `https://` put back for `github.com`, `gitlab.com` and `bitbucket.org` (#476); the reply shows the value that was actually stored (`https://github.com/owner/repo.git`). Any other scheme-less string is taken as a local path and stored as-is.
 
 `/clord-thread-init repo:<url>` **changes the repository of a thread that is already c-lord's** — it does not turn a thread into one (#551). Binding an ordinary conversation thread used to be step one of the takeover described under `/clord` above, so it is refused on the same test. To start on a different repository, use `/clord repo:<url> prompt:<...>` in the channel, which opens a new thread already bound to it. Showing the binding (no arguments) and `remove:True` still work anywhere — neither can turn a thread into a session.
 
