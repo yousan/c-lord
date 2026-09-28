@@ -191,7 +191,11 @@ class PaneMenuAnswerer:
         )
         delivered = await send_answer_keystrokes(runner, pane_question, selected)
         if delivered is False:
-            logger.warning("%s restart recovery: keystrokes reached no window (#600)", ctx)
+            # #809: the runner knows why — a refusal by tmux is not a missing window.
+            why = getattr(runner, "undelivered_reason", None)
+            logger.warning("%s restart recovery: keystrokes not delivered: %s", ctx, why)
+            if isinstance(why, str) and why:
+                return False, f"キーを送れませんでした（{why}）"
             return False, REASON_NOT_DELIVERED
 
         if message is None:

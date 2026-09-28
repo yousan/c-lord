@@ -729,6 +729,9 @@ class TmuxSessionManager:
         self._next_work_id: int = 1
         # thread_id -> tmux ``window_id`` (``@218``), never a window name (#649).
         self._thread_to_window: dict[int, str] = {}
+        # #809: thread_id -> tmux's stderr for the last keystrokes it refused.
+        # Read (and cleared) by :meth:`take_send_failure`.
+        self._send_failures: dict[int, str] = {}
         # #353: the session's secret-removal mark is issued once per manager,
         # not once per turn — it is a property of the session, not of the call.
         self._env_stripped: bool = False
@@ -2233,12 +2236,14 @@ class TmuxSessionManager:
                     exc,
                 )
                 safe_prompt = marked_prompt.replace("'", "'\\''")
-                cmd_parts.append(f"'{safe_prompt}'")
+                cmd_parts.extend(["--", f"'{safe_prompt}'"])
             else:
                 # Read it into a variable and delete the file *before* claude runs,
                 # so no prompt text sits on disk for the life of the session.
                 prelude = f'CLORD_PROMPT="$(cat {prompt_path})"; rm -f {prompt_path}; '
-                cmd_parts.append('"$CLORD_PROMPT"')
+                # ``--``: the prompt is a positional argument, never a flag
+                # (CLAUDE.md Security; #809).
+                cmd_parts.extend(["--", '"$CLORD_PROMPT"'])
 
         # Prefix with unalias to bypass any shell alias (e.g. --continue).
         cmd = f"unalias claude 2>/dev/null; {prelude}{' '.join(cmd_parts)}"
@@ -2246,7 +2251,9 @@ class TmuxSessionManager:
         # Typed literally and in pieces: the prompt rides on this command line,
         # so a long attachment/paste would otherwise blow past tmux's imsg cap
         # and the whole turn would be lost (#527).
-        if not self._type_literal(target, cmd, what="start_claude"):
+        errors: list[str] = []
+        if not self._type_literal(target, cmd, what="start_claude", errors=errors):
+            self._note_send_failure(thread_id, errors)
             return False
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         if result.returncode != 0:
@@ -2287,7 +2294,9 @@ class TmuxSessionManager:
             return None
         return result.stdout.strip() or None
 
-    def _type_literal(self, target: str, text: str, *, what: str) -> bool:
+    def _type_literal(
+        self, target: str, text: str, *, what: str, errors: list[str] | None = None
+    ) -> bool:
         """Type *text* into *target* with ``send-keys -l``, split for tmux's cap.
 
         One ``send-keys`` carrying more than ~16KB is refused outright by the
@@ -2298,20 +2307,30 @@ class TmuxSessionManager:
         continuous stream of characters.
 
         Returns True only if **every** chunk was accepted; the caller must not
-        press Enter on a partially typed payload.
+        press Enter on a partially typed payload.  When a chunk is refused,
+        tmux's own error text is appended to *errors* so the caller can report
+        the real cause instead of guessing one (#809).
         """
         chunks = _chunk_for_send_keys(text)
         for index, chunk in enumerate(chunks, start=1):
-            result = _run(["tmux", "send-keys", "-l", "-t", target, chunk])
+            # #809: ``--`` or a chunk starting with ``-`` is parsed as options —
+            # ``- 箇条書き`` fails with "invalid flag -" and ``-R`` "succeeds" by
+            # resetting the terminal and typing nothing. The first chunk of a
+            # bulleted menu answer and any later chunk of a long message can both
+            # start with ``-``.
+            result = _run(["tmux", "send-keys", "-l", "-t", target, "--", chunk])
             if result.returncode != 0:
+                error = result.stderr.strip()
                 logger.warning(
                     "%s: send-keys -l failed on chunk %d/%d (%d bytes): %s",
                     what,
                     index,
                     len(chunks),
                     len(chunk.encode("utf-8")),
-                    result.stderr.strip(),
+                    error,
                 )
+                if errors is not None:
+                    errors.append(error or f"send-keys exited {result.returncode}")
                 if index > 1:
                     # Best effort: wipe the half-typed payload. Left in the box
                     # it would prepend itself to whatever the user sends next —
@@ -2604,7 +2623,9 @@ class TmuxSessionManager:
             self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
         payload = f"{ZWSP_MARKER}{text}"
-        if not self._type_literal(target, payload, what="send_input"):
+        errors: list[str] = []
+        if not self._type_literal(target, payload, what="send_input", errors=errors):
+            self._note_send_failure(thread_id, errors)
             return False
         # #808: CLI 2.1.278+ strips the marker before writing the ``user``
         # event, so the mirror cannot rely on it — record what was typed.
@@ -2757,7 +2778,10 @@ class TmuxSessionManager:
             return False
 
         target = self._target(window)
-        ok = self._type_literal(target, text, what="send_literal")
+        errors: list[str] = []
+        ok = self._type_literal(target, text, what="send_literal", errors=errors)
+        if not ok:
+            self._note_send_failure(thread_id, errors)
         if ok:
             # After the keystrokes land, so nothing is registered for text that
             # never reached the pane and could not produce an echo.
@@ -2803,11 +2827,30 @@ class TmuxSessionManager:
             return False
 
         target = self._target(window)
-        result = _run(["tmux", "send-keys", "-t", target, *keys])
+        # ``--``: a key name is never an option (#809).
+        result = _run(["tmux", "send-keys", "-t", target, "--", *keys])
         if result.returncode != 0:
-            logger.warning("send_keys: send-keys failed: %s", result.stderr.strip())
+            error = result.stderr.strip()
+            logger.warning("send_keys: send-keys failed: %s", error)
+            self._note_send_failure(thread_id, [error or f"send-keys exited {result.returncode}"])
             return False
         return True
+
+    def _note_send_failure(self, thread_id: int, errors: list[str]) -> None:
+        """Remember why tmux refused *thread_id*'s keystrokes (#809)."""
+        if errors:
+            self._send_failures[thread_id] = errors[-1]
+
+    def take_send_failure(self, thread_id: int) -> str | None:
+        """tmux's error for *thread_id*'s last refused send, once, or None (#809).
+
+        None means no keystroke was *refused by tmux* since the last call —
+        a failure that returns None happened before tmux was asked (typically:
+        there is no window). The two need opposite advice, and the caller used
+        to tell every one of them "the window was not found" (#600 wording) or
+        "the pane is dead, /claude-restart" (#527 wording).
+        """
+        return self._send_failures.pop(thread_id, None)
 
     def capture_pane(self, thread_id: int, history_lines: int = 500) -> str:
         """Capture the current pane text from the tmux window.

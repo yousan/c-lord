@@ -224,17 +224,20 @@ def _mention(user_id: int | None) -> str | None:
     return f"<@{user_id}>" if user_id is not None else None
 
 
-def _answer_undeliverable_notice(selected: list[str]) -> str:
+def _answer_undeliverable_notice(selected: list[str], reason: str | None = None) -> str:
     """Told to the thread when the chosen answer never reached Claude (#600).
 
     Echo the choice back: the menu is gone from Discord's side, so without this
     the person's decision is simply lost and they have to guess what they picked.
+    *reason* is the runner's own account (#809) — "no window" was only one of
+    the causes, and saying it of a window that existed sent people looking for
+    the wrong problem.
     """
     choice = " / ".join(s for s in selected if s) or "(選択なし)"
     return (
         "-# ⚠️ 選んだ回答を Claude に届けられませんでした"
         f"（選択: {choice}）。"
-        "スレッドの tmux ウィンドウが見つかりませんでした。"
+        f"{reason or _NO_WINDOW_REASON}。"
         "もう一度送るか、`/tmux-screenshot` でセッションの状態を確認してください。"
     )
 
@@ -244,6 +247,12 @@ _NOT_ANSWERED_REASON = (
     "（メニューが回答を受け取らずに閉じています）"
 )
 _NO_WINDOW_REASON = "スレッドの tmux ウィンドウが見つかりませんでした"
+
+
+def _undelivered_reason(runner: object) -> str:
+    """The runner's account of why an answer did not land, or the #600 default (#809)."""
+    reason = getattr(runner, "undelivered_reason", None)
+    return reason if isinstance(reason, str) and reason else _NO_WINDOW_REASON
 
 
 async def _transcript_dir(runner: TmuxClaudeRunner) -> Path | None:
@@ -554,7 +563,7 @@ async def _finalize_menu_message(
 
 
 async def _report_answer_delivery(
-    thread: discord.Thread, *, delivered: bool, selected: list[str]
+    thread: discord.Thread, *, delivered: bool, selected: list[str], reason: str | None = None
 ) -> None:
     """Say something only when the answer did not land (#600).
 
@@ -570,7 +579,7 @@ async def _report_answer_delivery(
         selected,
     )
     with contextlib.suppress(Exception):
-        await thread.send(_answer_undeliverable_notice(selected))
+        await thread.send(_answer_undeliverable_notice(selected, reason))
 
 
 def _option_index(question: AskQuestion, answer: str) -> int | None:
@@ -942,7 +951,10 @@ async def _bridge_claimed_menu(
     delivered = await send_answer_keystrokes(runner, question, selected)
     # #600: the keystrokes can go nowhere (thread with no tmux window). Saying so
     # is what keeps the menu from silently staying open and being re-posted.
-    await _report_answer_delivery(thread, delivered=delivered is not False, selected=selected)
+    reason = _undelivered_reason(runner) if delivered is False else None
+    await _report_answer_delivery(
+        thread, delivered=delivered is not False, selected=selected, reason=reason
+    )
 
     # #651: keystrokes accepted by tmux is NOT the same as the answer reaching
     # Claude — #650 delivered every key, closed the menu, and still recorded
@@ -954,7 +966,9 @@ async def _bridge_claimed_menu(
         # verdict and not "the bus accepted it" — that optimism is what printed
         # 送りました two seconds before 届けられませんでした.
         _ask_bus.note_delivery(thread.id, DELIVERY_UNDELIVERED)
-        await _finalize_menu_message(msg, question, selected, ASK_NOT_ANSWERED, _NO_WINDOW_REASON)
+        await _finalize_menu_message(
+            msg, question, selected, ASK_NOT_ANSWERED, _undelivered_reason(runner)
+        )
         return
     outcome = await settle_answer(msg, question, selected, runner, menu_ref, thread_id=thread.id)
     # #804: the typed-answer line takes the verdict known at the end of the
