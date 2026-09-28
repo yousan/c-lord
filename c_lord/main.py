@@ -9,8 +9,9 @@ import logging
 import os
 import signal
 import sys
+from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Any
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -18,6 +19,7 @@ from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
 from .session_cleanup import DirOutcome, remove_clean_session_dir, sweep_days
 from .setup import setup_bridge
+from .shutdown_watchdog import arm_shutdown_watchdog, shutdown_timeout_from_env
 from .utils.logger import setup_logging
 
 if TYPE_CHECKING:
@@ -304,6 +306,26 @@ async def start_api_server(api_server: ApiServer | None) -> bool:
     return True
 
 
+def install_shutdown_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    shutdown: Callable[[], Coroutine[Any, Any, None]],
+) -> None:
+    """On SIGINT/SIGTERM: arm the shutdown watchdog, then run *shutdown* (#699).
+
+    The watchdog is armed first and off the loop, so even a shutdown that
+    never finishes — or one that finishes on the loop and then hangs in
+    ``asyncio.run()``'s executor join — ends with a stack dump and an exit
+    instead of a silent, live process.
+    """
+
+    def _on_signal() -> None:
+        arm_shutdown_watchdog(shutdown_timeout_from_env())
+        loop.create_task(shutdown())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _on_signal)
+
+
 async def main(env_path: Path | None = None) -> None:
     """Start the bot."""
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -419,8 +441,7 @@ async def main(env_path: Path | None = None) -> None:
                 await api_server.stop()
             await bot.close()
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown()))
+        install_shutdown_signal_handlers(loop, _shutdown)
 
         await bot.start(config["token"])
 
