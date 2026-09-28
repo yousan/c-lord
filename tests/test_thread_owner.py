@@ -267,7 +267,8 @@ class TestChatCommandsKeepOffOtherClordsThread:
         cog, tmux = _chat_cog()
         respond = AsyncMock()
 
-        await getattr(cog, impl)(_thread(), respond)
+        # #781: these are gated first; the authorizer here lets anyone through.
+        await getattr(cog, impl)(_thread(), respond, user=MagicMock())
 
         _assert_names_owner(_said(respond))
         tmux.kill_session.assert_not_called()

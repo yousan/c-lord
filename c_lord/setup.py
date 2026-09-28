@@ -253,6 +253,7 @@ async def setup_bridge(
         repo=session_repo,
         settings_repo=settings_repo,
         devenv_repo=devenv_repo,
+        authorizer=authorizer,
     )
     await bot.add_cog(session_manage_cog)
     logger.info("Registered SessionManageCog")

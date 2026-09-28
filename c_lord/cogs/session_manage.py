@@ -20,9 +20,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from ..command_gate import NOT_AUTHORIZED, authorize_command
 from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
+from ..discord_ui.authorization import Authorizer, get_default_authorizer
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..session_close import (
@@ -177,6 +179,7 @@ class SessionManageCog(commands.Cog):
         settings_repo: SettingsRepository | None = None,
         runner: object | None = None,
         devenv_repo: object | None = None,
+        authorizer: Authorizer | None = None,
     ) -> None:
         self.bot = bot
         self.repo = repo
@@ -189,6 +192,10 @@ class SessionManageCog(commands.Cog):
         # Optional ClaudeConfig reference for reading the default model.
         # Resolved lazily from ClaudeChatCog if not provided directly.
         self._runner = runner
+        # #781: who may run these commands. Optional so consumers constructing
+        # the cog themselves keep working — :meth:`_command_authorizer` then
+        # finds the process's own one.
+        self._authorizer = authorizer
 
     def _get_runner(self) -> object | None:
         """Return the runner, resolving it from ClaudeChatCog if not set directly."""
@@ -209,6 +216,50 @@ class SessionManageCog(commands.Cog):
         if runner is not None and hasattr(runner, "model"):
             return runner.model  # type: ignore[return-value]
         return "sonnet"
+
+    # ── Authorization (#781) ───────────────────────────────────────────────────
+
+    def _command_authorizer(self) -> Authorizer | None:
+        """The allowlist these commands answer to — the process's one, never a blank one.
+
+        The one handed in by ``setup_bridge``; failing that the one
+        ``ClaudeChatCog`` published on the bot / process (#466, #739). A blank
+        ``Authorizer()`` is deliberately not the fallback: with an allowlist
+        configured it would deny the owner too (#739).
+        """
+        return self._authorizer or getattr(self.bot, "authorizer", None) or get_default_authorizer()
+
+    def _authorize(
+        self, user: discord.Member | discord.User, message: discord.Message | None
+    ) -> bool:
+        """Allowlist for slash, the shared message-backed rule for text (#405, #781)."""
+        return authorize_command(self._command_authorizer(), user, message)
+
+    async def _admit(
+        self, source: discord.Interaction | commands.Context, respond: _Responder
+    ) -> bool:
+        """Gate a command before it touches anything; refuse out loud when it may not run.
+
+        Every command in this cog except the read-only ``show`` ones calls this
+        first (#781) — ``tests/test_command_authorization_coverage.py`` holds
+        each new command to it. Before, none did: anyone who could type in a
+        thread could delete a workspace or change the model for every thread.
+        """
+        if isinstance(source, discord.Interaction):
+            user, message = source.user, None
+        else:
+            user, message = source.author, source.message
+        if self._authorize(user, message):
+            return True
+        command = getattr(source.command, "qualified_name", "?")
+        logger.info(
+            "%s /%s rejected: user %s is not authorized (#781)",
+            log_ctx(thread_id=getattr(source.channel, "id", None)),
+            command,
+            getattr(user, "id", "?"),
+        )
+        await respond(NOT_AUTHORIZED, ephemeral=True)
+        return False
 
     # ── Slash/text I/O plumbing (#209 follow-up) ───────────────────────────────
     # Each read-only command's core takes a (respond, ack) pair so the same body
@@ -379,18 +430,22 @@ class SessionManageCog(commands.Cog):
     async def model_set(self, interaction: discord.Interaction, model: str) -> None:
         """Set the global default model stored in settings_repo."""
         respond, _ = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._model_set_impl(model=model, respond=respond)
 
     @commands.command(name="model-set")
     async def model_set_text(self, ctx: commands.Context, model: str | None = None) -> None:
         """Text/mention twin of /model set — webhook-invokable for E2E (#209)."""
+        respond, _ = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         if not model:
             await ctx.send(
                 f"Usage: `!model-set <{'/'.join(sorted(_VALID_MODELS))}|MODEL_ID>` "
                 "(e.g. `claude-fable-5`)"
             )
             return
-        respond, _ = self._ctx_io(ctx)
         await self._model_set_impl(model=model, respond=respond)
 
     # ── Thread auto-archive duration commands ──────────────────────────────────
@@ -469,6 +524,8 @@ class SessionManageCog(commands.Cog):
     async def thread_archive_set(self, interaction: discord.Interaction, duration: int) -> None:
         """Set the global thread auto-archive duration stored in settings_repo."""
         respond, _ = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._archive_set_impl(duration=duration, respond=respond)
 
     @commands.command(name="thread-archive-set")
@@ -476,11 +533,13 @@ class SessionManageCog(commands.Cog):
         self, ctx: commands.Context, duration: str | None = None
     ) -> None:
         """Text/mention twin of /thread-archive set — webhook-invokable for E2E."""
+        respond, _ = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         if not duration:
             valid = "/".join(str(d) for d in VALID_DURATIONS)
             await ctx.send(f"Usage: `!thread-archive-set <{valid}>` (minutes)")
             return
-        respond, _ = self._ctx_io(ctx)
         try:
             minutes = int(duration)
         except (TypeError, ValueError):
@@ -518,12 +577,16 @@ class SessionManageCog(commands.Cog):
     async def thread_rename(self, interaction: discord.Interaction) -> None:
         """Re-summarise this thread's name on demand (#705)."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._thread_rename_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="thread-rename")
     async def thread_rename_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /thread-rename — webhook-invokable for E2E (#209)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._thread_rename_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     # ------------------------------------------------------------------
@@ -715,6 +778,8 @@ class SessionManageCog(commands.Cog):
     async def clord_status(self, interaction: discord.Interaction, show_all: bool = False) -> None:
         """Per-channel session status. ``show_all`` adds closed sessions (#363)."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._clord_status_impl(
             channel=interaction.channel, show_all=show_all, respond=respond, ack=ack
         )
@@ -724,6 +789,8 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /clord-status. ``!clord-status all`` shows closed."""
         show_all = (arg or "").lower() in {"all", "-a", "a"}
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._clord_status_impl(
             channel=ctx.channel, show_all=show_all, respond=respond, ack=ack
         )
@@ -877,6 +944,8 @@ class SessionManageCog(commands.Cog):
         prefix-matching autocomplete.
         """
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._workspace_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
 
     @commands.command(name="workspace-cleanup")
@@ -886,6 +955,8 @@ class SessionManageCog(commands.Cog):
         Usage: ``!workspace-cleanup`` (remove) / ``!workspace-cleanup dry`` (preview).
         """
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._workspace_cleanup_impl(dry_run=self._dry_run_arg(arg), respond=respond, ack=ack)
 
     @app_commands.command(
@@ -907,12 +978,16 @@ class SessionManageCog(commands.Cog):
         package update alone (Zero-Config Principle).
         """
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._workspace_cleanup_impl(dry_run=dry_run, respond=respond, ack=ack)
 
     @commands.command(name="session-cleanup")
     async def session_cleanup_text(self, ctx: commands.Context, arg: str | None = None) -> None:
         """Text/mention twin of the /session-cleanup alias (#209)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._workspace_cleanup_impl(dry_run=self._dry_run_arg(arg), respond=respond, ack=ack)
 
     async def _tmux_list_impl(self, *, respond: _Responder, ack: _Acknowledger) -> None:
@@ -969,12 +1044,16 @@ class SessionManageCog(commands.Cog):
     async def tmux_list(self, interaction: discord.Interaction) -> None:
         """Show all windows across all channel tmux sessions."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._tmux_list_impl(respond=respond, ack=ack)
 
     @commands.command(name="tmux-list")
     async def tmux_list_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /tmux-list — webhook-invokable for E2E (#209)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._tmux_list_impl(respond=respond, ack=ack)
 
     async def _answered_as_foreign_thread(self, channel: object, respond: _Responder) -> bool:
@@ -1109,12 +1188,16 @@ class SessionManageCog(commands.Cog):
     async def tmux_screenshot(self, interaction: discord.Interaction) -> None:
         """Screenshot the current tmux pane and post it as a PNG (#285)."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._screenshot_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="tmux-screenshot")
     async def tmux_screenshot_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /tmux-screenshot — webhook-invokable for E2E (#285)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._screenshot_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     # ── /resync (#439) — reconnect the Discord mirror to tmux ───────────────
@@ -1231,12 +1314,16 @@ class SessionManageCog(commands.Cog):
     async def resync(self, interaction: discord.Interaction) -> None:
         """Re-bridge a stranded menu and post a fresh pane snapshot (#439)."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._resync_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="resync")
     async def resync_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /resync — webhook-invokable for E2E (#439)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._resync_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     async def _stop_transcript_mirror(self, thread_id: int) -> None:
@@ -1332,12 +1419,16 @@ class SessionManageCog(commands.Cog):
     async def workspace_delete(self, interaction: discord.Interaction) -> None:
         """Delete the tmux window and session directory for the current thread."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._workspace_delete_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="workspace-delete")
     async def workspace_delete_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /workspace-delete — webhook-invokable for E2E (#209)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     async def _sleep_workspace_impl(
@@ -1591,12 +1682,16 @@ class SessionManageCog(commands.Cog):
         did.
         """
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="workspace-stop")
     async def workspace_stop_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /workspace-stop — webhook-invokable for E2E (#271)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     @app_commands.command(
@@ -1612,12 +1707,16 @@ class SessionManageCog(commands.Cog):
         Zero-Config Principle.
         """
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._close_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="close-workspace")
     async def close_workspace_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of the /close-workspace alias (#271)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._close_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     async def _reopen_workspace_impl(
@@ -1708,12 +1807,16 @@ class SessionManageCog(commands.Cog):
         running state is what this actually changes.
         """
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="workspace-start")
     async def workspace_start_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /workspace-start — webhook-invokable for E2E (#512)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)
 
     @app_commands.command(
@@ -1723,10 +1826,14 @@ class SessionManageCog(commands.Cog):
     async def reopen_workspace(self, interaction: discord.Interaction) -> None:
         """Old name for :meth:`workspace_start`, kept working (#574)."""
         respond, ack = self._slash_io(interaction)
+        if not await self._admit(interaction, respond):
+            return
         await self._reopen_workspace_impl(channel=interaction.channel, respond=respond, ack=ack)
 
     @commands.command(name="reopen-workspace")
     async def reopen_workspace_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of the /reopen-workspace alias (#512)."""
         respond, ack = self._ctx_io(ctx)
+        if not await self._admit(ctx, respond):
+            return
         await self._reopen_workspace_impl(channel=ctx.channel, respond=respond, ack=ack)

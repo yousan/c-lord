@@ -105,6 +105,35 @@ View に `_authorizer` を渡し忘れた場合は、**プロセスが実際に�
 拒否したら `You are not authorized to use this command.` を返し（slash は本人にだけ見える）、
 `/clear rejected` を INFO で残す。テストは `tests/test_clear_authorization.py`。
 
+### すべてのコマンドが同じ規則を通る (#781)
+
+#405 のあと同じ観点で全 Cog を走査すると、**`Authorizer` を一度も通らないコマンドが 37 個**
+残っていた。`/workspace-delete`（作業ディレクトリ削除）・`/model set`（全スレッド共通の
+モデル変更）・`/stop`・`/compact`（要約は戻せない）・`/upgrade`（パッケージ更新＋再起動）など。
+#713 で既定を「所有者だけ」に絞っても、**ゲートを呼ばないコマンドには届かない**（#405 と同じ構図）。
+
+いまは次の**公開コマンド以外すべて**が、本体に入る前に同じ規則で判定する:
+
+| 公開（誰でも叩ける） | 理由 |
+|---|---|
+| `/version` `!version` | 走っているビルドの版を表示するだけ |
+| `/model show` `!model-show` | 現在のモデル名を表示するだけ |
+| `/thread-archive show` `!thread-archive-show` | 自動アーカイブ期間を表示するだけ |
+
+表示だけでも `/tmux-screenshot`（ペインの中身）・`/clord-status`・`/tmux-list`（ワークスペースの
+一覧とパス）は**ゲート対象**。見せてよいものは「設定値として公開して困らないもの」に限る。
+
+- slash → human allowlist（`Authorizer.is_allowed`）
+- text → `is_message_authorized`（webhook・信頼 bot は通る — E2E の text twin はそのまま動く）
+- `SessionManageCog` は `setup_bridge` から同じ `Authorizer` を受け取る。受け取っていなければ
+  bot / プロセスに公開された `Authorizer` を使い、それも無ければ**拒否**（空の `Authorizer()` は
+  使わない — #739）。判定は `c_lord.command_gate.authorize_command` に 1 つだけある
+
+**取りこぼしは構造テストで止める**: `tests/test_command_authorization_coverage.py` が
+`c_lord/cogs/*.py` の `*.command(...)` を AST で全部拾い、本体（か本体が呼ぶ `self._*`）が
+ゲートを通るか、上の公開リストに載っているかを確かめる。ゲート無しのコマンドを足すと CI が落ちる。
+公開リストに足すのは設計判断なので、PR に理由を書くこと。
+
 ### 拒否したときは理由を出す
 
 「allowlist に無い」のと「authorizer が無く判定できない」は**利用者にとっては同じ無反応でも、

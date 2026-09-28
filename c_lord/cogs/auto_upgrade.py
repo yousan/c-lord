@@ -22,7 +22,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..discord_ui.authorization import AuthorizedViewMixin, Authorizer
+from ..command_gate import NOT_AUTHORIZED
+from ..discord_ui.authorization import AuthorizedViewMixin, Authorizer, get_default_authorizer
 from ..protocols import DrainAware
 from ..thread_settings import resolve_auto_archive_duration
 
@@ -192,6 +193,16 @@ class AutoUpgradeCog(commands.Cog):
         async with self._lock:
             await self._run_upgrade(message)
 
+    def _is_allowed(self, user: discord.Member | discord.User) -> bool:
+        """Whether *user* is on the process's allowlist (#781).
+
+        The cog holds no :class:`Authorizer` of its own — it is the one
+        ``ClaudeChatCog`` published on the bot, as for the approval buttons
+        below. With none published there is nobody to ask, so the answer is no.
+        """
+        authorizer = getattr(self.bot, "authorizer", None) or get_default_authorizer()
+        return authorizer is not None and authorizer.is_allowed(user)
+
     @app_commands.command(name="upgrade", description="Manually trigger a package upgrade")
     async def upgrade_command(self, interaction: discord.Interaction) -> None:
         """Slash command entry point for manual upgrades.
@@ -199,7 +210,19 @@ class AutoUpgradeCog(commands.Cog):
         Only active when config.slash_command_enabled=True. Requires no webhook —
         any authorised user can trigger the upgrade from Discord directly.
         The same upgrade_approval / restart_approval safety gates apply.
+
+        "Authorised" is the process's allowlist (#781) — it used to be anyone
+        who could see the command. Checked before anything else, including
+        whether the command is enabled at all.
         """
+        if not self._is_allowed(interaction.user):
+            logger.info(
+                "/upgrade rejected: user %s is not authorized (#781)",
+                getattr(interaction.user, "id", "?"),
+            )
+            await interaction.response.send_message(NOT_AUTHORIZED, ephemeral=True)
+            return
+
         if not self.config.slash_command_enabled:
             await interaction.response.send_message(
                 "⚠️ Slash command upgrades are not enabled for this bot.",
