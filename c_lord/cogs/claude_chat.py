@@ -14,7 +14,8 @@ import asyncio
 import contextlib
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,13 +28,13 @@ from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
-from ..claude.tmux_runner import TmuxClaudeRunner
+from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
 from ..command_gate import is_message_authorized, owns
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
 from ..database.ask_repo import PendingAskRepository
 from ..database.lounge_repo import LoungeRepository
-from ..database.repository import SessionRepository
+from ..database.repository import SessionRecord, SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ref import enrich_discord_references
@@ -52,6 +53,16 @@ from ..discord_ui.views import (
     StopView,
     TextAnsweredMenuView,
 )
+from ..gateway_backfill import (
+    HISTORY_LIMIT,
+    GatewayWatch,
+    MissedEntry,
+    Outage,
+    Outcome,
+    SeenMessages,
+    merge_missed_prompt,
+    missed_notice,
+)
 from ..log_sampler import LogSampler
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed, was_auto_stopped
@@ -68,14 +79,19 @@ from ..session_resume import (
     NOT_A_CLORD_THREAD,
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
+    ThreadResume,
     accepts_message,
     classify,
     is_clord_thread,
     resume_notice,
+    stopped_hint,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_auto_enabled
 from ..thread_origin import inspect_origin
+from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
+from ..transcript.claim import adopt_cleared_session, list_transcripts
+from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
@@ -103,6 +119,16 @@ _MENU_TEXT_ANSWER_MAX = 500
 # a failure — it means nobody could tell us, and that is said out loud rather
 # than guessed at in either direction.
 _ANSWER_DELIVERY_WAIT = 25.0
+
+# Slash commands typed into the TUI (#803/#806). An interrupted turn usually
+# lets go of the pane within a second or two; a turn that has not after this long
+# is not going to, and typing at it would queue the command behind it.
+_SLASH_IDLE_TIMEOUT = 20.0
+# How long ``/clear`` waits for Claude Code to start the new transcript it
+# answers with (measured: immediately on submit). Missing it costs the mirror
+# its successor, so it is logged, but the clear itself has already happened.
+_CLEAR_ADOPT_TIMEOUT = 10.0
+_SLASH_POLL_INTERVAL = 0.5
 
 # How long a pre-empted turn gets to unwind after it was cancelled (#293). Its
 # teardown is a handful of Discord calls that normally take well under a second;
@@ -241,6 +267,45 @@ async def _safe_set_state(
         )
 
 
+def _local_stamp(moment: datetime) -> str:
+    """*moment* in the host's zone, the way the log's own timestamps read."""
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _span_text(span: timedelta) -> str:
+    """``6h35m45s`` — a timedelta without the microseconds."""
+    total = int(span.total_seconds())
+    hours, rest = divmod(max(total, 0), 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours}h{minutes:02d}m{seconds:02d}s" if hours else f"{minutes}m{seconds:02d}s"
+
+
+def _author_name(message: discord.Message) -> str:
+    author = message.author
+    return str(getattr(author, "display_name", None) or getattr(author, "name", "") or "?")
+
+
+def _missed_entry(message: discord.Message) -> MissedEntry:
+    """An earlier missed message as it goes into a merged prompt (#745)."""
+    return MissedEntry(
+        created_at=message.created_at,
+        author=_author_name(message),
+        text=message.content or "",
+        attachments=tuple(f"{a.filename} <{a.url}>" for a in message.attachments or ()),
+    )
+
+
+def _ever_ran_claude(working_dir: str | None) -> bool:
+    """Whether Claude Code ever wrote a transcript for ``working_dir`` (#806).
+
+    ``None`` (a row that never recorded one) is given the benefit of the doubt:
+    the wake then decides, as it did before this check existed.  Blocking.
+    """
+    if not working_dir:
+        return True
+    return latest_session_jsonl(derive_project_dir(working_dir)) is not None
+
+
 class ClaudeChatCog(commands.Cog):
     """Cog that handles Claude Code conversations via Discord threads."""
 
@@ -361,6 +426,17 @@ class ClaudeChatCog(commands.Cog):
         # #538: where Claude Code keeps its transcripts. None = its real
         # location (``~/.claude/projects``); tests point it at a tmp dir.
         self._projects_root: Path | None = None
+        # #745: a message posted while the gateway is down is never delivered
+        # once the session has to IDENTIFY again. ``_gateway`` says where to
+        # start reading back on reconnect; ``_gateway_seen`` what already
+        # arrived, so nothing runs twice. See c_lord/gateway_backfill.py.
+        self._gateway = GatewayWatch()
+        self._gateway_seen = SeenMessages()
+        self._backfill_lock = asyncio.Lock()
+        # The latest pick-up, plus strong references to every one in flight
+        # (asyncio only holds a weak reference to a running task).
+        self._backfill_task: asyncio.Task[None] | None = None
+        self._backfill_tasks: set[asyncio.Task[None]] = set()
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
         """Check if a member/user is authorized to use the bot.
@@ -807,11 +883,9 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
-        # Authorization: webhooks + trusted bots bypass the human allowlist;
-        # any other bot is ignored; humans must match owner / role. See
-        # _is_message_authorized. When no allowlist is configured, humans are
-        # still allowed (zero-config default unchanged).
-        if not self._is_message_authorized(message):
+        # #745: bookkeeping for the reconnect pick-up. Before any await, so a
+        # pick-up that starts after this event was dispatched always sees it.
+        if not self._note_delivered(message):
             return
 
         # Channel direct messages are ignored — thread creation is limited to
@@ -819,13 +893,7 @@ class ClaudeChatCog(commands.Cog):
         if message.channel.id == self.bot.channel_id:
             return
 
-        # System messages (thread rename, pin, etc.) must not reach Claude
-        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
-            return
-
-        # Text commands (e.g. !attach) are handled by process_commands — skip here
-        ctx = await self.bot.get_context(message)
-        if ctx.valid:
+        if not await self._is_runnable_request(message):
             return
 
         # Handle threads: only respond if session exists in DB (opt-in).
@@ -840,6 +908,56 @@ class ClaudeChatCog(commands.Cog):
             await self._handle_thread_reply(message)
         else:
             await self._handle_untracked_thread(message, message.channel)
+
+    async def _is_runnable_request(self, message: discord.Message) -> bool:
+        """Whether *message* is something ``on_message`` would act on.
+
+        One rule for the live path and for the reconnect pick-up (#745), so a
+        message read back from history is judged exactly as it would have been
+        had the gateway delivered it.
+        """
+        # Authorization: webhooks + trusted bots bypass the human allowlist;
+        # any other bot is ignored; humans must match owner / role. See
+        # _is_message_authorized. When no allowlist is configured, humans are
+        # still allowed (zero-config default unchanged).
+        if not self._is_message_authorized(message):
+            return False
+
+        # System messages (thread rename, pin, etc.) must not reach Claude
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return False
+
+        # Text commands (e.g. !attach) are handled by process_commands — skip
+        # here. The pick-up does not replay them either: a ``!stop`` hours late
+        # is not what anybody asked for.
+        ctx = await self.bot.get_context(message)
+        return not ctx.valid
+
+    def _note_delivered(self, message: discord.Message) -> bool:
+        """Record that the gateway delivered *message* (#745). False = already ran.
+
+        Two records: the message's time is the newest sign the gateway was
+        alive (where a later pick-up starts reading), and its id marks it as
+        handled. The id is only kept for thread messages that could drive a
+        turn — the only ones the pick-up ever reads back.
+
+        False means the reconnect pick-up already read this one from history
+        and ran it; the gateway delivering it as well must not run it again.
+        """
+        created_at = getattr(message, "created_at", None)
+        if isinstance(created_at, datetime):
+            self._gateway.seen(created_at)
+        channel = message.channel
+        if not isinstance(channel, discord.Thread) or not self._is_message_authorized(message):
+            return True
+        if self._gateway_seen.add(message.id):
+            return True
+        logger.info(
+            "%s message %s already picked up after a gateway outage — not running it twice (#745)",
+            log_ctx(thread_id=channel.id),
+            message.id,
+        )
+        return False
 
     async def _handle_untracked_thread(
         self, message: discord.Message, thread: discord.Thread
@@ -1058,6 +1176,13 @@ class ClaudeChatCog(commands.Cog):
         nothing at all and the prompt had to be retyped after the click.
         """
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
+        # #811: another c-lord's thread is a c-lord thread, just not this bot's —
+        # 「c-lord のスレッドではない」 would be false. Name the owner instead.
+        foreign = await foreign_owner_notice_for(self.bot, self.repo, thread)
+        if foreign is not None:
+            logger.info("%s /clord refused — another bot's thread (#811)", ctx)
+            await respond(foreign, ephemeral=True)
+            return False
         if not await self._was_ever_our_thread(thread, parent_channel_id):
             logger.info("%s /clord refused — never a c-lord thread (#551)", ctx)
             await respond(NOT_A_CLORD_THREAD, ephemeral=True)
@@ -1437,6 +1562,20 @@ class ClaudeChatCog(commands.Cog):
             repo=repo,
         )
 
+    async def _answered_as_foreign_thread(self, channel: object, respond: _Responder) -> bool:
+        """Answer 「<@owner> の担当です」 when ``channel`` is another bot's thread — #811.
+
+        With two c-lords in a guild every slash command is listed twice, and the
+        one picked may belong to the bot that never saw this thread. Without this
+        it answers from its own empty ``sessions`` table — or, where both bots
+        share a tmux server and repo, reaches for a window that is not its own.
+        """
+        notice = await foreign_owner_notice_for(self.bot, self.repo, channel)
+        if notice is None:
+            return False
+        await respond(notice, ephemeral=True)
+        return True
+
     async def _stop_impl(self, channel: object, respond: _Responder) -> None:
         """Shared core for /stop and !stop (#209).
 
@@ -1446,6 +1585,9 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         runner = self._active_runners.get(channel.id)
@@ -1483,6 +1625,11 @@ class ClaudeChatCog(commands.Cog):
             await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
+            return
+
+        foreign = await foreign_owner_notice_for(self.bot, self.repo, channel)
+        if foreign is not None:
+            await interaction.response.send_message(foreign, ephemeral=True)
             return
 
         existing = await self.repo.get(channel.id)
@@ -1630,11 +1777,22 @@ class ClaudeChatCog(commands.Cog):
         *,
         user: discord.Member | discord.User,
         message: discord.Message | None = None,
+        ack: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        """Shared core for /clear and !clear (#209).
+        """Shared core for /clear and !clear (#209, #803).
 
-        Kills the active runner and tmux window, then resets the session row so
-        the next message starts fresh.
+        Types Claude Code's own ``/clear`` into the thread's pane — the way
+        ``/compact`` already works (#278) — instead of killing the window and
+        stamping ``session_id = ''`` on the row as a "start fresh" mark. That
+        mark could only ever be held by one row (``session_id`` is UNIQUE), so
+        every ``/clear`` after the first one on a host failed (#803). The row is
+        not touched at all now; the process that answers the next message is the
+        same one, holding an empty conversation.
+
+        What does have to move is the claim (#773): ``/clear`` starts a new
+        transcript, and both the mirror and a later ``--resume`` follow the
+        claimed uuid — so it is re-pointed at the successor
+        (:func:`~c_lord.transcript.claim.adopt_cleared_session`).
 
         ``message`` is the invoking message for ``!clear``, ``None`` for the
         slash command. It decides which rule authorizes the call (#405) — see
@@ -1657,42 +1815,173 @@ class ClaudeChatCog(commands.Cog):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
 
+        if await self._answered_as_foreign_thread(channel, respond):
+            return
+
         thread_id = channel.id
+        if await self.repo.get(thread_id) is None:
+            await respond("No active session found for this thread.", ephemeral=True)
+            return
 
-        # Kill active runner if any
-        runner = self._active_runners.get(thread_id)
-        if runner:
-            await runner.kill()
-            del self._active_runners[thread_id]
-
-        # Kill the tmux window unconditionally — even for idle sessions where the
-        # runner has already been removed from _active_runners (issue #123).
-        # This ensures `is_claude_running` returns False next time, preventing
-        # old context from being resumed via send_input.
         parent_id = getattr(channel, "parent_id", None) or thread_id
         tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
-        if tmux_manager is not None:
-            await asyncio.to_thread(tmux_manager.kill_session, thread_id)
+        if tmux_manager is None:
+            await respond("tmux is not configured for this thread.", ephemeral=True)
+            return
 
-        reset = await self.repo.reset(thread_id)
-        if reset:
-            await respond("\U0001f504 Session cleared. Next message will start a fresh session.")
-        else:
-            await respond("No active session found for this thread.", ephemeral=True)
+        before: set[str] = set()
+        project_dir: Path | None = None
+
+        async def _snapshot() -> None:
+            # Taken after any wake (a restore must not count as the successor)
+            # and before the keystrokes, so the only new ``/clear`` transcript
+            # can be the one this command produced.
+            nonlocal before, project_dir
+            project_dir = await asyncio.to_thread(tmux_manager.project_dir_for, thread_id)
+            if project_dir is not None:
+                before = await asyncio.to_thread(list_transcripts, project_dir)
+
+        refusal = await self._deliver_slash_command(
+            channel, tmux_manager, "/clear", ack=ack, before_send=_snapshot
+        )
+        if refusal is not None:
+            await respond(refusal, ephemeral=True)
+            return
+
+        adopted = await self._adopt_cleared_session(thread_id, project_dir, before)
+        logger.info(
+            "%s /clear typed into the TUI (#803) — new session %s",
+            log_ctx(thread_id=thread_id),
+            adopted or "not found",
+        )
+        await respond(
+            "\U0001f504 Session cleared (`/clear` sent). "
+            "Your next message starts a fresh conversation."
+        )
+
+    async def _adopt_cleared_session(
+        self, thread_id: int, project_dir: Path | None, before: set[str]
+    ) -> str | None:
+        """Move the claim to the transcript ``/clear`` started (#803); its id or None."""
+        if project_dir is None:
+            logger.warning(
+                "%s /clear: could not tell where the transcripts are — the mirror "
+                "may stay on the pre-clear transcript (#803)",
+                log_ctx(thread_id=thread_id),
+            )
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CLEAR_ADOPT_TIMEOUT
+        while True:
+            adopted = await asyncio.to_thread(adopt_cleared_session, project_dir, before)
+            if adopted is not None:
+                return adopted
+            if loop.time() >= deadline:
+                logger.error(
+                    "%s /clear: no new transcript appeared in %s within %.0fs — the "
+                    "mirror stays on the pre-clear transcript (#803)",
+                    log_ctx(thread_id=thread_id),
+                    project_dir,
+                    _CLEAR_ADOPT_TIMEOUT,
+                )
+                return None
+            await asyncio.sleep(_SLASH_POLL_INTERVAL)
+
+    async def _deliver_slash_command(
+        self,
+        thread: discord.Thread,
+        tmux_manager: TmuxSessionManager,
+        command: str,
+        *,
+        ack: Callable[[], Awaitable[None]] | None = None,
+        before_send: Callable[[], Awaitable[None]] | None = None,
+    ) -> str | None:
+        """Type a TUI slash command at this thread's Claude, whatever state it is in.
+
+        Shared by ``/clear`` (#803) and ``/compact`` (#806). The command has to
+        reach a Claude that is **sitting at its input box**, so:
+
+        * a turn is running → interrupt it (the ⏹ Stop path, not a kill — the
+          conversation stays) and wait for the prompt to come back; typed into a
+          running turn, the command would be queued behind it instead;
+        * no Claude in the pane (slept after 4 hours, host restart) → restore it
+          the way ``/tmux-screenshot`` does (#642) and say so in the thread, but
+          only where a message would have restored it too — 終了 is the user's
+          choice and an untracked thread has nothing to restore (#538);
+        * otherwise → type it.
+
+        ``ack`` is called before anything slow, so a slash interaction is
+        answered inside Discord's 3-second window. Returns None once the command
+        was typed and submitted, else the sentence to tell the user.
+        """
+        thread_id = thread.id
+        runner = self._active_runners.get(thread_id)
+        if runner is not None:
+            if ack is not None:
+                await ack()
+            await runner.interrupt(silent=True)
+            if not await wait_for_idle_prompt(
+                tmux_manager,
+                thread_id,
+                timeout=_SLASH_IDLE_TIMEOUT,
+                interval=_SLASH_POLL_INTERVAL,
+            ):
+                logger.warning(
+                    "%s %s: the interrupted turn did not return to the prompt (#803)",
+                    log_ctx(thread_id=thread_id),
+                    command,
+                )
+                return (
+                    f"⚠️ 実行中の作業が止まりませんでした。`{command}` は送っていません。\n"
+                    "少し待ってからもう一度試すか、"
+                    "`/claude-restart` で Claude を再起動してください。"
+                )
+        elif not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
+            record = await self.repo.get(thread_id)
+            verdict = classify(record)
+            if verdict is not ThreadResume.RESUMES:
+                return stopped_hint(verdict)
+            if record is not None and not await asyncio.to_thread(
+                _ever_ran_claude, record.working_dir
+            ):
+                # Waking would start an empty Claude only to run the command on
+                # nothing (#806 AC5).
+                return (
+                    "ℹ️ このスレッドにはまだ Claude との会話の記録がないため、"
+                    f"`{command.split()[0]}` は送りませんでした。"
+                )
+            if ack is not None:
+                await ack()
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(
+                    f"-# 🔄 停止していたワークスペースを復元してから `{command}` を送ります。"
+                )
+            if not await self.wake_workspace(thread):
+                logger.warning(
+                    "%s %s: could not restore the stopped workspace (#806)",
+                    log_ctx(thread_id=thread_id),
+                    command,
+                )
+                return (
+                    "⚠️ 停止していたワークスペースの復元に失敗したため、"
+                    f"`{command}` を送れませんでした。\n"
+                    "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
+                )
+
+        if before_send is not None:
+            await before_send()
+        # send_literal (not send_input): no ZWSP prefix, so the leading "/" is
+        # preserved and the TUI recognises it as a slash command (#278).
+        if not await asyncio.to_thread(tmux_manager.send_literal, thread_id, command):
+            return f"Failed to send {command.split()[0]} to the session."
+        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
+        return None
 
     @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
     async def clear_session(self, interaction: discord.Interaction) -> None:
         """Reset the session for the current thread."""
-
-        async def respond(
-            content: str | None = None,
-            *,
-            embed: discord.Embed | None = None,
-            ephemeral: bool = False,
-        ) -> None:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        await self._clear_impl(interaction.channel, respond, user=interaction.user)
+        respond, ack = self._deferrable_responder(interaction)
+        await self._clear_impl(interaction.channel, respond, user=interaction.user, ack=ack)
 
     @commands.command(name="clear")
     async def clear_text(self, ctx: commands.Context) -> None:
@@ -1725,6 +2014,9 @@ class ClaudeChatCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         thread_id = channel.id
@@ -1770,6 +2062,38 @@ class ClaudeChatCog(commands.Cog):
             await interaction.response.send_message(content, ephemeral=ephemeral)
 
         return respond
+
+    @staticmethod
+    def _deferrable_responder(
+        interaction: discord.Interaction,
+    ) -> tuple[_Responder, Callable[[], Awaitable[None]]]:
+        """A text responder plus an ``ack`` for commands that may take a while.
+
+        A wake or an interrupt can run past Discord's 3-second answer window
+        (#803/#806). ``ack`` defers the interaction; after that, answers go out
+        as a follow-up. State is kept here rather than read back from
+        ``interaction.response.is_done()`` so the rule is the same in tests.
+        """
+        deferred = False
+
+        async def ack() -> None:
+            nonlocal deferred
+            if not deferred:
+                deferred = True
+                await interaction.response.defer()
+
+        async def respond(
+            content: str | None = None,
+            *,
+            embed: discord.Embed | None = None,
+            ephemeral: bool = False,
+        ) -> None:
+            if deferred:
+                await interaction.followup.send(content or "", ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+
+        return respond, ack
 
     @staticmethod
     def _ctx_text_responder(ctx: commands.Context) -> _Responder:
@@ -1824,9 +2148,14 @@ class ClaudeChatCog(commands.Cog):
         await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
 
     async def _compact_impl(
-        self, channel: object, respond: _Responder, *, instructions: str = ""
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        instructions: str = "",
+        ack: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        """Shared core for /compact and !compact (#278).
+        """Shared core for /compact and !compact (#278, #806).
 
         Fires the Claude Code TUI's built-in ``/compact`` slash command in the
         thread's tmux window to compress (summarize) the session context,
@@ -1835,12 +2164,19 @@ class ClaudeChatCog(commands.Cog):
         Sent via ``send_literal`` (NOT ``send_input``): ``send_input`` prepends
         a zero-width-space marker, so the line would no longer start with ``/``
         and the TUI would not treat it as a slash command (see
-        docs/COMMANDS.md). This mirrors the
-        existing ``/context`` probe in ``tmux_runner.py``. Enter is sent
-        separately via ``send_keys`` since ``send_literal`` does not submit.
+        docs/COMMANDS.md). Enter is sent separately since ``send_literal`` does
+        not submit.
+
+        A stopped workspace is restored first (#806) — :meth:`_deliver_slash_command`
+        — rather than refused with "no running session": whether the Claude is
+        asleep is c-lord's business, not the user's, and the refusal read as the
+        conversation being gone.
         """
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         thread_id = channel.id
@@ -1850,21 +2186,12 @@ class ClaudeChatCog(commands.Cog):
             await respond("tmux is not configured for this thread.", ephemeral=True)
             return
 
-        if not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
-            await respond("No running Claude session in this thread to compact.", ephemeral=True)
-            return
-
         instructions = instructions.strip()
         command = f"/compact {instructions}" if instructions else "/compact"
-
-        # send_literal (not send_input): no ZWSP prefix so the leading "/" is
-        # preserved and the TUI recognises it as a slash command.
-        ok = await asyncio.to_thread(tmux_manager.send_literal, thread_id, command)
-        if not ok:
-            await respond("Failed to send /compact to the session.", ephemeral=True)
+        refusal = await self._deliver_slash_command(channel, tmux_manager, command, ack=ack)
+        if refusal is not None:
+            await respond(refusal, ephemeral=True)
             return
-        await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
-
         await respond("\U0001f5dc️ Compacting context… (`/compact` sent)")
 
     @app_commands.command(
@@ -1879,10 +2206,8 @@ class ClaudeChatCog(commands.Cog):
     ) -> None:
         """Trigger the TUI ``/compact`` for the current thread's session."""
 
-        async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-
-        await self._compact_impl(interaction.channel, respond, instructions=instructions)
+        respond, ack = self._deferrable_responder(interaction)
+        await self._compact_impl(interaction.channel, respond, instructions=instructions, ack=ack)
 
     @commands.command(name="compact")
     async def compact_text(self, ctx: commands.Context, *, instructions: str = "") -> None:
@@ -2105,6 +2430,11 @@ class ClaudeChatCog(commands.Cog):
         # is served, and can only happen now — the owner comes from Discord.
         await resolve_fallback_owner_ids(self.bot, self._authorizer)
 
+        # #745: a reconnect that had to IDENTIFY again lands here, and the
+        # messages posted while we were away were not delivered — go and get
+        # them. After the owner resolution above: the pick-up authorizes.
+        self._on_gateway_back("ready")
+
         # Held on the cog so the task is not garbage-collected mid-sweep.
         self._stop_sweep_task = asyncio.create_task(self._run_startup_recovery())
 
@@ -2166,6 +2496,195 @@ class ClaudeChatCog(commands.Cog):
             except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
 
+    # ── #745: messages posted while the gateway was down ────────────────────
+
+    @commands.Cog.listener()
+    async def on_disconnect(self) -> None:
+        """Note when the gateway went away (#745).
+
+        discord.py dispatches this on every failed reconnect attempt, so only
+        the first of a streak is logged — that is when the outage began.
+        """
+        now = self._gateway.clock()
+        if self._gateway.disconnected(now):
+            logger.info(
+                "Discord gateway disconnected at %s — messages posted from now on are "
+                "read back on reconnect (#745)",
+                _local_stamp(now),
+            )
+
+    @commands.Cog.listener()
+    async def on_resumed(self) -> None:
+        """A RESUME: Discord replays what it still had — read back the rest (#745)."""
+        self._on_gateway_back("resumed")
+
+    def _on_gateway_back(self, via: str) -> None:
+        """Start reading back what the outage that just ended kept from us (#745).
+
+        Fire-and-forget: ``on_ready`` must not wait on a walk over threads. The
+        first connect of the process is not an outage and starts nothing.
+        """
+        outage = self._gateway.connected()
+        if outage is None:
+            return
+        logger.info(
+            "Discord gateway back (%s) at %s — down since %s (%s), last delivery %s; "
+            "reading back from %s (#745)",
+            via,
+            _local_stamp(outage.back_at),
+            _local_stamp(outage.down_at),
+            _span_text(outage.duration),
+            _local_stamp(outage.last_alive_at),
+            _local_stamp(outage.since),
+        )
+        task = asyncio.create_task(self._backfill_outage(outage, via))
+        self._backfill_tasks.add(task)
+        task.add_done_callback(self._backfill_tasks.discard)
+        self._backfill_task = task
+
+    async def _backfill_outage(self, outage: Outage, via: str) -> None:
+        """Read back and run what *outage* kept from us. Never raises.
+
+        Serialised: a second reconnect while the first pick-up is still walking
+        waits for it, so the two never read the same message at once.
+        """
+        async with self._backfill_lock:
+            try:
+                picked, threads_hit, read_back = await self._pick_up_missed(outage)
+            except Exception:
+                logger.exception(
+                    "Gateway outage %s → %s: reading back missed messages failed (#745)",
+                    _local_stamp(outage.down_at),
+                    _local_stamp(outage.back_at),
+                )
+                return
+            logger.info(
+                "Gateway outage %s → %s (%s, %s): picked up %d message(s) in %d thread(s); "
+                "%d thread(s) read back (#745)",
+                _local_stamp(outage.down_at),
+                _local_stamp(outage.back_at),
+                via,
+                _span_text(outage.duration),
+                picked,
+                threads_hit,
+                read_back,
+            )
+
+    async def _pick_up_missed(self, outage: Outage) -> tuple[int, int, int]:
+        """(messages picked up, threads they were in, threads read back)."""
+        picked = threads_hit = read_back = 0
+        for thread in await self._threads_active_since(outage.since):
+            # Ours = a thread this instance holds a session for — the rule
+            # on_message applies (accepts_message). A shared guild is full of
+            # other instances' threads; they read back their own.
+            record = await self.repo.get(thread.id)
+            if not accepts_message(classify(record)):
+                continue
+            read_back += 1
+            try:
+                count = await self._pick_up_thread(thread, record, outage)
+            except Exception:
+                logger.warning(
+                    "%s could not read back messages missed while disconnected (#745)",
+                    log_ctx(thread_id=thread.id),
+                    exc_info=True,
+                )
+                continue
+            if count:
+                picked += count
+                threads_hit += 1
+        return picked, threads_hit, read_back
+
+    async def _threads_active_since(self, since: datetime) -> list[discord.Thread]:
+        """Unarchived threads whose last message is newer than *since*.
+
+        One ``active_threads`` call per guild, then a filter on the snowflake of
+        each thread's last message — so only threads that actually had traffic
+        are read. Posting into an archived thread unarchives it, so a thread the
+        outage hid a message in is active unless it has since been archived
+        again (its auto-archive window, 3 days by default, ran out).
+        """
+        threads: list[discord.Thread] = []
+        for guild in list(getattr(self.bot, "guilds", None) or []):
+            try:
+                active = await guild.active_threads()
+            except Exception as exc:
+                logger.warning(
+                    "could not list active threads in guild=%s to read back missed "
+                    "messages (%s) (#745)",
+                    getattr(guild, "id", "?"),
+                    exc,
+                )
+                continue
+            for thread in active:
+                last_id = getattr(thread, "last_message_id", None)
+                if last_id and discord.utils.snowflake_time(last_id) > since:
+                    threads.append(thread)
+        return threads
+
+    async def _pick_up_thread(
+        self, thread: discord.Thread, record: SessionRecord | None, outage: Outage
+    ) -> int:
+        """Run what *thread* received while we were away. Returns how many.
+
+        Everything the gateway did deliver is skipped (``_gateway_seen``), and
+        what is picked up here is marked before anything awaits, so a late
+        gateway delivery of it — or the next reconnect — does not run it again.
+        """
+        ctx = log_ctx(thread_id=thread.id)
+        history = [
+            m
+            async for m in thread.history(
+                limit=HISTORY_LIMIT, after=outage.since, oldest_first=True
+            )
+        ]
+        if len(history) >= HISTORY_LIMIT:
+            logger.warning(
+                "%s read back only the first %d messages posted since %s (#745)",
+                ctx,
+                HISTORY_LIMIT,
+                _local_stamp(outage.since),
+            )
+        requests = [m for m in history if await self._is_runnable_request(m)]
+        missed = [m for m in requests if m.id not in self._gateway_seen]
+        if not missed:
+            return 0
+        newest = missed[-1]
+        # Somebody already posted again after the reconnect, and that message
+        # ran. Running the old ones now would interrupt it (⚡).
+        superseded = any(m.id > newest.id and m.id in self._gateway_seen for m in requests)
+        for m in missed:
+            self._gateway_seen.add(m.id)
+
+        outcome: Outcome
+        if superseded:
+            outcome = "superseded"
+        elif is_closed(record) and not was_auto_stopped(record):
+            outcome = "held"  # #512: the reply path answers with the closed notice
+        else:
+            outcome = "run"
+        logger.info(
+            "%s picked up %d message(s) posted while the gateway was down (%s → %s): %s (#745)",
+            ctx,
+            len(missed),
+            _local_stamp(missed[0].created_at),
+            _local_stamp(newest.created_at),
+            outcome,
+        )
+        with contextlib.suppress(discord.HTTPException):
+            await thread.send(
+                missed_notice(
+                    down_at=outage.down_at,
+                    back_at=outage.back_at,
+                    first_missed_at=missed[0].created_at,
+                    count=len(missed),
+                    outcome=outcome,
+                )
+            )
+        if outcome != "superseded":
+            await self._handle_thread_reply(newest, earlier=missed[:-1])
+        return len(missed)
+
     async def _run_startup_recovery(self) -> None:
         """Retire the previous process's dead UI (#634 stop buttons, #671 menus).
 
@@ -2178,8 +2697,14 @@ class ClaudeChatCog(commands.Cog):
         with contextlib.suppress(Exception):
             await run_startup_recovery(self.bot, self.repo, self._ask_repo)
 
-    async def _handle_thread_reply(self, message: discord.Message) -> None:
+    async def _handle_thread_reply(
+        self, message: discord.Message, *, earlier: Sequence[discord.Message] = ()
+    ) -> None:
         """Continue a Claude Code session in an existing thread.
+
+        ``earlier`` (#745) carries messages that reached this thread before
+        *message* while the gateway was down. They run in this same turn —
+        replayed one by one, each would interrupt the one before it.
 
         A new message while a turn is already in flight **interrupts** that turn
         and starts fresh with the new instruction — the documented behaviour (see
@@ -2222,7 +2747,8 @@ class ClaudeChatCog(commands.Cog):
         # buttons feel unresponsive (yousan sent `y`). Route it into the menu
         # instead of pre-empting the turn and throwing the question away.
         # Checked before the lock: nothing below it is needed for an answer.
-        if await self._maybe_answer_open_menu(message, thread):
+        # Several messages picked up at once are not one answer (#745).
+        if not earlier and await self._maybe_answer_open_menu(message, thread):
             return
 
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
@@ -2231,6 +2757,17 @@ class ClaudeChatCog(commands.Cog):
             session_id = (record.session_id or None) if record else None
             prompt, image_paths = await self._build_prompt_and_images(message)
             prompt = await enrich_discord_references(prompt, message, self.bot)
+            if earlier:
+                prompt = merge_missed_prompt(
+                    [
+                        *(_missed_entry(m) for m in earlier),
+                        MissedEntry(
+                            created_at=message.created_at,
+                            author=_author_name(message),
+                            text=prompt,
+                        ),
+                    ]
+                )
 
             # Interrupt any in-flight turn for this thread before starting the new
             # one.  We key on ``_active_tasks`` (set synchronously below, under

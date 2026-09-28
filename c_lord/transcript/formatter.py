@@ -423,6 +423,9 @@ def _render_user(event: dict[str, Any]) -> RenderedEvent | None:
             return _render_compact_summary(event.get("sessionId"))
         if content.startswith(ZWSP_MARKER):
             # Echo of c-lord-driven send-keys; Discord already has the original.
+            # Only a sufficient sign, never a necessary one: CLI 2.1.278+ strips
+            # the marker, and the mirror recognises those echoes by the
+            # ``pane_echo`` record of what c-lord typed instead (#808).
             return None
         if not stripped:
             return None

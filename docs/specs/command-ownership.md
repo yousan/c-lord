@@ -45,6 +45,17 @@ c-lord のスラッシュコマンドには、`!` 始まり（と `@bot` メン�
 
 これは意図した動きです。まっさらなチャンネルで `!clord-init` が全台に届くということは、**居合わせた bot 全部が勝手にそのチャンネルを自分のものとして登録する**ということで、それは事故です。
 
+### スラッシュコマンドを別の c-lord の方から選んだとき（#811）
+
+スラッシュコマンドは Discord が1つのアプリにだけ届けますが、**どのアプリに届けるかを選ぶのは利用者**です。同じサーバーに c-lord が2台以上いると、`/workspace-start` や `/tmux-screenshot` が**ボットの数だけ同じ名前で**候補に並び、担当でない方をうっかり選べてしまいます。
+
+- **担当外の c-lord は「このスレッドは <@担当ボット> の担当です」とだけ答える**（本人にだけ見える ephemeral）。候補から担当ボットの方を選び直せば済む、と分かるようにするためです。
+- **担当外の c-lord は、ワークスペースについて何も言わない・何もしない。** 「ワークスペースがありません」「メッセージを送っても復元できません（記録が見つかりません）」は**言わない**（担当ボットが作業中でも、担当外の側は自分の記録しか見えないので、これを言うと事実と逆になる）。停止・削除・`/clear`・`/compact` などもそのスレッドには一切手を付けない。
+- 「担当外」と判定するのは、**自分の `sessions` にそのスレッドの行が無く**、かつ**スレッドを立てた `owner_id` が自分以外のボット**のときだけです。人間が立てたスレッドや、自分の行が消えた自分のスレッドは、従来どおり [session-resume.md](./session-resume.md) の文言になります。判定に必要な照会（DB・Discord）が失敗したときも従来どおりです。
+- 対象: `/tmux-screenshot` `/resync` `/workspace-start`（`/reopen-workspace`） `/workspace-stop`（`/close-workspace`） `/workspace-delete` `/clord`（スレッド内） `/skill`（スレッド内） `/stop` `/clear` `/compact` `/restart-claude` `/clord-reattach`。判定は [`c_lord/thread_owner.py`](../../c_lord/thread_owner.py) の1か所。
+
+候補が二重に並ぶこと自体は変えていません（どう見せるかは別の判断）。
+
 ### 認可 — webhook は人間用 allowlist を通らない
 
 - **webhook から送ったテキストコマンドは、`DISCORD_OWNER_ID` を設定していても通る。** webhook URL を持っていること自体が認可だからです。
@@ -70,4 +81,4 @@ c-lord のスラッシュコマンドには、`!` 始まり（と `@bot` メン�
 - [`c_lord/command_gate.py`](../../c_lord/command_gate.py) — 実装（`owns` / `owns_channel` / `is_message_authorized`）
 - [session-close.md](./session-close.md) — `/workspace-stop` そのものの動き
 - [STAGING.md](../STAGING.md) — 本番と staging を同じサーバーで併走させる運用
-- Issue #522（担当判定の始まり）/ #596（本件）/ #507・#508（認可）
+- Issue #522（担当判定の始まり）/ #596（本件）/ #507・#508（認可）/ #811（スラッシュコマンドを別の c-lord から選んだとき）
