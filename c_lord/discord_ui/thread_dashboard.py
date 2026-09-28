@@ -117,8 +117,9 @@ def _completion_text(
     mention_id: int,
     no_response: bool,
     usage_limit: UsageLimit | None = None,
+    login_required: bool = False,
 ) -> str:
-    """The turn-end ping. Says what actually happened (#562, #631).
+    """The turn-end ping. Says what actually happened (#562, #631, #812).
 
     "終わりました" is a summons: the user drops what they are doing and comes to
     look. When the turn produced nothing at all, that summons is a lie, and a
@@ -130,6 +131,9 @@ def _completion_text(
     a lie when the account is rate limited, because sending it again cannot
     work until the limit resets. A limited turn therefore reports the limit and
     its reset time, and says nothing about resending.
+
+    #812 is the same lie for a logged-out Claude Code: nothing in the thread can
+    fix it, only ``/login`` on the host can.
 
     The mention trails the text either way so Discord's push preview leads with
     the message rather than "@you" (#495).
@@ -143,6 +147,12 @@ def _completion_text(
         return (
             f"⏳ Claude の{usage_limit.scope}（上限）に達したため、このターンは実行されていません。"
             f"{when}。それまでは送り直しても同じ結果になります。 <@{mention_id}>"
+        )
+    if login_required:
+        return (
+            "🔑 Claude Code のログインが切れているため、このターンは実行されていません。"
+            "ホストで `claude` を開いて `/login` してください。"
+            f"ログインするまでは送り直しても同じ結果になります。 <@{mention_id}>"
         )
     if no_response:
         return (
@@ -444,6 +454,7 @@ class ThreadStatusDashboard:
         no_response: bool = False,
         usage_limit: UsageLimit | None = None,
         preempted: bool = False,
+        login_required: bool = False,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -517,7 +528,9 @@ class ThreadStatusDashboard:
                 # leads with "Claude has finished…" instead of "@you". A user
                 # mention pings anywhere in the content, so trailing it does not
                 # weaken the notification.
-                await thread.send(_completion_text(mention_id, no_response, usage_limit))
+                await thread.send(
+                    _completion_text(mention_id, no_response, usage_limit, login_required)
+                )
             except discord.HTTPException:
                 logger.debug(
                     "Failed to send completion mention in thread %d", thread_id, exc_info=True
