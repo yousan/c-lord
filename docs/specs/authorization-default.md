@@ -88,6 +88,23 @@ View に `_authorizer` を渡し忘れた場合は、**プロセスが実際に�
 `AskView` の全構築経路が `authorizer=` を持つことは `tests/test_view_authorizer_wiring.py`
 が（AST で）固定している。
 
+### `/clear`・`!clear` も同じ規則を通る (#405)
+
+`/clear` は runner を kill し、tmux window を無条件に kill し、セッション行をリセットする
+— **会話が消える、チャットの中で一番破壊的なコマンド**。それなのに隣の `/clord-attach` は
+ゲートされていて、`/clear` だけ権限チェックが無かった（スレッドに書き込める人なら誰でも
+他人の会話を消せた）。
+
+いまは `ClaudeChatCog._clear_impl` の先頭で、何かを壊す**前に**判定する。規則は新しく
+作らず、上の `Authorizer` をそのまま使う:
+
+- `/clear`（slash）→ human allowlist（`Authorizer.is_allowed`）
+- `!clear`（text）→ `is_message_authorized`。**webhook は通す**ので、`DISCORD_OWNER_ID` を
+  設定したままでも E2E（`tests/e2e/test_text_command_twins.py`）は壊れない
+
+拒否したら `You are not authorized to use this command.` を返し（slash は本人にだけ見える）、
+`/clear rejected` を INFO で残す。テストは `tests/test_clear_authorization.py`。
+
 ### 拒否したときは理由を出す
 
 「allowlist に無い」のと「authorizer が無く判定できない」は**利用者にとっては同じ無反応でも、
@@ -96,7 +113,6 @@ View に `_authorizer` を渡し忘れた場合は、**プロセスが実際に�
 
 ## スコープ外
 
-- `/clear`・`!clear` に権限チェックが無い件 → **#405**
 - webhook / 信頼済み bot が human allowlist を迂回する経路 → `c_lord/command_gate.py`
   (`is_message_authorized`、#507 / #508)。webhook URL の所持そのものが認可であり、
   この規則とは別の話
