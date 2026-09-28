@@ -37,6 +37,9 @@ UTC = timezone.utc  # noqa: UP017 — datetime.UTC is 3.11+, we support 3.10
 T0 = datetime(2026, 9, 15, 20, 0, 0, tzinfo=UTC)  # 05:00 JST
 
 
+BOT_ID = 4242
+
+
 def _at(minutes: float) -> datetime:
     return T0 + timedelta(minutes=minutes)
 
@@ -272,6 +275,8 @@ def _message(
     *,
     content: str = "報告どうなってる？",
     bot_author: bool = False,
+    author_id: int = 42,
+    reacted: bool = False,
 ) -> MagicMock:
     msg = MagicMock(spec=discord.Message)
     msg.id = discord.utils.time_snowflake(created_at)
@@ -283,8 +288,11 @@ def _message(
     msg.attachments = []
     msg.author = MagicMock()
     msg.author.bot = bot_author
-    msg.author.id = 42
+    msg.author.id = author_id
     msg.author.display_name = "yousan"
+    reaction = MagicMock()
+    reaction.me = True
+    msg.reactions = [reaction] if reacted else []
     return msg
 
 
@@ -322,6 +330,8 @@ class _Harness:
         ctx.valid = False
         bot.get_context = AsyncMock(return_value=ctx)
         bot.get_cog = MagicMock(return_value=None)
+        bot.user = MagicMock()
+        bot.user.id = BOT_ID
         guild = MagicMock()
         guild.id = 1
         guild.active_threads = AsyncMock(return_value=threads)
@@ -615,3 +625,182 @@ class TestOutageIsLogged:
         assert _at(16).astimezone().strftime("%Y-%m-%d %H:%M") in summary[0]
         assert _at(396).astimezone().strftime("%Y-%m-%d %H:%M") in summary[0]
         assert "thread=501" in "\n".join(infos)
+
+
+# ── #776: messages posted while the c-lord process was not running ──────────
+
+
+def _bot_says(thread: MagicMock, created_at: datetime) -> MagicMock:
+    return _message(thread, created_at, content="Claude の返事", bot_author=True, author_id=BOT_ID)
+
+
+def _in_thread(thread_id: int, messages: list[MagicMock]) -> MagicMock:
+    thread = _thread(thread_id, messages)
+    for m in messages:
+        m.channel = thread
+    return thread
+
+
+class TestStartupPicksUpWhatTheRestartMissed:
+    """#776: a restart leaves a gap of seconds in which nothing is listening.
+
+    The new process IDENTIFYs, so Discord never delivers that gap. There is no
+    DB record of what the previous process ran — what it did leaves marks in
+    Discord instead: every turn puts a reaction on its trigger message, and
+    every other way of handling a message (menu answer, closed notice, slot
+    wait, ⚡) posts in the thread. A request newer than the previous process's
+    last mark is one it never saw.
+
+    The harness process comes up at ``_at(0)`` and reaches READY at ``_at(0.1)``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_message_posted_during_the_restart_runs_on_startup(self) -> None:
+        """AC1. RED before #776: the first connect reads nothing."""
+        answer = _bot_says(MagicMock(), _at(-10))
+        gap = _message(MagicMock(), _at(-0.1), content="再起動中に送った依頼")
+        thread = _in_thread(501, [answer, gap])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_awaited_once()
+        assert h.cog._handle_thread_reply.await_args.args[0] is gap
+        thread.send.assert_awaited_once()
+        line = thread.send.await_args.args[0]
+        assert line.startswith("-# 🔌 ")
+        assert "再起動" in line
+        assert "いまから処理します" in line
+
+    @pytest.mark.asyncio
+    async def test_a_message_the_previous_process_reacted_to_is_not_run_again(self) -> None:
+        """AC2: 🟢/🟡 on the message = the previous process ran it."""
+        ran = _message(MagicMock(), _at(-5), reacted=True)
+        thread = _in_thread(501, [ran])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+        thread.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_message_the_previous_process_answered_is_not_run_again(self) -> None:
+        """AC2: a typed menu answer / closed notice leaves no reaction, but the
+        previous process posted after it."""
+        handled = _message(MagicMock(), _at(-5), content="2")
+        notice = _bot_says(MagicMock(), _at(-4.9))
+        thread = _in_thread(501, [handled, notice])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_message_merged_into_a_later_turn_is_not_run_again(self) -> None:
+        """AC2: only the trigger of a turn gets the lamp; the one before it (⚡,
+        or merged by #745) is older than that mark."""
+        first = _message(MagicMock(), _at(-5), content="一つ目")
+        second = _message(MagicMock(), _at(-4), content="二つ目", reacted=True)
+        thread = _in_thread(501, [first, second])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_what_this_process_posts_does_not_hide_the_gap(self) -> None:
+        """The transcript mirror of the *new* process may post Claude's reply
+        (written while nobody was listening) before the pick-up reads the
+        thread. Only the previous process's marks count."""
+        gap = _message(MagicMock(), _at(-0.1))
+        caught_up = _bot_says(MagicMock(), _at(0.05))
+        thread = _in_thread(501, [gap, caught_up])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_awaited_once()
+        assert h.cog._handle_thread_reply.await_args.args[0] is gap
+
+    @pytest.mark.asyncio
+    async def test_several_messages_in_the_gap_run_as_one_turn(self) -> None:
+        answer = _bot_says(MagicMock(), _at(-10))
+        first = _message(MagicMock(), _at(-0.3), content="一つ目")
+        second = _message(MagicMock(), _at(-0.2), content="二つ目")
+        thread = _in_thread(501, [answer, first, second])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        call = h.cog._handle_thread_reply.await_args
+        assert call.args[0] is second
+        assert list(call.kwargs["earlier"]) == [first]
+        assert "2 件" in thread.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_a_newer_live_message_wins(self) -> None:
+        gap = _message(MagicMock(), _at(-0.1), content="古い依頼")
+        live = _message(MagicMock(), _at(0.2), content="新しい依頼")
+        thread = _in_thread(501, [gap, live])
+        h = _Harness([thread], {501: _record(501)})
+        # The live one is delivered (and run) before the pick-up reads the thread.
+        h.cog._gateway_seen.add(live.id)
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+        assert "実行していません" in thread.send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_messages_older_than_the_lookback_are_left_alone(self) -> None:
+        stale = _message(MagicMock(), _at(-61))
+        thread = _in_thread(501, [stale])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_threads_that_are_not_ours_are_left_alone(self) -> None:
+        gap = _message(MagicMock(), _at(-0.1))
+        thread = _in_thread(777, [gap])
+        h = _Harness([thread], {})
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+        thread.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_later_reconnect_does_not_pick_it_up_twice(self) -> None:
+        gap = _message(MagicMock(), _at(-0.1))
+        thread = _in_thread(501, [gap])
+        h = _Harness([thread], {501: _record(501)})
+
+        await h.connect(0.1)
+        await h.disconnect(1)
+        await h.connect(2)
+
+        assert h.cog._handle_thread_reply.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_window_and_count_are_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        """AC3."""
+        import logging
+
+        gap = _message(MagicMock(), _at(-0.1))
+        thread = _in_thread(501, [gap])
+        h = _Harness([thread], {501: _record(501)})
+
+        with caplog.at_level(logging.INFO, logger="c_lord"):
+            await h.connect(0.1)
+
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        summary = [m for m in infos if "Startup pick-up" in m and "picked up 1 message(s)" in m]
+        assert summary, infos
+        assert _at(-60).astimezone().strftime("%Y-%m-%d %H:%M") in summary[0]
+        assert _at(0.1).astimezone().strftime("%Y-%m-%d %H:%M") in summary[0]

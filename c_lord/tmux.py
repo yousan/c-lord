@@ -428,14 +428,41 @@ def _tmux_client_env() -> dict[str, str]:
     return env
 
 
+#: Upper bound for one :func:`_run` call. Everything routed through ``_run`` is
+#: an instant tmux/git query, so this only ever trips on a client that hangs.
+_RUN_TIMEOUT_SECONDS = 30.0
+
+#: returncode reported for a command cut off by :data:`_RUN_TIMEOUT_SECONDS`
+#: (the same value coreutils ``timeout`` uses).
+_RUN_TIMEOUT_RETURNCODE = 124
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess and return the result (never raises on non-zero exit)."""
-    return subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        env=_tmux_client_env(),
-    )
+    """Run a subprocess and return the result (never raises on non-zero exit).
+
+    Bounded by :data:`_RUN_TIMEOUT_SECONDS` (#699). Most callers reach this via
+    ``asyncio.to_thread``; an unbounded call that never returned pinned its
+    executor worker for good, and ``asyncio.run()`` joins every worker with no
+    timeout at shutdown — so the bot finished ``close()`` and then hung, alive
+    and silent. A timeout is reported like any other failure: a non-zero
+    returncode, not an exception.
+    """
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            env=_tmux_client_env(),
+            timeout=_RUN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("%s timed out after %.0fs (#699)", args[:2], _RUN_TIMEOUT_SECONDS)
+        return subprocess.CompletedProcess(
+            args,
+            _RUN_TIMEOUT_RETURNCODE,
+            stdout="",
+            stderr=f"timed out after {_RUN_TIMEOUT_SECONDS:.0f}s",
+        )
 
 
 # OTEL_RESOURCE_ATTRIBUTES is comma/equals separated and gets typed into a

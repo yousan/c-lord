@@ -334,15 +334,21 @@ A turn that does not wind down on its own within a few seconds is cancelled. If 
 
 If the bot restarts (upgrade, maintenance, etc.), active sessions are automatically marked for resume. When the bot comes back online, sessions pick up where they left off.
 
-### Messages sent while the bot was disconnected from Discord
+### Messages sent while the bot was disconnected or restarting
 
 If the bot loses its connection to Discord (host network or DNS trouble), messages you
 post in a c-lord thread meanwhile are not lost. When the connection comes back, c-lord
 reads them back from the thread and runs them, with one line explaining the delay
 (`-# 🔌 05:16〜11:52 の間 Discord と接続できておらず、この依頼を受け取れていませんでした。いまから処理します。`).
 Several messages in one thread run together as one turn; nothing runs twice. Text
-commands (`!stop` …) are not replayed. This covers a lost connection, not a bot restart
-(#745). See [specs/gateway-backfill.md](specs/gateway-backfill.md).
+commands (`!stop` …) are not replayed (#745).
+
+The same holds for messages posted while the bot process itself was restarting: on
+startup c-lord reads back the last hour of its threads and runs the requests posted
+after the previous process's last reaction or reply, with
+`-# 🔌 … の間 c-lord が再起動しており、…` as the one line (#776). What the previous
+process already handled is recognised by those marks, so it does not run again. See
+[specs/gateway-backfill.md](specs/gateway-backfill.md).
 
 ---
 
