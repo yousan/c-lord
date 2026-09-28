@@ -163,7 +163,7 @@ class TestStartClaudeWithoutPrompt:
         mgr._check_available = MagicMock(return_value=True)  # type: ignore[method-assign]
         mgr._find_window_for_thread = MagicMock(return_value="w1")  # type: ignore[method-assign]
         mgr._pane_path = MagicMock(return_value="/tmp/work")  # type: ignore[method-assign]
-        mgr._type_literal = lambda target, text, *, what: (  # type: ignore[method-assign]
+        mgr._type_literal = lambda target, text, *, what, errors=None: (  # type: ignore[method-assign]
             typed.append(text) or True
         )
         return mgr
@@ -275,7 +275,6 @@ class TestChatCogWakeWorkspace:
     async def test_unbound_channel_cannot_be_woken(self):
         cog, thread = self._cog(None)
         assert await cog.wake_workspace(thread) is False
-
 
     async def test_waits_for_the_per_thread_setup_lock(self, monkeypatch):
         """Two clicks (or a message landing mid-wake) must not each start a
