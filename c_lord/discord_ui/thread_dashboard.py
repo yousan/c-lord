@@ -84,6 +84,12 @@ _SWEEP_MAX_FAILURES = 5
 _SWEEP_ENV_FLAG = "CLORD_DASHBOARD_SWEEP"
 _OFF_VALUES = {"0", "false", "no", "off"}
 
+#: Opt in to the board itself (#761). Off by default: every start used to post
+#: or rewrite the board in the channel, and development restarts the bot many
+#: times a day. The turn-end ping is NOT governed by this — only the board.
+_BOARD_ENV_FLAG = "CLORD_SESSION_STATUS_BOARD"
+_ON_VALUES = {"1", "true", "yes", "on"}
+
 # Threads older than this are pruned from the dashboard automatically.
 # Keeps the embed from accumulating stale entries after a long idle period.
 _STALE_HOURS = 4
@@ -92,6 +98,11 @@ _STALE_HOURS = 4
 #: happen only inside a state change, so a day with no posts left 47-hour-old
 #: rows reading "0s ago". A tick that prunes nothing makes no Discord call.
 _PRUNE_INTERVAL_SECONDS = 300
+
+
+def board_enabled() -> bool:
+    """Whether this deployment shows the 📊 Session Status board (#761, opt-in)."""
+    return os.getenv(_BOARD_ENV_FLAG, "").strip().lower() in _ON_VALUES
 
 
 def _sweep_enabled() -> bool:
@@ -113,8 +124,9 @@ def _completion_text(
     mention_id: int,
     no_response: bool,
     usage_limit: UsageLimit | None = None,
+    login_required: bool = False,
 ) -> str:
-    """The turn-end ping. Says what actually happened (#562, #631).
+    """The turn-end ping. Says what actually happened (#562, #631, #812).
 
     "終わりました" is a summons: the user drops what they are doing and comes to
     look. When the turn produced nothing at all, that summons is a lie, and a
@@ -126,6 +138,9 @@ def _completion_text(
     a lie when the account is rate limited, because sending it again cannot
     work until the limit resets. A limited turn therefore reports the limit and
     its reset time, and says nothing about resending.
+
+    #812 is the same lie for a logged-out Claude Code: nothing in the thread can
+    fix it, only ``/login`` on the host can.
 
     The mention trails the text either way so Discord's push preview leads with
     the message rather than "@you" (#495).
@@ -139,6 +154,12 @@ def _completion_text(
         return (
             f"⏳ Claude の{usage_limit.scope}（上限）に達したため、このターンは実行されていません。"
             f"{when}。それまでは送り直しても同じ結果になります。 <@{mention_id}>"
+        )
+    if login_required:
+        return (
+            "🔑 Claude Code のログインが切れているため、このターンは実行されていません。"
+            "ホストで `claude` を開いて `/login` してください。"
+            f"ログインするまでは送り直しても同じ結果になります。 <@{mention_id}>"
         )
     if no_response:
         return (
@@ -210,8 +231,12 @@ class ThreadStatusDashboard:
         channel: discord.TextChannel,
         owner_id: int | None = None,
         bot_user_id: int | None = None,
+        board: bool | None = None,
     ) -> None:
         self._channel = channel
+        # #761: None → ``CLORD_SESSION_STATUS_BOARD`` decides (off by default).
+        self._board_enabled = board_enabled() if board is None else board
+        self._retired = False
         self._bot_user_id = bot_user_id
         self._sweep_task: asyncio.Task[None] | None = None
         self._prune_task: asyncio.Task[None] | None = None
@@ -237,6 +262,10 @@ class ThreadStatusDashboard:
         behind. The dead boards of earlier processes are deleted in the
         background (opt out with ``CLORD_DASHBOARD_SWEEP=0``).
         """
+        if not self._board_enabled:
+            await self._retire_boards()
+            return
+
         stale: list[discord.Message] = []
         self._start_prune_timer()
         async with self._lock:
@@ -267,6 +296,28 @@ class ThreadStatusDashboard:
             # and must never hold up on_ready. Keep the reference so the task
             # is not garbage collected mid-flight.
             self._sweep_task = asyncio.create_task(self._sweep_dead_boards(stale))
+
+    async def _retire_boards(self) -> None:
+        """Board off (#761): post nothing, and sweep the boards earlier starts left.
+
+        A board nobody updates any more is the #754 lie — rows reading
+        "0s ago" for days — so it goes, under the same rules as the #720 sweep
+        (only our own boards; ``CLORD_DASHBOARD_SWEEP=0`` keeps them). Done
+        once per process: ``on_ready`` fires again on every reconnect.
+        """
+        if self._retired:
+            return
+        self._retired = True
+        boards = await self._find_own_boards()
+        logger.info(
+            "Session Status board is off (set %s=1 to show it) — %d board(s) from "
+            "earlier starts to retire in channel %s",
+            _BOARD_ENV_FLAG,
+            len(boards),
+            getattr(self._channel, "id", "?"),
+        )
+        if boards:
+            self._sweep_task = asyncio.create_task(self._sweep_dead_boards(boards))
 
     async def _adopt(self, candidate: discord.Message, embed: discord.Embed) -> bool:
         """Try to take over *candidate* as the live board. True when adopted."""
@@ -416,6 +467,7 @@ class ThreadStatusDashboard:
         no_response: bool = False,
         usage_limit: UsageLimit | None = None,
         preempted: bool = False,
+        login_required: bool = False,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -489,7 +541,9 @@ class ThreadStatusDashboard:
                 # leads with "Claude has finished…" instead of "@you". A user
                 # mention pings anywhere in the content, so trailing it does not
                 # weaken the notification.
-                await thread.send(_completion_text(mention_id, no_response, usage_limit))
+                await thread.send(
+                    _completion_text(mention_id, no_response, usage_limit, login_required)
+                )
             except discord.HTTPException:
                 logger.debug(
                     "Failed to send completion mention in thread %d", thread_id, exc_info=True

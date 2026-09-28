@@ -33,6 +33,7 @@ from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
 from ..discord_ui.authorization import Authorizer
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
+from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -270,6 +271,11 @@ class SkillCommandCog(commands.Cog):
 
         # In-thread mode: if invoked inside a thread under the claude channel, resume it
         if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
+            # #811: another c-lord's thread — running here would take it over.
+            foreign = await foreign_owner_notice_for(self.bot, self.repo, channel)
+            if foreign is not None:
+                await respond(foreign, ephemeral=True)
+                return
             parent_channel_id = channel.parent_id or self.claude_channel_id
             sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=channel.id)
             tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=channel.id)

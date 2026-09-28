@@ -15,6 +15,7 @@ import logging
 
 from ..claude.tmux_runner import (
     FLEET_TMUX_RESTART_ERROR_PREFIX,
+    LOGIN_REQUIRED_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
@@ -347,6 +348,12 @@ class EventProcessor:
                 )
             ):
                 self._config.outcome.no_response = True
+            # #812: a turn refused for want of /login produced nothing either,
+            # and — like the limit below — must not be followed by "send it
+            # again", so the turn-end line gets its own wording.
+            if event.error.startswith(LOGIN_REQUIRED_ERROR_PREFIX):
+                self._config.outcome.no_response = True
+                self._config.outcome.login_required = True
             # #631: a rate-limited turn also produced nothing, but it knows why.
             # ``no_response`` is set too so no caller reads it as a completed
             # turn; ``usage_limit`` is what upgrades the wording from "send it

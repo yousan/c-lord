@@ -233,6 +233,11 @@ class TestOnError:
         assert any("zombie" in r.message.lower() for r in caplog.records)
 
 
+async def _no_messages():
+    for _ in ():
+        yield _
+
+
 class TestDashboardOnReady:
     """#720: on_ready must not add a Session Status board on every reconnect.
 
@@ -259,9 +264,29 @@ class TestDashboardOnReady:
         return bot, channel
 
     @pytest.mark.asyncio
-    async def test_second_on_ready_keeps_the_same_dashboard(self) -> None:
+    async def test_default_start_posts_no_board(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#761: the board is opt-in — a plain start leaves the channel alone."""
         from unittest.mock import patch
 
+        monkeypatch.delenv("CLORD_SESSION_STATUS_BOARD", raising=False)
+        bot, channel = self._make_bot()
+        channel.history = MagicMock(side_effect=lambda **_kw: _no_messages())
+        channel.pins = MagicMock(side_effect=lambda **_kw: _no_messages())
+
+        with patch.object(bot, "_assert_expected_identity"):
+            await bot.on_ready()
+
+        channel.send.assert_not_awaited()
+        # The turn-end ping lives on the same object, so it must still exist.
+        assert bot.thread_dashboard is not None
+
+    @pytest.mark.asyncio
+    async def test_second_on_ready_keeps_the_same_dashboard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import patch
+
+        monkeypatch.setenv("CLORD_SESSION_STATUS_BOARD", "1")
         bot, channel = self._make_bot()
 
         with patch.object(bot, "_assert_expected_identity"):

@@ -34,6 +34,7 @@ from ..session_close import (
 from ..session_dir import SessionDirManager
 from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
 from ..status_view import StatusRow, classify_status, render_status
+from ..thread_owner import foreign_owner_notice_for
 from ..thread_rename import rename_thread_topic
 from ..thread_settings import (
     SETTING_THREAD_AUTO_ARCHIVE,
@@ -976,6 +977,21 @@ class SessionManageCog(commands.Cog):
         respond, ack = self._ctx_io(ctx)
         await self._tmux_list_impl(respond=respond, ack=ack)
 
+    async def _answered_as_foreign_thread(self, channel: object, respond: _Responder) -> bool:
+        """Answer 「<@owner> の担当です」 when ``channel`` is another bot's thread — #811.
+
+        Two c-lords in one guild list every slash command twice. The one that did
+        not create the thread has no row for it, and every thread command used to
+        take that as "this workspace is gone" — about a thread its owner was busy
+        in. Returns ``True`` when it answered, so the caller stops there and
+        claims (or does, for stop/delete) nothing about someone else's workspace.
+        """
+        notice = await foreign_owner_notice_for(self.bot, self.repo, channel)
+        if notice is None:
+            return False
+        await respond(notice, ephemeral=True)
+        return True
+
     async def _screenshot_impl(
         self, *, channel: object, respond: _Responder, ack: _Acknowledger
     ) -> None:
@@ -991,6 +1007,9 @@ class SessionManageCog(commands.Cog):
                 "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         thread_id = channel.id
@@ -1181,6 +1200,10 @@ class SessionManageCog(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        if await self._answered_as_foreign_thread(channel, respond):
+            return
+
         thread_id = channel.id
         await ack()
         session_name, window_name = await self._find_thread_window(thread_id)
@@ -1254,6 +1277,9 @@ class SessionManageCog(commands.Cog):
                 "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         thread_id = channel.id
@@ -1447,6 +1473,9 @@ class SessionManageCog(commands.Cog):
             )
             return
 
+        if await self._answered_as_foreign_thread(channel, respond):
+            return
+
         thread_id = channel.id
         parent_channel_id = channel.parent_id or thread_id
         await ack()
@@ -1609,6 +1638,9 @@ class SessionManageCog(commands.Cog):
                 "This command can only be used in a Claude chat thread.",
                 ephemeral=True,
             )
+            return
+
+        if await self._answered_as_foreign_thread(channel, respond):
             return
 
         await ack()

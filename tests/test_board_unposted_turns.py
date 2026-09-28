@@ -38,6 +38,12 @@ from c_lord.discord_ui.thread_dashboard import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _board_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the board itself, which is opt-in since #761."""
+    monkeypatch.setenv("CLORD_SESSION_STATUS_BOARD", "1")
+
+
 def _mock_dashboard() -> MagicMock:
     """A dashboard double that records the order of state transitions."""
     dashboard = MagicMock(spec=ThreadStatusDashboard)
