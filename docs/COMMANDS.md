@@ -418,10 +418,10 @@ automatically (see `tests/e2e/test_text_command_twins.py`).
 > marker, so the line no longer starts with `/` and the TUI does not treat it as
 > a slash command. Use the `!`/mention twin instead.
 
-> **Auth note.** The text twins that act on a session — `!clord`, `!attach`,
-> `!clord-reattach`, `!clear`, `!skill`, `!clord-init`, `!clord-thread-init` —
-> are authorized by the message-backed rule in `c_lord/command_gate.py`
-> (`is_message_authorized`, #507 / #508 / #405):
+> **Auth note.** Every text twin except the read-only `!version`,
+> `!model-show` and `!thread-archive-show` is authorized by the message-backed
+> rule in `c_lord/command_gate.py` (`is_message_authorized`, #507 / #508 / #405 /
+> #781):
 >
 > - a **webhook** message is allowed — holding the webhook URL is the grant, and
 >   it is what keeps the E2E harness working with `DISCORD_OWNER_ID` set;
@@ -455,6 +455,13 @@ A user who is not allowed gets `You are not authorized to use this command.` and
 nothing happens. That includes `/clear` / `!clear` (#405): it throws the conversation
 away (#803: by typing `/clear` into Claude Code), so a stranger in the thread must not be
 able to run it on someone else's conversation.
+
+The same goes for **every** command except `/version`, `/model show` and
+`/thread-archive show` (and their `!` twins), which only display harmless
+settings (#781). Before #781, `/workspace-delete`, `/model set`, `/stop`,
+`/compact`, `/upgrade` and ~30 others ran for anyone who could type in the
+thread. `tests/test_command_authorization_coverage.py` fails CI if a new command
+skips the gate.
 
 See [specs/authorization-default.md](specs/authorization-default.md).
 

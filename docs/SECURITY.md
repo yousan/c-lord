@@ -172,8 +172,12 @@ class ClaudeChatCog(commands.Cog):
   be configured for the bot to be usable *by you* and unusable by everyone else
   (#713). Until the bot has logged in and asked Discord, nobody passes.
 - `CLORD_ALLOW_ANYONE=1` restores "anyone in the server", with a startup warning
-- The same check applies to `SkillCommandCog` and `ChannelRepoCog` — they hold
-  the same `Authorizer` instance rather than a copy of the rule
+- The same check applies to `SkillCommandCog`, `ChannelRepoCog` and
+  `SessionManageCog` — they hold the same `Authorizer` instance rather than a
+  copy of the rule. Every slash / text command goes through it except the
+  read-only `/version`, `/model show`, `/thread-archive show`; an AST test
+  (`tests/test_command_authorization_coverage.py`) fails CI for a new command
+  that skips it (#781)
 
 **Why the default is not "everyone"**: being able to talk to c-lord is being
 able to run shell commands on the host that runs it. A fail-open default means

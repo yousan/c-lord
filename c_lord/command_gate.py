@@ -36,11 +36,17 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import discord
 
+if TYPE_CHECKING:
+    from .discord_ui.authorization import Authorizer
+
 logger = logging.getLogger(__name__)
+
+#: What a refused command answers (#405, #781). Ephemeral for a slash command.
+NOT_AUTHORIZED = "You are not authorized to use this command."
 
 # A binding lookup: ``(channel_id, thread_id=...) -> manager | None``.
 _Resolver = Callable[..., Awaitable[Any]]
@@ -79,6 +85,30 @@ def is_message_authorized(
     if message.author.bot:
         return message.author.id in _trusted_bot_ids()
     return is_allowed(message.author)
+
+
+def authorize_command(
+    authorizer: Authorizer | None,
+    user: discord.Member | discord.User,
+    message: discord.Message | None,
+) -> bool:
+    """Whether *user* may run a command — slash or text — under *authorizer* (#781).
+
+    The same split as ``ClaudeChatCog._authorize`` (#405), for cogs that do not
+    own the process's :class:`Authorizer`: a slash command has no message and
+    can never come from a webhook, so it is the human allowlist; a text command
+    goes through :func:`is_message_authorized`, so a webhook or a trusted bot
+    can still drive it.
+
+    ``None`` — no authorizer to ask — denies. Not knowing who is allowed must
+    never widen access (#713), and a blank ``Authorizer()`` is not a stand-in:
+    with an allowlist configured it denies the owner too (#739).
+    """
+    if authorizer is None:
+        return False
+    if message is None:
+        return authorizer.is_allowed(user)
+    return is_message_authorized(message, authorizer.is_allowed)
 
 
 async def owns(

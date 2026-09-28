@@ -1550,13 +1550,32 @@ class ClaudeChatCog(commands.Cog):
         await respond(notice, ephemeral=True)
         return True
 
-    async def _stop_impl(self, channel: object, respond: _Responder) -> None:
+    async def _stop_impl(
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        user: discord.Member | discord.User,
+        message: discord.Message | None = None,
+    ) -> None:
         """Shared core for /stop and !stop (#209).
 
         Interrupts the active runner without clearing the session DB so the
         user can resume by sending a new message.  ``respond`` posts the reply
         the way the caller needs (interaction response vs ctx.send).
+
+        Gated like ``/clear`` (#405, #781): ``message`` is the invoking message
+        for ``!stop`` (so a webhook can still drive it), ``None`` for the slash.
         """
+        if not self._authorize(user, message):
+            logger.info(
+                "%s /stop rejected: user %s is not authorized (#781)",
+                log_ctx(thread_id=getattr(channel, "id", None)),
+                getattr(user, "id", "?"),
+            )
+            await respond("You are not authorized to use this command.", ephemeral=True)
+            return
+
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
@@ -1657,7 +1676,7 @@ class ClaudeChatCog(commands.Cog):
             else:
                 await interaction.response.send_message(content, ephemeral=ephemeral)
 
-        await self._stop_impl(interaction.channel, respond)
+        await self._stop_impl(interaction.channel, respond, user=interaction.user)
 
     @commands.command(name="stop")
     async def stop_text(self, ctx: commands.Context) -> None:
@@ -1674,7 +1693,7 @@ class ClaudeChatCog(commands.Cog):
             else:
                 await ctx.send(content or "")
 
-        await self._stop_impl(ctx.channel, respond)
+        await self._stop_impl(ctx.channel, respond, user=ctx.author, message=ctx.message)
 
     @app_commands.command(
         name="clord-attach",
@@ -1971,7 +1990,14 @@ class ClaudeChatCog(commands.Cog):
 
         await self._clear_impl(ctx.channel, respond, user=ctx.author, message=ctx.message)
 
-    async def _restart_impl(self, channel: object, respond: _Responder) -> None:
+    async def _restart_impl(
+        self,
+        channel: object,
+        respond: _Responder,
+        *,
+        user: discord.Member | discord.User,
+        message: discord.Message | None = None,
+    ) -> None:
         """Shared core for /claude-restart and its /restart-claude alias (#440, #578).
 
         Restarts the Claude **process** for this thread while PRESERVING the
@@ -1985,7 +2011,18 @@ class ClaudeChatCog(commands.Cog):
         process is untouched) and ``/clear`` (wipe the session, start fresh).
         Observationally for the Discord user: after this, your next message is
         handled by a fresh claude process that still remembers the conversation.
+
+        Gated like ``/clear`` (#405, #781) — it kills someone's running turn.
         """
+        if not self._authorize(user, message):
+            logger.info(
+                "%s /claude-restart rejected: user %s is not authorized (#781)",
+                log_ctx(thread_id=getattr(channel, "id", None)),
+                getattr(user, "id", "?"),
+            )
+            await respond("You are not authorized to use this command.", ephemeral=True)
+            return
+
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
@@ -2095,12 +2132,16 @@ class ClaudeChatCog(commands.Cog):
         typing ``/claude`` surfaces this next to the other Claude-scoped
         commands instead of hiding it under ``/restart``.
         """
-        await self._restart_impl(interaction.channel, self._slash_text_responder(interaction))
+        await self._restart_impl(
+            interaction.channel, self._slash_text_responder(interaction), user=interaction.user
+        )
 
     @commands.command(name="claude-restart")
     async def claude_restart_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /claude-restart — invokable from webhooks (#440)."""
-        await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
+        await self._restart_impl(
+            ctx.channel, self._ctx_text_responder(ctx), user=ctx.author, message=ctx.message
+        )
 
     @app_commands.command(
         name="restart-claude",
@@ -2114,18 +2155,24 @@ class ClaudeChatCog(commands.Cog):
         consumers get the new name by updating the package alone, which is the
         Zero-Config Principle.
         """
-        await self._restart_impl(interaction.channel, self._slash_text_responder(interaction))
+        await self._restart_impl(
+            interaction.channel, self._slash_text_responder(interaction), user=interaction.user
+        )
 
     @commands.command(name="restart-claude")
     async def restart_claude_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of the /restart-claude alias (#440)."""
-        await self._restart_impl(ctx.channel, self._ctx_text_responder(ctx))
+        await self._restart_impl(
+            ctx.channel, self._ctx_text_responder(ctx), user=ctx.author, message=ctx.message
+        )
 
     async def _compact_impl(
         self,
         channel: object,
         respond: _Responder,
         *,
+        user: discord.Member | discord.User,
+        message: discord.Message | None = None,
         instructions: str = "",
         ack: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
@@ -2145,7 +2192,18 @@ class ClaudeChatCog(commands.Cog):
         — rather than refused with "no running session": whether the Claude is
         asleep is c-lord's business, not the user's, and the refusal read as the
         conversation being gone.
+
+        Gated like ``/clear`` (#405, #781): a summary cannot be undone.
         """
+        if not self._authorize(user, message):
+            logger.info(
+                "%s /compact rejected: user %s is not authorized (#781)",
+                log_ctx(thread_id=getattr(channel, "id", None)),
+                getattr(user, "id", "?"),
+            )
+            await respond("You are not authorized to use this command.", ephemeral=True)
+            return
+
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
             return
@@ -2181,7 +2239,13 @@ class ClaudeChatCog(commands.Cog):
         """Trigger the TUI ``/compact`` for the current thread's session."""
 
         respond, ack = self._deferrable_responder(interaction)
-        await self._compact_impl(interaction.channel, respond, instructions=instructions, ack=ack)
+        await self._compact_impl(
+            interaction.channel,
+            respond,
+            user=interaction.user,
+            instructions=instructions,
+            ack=ack,
+        )
 
     @commands.command(name="compact")
     async def compact_text(self, ctx: commands.Context, *, instructions: str = "") -> None:
@@ -2190,7 +2254,13 @@ class ClaudeChatCog(commands.Cog):
         async def respond(content: str | None = None, *, ephemeral: bool = False) -> None:
             await ctx.send(content or "")
 
-        await self._compact_impl(ctx.channel, respond, instructions=instructions)
+        await self._compact_impl(
+            ctx.channel,
+            respond,
+            user=ctx.author,
+            message=ctx.message,
+            instructions=instructions,
+        )
 
     async def _handle_new_conversation(self, message: discord.Message) -> None:
         """Create a new thread and start a Claude Code session."""
