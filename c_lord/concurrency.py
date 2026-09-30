@@ -1,10 +1,10 @@
-"""Concurrency awareness for multiple simultaneous Claude Code sessions.
+"""In-memory registry of the Claude Code sessions that are running a turn.
 
-Layer 1: Every session receives a generic concurrency warning in its prompt.
-Layer 2: An in-memory registry tracks active sessions so each one knows
-         what others are doing and can avoid conflicts.
+``/workspace-cleanup`` reads it to skip workspaces that are in use.
 
-See: https://github.com/yousan/c-lord/issues/52
+History: this module also built a "concurrency notice" meant to be injected into
+every session (#52). Since the tmux TUI (#53) there is no per-turn channel for it,
+so it was built and dropped (#758); #766 removed the builder.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import threading
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
-# Layer 2: Active Session Registry
+# Active Session Registry
 # ---------------------------------------------------------------------------
 
 
@@ -24,29 +24,6 @@ class ActiveSession:
     thread_id: int
     description: str
     working_dir: str | None = None
-
-
-_BASE_CONCURRENCY_NOTICE = """\
-[CONCURRENCY NOTICE — MANDATORY] You are one of MULTIPLE Claude Code sessions \
-running simultaneously via Discord. Other sessions ARE active right now. \
-You MUST follow these rules to avoid destroying each other's work:
-
-1. **Git — INDEPENDENT CLONE**: You are working in an independent clone \
-directory, isolated from other sessions. Always commit and push before \
-finishing — uncommitted changes WILL be lost when the session ends.
-2. **Files**: Another session may be working on overlapping files in a \
-separate clone. Coordinate via git (commit, push, pull) to avoid conflicts.
-3. **Ports & processes**: Shared network ports or lock files may already be in use.
-4. **Resources**: Shared databases, APIs with rate limits, or singleton processes \
-may be accessed concurrently.
-
-CRITICAL: If your work targets the same repository as another active session, \
-coordinate via git branches to avoid conflicts.\
-"""
-
-_OTHER_SESSIONS_HEADER = """
-⚠️ ACTIVE SESSIONS RIGHT NOW (you MUST avoid conflicts with these):
-"""
 
 
 class SessionRegistry:
@@ -104,24 +81,3 @@ class SessionRegistry:
         """Return all active sessions except the given thread."""
         with self._lock:
             return [s for s in self._sessions.values() if s.thread_id != thread_id]
-
-    def build_concurrency_notice(self, thread_id: int) -> str:
-        """Build the full concurrency notice for a session.
-
-        Combines the base Layer 1 warning with Layer 2 context about
-        other active sessions.
-        """
-        notice = _BASE_CONCURRENCY_NOTICE
-        others = self.list_others(thread_id)
-        if others:
-            notice += _OTHER_SESSIONS_HEADER
-            for s in others:
-                line = f"- {s.description}"
-                if s.working_dir:
-                    line += f" (working in {s.working_dir})"
-                notice += line + "\n"
-            notice += (
-                "\nIf your work targets the same repository as any session above, "
-                "coordinate via git branches to avoid conflicts.\n"
-            )
-        return notice
