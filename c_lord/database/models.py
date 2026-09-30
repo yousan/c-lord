@@ -130,6 +130,9 @@ _MIGRATIONS = [
         "last_message_id INTEGER NOT NULL, "
         "swept_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
     ),
+    # #796: which sweep wrote the cursor. A cursor from a sweep that did not yet
+    # recognise a kind of residue has stepped over it; older rows read as absent.
+    "ALTER TABLE ui_sweep_cursors ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
     # #671: the message a pending menu is drawn on (startup retires closed menus).
     "ALTER TABLE pending_asks ADD COLUMN message_id INTEGER",
     "ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'discord'",
