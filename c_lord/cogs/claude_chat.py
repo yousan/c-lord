@@ -91,6 +91,7 @@ from ..session_resume import (
     is_clord_thread,
     resume_notice,
     stopped_hint,
+    swept_notice,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_auto_enabled
 from ..thread_origin import inspect_origin
@@ -1022,7 +1023,10 @@ class ClaudeChatCog(commands.Cog):
             # not drown the log — the INFO line below is for threads we own.
             logger.debug("%s message ignored — not this instance's thread (#538)", ctx)
             return
-        if not await self._was_ever_our_thread(thread, parent_channel_id):
+        # #818: the sweep's tombstone is the strongest trace there is — the row
+        # itself, kept as history. With it, the thread was ours for certain.
+        tomb = await self._swept_record(thread.id)
+        if tomb is None and not await self._was_ever_our_thread(thread, parent_channel_id):
             # #556: the check above says the *channel* is ours, which every
             # thread under a /clord-init binding satisfies — so on its own it
             # sent this notice into ordinary conversation threads. A thread that
@@ -1038,7 +1042,11 @@ class ClaudeChatCog(commands.Cog):
             await self._handle_thread_reply(message)
             return
 
-        logger.info("%s message not run — nothing left to reconnect to (#538)", ctx)
+        logger.info(
+            "%s message not run — nothing left to reconnect to (#538)%s",
+            ctx,
+            f" — swept at {tomb.closed_at} (#818)" if tomb is not None else "",
+        )
 
         with contextlib.suppress(discord.HTTPException):
             await message.add_reaction(UNTRACKED_REACTION)
@@ -1047,7 +1055,25 @@ class ClaudeChatCog(commands.Cog):
             return
         self._untracked_notice_sent.add(thread.id)
         with contextlib.suppress(discord.HTTPException):
-            await thread.send(UNTRACKED_NOTICE)
+            await thread.send(swept_notice(tomb) if tomb is not None else UNTRACKED_NOTICE)
+
+    async def _swept_record(self, thread_id: int) -> SessionRecord | None:
+        """The 30-day sweep's tombstone for ``thread_id``, if there is one — #818.
+
+        Never raises, and ``None`` for a repository that predates #818 (a
+        consumer may pass their own): the tombstone only sharpens the answer to
+        a message that is already not going to run, so it must never be the
+        reason that answer fails.
+        """
+        getter = getattr(self.repo, "get_swept", None)
+        if getter is None:
+            return None
+        try:
+            record = await getter(thread_id)
+        except Exception:
+            logger.debug("%s tombstone lookup failed", log_ctx(thread_id=thread_id), exc_info=True)
+            return None
+        return record if isinstance(record, SessionRecord) else None
 
     async def _auto_reattach(self, thread: discord.Thread, parent_channel_id: int) -> Plan | None:
         """Reconnect a swept thread to what is still on disk — #700 (was #538's button).
@@ -1165,7 +1191,8 @@ class ClaudeChatCog(commands.Cog):
             logger.info("%s /clord refused — another bot's thread (#811)", ctx)
             await respond(foreign, ephemeral=True)
             return False
-        if not await self._was_ever_our_thread(thread, parent_channel_id):
+        tomb = await self._swept_record(thread.id)
+        if tomb is None and not await self._was_ever_our_thread(thread, parent_channel_id):
             logger.info("%s /clord refused — never a c-lord thread (#551)", ctx)
             await respond(NOT_A_CLORD_THREAD, ephemeral=True)
             return False
@@ -1174,7 +1201,7 @@ class ClaudeChatCog(commands.Cog):
             return True
         logger.info("%s /clord: nothing left to reconnect to (#538 AC8)", ctx)
         with contextlib.suppress(discord.HTTPException):
-            await thread.send(UNTRACKED_NOTICE)
+            await thread.send(swept_notice(tomb) if tomb is not None else UNTRACKED_NOTICE)
         await respond(
             "ℹ️ このスレッドの記録が見つかりませんでした。スレッドに案内を出しました。",
             ephemeral=True,

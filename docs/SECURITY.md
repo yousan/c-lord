@@ -244,7 +244,7 @@ Key principles:
 - SQLite database stores `thread_id` → `session_id` mappings only
 - No user data, no messages, no secrets stored
 - Parameterized queries throughout (`?` placeholders, no string formatting)
-- `cleanup_old()` method for age-based data removal
+- `cleanup_old()` for age-based sweeping — since #818 it marks rows 片付け済み (`closed_reason = 'swept'`) instead of deleting them; the heavy data (session dirs) is what gets removed
 
 ## REST API exposure (#712, #457)
 

@@ -1,4 +1,9 @@
-"""What the 30-day sweep deleted, and what it left behind — #554.
+"""What the 30-day sweep tidied, and what it left behind — #554.
+
+Since #818 the sweep keeps the ``sessions`` row as a swept tombstone rather than
+deleting it (see ``SWEPT_REASON`` in :mod:`c_lord.database.repository`). The
+history below is why the notice exists; "deleted" there means "no longer a
+live session".
 
 c-lord deletes every ``sessions`` row that has gone 30 days unused, on every
 startup, and until #554 it did so in total silence: one ``Cleaned up 3 old

@@ -411,9 +411,9 @@ async def main(env_path: Path | None = None) -> None:
         sweep_days_value = sweep_days()
         deleted = await components.session_repo.cleanup_old(days=sweep_days_value)
 
-        # Deleting the row alone strands the directory: the row is the only
-        # handle tying a Discord thread to its working copy. Clean checkouts go
-        # with it; anything with uncommitted or untracked work is kept (#575).
+        # The rows are kept as swept tombstones (#818), but no longer claim their
+        # directories, so the sweep removes those here. Clean checkouts go;
+        # anything with uncommitted or untracked work is kept (#575).
         for record in deleted:
             outcome = await asyncio.to_thread(remove_clean_session_dir, record)
             if outcome is DirOutcome.KEPT_DIRTY:

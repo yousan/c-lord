@@ -69,10 +69,12 @@ class TestCleanupOldReturnsRows:
         assert {r.thread_id for r in deleted} == {400, 401}
         assert {r.working_dir for r in deleted} == {"/tmp/a", "/tmp/b"}
 
-    async def test_rows_are_actually_gone(self, repo) -> None:
+    async def test_rows_leave_the_live_view(self, repo) -> None:
+        """#818: the row is kept as a tombstone, but no longer reads as a session."""
         await repo.save(thread_id=400, session_id="old")
         await repo.cleanup_old(days=0)
         assert await repo.get(400) is None
+        assert await repo.get_swept(400) is not None
 
     async def test_young_rows_are_kept_and_not_reported(self, repo) -> None:
         await repo.save(thread_id=400, session_id="fresh")
