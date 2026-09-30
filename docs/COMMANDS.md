@@ -312,10 +312,17 @@ A swept row is history, not a session: it is left out of `/clord-status`, the tr
 The sweep still runs. What changed is that **each swept thread now gets a notice in the thread itself**, so the reason is where the question gets asked:
 
 ```
-🧹 このスレッドは 30 日以上使われていなかったため、作業セッションの記録を整理しました。
-・作業ディレクトリ（clone した内容）は残っています — 書きかけの成果物はディスク上にそのままあります
-・会話の履歴は失われています（Claude Code 自身も既定 30 日で transcript を整理するため）
+🧹 このスレッドは 30 日以上使われていなかったため、**ワークスペースを整理しました。**
+（30 日は Claude Code の会話ログ保持期間 `cleanupPeriodDays` に合わせています。c-lord 独自の期間ではありません）
+・作業ディレクトリ（clone した内容）は**残っています** — 書きかけの成果物はディスク上にそのままあります
+・会話の履歴は**失われています**（Claude Code 自身も既定 30 日で transcript を整理するため）
+
+続けるには:
+・**この作業の続きから再開する** → `/clord-reattach`（ディスクに残っている作業ディレクトリに繋ぎ直します）
+・新しく始める → **チャンネルで** `/clord prompt:<やること>`
 ```
+
+(The "clone only" case, verbatim from `c_lord/session_cleanup.py::notice_for`.)
 
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
