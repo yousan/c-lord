@@ -326,7 +326,7 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
-**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `c-lord-sessions/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). The rule is `remove_clean_session_dir` (`c_lord/session_cleanup.py`), and every doubt resolves to *keep*:
+**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `<session dir base>/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). The rule is `remove_clean_session_dir` (`c_lord/session_cleanup.py`), and every doubt resolves to *keep*:
 
 | The checkout | The sweep |
 |---|---|

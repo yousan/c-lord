@@ -434,3 +434,84 @@ async def test_setup_bridge_quiet_when_build_is_undatable(
 ) -> None:
     """#756 AC4: no date in the version → nothing, never ``None days old``."""
     assert not await _boot_log(tmp_path, caplog, monkeypatch, "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Default session-dir base (#837)
+# ---------------------------------------------------------------------------
+
+
+def _channel_repo_base(bot: MagicMock) -> object:
+    from c_lord.cogs.channel_repo import ChannelRepoCog
+
+    for call in bot.add_cog.call_args_list:
+        cog = call.args[0]
+        if isinstance(cog, ChannelRepoCog):
+            return cog._session_dir_base
+    raise AssertionError("ChannelRepoCog not registered")
+
+
+async def _boot_for_base(tmp_path, monkeypatch, **kwargs) -> MagicMock:  # noqa: ANN001
+    monkeypatch.setenv("CLORD_ORPHAN_SWEEP_DAYS", "0")
+    bot = _make_bot()
+    await setup_bridge(
+        bot,
+        _make_runner(),
+        session_db_path=str(tmp_path / "db" / "sessions.db"),
+        enable_scheduler=False,
+        **kwargs,
+    )
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_session_dir_base_defaults_to_home_dot_c_lord(tmp_path, monkeypatch) -> None:
+    """Nothing configured → workspaces go to ~/.c-lord/<clone dir>/sessions (#837)."""
+    from pathlib import Path
+
+    clone = tmp_path / "my-clone"
+    clone.mkdir()
+    monkeypatch.chdir(clone)
+    monkeypatch.delenv("SESSION_DIR_BASE", raising=False)
+    monkeypatch.delenv("CLORD_INSTANCE", raising=False)
+    bot = await _boot_for_base(tmp_path, monkeypatch)
+    assert _channel_repo_base(bot) == str(Path.home() / ".c-lord" / "my-clone" / "sessions")
+
+
+@pytest.mark.asyncio
+async def test_session_dir_base_follows_clord_instance(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SESSION_DIR_BASE", raising=False)
+    monkeypatch.setenv("CLORD_INSTANCE", "staging-9")
+    bot = await _boot_for_base(tmp_path, monkeypatch)
+    assert _channel_repo_base(bot) == str(Path.home() / ".c-lord" / "staging-9" / "sessions")
+
+
+@pytest.mark.asyncio
+async def test_session_dir_base_env_is_unchanged(tmp_path, monkeypatch) -> None:
+    """An .env that already names SESSION_DIR_BASE keeps it (Zero-Config, #837)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SESSION_DIR_BASE", "/srv/clord-sessions")
+    monkeypatch.setenv("CLORD_INSTANCE", "ignored")
+    bot = await _boot_for_base(tmp_path, monkeypatch)
+    assert _channel_repo_base(bot) == "/srv/clord-sessions"
+
+
+@pytest.mark.asyncio
+async def test_session_dir_base_argument_is_unchanged(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SESSION_DIR_BASE", raising=False)
+    bot = await _boot_for_base(tmp_path, monkeypatch, session_dir_base="/srv/explicit")
+    assert _channel_repo_base(bot) == "/srv/explicit"
+
+
+@pytest.mark.asyncio
+async def test_legacy_data_sessions_keeps_the_old_behaviour(tmp_path, monkeypatch) -> None:
+    """An instance already using ./data/sessions is not moved (--resume would break)."""
+    (tmp_path / "data" / "sessions").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SESSION_DIR_BASE", raising=False)
+    bot = await _boot_for_base(tmp_path, monkeypatch)
+    assert _channel_repo_base(bot) is None
