@@ -15,7 +15,7 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 | tmux session | `c-lord` | `c-lord-staging-1` |
 | session dir | `c-lord-sessions/` | `c-lord-sessions-staging/` |
 | ログ (最新) | `/tmp/clord-bot-c-lord.log`* | `/tmp/clord-bot-c-lord-staging-1.log`* |
-| ライフサイクル | **supervised**(手動 kill+nohup 禁止 — #195) | `scripts/staging.sh` で手動管理 |
+| ライフサイクル | **systemd `c-lord.service` だけ**(kill+自前起動禁止 — #195 / ops#2) | `scripts/staging.sh` で手動管理 |
 | idle ブランチ | `main` | **`main`** |
 
 session dir は `.env` の `SESSION_DIR_BASE` で決めている(上表はいまの実値。#837 以前に立てたので `~` 直下にある)。
@@ -23,7 +23,7 @@ session dir は `.env` の `SESSION_DIR_BASE` で決めている(上表はいま
 (`<instance>` は `CLORD_INSTANCE`、未設定なら clone のディレクトリ名)。
 稼働中の session dir は移さないこと — transcript が作業ディレクトリのパスに紐付くので、移すと既存スレッドの `--resume` が切れる。
 
-\* `scripts/staging.sh` 導入後は per-run ログ `/tmp/clord-bot-<name>-<timestamp>.log` + 最新への symlink。
+\* staging は per-run ログ `/tmp/clord-bot-<name>-<timestamp>.log` + 最新への symlink。本番のログは `journalctl --user -u c-lord.service`(本番の `/tmp/clord-bot-c-lord.log` は、以前 staging.sh が本番を自前起動していた頃の名残り)。
 旧固定パス (`/tmp/clord-bot.log` / `/tmp/clord-bot-staging.log`) は旧手順の名残り。
 
 > **idle ブランチについて**: かつて CLAUDE.md は `fix/wire-max-concurrent-sessions` を idle ブランチとしていたが、
@@ -154,7 +154,56 @@ ff できない場合は、**黙って古いコードを起動せず明示エラ
 - `pgrep -f "c_lord.main" | xargs kill` 系の**パターン kill**(本番・自分のシェルに当たる/相対パス起動を取り逃す)
 - kill を**並列ツールバッチに入れる**(キャンセルしても発射済みの kill は戻らない)
 - `nohup uv run ...` での起動(Bash ツール teardown で exit 144 死する)
-- 本番 (`/home/yousan/c-lord`) への手動 kill+nohup(supervised — #195 の二重 bot 事故になる)
+- 本番 (`/home/yousan/c-lord`) への手動 kill+nohup(#195 の二重 bot 事故になる)。本番は下の「[本番の再起動](#本番の再起動--systemd-だけ-ops2)」の手順だけ
+
+## 本番の再起動 — systemd だけ (ops#2)
+
+**本番を起動する入口は systemd の unit `c-lord.service` 1 つだけ。**
+
+```bash
+cd /home/yousan/c-lord && git pull
+systemctl --user restart c-lord.service      # これだけ。staging.sh restart でも同じことが起きる(下記)
+bash scripts/staging.sh status               # 監視下に戻ったかを確かめる
+```
+
+**`staging.sh` は本番を見分けて kill しない**: user unit の `WorkingDirectory=` が実行した clone と一致すれば
+(= 本番)、`restart` / `stop` は bot を kill せず `systemctl --user restart|stop <unit>` に委ねる。リースも不要。
+`restart` は journal の `Logged in as` と identity を確かめ、unit が `active`・起動中に落ちていない
+(`NRestarts` が増えていない)・監視外の bot がいない、まで見てから `OK` を出す。
+
+- **systemctl が使えない**(`Failed to connect to bus` 等)ときは**エラーで止まり、bot を kill しない**。
+  bus の直し方は下の[禁止事項 2・3](#systemd-操作で-tmux--bot-を巻き添えにする事故-504)
+- **監視外の bot**(unit の cgroup の外で動いている本番 bot — 過去の事故の残骸)が居れば、PID 直指定で
+  止めてから systemd に渡す。放っておくと systemd の起動が単一インスタンスロック(#212/#325)に
+  弾かれて `failed` に戻るため
+- 判定は unit ファイルを読むだけなので、bus に繋がらないときでも「本番だ」と分かる(そこで kill に落ちない)
+
+**なぜこうしたか**: 以前は CLAUDE.md の本番再起動手順が `staging.sh restart` で、その中身は
+kill → `setsid` 自前起動だった。systemd は「落ちた」と判断して 5 秒おきに立て直しを試み、
+単一インスタンスロックに弾かれて 6 回失敗 → `Start request repeated too quickly` で `failed` になって諦める。
+以後、本番は**監視外**で動き続け、落ちても誰も立て直さない(2026-08-31・09-28 に 2 回。08-31〜09-25 の
+約 25 日間は監視外だった)。手順書どおりに動いた担当が事故を起こしていたので、スクリプトの側で塞いだ。
+
+**「監視されているか」は unit の状態と cgroup で見る**:
+
+```bash
+bash scripts/staging.sh status
+# supervisor: systemd c-lord.service — active (running) MainPID=12345 NRestarts=0
+#   pid 12345: 監視下 (c-lord.service)
+#   pid 12346: 監視下 (c-lord.service)
+```
+
+`監視外` の pid や `active` 以外の状態があれば終了コード 2 と WARNING が出る(`staging.sh restart` で戻す)。
+手で見るなら `systemctl --user is-active c-lord` と `cat /proc/<pid>/cgroup`(`…/c-lord.service` の中か)。
+**「bot の親が `systemd --user` だから監視下」は根拠にならない** — `setsid` で立った孤児も親は
+systemd --user に付け替わるので、監視外でも親だけ見ると監視下に見える(過去の確認はこれで誤った)。
+
+**unit は repo の `deploy/c-lord.service` そのもの**。`bash scripts/install-systemd.sh` が
+`~/.config/systemd/user/c-lord.service` に**そのまま**置き、ホスト固有の値(clone の場所・uv・PATH)は
+drop-in `c-lord.service.d/10-install.conf` に書く。unit を手で書き換えない(`status` が
+`deploy/c-lord.service と違う` と警告する)。unit を変えたら `install-systemd.sh` を打ち直し、
+`systemctl --user restart c-lord.service` で反映する(`enable --now` は動いている unit を再起動しない)。
+以前の `start-clord.sh`(repo 外の起動スクリプト)と `--guard` モードは廃止した。
 
 ### systemd 操作で tmux / bot を巻き添えにする事故 (#504)
 
@@ -162,9 +211,13 @@ ff できない場合は、**黙って古いコードを起動せず明示エラ
 c-lord と tmux が死ぬ**系。2026-08-07 に 3 件とも実際に踏んだ。コマンド単体は正しく見えるので、
 知らないと必ず踏む。
 
-**1. `systemctl --user restart|stop c-lord.service` は tmux サーバを道連れにする**
+**1. `systemctl --user restart|stop c-lord.service` は tmux サーバを道連れにする**(#503 で解消済み — 記録として残す)
 
-c-lord は Discord メッセージ受信時に `tmux new-session` でサーバを起こすため、
+> **現在は起きない**: #503 以降、c-lord は tmux サーバを `systemd-run --user` で**別の unit**(`tmux-spawn-*.scope`)に
+> 起こすので、`c-lord.service` の cgroup に tmux は入らない。`systemctl --user restart c-lord.service` は tmux を道連れにしない
+> (`systemd-run` が使えない環境だけ旧来の `tmux new-session` に落ちる — `docs/SECURITY.md`)。以下は当時の記録。
+
+当時の c-lord は Discord メッセージ受信時に `tmux new-session` でサーバを起こしていたため、
 **tmux サーバが `c-lord.service` の cgroup に入る**(→ [supervision モデル](#supervision-モデル--誰が-respawn-するか-437))。
 systemd はユニット停止時に cgroup 内の全プロセスを kill するので、bot を再起動しただけで
 **c-lord と無関係な作業セッションまで全滅**する。
@@ -175,8 +228,8 @@ Aug 07 14:37:16 systemd[379]: Stopping c-lord.service...               ← resta
 → tmux ls: no server running(16 セッション消滅)
 ```
 
-- 事前確認: `systemd-cgls --user-unit c-lord.service` に `tmux: server` が居たらアウト
-- 回避: tmux を独立した user unit で先に起こす。根本対処は #503(c-lord 側が cgroup 外でサーバを起こす)
+- 事前確認: `systemd-cgls --user-unit c-lord.service` に `tmux: server` が居たらアウト(#503 以降は居ない)
+- 根本対処: #503(c-lord 側が cgroup 外でサーバを起こす)
 - 復旧: tmux-continuum の `@continuum-restore on` が次のサーバ起動時に自動復元する。
   ただしスナップショットは 15 分間隔なので直近の作業は失われ、**復元 window と c-lord が作る window が
   二重になって #501 の発生条件を再生成する**
@@ -281,8 +334,8 @@ pytest 全体に対してこれをやっている — テストは `-L` を忘�
 
 | | prod (`/home/yousan/c-lord`) | staging (`/home/yousan/c-lord-staging-N`) |
 |---|---|---|
-| 起動者 | **`systemd --user c-lord.service`**(`Restart=always`, `RestartSec=5`) | **`scripts/staging.sh`**(手動) |
-| 起動コマンド | `start-clord.sh` → `exec uv run python -m c_lord.main` | `setsid <venv>/bin/python -m c_lord.main`(uv ラッパ無し) |
+| 起動者 | **`systemd --user c-lord.service`**(`Restart=always`, `RestartSec=5`) — **これ以外から起動しない** | **`scripts/staging.sh`**(手動) |
+| 起動コマンド | `uv run python -m c_lord.main`(unit の `ExecStart`) | `setsid <venv>/bin/python -m c_lord.main`(uv ラッパ無し) |
 | プロセス数 | **2 が正常**: `uv` ラッパ(親) + `python` 実体(子) | **1**: `python` のみ |
 | 死んだら | systemd が 5 秒後に respawn | **respawn しない**(stop したら止まったまま) |
 
@@ -292,21 +345,12 @@ pytest 全体に対してこれをやっている — テストは `-L` を忘�
   `staging.sh status` / `restart` は**この parent+child を 1 インスタンスと数える**(`instance_leaders`:
   親が同一 clone の matched pid である pid = 子 を代表から除く)。本物の二重起動(独立した 2 起動)は
   ちゃんと `instances: 2` + 終了コード 2 で検出する。
-- **staging には systemd ユニットも guard も無い**。`staging.sh` は `setsid` で venv python を直起動する
+- **staging には systemd ユニットが無い**。`staging.sh` は `setsid` で venv python を直起動する
   だけなので、`stop` 後に勝手に復活する経路は無い。staging で churn(pid が数秒おきに変わる)を見たら、
   それは respawn ではなく**手動 `restart` の競合**を疑う。
-- **tmux サーバは「最初に起こした人」の cgroup に入る (#504)**。c-lord は
-  `TmuxSessionManager._ensure_session()` でサーバ不在時に `tmux new-session` を実行するため、
-  **c-lord が第一発見者だと tmux サーバが `c-lord.service` の cgroup に入る**。systemd は
-  ユニット停止時に cgroup ごと kill するので、`systemctl --user restart c-lord.service` が
-  tmux 全セッションを道連れにする(→ [禁止事項](#systemd-操作で-tmux--bot-を巻き添えにする事故-504) 1)。
-  現状の切り分けは `systemd-cgls --user-unit c-lord.service` に `tmux: server` が居るかどうか。
-  staging は `setsid` 起動なので c-lord.service の cgroup には属さないが、**staging bot が
-  第一発見者になれば同じことが起きる**(その bot を kill すると tmux が落ちる)。根本対処は #503。
-- **`start-clord.sh --guard`**(ログインフックモード)は存在するが、**prod しか起動しない**
-  (`cd $HOME/c-lord`)。二重起動防止に global な `pgrep -f c_lord.main` を使うため、staging bot が
-  動いていると「既に起動済み」と判断して prod を起こさない、という相互作用がある。現状 `~/.zprofile`
-  等のシェルプロファイルには未配線。
+- **tmux サーバは c-lord の cgroup に入らない (#504 → #503)**。c-lord は `systemd-run --user` で
+  tmux サーバを別の unit に起こすので、bot(本番・staging とも)を再起動・kill しても tmux は落ちない。
+  確認は `systemd-cgls --user-unit c-lord.service` に `tmux: server` が居ないこと。
 
 ## 占有(借用)プロトコル (#328)
 

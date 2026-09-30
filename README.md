@@ -286,9 +286,12 @@ host reboots**, install it as a `systemd --user` service. From your clone:
 bash scripts/install-systemd.sh
 ```
 
-This generates `~/.config/systemd/user/c-lord.service` (pointing at this clone
-and your `uv`), enables it, and turns on **linger** so the service starts on
-boot even when no one is logged in. Then manage it with standard systemd:
+This installs [`deploy/c-lord.service`](deploy/c-lord.service) verbatim as
+`~/.config/systemd/user/c-lord.service`, writes the host-specific values (this
+clone's path, your `uv`, your `PATH`) to the drop-in
+`c-lord.service.d/10-install.conf`, enables it, and turns on **linger** so the
+service starts on boot even when no one is logged in. Re-run it after
+`deploy/c-lord.service` changes. Then manage it with standard systemd:
 
 ```bash
 systemctl --user restart c-lord.service     # after a `git pull`
@@ -296,6 +299,15 @@ systemctl --user stop    c-lord.service
 systemctl --user status  c-lord.service
 journalctl --user -u c-lord.service -f      # live logs
 ```
+
+Once the unit is installed, **systemd is the only thing that starts this clone's
+bot.** Don't kill it and start it by hand — systemd would try to respawn it, hit
+the single-instance lock, give up (`Start request repeated too quickly`), and
+leave the bot running unsupervised. `bash scripts/staging.sh restart|stop` knows
+this: in a clone that a user unit's `WorkingDirectory=` points at, it calls
+`systemctl --user restart|stop` instead of killing, and errors out (without
+killing) when `systemctl --user` is unavailable. `bash scripts/staging.sh status`
+shows whether each bot process is inside the unit's cgroup.
 
 Why `--user` instead of a system service: c-lord drives the user's `tmux`,
 `~/.claude` session files, `uv`, and the `claude` CLI, so it runs cleanest as
