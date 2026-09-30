@@ -24,7 +24,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -364,11 +366,47 @@ _PROMPT_FILE_PREFIX = "clord-prompt-"
 _PROMPT_FILE_MAX_AGE = 3600.0  # seconds; a file older than this was abandoned
 
 
-def _prompt_file_dir() -> Path:
-    """Directory holding hand-off prompt files (created 0700 on first use)."""
-    directory = Path(tempfile.gettempdir()) / "clord-prompts"
+def _private_dir(directory: Path) -> Path:
+    """Create *directory* 0700 if missing; raise OSError unless it is ours alone.
+
+    ``mkdir(exist_ok=True)`` happily accepts a directory someone else made. Its
+    owner can unlink and replace the prompt file between our write and the
+    pane's ``cat``, which hands *our* Claude *their* request (#836). So the
+    existing entry must be a real directory (not a symlink), owned by us, with
+    no group/other bits. One that fails is refused, not repaired.
+    """
     directory.mkdir(mode=0o700, exist_ok=True)
+    st = os.lstat(directory)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(f"{directory} is not a directory (#836)")
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"{directory} is owned by uid {st.st_uid}, not us (#836)")
+    if st.st_mode & 0o077:
+        raise PermissionError(f"{directory} is open to others ({oct(st.st_mode & 0o777)}) (#836)")
     return directory
+
+
+def _prompt_file_dir() -> Path:
+    """Directory holding hand-off prompt files — this Unix user's alone (#836).
+
+    ``$XDG_RUNTIME_DIR`` first: it is per-user by construction, so nobody can
+    squat the name. Otherwise ``<tmp>/clord-prompts-<uid>``. It used to be a
+    fixed ``<tmp>/clord-prompts``, which the first user on a shared host owned
+    for everyone after them. Raises OSError when no candidate is safe; the
+    caller then types the prompt inline (#529).
+    """
+    candidates: list[Path] = []
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isabs(runtime):
+        candidates.append(Path(runtime) / "clord-prompts")
+    candidates.append(Path(tempfile.gettempdir()) / f"clord-prompts-{os.getuid()}")
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            return _private_dir(candidate)
+        except OSError as exc:
+            errors.append(str(exc))
+    raise PermissionError("; ".join(errors))
 
 
 def _sweep_stale_prompt_files(directory: Path) -> None:
@@ -2286,7 +2324,8 @@ class TmuxSessionManager:
             else:
                 # Read it into a variable and delete the file *before* claude runs,
                 # so no prompt text sits on disk for the life of the session.
-                prelude = f'CLORD_PROMPT="$(cat {prompt_path})"; rm -f {prompt_path}; '
+                quoted = shlex.quote(str(prompt_path))
+                prelude = f'CLORD_PROMPT="$(cat {quoted})"; rm -f {quoted}; '
                 # ``--``: the prompt is a positional argument, never a flag
                 # (CLAUDE.md Security; #809).
                 cmd_parts.extend(["--", '"$CLORD_PROMPT"'])
