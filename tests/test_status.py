@@ -381,3 +381,65 @@ class TestTurnThatEndsWithoutAFinalLamp:
         assert sm._current_emoji == EMOJI_WAITING
         assert sm._stall_task is None
         msg.add_reaction.assert_awaited_with(EMOJI_WAITING)
+
+
+class TestActivityFromTheTranscript:
+    """#769: jsonl activity is what keeps a working turn off ⏳/⚠️.
+
+    The stall timer used to be reset only by producers that no longer exist
+    (#723), so it measured time since the turn started: every turn past 30s
+    read ⚠️ however busy Claude was.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transcript_activity_resets_the_stall_timer(self) -> None:
+        from c_lord.turn_activity import turn_activity
+
+        msg = _make_message()
+        sm = StatusManager(msg, thread_id=7690)
+        await sm.set_running()
+        loop = asyncio.get_running_loop()
+        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        turn_activity.note(7690)
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_RUNNING
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_activity_after_a_stall_brings_back_green(self) -> None:
+        from c_lord.turn_activity import turn_activity
+
+        msg = _make_message()
+        sm = StatusManager(msg, thread_id=7691)
+        await sm.set_running()
+        loop = asyncio.get_running_loop()
+        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_STALL_HARD
+        turn_activity.note(7691)
+        await asyncio.sleep(2.2)
+        assert sm._current_emoji == EMOJI_RUNNING
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_silence_still_paints_the_warning(self) -> None:
+        """AC2: no transcript activity → ⚠️ as before."""
+        msg = _make_message()
+        sm = StatusManager(msg, thread_id=7692)
+        await sm.set_running()
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_STALL_HARD
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_a_finished_turn_stops_listening(self) -> None:
+        from c_lord.turn_activity import turn_activity
+
+        msg = _make_message()
+        sm = StatusManager(msg, thread_id=7693)
+        await sm.set_running()
+        await sm.set_waiting()
+        sm._last_activity = 0.0
+        turn_activity.note(7693)
+        assert sm._last_activity == 0.0
