@@ -1,63 +1,53 @@
 # Architecture
 
-> **⚠️ この文書は古い構成（#53 以前）を説明しています。** 当時は `runner.py` が
-> Claude CLI の stdout を読み、`chunker.py` が応答テキストを分割して Discord に
-> 投稿していました。#53 でこの「TUI/stdout を読んで Discord に貼る」経路は撤去され、
-> いったん Claude 自身が Skill 経由で `curl POST /api/reply` する方式になり、その後
-> #71/#216 の JSONL transcript ミラーに移行しました（#712 で skill 経路は削除、
-> ミラーが唯一の配信経路です）。そのため下記の `runner.py` / `parser.py` / `chunker.py` /
-> `streaming_manager.py` などは**現在は存在しません**（実体は `claude/tmux_runner.py`
-> や `discord_ui/reply_chunker.py` などに置き換わっています）。
+> **この文書の一部はまだ #53 以前の構成を説明しています。** #724 で **Overview の図・
+> Claude CLI 層 / Discord UI 層の表・Data Flow・Dependency Graph** はいまの経路
+> （tmux ペイン常駐 + jsonl transcript ミラー配信 + ask bridge）に描き直しました。
+> **Concurrency Model / Extension Points はまだ当時の `ClaudeRunner` 前提の記述**が残っています
+> （いまの実体は `claude/tmux_runner.py` の `TmuxClaudeRunner`）。
 >
 > **今のモジュール構成（あるべき動き／実態）を知りたいときは、`CLAUDE.md` の
-> "Project Structure" を一次情報として参照してください。** この文書は当時の設計判断を
-> 残す記録として保存しています（履歴・経緯の参照用）。
+> "Project Structure" と "Key Design Decisions" を一次情報として参照してください。**
 
 ## Overview
 
-c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. It has no AI logic of its own — all intelligence comes from Claude Code's existing capabilities (CLAUDE.md, skills, tools, memory, MCP servers). The bridge's sole responsibility is: accept user input from Discord, spawn the CLI, parse its output, and render results back to Discord.
+c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. It has no AI logic of its own — all intelligence comes from Claude Code's existing capabilities (CLAUDE.md, skills, tools, memory, MCP servers). The bridge's responsibility is: accept user input from Discord, type it into an interactive `claude` running in a tmux pane, and deliver Claude's answer back to Discord **by reading Claude Code's own transcript** (`~/.claude/projects/<slug>/*.jsonl`), not by scraping the TUI (#71/#712).
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    Discord (Gateway)                     │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐  │
-│  │ Channel   │  │ Threads  │  │ Reactions / Embeds   │  │
+│  │ Channel   │  │ Threads  │  │ Reactions / Buttons  │  │
 │  └─────┬────┘  └────┬─────┘  └──────────┬───────────┘  │
 └────────┼────────────┼───────────────────┼───────────────┘
-         │            │                   ▲
-         ▼            ▼                   │
-┌─────────────────────────────────────────┼───────────────┐
-│              discord.py Bot (bot.py)    │               │
-│  ┌────────────────┐  ┌─────────────────┴──────┐        │
-│  │ ClaudeChatCog  │  │ SkillCommandCog        │        │
-│  │ (claude_chat)  │  │ (skill_command)        │        │
-│  └───────┬────────┘  └───────┬────────────────┘        │
-│          │                   │                          │
-│          └─────────┬─────────┘                          │
-│                    ▼                                    │
-│          ┌─────────────────┐                            │
-│          │ _run_helper.py  │  ← shared execution logic  │
-│          └────────┬────────┘                            │
-│                   │                                     │
-│     ┌─────────────┼──────────────┐                      │
-│     ▼             ▼              ▼                      │
-│  ┌────────┐  ┌──────────┐  ┌──────────┐                │
-│  │ runner │  │ status   │  │ chunker  │                │
-│  │  .py   │  │  .py     │  │  .py     │                │
-│  └───┬────┘  └──────────┘  └──────────┘                │
-│      │                                                  │
-│      ▼                                                  │
-│  ┌──────────┐  ┌──────────────┐                         │
-│  │ parser   │  │ repository   │                         │
-│  │  .py     │  │  .py (SQLite)│                         │
-│  └──────────┘  └──────────────┘                         │
-└─────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────┐
-│              Claude Code CLI (subprocess)                │
-│  claude -p --output-format stream-json --model sonnet   │
-│                                                         │
+         │            │                   ▲  answer text, attachments,
+         ▼            ▼                   │  turn progress line (jsonl)
+┌──────────────────────────────────────────────────────────────┐
+│              discord.py Bot (bot.py)                          │
+│  ┌────────────────┐  ┌──────────────────┐                     │
+│  │ ClaudeChatCog  │  │ SkillCommandCog  │                     │
+│  └───────┬────────┘  └───────┬──────────┘                     │
+│          └─────────┬─────────┘                                │
+│                    ▼                                          │
+│          ┌──────────────────┐   ┌──────────────────────────┐  │
+│          │ _run_helper.py   │   │ TranscriptMirrorCog      │  │
+│          │ + EventProcessor │   │ (transcript/mirror.py)   │  │
+│          │ (status lamp,    │   │ tails the jsonl → posts  │  │
+│          │  ask bridge,     │   │ the answer (the ONLY     │  │
+│          │  errors, DB)     │   │ delivery path, #712)     │  │
+│          └────────┬─────────┘   └────────────▲─────────────┘  │
+│                   ▼                          │                │
+│          ┌──────────────────┐                │                │
+│          │ tmux_runner.py   │ yields SYSTEM / RESULT only     │
+│          │ + tmux.py        │ (#723)         │                │
+│          └────────┬─────────┘                │                │
+└───────────────────┼──────────────────────────┼────────────────┘
+                    │ send-keys / capture-pane │ reads
+                    ▼                          │
+┌──────────────────────────────────────────────┼──────────┐
+│  tmux window (one per thread) — resident     │          │
+│  claude --session-id <uuid>  /  --resume <uuid>         │
+│   └─ writes ~/.claude/projects/<slug>/<uuid>.jsonl ─────┘
 │  ┌─────────────────────────────────────────────────┐    │
 │  │ CLAUDE.md, skills, tools, memory, MCP servers   │    │
 │  │ (all inherited from the host environment)       │    │
@@ -81,15 +71,24 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 |--------|-------|------|
 | `claude_chat.py` | `ClaudeChatCog` | Core message handler. Listens for `on_message` in the configured channel and its child threads. Creates threads for new conversations, resumes sessions for thread replies. Manages concurrency via `asyncio.Semaphore`. Provides `/clear` slash command, which types Claude Code's own `/clear` into the pane (#803). |
 | `skill_command.py` | `SkillCommandCog` | Provides `/skill` and `/skills` slash commands. Scans `~/.claude/skills/` at startup, parses YAML frontmatter from `SKILL.md` files, offers Discord autocomplete. Creates a thread and delegates to `_run_helper`. |
-| `_run_helper.py` | `run_claude_in_thread()` | Shared function extracted to avoid duplicating the Claude CLI streaming logic between ClaudeChatCog and SkillCommandCog. Handles the full event loop: session init, tool use embeds, status updates, text accumulation, chunked response posting, error handling, and session persistence. |
+| `_run_helper.py` | `run_claude_with_config()` | Shared function extracted to avoid duplicating the Claude CLI run logic between ClaudeChatCog and SkillCommandCog. Drives one turn: iterates the runner's events and hands them to `EventProcessor` (status lamp, ask bridge, error embeds, session persistence). **It never posts the answer text** — that is the transcript mirror's job (#712). |
+| `event_processor.py` | `EventProcessor` | Turns the runner's SYSTEM / RESULT events into Discord side effects: saves the session record, bridges `pane_ask` menus to buttons, sets the 🟢/🟡/❌ lamp, posts error / usage-limit embeds. |
+| `transcript_mirror.py` | `TranscriptMirrorCog` | `start_for(thread_id, working_dir)` tails the thread's Claude Code transcript (`transcript/mirror.py`) and posts assistant text, attachments (`SendUserFile`) and the turn progress line. The **only** path Claude's answer takes to Discord (#71/#712). |
 
 ### Claude CLI Layer (`claude/`)
 
 | Module | Class/Function | Role |
 |--------|---------------|------|
-| `runner.py` | `ClaudeRunner` | Subprocess lifecycle manager. Builds command args, sanitizes environment, spawns `claude` via `create_subprocess_exec`, reads stdout line-by-line, yields `StreamEvent` objects. Handles timeout, cleanup, and `kill()`. Supports `clone()` for creating fresh runner instances per session. |
-| `parser.py` | `parse_line()` | Stateless JSON parser. Takes a single line of stream-json output, returns a `StreamEvent` or `None`. Dispatches to `_parse_system`, `_parse_assistant`, `_parse_user`, `_parse_result` based on message type. |
+| `tmux_runner.py` | `TmuxClaudeRunner` | Per-turn runner. Starts `claude` in the thread's tmux window if it is not running (`tmux.start_claude`), otherwise types the prompt into the resident pane (`tmux.send_input`). Polls `capture-pane` only to detect turn end, open menus and blocking prompts; **yields SYSTEM (`session_id` / `pane_ask` / `unknown_tui_prompt`) and RESULT (done / error / usage limit) events only** (#723). No answer text is read off the pane. |
 | `types.py` | `StreamEvent`, `ToolUseEvent`, `SessionState`, enums | Type definitions. `MessageType` (system/assistant/user/result), `ContentBlockType` (text/tool_use/tool_result), `ToolCategory` (read/edit/command/web/think/other). `TOOL_CATEGORIES` maps Claude Code tool names to categories. `ToolUseEvent.display_name` provides human-readable descriptions. |
+
+### tmux / Transcript Layer (`tmux.py`, `transcript/`)
+
+| Module | Class/Function | Role |
+|--------|---------------|------|
+| `tmux.py` | `TmuxSessionManager` | One tmux session per repo, one window per thread (`create_session`). `start_claude` launches `claude --session-id <uuid>` (or `--resume <claimed uuid>`) with secrets `env -u`'d (#353/#773); `send_input` types the prompt with a zero-width-space marker (#71). |
+| `transcript/claim.py` | — | Records the uuid c-lord gave the session in `<project_dir>/.clord-session`, so the mirror knows which jsonl belongs to the thread (#773). |
+| `transcript/mirror.py` | — | Tails that jsonl and turns assistant entries into posts; `cogs/transcript_mirror.py` sends them, split by `discord_ui/reply_chunker.py`. |
 
 ### Database Layer (`database/`)
 
@@ -103,7 +102,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 | Module | Class/Function | Role |
 |--------|---------------|------|
 | `status.py` | `StatusManager` | Emoji reaction lamp on the user's trigger message: 🟢 running (turn start, kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall as temporary overrides. Applied immediately (no debounce) — the lamp changes only a couple of times per turn, and reactions use a different rate-limit bucket than thread renames. This replaced the per-turn thread-name lamp that saturated Discord's ~2/10min rename limit (#246); the thread-name 🟢/🟡 is now a slow, poll-driven sidebar view that is **off by default** (#329 — opt in with `CLORD_THREAD_LAMP=1`, see `docs/specs/thread-lamp.md`). Includes stall detection: soft (⏳) at 10s, hard (⚠️) at 30s. **`set_compact()` (🗜️) is still in the code but unreachable** — it only runs when a SYSTEM event carries `StreamEvent.is_compact`, and nothing sets that field, so no 🗜️ reaction has ever been added (#753). The compaction users actually see is the mirror's one-line `🗜️ コンテキストを圧縮しました` (#628). |
-| `chunker.py` | `chunk_message()` | Fence-aware message splitter. Splits at paragraph boundaries (preferred), then line boundaries, then hard-splits. Tracks open code fences and properly closes/reopens them across chunk boundaries. Limits chunks to 1950 chars (2000 minus overhead). |
+| `reply_chunker.py` | — | Splits the mirrored answer into Discord-sized messages (fence-aware). |
 | `embeds.py` | `session_start_embed()`, `ask_embed()`, etc. | Discord embed builders. Color-coded: blurple for info, green for success, red for error, yellow for tool use. Consistent visual language across all bot output. **`tool_use_embed()` (and `tool_timer.py`, which renders it) is currently unreachable** — nothing sets `StreamEvent.tool_use` any more, so no tool-use embed has ever been posted (#723). Tool activity reaches Discord through the jsonl mirror instead: the turn progress line (`turn_progress.py`) and the `progress.txt` attachment. |
 
 ### Utilities (`utils/`)
@@ -116,8 +115,6 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 
 ### New Conversation
 
-> ⚠️ **この図は #53 以前の subprocess 経路のまま**で、いまの tmux ペイン常駐 + jsonl ミラー配信とは違う（書き直しは #724）。確かなのは、`tmux_runner` が yield するイベントが **SYSTEM（`session_id` / `pane_ask` / `unknown_tui_prompt`）と RESULT の 2 種だけ**で、**回答本文は jsonl ミラーが配信する**こと (#712/#723)。
-
 ```
 1. User sends message in configured channel
    │
@@ -129,27 +126,35 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
    │
 4. _run_claude()
    ├── Check semaphore (post "waiting" if full)
-   ├── Create StatusManager on user's message
-   ├── Clone runner (fresh subprocess state)
+   ├── StatusManager on the user's message → 🟢
+   ├── session_dir: git clone into c-lord-sessions/<ch>/<thread>/
+   │   (+ prepare-commit-msg co-author hook, #518)
+   ├── resolve_tmux_manager(channel_id, thread_id=…) → tmux window w<N>
+   ├── TranscriptMirrorCog.start_for(thread_id, working_dir)  ← delivery
    │
-5. run_claude_in_thread()
-   ├── Create SessionState
+5. run_claude_with_config() → EventProcessor
    │
-6. runner.run(prompt, session_id=None)
-   ├── _build_args() → [claude, -p, --output-format, stream-json, ...]
-   ├── _build_env() → strip DISCORD_BOT_TOKEN etc.
-   ├── create_subprocess_exec()
+6. TmuxClaudeRunner.run(prompt)
+   ├── claude not running in the window:
+   │     tmux.start_claude → send-keys `claude --session-id <uuid> … -- <prompt>`
+   │     (uuid recorded in .clord-session, #773; secrets env -u'd, #353)
+   ├── claude already resident:
+   │     tmux.send_input → send-keys the prompt (+ ZWSP marker, #71)
+   ├── poll capture-pane (turn end / menus / blocking prompts only)
    │
-7. Stream events:
-   ├── SYSTEM {session_id} → save to DB, post session_start_embed
-   ├── ASSISTANT {text}    → accumulate in SessionState
-   ├── USER {tool_result}  → set thinking emoji
-   ├── RESULT {text, cost} → post chunked text, session_complete_embed
+7. Events yielded by the runner (these two kinds only — #723):
+   ├── SYSTEM {session_id}          → save session record to DB
+   ├── SYSTEM {pane_ask}            → AskUserQuestion / plan menu → Discord buttons
+   ├── SYSTEM {unknown_tui_prompt}  → tell the thread an unknown prompt is blocking
+   ├── RESULT {done | error | usage limit} → lamp 🟡 / ❌, error embed
    │
-8. Cleanup
-   ├── Kill subprocess
-   ├── Clean up status reactions
-   └── Return session_id
+   Meanwhile, independently of the runner:
+   └── TranscriptMirrorCog reads <uuid>.jsonl → posts the answer text,
+       attachments, and the "⚙️ 作業中" progress line (#712)
+   │
+8. Turn ends
+   ├── Lamp 🟢 → 🟡 on the trigger message
+   └── claude stays resident in the pane (no process is killed)
 ```
 
 ### Thread Reply (Session Resume)
@@ -158,15 +163,17 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 1. User replies in existing thread
    │
 2. on_message() → _handle_thread_reply()
-   ├── repo.get(thread_id) → SessionRecord with session_id
+   ├── repo.get(thread_id) → session record
    │
-3. _run_claude(session_id=existing_id)
+3. _run_claude() — same as above (semaphore, lamp, session_dir, window, mirror)
    │
-4. runner.run(prompt, session_id=existing_id)
-   ├── _build_args includes --resume {session_id}
+4. TmuxClaudeRunner.run(prompt)
+   ├── claude still resident in the window (the usual case):
+   │     send_input → the prompt is typed into the same conversation
+   ├── pane has no claude (bot restart, window gone, …):
+   │     start_claude → `claude --resume <uuid from .clord-session>` (#773)
    │
-5. Same streaming flow as above
-   └── Session ID persisted on RESULT event
+5. Same event flow as above; the answer arrives via the jsonl mirror
 ```
 
 ### Skill Execution
@@ -230,22 +237,23 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 
 ```
 c_lord/
-  __init__.py ──────────┬──→ claude/runner.py
-                        ├──→ claude/parser.py
+  __init__.py ──────────┬──→ claude/tmux_runner.py ──→ tmux.py
                         ├──→ claude/types.py
-                        ├──→ cogs/claude_chat.py ──→ _run_helper.py ──→ runner, types
-                        ├──→ cogs/skill_command.py ──→ _run_helper.py     parser, repo
-                        ├──→ database/repository.py                       status, chunker
-                        ├──→ discord_ui/status.py                         embeds
-                        ├──→ discord_ui/chunker.py
+                        ├──→ cogs/claude_chat.py ──→ _run_helper.py ──→ event_processor.py
+                        │                          └→ transcript_mirror.py ──→ transcript/,
+                        │                                                     discord_ui/reply_chunker.py
+                        ├──→ cogs/skill_command.py ──→ _run_helper.py
+                        ├──→ database/repository.py
+                        ├──→ discord_ui/status.py
                         └──→ discord_ui/embeds.py
 
-  main.py ──→ bot.py, runner, claude_chat, models, repository, logger
+  main.py ──→ bot.py, setup.py (wires the Cogs), models, repository, logger
 
 External:
   discord.py (Gateway, commands, app_commands)
   aiosqlite (async SQLite)
+  tmux (the resident claude panes)
   python-dotenv (env loading, standalone mode only)
 ```
 
-Key design constraint: `claude/` and `discord_ui/` have zero dependencies on each other. The `cogs/` layer (specifically `_run_helper.py`) is the only place where CLI output meets Discord rendering. This keeps the parser testable without Discord mocks and the UI components testable without subprocess mocks.
+Key design constraint: `claude/` and `discord_ui/` have zero dependencies on each other. The `cogs/` layer is the only place where CLI state meets Discord rendering — `_run_helper.py` / `EventProcessor` for runner events, `TranscriptMirrorCog` for the answer text. This keeps the runner testable without Discord mocks and the UI components testable without tmux.
