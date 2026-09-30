@@ -18,6 +18,11 @@ CLAUDE.md・メモリ・他ドキュメントに別レシピが書いてあっ�
 | ライフサイクル | **supervised**(手動 kill+nohup 禁止 — #195) | `scripts/staging.sh` で手動管理 |
 | idle ブランチ | `main` | **`main`** |
 
+session dir は `.env` の `SESSION_DIR_BASE` で決めている(上表はいまの実値。#837 以前に立てたので `~` 直下にある)。
+**新しく立てるインスタンスは `SESSION_DIR_BASE` を書かなければ `~/.c-lord/<instance>/sessions/`** に作られる
+(`<instance>` は `CLORD_INSTANCE`、未設定なら clone のディレクトリ名)。
+稼働中の session dir は移さないこと — transcript が作業ディレクトリのパスに紐付くので、移すと既存スレッドの `--resume` が切れる。
+
 \* `scripts/staging.sh` 導入後は per-run ログ `/tmp/clord-bot-<name>-<timestamp>.log` + 最新への symlink。
 旧固定パス (`/tmp/clord-bot.log` / `/tmp/clord-bot-staging.log`) は旧手順の名残り。
 
@@ -369,7 +374,9 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 3. `git clone` で新ディレクトリ(例 `/home/yousan/c-lord-parallel-4`)を作成、`uv sync --dev`
 4. `.env` を**実ファイル**で作成(symlink 禁止 — #326)。必須: `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` /
    **`EXPECTED_BOT_USER_ID`(新 bot の user id)** / `CLORD_API_PORT`(未使用ポート、#258 で自動化予定) /
-   `SESSION_DIR_BASE`(専用ディレクトリ) / `E2E_TEST_WEBHOOK_URL`
+   **`CLORD_INSTANCE`(例 `staging-5`)** / `E2E_TEST_WEBHOOK_URL`
+   - session dir は `SESSION_DIR_BASE` を書かなければ `~/.c-lord/<CLORD_INSTANCE>/sessions/` に作られる(#837)。
+     `CLORD_INSTANCE` を書いておけば、あとで clone を改名しても置き場が変わらない(改名で `--resume` が切れない)
    - `E2E_TEST_WEBHOOK_URL` は任意。webhook を作らない場合、新スレッドは `POST /api/spawn`、既存スレッドへの
      返信は次の信頼bot方式で代替できる。プレースホルダを入れたなら「staging フリート」節の表に **webhook なし** と書く。
    - 信頼bot方式を使うなら `CLORD_TRUSTED_BOT_IDS=<prod bot user id>` も入れる(prod token 投稿でトリガー可能になる)。

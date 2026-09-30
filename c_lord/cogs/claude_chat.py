@@ -45,6 +45,7 @@ from ..discord_ui.authorization import (
     set_default_authorizer,
 )
 from ..discord_ui.embeds import error_embed, stopped_embed
+from ..discord_ui.lamp_recovery import adopt_orphaned_lamp
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.status import StatusManager
@@ -69,6 +70,7 @@ from ..gateway_backfill import (
     merge_missed_prompt,
     missed_notice,
 )
+from ..host_restart_notice import stopped_mid_turn
 from ..log_sampler import LogSampler
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed, was_auto_stopped
@@ -361,6 +363,9 @@ class ClaudeChatCog(commands.Cog):
         # #800: turns the next message replaced before they had registered a
         # runner — the runner they register later must start out stopped.
         self._preempted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
+        # #718: startup watchers for lamps the previous process left mid-turn.
+        # Held so they are not garbage-collected while waiting for the turn end.
+        self._lamp_recovery_tasks: set[asyncio.Task] = set()
         # Dashboard may be None until bot is ready; resolved lazily in _get_dashboard()
         self._dashboard = dashboard
         # Coordination service resolved lazily from bot if not supplied directly
@@ -2546,6 +2551,45 @@ class ClaudeChatCog(commands.Cog):
             except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
 
+            # #718: the lamp on the turn's trigger message died with the old
+            # process — take it back. Its own task: it may wait for the turn end.
+            task = asyncio.create_task(self._recover_orphaned_lamp(thread))
+            self._lamp_recovery_tasks.add(task)
+            task.add_done_callback(self._lamp_recovery_tasks.discard)
+
+    async def _recover_orphaned_lamp(self, thread: discord.Thread) -> None:
+        """Adopt the lamp a restart left on *thread*'s trigger message (#718).
+
+        Everything it needs is already on record: the trigger message id
+        (``sessions.trigger_message_id``, #115) and the transcript that says
+        whether the turn is still going (the #807 reader). Never raises.
+        """
+        ctx = log_ctx(thread_id=thread.id)
+        try:
+            record = await self.repo.get(thread.id)
+            trigger_id = getattr(record, "trigger_message_id", None) if record else None
+            working_dir = getattr(record, "working_dir", None) if record else None
+            if not trigger_id or not working_dir:
+                logger.info("%s lamp recovery: no trigger message on record", ctx)
+                return
+            try:
+                message = await thread.fetch_message(trigger_id)
+            except discord.NotFound:
+                # A thread's first message is its starter, which lives in the
+                # parent channel under the thread's own id.
+                parent = thread.parent
+                if not isinstance(parent, discord.TextChannel):
+                    raise
+                message = await parent.fetch_message(trigger_id)
+            project_dir = derive_project_dir(working_dir)
+
+            async def turn_running() -> bool:
+                return await asyncio.to_thread(stopped_mid_turn, project_dir)
+
+            await adopt_orphaned_lamp(message, thread_id=thread.id, turn_running=turn_running)
+        except Exception:
+            logger.warning("%s lamp recovery skipped", ctx, exc_info=True)
+
     # ── #745: messages posted while the gateway was down ────────────────────
 
     @commands.Cog.listener()
@@ -3794,7 +3838,9 @@ class ClaudeChatCog(commands.Cog):
 
             # #473: a hard stall shows the ⚠️ lamp on the trigger message and
             # nothing else — no prose line in the thread.
-            status = StatusManager(user_message)
+            # #769: thread_id routes the transcript mirror's activity to this
+            # lamp, so a working turn stays 🟢 instead of going ⚠️ at 30s.
+            status = StatusManager(user_message, thread_id=thread.id)
             await status.set_running()
 
             model_override = await self._get_current_model()

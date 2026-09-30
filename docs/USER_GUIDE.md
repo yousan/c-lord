@@ -32,8 +32,12 @@ Bot (c-lord process)                                     ← one instance
     └── /clord → error "No repository configured"
 
 session_dir (the git clone each thread works in):
-    ~/c-lord-sessions/<channel_id>/<thread_id>/
+    ~/.c-lord/<instance>/sessions/<channel_id>/<thread_id>/
 ```
+
+`<instance>` is `CLORD_INSTANCE`, or the directory name of the c-lord checkout when that
+is not set. `SESSION_DIR_BASE` in `.env` replaces `~/.c-lord/<instance>/sessions` entirely,
+and an instance that already keeps its workspaces in `./data/sessions` goes on using it (#837).
 
 **The tmux session follows the repository, not the channel.** Thread 103 above is
 in #project-a but lives in the `project-c` session. Two channels bound to the same
@@ -47,7 +51,7 @@ repo share one session. See [specs/tmux-layout.md](specs/tmux-layout.md).
 | Thread : Repository | 1:1 | the channel's, or the thread's own via `/clord-thread-init` |
 | Repository : tmux session | 1:1 | Auto-generated from the repo name — so a channel can span **several** sessions, and two channels on the same repo **share** one |
 | Thread : tmux window | 1:1 | `@thread_id` (tmux window option). Numbers are unique within a session, not within a channel |
-| Thread : session_dir | 1:1 | `~/c-lord-sessions/{channel_id}/{thread_id}/` |
+| Thread : session_dir | 1:1 | `~/.c-lord/<instance>/sessions/{channel_id}/{thread_id}/` |
 | Thread : Claude session | 1:1 | DB (`sessions` table) |
 
 ### Setup Flow
@@ -291,7 +295,7 @@ See [specs/session-resume.md](specs/session-resume.md).
 /clord "Fix the bug"
     ↓
 1. DB session record created (thread_id → session_id)
-2. session_dir created: ~/c-lord-sessions/project-a/{thread_id}/
+2. session_dir created: ~/.c-lord/<instance>/sessions/{channel_id}/{thread_id}/
    └── git clone https://github.com/user/project-a.git
 3. tmux window created: project-a:w1
    └── @thread_id = {thread_id}
