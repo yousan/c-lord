@@ -36,6 +36,7 @@ from ..discord_ui.bridged_context import bridged_context
 from ..discord_ui.pane_context import replace_pane_context
 from ..discord_ui.turn_progress import DEFAULT_QUIET_SECONDS, TurnProgress
 from ..log_sampler import LogSampler
+from ..turn_activity import turn_activity
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import (
     banner_only,
@@ -886,6 +887,13 @@ class TranscriptMirror:
                         # re-post this idle-flushed final answer.
                         await _commit_cursor()
                     continue
+
+                # #769: anything Claude writes to its transcript — a tool call,
+                # its result, a thinking block — proves the session is moving.
+                # This is the stall lamp's only live feed: the runner-side
+                # producers it used to hear from are gone (#723), and without
+                # this every turn past 30s read ⚠️ however busy Claude was.
+                turn_activity.note(self.thread_id)
 
                 # #232: bridge an open AskUserQuestion menu regardless of
                 # verbosity / turn-end / who triggered the turn.

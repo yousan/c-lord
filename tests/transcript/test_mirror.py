@@ -2206,3 +2206,51 @@ async def test_a_final_answer_is_never_folded(tmp_path: Path) -> None:
         await mirror.stop()
 
     assert reply_calls == ["待機中。"], reply_calls
+
+
+async def test_mirror_reports_transcript_activity_to_the_turn_lamp(tmp_path: Path) -> None:
+    """#769: every event read from the jsonl tells the thread's stall lamp the
+    session is alive — including tool traffic and thinking, which post nothing."""
+    from c_lord.turn_activity import turn_activity
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    async def sink(text: str) -> None:
+        pass
+
+    seen: list[int] = []
+    unsubscribe = turn_activity.subscribe(7694, lambda: seen.append(1))
+    mirror = TranscriptMirror(
+        thread_id=7694, project_dir=project, sink=sink, verbosity="minimal", poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        seen.clear()  # whatever the start-up read produced is not the point
+        _write_event(jsonl, _assistant_tool_use("Bash", "sleep 5"))
+        await asyncio.sleep(0.25)
+        after_tool = len(seen)
+        _write_event(jsonl, _user_tool_result("done"))
+        _write_event(
+            jsonl,
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "hmm"}],
+                },
+            },
+        )
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+        unsubscribe()
+
+    assert after_tool >= 1
+    assert len(seen) >= 3
