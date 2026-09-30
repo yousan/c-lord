@@ -49,12 +49,34 @@ class SessionRecord:
     # Issue #574: who stopped it — "manual" or "idle". Read **only** to word the
     # notice. The state itself is still decided by closed_at alone, so a second
     # column can never contradict the first (the #538 failure mode).
+    # #818: the one exception is ``"swept"`` (:data:`SWEPT_REASON`) — the
+    # tombstone the 30-day sweep leaves instead of deleting the row. See there.
     closed_reason: str | None = None
     # Issue #572: when the 4-hour sleep stopped this workspace's Claude, or None
     # once any turn has run since. Read **only** to word the resume: a slept
     # workspace comes back silently, a crashed one announces itself (#464).
     # Whether to resume is still decided by "is the pane alive?" alone.
     slept_at: str | None = None
+
+
+#: #818: ``closed_reason`` of a row the 30-day sweep tidied away.
+#:
+#: The sweep used to ``DELETE`` the row, and with it the only link from a
+#: Discord thread to its ``working_dir`` and Claude session id. It now keeps the
+#: row as a **tombstone**: ``closed_at`` says when, this value says why. No new
+#: column and no new state — a tombstone is a stopped row whose stop was the
+#: sweep.
+#:
+#: A tombstone is history, not a session. Every live read in this repository
+#: (:meth:`SessionRepository.get`, the lists, :meth:`~SessionRepository.reset`)
+#: skips it, so the rest of c-lord sees exactly what it saw when the row was
+#: deleted; only :meth:`SessionRepository.get_swept` returns it. Writing the row
+#: again (:meth:`SessionRepository.save` — a reattach or a new turn) lifts it.
+SWEPT_REASON = "swept"
+
+#: The predicate every live read appends. ``IS NOT`` so that ``NULL`` passes.
+#: A fixed fragment (no user input) — keep it in step with :data:`SWEPT_REASON`.
+_LIVE = "closed_reason IS NOT 'swept'"
 
 
 def _record(row) -> SessionRecord:
@@ -83,17 +105,33 @@ class SessionRepository:
         self.db_path = db_path
 
     async def get(self, thread_id: int) -> SessionRecord | None:
-        """Get session by Discord thread ID."""
+        """Get session by Discord thread ID. A swept tombstone (#818) is not one."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT * FROM sessions WHERE thread_id = ?",
+                f"SELECT * FROM sessions WHERE thread_id = ? AND {_LIVE}",
                 (thread_id,),
             )
             row = await cursor.fetchone()
             if row is None:
                 return None
             return _record(row)
+
+    async def get_swept(self, thread_id: int) -> SessionRecord | None:
+        """The tombstone the 30-day sweep left for ``thread_id``, or ``None`` — #818.
+
+        The way back from a thread to the session it once had: ``working_dir``,
+        ``session_id``, and when (``closed_at``) it was tidied away. ``None`` for
+        a live or stopped row — those are :meth:`get`'s.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM sessions WHERE thread_id = ? AND closed_reason = ?",
+                (thread_id, SWEPT_REASON),
+            )
+            row = await cursor.fetchone()
+            return None if row is None else _record(row)
 
     async def save(
         self,
@@ -122,8 +160,24 @@ class SessionRepository:
                      -- forget to, and it can only ever be cleared — never set —
                      -- so it cannot contradict `set_slept` (#572).
                      slept_at = NULL,
+                     -- #818: writing a swept row again (a reattach, a new turn)
+                     -- brings it back to life. Only the tombstone is lifted; a
+                     -- stop the user made stays theirs to undo.
+                     closed_at = CASE WHEN sessions.closed_reason = ?
+                                 THEN NULL ELSE sessions.closed_at END,
+                     closed_reason = CASE WHEN sessions.closed_reason = ?
+                                     THEN NULL ELSE sessions.closed_reason END,
                      last_used_at = datetime('now', 'localtime')""",
-                (thread_id, session_id, working_dir, model, origin, summary),
+                (
+                    thread_id,
+                    session_id,
+                    working_dir,
+                    model,
+                    origin,
+                    summary,
+                    SWEPT_REASON,
+                    SWEPT_REASON,
+                ),
             )
             await db.commit()
 
@@ -141,7 +195,7 @@ class SessionRepository:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT * FROM sessions ORDER BY last_used_at DESC LIMIT ?",
+                f"SELECT * FROM sessions WHERE {_LIVE} ORDER BY last_used_at DESC LIMIT ?",
                 (limit,),
             )
             rows = await cursor.fetchall()
@@ -167,7 +221,7 @@ class SessionRepository:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "UPDATE sessions SET session_id = '', last_used_at = datetime('now', 'localtime')"
-                " WHERE thread_id = ?",
+                f" WHERE thread_id = ? AND {_LIVE}",
                 (thread_id,),
             )
             await db.commit()
@@ -373,7 +427,8 @@ class SessionRepository:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT * FROM sessions WHERE state = 'alive' ORDER BY last_used_at DESC"
+                f"SELECT * FROM sessions WHERE state = 'alive' AND {_LIVE} "
+                "ORDER BY last_used_at DESC"
             )
             rows = await cursor.fetchall()
             return [_record(row) for row in rows]
@@ -408,35 +463,46 @@ class SessionRepository:
         set, so it must err towards listing too much. A stopped workspace is
         still someone's checkout; filtering by state here would hand it to the
         sweep as an orphan.
+
+        Swept tombstones (#818) are the exception: they claim nothing. Before
+        #818 their rows were deleted, so a directory the 30-day sweep kept
+        (uncommitted work) was already an orphan to #613 — keeping the row as
+        history must not quietly change that.
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL"
+                f"SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL AND {_LIVE}"
             )
             rows = await cursor.fetchall()
             return {row[0] for row in rows if row[0]}
 
     async def cleanup_old(self, days: int = 30) -> list[SessionRecord]:
-        """Delete sessions unused for N days. Returns the rows that were deleted.
+        """Mark sessions unused for N days as swept. Returns the rows it marked.
+
+        #818: the row is **kept** as a tombstone (:data:`SWEPT_REASON` in
+        ``closed_reason``, the time in ``closed_at``) rather than deleted. It is
+        the only link from a thread to its ``working_dir`` and session id, and
+        yousan wants that link to survive: 「スレッドと過去にあったであろう
+        セッションの紐付けを、調べようとしたら調べられる」. The heavy part — the
+        session dir — is still the caller's to remove.
 
         Returns the rows rather than a count (#554) because the caller has to
         tell each of those threads what happened, and a count names no thread.
-        They are read inside the same transaction as the DELETE and with the
-        same predicate, so the list is exactly what went — no row can be deleted
-        without being reported, and none reported without being deleted.
-
-        The row carries ``working_dir``, which is the only handle left on the
-        session dir and the transcript once the row is gone. Reading it after the
-        delete would be too late; :func:`c_lord.session_cleanup.inspect_survivors`
-        needs it to say what survived.
+        They are read inside the same transaction as the UPDATE and with the same
+        predicate, so the list is exactly what was swept. Rows already swept are
+        excluded, or every restart would announce the same sweep again.
         """
-        where = " WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ?"
+        where = f" WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ? AND {_LIVE}"
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
-            doomed = [_record(row) for row in await cursor.fetchall()]
-            if not doomed:
+            swept = [_record(row) for row in await cursor.fetchall()]
+            if not swept:
                 return []
-            await db.execute("DELETE FROM sessions" + where, (days,))
+            await db.execute(
+                "UPDATE sessions SET closed_at = datetime('now', 'localtime'), "
+                "closed_reason = ?" + where,
+                (SWEPT_REASON, days),
+            )
             await db.commit()
-            return doomed
+            return swept
