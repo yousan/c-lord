@@ -1,10 +1,10 @@
-"""Startup sweep for buttons a previous process left behind (#634, #752).
+"""Startup sweep for buttons a previous process left behind (#634, #752, #796).
 
 A button's handler lives in the process that drew it. When that process goes,
 the button stays on screen — and pressing it answers ``This interaction
 failed``. A UI element that looks live and is not is worse than no element at
 all, which is why this runs on startup rather than waiting for the thread's
-next turn. Two kinds of residue are cleared:
+next turn. Three kinds of residue are cleared:
 
 - **⏹ Stop** (#634). ``StopView.disable`` deletes the stop-button message when a
   turn ends. At **shutdown** it cannot: aiohttp's session is already closed, so
@@ -22,6 +22,16 @@ next turn. Two kinds of residue are cleared:
   question overwrites the previous one's row (the table is keyed by thread),
   so nothing remembered them. They are **retired, not deleted**: the buttons
   go, the question stays readable.
+
+- **every other view's buttons** (#796) — 「⚡ これは新しい指示でした」
+  (``TextAnsweredMenuView``), 「▶️ 再開する」 (``ReopenSessionView``). They are
+  ``timeout=None`` but not persistent: discord.py gives their buttons a random
+  ``custom_id`` and nothing re-registers a handler for them, so after a restart
+  no process can answer. Production 2026-09-23: 3 live-looking ⚡ buttons, all
+  in archived threads. Their callbacks close over the original message and the
+  turn it belonged to, so there is nothing a restarted process could faithfully
+  run — they are **retired** like the menus: the buttons go, the notice stays,
+  and one line says why.
 
 Matching on the messages themselves rather than on recorded message ids is
 deliberate: the residue that already exists was written by versions that
@@ -46,6 +56,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -90,6 +101,26 @@ KeepMenu = Callable[[int, int], bool]
 
 _ASK_CUSTOM_ID_PREFIX = "ask_"
 
+# Appended to a retired non-persistent view's message (#796). The notice itself
+# — where a sentence went, what was held — is kept; only the buttons go.
+RETIRED_VIEW_NOTE = (
+    "-# 🔁 bot の再起動より前のボタンのため無効になりました。"
+    "必要なら、あらためてメッセージを送ってください。"
+)
+
+_DISCORD_CONTENT_LIMIT = 2000
+
+# discord.py names a button that was given no custom_id ``os.urandom(16).hex()``
+# (``discord/ui/button.py``). Nothing can route such an id once the process that
+# drew it is gone — every c-lord control meant to survive a restart has a fixed
+# id (``ask_…``) and is re-registered with ``bot.add_view`` (#671).
+_UNROUTABLE_CUSTOM_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def is_unroutable_custom_id(custom_id: object) -> bool:
+    """True for a discord.py-generated ``custom_id`` — dead once its process is."""
+    return isinstance(custom_id, str) and _UNROUTABLE_CUSTOM_ID.fullmatch(custom_id) is not None
+
 
 def _max_threads() -> int | None:
     raw = os.getenv(_MAX_THREADS_ENV)
@@ -106,6 +137,7 @@ def _max_threads() -> int | None:
 class _Tally:
     stops: int = 0
     menus: int = 0
+    views: int = 0
     failed: int = 0
     threads_failed: int = 0
 
@@ -168,16 +200,18 @@ async def sweep_dead_buttons(
             tally,
         )
 
-    if tally.stops or tally.menus or tally.failed or tally.threads_failed:
+    if tally.stops or tally.menus or tally.views or tally.failed or tally.threads_failed:
         logger.info(
             "dead-button sweep: removed %d dead ⏹ Stop button(s), retired %d dead ❓ "
-            "menu(s); %d could not be cleared, %d thread(s) unreadable (#634/#752)",
+            "menu(s) and %d other dead button message(s); %d could not be cleared, "
+            "%d thread(s) unreadable (#634/#752/#796)",
             tally.stops,
             tally.menus,
+            tally.views,
             tally.failed,
             tally.threads_failed,
         )
-    return tally.stops + tally.menus
+    return tally.stops + tally.menus + tally.views
 
 
 async def _sweep_thread(
@@ -285,8 +319,10 @@ async def _clear_all(
                 failed.append(int(message.id))
             elif kind == "stop":
                 tally.stops += 1
-            else:
+            elif kind == "menu":
                 tally.menus += 1
+            else:
+                tally.views += 1
     finally:
         if reopened:
             try:
@@ -304,7 +340,11 @@ async def _clear_all(
 def _residue_kind(
     message: object, my_id: int, thread_id: int, keep_menu: KeepMenu | None
 ) -> str | None:
-    """``"stop"`` / ``"menu"`` for one of *our* dead controls, else None."""
+    """``"stop"`` / ``"menu"`` / ``"view"`` for one of *our* dead controls, else None.
+
+    Order matters: a ⏹ Stop's button also has a generated id, and it is deleted
+    rather than retired.
+    """
     if _is_dead_stop_message(message, my_id):
         return "stop"
     if _is_menu_message(message, my_id):
@@ -312,14 +352,19 @@ def _residue_kind(
         if keep_menu is not None and keep_menu(thread_id, message_id):
             return None  # re-armed by restart recovery (#671) — it works
         return "menu"
+    if _is_unroutable_view_message(message, my_id):
+        return "view"
     return None
 
 
 async def _clear(message: Any, kind: str) -> bool:
-    """Delete a Stop / strip a menu's buttons. True when Discord accepted it."""
+    """Delete a Stop / strip a menu's or view's buttons. True when Discord accepted it."""
     try:
         if kind == "stop":
             await message.delete()
+        elif kind == "view":
+            content = getattr(message, "content", "") or ""
+            await message.edit(content=_with_retired_note(content), view=None)
         else:
             # ``view=None`` only: ``embed=None`` would erase the question and any
             # answer it recorded along with the buttons (#536).
@@ -327,6 +372,16 @@ async def _clear(message: Any, kind: str) -> bool:
     except Exception:
         return False
     return True
+
+
+def _with_retired_note(content: str) -> str:
+    """*content* plus :data:`RETIRED_VIEW_NOTE`, trimmed to Discord's 2,000 chars."""
+    if not content:
+        return RETIRED_VIEW_NOTE
+    room = _DISCORD_CONTENT_LIMIT - len(RETIRED_VIEW_NOTE) - 1
+    if len(content) > room:
+        content = content[: room - 1] + "…"
+    return f"{content}\n{RETIRED_VIEW_NOTE}"
 
 
 def _is_dead_stop_message(message: object, my_id: int) -> bool:
@@ -346,22 +401,36 @@ def _is_dead_stop_message(message: object, my_id: int) -> bool:
     return bool(getattr(message, "components", None))
 
 
-def _is_menu_message(message: object, my_id: int) -> bool:
-    """True for one of *our* ❓ menus that still shows a pressable control.
+def _pressable_custom_ids(message: object, my_id: int) -> list[str]:
+    """The custom ids of *our* message's controls that can still be pressed.
 
-    Recognised by the ``ask_…`` custom ids ``AskView`` gives every control —
-    stable on purpose (#671), and nothing else in c-lord uses them. A disabled
-    control, or a link button (which needs no handler), is not "pressable".
+    A disabled control, or a link button (which needs no handler), is not
+    "pressable". Another author's message yields nothing.
     """
     author = getattr(message, "author", None)
     if author is None or getattr(author, "id", None) != my_id:
-        return False
+        return []
+    ids: list[str] = []
     for row in getattr(message, "components", None) or []:
         children = getattr(row, "children", None)
         for item in children if isinstance(children, list) else [row]:
             if getattr(item, "disabled", False) is True or getattr(item, "url", None):
                 continue
             custom_id = getattr(item, "custom_id", None)
-            if isinstance(custom_id, str) and custom_id.startswith(_ASK_CUSTOM_ID_PREFIX):
-                return True
-    return False
+            if isinstance(custom_id, str):
+                ids.append(custom_id)
+    return ids
+
+
+def _is_unroutable_view_message(message: object, my_id: int) -> bool:
+    """True for *our* message with a pressable button no process can route (#796)."""
+    return any(is_unroutable_custom_id(i) for i in _pressable_custom_ids(message, my_id))
+
+
+def _is_menu_message(message: object, my_id: int) -> bool:
+    """True for one of *our* ❓ menus that still shows a pressable control.
+
+    Recognised by the ``ask_…`` custom ids ``AskView`` gives every control —
+    stable on purpose (#671), and nothing else in c-lord uses them.
+    """
+    return any(i.startswith(_ASK_CUSTOM_ID_PREFIX) for i in _pressable_custom_ids(message, my_id))
