@@ -37,8 +37,8 @@ Hilo C (docs)          ──→  Claude Code  (clon propio)  ─┘
 
 | Mecanismo | Estado real |
 |---|---|
-| **Aviso de concurrencia** (instrucciones a Claude sobre el trabajo en paralelo) | Se construye en cada turno pero **no se entrega** — las sesiones se ejecutan en la TUI de tmux (#53), que no tiene un canal de prompt de sistema por turno, así que el texto se descarta |
-| **Registro de sesiones activas** | Existe en memoria y lo usa `/workspace-cleanup`, pero **las sesiones no lo ven** (viaja en el mismo texto descartado) |
+| **Aviso de concurrencia** (instrucciones a Claude sobre el trabajo en paralelo) | **No se construye** — las sesiones se ejecutan en la TUI de tmux (#53), que no tiene un canal de prompt de sistema por turno, así que nunca se entregó; c-lord dejó de construirlo (#766) |
+| **Registro de sesiones activas** | Existe en memoria y lo usa `/workspace-cleanup`, pero **las sesiones no lo ven** (nada se lo envía) |
 | **Canal de coordinación** | **Desactivado por defecto.** Con `COORDINATION_CHANNEL_ID` configurado, publica un aviso de una línea cuando termina el turno de una sesión; no existe evento de inicio |
 | **AI Lounge** | Los endpoints REST funcionan, pero **nada le dice a Claude que el lounge existe**, así que en la práctica nadie publica nada — ver [#758](https://github.com/yousan/c-lord/issues/758) |
 

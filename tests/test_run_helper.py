@@ -1051,6 +1051,41 @@ class TestConcurrencyIntegration:
         runner.clone.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_lounge_repo_is_not_read_per_turn(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        """#766: the lounge text went nowhere, so a turn no longer reads the lounge DB.
+
+        ``lounge_repo`` is still accepted (backward compatible) but ignored.
+        """
+        lounge_repo = MagicMock()
+        lounge_repo.get_recent = AsyncMock(return_value=[])
+        runner.run = self._make_async_gen(self._simple_events())
+
+        await run_claude_in_thread(
+            thread, runner, repo, "fix the bug", None, lounge_repo=lounge_repo
+        )
+
+        lounge_repo.get_recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_concurrency_notice_built_log(
+        self,
+        thread: MagicMock,
+        runner: MagicMock,
+        repo: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """#766: the log must not say a notice was "built" — nothing is built any more."""
+        registry = SessionRegistry()
+        runner.run = self._make_async_gen(self._simple_events())
+
+        with caplog.at_level("DEBUG"):
+            await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
+
+        assert "Concurrency notice built" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_no_registry_no_clone(
         self, thread: MagicMock, runner: MagicMock, repo: MagicMock
     ) -> None:

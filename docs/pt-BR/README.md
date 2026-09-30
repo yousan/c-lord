@@ -37,8 +37,8 @@ Thread C (docs)       ──→  Claude Code  (clone próprio)  ─┘
 
 | Mecanismo | Estado real |
 |---|---|
-| **Aviso de concorrência** (instruções ao Claude sobre trabalhar em paralelo) | Montado a cada turno, mas **não entregue** — as sessões rodam na TUI do tmux (#53), que não tem canal de system prompt por turno, então o texto é descartado |
-| **Registro de sessões ativas** | Existe em memória e é usado por `/workspace-cleanup`, mas **as sessões não o veem** (ele viaja no mesmo texto descartado) |
+| **Aviso de concorrência** (instruções ao Claude sobre trabalhar em paralelo) | **Não é montado** — as sessões rodam na TUI do tmux (#53), que não tem canal de system prompt por turno, então nunca foi entregue; o c-lord parou de montá-lo (#766) |
+| **Registro de sessões ativas** | Existe em memória e é usado por `/workspace-cleanup`, mas **as sessões não o veem** (nada o envia a elas) |
 | **Canal de coordenação** | **Desligado por padrão.** Com `COORDINATION_CHANNEL_ID` definido, publica um aviso de uma linha quando o turno de uma sessão termina; não existe evento de início |
 | **AI Lounge** | Os endpoints REST (`GET/POST /api/lounge`) funcionam, mas **nada informa ao Claude que o lounge existe**, então na prática nada é publicado — veja [#758](https://github.com/yousan/c-lord/issues/758) |
 

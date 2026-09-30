@@ -367,7 +367,7 @@ class ClaudeChatCog(commands.Cog):
         self._coordination = coordination
         # For AskUserQuestion persistence across restarts
         self._ask_repo = ask_repo or getattr(bot, "ask_repo", None)
-        # AI Lounge repo (optional — lounge disabled when None)
+        # AI Lounge repo — passed through to RunConfig but unused since #766
         self._lounge_repo = lounge_repo or getattr(bot, "lounge_repo", None)
         # Pending resume repo (optional — startup resume disabled when None)
         self._resume_repo = resume_repo or getattr(bot, "resume_repo", None)
