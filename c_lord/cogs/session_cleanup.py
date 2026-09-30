@@ -1,6 +1,7 @@
 """Tell each thread that its session record was swept — #554.
 
-The 30-day DELETE itself is unchanged and still runs from :mod:`c_lord.main`,
+The 30-day sweep itself (since #818 it marks rows swept instead of deleting
+them) still runs from :mod:`c_lord.main`,
 before the bot connects. That timing matters: ``TranscriptMirrorCog``
 walks the ``sessions`` table on ``on_ready`` and starts a mirror per row, so
 sweeping *after* the connection would race it into starting mirrors for rows

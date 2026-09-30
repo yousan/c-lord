@@ -95,7 +95,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 | Module | Class/Function | Role |
 |--------|---------------|------|
 | `models.py` | `init_db()` | Schema definition and initialization. Single `sessions` table with `thread_id` (PK), `session_id`, `working_dir`, `model`, timestamps. Uses `datetime('now', 'localtime')` for timestamps. |
-| `repository.py` | `SessionRepository` | CRUD operations. `get()` by thread_id, `save()` with upsert, `delete()`, `cleanup_old()` for age-based cleanup. Each operation opens and closes its own `aiosqlite` connection (simple, no connection pooling). |
+| `repository.py` | `SessionRepository` | CRUD operations. `get()` by thread_id, `save()` with upsert, `delete()`, `cleanup_old()` for age-based cleanup (marks rows swept rather than deleting them — #818; `get()` and the lists skip swept rows, `get_swept()` returns them). Each operation opens and closes its own `aiosqlite` connection (simple, no connection pooling). |
 
 ### Discord UI Layer (`discord_ui/`)
 

@@ -298,7 +298,14 @@ The hint's wording and the rule that decides whether a message is accepted come 
 
 ### Why a thread loses its record (the 30-day sweep)
 
-The most common reason c-lord "has no record of the thread" is not a bug: **every startup deletes session records that have gone 30 days unused.** Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
+The most common reason c-lord "has no record of the thread" is not a bug: **every startup sweeps session records that have gone 30 days unused.** Since #818 the sweep **no longer deletes the row** — it marks it 片付け済み (`closed_at` = when, `closed_reason = 'swept'`) and keeps it, so the link from a thread to the session it once had can still be looked up later:
+
+```bash
+sqlite3 <data_dir>/sessions.db \
+  "SELECT thread_id, session_id, working_dir, closed_at FROM sessions WHERE thread_id = <THREAD_ID>"
+```
+
+A swept row is history, not a session: it is left out of `/clord-status`, the transcript mirror, and every periodic sweep, exactly as when the row was deleted. Posting into the thread later either reconnects to a checkout still on disk (#700) or — when nothing is left — answers with 「🧹 このスレッドは YYYY-MM-DD に**片付け済み**です … いま送ったメッセージは Claude に届いていません」 plus the next step, instead of dropping the message (a human-created thread with no other trace of c-lord used to get no answer at all). Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
 
 > 古い C-lord セッションを続けようとしたところセッションが無い、って言われちゃった。消した覚えは無いはず。Discord 上にそういう事も書いてないし
 
@@ -312,7 +319,7 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
-**What is deleted is the record, not the work.** The row ties a Discord thread to its Claude session; the git clone under `c-lord-sessions/<channel>/<thread>/` is left alone. So a swept thread usually still has its checkout, half-finished edits included — which is why the notice inspects the disk instead of printing one fixed sentence. It reports three different situations:
+**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `c-lord-sessions/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). So a swept thread usually still has its checkout, half-finished edits included — which is why the notice inspects the disk instead of printing one fixed sentence. It reports three different situations:
 
 | On disk | Notice says |
 |---|---|
