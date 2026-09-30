@@ -3794,7 +3794,9 @@ class ClaudeChatCog(commands.Cog):
 
             # #473: a hard stall shows the ⚠️ lamp on the trigger message and
             # nothing else — no prose line in the thread.
-            status = StatusManager(user_message)
+            # #769: thread_id routes the transcript mirror's activity to this
+            # lamp, so a working turn stays 🟢 instead of going ⚠️ at 30s.
+            status = StatusManager(user_message, thread_id=thread.id)
             await status.set_running()
 
             model_override = await self._get_current_model()
