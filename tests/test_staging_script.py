@@ -607,3 +607,270 @@ class TestStopEscalation(TestRestartReturnsToCaller):
             assert "SIGKILL" in log.read_text(encoding="utf-8")
         finally:
             self._cleanup(clone)
+
+
+FAKE_SYSTEMCTL = r"""#!/usr/bin/env bash
+# staging.sh が叩く `systemctl --user ...` の偽物。呼ばれた引数を記録し、
+# `show -p <PROP> --value <UNIT>` には環境変数で決めた値を返す。
+echo "$*" >>"$FAKE_SYSTEMCTL_LOG"
+if [ -n "${FAKE_SYSTEMCTL_FAIL:-}" ]; then
+  echo "Failed to connect to bus: No such file or directory" >&2
+  exit 1
+fi
+if [ "$2" = "show" ]; then
+  case "$4" in
+  ActiveState) echo "${FAKE_ACTIVE:-active}" ;;
+  SubState) echo "${FAKE_SUB:-running}" ;;
+  MainPID) echo "${FAKE_MAINPID:-0}" ;;
+  NRestarts) echo "${FAKE_NRESTARTS:-0}" ;;
+  ControlGroup) echo "${FAKE_CGROUP:-}" ;;
+  FragmentPath) echo "${FAKE_FRAGMENT:-}" ;;
+  *) echo "" ;;
+  esac
+fi
+exit 0
+"""
+
+FAKE_JOURNALCTL = r"""#!/usr/bin/env bash
+printf '%s\n' "${FAKE_JOURNAL:-}"
+"""
+
+
+def _own_cgroup() -> str:
+    """この pytest プロセスの cgroup v2 パス（子プロセスはこれを継承する）。"""
+    for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+        if line.startswith("0::"):
+            return line[3:]
+    pytest.skip("cgroup v2 が無い環境")
+    raise AssertionError  # unreachable
+
+
+class TestSystemdManagedClone:
+    """本番 (systemd の unit が管理する clone) では kill せず systemctl に委ねる (ops#2).
+
+    staging.sh restart が本番の bot を kill → setsid で自前起動すると、systemd が
+    「落ちた」と判断して立て直しを試み、単一インスタンスロックに弾かれて 6 回失敗 →
+    `failed` で諦める。以後、本番は監視外で動き続ける（4 か月で少なくとも 3 回）。
+
+    「本番かどうか」は unit ファイルの `WorkingDirectory=` が clone と一致するかで
+    判定する（bus に繋がらなくても読める）。systemctl / journalctl は PATH の偽物で
+    置き換え、呼び出しだけを検証する。ホストの本物の systemd には触れない。
+    """
+
+    def _setup(self, tmp_path: Path, *, managed: bool = True) -> tuple[Path, dict[str, str]]:
+        clone = tmp_path / "clone"
+        (clone / ".venv" / "bin").mkdir(parents=True)
+        (clone / ".env").write_text(
+            "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\nEXPECTED_BOT_USER_ID=42\n",
+            encoding="utf-8",
+        )
+        xdg = tmp_path / "xdg"
+        unit_dir = xdg / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        if managed:
+            (unit_dir / "c-lord.service").write_text(
+                f"[Service]\nWorkingDirectory={clone}\nExecStart=/bin/true\n", encoding="utf-8"
+            )
+        # 無関係な unit は拾わない
+        (unit_dir / "other.service").write_text(
+            f"[Service]\nWorkingDirectory={tmp_path}\n", encoding="utf-8"
+        )
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for name, body in (("systemctl", FAKE_SYSTEMCTL), ("journalctl", FAKE_JOURNALCTL)):
+            (bindir / name).write_text(body, encoding="utf-8")
+            (bindir / name).chmod(0o755)
+        log = tmp_path / "systemctl.log"
+        log.touch()
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "XDG_CONFIG_HOME": str(xdg),
+            "FAKE_SYSTEMCTL_LOG": str(log),
+            "FAKE_JOURNAL": "[INFO] c_lord.bot: Logged in as Prod#0001 (ID: 42)",
+            "FAKE_MAINPID": "4242",
+            "FAKE_CGROUP": _own_cgroup(),
+            "CLORD_SYSTEMD_WAIT_SECONDS": "6",
+            "CLORD_STOP_GRACE_SECONDS": "2",
+        }
+        env.pop("CLORD_LEASE_OWNER", None)
+        return clone, env
+
+    @staticmethod
+    def _run(args: list[str], clone: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(SCRIPT), *args],
+            cwd=clone,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _calls(env: dict[str, str]) -> list[str]:
+        return Path(env["FAKE_SYSTEMCTL_LOG"]).read_text(encoding="utf-8").splitlines()
+
+    @staticmethod
+    def _spawn_bot(clone: Path) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            ["bash", "-c", 'exec -a "python -m c_lord.main" sleep 300'],
+            cwd=str(clone),
+            start_new_session=True,
+        )
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen[bytes]) -> None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+    @staticmethod
+    def _wait_up(clone: Path, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            out = subprocess.run(
+                ["pgrep", "-f", r"c_lord\.main"], capture_output=True, text=True
+            ).stdout.split()
+            for pid in out:
+                with contextlib.suppress(OSError):
+                    if os.readlink(f"/proc/{pid}/cwd") == str(clone):
+                        return
+            time.sleep(0.1)
+        raise AssertionError("fake bot が上がらない")
+
+    def test_restart_delegates_to_systemctl_and_does_not_kill(self, tmp_path: Path) -> None:
+        """AC1: 本番 clone の restart は bot を kill せず `systemctl --user restart` を呼ぶ。"""
+        clone, env = self._setup(tmp_path)
+        bot = self._spawn_bot(clone)  # cgroup = unit の ControlGroup（= 監視下の bot）
+        try:
+            self._wait_up(clone)
+            result = self._run(["restart"], clone, env)  # 本番はリース不要
+            out = result.stdout + result.stderr
+            assert result.returncode == 0, out
+            assert "--user restart c-lord.service" in self._calls(env), self._calls(env)
+            assert bot.poll() is None, "監視下の bot を staging.sh が kill した"
+            assert "launched ->" not in out  # 自前起動の経路に落ちていない
+            assert "OK" in out
+        finally:
+            self._kill(bot)
+
+    def test_restart_errors_without_killing_when_systemctl_unusable(self, tmp_path: Path) -> None:
+        """AC2: systemctl が使えないと本番に対してはエラーで止まり、bot を kill しない。"""
+        clone, env = self._setup(tmp_path)
+        env["FAKE_SYSTEMCTL_FAIL"] = "1"
+        bot = self._spawn_bot(clone)
+        try:
+            self._wait_up(clone)
+            result = self._run(["restart"], clone, env)
+            out = result.stdout + result.stderr
+            assert result.returncode != 0, out
+            assert "systemctl" in out
+            assert bot.poll() is None, "systemctl 不通なのに bot を kill した"
+            assert "launched ->" not in out
+        finally:
+            self._kill(bot)
+
+    def test_stop_delegates_to_systemctl(self, tmp_path: Path) -> None:
+        clone, env = self._setup(tmp_path)
+        result = self._run(["stop"], clone, env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "--user stop c-lord.service" in self._calls(env)
+
+    def test_stop_errors_when_systemctl_unusable(self, tmp_path: Path) -> None:
+        clone, env = self._setup(tmp_path)
+        env["FAKE_SYSTEMCTL_FAIL"] = "1"
+        bot = self._spawn_bot(clone)
+        try:
+            self._wait_up(clone)
+            result = self._run(["stop"], clone, env)
+            assert result.returncode != 0
+            assert bot.poll() is None
+        finally:
+            self._kill(bot)
+
+    def test_restart_hands_unsupervised_bot_over_to_systemd(self, tmp_path: Path) -> None:
+        """監視外の bot（unit の cgroup の外）が居たら、それを止めてから systemd に渡す。
+
+        放っておくと systemd の起動が単一インスタンスロックに弾かれて `failed` に戻る。
+        """
+        clone, env = self._setup(tmp_path)
+        env["FAKE_CGROUP"] = "/user.slice/fake.slice/c-lord.service"  # bot はこの外
+        orphan = self._spawn_bot(clone)
+        try:
+            self._wait_up(clone)
+            result = self._run(["restart"], clone, env)
+            out = result.stdout + result.stderr
+            assert result.returncode == 0, out
+            assert "監視外" in out
+            orphan.wait(timeout=10)  # 止められている
+            calls = self._calls(env)
+            assert "--user restart c-lord.service" in calls
+            assert "--user reset-failed c-lord.service" in calls
+        finally:
+            self._kill(orphan)
+
+    def test_restart_fails_when_unit_does_not_come_up(self, tmp_path: Path) -> None:
+        clone, env = self._setup(tmp_path)
+        env["FAKE_ACTIVE"] = "failed"
+        env["FAKE_JOURNAL"] = "Start request repeated too quickly."
+        result = self._run(["restart"], clone, env)
+        assert result.returncode != 0
+        assert "OK" not in result.stdout
+
+    def test_restart_fails_on_identity_mismatch_in_journal(self, tmp_path: Path) -> None:
+        clone, env = self._setup(tmp_path)
+        env["FAKE_JOURNAL"] = "[INFO] c_lord.bot: Logged in as Evil#2 (ID: 999)"
+        result = self._run(["restart"], clone, env)
+        out = result.stdout + result.stderr
+        assert result.returncode != 0, out
+        assert "999" in out
+
+    def test_status_reports_supervision(self, tmp_path: Path) -> None:
+        """「監視されているか」は unit の状態と cgroup で見せる（親が systemd かでは見ない）。"""
+        clone, env = self._setup(tmp_path)
+        bot = self._spawn_bot(clone)
+        try:
+            self._wait_up(clone)
+            result = self._run(["status"], clone, env)
+            out = result.stdout
+            assert result.returncode == 0, out
+            assert "c-lord.service" in out
+            assert "active" in out
+            assert "監視下" in out
+        finally:
+            self._kill(bot)
+
+    def test_status_flags_unsupervised_bot(self, tmp_path: Path) -> None:
+        clone, env = self._setup(tmp_path)
+        env["FAKE_ACTIVE"] = "failed"
+        env["FAKE_MAINPID"] = "0"
+        env["FAKE_CGROUP"] = ""
+        bot = self._spawn_bot(clone)
+        try:
+            self._wait_up(clone)
+            result = self._run(["status"], clone, env)
+            assert result.returncode == 2, result.stdout
+            assert "監視外" in result.stdout
+        finally:
+            self._kill(bot)
+
+    def test_status_warns_when_unit_drifts_from_repo(self, tmp_path: Path) -> None:
+        """本番の unit が repo の deploy/c-lord.service と違えば status が警告する。"""
+        clone, env = self._setup(tmp_path)
+        (clone / "deploy").mkdir()
+        (clone / "deploy" / "c-lord.service").write_text("[Service]\n# repo\n", encoding="utf-8")
+        env["FAKE_FRAGMENT"] = str(tmp_path / "xdg" / "systemd" / "user" / "c-lord.service")
+        result = self._run(["status"], clone, env)
+        assert "deploy/c-lord.service" in result.stdout, result.stdout
+
+    def test_unmanaged_clone_never_calls_systemctl(self, tmp_path: Path) -> None:
+        """staging（unit の無い clone）は従来どおり — systemctl を呼ばない。"""
+        clone, env = self._setup(tmp_path, managed=False)
+        env["CLORD_LEASE_OWNER"] = "sess-S"
+        self._run(["borrow", "--purpose", "t"], clone, env)
+        (clone / ".venv" / "bin").rmdir()
+        result = self._run(["restart"], clone, env)
+        assert ".venv" in result.stdout + result.stderr
+        assert self._calls(env) == []

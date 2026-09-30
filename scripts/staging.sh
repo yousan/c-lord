@@ -7,6 +7,10 @@
 #   bash scripts/staging.sh stop               # この clone の bot を安全停止
 #   bash scripts/staging.sh restart [<branch>] # (branch 切替+)安全再起動
 #
+# 本番 (systemd の unit が WorkingDirectory にしている clone) では restart / stop は
+# **bot を kill しない**。`systemctl --user restart|stop <unit>` に委ね、systemctl が
+# 使えなければエラーで止まる (ops#2)。本番の起動の入口は systemd の 1 つだけ。
+#
 # 環境非依存: すべての値 (bot 名・ログ名・venv・期待 identity) は「実行した
 # ディレクトリ」から導出する。staging 専用にハードコードしない — 環境が
 # 増えても (C-lord-4 等) このスクリプト 1 本で足りる。
@@ -196,7 +200,7 @@ instance_leaders() {
   # なぜ必要か: `uv run python -m c_lord.main` は uv ラッパ(親)+python(子) の
   # 2 プロセスになり、どちらの cmdline にも c_lord.main が入るので pgrep は
   # 両方に当たる。これは「正常な 1 インスタンス」であって二重起動ではない
-  # (prod は systemd → start-clord.sh → uv run … でこの形。docs/STAGING.md
+  # (prod は systemd → uv run … でこの形。docs/STAGING.md
   # 参照)。子 (親が同 clone の matched pid である pid) を除けば、本当に独立
   # した起動だけが代表として残り、parent+child は 1 と数えられる。
   local pids pid ppid
@@ -212,6 +216,184 @@ instance_leaders() {
 count_instances() {
   # 論理インスタンス数 (parent+child を 1 と数える)。0 なら 0 を返す。
   instance_leaders | /usr/bin/grep -c . || true
+}
+
+# ---- systemd 管理下の clone (本番) — ops#2 ------------------------------------
+# 本番を起動する入口は systemd の unit 1 つだけにする。以前は staging.sh restart が
+# 本番の bot を kill → setsid で自前起動していたため、systemd が「落ちた」と判断して
+# 立て直しを試み、単一インスタンスロック (#212/#325) に弾かれて 6 回失敗 →
+# `Start request repeated too quickly` で諦め、本番が監視外で動き続けた (4 か月で
+# 少なくとも 3 回)。
+#
+# 「本番か」は unit ファイルの WorkingDirectory= がこの clone と一致するかで決める。
+# ファイルを読むだけなので、systemctl --user が bus に繋がらないときでも判定できる
+# (その場合は kill に落ちずエラーで止まる — それが肝)。
+SYSTEMD_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+CLONE_DIR_REAL="$(pwd -P)"
+SYSTEMD_WAIT="${CLORD_SYSTEMD_WAIT_SECONDS:-90}"
+case "$SYSTEMD_WAIT" in '' | *[!0-9]*) SYSTEMD_WAIT=90 ;; esac
+
+unit_working_dir() {
+  # unit_working_dir <unit file> — drop-in (<unit>.d/*.conf) を含めた最後の定義
+  local f="$1"
+  cat "$f" "$f.d"/*.conf 2>/dev/null |
+    sed -n 's/^[[:space:]]*WorkingDirectory=[[:space:]]*//p' | tail -1 |
+    sed -e 's/^-//' -e "s|%h|$HOME|g" -e 's/[[:space:]]*$//'
+}
+
+find_managed_unit() {
+  # この clone を WorkingDirectory にしている user unit の名前 (無ければ空)
+  local f wd
+  for f in "$SYSTEMD_UNIT_DIR"/*.service; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in *@.service) continue ;; esac # テンプレートは対象外
+    wd="$(unit_working_dir "$f")"
+    [ -n "$wd" ] || continue
+    wd="$(cd "$wd" 2>/dev/null && pwd -P)" || continue
+    if [ "$wd" = "$CLONE_DIR_REAL" ]; then
+      basename "$f"
+      return 0
+    fi
+  done
+}
+
+unit_prop() {
+  # unit_prop <PROP> — 失敗 (bus 不通) は空文字 + 非 0
+  systemctl --user show -p "$1" --value "$UNIT" 2>/dev/null
+}
+
+systemctl_usable() {
+  systemctl --user show -p ActiveState --value "$UNIT" >/dev/null 2>&1
+}
+
+pid_cgroup() {
+  sed -n 's/^0:://p' "/proc/$1/cgroup" 2>/dev/null
+}
+
+is_supervised_pid() {
+  # is_supervised_pid <pid> <unit の ControlGroup> — pid がその cgroup の中か。
+  # 「親が systemd --user か」では判定しない: setsid で立った孤児も親は
+  # systemd --user に付け替わるので、監視外でも親だけ見ると監視下に見える。
+  local cg="$2" pcg
+  [ -n "$cg" ] || return 1
+  pcg="$(pid_cgroup "$1")"
+  case "$pcg" in "$cg" | "$cg"/*) return 0 ;; esac
+  return 1
+}
+
+orphan_pids() {
+  # この clone の bot のうち unit の cgroup の外に居るもの (= 監視外)
+  local cg p
+  cg="$(unit_prop ControlGroup)"
+  for p in $(find_pids); do
+    is_supervised_pid "$p" "$cg" || echo "$p"
+  done
+}
+
+managed_status() {
+  # status の supervisor 部。異常 (unit が active でない / 監視外の bot) なら 2 を返す
+  local rc=0 active sub mainpid nrestarts cg frag p pids
+  if ! systemctl_usable; then
+    echo "supervisor: systemd $UNIT — systemctl --user に繋がらない (状態を確認できない)"
+    return 2
+  fi
+  active="$(unit_prop ActiveState)"
+  sub="$(unit_prop SubState)"
+  mainpid="$(unit_prop MainPID)"
+  nrestarts="$(unit_prop NRestarts)"
+  cg="$(unit_prop ControlGroup)"
+  echo "supervisor: systemd $UNIT — $active ($sub) MainPID=$mainpid NRestarts=$nrestarts"
+  echo "log:        journalctl --user -u $UNIT"
+  pids="$(find_pids)"
+  for p in $pids; do
+    if is_supervised_pid "$p" "$cg"; then
+      echo "  pid $p: 監視下 ($UNIT)"
+    else
+      echo "  pid $p: 監視外 (cgroup=$(pid_cgroup "$p")) — systemd は落ちても立て直さない"
+      rc=2
+    fi
+  done
+  if [ "$active" != "active" ]; then
+    echo "WARNING: $UNIT が $active。bash scripts/staging.sh restart で systemd の下に戻す。"
+    rc=2
+  fi
+  [ "$rc" = 2 ] && [ -n "$pids" ] &&
+    echo "WARNING: 監視外の bot がいる。bash scripts/staging.sh restart で止めて systemd に渡す。"
+  # unit が repo の deploy/ と一致しているか (本番の構成を repo の外に置かない)
+  frag="$(unit_prop FragmentPath)"
+  if [ -f "$CLONE_DIR/deploy/c-lord.service" ] && [ -n "$frag" ] &&
+    ! cmp -s "$frag" "$CLONE_DIR/deploy/c-lord.service"; then
+    echo "WARNING: $frag が repo の deploy/c-lord.service と違う。bash scripts/install-systemd.sh で揃える。"
+  fi
+  return "$rc"
+}
+
+managed_stop() {
+  systemctl_usable ||
+    die "systemctl --user が使えない — 本番 ($UNIT) の bot は kill していない。bus を直してから再実行してください (docs/STAGING.md)。"
+  systemctl --user stop "$UNIT" || die "systemctl --user stop $UNIT に失敗"
+  if [ -n "$(orphan_pids)" ]; then
+    echo "WARNING: 監視外の bot が残っている — PID 直指定で止める"
+    cmd_stop orphan_pids
+  fi
+  echo "stopped (systemd: $UNIT)。再開は bash scripts/staging.sh restart"
+}
+
+managed_restart() {
+  # kill → 自前起動はしない。systemd に restart させ、監視下で上がったことを確かめる。
+  systemctl_usable ||
+    die "systemctl --user が使えない — 本番 ($UNIT) の bot は kill していない。bus を直してから再実行してください (docs/STAGING.md)。"
+  if [ -n "$(orphan_pids)" ]; then
+    # 放っておくと systemd の起動が単一インスタンスロックに弾かれて failed に戻る
+    echo "WARNING: 監視外の bot がいる (pid $(orphan_pids | tr '\n' ' ')) — 止めてから systemd に渡す"
+    cmd_stop orphan_pids
+  fi
+  local since log waited=0 r0 active mainpid
+  since="$(date +%s)"
+  # 立て直しに諦めた後 (start-limit-hit) でも起動できるように、失敗カウンタを戻す
+  systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  echo "systemctl --user restart $UNIT"
+  systemctl --user restart "$UNIT" || die "systemctl --user restart $UNIT に失敗 (journalctl --user -u $UNIT)"
+  r0="$(unit_prop NRestarts)"
+  log="$(mktemp)"
+  while [ $waited -lt "$SYSTEMD_WAIT" ]; do
+    journalctl --user -u "$UNIT" --since "@$since" -o cat --no-pager >"$log" 2>/dev/null || true
+    if /usr/bin/grep -q "IDENTITY MISMATCH" "$log"; then
+      /usr/bin/grep -E "Logged in as|IDENTITY MISMATCH" "$log" | tail -2
+      rm -f "$log"
+      die "identity mismatch — 誤った bot として起動しようとした (#323 ガード作動)"
+    fi
+    active="$(unit_prop ActiveState)"
+    if [ "$active" = "failed" ]; then
+      tail -5 "$log"
+      rm -f "$log"
+      die "$UNIT が failed になった (journalctl --user -u $UNIT)"
+    fi
+    if /usr/bin/grep -q "Logged in as" "$log"; then
+      /usr/bin/grep -E "Logged in as" "$log" | tail -1
+      if ! check_log_identity "$log"; then
+        rm -f "$log"
+        systemctl --user stop "$UNIT" || true
+        die "誤った identity で起動したため $UNIT を停止した"
+      fi
+      rm -f "$log"
+      mainpid="$(unit_prop MainPID)"
+      [ "$active" = "active" ] && [ "${mainpid:-0}" != "0" ] ||
+        die "$UNIT が active でない (ActiveState=$active MainPID=$mainpid)"
+      [ "$(unit_prop NRestarts)" = "$r0" ] ||
+        die "$UNIT が起動中に落ちて立て直された (NRestarts $r0 -> $(unit_prop NRestarts))"
+      [ -z "$(orphan_pids)" ] ||
+        die "監視外の bot が残っている (pid $(orphan_pids | tr '\n' ' '))"
+      echo "supervisor: $UNIT active MainPID=$mainpid"
+      echo "OK"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  tail -5 "$log"
+  rm -f "$log"
+  die "${SYSTEMD_WAIT} 秒以内に 'Logged in as' が出ない (journalctl --user -u $UNIT)"
 }
 
 cmd_status() {
@@ -240,11 +422,18 @@ cmd_status() {
     echo "WARNING: 二重起動の疑い。stop してから restart してください。"
     return 2
   fi
+  [ -n "$UNIT" ] && {
+    managed_status
+    return $?
+  }
+  return 0
 }
 
 cmd_stop() {
-  local pids p waited
-  pids="$(find_pids)"
+  # cmd_stop [<pid lister>] — 既定は find_pids (この clone の bot 全部)。
+  # 本番の監視外 bot だけを止めるときは orphan_pids を渡す。
+  local lister="${1:-find_pids}" pids p waited
+  pids="$($lister)"
   if [ -z "$pids" ]; then
     echo "no running instance for $CLONE_DIR"
     return 0
@@ -261,7 +450,7 @@ cmd_stop() {
   while [ $waited -lt "$grace" ]; do
     sleep 1
     waited=$((waited + 1))
-    pids="$(find_pids)"
+    pids="$($lister)"
     [ -z "$pids" ] && {
       echo "stopped."
       return 0
@@ -276,7 +465,7 @@ cmd_stop() {
   # 照合を SIGKILL の直前にもう一度通す (その間に pid が再利用されていても
   # 別プロセスを撃たない)。エスカレーションした事実は bot のログにも残す。
   local msg
-  pids="$(find_pids)"
+  pids="$($lister)"
   for p in $pids; do
     msg="staging.sh: pid $p が SIGTERM から ${grace} 秒で終了しないため SIGKILL します (#699)"
     echo "WARNING: $msg" >&2
@@ -285,7 +474,7 @@ cmd_stop() {
   done
   waited=0
   while [ $waited -lt 5 ]; do
-    pids="$(find_pids)"
+    pids="$($lister)"
     [ -z "$pids" ] && {
       echo "stopped (SIGKILL)."
       return 0
@@ -347,6 +536,11 @@ cmd_restart() {
   head_branch="$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   head_sha="$(git -C "$CLONE_DIR" rev-parse --short HEAD 2>/dev/null || true)"
   [ -n "$head_sha" ] && echo "checked out $head_branch @ $head_sha"
+
+  if [ -n "$UNIT" ]; then
+    managed_restart
+    return $?
+  fi
 
   [ -x "$VENV_PY" ] || die "no .venv in $CLONE_DIR ($VENV_PY がない)。uv sync --dev を先に実行。"
 
@@ -438,6 +632,8 @@ cmd_restart() {
 COMMAND="${1:-}"
 [ $# -gt 0 ] && shift
 
+UNIT="$(find_managed_unit)" # 空 = staging (従来どおり) / 非空 = 本番 (systemd に委ねる)
+
 # 共通フラグ解析: --owner / --purpose / --ttl-hours、残り 1 つは branch
 OWNER="${CLORD_LEASE_OWNER:-}"
 PURPOSE=""
@@ -487,6 +683,11 @@ status)
 borrow) cmd_borrow "$OWNER" "$PURPOSE" "$TTL_HOURS" ;;
 release) cmd_release "$OWNER" ;;
 stop)
+  # 本番はリースの対象外 (借りるものではない)。systemd に委ねる。
+  if [ -n "$UNIT" ]; then
+    managed_stop
+    exit $?
+  fi
   # リース無しの stop は許可 (掃除目的)。他人の有効リース中のみ拒否。
   if lease_is_valid; then
     holder="$(lease_field owner)"
@@ -498,7 +699,7 @@ stop)
   cmd_stop
   ;;
 restart)
-  lease_guard "$OWNER" # 有効な自リース必須 (#328)
+  [ -n "$UNIT" ] || lease_guard "$OWNER" # staging は有効な自リース必須 (#328)。本番は対象外
   cmd_restart "$BRANCH"
   ;;
 check-log)

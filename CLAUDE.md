@@ -103,8 +103,9 @@ uv run python -m c_lord.main
 Bot 再起動は積極的に行ってよい。新しいコードで Bot を再起動し、Discord 上で動作確認する。
 
 ```bash
-# 1. Bot 再起動 — 必ず scripts/staging.sh を使う (#327)。
-#    pgrep パターン kill / nohup uv run は事故パターンとして禁止 (docs/STAGING.md 参照)
+# 1. Bot 再起動 — 必ず scripts/staging.sh を使う (#327)。staging の clone で打つ。
+#    pgrep パターン kill / nohup uv run は事故パターンとして禁止 (docs/STAGING.md 参照)。
+#    本番 checkout で打つと kill せず systemctl --user restart に委ねる (本番の入口は systemd だけ)
 bash scripts/staging.sh restart
 
 # 2. E2E テスト実行（要 .env: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID / E2E_TEST_WEBHOOK_URL）
@@ -442,9 +443,11 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 4. **動作確認 (E2E on staging)** ← **必須** — 下記のスキーム
 5. **セルフレビュー** — diff を読み返す / 不要な変更がないか / セキュリティ監査 (`security-audit` skill)
 6. **Merge** (squash + delete branch) — **only after every [Definition of Done](#definition-of-done-dod--single-source-of-truth) box is checked.** A green CI is necessary but not sufficient.
-7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && bash scripts/staging.sh restart`
-   - スクリプトは実行ディレクトリの bot **だけ**を `/proc/<pid>/cwd` で同定して PID 直 kill する(staging を巻き添えにしない)。pgrep パターン kill は禁止 — 事故パターン一覧は `docs/STAGING.md` 参照。
-   - ⚠️ 本番が supervisor (systemd --user / start-clord.sh --guard) 配下で動いている場合は supervisor 経由で再起動すること(手動 kill+起動は #195 の二重 bot 事故の元)。
+7. **Prod redeploy** — `cd /home/yousan/c-lord && git pull && systemctl --user restart c-lord.service`
+   - **本番の起動の入口は systemd の unit (`c-lord.service`) 1 つだけ。** kill して自前で起動しない（pgrep kill・`nohup`・`setsid` いずれも。#195 の二重 bot、および「systemd が立て直しに 6 回失敗して諦め、本番が監視外で動き続ける」事故の元 — 2026-06〜09 に少なくとも 3 回）。
+   - 本番 checkout で `bash scripts/staging.sh restart` を打っても同じになる: unit の `WorkingDirectory` がその clone なら、bot を kill せず `systemctl --user restart` に委ね、`Logged in as` と identity まで確かめる。**systemctl が使えなければ kill せずエラーで止まる**。監視外の bot が残っていれば、それを止めてから systemd に渡す。
+   - **「監視されているか」は unit の状態と cgroup で見る**: `bash scripts/staging.sh status`（`supervisor: systemd c-lord.service — active (running)` と、各 pid が `監視下` か）。「bot の親が `systemd --user` だから監視下」は**根拠にならない**（`setsid` で立った孤児も親は systemd --user に付け替わる）。
+   - unit は repo の `deploy/c-lord.service` そのもの（ホスト固有の値は `bash scripts/install-systemd.sh` が drop-in に書く）。手で書き換えない。詳細は [docs/STAGING.md](docs/STAGING.md#本番の再起動--systemd-だけ-ops2)。
 
 ### 動作確認スキーム (必須)
 
