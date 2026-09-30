@@ -10,11 +10,22 @@ A per-thread cursor turns that into "read everything once, then only what is
 new": each startup resumes after the last message the previous sweep examined,
 so a thread costs one request when nothing happened in it and none of its
 history is ever skipped.
+
+**Generations (#796).** A cursor only means "nothing left to find up to here"
+for the kinds of residue the sweep that wrote it knew about. When the sweep
+learns a new kind — #796 added the buttons of non-persistent views — every
+existing cursor has already stepped over that kind. :data:`CURSOR_GENERATION`
+is bumped with each such change and cursors from an older generation read as
+absent, so each thread gets one more deep first visit.
 """
 
 from __future__ import annotations
 
 import aiosqlite
+
+#: Bump when the sweep starts recognising a new kind of residue (#796).
+#: 1 = ⏹ Stop + ❓ menus (#752), 2 = + non-persistent view buttons (#796).
+CURSOR_GENERATION = 2
 
 
 class SweepCursorRepository:
@@ -24,10 +35,14 @@ class SweepCursorRepository:
         self._db_path = db_path
 
     async def get_all(self) -> dict[int, int]:
-        """``{thread_id: last examined message id}`` for every swept thread."""
+        """``{thread_id: last examined message id}`` for every thread swept by
+        a sweep of the current :data:`CURSOR_GENERATION`."""
         async with (
             aiosqlite.connect(self._db_path) as db,
-            db.execute("SELECT thread_id, last_message_id FROM ui_sweep_cursors") as cursor,
+            db.execute(
+                "SELECT thread_id, last_message_id FROM ui_sweep_cursors WHERE generation >= ?",
+                (CURSOR_GENERATION,),
+            ) as cursor,
         ):
             rows = await cursor.fetchall()
         return {int(row[0]): int(row[1]) for row in rows}
@@ -36,10 +51,12 @@ class SweepCursorRepository:
         """Record that every message of *thread_id* up to *message_id* was examined."""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO ui_sweep_cursors (thread_id, last_message_id) VALUES (?, ?) "
+                "INSERT INTO ui_sweep_cursors (thread_id, last_message_id, generation) "
+                "VALUES (?, ?, ?) "
                 "ON CONFLICT(thread_id) DO UPDATE SET "
                 "last_message_id = excluded.last_message_id, "
+                "generation = excluded.generation, "
                 "swept_at = datetime('now', 'localtime')",
-                (thread_id, message_id),
+                (thread_id, message_id, CURSOR_GENERATION),
             )
             await db.commit()
