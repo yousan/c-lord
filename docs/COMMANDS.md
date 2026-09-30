@@ -322,19 +322,28 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 ・新しく始める → **チャンネルで** `/clord prompt:<やること>`
 ```
 
-(The "clone only" case, verbatim from `c_lord/session_cleanup.py::notice_for`.)
+(The "clone only" case — a checkout the sweep **kept because it held uncommitted work** — verbatim from `c_lord/session_cleanup.py::notice_for`.)
 
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
-**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `c-lord-sessions/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). So a swept thread usually still has its checkout, half-finished edits included — which is why the notice inspects the disk instead of printing one fixed sentence. It reports three different situations:
+**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `c-lord-sessions/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). The rule is `remove_clean_session_dir` (`c_lord/session_cleanup.py`), and every doubt resolves to *keep*:
+
+| The checkout | The sweep |
+|---|---|
+| `git` reports nothing uncommitted or untracked, apart from the files c-lord wrote there itself (#749) | **removes it** |
+| uncommitted or untracked work | keeps it, half-finished edits included |
+| not a git repository, or `git` cannot tell | keeps it — cleanliness cannot be established |
+| a path too shallow to be a session dir (a corrupt row) | keeps it, with a WARNING |
+
+So whether a swept thread still has its checkout depends on whether work was left uncommitted in it — which is why the notice inspects the disk (after the removal) instead of printing one fixed sentence. It reports three different situations:
 
 | On disk | Notice says |
 |---|---|
 | clone + transcript | both survived |
-| clone only (the common case) | the work is there, the conversation is not |
+| clone only | the work is there, the conversation is not |
 | neither | nothing left to reconnect to |
 
-**Two cleaners run on the same schedule.** Claude Code expires its own transcripts under `~/.claude/projects/` via `cleanupPeriodDays` (default 30), independently of c-lord. That is why the middle row is the common one, and why c-lord cannot restore a conversation it never deleted — raise `cleanupPeriodDays` in your Claude Code settings if you want longer history.
+**Two cleaners run on the same schedule.** Claude Code expires its own transcripts under `~/.claude/projects/` via `cleanupPeriodDays` (default 30), independently of c-lord. Since #575 the sweep period follows that same setting, so a checkout that survives usually survives without its transcript (the middle row). c-lord cannot restore a conversation it never deleted — raise `cleanupPeriodDays` in your Claude Code settings if you want longer history.
 
 **Screenshot height (#471)**: `/tmux-screenshot` (and the `/resync` PNG snapshot) show **more history than the live ~40-row window**. Claude's TUI keeps no scrollback, so before capturing, c-lord transiently grows the window so Claude redraws more of the conversation, captures the taller screen, then restores the exact original size (the human's attached view is unchanged). The default height is **100 rows**; override it with `CLORD_TMUX_SCREENSHOT_ROWS` (rows), or set it to `0` to capture the current window as-is.
 
