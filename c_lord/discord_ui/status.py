@@ -62,6 +62,7 @@ class StatusManager:
         # the turn start, as before.
         self._thread_id = thread_id
         self._unsubscribe_activity: Callable[[], None] | None = None
+        self._activity_listener: Callable[[], None] | None = None
         self._current_emoji: str | None = None
         self._stall_task: asyncio.Task | None = None
         # #799: the task running the turn. A turn cancelled by the next message
@@ -71,6 +72,28 @@ class StatusManager:
         self._turn_active = False
         self._lock = asyncio.Lock()
         self._last_activity = asyncio.get_running_loop().time()
+
+    @classmethod
+    def adopt(
+        cls, message: discord.Message, emoji: str, *, thread_id: int | None = None
+    ) -> StatusManager:
+        """A manager for a lamp an earlier process painted (#718).
+
+        A restart mid-turn kills the manager that owned the lamp, and its last
+        paint (🟢/⏳/⚠️) would otherwise stay on the message for good. The new
+        manager starts out knowing ``emoji`` is on the message, so its first
+        paint replaces it rather than landing next to it.
+        """
+        manager = cls(message, thread_id=thread_id)
+        manager._current_emoji = emoji
+        return manager
+
+    @property
+    def displaced(self) -> bool:
+        """A newer turn in this thread has taken over the activity feed (#718)."""
+        if self._thread_id is None or self._activity_listener is None:
+            return False
+        return not turn_activity.is_current(self._thread_id, self._activity_listener)
 
     async def set_running(self) -> None:
         """🟢 — Claude is actively working (turn start)."""
@@ -118,6 +141,10 @@ class StatusManager:
             await self._remove_current_locked()
             self._current_emoji = None
 
+    async def cleanup_monitor(self) -> None:
+        """Stop watching this turn without touching the lamp (#718)."""
+        await self._stop_stall_timer()
+
     async def _paint_stall(self, emoji: str) -> None:
         """Paint a stall override (⏳/⚠️) — but only while the turn is running.
 
@@ -160,8 +187,11 @@ class StatusManager:
         self._turn_active = True
         self._turn_task = asyncio.current_task()
         if self._thread_id is not None:
+            # Held so ``displaced`` can compare identities: a bound method is a
+            # new object on every attribute access.
+            self._activity_listener = self._reset_stall_timer
             self._unsubscribe_activity = turn_activity.subscribe(
-                self._thread_id, self._reset_stall_timer
+                self._thread_id, self._activity_listener
             )
         self._stall_task = asyncio.create_task(self._stall_monitor())
 

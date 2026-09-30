@@ -48,6 +48,14 @@ class TurnActivity:
 
         return unsubscribe
 
+    def is_current(self, thread_id: int, listener: Listener) -> bool:
+        """Is *listener* still the one *thread_id*'s activity goes to?
+
+        ``False`` once a newer turn in the thread has subscribed — that turn
+        owns the thread now (#718).
+        """
+        return self._listeners.get(thread_id) is listener
+
     def note(self, thread_id: int) -> None:
         """The transcript showed *thread_id*'s session doing something."""
         listener = self._listeners.get(thread_id)
