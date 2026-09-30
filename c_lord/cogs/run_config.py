@@ -70,11 +70,12 @@ class RunConfig:
         repo: Session repository for persisting thread-session mappings.
               Pass None for automated workflows without session persistence.
         status: StatusManager for emoji reactions on the user's message.
-        registry: SessionRegistry for concurrency awareness. When provided,
-                  the session is registered during execution and a concurrency
-                  notice is prepended to the prompt.
+        registry: SessionRegistry. When provided, the session is registered
+                  during execution (``/workspace-cleanup`` reads it). Nothing
+                  is sent to Claude (#758/#766).
         ask_repo: Repository for persisting AskUserQuestion state across restarts.
-        lounge_repo: Repository for AI Lounge context injection.
+        lounge_repo: Unused since #766 (the lounge text was never delivered —
+                     #758). Kept so existing callers keep working.
         settings_repo: KV store for the persisted per-model context-window total
                        (#370). When provided, a learned window survives restarts
                        and the /context probe stops re-running every session.
