@@ -46,6 +46,7 @@ __all__ = [
     "is_clord_thread",
     "resume_notice",
     "stopped_hint",
+    "swept_notice",
 ]
 
 
@@ -117,6 +118,26 @@ UNTRACKED_NOTICE = (
     "⚠️ このスレッドには復元できるワークスペースがありません（c-lord の記録が見つかりません）。\n"
     "**いま送ったメッセージは Claude に届いていません。**\n\n" + _NEXT_STEPS
 )
+
+
+def swept_notice(record: SessionRecord) -> str:
+    """:data:`UNTRACKED_NOTICE` for a thread the 30-day sweep tidied away — #818.
+
+    Same shape and same way out as the untracked notice, because to the message
+    path it *is* that case: there is no session to continue and nothing left on
+    disk to reconnect to (a surviving checkout is reattached before this is ever
+    reached — #700). What the tombstone adds is the answer to 「なぜ無いの？」:
+    c-lord tidied it, and when. ``closed_at`` is the local wall clock; only the
+    date is shown, since the hour is noise to the reader.
+    """
+    when = (record.closed_at or "").strip()[:10]
+    stamp = f" {when} に" if when else ""
+    return (
+        f"🧹 このスレッドは{stamp}**片付け済み**です"
+        "（長く使われていなかったため、ワークスペースを整理しました）。\n"
+        "**いま送ったメッセージは Claude に届いていません。**\n\n" + _NEXT_STEPS
+    )
+
 
 #: Added to every message dropped this way. The notice is posted once per thread
 #: per process (it is a wall of text); the reaction is what keeps the 2nd, 3rd, …
