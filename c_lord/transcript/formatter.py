@@ -282,6 +282,16 @@ _COMMAND_MARKER_RE = re.compile(r"^<(command-name|local-command-stdout)>.*</\1>"
 _COMMAND_NAME_RE = re.compile(r"^<command-name>(.*?)</command-name>", re.DOTALL)
 _LOCAL_STDOUT_RE = re.compile(r"^<local-command-stdout>(.*)</local-command-stdout>$", re.DOTALL)
 _COMMAND_TAG_RE = re.compile(r"</?(?:command-name|command-message|command-args)>")
+# #834: a skill invocation (``/skill``, or ``/<skill>`` typed in the pane) is
+# stored ``<command-message>``-first. Unlike the ``<command-name>``-first
+# records above it is the user's *request*, not tool activity: it carries
+# the whole prompt in ``<command-args>``.
+_SKILL_INVOCATION_RE = re.compile(
+    r"^<command-message>[^<]*</command-message>\s*"
+    r"<command-name>(/[^<]*)</command-name>\s*"
+    r"<command-args>(.*)</command-args>$",
+    re.DOTALL,
+)
 # The CLI writes its slash-command output with the terminal's own colour codes.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -341,6 +351,22 @@ def _render_slash_command(text: str, session_id: str | None) -> RenderedEvent | 
     if not stripped:
         return None
     return RenderedEvent(kind="tool_result", body=stripped, session_id=session_id)
+
+
+def _render_skill_invocation(text: str, session_id: str | None) -> RenderedEvent | None:
+    """Read a ``<command-message>`` record back into the ``/name args`` typed (#834).
+
+    Rendered as ``user_input`` in the form c-lord typed it, so the mirror's
+    #808 ``pane_echo`` test recognises c-lord's own ``/skill`` and drops it,
+    while a command a person typed in the pane is still posted — as the
+    command, not as the raw storage tags.  ``None`` when *text* is not one.
+    """
+    m = _SKILL_INVOCATION_RE.match(text)
+    if m is None:
+        return None
+    name, args = m.group(1).strip(), m.group(2).strip()
+    body = f"{name} {args}" if args else name
+    return RenderedEvent(kind="user_input", body=body, session_id=session_id)
 
 
 def _is_bash_mode_marker(text: str) -> bool:
@@ -419,6 +445,9 @@ def _render_user(event: dict[str, Any]) -> RenderedEvent | None:
         # the prompt it re-primes the session with after compacting.
         if _is_slash_command_marker(stripped):
             return _render_slash_command(stripped, event.get("sessionId"))
+        skill = _render_skill_invocation(stripped, event.get("sessionId"))
+        if skill is not None:
+            return skill
         if _is_compact_summary(event, stripped):
             return _render_compact_summary(event.get("sessionId"))
         if content.startswith(ZWSP_MARKER):
