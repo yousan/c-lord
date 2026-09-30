@@ -127,6 +127,16 @@ class TurnEndBus:
             return False
         return record.prompt_at > _as_utc(started_at) and record.ended_at >= record.prompt_at
 
+    def ended_at(self, thread_id: int) -> datetime | None:
+        """When the transcript last said a turn in *thread_id* ended, if ever.
+
+        For a caller that already knows a turn was running at some moment and
+        only asks "has it ended since?" — the lamp adopted after a restart
+        (#718), whose prompt was read by the previous process.
+        """
+        record = self._threads.get(thread_id)
+        return record.ended_at if record is not None else None
+
     def forget(self, thread_id: int) -> None:
         """Drop *thread_id*'s record (workspace teardown, tests)."""
         self._threads.pop(thread_id, None)
