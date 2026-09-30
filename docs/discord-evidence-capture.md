@@ -71,10 +71,15 @@ Discord が禁じるのは (1) **ユーザーアカウントに自動でアク�
    ウィンドウが Windows デスクトップに出る):
 
    ```bash
-   mkdir -p ~/.clord && chmod 700 ~/.clord
-   google-chrome --user-data-dir=$HOME/.clord/discord-evidence-profile \
+   mkdir -p ~/.c-lord && chmod 700 ~/.c-lord
+   google-chrome --user-data-dir=$HOME/.c-lord/evidence-profile \
      "https://discord.com/login"
    ```
+
+   プロファイルの既定は `~/.c-lord/evidence-profile`(#837 — c-lord の生成物は `~/.c-lord/` に揃える)。
+   **#837 以前に旧 `~/.clord/discord-evidence-profile` へログイン済みのホストは、新しい方が無い限り旧の方を使い続ける**
+   (作り直すと人間のログインがもう 1 回要るため)。どちらが使われるかは
+   `scripts/discord_evidence_shot.sh --show-profile` で分かる。`CLORD_EVIDENCE_PROFILE` / `--profile` で上書きできる
 
    テストアカウントでログインし、サーバが見えたらウィンドウを閉じる。
    セッショントークンがプロファイルに保存され、以降の撮影はすべて無人で動く。
@@ -152,7 +157,7 @@ Discord の販促モーダル (「ショップ新着: プロフィールフレ�
 テストアカウントの状態で出るもので、**ウィンドウサイズでは消せない**。
 入力注入は禁止 (上記「禁止事項」) なので、**人間が一度手で閉じる**。
 
-**プロファイル (`~/.clord/discord-evidence-profile`) は全スレッド共有**なので、
+**プロファイル (`scripts/discord_evidence_shot.sh --show-profile` が出すパス) は全スレッド共有**なので、
 **その 1 回の解除で、以後のすべてのスレッド・すべての実行に効く。**
 スレッドごとに人間へ依頼を飛ばさないこと (2026-08-26 に複数スレッドが同時に
 同じ依頼を投げる事故が起きた)。
@@ -160,7 +165,7 @@ Discord の販促モーダル (「ショップ新着: プロフィールフレ�
 **人間が手で開くコマンド** (bot ホスト上。WSLg なら Windows デスクトップに出る):
 
 ```bash
-DISPLAY=:0 google-chrome --user-data-dir=$HOME/.clord/discord-evidence-profile \
+DISPLAY=:0 google-chrome --user-data-dir="$(scripts/discord_evidence_shot.sh --show-profile)" \
   "https://discord.com/channels/@me"
 ```
 
@@ -261,7 +266,7 @@ Discord の実 CSS で確認した値 (2026-09-01 実測):
 
 ## セキュリティ
 
-- プロファイル (`~/.clord/discord-evidence-profile`) には**テストアカウントの
+- プロファイル (既定 `~/.c-lord/evidence-profile`、旧ホストは `~/.clord/discord-evidence-profile`) には**テストアカウントの
   セッショントークン**が入っている。漏れたらそのアカウントは乗っ取られ得る。
   だからこそ**使い捨て・最小権限・staging のみ参加**にして、漏洩時の損失を
   ゼロに設計する。**本人の常用アカウントでのログインは絶対にしない**

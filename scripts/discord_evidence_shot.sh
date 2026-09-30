@@ -21,6 +21,7 @@ usage() {
 Usage:
   scripts/discord_evidence_shot.sh <discord-url|channel-id> [-o out.png]
       [--size WxH] [--wait SECONDS] [--profile DIR] [--no-qc]
+  scripts/discord_evidence_shot.sh --show-profile
 
   <discord-url>   https://discord.com/channels/<guild>/<channel>[/<message>]
                   (a message link makes the client jump to that message)
@@ -32,7 +33,11 @@ Usage:
   --size WxH      virtual screen size (default: 1600x1000). A very tall window
                   is the documented mitigation while a promo modal is up
   --wait SECONDS  seconds to let the client render (default: 45)
-  --profile DIR   Chrome profile holding the test account's session
+  --profile DIR   Chrome profile holding the test account's session. Default:
+                  $CLORD_EVIDENCE_PROFILE, else ~/.c-lord/evidence-profile — or
+                  the old ~/.clord/discord-evidence-profile while only that
+                  one exists (#837)
+  --show-profile  print the profile that would be used, and exit
   --no-qc         skip the post-capture image check (it will not be evidence)
 
 Guild lookup and verification need a bot token: $DISCORD_BOT_TOKEN, else
@@ -41,7 +46,16 @@ USAGE
 }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROFILE="${CLORD_EVIDENCE_PROFILE:-$HOME/.clord/discord-evidence-profile}"
+# #837: c-lord's own output lives under ~/.c-lord. A host whose test account is
+# already logged into the old profile keeps it — a fresh one means another
+# human login.
+PROFILE_DEFAULT="$HOME/.c-lord/evidence-profile"
+PROFILE_LEGACY="$HOME/.clord/discord-evidence-profile"
+if [[ ! -d "$PROFILE_DEFAULT" && -d "$PROFILE_LEGACY" ]]; then
+    PROFILE_DEFAULT="$PROFILE_LEGACY"
+fi
+PROFILE="${CLORD_EVIDENCE_PROFILE:-$PROFILE_DEFAULT}"
+SHOW_PROFILE=0
 OUT="evidence.png"
 SIZE="1600x1000"
 WAIT=45
@@ -57,11 +71,14 @@ while [[ $# -gt 0 ]]; do
         --wait) WAIT="$2"; shift 2 ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --no-qc) QC=0; shift ;;
+        --show-profile) SHOW_PROFILE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) URL="$1"; shift ;;
     esac
 done
+
+if [[ "$SHOW_PROFILE" == 1 ]]; then echo "$PROFILE"; exit 0; fi
 
 [[ -n "$URL" ]] || { usage >&2; exit 1; }
 

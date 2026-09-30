@@ -110,7 +110,11 @@ async def setup_bridge(
         session_dir_base: Base directory for session clone directories.
                           When set with ``session_source_repo``, a
                           SessionDirManager is created and attached to the bot.
-                          Defaults to SESSION_DIR_BASE env var, or None (disabled).
+                          Defaults to SESSION_DIR_BASE env var, else
+                          ``~/.c-lord/<instance>/sessions`` (#837; ``<instance>``
+                          is ``$CLORD_INSTANCE`` or the clone directory name).
+                          An instance that already has ``./data/sessions``
+                          keeps using it.
         session_source_repo: Git repository URL or local path to clone for
                              each session. Required when session_dir_base is set.
                              Defaults to SESSION_SOURCE_REPO env var.
@@ -195,6 +199,21 @@ async def setup_bridge(
     # ChannelRepoCog so per-channel directories share the same base path.
     if session_dir_base is None:
         session_dir_base = os.getenv("SESSION_DIR_BASE")
+    if session_dir_base is None:
+        # #837: nothing configured → ~/.c-lord/<instance>/sessions, unless this
+        # instance already has workspaces in ./data/sessions (then unchanged).
+        from .clord_home import LEGACY_SESSION_DIR_BASE, default_session_dir_base
+
+        session_dir_base = default_session_dir_base()
+        if session_dir_base is None:
+            logger.info(
+                "Session dirs: %s (existing; SESSION_DIR_BASE not set)",
+                LEGACY_SESSION_DIR_BASE,
+            )
+        else:
+            logger.info("Session dirs: %s (default; SESSION_DIR_BASE not set)", session_dir_base)
+    else:
+        logger.info("Session dirs: %s", session_dir_base)
     if session_source_repo is not None or os.getenv("SESSION_SOURCE_REPO"):
         import warnings
 
