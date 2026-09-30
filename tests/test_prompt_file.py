@@ -144,3 +144,133 @@ def test_stale_prompt_files_are_swept(tmp_path: Path) -> None:
 
     assert not old.exists(), "a prompt file left behind holds user text — clean it up"
     assert fresh.exists(), "a file for a turn still starting must survive"
+
+
+# ── the directory belongs to this user alone (#836) ─────────────────
+#
+# ``conftest._isolated_prompt_dir`` replaces ``_prompt_file_dir`` for every test;
+# this module-level reference was taken at import time, before that patch, so
+# the tests below exercise the real resolver.
+
+import stat  # noqa: E402
+
+import pytest  # noqa: E402
+
+from c_lord.tmux import _prompt_file_dir as _real_prompt_file_dir  # noqa: E402
+
+
+@pytest.fixture
+def tmp_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A private stand-in for ``/tmp`` with no XDG runtime dir."""
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setattr("tempfile.tempdir", str(root))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    return root
+
+
+def _assert_private(directory: Path) -> None:
+    st = os.lstat(directory)
+    assert stat.S_ISDIR(st.st_mode)
+    assert st.st_uid == os.getuid()
+    assert oct(st.st_mode & 0o777) == "0o700"
+
+
+def test_prefers_the_xdg_runtime_dir(tmp_root: Path, tmp_path, monkeypatch) -> None:
+    runtime = tmp_path / "run-user"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    directory = _real_prompt_file_dir()
+
+    assert directory == runtime / "clord-prompts"
+    _assert_private(directory)
+
+
+def test_without_a_runtime_dir_the_temp_dir_is_named_after_the_uid(tmp_root: Path) -> None:
+    """A fixed name let the first user on the host own it for everyone (#836)."""
+    directory = _real_prompt_file_dir()
+
+    assert directory == tmp_root / f"clord-prompts-{os.getuid()}"
+    _assert_private(directory)
+
+
+def test_a_leftover_shared_dir_from_an_old_build_is_not_used(tmp_root: Path) -> None:
+    legacy = tmp_root / "clord-prompts"
+    legacy.mkdir(mode=0o700)
+
+    directory = _real_prompt_file_dir()
+
+    assert directory != legacy
+    _assert_private(directory)
+
+
+def test_another_users_dir_does_not_block_this_user(tmp_root: Path) -> None:
+    """User B's turn stages its prompt even though user A got there first."""
+    (tmp_root / "clord-prompts").mkdir(mode=0o700)  # the old shared name
+    (tmp_root / f"clord-prompts-{os.getuid() + 1}").mkdir(mode=0o700)  # user A's
+
+    directory = _real_prompt_file_dir()
+
+    _assert_private(directory)
+    fd, name = __import__("tempfile").mkstemp(dir=directory)
+    os.close(fd)
+    Path(name).unlink()
+
+
+def test_a_dir_owned_by_someone_else_is_refused(tmp_root: Path, monkeypatch) -> None:
+    """Someone pre-created *our* path — they could swap the prompt before ``cat``."""
+    fake_uid = os.getuid() + 1
+    squatted = tmp_root / f"clord-prompts-{fake_uid}"
+    squatted.mkdir(mode=0o700)  # owned by the real uid, i.e. not by ``fake_uid``
+    monkeypatch.setattr("c_lord.tmux.os.getuid", lambda: fake_uid)
+
+    with pytest.raises(OSError):
+        _real_prompt_file_dir()
+
+
+def test_a_dir_others_can_write_to_is_refused(tmp_root: Path) -> None:
+    loose = tmp_root / f"clord-prompts-{os.getuid()}"
+    loose.mkdir()
+    loose.chmod(0o777)
+
+    with pytest.raises(OSError):
+        _real_prompt_file_dir()
+    assert oct(loose.stat().st_mode & 0o777) == "0o777", "refuse it, don't quietly reuse it"
+
+
+def test_a_symlink_in_place_of_the_dir_is_refused(tmp_root: Path, tmp_path) -> None:
+    target = tmp_path / "elsewhere"
+    target.mkdir(mode=0o700)
+    (tmp_root / f"clord-prompts-{os.getuid()}").symlink_to(target)
+
+    with pytest.raises(OSError):
+        _real_prompt_file_dir()
+
+
+def test_an_unsafe_runtime_dir_falls_back_to_the_temp_dir(
+    tmp_root: Path, tmp_path, monkeypatch
+) -> None:
+    runtime = tmp_path / "run-user"
+    runtime.mkdir(mode=0o700)
+    (runtime / "clord-prompts").mkdir()
+    (runtime / "clord-prompts").chmod(0o777)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    directory = _real_prompt_file_dir()
+
+    assert directory == tmp_root / f"clord-prompts-{os.getuid()}"
+    _assert_private(directory)
+
+
+def test_an_unusable_dir_still_falls_back_to_an_inline_prompt(tmp_root: Path, monkeypatch) -> None:
+    """Refusing the directory must not cost the turn (#529's call)."""
+    loose = tmp_root / f"clord-prompts-{os.getuid()}"
+    loose.mkdir()
+    loose.chmod(0o777)
+    monkeypatch.setattr("c_lord.tmux._prompt_file_dir", _real_prompt_file_dir)
+
+    cmd = _typed("hello world")
+
+    assert "'​hello world'" in cmd
+    assert list(loose.iterdir()) == [], "nothing may be written into a dir others control"
