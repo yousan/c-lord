@@ -2906,12 +2906,52 @@ class TestOnReadyLampRecovery:
 
         assert adopt.await_args.args[0] is starter
 
+    @staticmethod
+    def _history(*messages):
+        async def history(limit: int = 100):
+            for m in messages:
+                yield m
+
+        return history
+
+    @staticmethod
+    def _msg(*lamps: str, me: bool = True):
+        from types import SimpleNamespace
+
+        m = MagicMock()
+        m.reactions = [SimpleNamespace(emoji=e, me=me) for e in lamps]
+        return m
+
     @pytest.mark.asyncio
-    async def test_no_recorded_trigger_means_nothing_to_adopt(self) -> None:
+    async def test_a_first_turn_with_no_recorded_trigger_is_found_in_history(self) -> None:
+        """A thread's first turn never gets ``trigger_message_id`` (the row does
+        not exist yet when it is written) — its orphaned ⚠️ was still left on
+        the seed message in production after #850. Newest-first history is
+        searched for the bot's own open lamp instead."""
         from unittest.mock import patch
 
         thread = self._thread(7190)
         thread.fetch_message = AsyncMock()
+        orphan = self._msg("⚠️")
+        thread.history = self._history(self._msg(), orphan, self._msg("🟡"))
+        cog = self._cog(MagicMock(trigger_message_id=None, working_dir="/x"), thread)
+
+        adopt = AsyncMock()
+        with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        thread.fetch_message.assert_not_awaited()
+        assert adopt.await_args.args[0] is orphan
+
+    @pytest.mark.asyncio
+    async def test_history_search_stops_at_the_newest_final_lamp(self) -> None:
+        """An old ⚠️ above a 🟡 belongs to a turn that is long over — and to
+        some other process's story; the newest lamp decides."""
+        from unittest.mock import patch
+
+        thread = self._thread(7191)
+        thread.history = self._history(self._msg("🟡"), self._msg("⚠️"))
         cog = self._cog(MagicMock(trigger_message_id=None, working_dir="/x"), thread)
 
         adopt = AsyncMock()
@@ -2920,4 +2960,18 @@ class TestOnReadyLampRecovery:
             await asyncio.gather(*cog._lamp_recovery_tasks)
 
         adopt.assert_not_awaited()
-        thread.fetch_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_working_dir_means_nothing_to_adopt(self) -> None:
+        from unittest.mock import patch
+
+        thread = self._thread(7192)
+        thread.fetch_message = AsyncMock()
+        cog = self._cog(MagicMock(trigger_message_id=5, working_dir=None), thread)
+
+        adopt = AsyncMock()
+        with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        adopt.assert_not_awaited()

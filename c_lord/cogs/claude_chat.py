@@ -45,7 +45,8 @@ from ..discord_ui.authorization import (
     set_default_authorizer,
 )
 from ..discord_ui.embeds import error_embed, stopped_embed
-from ..discord_ui.lamp_recovery import adopt_orphaned_lamp
+from ..discord_ui.lamp_recovery import HISTORY_LIMIT as LAMP_HISTORY_LIMIT
+from ..discord_ui.lamp_recovery import adopt_orphaned_lamp, find_open_lamp
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.status import StatusManager
@@ -2569,18 +2570,26 @@ class ClaudeChatCog(commands.Cog):
             record = await self.repo.get(thread.id)
             trigger_id = getattr(record, "trigger_message_id", None) if record else None
             working_dir = getattr(record, "working_dir", None) if record else None
-            if not trigger_id or not working_dir:
-                logger.info("%s lamp recovery: no trigger message on record", ctx)
+            if not working_dir:
+                logger.info("%s lamp recovery: no workspace on record", ctx)
                 return
-            try:
-                message = await thread.fetch_message(trigger_id)
-            except discord.NotFound:
-                # A thread's first message is its starter, which lives in the
-                # parent channel under the thread's own id.
-                parent = thread.parent
-                if not isinstance(parent, discord.TextChannel):
-                    raise
-                message = await parent.fetch_message(trigger_id)
+            if trigger_id:
+                try:
+                    message = await thread.fetch_message(trigger_id)
+                except discord.NotFound:
+                    # A thread's first message is its starter, which lives in
+                    # the parent channel under the thread's own id.
+                    parent = thread.parent
+                    if not isinstance(parent, discord.TextChannel):
+                        raise
+                    message = await parent.fetch_message(trigger_id)
+            else:
+                # A thread's first turn records its trigger before the session
+                # row exists, so nothing is on record — find the lamp itself.
+                message = await find_open_lamp(thread.history(limit=LAMP_HISTORY_LIMIT))
+                if message is None:
+                    logger.info("%s lamp recovery: no open lamp in the thread", ctx)
+                    return
             project_dir = derive_project_dir(working_dir)
 
             async def turn_running() -> bool:

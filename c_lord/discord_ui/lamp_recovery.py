@@ -26,14 +26,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 
 import discord
 
 from ..turn_end_bus import turn_end_bus
 from ..utils.logger import log_ctx
-from .status import EMOJI_RUNNING, EMOJI_STALL_HARD, EMOJI_STALL_SOFT, StatusManager
+from .status import (
+    EMOJI_ERROR,
+    EMOJI_RUNNING,
+    EMOJI_STALL_HARD,
+    EMOJI_STALL_SOFT,
+    EMOJI_WAITING,
+    StatusManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +49,12 @@ _UTC = timezone.utc  # noqa: UP017
 
 #: The lamps that mean "this turn is not over" — the ones a restart orphans.
 _OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD)
+
+#: Final lamps: a message carrying one of these closed its turn.
+_FINAL_LAMPS = (EMOJI_WAITING, EMOJI_ERROR)
+
+#: How far back :func:`find_open_lamp` looks when no trigger id is on record.
+HISTORY_LIMIT = 20
 
 #: How often to look at the mirror's turn-end record (cheap, in memory).
 POLL_SECONDS = 2.0
@@ -59,6 +72,23 @@ def _open_lamp(message: discord.Message) -> str | None:
     for reaction in message.reactions:
         if getattr(reaction, "me", False) and str(reaction.emoji) in _OPEN_LAMPS:
             return str(reaction.emoji)
+    return None
+
+
+async def find_open_lamp(history: AsyncIterator[discord.Message]) -> discord.Message | None:
+    """The newest message in *history* (newest first) with the bot's open lamp.
+
+    The fallback for a turn whose trigger id was never recorded — a thread's
+    first turn writes it before the session row exists. The newest lamp of
+    either kind decides: a 🟡/❌ above an old ⚠️ means that ⚠️ belongs to a turn
+    that is long over, and it is not ours to guess about.
+    """
+    async for message in history:
+        mine = [str(r.emoji) for r in message.reactions if getattr(r, "me", False)]
+        if any(e in _OPEN_LAMPS for e in mine):
+            return message
+        if any(e in _FINAL_LAMPS for e in mine):
+            return None
     return None
 
 
