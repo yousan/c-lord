@@ -2831,3 +2831,93 @@ class TestDiscordLinkEnrichmentWireIn:
         prompt_arg = cog._run_claude.await_args.args[2]
         assert prompt_arg == prompt  # passed through unchanged
         assert "LEAKED" not in prompt_arg
+
+
+class TestOnReadyLampRecovery:
+    """#718: a turn in flight at shutdown gets its lamp taken back on startup."""
+
+    def _cog(self, record, thread):
+        from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
+
+        entry = PendingResume(
+            id=3,
+            thread_id=thread.id,
+            session_id="sess",
+            reason="bot_shutdown",
+            resume_prompt=None,
+            created_at="2026-09-30 10:00:00",
+        )
+        resume_repo = MagicMock(spec=PendingResumeRepository)
+        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.delete = AsyncMock()
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=record)
+        bot = MagicMock()
+        bot.get_channel.return_value = thread
+        return ClaudeChatCog(bot=bot, repo=repo, runner=MagicMock(), resume_repo=resume_repo)
+
+    def _thread(self, thread_id: int = 7188):
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.send = AsyncMock()
+        thread.parent = MagicMock(spec=discord.TextChannel)
+        return thread
+
+    @pytest.mark.asyncio
+    async def test_the_trigger_messages_lamp_is_adopted(self, tmp_path) -> None:
+        from unittest.mock import patch
+
+        thread = self._thread()
+        trigger = MagicMock()
+        thread.fetch_message = AsyncMock(return_value=trigger)
+        record = MagicMock(trigger_message_id=4242, working_dir=str(tmp_path))
+        cog = self._cog(record, thread)
+
+        adopt = AsyncMock()
+        with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        thread.fetch_message.assert_awaited_once_with(4242)
+        adopt.assert_awaited_once()
+        assert adopt.await_args.args[0] is trigger
+        assert adopt.await_args.kwargs["thread_id"] == thread.id
+        # With no transcript on disk the turn is not running.
+        assert await adopt.await_args.kwargs["turn_running"]() is False
+
+    @pytest.mark.asyncio
+    async def test_a_thread_starter_trigger_is_read_from_the_parent(self, tmp_path) -> None:
+        """A thread's first message lives in the parent channel (id == thread id)."""
+        from unittest.mock import patch
+
+        thread = self._thread(7189)
+        starter = MagicMock()
+        thread.fetch_message = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "Unknown Message")
+        )
+        thread.parent.fetch_message = AsyncMock(return_value=starter)
+        record = MagicMock(trigger_message_id=7189, working_dir=str(tmp_path))
+        cog = self._cog(record, thread)
+
+        adopt = AsyncMock()
+        with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        assert adopt.await_args.args[0] is starter
+
+    @pytest.mark.asyncio
+    async def test_no_recorded_trigger_means_nothing_to_adopt(self) -> None:
+        from unittest.mock import patch
+
+        thread = self._thread(7190)
+        thread.fetch_message = AsyncMock()
+        cog = self._cog(MagicMock(trigger_message_id=None, working_dir="/x"), thread)
+
+        adopt = AsyncMock()
+        with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        adopt.assert_not_awaited()
+        thread.fetch_message.assert_not_awaited()
