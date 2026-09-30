@@ -2,9 +2,8 @@
 
 Covers:
 - LoungeRepository CRUD and pruning
-- lounge.build_lounge_prompt() formatting
 - ApiServer GET/POST /api/lounge endpoints
-- run_claude_in_thread lounge context injection
+- run_claude_in_thread no longer reads the lounge per turn (#766)
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ from c_lord.database.lounge_repo import LoungeMessage, LoungeRepository
 from c_lord.database.models import init_db
 from c_lord.database.notification_repo import NotificationRepository
 from c_lord.ext.api_server import ApiServer
-from c_lord.lounge import _NO_MESSAGES, build_lounge_prompt
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -173,48 +171,6 @@ class TestLoungeRepository:
 
 
 # ---------------------------------------------------------------------------
-# build_lounge_prompt tests
-# ---------------------------------------------------------------------------
-
-
-class TestBuildLoungePrompt:
-    def test_empty_returns_no_messages_placeholder(self) -> None:
-        result = build_lounge_prompt([])
-        assert _NO_MESSAGES.strip() in result
-
-    def test_messages_included(self) -> None:
-        messages = [
-            LoungeMessage(
-                id=1, label="BotA", message="Starting work", posted_at="2026-02-21 10:00:00"
-            ),
-            LoungeMessage(
-                id=2, label="BotB", message="Good luck!", posted_at="2026-02-21 10:01:00"
-            ),
-        ]
-        result = build_lounge_prompt(messages)
-        assert "BotA" in result
-        assert "Starting work" in result
-        assert "BotB" in result
-        assert "Good luck!" in result
-
-    def test_timestamp_trimmed_to_hhmm(self) -> None:
-        messages = [
-            LoungeMessage(id=1, label="Bot", message="hi", posted_at="2026-02-21 14:30:00"),
-        ]
-        result = build_lounge_prompt(messages)
-        assert "14:30" in result
-        # Full datetime should not appear (seconds stripped)
-        assert "14:30:00" not in result
-
-    def test_curl_instructions_included(self) -> None:
-        """The prompt always explains how to post a message."""
-        result = build_lounge_prompt([])
-        assert "curl" in result
-        assert "CLORD_API_URL" in result
-        assert "/api/lounge" in result
-
-
-# ---------------------------------------------------------------------------
 # API endpoint tests
 # ---------------------------------------------------------------------------
 
@@ -302,17 +258,17 @@ class TestLoungeApiEndpoints:
 
 
 # ---------------------------------------------------------------------------
-# run_claude_in_thread lounge injection tests
+# run_claude_in_thread lounge tests
 # ---------------------------------------------------------------------------
 
 
 class TestRunHelperLoungeInjection:
-    """Verify that lounge context is injected as --append-system-prompt when lounge_repo is set."""
+    """The lounge is never injected (#758), and #766 stopped reading it per turn."""
 
-    async def test_lounge_context_built_but_not_injected(self) -> None:
-        """When lounge_repo has messages, the context is built (side effect)
-        but NOT injected into the CLI — tmux TUI mode doesn't support
-        --append-system-prompt. The user prompt must be passed unchanged.
+    async def test_lounge_repo_ignored(self) -> None:
+        """A lounge_repo is still accepted but not read: the context it fed was
+        never delivered (tmux TUI has no --append-system-prompt, #758), so #766
+        stopped building it. The user prompt must be passed unchanged.
         """
         from c_lord.cogs._run_helper import run_claude_in_thread
 
@@ -355,8 +311,8 @@ class TestRunHelperLoungeInjection:
         # User prompt is unchanged — lounge context is NOT in the user message.
         assert captured_prompt[0] == "Do something cool"
 
-        # Side effect: lounge_repo.get_recent was still called (context was built).
-        lounge_repo_mock.get_recent.assert_called_once()
+        # #766: the lounge is not read — nothing is built from it any more.
+        lounge_repo_mock.get_recent.assert_not_called()
 
         # clone() is NOT called — tmux TUI mode doesn't support --append-system-prompt.
         runner.clone.assert_not_called()

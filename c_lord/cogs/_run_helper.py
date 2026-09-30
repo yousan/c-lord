@@ -2,9 +2,10 @@
 
 Both ClaudeChatCog and SkillCommandCog need to run Claude and post results.
 This module is the thin orchestration layer that:
-1. Registers the session in the concurrency registry. It also builds the lounge +
-   concurrency notice text, but that text is not delivered: the tmux TUI has no
-   per-turn --append-system-prompt, so the string is dropped (#758)
+1. Registers the session in the concurrency registry (``/workspace-cleanup`` reads
+   it). The lounge + concurrency notice text is not built: the tmux TUI has no
+   per-turn --append-system-prompt, so it was never delivered (#758), and #766
+   stopped building it
 2. Delegates event processing to EventProcessor
 3. Handles AskUserQuestion flow (recursive resume)
 
@@ -58,7 +59,6 @@ from ..discord_ui.embeds import (
     usage_limit_embed,
 )
 from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
-from ..lounge import build_lounge_prompt
 from ..transcript.mirror import note_run_ended
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
@@ -143,44 +143,16 @@ def _truncate_result(content: str) -> str:
     return content[:TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
 
 
-async def _build_system_context(config: RunConfig) -> str | None:
-    """Build ephemeral system context from AI Lounge and concurrency notice.
+def _register_session(config: RunConfig) -> None:
+    """Register this turn in the session registry, if one is configured.
 
-    Returns the context string, or None if no context is available. It was meant to
-    be injected via --append-system-prompt (so it would not accumulate in session
-    history), but the tmux TUI has no per-turn channel for that: the only caller
-    keeps this for the registry side effect and drops the string (#758).
+    ``/workspace-cleanup`` reads the registry to skip workspaces that are running.
+    Nothing is sent to Claude: the lounge / concurrency notice text used to be
+    built here and dropped (#758), and #766 stopped building it.
     """
-    parts: list[str] = []
-
-    # Layer 3: AI Lounge context (recent messages + invitation).
-    if config.lounge_repo is not None:
-        try:
-            recent = await config.lounge_repo.get_recent(limit=10)
-            lounge_context = build_lounge_prompt(recent)
-            parts.append(lounge_context)
-            logger.debug("Lounge context built (%d recent message(s))", len(recent))
-        except Exception:
-            logger.warning("Failed to fetch lounge context — skipping", exc_info=True)
-
-    # Layer 1 + 2: Register session and build concurrency notice.
-    if config.registry is not None:
-        config.registry.register(config.thread.id, config.prompt[:100], config.runner.working_dir)
-        others = config.registry.list_others(config.thread.id)
-        notice = config.registry.build_concurrency_notice(config.thread.id)
-        parts.append(notice)
-        logger.info(
-            "Concurrency notice built for thread %d (%d other active session(s), dir=%s)",
-            config.thread.id,
-            len(others),
-            config.runner.working_dir or "(default)",
-        )
-    else:
-        logger.debug(
-            "No session registry — concurrency notice skipped for thread %d", config.thread.id
-        )
-
-    return "\n\n".join(parts) if parts else None
+    if config.registry is None:
+        return
+    config.registry.register(config.thread.id, config.prompt[:100], config.runner.working_dir)
 
 
 async def _cleanup_session_dir(config: RunConfig) -> None:
@@ -533,10 +505,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
 
 async def _run_turn(config: RunConfig, ctx: str) -> str | None:
     """The body of :func:`run_claude_with_config`, which owns the enter/exit log."""
-    # Build system context for side effects (session registry, lounge prompt).
-    # The context string itself is not injected — tmux TUI mode does not
-    # support --append-system-prompt.
-    await _build_system_context(config)
+    _register_session(config)
 
     runner = config.runner
     processor = EventProcessor(config)

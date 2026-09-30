@@ -41,8 +41,8 @@ Thread C (docs)      ──→  Claude Code  (own clone)  ─┘
 
 | Mechanism | Actual state |
 |---|---|
-| **Concurrency notice** (instructions to Claude about working in parallel) | Built every turn but **not delivered** — sessions run in the tmux TUI (#53), which has no per-turn system-prompt channel, so the text is dropped |
-| **Active session registry** | Exists in memory and is used by `/workspace-cleanup`, but **sessions don't see it** (it travels in the same dropped text) |
+| **Concurrency notice** (instructions to Claude about working in parallel) | **Not built** — sessions run in the tmux TUI (#53), which has no per-turn system-prompt channel, so it was never delivered; c-lord stopped building it (#766) |
+| **Active session registry** | Exists in memory and is used by `/workspace-cleanup`, but **sessions don't see it** (nothing sends it to them) |
 | **Coordination channel** | **Off by default.** With `COORDINATION_CHANNEL_ID` set, it posts a one-line notice when a session's turn ends; there is no start event |
 | **AI Lounge** | The REST endpoints work, but **nothing tells Claude the lounge exists**, so in practice nothing is posted — see [AI Lounge](#ai-lounge-not-delivered-to-sessions) |
 
@@ -88,7 +88,7 @@ GitHub PR ←── git push ←── Claude Code ─────────�
 
 ### AI Lounge (not delivered to sessions)
 
-> **Status: not wired up** ([#758](https://github.com/yousan/c-lord/issues/758)). The lounge was designed to be injected into every session as ephemeral system context. Since sessions run in the tmux TUI (#53) there is no per-turn channel for that, so c-lord builds the text and drops it: Claude is never told the lounge exists, and in practice nothing gets posted.
+> **Status: not wired up** ([#758](https://github.com/yousan/c-lord/issues/758)). The lounge was designed to be injected into every session as ephemeral system context. Since sessions run in the tmux TUI (#53) there is no per-turn channel for that, so c-lord does not build it (#766): Claude is never told the lounge exists, and in practice nothing gets posted.
 
 The REST endpoints still work, so you can use the lounge yourself — for example by describing it in your repository's `CLAUDE.md`:
 
@@ -735,7 +735,7 @@ c_lord/
   main.py                  # Standalone entry point
   setup.py                 # setup_bridge() — one-call Cog wiring
   bot.py                   # Discord Bot class
-  concurrency.py           # Active session registry (its concurrency notice is not delivered — #758)
+  concurrency.py           # Active session registry (nothing is sent to sessions — #758/#766)
   cogs/
     claude_chat.py         # Interactive chat (thread creation, message handling)
     skill_command.py       # /skill slash command with autocomplete

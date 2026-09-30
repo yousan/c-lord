@@ -37,8 +37,8 @@ Fil C (docs)           ──→  Claude Code  (son propre clone)  ─┘
 
 | Mécanisme | État réel |
 |---|---|
-| **Avis de concurrence** (instructions à Claude sur le travail en parallèle) | Construit à chaque tour mais **jamais transmis** — les sessions tournent dans le TUI tmux (#53), qui n'a pas de canal de prompt système par tour, donc le texte est abandonné |
-| **Registre des sessions actives** | Existe en mémoire et est utilisé par `/workspace-cleanup`, mais **les sessions ne le voient pas** (il voyage dans le même texte abandonné) |
+| **Avis de concurrence** (instructions à Claude sur le travail en parallèle) | **Plus construit** — les sessions tournent dans le TUI tmux (#53), qui n'a pas de canal de prompt système par tour, donc il n'a jamais été transmis ; c-lord a cessé de le construire (#766) |
+| **Registre des sessions actives** | Existe en mémoire et est utilisé par `/workspace-cleanup`, mais **les sessions ne le voient pas** (rien ne le leur transmet) |
 | **Canal de coordination** | **Désactivé par défaut.** Avec `COORDINATION_CHANNEL_ID` défini, il publie une notice d'une ligne quand le tour d'une session se termine ; il n'y a pas d'événement de démarrage |
 | **AI Lounge** | Les endpoints REST fonctionnent, mais **rien n'indique à Claude que le lounge existe**, donc en pratique rien n'y est publié ([#758](https://github.com/yousan/c-lord/issues/758)) |
 

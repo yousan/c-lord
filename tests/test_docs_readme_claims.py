@@ -63,10 +63,13 @@ def test_readme_big_idea_does_not_promise_what_nothing_enforces() -> None:
 
 
 def test_run_helper_docstring_does_not_claim_injection() -> None:
-    """AC3: モジュール docstring が「注入していない」というコメントと矛盾しない。"""
+    """AC3: モジュール docstring が「注入していない」というコメントと矛盾しない (#758)。
+
+    #766 で組み立ても止めたので、「組み立てていない」と書いてあること。
+    """
     doc = _run_helper.__doc__ or ""
     assert "via --append-system-prompt" not in doc
-    assert "not delivered" in doc
+    assert "is not built" in doc  # #766: 組み立ても止めた
 
 
 def test_commands_lounge_rows_say_nobody_posts() -> None:
