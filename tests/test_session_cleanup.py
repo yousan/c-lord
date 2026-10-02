@@ -289,3 +289,79 @@ class TestRecoveryPointer:
         text = notice_for(_record(), Survivors(False, False), days=30)
         assert "/clord-reattach" not in text
         assert "/clord" in text  # …but still names a way forward
+
+
+# ── #857: an archived thread is tidied in silence, an open one re-archived ───
+
+
+class TestArchivedThreads:
+    """Discord un-archives a thread the moment anything is posted to it. A swept
+    thread is 30 days quiet, so most were already closed — and on 2026-10-02 the
+    notice reopened 27 of them at once. Closed threads are swept silently (the
+    #818 tombstone still answers whoever comes back); open ones are told, then
+    closed."""
+
+    async def test_an_archived_thread_gets_no_post(self, caplog) -> None:
+        bot, cog = _make_cog()
+        t = _thread(700)
+        t.archived = True
+        t.edit = AsyncMock()
+        bot.fetch_channel = AsyncMock(return_value=t)
+
+        with caplog.at_level(logging.INFO):
+            cog.announce([_record(700, None)])
+            await cog.flush()
+
+        t.send.assert_not_awaited()
+        t.edit.assert_not_awaited()  # stays archived — nothing to undo
+        lines = [r.getMessage() for r in caplog.records if "thread=700" in r.getMessage()]
+        assert any("archived" in m and "silent" in m for m in lines), lines
+
+    async def test_an_open_thread_is_told_then_archived(self, caplog) -> None:
+        bot, cog = _make_cog()
+        t = _thread(700)
+        t.archived = False
+        order: list[str] = []
+        t.send = AsyncMock(side_effect=lambda *_a, **_k: order.append("send"))
+        t.edit = AsyncMock(side_effect=lambda **_k: order.append("edit"))
+        bot.fetch_channel = AsyncMock(return_value=t)
+
+        with caplog.at_level(logging.INFO):
+            cog.announce([_record(700, None)])
+            await cog.flush()
+
+        assert order == ["send", "edit"]
+        t.edit.assert_awaited_once_with(archived=True)
+        lines = [r.getMessage() for r in caplog.records if "thread=700" in r.getMessage()]
+        assert any("posted" in m and "archived" in m for m in lines), lines
+
+    async def test_a_failed_rearchive_is_logged_not_raised(self, caplog) -> None:
+        bot, cog = _make_cog()
+        t = _thread(700)
+        t.archived = False
+        t.edit = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "no"))
+        good = _thread(701)
+        good.archived = False
+        bot.fetch_channel = AsyncMock(side_effect=lambda tid: t if tid == 700 else good)
+
+        with caplog.at_level(logging.WARNING):
+            cog.announce([_record(700, None), _record(701, None)])
+            await cog.flush()  # must not raise
+
+        good.send.assert_awaited_once()
+        assert any("thread=700" in r.getMessage() for r in caplog.records)
+
+    async def test_a_failed_notice_does_not_archive(self) -> None:
+        """If the notice never landed the thread was not reopened by us, and
+        closing it would hide it with no explanation at all."""
+        bot, cog = _make_cog()
+        t = _thread(700)
+        t.archived = False
+        t.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "no"))
+        t.edit = AsyncMock()
+        bot.fetch_channel = AsyncMock(return_value=t)
+
+        cog.announce([_record(700, None)])
+        await cog.flush()
+
+        t.edit.assert_not_awaited()
