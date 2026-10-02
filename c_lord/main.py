@@ -17,7 +17,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
-from .session_cleanup import DirOutcome, remove_clean_session_dir, sweep_days
+from .session_cleanup import DirOutcome, retire_swept_workspace, sweep_days
 from .setup import setup_bridge
 from .shutdown_watchdog import arm_shutdown_watchdog, shutdown_timeout_from_env
 from .utils.logger import setup_logging
@@ -427,7 +427,8 @@ async def main(env_path: Path | None = None) -> None:
         # directories, so the sweep removes those here. Clean checkouts go;
         # anything with uncommitted or untracked work is kept (#575).
         for record in deleted:
-            outcome = await asyncio.to_thread(remove_clean_session_dir, record)
+            # #595: a workspace deleted here also frees its thread's w{N}.
+            outcome = await asyncio.to_thread(retire_swept_workspace, record)
             if outcome is DirOutcome.KEPT_DIRTY:
                 logger.info(
                     "Session cleanup: kept %s (uncommitted work) thread=%s",

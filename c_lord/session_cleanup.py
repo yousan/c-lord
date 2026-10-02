@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 
 from .retention import claude_transcript_retention_days
 from .session_dir import WorktreeStatus, worktree_status
+from .tmux import release_window_number
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
 if TYPE_CHECKING:
@@ -261,3 +262,21 @@ def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
         return DirOutcome.KEPT_DIRTY
     logger.info("session cleanup: removed %s (thread=%s)", path, record.thread_id)
     return DirOutcome.REMOVED
+
+
+def retire_swept_workspace(record: SessionRecord) -> DirOutcome:
+    """Finish the sweep of one swept row: its checkout, then its ``w{N}``. Never raises.
+
+    #595: the 30-day sweep is the automatic delete, and deletion is when a
+    thread's window number is freed. A checkout kept for uncommitted work means
+    the workspace was not deleted, so the thread keeps its number.
+    """
+    outcome = remove_clean_session_dir(record)
+    if outcome in (DirOutcome.REMOVED, DirOutcome.ABSENT):
+        try:
+            release_window_number(record.thread_id)
+        except Exception:  # never let a number cost the sweep
+            logger.exception(
+                "session cleanup: releasing window number failed (thread=%s)", record.thread_id
+            )
+    return outcome

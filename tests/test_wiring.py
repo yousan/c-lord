@@ -52,7 +52,7 @@ MUST_BE_WIRED = [
     ("DevEnvRepository", "database/devenv_repo.py"),
     ("orphaned_containers", "devenv.py"),
     # #575: 行を消すときにディレクトリも消す
-    ("remove_clean_session_dir", "session_cleanup.py"),
+    ("retire_swept_workspace", "session_cleanup.py"),
     # #730: 復元したとき「開発環境は停止したまま」と言う1行。
     #
     # この表が想定している事故そのものが起きた例 — #574 の AC として書かれたのに

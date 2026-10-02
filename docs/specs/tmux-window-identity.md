@@ -53,12 +53,12 @@ critical section" は前者を意図していたが、守れていたのは同�
 | 項目 | 実装 |
 |------|------|
 | 直列化 | `_session_lock(session_name)` — モジュールレベルの `dict[str, threading.Lock]`。`TmuxSessionManager._lock` は毎回ここから引く（`session_name` を後から差し替えても正しいロックを取る） |
-| 採番 | `_next_window_name()` が `list-windows` の最大 `w{N}` / `work{N}` から毎回決める。`_next_work_id` は `list-windows` 自体が失敗したときのフォールバックのみ |
+| 採番 | `_next_window_name(thread_id)` は、まずそのスレッドが永続マップに持っている番号を返す（生きている窓・他スレッドと被らなければ — #595）。無ければ「生きている窓の番号」と「永続マップで他スレッドが持っている番号」の最大 +1。`_next_work_id` は `list-windows` 自体が失敗したときのフォールバックのみ |
 | 二重作成の防止 | `create_session()` はロック**取得後にもう一度** `_find_window_for_thread()` で確認する（待っている間に別スレッドが作り終えている可能性がある） |
 | 新規窓の同定 | `new-window -P -F '#{window_id}'` で ID を受け取る。以降 `@thread_id` 設定・resize・send・capture すべてこの ID をターゲットにする |
 | マッピング | `_thread_to_window` は `thread_id -> window_id`。`_target()` が ID をそのまま使い、名前だけは `session:名前` に修飾する（`remap_window` など運用コマンド経由の名前入力用） |
 | 重複の解決 | `_rebuild_mapping()` は `list-windows` 1発で `window_id` / 名前 / `@thread_id` / パスをまとめて読み、**`window_id` をキーに**クレームを集計する。ログも `@218 (w134)` 形式で出るので、別々の窓が同じ名前で出力されて自分自身と衝突しているように見えることはない |
-| 永続マップ | `~/.cache/c-lord/<session>-window-map.json` は**名前**を保存する（tmux サーバ再起動で ID は振り直されるが、名前は tmux-resurrect が復元するため）。読み込み時に名前→`window_id` へ解決し、名前が曖昧なら**そのエントリを使わない**（推測しない） |
+| 永続マップ | `~/.cache/c-lord/<session>-window-map.json` は**名前**を保存する（tmux サーバ再起動で ID は振り直されるが、名前は tmux-resurrect が復元するため）。読み込み時に名前→`window_id` へ解決し、名前が曖昧なら**そのエントリを使わない**（推測しない）。**#595 以降はスレッドの番号の台帳も兼ねる**: 窓が消えてもエントリは消さず（保存はディスク上の内容への**マージ** — 同じセッションに複数の manager がいても互いの行を消さない）、消すのは削除（`release_window_number()` — `/workspace-delete` と30日スイープで作業フォルダが片付いたとき）と、別セッションへ移ったときの移動元だけ。DB には何も足していない |
 
 ### `@thread_id` は再起動をまたがない — またぐのは**名前**（#677）
 

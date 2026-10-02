@@ -290,6 +290,68 @@ def parse_work_number(window_name: str) -> int | None:
     return None
 
 
+#: Suffix of the per-session thread → window-name file (#113), which since #595
+#: is also the record of which ``w{N}`` each thread holds.
+_MAPPING_SUFFIX = "-window-map.json"
+
+#: Serializes read-modify-write of those files (#595). Several managers share
+#: one session (#649) and each used to overwrite the file with its own subset;
+#: now that an entry outlives its window, a lost write would lose a number.
+_MAPPING_FILE_LOCK = threading.Lock()
+
+
+def _default_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "c-lord")
+
+
+def _read_mapping_file(path: str) -> dict[str, str]:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _write_mapping_file(path: str, data: dict[str, str]) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except OSError as exc:
+        logger.warning("Failed to save window mapping to %s: %s", path, exc)
+
+
+def release_window_number(thread_id: int, cache_dir: str | None = None) -> None:
+    """Give up the ``w{N}`` *thread_id* holds, in every session (#595).
+
+    A thread keeps its number while it sleeps or is stopped — the number is the
+    handle a user follows in the sidebar — and frees it only when its workspace
+    is deleted (yousan, 2026-09-08). The delete paths know the thread but not
+    necessarily which session it last lived in, so every session's file is
+    visited.
+    """
+    directory = cache_dir if cache_dir is not None else _default_cache_dir()
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(_MAPPING_SUFFIX))
+    except OSError:
+        return
+    key = str(thread_id)
+    with _MAPPING_FILE_LOCK:
+        for name in names:
+            path = os.path.join(directory, name)
+            data = _read_mapping_file(path)
+            released = data.pop(key, None)
+            if released is None:
+                continue
+            _write_mapping_file(path, data)
+            logger.info(
+                "Released window number %s of %s (thread=%d)",
+                released,
+                name[: -len(_MAPPING_SUFFIX)],
+                thread_id,
+            )
+
+
 def _screenshot_rows_from_env() -> int:
     """Read the configured tmux-screenshot height (rows) from the environment.
 
@@ -838,12 +900,14 @@ class TmuxSessionManager:
         self._vim_mode: dict[str, bool] = {}
         # Persistent thread→window mapping file. Survives tmux restarts; used
         # as fallback in _rebuild_mapping when pane has cd'd away (issue #113).
+        # Since #595 it also keeps a thread's entry after its window dies, so the
+        # thread gets the same ``w{N}`` back; see :meth:`_next_window_name`.
         if mapping_path is not None:
             self._mapping_path: str = mapping_path
         else:
-            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "c-lord")
+            cache_dir = _default_cache_dir()
             os.makedirs(cache_dir, exist_ok=True)
-            self._mapping_path = os.path.join(cache_dir, f"{self.session_name}-window-map.json")
+            self._mapping_path = os.path.join(cache_dir, f"{self.session_name}{_MAPPING_SUFFIX}")
 
     @property
     def _lock(self) -> threading.Lock:
@@ -1103,8 +1167,18 @@ class TmuxSessionManager:
         self._rebuild_mapping()
         return self._thread_to_window.get(thread_id)
 
-    def _next_window_name(self) -> str:
-        """Next free ``w{N}`` name, read from live tmux state (#649).
+    def _next_window_name(self, thread_id: int | None = None, preferred: int | None = None) -> str:
+        """The ``w{N}`` name for *thread_id*'s next window, read from live tmux state (#649).
+
+        #595: a thread gets back the number it already holds. The mapping file
+        keeps a thread's entry after its window dies (sleep, stop, a tmux server
+        restart), so waking it recreates ``w5``, not ``max + 1``. *preferred* is
+        tried next — the number a window brings when it moves in from another
+        session (#427). A number is usable only when no live window carries it
+        and no other thread holds it in the file; otherwise, and for new
+        threads, the answer is one past everything live *or* held, so a
+        sleeping thread's number is never handed to somebody else. Only
+        :func:`release_window_number` (workspace deletion) frees one.
 
         The number used to come from ``self._next_work_id``, an instance
         counter. Two managers for one session each carried their own, so both
@@ -1122,13 +1196,28 @@ class TmuxSessionManager:
             self._next_work_id += 1
             return name
 
-        max_id = 0
+        # Count both ``w{N}`` and legacy ``work{N}`` so numbering stays
+        # monotonic across the prefix rename.
+        live: set[int] = set()
         for line in result.stdout.splitlines():
-            # Count both ``w{N}`` and legacy ``work{N}`` so numbering stays
-            # monotonic across the prefix rename.
             n = parse_work_number(line.strip())
             if n is not None:
-                max_id = max(max_id, n)
+                live.add(n)
+        held: dict[str, int] = {}
+        if self._mapping_path:
+            with _MAPPING_FILE_LOCK:
+                data = _read_mapping_file(self._mapping_path)
+            for tid, name in data.items():
+                n = parse_work_number(name)
+                if n is not None:
+                    held[tid] = n
+
+        mine = held.pop(str(thread_id), None) if thread_id is not None else None
+        for candidate in (mine, preferred):
+            if candidate is not None and candidate not in live and candidate not in held.values():
+                return f"{WINDOW_PREFIX}{candidate}"
+
+        max_id = max(live | set(held.values()) | {0})
         self._next_work_id = max_id + 2  # fallback value should the next call fail
         return f"{WINDOW_PREFIX}{max_id + 1}"
 
@@ -1430,17 +1519,39 @@ class TmuxSessionManager:
         holds (#649): this file exists to survive a tmux *server* restart, and a
         restart reassigns every id while tmux-resurrect restores the names.
 
+        #595: the write *merges* into what is on disk. Entries for threads whose
+        window is gone are kept — that is how a thread gets its number back —
+        and entries written by another manager for the same session (#649) are
+        not erased by this one's partial view. Only
+        :func:`release_window_number` removes an entry.
+
         No-op when mapping_path is empty (disabled or test mode).
         """
         if not self._mapping_path:
             return
         names = self._window_names()
-        try:
-            data = {str(tid): names.get(win, win) for tid, win in self._thread_to_window.items()}
-            with open(self._mapping_path, "w") as f:
-                json.dump(data, f)
-        except OSError as exc:
-            logger.warning("Failed to save window mapping to %s: %s", self._mapping_path, exc)
+        with _MAPPING_FILE_LOCK:
+            data = _read_mapping_file(self._mapping_path)
+            for tid, win in self._thread_to_window.items():
+                name = names.get(win) if _WINDOW_ID_RE.match(win) else win
+                if name:
+                    data[str(tid)] = name
+            _write_mapping_file(self._mapping_path, data)
+
+    def _forget_in_session_file(self, session_name: str, thread_id: int) -> None:
+        """Drop *thread_id* from *session_name*'s mapping file (#595).
+
+        Used when a window moves to this session (#427): the number now lives
+        here, and the source session must stop holding it for a thread that
+        will never come back there.
+        """
+        if not self._mapping_path:
+            return
+        path = os.path.join(os.path.dirname(self._mapping_path), f"{session_name}{_MAPPING_SUFFIX}")
+        with _MAPPING_FILE_LOCK:
+            data = _read_mapping_file(path)
+            if data.pop(str(thread_id), None) is not None:
+                _write_mapping_file(path, data)
 
     def _load_from_mapping_file(self, target: dict[int, str]) -> None:
         """Restore @thread_id from the persistent mapping file into *target*.
@@ -1631,6 +1742,10 @@ class TmuxSessionManager:
         # matched by path, and later lookups need the option to be there.
         self._tag_window(window_id, thread_id)
 
+        # Minted before the move (#595) so the window's own name does not count
+        # as taken: it keeps its number when the destination has it free.
+        new_name = self._next_window_name(thread_id, preferred=parse_work_number(src_name))
+
         result = _run(
             [
                 "tmux",
@@ -1654,12 +1769,11 @@ class TmuxSessionManager:
                 result.stderr.strip(),
             )
             return None
-
-        new_name = self._next_window_name()
         _run(["tmux", "rename-window", "-t", window_id, new_name])
 
         self._thread_to_window[thread_id] = window_id
         self._save_mapping()
+        self._forget_in_session_file(src_session, thread_id)
         logger.info(
             "Adopted tmux window %s (%s:%s) -> %s:%s (thread=%d, dir=%s)",
             window_id,
@@ -1733,7 +1847,7 @@ class TmuxSessionManager:
                 self._sort_windows_unlocked()
                 return migrated
 
-            window_name = self._next_window_name()
+            window_name = self._next_window_name(thread_id)
 
             result = _run(
                 [
