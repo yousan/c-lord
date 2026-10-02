@@ -459,12 +459,12 @@ Issue → branch → PR → **動作確認 + セルフレビュー** → merge �
 > これを外すと**動いていた全スレッドの Claude が同時に死ぬ**（2026-09-08 に実際に3本死亡 — #701）。
 > 詳細と正しい手順: [docs/STAGING.md → 実機 tmux を触る検証は必ず `-L` で分離する](docs/STAGING.md#実機-tmux-を触る検証は必ず--l-で分離する-701)
 
-**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-parallel-3` で常時稼働している。本番 (`/home/yousan/c-lord`) は kill しない。staging bot は共有リソース — 借用前の占有確認と検証後の**原状復帰**を必ず行う。
+**前提**: staging 環境 (本番と独立した bot / channel) が `/home/yousan/c-lord-staging-1`〜`4` の 4 台で常時稼働している（空いている台を `staging.sh status` で探して借りる。一覧は [docs/STAGING.md → staging フリート](docs/STAGING.md#staging-フリート並行検証用に増設-2026-06-11)）。本番 (`/home/yousan/c-lord`) は kill しない。staging bot は共有リソース — 借用前の占有確認と検証後の**原状復帰**を必ず行う。
 
 **手順の詳細は [docs/STAGING.md](docs/STAGING.md) が唯一の正**(レイアウト・占有プロトコル・禁止事項・増設手順を含む)。骨子:
 
 ```bash
-cd /home/yousan/c-lord-parallel-3
+cd /home/yousan/c-lord-staging-<N>                       # 空いている台 (1〜4)
 export CLORD_LEASE_OWNER="<セッション識別子>"
 bash scripts/staging.sh status                          # 0. 占有・状態確認
 bash scripts/staging.sh borrow --purpose "PR #NNN 検証"  # 1. 借用 (他人の有効リース中は拒否される)
