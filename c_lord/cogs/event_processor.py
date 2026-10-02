@@ -19,6 +19,7 @@ from ..claude.tmux_runner import (
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
+    unavailable_model,
 )
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
@@ -354,6 +355,12 @@ class EventProcessor:
             if event.error.startswith(LOGIN_REQUIRED_ERROR_PREFIX):
                 self._config.outcome.no_response = True
                 self._config.outcome.login_required = True
+            # #484: likewise for a model Claude Code will not use — only
+            # ``/model set`` can fix it.
+            refused_model = unavailable_model(event.error)
+            if refused_model is not None:
+                self._config.outcome.no_response = True
+                self._config.outcome.model_unavailable = refused_model
             # #631: a rate-limited turn also produced nothing, but it knows why.
             # ``no_response`` is set too so no caller reads it as a completed
             # turn; ``usage_limit`` is what upgrades the wording from "send it
