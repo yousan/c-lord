@@ -395,6 +395,7 @@ uv lock --upgrade-package c-lord && uv sync
 | `DISCORD_OWNER_ID` | User ID allowed to drive the bot, and @-mentioned when Claude needs input. Unset, the bot allows only the Discord application's owner (#713) | (optional) |
 | `CLORD_ALLOWED_ROLE` | Discord role name whose members may drive the bot (OR with `DISCORD_OWNER_ID`) | (optional) |
 | `CLORD_ALLOW_ANYONE` | `1` lets **every** member of the server drive the bot — which means running shell commands on the host. Warned about at startup | `false` |
+| `CLORD_NOTIFY_DENIED` | `0` stops the DM the application owner gets when someone not allowed posts in a bot thread (the sender never sees anything; the refusal is still logged — #346) | `true` |
 | `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end 🟡 + pauses + failures), `blocked` (pauses + failures — quiet when it works, loud when it breaks), `off` (never, failures included) | `blocked` |
 | `COORDINATION_CHANNEL_ID` | Channel that gets a one-line notice when a session's turn ends; also the default AI Lounge channel | (optional) |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |

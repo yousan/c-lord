@@ -38,6 +38,7 @@ from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRecord, SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
+from ..denied_notice import DeniedNotifier
 from ..discord_ref import enrich_discord_references
 from ..discord_ui.authorization import (
     Authorizer,
@@ -347,6 +348,8 @@ class ClaudeChatCog(commands.Cog):
         # is how a View ended up judging the owner against an empty allowlist.
         # This is the floor under that mistake, not a licence to skip wiring.
         set_default_authorizer(getattr(bot, "authorizer", None) or self._authorizer)
+        # #346: who gets told — and how often — when a message is refused.
+        self._denied_notifier = DeniedNotifier()
         self._registry = registry or getattr(bot, "session_registry", None)
         self._semaphore = asyncio.Semaphore(max_concurrent)
         # #634: the startup sweep for a previous process's dead ⏹ Stop buttons.
@@ -875,6 +878,12 @@ class ClaudeChatCog(commands.Cog):
         # #745: bookkeeping for the reconnect pick-up. Before any await, so a
         # pick-up that starts after this event was dispatched always sees it.
         if not self._note_delivered(message):
+            return
+
+        # #346: a refused message used to vanish here without a trace. The
+        # sender still sees nothing; the owner is told by DM and it is logged.
+        if not self._is_message_authorized(message):
+            await self._denied_notifier.report(self.bot, message)
             return
 
         # Channel direct messages are ignored — thread creation is limited to
