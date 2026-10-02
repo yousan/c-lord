@@ -36,6 +36,7 @@ from ..claude.tmux_runner import (
     CLAUDE_VANISHED_ERROR_PREFIX,
     FLEET_TMUX_RESTART_ERROR_PREFIX,
     LOGIN_REQUIRED_ERROR_PREFIX,
+    MODEL_UNAVAILABLE_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
@@ -52,6 +53,7 @@ from ..discord_ui.embeds import (
     error_embed,
     fleet_tmux_restart_embed,
     login_required_embed,
+    model_unavailable_embed,
     no_response_embed,
     timeout_embed,
     trust_start_failed_embed,
@@ -126,6 +128,10 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # which cannot work until someone runs /login on the host.
     if error.startswith(LOGIN_REQUIRED_ERROR_PREFIX):
         return login_required_embed(error)
+    # #484: the configured model is unusable. Its own embed for the #812 reason
+    # (resending cannot help) and because the fix is a c-lord setting.
+    if error.startswith(MODEL_UNAVAILABLE_ERROR_PREFIX):
+        return model_unavailable_embed(error)
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))

@@ -4107,6 +4107,9 @@ class ClaudeChatCog(commands.Cog):
                         # #812: and when Claude Code is logged out, say that —
                         # only /login on the host can fix it.
                         login_required=run_config.outcome.login_required,
+                        # #484: and when it refused the configured model, point
+                        # at /model set — the only thing that can change it.
+                        model_unavailable=run_config.outcome.model_unavailable,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply
