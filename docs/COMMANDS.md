@@ -183,7 +183,7 @@ The `repo` value is stored in clonable form. A PR / issue / file link is shrunk 
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/model show` | Show the current Claude model | Anywhere |
-| `/model set <model>` | Change the global model for new sessions. Pick a tier alias (`sonnet`/`opus`/`haiku`, each resolves to the latest of that tier) or type any model ID (e.g. `claude-fable-5`) — the CLI validates it | Anywhere |
+| `/model set <model>` | Change the global model for new sessions. Pick a tier alias (`sonnet`/`opus`/`haiku`, each resolves to the latest of that tier) or type any model ID (e.g. `claude-fable-5`) — the CLI validates it. If the CLI cannot use it, every turn in a new session ends with a ❌ "設定されたモデルを Claude Code が使えません" embed naming the model, until you `/model set` a usable one (#484) | Anywhere |
 
 Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful).
 
