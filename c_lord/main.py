@@ -216,6 +216,10 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     }
 
 
+# Where the REST API listens when ``CLORD_API_PORT`` is not set.
+DEFAULT_API_PORT = 8080
+
+
 async def build_api_server(
     bot: ClaudeDiscordBot,
     *,
@@ -255,11 +259,18 @@ async def build_api_server(
     notif_repo = NotificationRepository(str(data_dir / "notifications.db"))
     await notif_repo.init_db()
 
+    # #258: a port nobody chose may move to the next free one; a pinned port
+    # (env or override) is used as-is or not at all.
+    auto_port = False
     if port_override is not None:
         api_port = port_override
     else:
         api_port_env = os.getenv("CLORD_API_PORT", "")
-        api_port = int(api_port_env) if api_port_env.isdigit() else 8080
+        if api_port_env.isdigit():
+            api_port = int(api_port_env)
+        else:
+            api_port = DEFAULT_API_PORT
+            auto_port = True
 
     return ApiServer(
         repo=notif_repo,
@@ -267,6 +278,7 @@ async def build_api_server(
         default_channel_id=default_channel_id,
         host=os.getenv("CLORD_API_HOST", "127.0.0.1"),
         port=api_port,
+        auto_port=auto_port,
         api_secret=os.getenv("CLORD_API_SECRET") or None,
         # #457: loopback is not a UID boundary. The API only serves the Unix
         # user running the bot; this opens it to anyone who can reach the port.
