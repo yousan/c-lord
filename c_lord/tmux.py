@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import api_endpoint
 from .pane_running import pane_shows_running
 from .utils.logger import log_ctx
 
@@ -2379,6 +2380,13 @@ class TmuxSessionManager:
         otel_attributes = _otel_resource_attributes(pane_path)
         if otel_attributes:
             cmd_parts.append(f"OTEL_RESOURCE_ATTRIBUTES='{otel_attributes}'")
+        # #258: where this bot's REST API is — the port actually bound, which
+        # need not be CLORD_API_PORT (the API walks past a taken default).
+        # Absent when no API is listening, so a curl fails loudly instead of
+        # reaching whatever else holds the port.
+        api_url = api_endpoint.current()
+        if api_url:
+            cmd_parts.append(f"CLORD_API_URL={shlex.quote(api_url)}")
         cmd_parts.append("claude")
         cmd_parts.extend(self._session_flags(pane_path, try_continue=try_continue))
         cmd_parts.extend(["--model", model])

@@ -417,7 +417,7 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 2. サーバに専用チャンネルを作成し、bot を招待(送信・スレッド権限)。チャンネルに Webhook を作成
 3. `git clone` で新ディレクトリ(例 `/home/yousan/c-lord-parallel-4`)を作成、`uv sync --dev`
 4. `.env` を**実ファイル**で作成(symlink 禁止 — #326)。必須: `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` /
-   **`EXPECTED_BOT_USER_ID`(新 bot の user id)** / `CLORD_API_PORT`(未使用ポート、#258 で自動化予定) /
+   **`EXPECTED_BOT_USER_ID`(新 bot の user id)** / `CLORD_API_PORT`(未使用ポート。書かなくても #258 で空きポートへずれて起動するが、フリートでは番号を固定して `port = 8087 + 2×N` に揃える) /
    **`CLORD_INSTANCE`(例 `staging-5`)** / `E2E_TEST_WEBHOOK_URL`
    - session dir は `SESSION_DIR_BASE` を書かなければ `~/.c-lord/<CLORD_INSTANCE>/sessions/` に作られる(#837)。
      `CLORD_INSTANCE` を書いておけば、あとで clone を改名しても置き場が変わらない(改名で `--resume` が切れない)

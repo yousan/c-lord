@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from .. import api_endpoint
 from ..log_sampler import LogSampler
 from .peer_uid import resolve_peer_uid
 
@@ -38,6 +39,11 @@ if TYPE_CHECKING:
     from ..database.task_repo import TaskRepository
 
 logger = logging.getLogger(__name__)
+
+# How many ports from the requested one an ``auto_port`` server tries before it
+# lets the OS pick (#258). Twenty covers a host full of c-lord clones while
+# keeping their ports next to each other, where a person looks for them.
+AUTO_PORT_TRIES = 20
 
 
 def _current_uid() -> int | None:
@@ -78,6 +84,7 @@ class ApiServer:
         show_url_embeds: bool = False,
         owner_uid: int | None = None,
         allow_any_peer: bool = False,
+        auto_port: bool = False,
     ) -> None:
         self.repo = repo
         self.bot = bot
@@ -88,6 +95,10 @@ class ApiServer:
         self.show_url_embeds = show_url_embeds
         self.host = host
         self.port = port
+        # #258: when the port was not chosen by anyone, a taken one is no
+        # reason to run without an API — walk to the next free one. A port the
+        # operator pinned is never walked past (their curl expects it there).
+        self.auto_port = auto_port
         self.api_secret = api_secret
         self.task_repo = task_repo
         self.lounge_repo = lounge_repo
@@ -224,8 +235,15 @@ class ApiServer:
         """Start the API server."""
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
-        await site.start()
+        try:
+            self.port = await self._bind()
+        except OSError:
+            await self._runner.cleanup()
+            self._runner = None
+            raise
+        # #258: Claude in each session is told this address — the port that was
+        # actually bound, which after a walk is not the one asked for.
+        api_endpoint.advertise(self.host, self.port)
         logger.info("REST API started: http://%s:%d", self.host, self.port)
         # #457: who may drive the control plane is never left implicit — an
         # opened gate says so at every start, not only in the docs.
@@ -255,8 +273,44 @@ class ApiServer:
         note = "or holding CLORD_API_SECRET" if self.api_secret else "no secret configured"
         return f"serving uid={self.owner_uid} only, {note}"
 
+    async def _bind(self) -> int:
+        """Listen on ``self.port`` — or, for ``auto_port``, the next free one (#258).
+
+        Returns the port actually bound. Raises the last ``OSError`` when no
+        port could be bound (always the case for a taken, operator-pinned port).
+        """
+        assert self._runner is not None
+        if not self.auto_port:
+            candidates = [self.port]
+        else:
+            # Then port 0: the OS picks one that is certainly free.
+            candidates = [self.port + i for i in range(AUTO_PORT_TRIES)] + [0]
+        error: OSError | None = None
+        for port in candidates:
+            site = web.TCPSite(self._runner, self.host, port)
+            try:
+                await site.start()
+            except OSError as exc:
+                error = exc
+                continue
+            bound = _bound_port(site) or port
+            if bound != self.port:
+                # INFO, not WARNING: a second instance on one host is the case
+                # this exists for, not a fault.
+                logger.info(
+                    "REST API: port %d on %s is taken — listening on %d instead. "
+                    "Set CLORD_API_PORT to pin a port (#258).",
+                    self.port,
+                    self.host,
+                    bound,
+                )
+            return bound
+        assert error is not None
+        raise error
+
     async def stop(self) -> None:
         """Stop the API server."""
+        api_endpoint.clear()
         if self._runner:
             await self._runner.cleanup()
 
@@ -993,3 +1047,14 @@ class ApiServer:
             color=color or 0x00BFFF,
             timestamp=datetime.now(),
         )
+
+
+def _bound_port(site: web.TCPSite) -> int | None:
+    """The port *site* is actually listening on (differs from the asked-for 0)."""
+    server = getattr(site, "_server", None)
+    sockets = getattr(server, "sockets", None) or ()
+    for sock in sockets:
+        name = sock.getsockname()
+        if isinstance(name, tuple) and len(name) >= 2:
+            return int(name[1])
+    return None
