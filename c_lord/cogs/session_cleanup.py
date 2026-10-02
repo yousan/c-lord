@@ -18,7 +18,6 @@ zero-config.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -43,7 +42,7 @@ DEFAULT_POST_DELAY_SECONDS = 1.0
 
 
 class SessionCleanupCog(commands.Cog):
-    """Posts the 「記録を整理しました」 notice into every swept thread."""
+    """Posts the 🧹 notice into every swept thread that is still open (#857)."""
 
     def __init__(self, bot: commands.Bot, *, days: int = 30) -> None:
         self.bot = bot
@@ -117,13 +116,35 @@ class SessionCleanupCog(commands.Cog):
         if not isinstance(thread, discord.abc.Messageable):
             logger.warning("%s cleanup notice skipped — not messageable (#554)", ctx)
             return
-        with contextlib.suppress(discord.HTTPException):
-            await thread.send(notice_for(record, survivors, days=self._days))
+        # #857: Discord un-archives a thread the moment anything is posted to it.
+        # A swept thread has been quiet for 30 days, so most are already closed —
+        # and posting there reopened 27 of them at once (2026-10-02). A closed
+        # thread is tidied in silence: the #818 tombstone answers whoever comes
+        # back to it. ``is True`` because only an explicit flag counts as closed.
+        if getattr(thread, "archived", False) is True:
             logger.info(
-                "%s cleanup notice posted (session_dir=%s transcript=%s)",
-                ctx,
-                survivors.session_dir,
-                survivors.transcript,
+                "%s cleanup: thread already archived — swept silently, no notice (#857)", ctx
             )
             return
-        logger.warning("%s cleanup notice failed to send (#554)", ctx)
+        try:
+            await thread.send(notice_for(record, survivors, days=self._days))
+        except discord.HTTPException:
+            logger.warning("%s cleanup notice failed to send (#554)", ctx)
+            return
+        # Leave the thread as closed as it would have been without us: an open
+        # one that has been quiet for 30 days is done with (#857).
+        try:
+            if isinstance(thread, discord.Thread):
+                await thread.edit(archived=True)
+        except discord.HTTPException:
+            logger.warning(
+                "%s cleanup notice posted but re-archiving failed — thread left open (#857)",
+                ctx,
+            )
+            return
+        logger.info(
+            "%s cleanup notice posted, thread archived (session_dir=%s transcript=%s)",
+            ctx,
+            survivors.session_dir,
+            survivors.transcript,
+        )

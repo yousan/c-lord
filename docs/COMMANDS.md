@@ -324,6 +324,15 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 
 (The "clone only" case — a checkout the sweep **kept because it held uncommitted work** — verbatim from `c_lord/session_cleanup.py::notice_for`.)
 
+**Only open threads get the notice, and they are closed again after it (#857).** Discord un-archives a thread the moment anything is posted to it, and a thread unused for 30 days is usually already closed — on 2026-10-02 the notice reopened 27 closed threads at once. So:
+
+| The thread when it is swept | What appears in Discord |
+|---|---|
+| already archived (closed) | **nothing** — it stays closed; the checkout is tidied and the tombstone recorded all the same. Posting there later gets the 「片付け済み」 answer above |
+| still open | the notice above, then the thread is archived |
+
+Each decision is one `[thread=<id>]` INFO line: `thread already archived — swept silently, no notice (#857)` or `cleanup notice posted, thread archived`.
+
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
 **What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `<session dir base>/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). The rule is `remove_clean_session_dir` (`c_lord/session_cleanup.py`), and every doubt resolves to *keep*:
