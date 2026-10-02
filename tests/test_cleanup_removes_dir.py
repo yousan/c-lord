@@ -99,9 +99,14 @@ class TestRemovesOnlyWhatIsSafe:
         that shallow is not one, whatever the row claims.
         """
         rec = SessionRecord(
-            thread_id=1, session_id="a" * 32, working_dir=bad, model="opus",
-            origin="discord", summary=None,
-            created_at="2026-01-01 00:00:00", last_used_at="2026-01-01 00:00:00",
+            thread_id=1,
+            session_id="a" * 32,
+            working_dir=bad,
+            model="opus",
+            origin="discord",
+            summary=None,
+            created_at="2026-01-01 00:00:00",
+            last_used_at="2026-01-01 00:00:00",
         )
         assert remove_clean_session_dir(rec) is DirOutcome.KEPT_UNSAFE
 
@@ -130,3 +135,42 @@ class TestPeriodFollowsClaudeCode:
         text = notice_for(_rec(None), Survivors(session_dir=False, transcript=False), days=30)
 
         assert "cleanupPeriodDays" in text
+
+
+class TestSweepFreesWindowNumber:
+    """#595: the 30-day sweep is the automatic delete — it frees the ``w{N}``.
+
+    Only when the checkout actually went: a sweep that kept uncommitted work
+    left the workspace in place, so the thread still holds its number.
+    """
+
+    def test_clean_checkout_releases_the_number(self, tmp_path: Path, monkeypatch) -> None:
+        from c_lord import session_cleanup
+
+        released: list[int] = []
+        monkeypatch.setattr(session_cleanup, "release_window_number", released.append)
+        _repo(tmp_path / "c-lord-sessions" / "1" / "2")
+
+        rec = _rec(tmp_path / "c-lord-sessions" / "1" / "2")
+        assert session_cleanup.retire_swept_workspace(rec) is DirOutcome.REMOVED
+        assert released == [1]
+
+    def test_missing_checkout_releases_the_number(self, tmp_path: Path, monkeypatch) -> None:
+        from c_lord import session_cleanup
+
+        released: list[int] = []
+        monkeypatch.setattr(session_cleanup, "release_window_number", released.append)
+
+        assert session_cleanup.retire_swept_workspace(_rec(None)) is DirOutcome.ABSENT
+        assert released == [1]
+
+    def test_dirty_checkout_keeps_the_number(self, tmp_path: Path, monkeypatch) -> None:
+        from c_lord import session_cleanup
+
+        released: list[int] = []
+        monkeypatch.setattr(session_cleanup, "release_window_number", released.append)
+        _repo(tmp_path / "c-lord-sessions" / "1" / "2", dirty=True)
+
+        rec = _rec(tmp_path / "c-lord-sessions" / "1" / "2")
+        assert session_cleanup.retire_swept_workspace(rec) is DirOutcome.KEPT_DIRTY
+        assert released == []

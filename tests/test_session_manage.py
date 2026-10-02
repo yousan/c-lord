@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
@@ -408,6 +408,25 @@ class TestCloseWorkspace:
         await cog.workspace_delete_text.callback(cog, ctx)
 
         mirror_cog.stop_for.assert_awaited_once_with(555)
+
+    async def test_workspace_delete_frees_the_window_number(self):
+        """#595: deletion — and only deletion — gives the thread's ``w{N}`` back."""
+        cog = _make_cog()
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(return_value=True)
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog.bot.get_cog = MagicMock(return_value=None)
+
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 555
+        thread.parent_id = 999
+        ctx = _make_ctx(channel=thread)
+
+        with patch("c_lord.cogs.session_manage.release_window_number") as release:
+            await cog.workspace_delete_text.callback(cog, ctx)
+
+        release.assert_called_once_with(555)
 
 
 class TestThreadArchiveCommand:
