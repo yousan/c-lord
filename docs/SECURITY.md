@@ -176,6 +176,11 @@ class ClaudeChatCog(commands.Cog):
   be configured for the bot to be usable *by you* and unusable by everyone else
   (#713). Until the bot has logged in and asked Discord, nobody passes.
 - `CLORD_ALLOW_ANYONE=1` restores "anyone in the server", with a startup warning
+- A refused message is never answered in the channel — the sender is not even
+  told a bot is reading. The application owner gets a DM instead (who, where,
+  first lines, link; once a day per person, in memory), and every refusal is
+  logged. The DM never names who *is* allowed. `CLORD_NOTIFY_DENIED=0` turns
+  the DM off (#346, `docs/specs/authorization-default.md`)
 - The same check applies to `SkillCommandCog`, `ChannelRepoCog` and
   `SessionManageCog` — they hold the same `Authorizer` instance rather than a
   copy of the rule. Every slash / text command goes through it except the
