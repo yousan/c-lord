@@ -44,7 +44,7 @@ from ..thread_settings import (
     VALID_DURATIONS,
     resolve_auto_archive_duration,
 )
-from ..tmux import parse_work_number
+from ..tmux import parse_work_number, release_window_number
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from ..workspace_notice import (
@@ -1358,6 +1358,10 @@ class SessionManageCog(commands.Cog):
                 results.append("✅ Tmux window deleted")
             else:
                 results.append("ℹ️ No tmux window found")
+
+        # #595: deletion is the one operation that frees the thread's ``w{N}``;
+        # sleep and stop keep it so the thread returns under the same number.
+        await asyncio.to_thread(release_window_number, thread_id)
 
         # Remove session directory
         sdm = await self._resolve_session_dir_manager(parent_channel_id)
