@@ -305,7 +305,7 @@ sqlite3 <data_dir>/sessions.db \
   "SELECT thread_id, session_id, working_dir, closed_at FROM sessions WHERE thread_id = <THREAD_ID>"
 ```
 
-A swept row is history, not a session: it is left out of `/clord-status`, the transcript mirror, and every periodic sweep, exactly as when the row was deleted. Posting into the thread later either reconnects to a checkout still on disk (#700) or — when nothing is left — answers with 「🧹 このスレッドは YYYY-MM-DD に**片付け済み**です … いま送ったメッセージは Claude に届いていません」 plus the next step, instead of dropping the message (a human-created thread with no other trace of c-lord used to get no answer at all). Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
+A swept row is history, not a session: it is left out of `/clord-status`, the transcript mirror, and every periodic sweep, exactly as when the row was deleted. Posting into the thread later either reconnects to a checkout still on disk (#700), or — when nothing is left but a repository binding still resolves — posts 「🧹 前の会話は残っていないので、新しい会話として始めます」, clones the session dir again and runs the message as the first turn of a **new** conversation in the same thread (#862; no `--continue`, and the first prompt notes that the thread's earlier exchange can be read with the `discord-read` skill). Only a thread with no binding at all still answers with 「🧹 このスレッドは YYYY-MM-DD に**片付け済み**です … いま送ったメッセージは Claude に届いていません」 plus the next step, instead of dropping the message (a human-created thread with no other trace of c-lord used to get no answer at all). Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
 
 > 古い C-lord セッションを続けようとしたところセッションが無い、って言われちゃった。消した覚えは無いはず。Discord 上にそういう事も書いてないし
 
@@ -328,7 +328,7 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 
 | The thread when it is swept | What appears in Discord |
 |---|---|
-| already archived (closed) | **nothing** — it stays closed; the checkout is tidied and the tombstone recorded all the same. Posting there later gets the 「片付け済み」 answer above |
+| already archived (closed) | **nothing** — it stays closed; the checkout is tidied and the tombstone recorded all the same. Posting there later starts a new conversation (#862), or gets the 「片付け済み」 answer above when no binding resolves |
 | still open | the notice above, then the thread is archived |
 
 Each decision is one `[thread=<id>]` INFO line: `thread already archived — swept silently, no notice (#857)` or `cleanup notice posted, thread archived`.
