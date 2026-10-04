@@ -111,9 +111,7 @@ def _make_cog(channel_cog, *, record=None, tmp_path=None):
     # default is owner-only, resolved from Discord at on_ready — which a
     # unit test never reaches — so the gate is opened explicitly here and
     # the rule itself is pinned in tests/test_default_authorization.py.
-    cog = ClaudeChatCog(
-        bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True)
-    )
+    cog = ClaudeChatCog(bot=bot, repo=repo, runner=runner, authorizer=Authorizer(allow_anyone=True))
     cog._run_claude = AsyncMock()  # type: ignore[method-assign]
     cog.spawn_session = AsyncMock()  # type: ignore[method-assign]
     if tmp_path is not None:
@@ -225,8 +223,12 @@ class TestFormerClordThreadIsOfferedRecovery:
 
         await _clord(cog, _thread(owner_id=BOT_ID), respond)
 
-        cog._run_claude.assert_not_awaited()
         assert "c-lord のスレッドではない" not in _said(respond), _said(respond)
+        # #862: nothing on disk, but the channel is bound — so it starts over
+        # here as a new conversation instead of refusing.
+        cog._run_claude.assert_awaited_once()
+        assert cog._run_claude.await_args.kwargs["session_id"] is None
+        assert "discord-read" in cog._run_claude.await_args.kwargs["prompt"]
 
 
 # ── branch 1 / AC5: live threads are untouched ───────────────────────────────
@@ -352,6 +354,8 @@ class TestGuidanceMatchesBehaviour:
         people to run the command it rejects."""
         from c_lord.session_resume import UNTRACKED_NOTICE, ThreadResume, stopped_hint
 
-        for text in (UNTRACKED_NOTICE, stopped_hint(ThreadResume.UNTRACKED)):
-            assert "このスレッドで新しく始める" not in text, text
-            assert "チャンネルで" in text, text
+        assert "このスレッドで新しく始める" not in UNTRACKED_NOTICE
+        assert "チャンネルで" in UNTRACKED_NOTICE
+        # #862: the stopped-workspace hint describes what a *message* does,
+        # and a message in a bound thread now starts over right here.
+        assert "新しい会話として始めます" in stopped_hint(ThreadResume.UNTRACKED)

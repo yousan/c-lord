@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .database.repository import SessionRecord, SessionRepository
 
 __all__ = [
+    "FRESH_START_NOTICE",
     "NOT_A_CLORD_THREAD",
     "NOT_A_CLORD_THREAD_BINDING",
     "UNTRACKED_NOTICE",
@@ -42,6 +43,7 @@ __all__ = [
     "ThreadResume",
     "accepts_message",
     "classify",
+    "fresh_start_preamble",
     "hint_for_thread",
     "is_clord_thread",
     "resume_notice",
@@ -59,7 +61,9 @@ class ThreadResume(Enum):
     #: A row exists but the user closed the session (#512) — the message is held
     #: and a 「▶️ 再開する」 notice is posted instead.
     CLOSED = "closed"
-    #: No row — nothing runs. Before #538 this was also completely silent.
+    #: No row. A checkout left on disk is reconnected (#700); otherwise a bound
+    #: thread starts a new conversation (#862), and only an unbound one runs
+    #: nothing. Before #538 this was also completely silent.
     UNTRACKED = "untracked"
 
 
@@ -139,6 +143,29 @@ def swept_notice(record: SessionRecord) -> str:
     )
 
 
+#: #862: what a thread with nothing left to reconnect to says before it starts
+#: over. The notices above refuse; this one is posted instead whenever the
+#: thread still has a repository binding — the session dir is cloned again and
+#: the message runs as the first turn of a new conversation. One line, because
+#: the only thing the reader needs to know is that the old conversation is gone.
+FRESH_START_NOTICE = "🧹 前の会話は残っていないので、新しい会話として始めます"
+
+
+def fresh_start_preamble(thread_id: int) -> str:
+    """The line prepended to the first prompt of a restarted thread — #862.
+
+    The new Claude remembers nothing, but the Discord thread still holds the
+    whole exchange. It is told that it *can* read it, not made to: reading 500
+    messages for 「サーバを再起動して」 would cost more than it earns, and
+    Claude is the one who can tell which request needs the history.
+    """
+    return (
+        "（c-lord より）このスレッドの以前の会話は残っていません。"
+        "必要なら discord-read skill でこのスレッドの過去のやり取りを読めます"
+        f"（thread_id: {thread_id}）。"
+    )
+
+
 #: Added to every message dropped this way. The notice is posted once per thread
 #: per process (it is a wall of text); the reaction is what keeps the 2nd, 3rd, …
 #: message from looking silently ignored again.
@@ -178,9 +205,14 @@ _HINTS = {
         "**メッセージを送ると「▶️ 再開する」ボタンが出ます**"
         "（`/reopen-workspace` でも再開できます）。"
     ),
+    # #862: a message here now starts over in the same thread rather than being
+    # refused, so the hint says that — the promise and the behaviour are kept in
+    # step, which is the whole of #538.
     ThreadResume.UNTRACKED: (
-        "ℹ️ このスレッドのワークスペースは停止していて、**メッセージを送っても復元できません**"
-        "（c-lord の記録が見つかりません）。\n" + _NEXT_STEPS
+        "ℹ️ このスレッドのワークスペースは停止していて、前の会話は残っていません"
+        "（c-lord の記録が見つかりません）。\n"
+        "**このスレッドにメッセージを送ると、新しい会話として始めます**"
+        "（前の会話は引き継ぎません）。"
     ),
 }
 

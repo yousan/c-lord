@@ -88,7 +88,7 @@ class TestStoppedHint:
         """The bug: this case used to get the 「送れば復元します」 wording."""
         text = stopped_hint(ThreadResume.UNTRACKED)
         assert "自動で復元" not in text
-        assert "/clord" in text  # …and names the next step instead
+        assert "新しい会話" in text  # …and says what a message does instead (#862)
 
     def test_closed_hint_points_at_the_reopen_path(self) -> None:
         text = stopped_hint(ThreadResume.CLOSED)

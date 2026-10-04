@@ -85,12 +85,14 @@ from ..session_reattach import (
     render_history,
 )
 from ..session_resume import (
+    FRESH_START_NOTICE,
     NOT_A_CLORD_THREAD,
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
     ThreadResume,
     accepts_message,
     classify,
+    fresh_start_preamble,
     is_clord_thread,
     resume_notice,
     stopped_hint,
@@ -1047,6 +1049,20 @@ class ClaudeChatCog(commands.Cog):
             logger.info("%s reattached on arrival — running the message (#700)", ctx)
             await self._handle_thread_reply(message)
             return
+        # #862: nothing to reconnect to, but the binding still says which repo
+        # this thread works in — so start over here instead of sending the
+        # reader off to open a new thread. Only an unbound thread, where there
+        # is nothing to clone, still gets the refusal below.
+        if await self._can_start_fresh(thread, parent_channel_id):
+            logger.info(
+                "%s nothing left to reconnect to — starting a new conversation here (#862)%s",
+                ctx,
+                f" — swept at {tomb.closed_at}" if tomb is not None else "",
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(FRESH_START_NOTICE)
+            await self._handle_thread_reply(message, fresh=True)
+            return
 
         logger.info(
             "%s message not run — nothing left to reconnect to (#538)%s",
@@ -1062,6 +1078,41 @@ class ClaudeChatCog(commands.Cog):
         self._untracked_notice_sent.add(thread.id)
         with contextlib.suppress(discord.HTTPException):
             await thread.send(swept_notice(tomb) if tomb is not None else UNTRACKED_NOTICE)
+
+    async def _can_start_fresh(self, thread: discord.Thread, parent_channel_id: int) -> bool:
+        """Whether a thread with nothing to reconnect to can start over — #862.
+
+        True when a repository binding (the thread's own or its channel's)
+        resolves, because that is what tells ``_run_claude`` what to clone. It
+        is the same precondition a brand-new thread has: without it there is
+        nothing to start, and the caller keeps the old notice.
+        """
+        try:
+            sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
+            tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+        except Exception:
+            logger.warning(
+                "%s binding lookup failed — not starting over",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            return False
+        return sdm is not None and tmux is not None
+
+    async def _close_leftover_window(self, thread: discord.Thread) -> None:
+        """Close ``thread``'s own tmux window before a fresh start — #862. Never raises."""
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        ctx = log_ctx(thread_id=thread.id)
+        try:
+            tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+            if tmux_manager is None:
+                return
+            if await asyncio.to_thread(tmux_manager.kill_session, thread.id):
+                logger.info("%s closed the leftover window before starting fresh (#862)", ctx)
+        except Exception:
+            # Worst case the turn lands in the old window — the pre-#862 risk,
+            # not a reason to drop the message.
+            logger.warning("%s could not close the leftover window (#862)", ctx, exc_info=True)
 
     async def _swept_record(self, thread_id: int) -> SessionRecord | None:
         """The 30-day sweep's tombstone for ``thread_id``, if there is one — #818.
@@ -1204,6 +1255,14 @@ class ClaudeChatCog(commands.Cog):
             return False
         if await self._auto_reattach(thread, parent_channel_id) is not None:
             logger.info("%s /clord: reattached, continuing (#551/#538/#700)", ctx)
+            return True
+        if await self._can_start_fresh(thread, parent_channel_id):
+            # #862: the same answer a plain message gets — start over here.
+            # The caller finds no row and runs the prompt with no session id,
+            # which is exactly a new thread's first turn.
+            logger.info("%s /clord: nothing to reconnect to — starting fresh (#862)", ctx)
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(FRESH_START_NOTICE)
             return True
         logger.info("%s /clord: nothing left to reconnect to (#538 AC8)", ctx)
         with contextlib.suppress(discord.HTTPException):
@@ -1418,6 +1477,13 @@ class ClaudeChatCog(commands.Cog):
             # Continue in existing thread. The row was read by the #551 branch
             # above, which only lets a thread through when it has one.
             session_id = (thread_record.session_id or None) if thread_record else None
+            # #862: no row even after the branch above means it started over —
+            # the first prompt carries the "history is in the thread" line.
+            claude_prompt = (
+                prompt
+                if thread_record is not None
+                else f"{fresh_start_preamble(channel.id)}\n\n{prompt}"
+            )
             try:
                 seed_message = await channel.send(prompt)
             except discord.Forbidden:
@@ -1433,7 +1499,7 @@ class ClaudeChatCog(commands.Cog):
             # #520: the seed message above is ours, so hand the invoker down
             # explicitly — otherwise the turn would ping and credit the bot.
             await self._run_claude(
-                seed_message, channel, prompt=prompt, session_id=session_id, requester=user
+                seed_message, channel, prompt=claude_prompt, session_id=session_id, requester=user
             )
             await respond("Session completed.", silent=True)
         else:
@@ -2887,9 +2953,18 @@ class ClaudeChatCog(commands.Cog):
             await run_startup_recovery(self.bot, self.repo, self._ask_repo)
 
     async def _handle_thread_reply(
-        self, message: discord.Message, *, earlier: Sequence[discord.Message] = ()
+        self,
+        message: discord.Message,
+        *,
+        earlier: Sequence[discord.Message] = (),
+        fresh: bool = False,
     ) -> None:
         """Continue a Claude Code session in an existing thread.
+
+        ``fresh`` (#862) starts a new conversation instead: the thread had
+        nothing left to reconnect to, so there is no session to continue. It
+        forbids ``--continue``/``--resume`` outright and prepends
+        :func:`~c_lord.session_resume.fresh_start_preamble` to this one prompt.
 
         ``earlier`` (#745) carries messages that reached this thread before
         *message* while the gateway was down. They run in this same turn —
@@ -2943,9 +3018,11 @@ class ClaudeChatCog(commands.Cog):
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             record = await self.repo.get(thread.id)
-            session_id = (record.session_id or None) if record else None
+            session_id = (record.session_id or None) if record and not fresh else None
             prompt, image_paths = await self._build_prompt_and_images(message)
             prompt = await enrich_discord_references(prompt, message, self.bot)
+            if fresh:
+                prompt = f"{fresh_start_preamble(thread.id)}\n\n{prompt}"
             if earlier:
                 prompt = merge_missed_prompt(
                     [
@@ -2986,6 +3063,13 @@ class ClaudeChatCog(commands.Cog):
             # This extends the --continue fallback (previously only on the
             # restart-resume path, #123 Part 2) to the ordinary reply path.
             try_continue = False
+            if fresh:
+                # #862: the sweep tidies the checkout, not the tmux window. A
+                # window still holding the old Claude would take this prompt as
+                # the next turn of the conversation we are starting over from —
+                # in a directory that no longer exists. It is this thread's own
+                # window, so closing it touches nobody else.
+                await self._close_leftover_window(thread)
             if session_id is not None and not had_active:
                 parent_channel_id = getattr(thread, "parent_id", None) or thread.id
                 tmux_manager = await self._resolve_tmux_manager(
