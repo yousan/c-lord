@@ -100,8 +100,9 @@ def _cog(tmp_path: Path, *, tomb: SessionRecord | None, bound: bool = True):
     cog._resolve_session_dir_manager = AsyncMock(  # type: ignore[method-assign]
         return_value=sdm if bound else None
     )
+    tmux = MagicMock()
     cog._resolve_tmux_manager = AsyncMock(  # type: ignore[method-assign]
-        return_value=MagicMock() if bound else None
+        return_value=tmux if bound else None
     )
     cog._thread_binding_exists = AsyncMock(return_value=False)  # type: ignore[method-assign]
     cog._projects_root = tmp_path / "projects"
@@ -170,6 +171,19 @@ class TestSweptThreadStartsFresh:
         kwargs = cog._run_claude.await_args.kwargs
         assert kwargs["session_id"] is None
         assert kwargs["try_continue"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_leftover_window_is_closed_before_starting(self, tmp_path) -> None:
+        """AC3: スイープは tmux の窓までは閉じない。古い Claude が窓に残っていたら、
+        そこへ打ち込むのは前の会話の続き（しかも消えたディレクトリの中）になる。"""
+        cog = _cog(tmp_path, tomb=_tomb())
+        tmux = await cog._resolve_tmux_manager(CHANNEL_ID, thread_id=THREAD_ID)
+        thread = _thread()
+
+        await cog._handle_untracked_thread(_message(thread), thread)
+        await _drain(cog)
+
+        tmux.kill_session.assert_called_once_with(THREAD_ID)
 
     @pytest.mark.asyncio
     async def test_first_prompt_mentions_discord_read(self, tmp_path) -> None:

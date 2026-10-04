@@ -1099,6 +1099,21 @@ class ClaudeChatCog(commands.Cog):
             return False
         return sdm is not None and tmux is not None
 
+    async def _close_leftover_window(self, thread: discord.Thread) -> None:
+        """Close ``thread``'s own tmux window before a fresh start — #862. Never raises."""
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        ctx = log_ctx(thread_id=thread.id)
+        try:
+            tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+            if tmux_manager is None:
+                return
+            if await asyncio.to_thread(tmux_manager.kill_session, thread.id):
+                logger.info("%s closed the leftover window before starting fresh (#862)", ctx)
+        except Exception:
+            # Worst case the turn lands in the old window — the pre-#862 risk,
+            # not a reason to drop the message.
+            logger.warning("%s could not close the leftover window (#862)", ctx, exc_info=True)
+
     async def _swept_record(self, thread_id: int) -> SessionRecord | None:
         """The 30-day sweep's tombstone for ``thread_id``, if there is one — #818.
 
@@ -3048,6 +3063,13 @@ class ClaudeChatCog(commands.Cog):
             # This extends the --continue fallback (previously only on the
             # restart-resume path, #123 Part 2) to the ordinary reply path.
             try_continue = False
+            if fresh:
+                # #862: the sweep tidies the checkout, not the tmux window. A
+                # window still holding the old Claude would take this prompt as
+                # the next turn of the conversation we are starting over from —
+                # in a directory that no longer exists. It is this thread's own
+                # window, so closing it touches nobody else.
+                await self._close_leftover_window(thread)
             if session_id is not None and not had_active:
                 parent_channel_id = getattr(thread, "parent_id", None) or thread.id
                 tmux_manager = await self._resolve_tmux_manager(
