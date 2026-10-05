@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 import discord
 
 from . import topic as topic_module
-from .thread_name import replace_topic_in_name
+from .thread_name import note_own_rename, replace_topic_in_name
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -138,6 +138,7 @@ async def rename_thread_topic(
         return f"ℹ️ 要約は同じでした（`{_safe(current)}`）。名前は変えていません。"
 
     try:
+        note_own_rename(thread.id, new_name)  # #856: not a manual rename
         await asyncio.wait_for(thread.edit(name=new_name), timeout=RENAME_TIMEOUT_SECONDS)
     except discord.Forbidden:
         logger.warning("%s /thread-rename forbidden (no Manage Threads)", ctx)

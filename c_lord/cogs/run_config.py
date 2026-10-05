@@ -8,6 +8,7 @@ added without changing every caller).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -135,6 +136,11 @@ class RunConfig:
     # dispatched turn is dead (see :mod:`c_lord.notify_policy`). ``None`` ⇒ no
     # one to ping ⇒ the ❌ embed is posted with no content, as before.
     failure_notify_id: int | None = None
+    # #856: awaited with the thread id right after the turn first saves the
+    # session row, so whatever was waiting for the row to exist (the naming
+    # pass's topic and origin number) is persisted *now* — not on a next turn
+    # that a one-turn dispatch thread never has. ``None`` ⇒ nothing waits.
+    on_session_saved: Callable[[int], Awaitable[None]] | None = None
 
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is

@@ -50,7 +50,7 @@ from .menu_ledger import (
 from .notify_policy import owner_notify_id
 from .pane_running import pane_shows_running
 from .session_close import is_closed
-from .thread_name import build_name
+from .thread_name import build_name, note_own_rename
 from .tmux import parse_work_number
 from .utils.logger import log_ctx
 
@@ -538,6 +538,7 @@ class ThreadStateSyncLoop:
             return
 
         try:
+            note_own_rename(thread_id, new_name)  # #856: not a manual rename
             await asyncio.wait_for(channel.edit(name=new_name), timeout=_RENAME_TIMEOUT_SECONDS)
             logger.info(
                 "state-sync: renamed thread %d → %r (state=%s)",
