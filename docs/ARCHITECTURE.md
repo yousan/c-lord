@@ -86,7 +86,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
 
 | Module | Class/Function | Role |
 |--------|---------------|------|
-| `tmux.py` | `TmuxSessionManager` | One tmux session per repo, one window per thread (`create_session`). `start_claude` launches `claude --session-id <uuid>` (or `--resume <claimed uuid>`) with secrets `env -u`'d (#353/#773); `send_input` types the prompt with a zero-width-space marker (#71). |
+| `tmux.py` | `TmuxSessionManager` | One tmux session per repo, one window per thread (`create_session`). `start_claude` launches `claude --session-id <uuid>` (or `--resume <claimed uuid>`) with secrets `env -u`'d (#353/#773); `send_input` types the prompt as it is — a leading `/`/`!` gets one space so it stays text, and no invisible marker (#861). |
 | `transcript/claim.py` | — | Records the uuid c-lord gave the session in `<project_dir>/.clord-session`, so the mirror knows which jsonl belongs to the thread (#773). |
 | `transcript/mirror.py` | — | Tails that jsonl and turns assistant entries into posts; `cogs/transcript_mirror.py` sends them, split by `discord_ui/reply_chunker.py`. |
 
@@ -139,7 +139,7 @@ c-lord is a thin UI layer that bridges Discord messages to the Claude Code CLI. 
    │     tmux.start_claude → send-keys `claude --session-id <uuid> … -- <prompt>`
    │     (uuid recorded in .clord-session, #773; secrets env -u'd, #353)
    ├── claude already resident:
-   │     tmux.send_input → send-keys the prompt (+ ZWSP marker, #71)
+   │     tmux.send_input → send-keys the prompt (no marker, #861)
    ├── poll capture-pane (turn end / menus / blocking prompts only)
    │
 7. Events yielded by the runner (these two kinds only — #723):

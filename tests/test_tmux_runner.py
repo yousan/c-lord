@@ -1138,7 +1138,7 @@ class TestTmuxClaudeRunnerRun:
             async for event in runner.run("follow up"):
                 events.append(event)
 
-        tmux_manager.send_input.assert_called_once_with(12345, "follow up")
+        tmux_manager.send_input.assert_called_once_with(12345, "follow up", as_command=False)
         tmux_manager.start_claude.assert_not_called()
 
     @pytest.mark.asyncio

@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from c_lord.claude.tmux_runner import TmuxClaudeRunner
-from c_lord.transcript.formatter import ZWSP_MARKER
 from tests.test_coldstart_echo import _mgr, _staged, _typed_command
 
 
@@ -39,9 +38,9 @@ def test_a_command_prompt_is_handed_over_unmarked() -> None:
     assert _staged(_start("/copywriting hello", as_command=True)) == "/copywriting hello"
 
 
-def test_an_ordinary_prompt_keeps_the_marker() -> None:
-    """#530 is untouched: only an explicit command skips the marker."""
-    assert _staged(_start("/not a command")) == f"{ZWSP_MARKER}/not a command"
+def test_an_ordinary_prompt_starting_with_a_slash_stays_text() -> None:
+    """#861: only an explicit command runs as one; the rest is shielded."""
+    assert _staged(_start("/not a command")) == " /not a command"
 
 
 @pytest.mark.parametrize("slash_command", [True, False])
