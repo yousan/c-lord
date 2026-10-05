@@ -40,8 +40,9 @@ Design (a false positive here swallows a real message, so it is deliberately
 conservative — see also :mod:`c_lord.discord_ui.bridged_context`, the same
 pattern for the pre-menu prose):
 
-- matching is **exact** after normalization (all whitespace and any stray ZWSP
-  removed), never fuzzy or containment. The two copies come from the same
+- matching is **exact** after normalization (all whitespace, any stray ZWSP and
+  the CLI's ``<pasted_content id=…>`` wrapper removed), never fuzzy or
+  containment. The two copies come from the same
   string, so nothing weaker is needed, and anything weaker would start
   swallowing human pane input that merely *quotes* an answer;
 - there is deliberately **no minimum length**: menu answers are routinely two
@@ -60,6 +61,7 @@ pattern for the pre-menu prose):
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 logger = logging.getLogger(__name__)
@@ -79,9 +81,20 @@ PROMPT_TTL_SECONDS = 6 * 3600.0
 _MAX_PER_THREAD = 32
 
 
+# #808 (reopened): Claude Code folds input of ~800+ characters into a
+# ``[Pasted text #N]`` placeholder and writes it to the transcript wrapped as
+# ``<pasted_content id="666f">…</pasted_content id="666f">`` (2.1.283, measured).
+# The wrapper is the CLI's, not the user's, so it is dropped before comparing —
+# from both copies, so a message that merely quotes the tag still matches itself.
+# Part of the text may follow the closing tag (a split paste), which dropping the
+# tags rather than extracting their contents also covers.
+_PASTED_CONTENT_TAG_RE = re.compile(r'</?pasted_content id="[^"<>]*">')
+
+
 def _normalize(text: str) -> str:
     from .formatter import ZWSP_MARKER
 
+    text = _PASTED_CONTENT_TAG_RE.sub("", text)
     return "".join(text.split()).replace(ZWSP_MARKER, "")
 
 
