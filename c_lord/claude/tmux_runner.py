@@ -811,6 +811,48 @@ def _unknown_prompt_signature(text: str) -> str:
 # Regex for separator lines (all box-drawing horizontal characters).
 _SEPARATOR_RE = re.compile(r"^[─━═─\s]{10,}$")
 
+# A horizontal rule that frames the input box.  Stricter than ``_SEPARATOR_RE``,
+# which also matches a row of 10+ plain spaces — a blank row must not pass for
+# one edge of the box.
+_INPUT_BOX_RULE_RE = re.compile(r"^\s*[─━═]{4,}\s*$")
+
+
+def _input_box_rows(lines: list[str]) -> set[int]:
+    """Indices of the live input box's text rows in *lines* (#858).
+
+    Claude Code draws the box as a ``❯ <text>`` row (wrapped text continues on
+    the rows below it) between two horizontal rules, with the status rows under
+    the lower rule::
+
+        ────────────────
+        ❯ 8.33 に戻して確かめて
+        ────────────────
+           Model: Opus 5.5  v2.1.283 ...
+
+    Whatever sits in the box — a suggestion from the CLI, or text the user left
+    unsent — is not part of any menu, yet ``❯ 8.33 …`` has exactly the shape of
+    a ``❯ 1.`` menu cursor.  Only the last framed block whose first row starts
+    with ``❯`` counts: menus are not drawn between two rules, so the numbered
+    cursor of a real menu is never inside it.  Returns an empty set when the
+    pane shows no box (a menu is open instead, or the top rule scrolled off).
+    """
+    plain = [_ANSI_CSI_RE.sub("", line) for line in lines]
+    rules = [i for i, line in enumerate(plain) if _INPUT_BOX_RULE_RE.match(line)]
+    for top, bottom in reversed(list(zip(rules, rules[1:], strict=False))):
+        if bottom - top > 1 and plain[top + 1].lstrip().startswith("❯"):
+            return set(range(top + 1, bottom))
+    return set()
+
+
+def _blank_input_box(text: str) -> str:
+    """*text* with the input box rows emptied, every other row in place (#858)."""
+    lines = text.splitlines()
+    box = _input_box_rows(lines)
+    if not box:
+        return text
+    return "\n".join("" if i in box else line for i, line in enumerate(lines))
+
+
 # -- AskUserQuestion TUI menu parsing (#166) ----------------------------------
 # The AskUserQuestion tool renders a numbered menu in the pane that c-lord
 # bridges to Discord buttons.  Recent Claude Code (v2.1.150) appends two
@@ -3052,7 +3094,10 @@ class TmuxClaudeRunner:
         """
         if not text:
             return False
-        zone = _permission_zone(text)
+        # #858: the input box is not a menu, whatever is written in it.  Blank
+        # it on the whole pane (not the zone) so a tall box whose top rule sits
+        # above the zone is still recognised.
+        zone = _permission_zone(_blank_input_box(text))
         has_menu = bool(_INTERACTIVE_MENU_RE.search(zone)) or bool(_YN_PROMPT_RE.search(zone))
         if not has_menu:
             # #695: an unnumbered menu has to be judged on its own terms.  The
@@ -3652,13 +3697,17 @@ class TmuxClaudeRunner:
         ~6–8 lines tall, so a 6-line window misses the box entirely (#62).
         """
         lines = text.rstrip().splitlines()
-        for line in lines[-_INPUT_PROMPT_SCAN_LINES:]:
-            stripped_line = line.strip()
+        # #858: inside the framed box a ``❯\xa08.33 …`` row is the box, not a
+        # numbered-menu cursor, so the menu exclusion below does not apply.
+        box = _input_box_rows(lines)
+        start = max(0, len(lines) - _INPUT_PROMPT_SCAN_LINES)
+        for i in range(start, len(lines)):
+            stripped_line = lines[i].strip()
             if stripped_line in ("❯", ">"):
                 return True
-            if (
-                stripped_line.startswith("❯\xa0") or stripped_line.startswith(">\xa0")
-            ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
+            if (stripped_line.startswith("❯\xa0") or stripped_line.startswith(">\xa0")) and (
+                i in box or not _INTERACTIVE_MENU_RE.match(stripped_line)
+            ):
                 return True
         return False
 
