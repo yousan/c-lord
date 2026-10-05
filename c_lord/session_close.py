@@ -34,7 +34,14 @@ from typing import TYPE_CHECKING
 import discord
 
 from .discord_ui.embeds import COLOR_INFO
-from .thread_name import CLOSED_MARK, build_name, parse_topic_from_name, thread_lamp_enabled
+from .thread_name import (
+    CLOSED_MARK,
+    build_name,
+    note_own_rename,
+    parse_origin_ref_from_name,
+    parse_topic_from_name,
+    thread_lamp_enabled,
+)
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -128,12 +135,17 @@ def _name_parts(
     opened for, which is precisely when a stopped thread most needs to stay
     findable in the archived list.
     """
+    name = thread.name if isinstance(thread.name, str) else ""
     topic = record.topic if record else None
     if not topic:
-        name = thread.name if isinstance(thread.name, str) else ""
         topic = parse_topic_from_name(name)
     issue_ref = record.issue_ref if record else None
     origin_issue_ref = record.origin_issue_ref if record else None
+    if not origin_issue_ref and not issue_ref:
+        # #856: the name may be the only place the thread's number survives
+        # (``W13 │ #812 と…`` with nothing persisted). Rebuilding without it is
+        # how stopped threads came out as ``[停止] と #815 を直してくださ…``.
+        origin_issue_ref = parse_origin_ref_from_name(name)
     return topic or _FALLBACK_TOPIC, issue_ref, origin_issue_ref
 
 
@@ -148,6 +160,8 @@ async def _edit(thread: discord.Thread, *, archived: bool, name: str | None = No
     """
     label = f"archived={archived}" + (f" name={name!r}" if name is not None else "")
     try:
+        if name is not None:
+            note_own_rename(thread.id, name)  # #856: not a manual rename
         coro = (
             thread.edit(archived=archived)
             if name is None

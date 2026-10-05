@@ -291,6 +291,22 @@ class SessionRepository:
             )
             await db.commit()
 
+    async def set_origin_issue_ref(self, thread_id: int, origin_issue_ref: str) -> None:
+        """Seed ``origin_issue_ref`` (#593) without touching ``issue_ref`` (#856).
+
+        For a number read off the thread's **name** (``#812 と…``, ``W5 │ #769 …``):
+        it says what the thread was opened for, not what it is working on now, so
+        it must not move ``issue_ref``. Write-once like :meth:`set_issue_ref` —
+        an origin already recorded is never replaced.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+                " WHERE thread_id = ?",
+                (origin_issue_ref, thread_id),
+            )
+            await db.commit()
+
     async def set_closed(self, thread_id: int, closed: bool, *, reason: str = "manual") -> None:
         """Mark the workspace stopped (停止) or reopen it (#512, #574).
 
