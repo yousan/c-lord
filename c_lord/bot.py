@@ -293,7 +293,19 @@ class ClaudeDiscordBot(commands.Bot):
         if record is None:
             return  # not a c-lord thread
 
-        from .thread_name import parse_topic_from_name
+        from .thread_name import (
+            consume_own_rename,
+            parse_origin_ref_from_name,
+            parse_topic_from_name,
+        )
+
+        # #856: a rename c-lord itself just sent is never a manual one — whatever
+        # its body parses to. Deciding that by comparing the body with the stored
+        # topic misfired whenever the two differed for c-lord's own reasons (no
+        # topic persisted yet, a leading ``#812`` the parser strips): its own
+        # ``W13 │`` and ``[停止]`` renames were saved as manual and locked.
+        if consume_own_rename(after.id, after.name):
+            return
 
         body = parse_topic_from_name(after.name)
         if not body:
@@ -307,6 +319,12 @@ class ClaudeDiscordBot(commands.Bot):
         try:
             await session_repo.set_topic(after.id, body, source="manual")
             await session_repo.lock_topic(after.id)
+            # #856: the parser strips a leading ``#812`` as decoration; when the
+            # thread has no origin yet, that number is what the human named it
+            # for, so keep it rather than lose it with the strip.
+            name_ref = parse_origin_ref_from_name(after.name)
+            if name_ref and not record.origin_issue_ref:
+                await session_repo.set_origin_issue_ref(after.id, name_ref)
             logger.info("Manual rename detected for thread %d: topic=%r (locked)", after.id, body)
         except Exception:
             logger.warning(

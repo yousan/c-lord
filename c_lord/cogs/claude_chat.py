@@ -389,6 +389,9 @@ class ClaudeChatCog(commands.Cog):
         # Issue #414: issue/PR number resolved before the session row exists;
         # drained by _apply_thread_naming on the next call once the row is saved.
         self._pending_issue_ref: dict[int, str] = {}
+        # #856: the number the thread's own name leads with (``#812 と…``) — its
+        # origin — when it was read before the row existed. Same drain as above.
+        self._pending_origin_ref: dict[int, str] = {}
         # #512: thread ids reopened since the last turn. Consumed once, to swap the
         # #464 crash-recovery wording ("前回のセッションが落ちていたので…") for the
         # deliberate-reopen wording — a user who closed the session on purpose is
@@ -648,7 +651,12 @@ class ClaudeChatCog(commands.Cog):
         All errors are swallowed by the caller; this helper raises only
         on truly unexpected programmer mistakes.
         """
-        from ..thread_name import build_name, parse_topic_from_name
+        from ..thread_name import (
+            build_name,
+            note_own_rename,
+            parse_origin_ref_from_name,
+            parse_topic_from_name,
+        )
 
         record = await self.repo.get(thread.id)
         topic = record.topic if record else None
@@ -669,18 +677,10 @@ class ClaudeChatCog(commands.Cog):
         # Drain any topic / issue-ref / window-id pending from a previous call
         # where the session row did not yet exist.
         if record is not None:
-            pending = self._pending_topic.pop(thread.id, None)
-            if pending and not record.topic and not locked:
-                await self.repo.set_topic(thread.id, pending[0], source=pending[1])
-                topic = pending[0]
-            pending_ref = self._pending_issue_ref.pop(thread.id, None)
-            if pending_ref and not record.issue_ref:
-                await self.repo.set_issue_ref(thread.id, pending_ref)
-                issue_ref = pending_ref
-                origin_issue_ref = origin_issue_ref or pending_ref
-            pending_win = self._pending_tmux_window_id.pop(thread.id, None)
-            if pending_win and record.tmux_window_id != pending_win:
-                await self.repo.set_tmux_window_id(thread.id, pending_win)
+            drained = await self._drain_pending_naming(thread.id, record)
+            topic = drained.get("topic", topic)
+            issue_ref = drained.get("issue_ref", issue_ref)
+            origin_issue_ref = drained.get("origin_issue_ref", origin_issue_ref)
 
         # Resolve tmux window-id / work-number (the stable w{N} number).
         info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
@@ -717,6 +717,18 @@ class ClaudeChatCog(commands.Cog):
         # for costs them that. ``CLORD_AUTO_TOPIC=1`` restores the LLM naming,
         # and ``/thread-rename`` summarises on demand at any time.
         if not topic and not locked:
+            # #856: the topic below is recovered from the name with its leading
+            # ``#NNN`` stripped off as decoration — so that number is the
+            # thread's origin and must be kept here, or no rebuild can put it
+            # back (``#769 → #718 …`` became ``#718 → #718 …`` once the branch
+            # moved to ``fix/718``; a stop rendered ``[停止] と #815 …``).
+            name_ref = parse_origin_ref_from_name(thread.name or "")
+            if name_ref and not origin_issue_ref:
+                origin_issue_ref = name_ref
+                if record is not None:
+                    await self.repo.set_origin_issue_ref(thread.id, name_ref)
+                else:
+                    self._pending_origin_ref[thread.id] = name_ref
             if not self._auto_topic:
                 topic = topic_module.initial_topic(thread.name or "", first_message or "")
                 source = "thread_name"
@@ -777,6 +789,8 @@ class ClaudeChatCog(commands.Cog):
         )
         if (thread.name or "") == new_name:
             return
+        # #856: so the echo of this edit is not recorded as a manual rename.
+        note_own_rename(thread.id, new_name)
         try:
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
             logger.info(
@@ -817,6 +831,72 @@ class ClaudeChatCog(commands.Cog):
                         "-# スレッド名を自動更新できませんでした"
                         "（bot に「スレッドの管理 / Manage Threads」権限が必要）"
                     )
+
+    async def _drain_pending_naming(self, thread_id: int, record: SessionRecord) -> dict[str, str]:
+        """Persist what a naming pass stashed before ``record``'s row existed.
+
+        Returns the values it wrote (keys ``topic`` / ``issue_ref`` /
+        ``origin_issue_ref``) so a naming pass in progress can use them.
+
+        The origin goes first: :meth:`SessionRepository.set_issue_ref` seeds the
+        origin from the current number when none is recorded, and the number the
+        name led with (#856) must win that race.
+        """
+        written: dict[str, str] = {}
+        pending_origin = self._pending_origin_ref.pop(thread_id, None)
+        if pending_origin and not record.origin_issue_ref:
+            await self.repo.set_origin_issue_ref(thread_id, pending_origin)
+            written["origin_issue_ref"] = pending_origin
+        pending = self._pending_topic.pop(thread_id, None)
+        if pending and not record.topic and not record.auto_topic_locked:
+            await self.repo.set_topic(thread_id, pending[0], source=pending[1])
+            written["topic"] = pending[0]
+        pending_ref = self._pending_issue_ref.pop(thread_id, None)
+        if pending_ref and not record.issue_ref:
+            await self.repo.set_issue_ref(thread_id, pending_ref)
+            written["issue_ref"] = pending_ref
+            written.setdefault("origin_issue_ref", record.origin_issue_ref or pending_ref)
+        pending_win = self._pending_tmux_window_id.pop(thread_id, None)
+        if pending_win and record.tmux_window_id != pending_win:
+            await self.repo.set_tmux_window_id(thread_id, pending_win)
+        return written
+
+    async def on_session_saved(self, thread_id: int) -> None:
+        """The turn just saved ``thread_id``'s row — persist the naming stash (#856).
+
+        The first naming pass runs before the row exists, so what it works out
+        (topic, the ``#812`` the thread was opened for) can only be stashed in
+        memory. That stash used to be drained by the *next* naming pass — which a
+        dispatch thread (one long turn, then ``/workspace-stop``) never reaches,
+        and which a restart wipes. 23 stopped threads lost their number that way
+        in five days. Writing it here, right after the save, closes the window.
+
+        Never raises: naming is decoration and must not break the turn.
+        """
+        if not (
+            thread_id in self._pending_topic
+            or thread_id in self._pending_issue_ref
+            or thread_id in self._pending_origin_ref
+            or thread_id in self._pending_tmux_window_id
+        ):
+            return
+        try:
+            record = await self.repo.get(thread_id)
+            if record is None:
+                return
+            written = await self._drain_pending_naming(thread_id, record)
+            if written:
+                logger.info(
+                    "%s naming persisted on session save (#856): %s",
+                    log_ctx(thread_id=thread_id),
+                    written,
+                )
+        except Exception:
+            logger.warning(
+                "%s could not persist the pending thread naming",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
 
     async def _detect_issue_ref(
         self,
@@ -4139,6 +4219,9 @@ class ClaudeChatCog(commands.Cog):
                 # #681: who hears about a turn that ended in an error. The ❌
                 # embed carries the cause; this is what makes it push.
                 failure_notify_id=failure_notify_id,
+                # #856: persist the naming pass's stash the moment the row
+                # exists, not on a next naming pass that may never come.
+                on_session_saved=self.on_session_saved,
             )
             try:
                 await run_claude_with_config(run_config)
