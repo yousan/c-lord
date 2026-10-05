@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 
 STATUS_EMOJI: dict[str, str] = {
     "running": "🟢",  # Claude is executing
@@ -329,6 +330,66 @@ def parse_topic_from_name(name: str) -> str:
     body = _TRAILING_CUR_REF_RE.sub("", body)
     body = _TRAILING_INDEX_RE.sub("", body)
     return body.strip()
+
+
+def parse_origin_ref_from_name(name: str) -> str | None:
+    """Return the leading ``#<digits>`` of ``name`` — the thread's origin (#856).
+
+    :func:`parse_topic_from_name` strips that token as decoration, which is right
+    for the *topic*: ``build_name`` writes it back from ``origin_issue_ref``. But
+    whenever a topic is recovered from a name, the number has to be recovered with
+    it, or the next rebuild has nothing to write back. That is how a dispatch
+    thread opened as ``#812 と #815 を直して…`` was stopped as
+    ``[停止] と #815 を直してくださ…``.
+
+    The token is read from the same position the builder writes it (after the
+    status emoji, ``[停止]`` marker and ``<session>:W<N> │`` prefix), so a name a
+    human opened with ``#812 …`` and a name c-lord built as ``W13 │ #812 …`` both
+    yield ``"812"``. A number further into the name is part of the topic and is
+    never taken. Returns ``None`` when the name does not lead with one.
+    """
+    body = _LEADING_EMOJI_RE.sub("", name or "")
+    body = _CLOSED_PREFIX_RE.sub("", body)
+    body = _WORK_PREFIX_RE.sub("", body)
+    match = re.match(r"#(\d{1,7})(?=\s|$)", body)
+    return match.group(1) if match else None
+
+
+#: How long a rename c-lord sent is remembered as its own (#856). Discord echoes
+#: an edit back as ``on_thread_update`` within seconds; the margin covers a slow
+#: gateway without letting a stale entry swallow a later human rename for long.
+_OWN_RENAME_TTL_SECONDS = 600.0
+
+#: Names c-lord itself has just written, per thread (#856).
+_OWN_RENAMES: dict[int, dict[str, float]] = {}
+
+
+def note_own_rename(thread_id: int, name: str) -> None:
+    """Remember that c-lord is about to rename ``thread_id`` to ``name`` (#856).
+
+    Every rename path calls this right before ``thread.edit(name=…)``, so the
+    ``on_thread_update`` echo of that edit is recognised as c-lord's own and not
+    recorded as a manual rename. Without it, the echo was compared against the
+    stored topic — and whenever the two differed (no topic persisted yet, a topic
+    parsed differently) c-lord's own ``W13 │`` or ``[停止]`` rename was saved as
+    ``topic_source='manual'`` and **locked**, 34 times in five days.
+    """
+    now = time.monotonic()
+    names = _OWN_RENAMES.setdefault(thread_id, {})
+    for stale in [n for n, t in names.items() if now - t > _OWN_RENAME_TTL_SECONDS]:
+        del names[stale]
+    names[name.strip()] = now
+
+
+def consume_own_rename(thread_id: int, name: str) -> bool:
+    """True (once) when ``name`` is a rename c-lord itself just sent (#856)."""
+    names = _OWN_RENAMES.get(thread_id)
+    if not names:
+        return False
+    sent = names.pop((name or "").strip(), None)
+    if not names:
+        _OWN_RENAMES.pop(thread_id, None)
+    return sent is not None and time.monotonic() - sent <= _OWN_RENAME_TTL_SECONDS
 
 
 def topic_auto_enabled(explicit: bool | None = None) -> bool:
