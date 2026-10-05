@@ -64,19 +64,23 @@ def _staged(cmd: str) -> str:
         path.unlink(missing_ok=True)
 
 
-def test_cold_start_prompt_is_marked_as_clord_originated() -> None:
+def test_cold_start_prompt_is_recorded_as_clord_originated() -> None:
+    """#861 dropped the marker; the echo is recognised by ``pane_echo`` (#808)."""
+    from c_lord.transcript.pane_echo import pane_echo
+
+    pane_echo.clear()
     cmd = _start("最初のメッセージ")
-    assert _staged(cmd) == f"{ZWSP_MARKER}最初のメッセージ", (
-        "start_claude must mark its prompt the way send_input does (#530)"
+    assert _staged(cmd) == "最初のメッセージ"
+    assert pane_echo.consume_match(12345, "最初のメッセージ"), (
+        "start_claude must record its prompt the way send_input does (#530/#808)"
     )
 
 
-def test_the_marker_never_lands_on_the_command_line() -> None:
-    """It rides with the prompt, never on the `claude` command itself."""
+def test_no_marker_lands_on_the_command_line() -> None:
     cmd = _start("hello")
     assert cmd.startswith("unalias claude")
     assert ZWSP_MARKER not in cmd
-    assert _staged(cmd) == f"{ZWSP_MARKER}hello"
+    assert _staged(cmd) == "hello"
 
 
 # ── and the mirror then keeps quiet about it ────────────────────────

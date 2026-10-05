@@ -447,10 +447,11 @@ twins are the webhook-invocable path, so these flows can be verified
 automatically (see `tests/e2e/test_text_command_twins.py`).
 
 > **Note (leading-slash is _not_ a substitute).** Typing `/skill-name` as an
-> ordinary message does **not** run the skill: c-lord prefixes every message
-> sent to the Claude TUI with a zero-width-space
-> marker, so the line no longer starts with `/` and the TUI does not treat it as
-> a slash command. Use the `!`/mention twin instead.
+> ordinary message does **not** run the skill: when a message starts with a
+> character that switches the Claude TUI's input box into another mode (`/`, `!`,
+> `#`, `&`, `?`), c-lord types it with one leading space, so the TUI takes it as
+> ordinary text (#861 — before that a zero-width-space marker did this job, until
+> CLI 2.1.278 started stripping it). Use the `!`/mention twin instead.
 
 > **Auth note.** Every text twin except the read-only `!version`,
 > `!model-show` and `!thread-archive-show` is authorized by the message-backed
