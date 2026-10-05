@@ -658,6 +658,33 @@ def _pane_at_input_prompt(pane_text: str) -> bool:
     return any(anchor in _status_zone(pane_text) for anchor in _STATUS_BAR_ANCHORS)
 
 
+# #861: first characters that switch Claude Code's input box out of "message"
+# mode — ``/`` slash command, ``!`` shell, ``#`` memory, ``&`` background, a
+# lone ``?`` shortcut help. A Discord message starting with one of them is meant
+# as text, and one leading space keeps it text (measured on 2.1.283: `` /cost``
+# and `` !echo hi`` both reach Claude as ordinary messages on the first Enter).
+_MODE_KEYS = frozenset("/!#&?")
+
+
+def shield_input(text: str, *, as_command: bool = False) -> str:
+    """The form of *text* c-lord types (or hands over) so it arrives as text (#861).
+
+    Replaces the zero-width-space marker c-lord used to prepend (#71). Claude
+    Code 2.1.278+ holds back the first Enter of any input carrying an invisible
+    character ("Removed 1 invisible character · review and press Enter to
+    send"), so every message relied on the #560 re-press — and it no longer
+    stopped a leading ``/`` from running as a command either (``\u200b/cost``
+    + Enter + Enter runs ``/cost``). Recognising c-lord's own input is done
+    without any mark: the claimed transcript (#773) and ``pane_echo`` (#808).
+
+    *as_command* is for a prompt that **is** a slash command (a /skill, #762):
+    it is returned unchanged so the CLI runs it.
+    """
+    if as_command or not text or text[0] not in _MODE_KEYS:
+        return text
+    return f" {text}"
+
+
 def _squash(text: str) -> str:
     """Drop all whitespace (and the bridge ZWSP) so wrapped text can be matched.
 
@@ -2414,19 +2441,11 @@ class TmuxSessionManager:
         # so claude opens its TUI on the restored conversation and waits.
         # Staging an empty prompt file here would submit an empty turn instead.
         if prompt is not None:
-            # #530: mark the prompt as c-lord-originated, exactly as send_input
-            # does. Without it the jsonl mirror reads the ``user`` event Claude
-            # writes for this prompt as "a human typed into the pane" and posts
-            # the whole thing back to the thread — one duplicated line for a
-            # short message, a dozen messages burying the answer for a big one.
-            from .transcript.formatter import ZWSP_MARKER
-
-            # #762: except for a prompt that *is* a slash command (/skill).
-            # Claude Code leaves a marked ``\u200b/cmd …`` argument sitting in
-            # the input box and never submits it, so the turn ran nothing. The
-            # marker is only a supplementary echo signal (#808) — and a command
-            # is recorded as <command-message> anyway, which it cannot mark.
-            marked_prompt = prompt if as_command else f"{ZWSP_MARKER}{prompt}"
+            # #861: no invisible marker any more (#530 added one so the mirror
+            # would not post the prompt back; ``pane_echo`` below does that job
+            # now). A prompt that only *starts* with ``/`` is still text, and a
+            # /skill prompt (*as_command*, #762) still runs as a command.
+            marked_prompt = shield_input(prompt, as_command=as_command)
 
             # #529: hand the prompt over in a file rather than typing it. Anything
             # typed at the pane's prompt goes through zsh's line editor, and
@@ -2765,11 +2784,15 @@ class TmuxSessionManager:
         )
         return True
 
-    def send_input(self, thread_id: int, text: str) -> bool:
+    def send_input(self, thread_id: int, text: str, *, as_command: bool = False) -> bool:
         """Send text to the Claude process in the tmux window via ``send-keys -l``.
 
         Uses ``-l`` (literal) to prevent tmux from interpreting special
         characters in the text.  Sends Enter afterwards to submit.
+
+        *as_command* types a slash command as a command (a /skill in a thread
+        whose Claude is already running, #762); otherwise a leading ``/`` is
+        shielded so the message stays text — see :func:`shield_input`.
 
         Returns True on success.
         """
@@ -2783,13 +2806,10 @@ class TmuxSessionManager:
 
         target = self._target(window)
 
-        # Send the text literally (no tmux key interpretation).  The text is
-        # prefixed with a zero-width-space marker so the JSONL ``user`` event
-        # Claude Code subsequently writes is recognised as c-lord-originated and
-        # skipped by the transcript mirror (Issue #71) — prevents double-posting
-        # Discord input back to the same thread.
-        from .transcript.formatter import ZWSP_MARKER
-
+        # Send the text literally (no tmux key interpretation).  #861: without
+        # the zero-width-space marker #71 used to prepend — CLI 2.1.278+ held
+        # back the first Enter of every marked message.  The mirror recognises
+        # c-lord's own input through ``pane_echo`` (registered below) instead.
         # #485: if an interactive menu (AskUserQuestion / plan approval) is open
         # in the pane, a plain message's trailing Enter would SELECT the
         # highlighted option — fabricating an answer the user never made (a
@@ -2829,7 +2849,7 @@ class TmuxSessionManager:
         if visible.returncode == 0:
             self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
-        payload = f"{ZWSP_MARKER}{text}"
+        payload = shield_input(text, as_command=as_command)
         errors: list[str] = []
         if not self._type_literal(target, payload, what="send_input", errors=errors):
             self._note_send_failure(thread_id, errors)
@@ -2877,10 +2897,7 @@ class TmuxSessionManager:
         capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", self._target(window)])
         if capture.returncode != 0:
             return None
-        from .transcript.formatter import ZWSP_MARKER
-
-        payload = f"{ZWSP_MARKER}{text}"
-        return _input_box_retains(capture.stdout, payload)
+        return _input_box_retains(capture.stdout, shield_input(text))
 
     def _confirm_submitted(self, target: str, payload: str, thread_id: int) -> bool:
         """Read the input box back and make sure the message actually left it (#560).

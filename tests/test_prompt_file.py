@@ -66,7 +66,7 @@ def test_the_prompt_file_holds_the_prompt_verbatim() -> None:
     path = _prompt_path(cmd)
     try:
         body = path.read_text(encoding="utf-8")
-        assert body == f"{ZWSP_MARKER}{_PROMPT}", "the prompt must survive byte-for-byte"
+        assert body == _PROMPT, "the prompt must survive byte-for-byte"
         assert _URL in body
     finally:
         path.unlink(missing_ok=True)
@@ -106,12 +106,13 @@ def test_the_command_stays_small_however_long_the_prompt_is() -> None:
         path.unlink(missing_ok=True)
 
 
-def test_the_marker_goes_into_the_file_not_the_command_line() -> None:
+def test_no_invisible_marker_is_added_anywhere() -> None:
+    """#861: the #530 marker is gone — from the file and the command line."""
     cmd = _typed("hello")
     path = _prompt_path(cmd)
     try:
         assert ZWSP_MARKER not in cmd
-        assert path.read_text(encoding="utf-8") == f"{ZWSP_MARKER}hello"
+        assert path.read_text(encoding="utf-8") == "hello"
     finally:
         path.unlink(missing_ok=True)
 
@@ -123,7 +124,7 @@ def test_falls_back_to_an_inline_prompt_when_the_file_cannot_be_written() -> Non
     """Losing the turn would be worse than a mangled URL."""
     with patch("c_lord.tmux._write_prompt_file", side_effect=OSError("no space")):
         cmd = _typed("hello world")
-    assert "'​hello world'" in cmd
+    assert "'hello world'" in cmd
     assert "$(cat" not in cmd
 
 
@@ -272,5 +273,5 @@ def test_an_unusable_dir_still_falls_back_to_an_inline_prompt(tmp_root: Path, mo
 
     cmd = _typed("hello world")
 
-    assert "'​hello world'" in cmd
+    assert "'hello world'" in cmd
     assert list(loose.iterdir()) == [], "nothing may be written into a dir others control"
