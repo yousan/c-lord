@@ -1667,7 +1667,12 @@ class TmuxClaudeRunner:
                 yield stopped
                 return
             self._take_send_failure()  # #809: only this send's refusal may explain it
-            ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
+            ok = await asyncio.to_thread(
+                self._tmux.send_input,
+                self._thread_id,
+                prompt,
+                as_command=self._slash_command,
+            )
             if not ok:
                 refused = self._take_send_failure()
                 # #560: two very different failures reach this branch. Either the

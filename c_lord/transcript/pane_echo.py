@@ -27,6 +27,10 @@ so "did c-lord type this?" no longer depends on what the CLI does to its input
 (the #773 lesson). The marker is still honoured where it survives; the mirror
 then retires the matching record so it cannot outlive the echo it stood for.
 
+#861 stopped typing the marker at all — CLI 2.1.278+ refuses to submit marked
+input on the first Enter — so this registry is now the only "c-lord typed
+this" signal for new input. The marker paths remain for old transcripts.
+
 A prompt is recorded with a longer lifetime than a menu answer
 (:data:`PROMPT_TTL_SECONDS`): a message sent while a turn is running is queued
 by the CLI and only written to the transcript when it is dequeued, i.e. after
