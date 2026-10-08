@@ -1108,3 +1108,16 @@ class TestApprovalButton:
         await cog._wait_for_approval(MagicMock(), thread)
 
         thread.send.assert_any_call("👍 Restart approved!")
+
+
+class TestClaimsMessage:
+    """#862: ClaudeChatCog asks this before starting a conversation from a webhook."""
+
+    def test_the_trigger_is_claimed(self, cog: AutoUpgradeCog) -> None:
+        assert cog.claims_message(_make_message())
+
+    def test_other_text_is_not_claimed(self, cog: AutoUpgradeCog) -> None:
+        assert not cog.claims_message(_make_message(content="サーバを再起動して"))
+
+    def test_a_human_message_is_not_claimed(self, cog: AutoUpgradeCog) -> None:
+        assert not cog.claims_message(_make_message(webhook_id=None))

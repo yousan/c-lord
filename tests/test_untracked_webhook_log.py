@@ -49,6 +49,7 @@ def _make_cog() -> ClaudeChatCog:
     bot.get_cog = MagicMock(return_value=None)
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)  # no sessions row — the #538/#556 path
+    repo.get_swept = AsyncMock(return_value=None)  # …and no #818 tombstone either
     repo.save = AsyncMock()
     runner = MagicMock()
     runner.clone = MagicMock(return_value=MagicMock())

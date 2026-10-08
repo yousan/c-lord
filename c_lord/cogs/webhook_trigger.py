@@ -93,33 +93,42 @@ class WebhookTriggerCog(commands.Cog):
         """Number of currently running webhook-triggered Claude sessions."""
         return self._active_count
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
-        """Handle incoming messages, filtering for webhook triggers."""
+    def _match(self, message: discord.Message) -> tuple[str, WebhookTrigger] | None:
+        """The trigger *message* fires, or ``None`` when it is not one of ours."""
         if not message.webhook_id:
-            return
+            return None
 
         if (
             self.allowed_webhook_ids is not None
             and message.webhook_id not in self.allowed_webhook_ids
         ):
-            return
+            return None
 
         if self.channel_ids is not None and message.channel.id not in self.channel_ids:
-            return
+            return None
 
         content = message.content.strip()
-        matched_prefix: str | None = None
-        matched_trigger: WebhookTrigger | None = None
-
         for prefix, trigger in self.triggers.items():
             if content == prefix or content.startswith(prefix):
-                matched_prefix = prefix
-                matched_trigger = trigger
-                break
+                return prefix, trigger
+        return None
 
-        if matched_prefix is None or matched_trigger is None:
+    def claims_message(self, message: discord.Message) -> bool:
+        """Whether *message* is a trigger this cog acts on — #862.
+
+        ``ClaudeChatCog`` asks before turning a webhook message in a thread with
+        no session into a new conversation, so a trigger is never also run as a
+        request to Claude.
+        """
+        return self._match(message) is not None
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Handle incoming messages, filtering for webhook triggers."""
+        matched = self._match(message)
+        if matched is None:
             return
+        matched_prefix, matched_trigger = matched
 
         logger.info(
             "%s Webhook trigger matched: prefix=%r, webhook_id=%d",
