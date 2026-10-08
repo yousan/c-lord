@@ -443,3 +443,81 @@ class TestActivityFromTheTranscript:
         sm._last_activity = 0.0
         turn_activity.note(7693)
         assert sm._last_activity == 0.0
+
+
+class _FlakyMessage:
+    """Reactions as Discord holds them, with chosen calls failing (#871)."""
+
+    def __init__(self) -> None:
+        self.reactions: list[str] = []
+        self.guild = MagicMock()
+        self.fail_remove: set[str] = set()
+        self.fail_add: set[str] = set()
+        self.removes: list[str] = []
+
+    async def add_reaction(self, emoji: str) -> None:
+        if emoji in self.fail_add:
+            self.fail_add.discard(emoji)
+            raise discord.HTTPException(MagicMock(status=400), "Thread is archived")
+        if emoji not in self.reactions:
+            self.reactions.append(emoji)
+
+    async def remove_reaction(self, emoji: str, member: object) -> None:
+        self.removes.append(emoji)
+        if emoji in self.fail_remove:
+            self.fail_remove.discard(emoji)
+            raise discord.HTTPException(MagicMock(status=400), "Thread is archived")
+        if emoji in self.reactions:
+            self.reactions.remove(emoji)
+
+
+class TestAFailedReactionCallLeavesNoSecondLamp:
+    """#871: one failed remove used to leave the old lamp for good.
+
+    ``_set_reaction`` only ever removes the emoji it *believes* is on the
+    message. A remove that failed (archived thread, transient 5xx) left 🟢 on
+    Discord while the manager had moved on, so the final 🟡/❌ landed next to it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_remove_before_a_stall_paint_ends_on_waiting_alone(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        msg.fail_remove.add(EMOJI_RUNNING)  # e.g. the thread was archived
+        await sm._paint_stall(EMOJI_STALL_SOFT)
+        assert msg.reactions == [EMOJI_RUNNING, EMOJI_STALL_SOFT]
+        await sm.set_waiting()
+        assert msg.reactions == [EMOJI_WAITING]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_add_and_remove_ends_on_error_alone(self) -> None:
+        """The production 🟢+❌ shape: ⏳ could neither replace 🟢 nor be added."""
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        msg.fail_remove.add(EMOJI_RUNNING)
+        msg.fail_add.add(EMOJI_STALL_SOFT)
+        await sm._paint_stall(EMOJI_STALL_SOFT)
+        await sm.set_error()
+        assert msg.reactions == [EMOJI_ERROR]
+
+    @pytest.mark.asyncio
+    async def test_a_clean_turn_costs_no_extra_calls(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        await sm.set_waiting()
+        assert msg.reactions == [EMOJI_WAITING]
+        assert msg.removes == [EMOJI_RUNNING]
+
+    @pytest.mark.asyncio
+    async def test_the_failure_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        msg.fail_remove.add(EMOJI_RUNNING)
+        with caplog.at_level("WARNING", logger="c_lord.discord_ui.status"):
+            await sm._paint_stall(EMOJI_STALL_SOFT)
+        assert any("remove" in r.getMessage() for r in caplog.records)
+        await sm.cleanup()

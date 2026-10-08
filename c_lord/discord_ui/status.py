@@ -16,9 +16,8 @@ limit and made the lamp stick (#236 regression).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import discord
 
@@ -35,6 +34,10 @@ EMOJI_ERROR = "❌"  # ❌
 EMOJI_STALL_SOFT = "⏳"  # ⏳
 EMOJI_STALL_HARD = "⚠️"  # ⚠️
 EMOJI_COMPACT = "\U0001f5dc️"  # 🗜️
+
+# Lamps that say "this turn is not over" — what a final paint must not leave
+# behind (#871).
+_OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD, EMOJI_COMPACT)
 
 STALL_SOFT_SECONDS = 10
 STALL_HARD_SECONDS = 30
@@ -71,6 +74,8 @@ class StatusManager:
         self._turn_task: asyncio.Task | None = None
         self._turn_active = False
         self._lock = asyncio.Lock()
+        # #871: a reaction call failed, so Discord may show more than we think.
+        self._out_of_sync = False
         self._last_activity = asyncio.get_running_loop().time()
 
     @classmethod
@@ -122,7 +127,7 @@ class StatusManager:
     async def set_waiting(self) -> None:
         """🟡 — flip the lamp to *waiting for user input*."""
         await self._stop_stall_timer()
-        await self._set_reaction(EMOJI_WAITING)
+        await self._set_reaction(EMOJI_WAITING, final=True)
 
     async def set_compact(self) -> None:
         """🗜️ — context compaction in progress (temporary override)."""
@@ -132,7 +137,7 @@ class StatusManager:
     async def set_error(self) -> None:
         """❌ — the turn ended in an error (temporary override, left visible)."""
         await self._stop_stall_timer()
-        await self._set_reaction(EMOJI_ERROR)
+        await self._set_reaction(EMOJI_ERROR, final=True)
 
     async def cleanup(self) -> None:
         """Remove the current status reaction."""
@@ -154,31 +159,68 @@ class StatusManager:
         """
         await self._set_reaction(emoji, only_while_running=True)
 
-    async def _set_reaction(self, emoji: str, *, only_while_running: bool = False) -> None:
-        """Replace the current reaction with ``emoji`` (immediate, single-flight)."""
+    async def _set_reaction(
+        self, emoji: str, *, only_while_running: bool = False, final: bool = False
+    ) -> None:
+        """Replace the current reaction with ``emoji`` (immediate, single-flight).
+
+        ``final`` marks the turn's last paint (🟡/❌). If any earlier reaction
+        call failed, what Discord shows may differ from what we recorded, so the
+        final paint also takes off every other lamp of ours (#871).
+        """
         async with self._lock:
             if only_while_running and not self._turn_active:
                 return
-            if self._current_emoji == emoji:
-                return
-            await self._remove_current_locked()
-            # Record the target *before* the request goes out: ``add_reaction``
-            # applies on Discord the moment the request is sent, so a cancel
-            # landing while we await the response must not leave us believing
-            # the *old* emoji is still the one on the message. It did, and the
-            # next paint then removed that old emoji and left two lamps side by
-            # side — ⚠️ next to 🟡 on a turn that had finished (#718).
-            self._current_emoji = emoji
-            with contextlib.suppress(discord.HTTPException):
-                await self._message.add_reaction(emoji)
+            if self._current_emoji != emoji:
+                await self._remove_current_locked()
+                # Record the target *before* the request goes out: ``add_reaction``
+                # applies on Discord the moment the request is sent, so a cancel
+                # landing while we await the response must not leave us believing
+                # the *old* emoji is still the one on the message. It did, and the
+                # next paint then removed that old emoji and left two lamps side by
+                # side — ⚠️ next to 🟡 on a turn that had finished (#718).
+                self._current_emoji = emoji
+                await self._react(self._message.add_reaction(emoji), "add", emoji)
+            if final and self._out_of_sync:
+                await self._sweep_locked(keep=emoji)
+
+    async def _react(self, call: Awaitable[None], what: str, emoji: str) -> None:
+        """Await one reaction call; a failure marks the lamp out of sync (#871).
+
+        Failures are still not raised — the lamp is decoration (#632) — but they
+        are no longer silent, and the turn's final paint knows to clean up.
+        """
+        try:
+            await call
+        except discord.HTTPException as exc:
+            self._out_of_sync = True
+            logger.warning("lamp: could not %s %s (%s)", what, emoji, exc)
+        except asyncio.CancelledError:
+            # The request may or may not have reached Discord.
+            self._out_of_sync = True
+            raise
+
+    async def _sweep_locked(self, *, keep: str) -> None:
+        """Take off every lamp of ours except ``keep``. Caller holds the lock."""
+        guild = getattr(self._message, "guild", None)
+        if not guild:
+            return
+        self._out_of_sync = False
+        for stray in _OPEN_LAMPS:
+            if stray != keep:
+                await self._react(self._message.remove_reaction(stray, guild.me), "sweep", stray)
 
     async def _remove_current_locked(self) -> None:
         """Remove the bot's current reaction. Caller must hold ``self._lock``."""
-        if self._current_emoji:
-            with contextlib.suppress(discord.HTTPException, AttributeError):
-                guild = self._message.guild
-                if guild:
-                    await self._message.remove_reaction(self._current_emoji, guild.me)
+        if not self._current_emoji:
+            return
+        guild = getattr(self._message, "guild", None)
+        if guild:
+            await self._react(
+                self._message.remove_reaction(self._current_emoji, guild.me),
+                "remove",
+                self._current_emoji,
+            )
 
     async def _start_stall_timer(self) -> None:
         """Start the stall detection timer."""
