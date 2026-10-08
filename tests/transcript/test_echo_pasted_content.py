@@ -77,3 +77,40 @@ async def test_a_paste_typed_by_a_person_in_the_pane_is_still_mirrored(tmp_path)
     assert _send_input("Discord からの別の発言") is True
     posted = await _mirror(tmp_path, [_user(_wrapped("ターミナルに人が貼った長文" * 80))])
     assert any("👤" in p for p in posted), posted
+
+
+# ── #864: the CLI escapes the tag when the *user's* text contains it ────
+#
+# Measured on 2.1.294 (isolated tmux): a message that merely mentions the tag is
+# written with a backslash so it cannot pass for the CLI's own wrapper —
+# ``<pasted_content`` → ``<\pasted_content``, ``</pasted_content`` →
+# ``<\/pasted_content``. Production, 2026-10-08 14:41: a dispatch about this
+# very bug ("<pasted_content> で包まれると…") came back as 👤 for that reason.
+
+
+def test_an_escaped_tag_in_the_users_text_still_matches(reg: PaneEchoRegistry) -> None:
+    sent = "#864（「長い入力が <pasted_content> で包まれると 👤 で送り返される」）が open のまま"
+    recorded = sent.replace("<pasted_content>", "<\\pasted_content>")
+    reg.register(TID, sent)
+    assert reg.consume_match(TID, recorded) is True
+
+
+def test_escaped_opening_and_closing_tags_with_ids_still_match(reg: PaneEchoRegistry) -> None:
+    sent = '「</pasted_content id="834d">」と「<pasted_content id="ab12">」の話'
+    recorded = '「<\\/pasted_content id="834d">」と「<\\pasted_content id="ab12">」の話'
+    reg.register(TID, sent)
+    assert reg.consume_match(TID, recorded) is True
+
+
+def test_an_escaped_tag_inside_the_wrapper_still_matches(reg: PaneEchoRegistry) -> None:
+    sent = _LONG + '\n引用: <pasted_content id="834d">…</pasted_content id="834d">'
+    inner = sent.replace("<pasted_content", "<\\pasted_content").replace(
+        "</pasted_content", "<\\/pasted_content"
+    )
+    reg.register(TID, sent)
+    assert reg.consume_match(TID, _wrapped(inner)) is True
+
+
+def test_unescaping_does_not_loosen_the_match(reg: PaneEchoRegistry) -> None:
+    reg.register(TID, "<pasted_content> の話")
+    assert reg.consume_match(TID, "<\\pasted_content> の話（書き足し）") is False
