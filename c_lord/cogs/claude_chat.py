@@ -372,6 +372,12 @@ class ClaudeChatCog(commands.Cog):
         # #718: startup watchers for lamps the previous process left mid-turn.
         # Held so they are not garbage-collected while waiting for the turn end.
         self._lamp_recovery_tasks: set[asyncio.Task] = set()
+        # #870: lamps that must survive the *next* restart too. A running turn's
+        # trigger message (written again at shutdown: a thread's first turn
+        # records it before its session row exists), and the lamps the startup
+        # recovery is still watching — those turns have no runner here.
+        self._turn_triggers: dict[int, int] = {}
+        self._adopted_lamps: dict[int, int] = {}
         # Dashboard may be None until bot is ready; resolved lazily in _get_dashboard()
         self._dashboard = dashboard
         # Coordination service resolved lazily from bot if not supplied directly
@@ -2584,19 +2590,39 @@ class ClaudeChatCog(commands.Cog):
 
         No-op when ``_resume_repo`` is not configured.
         """
-        if not self._active_runners or self._resume_repo is None:
+        # #870: a turn whose lamp was adopted at the last startup is still
+        # running, it just has no runner in this process.
+        threads = list(dict.fromkeys([*self._active_runners, *self._adopted_lamps]))
+        if not threads or self._resume_repo is None:
             return
 
         logger.info(
             "Shutdown detected: recording %d active session(s) for restart notice",
-            len(self._active_runners),
+            len(threads),
         )
-        for thread_id in list(self._active_runners):
+        for thread_id in threads:
             try:
                 session_id: str | None = None
                 record = await self.repo.get(thread_id)
                 if record is not None:
                     session_id = record.session_id
+
+                # #870: the message whose lamp the next startup must take back.
+                # Written here because the turn-start write misses a thread's
+                # first turn (no session row yet), and an adopted lamp's message
+                # may not be the recorded one at all.
+                lamp_message = self._adopted_lamps.get(thread_id) or self._turn_triggers.get(
+                    thread_id
+                )
+                if lamp_message is not None:
+                    try:
+                        await self.repo.update_trigger_message(thread_id, lamp_message)
+                    except Exception:
+                        logger.warning(
+                            "%s could not save the lamp message at shutdown",
+                            log_ctx(thread_id=thread_id),
+                            exc_info=True,
+                        )
 
                 # resume_prompt is intentionally None (#406): on_ready posts a
                 # quiet notice, it never re-runs Claude with a stored prompt.
@@ -2750,7 +2776,13 @@ class ClaudeChatCog(commands.Cog):
             async def turn_running() -> bool:
                 return await asyncio.to_thread(stopped_mid_turn, project_dir)
 
-            await adopt_orphaned_lamp(message, thread_id=thread.id, turn_running=turn_running)
+            # #870: visible to the next shutdown while the watch lasts.
+            self._adopted_lamps[thread.id] = message.id
+            try:
+                await adopt_orphaned_lamp(message, thread_id=thread.id, turn_running=turn_running)
+            finally:
+                if self._adopted_lamps.get(thread.id) == message.id:
+                    del self._adopted_lamps[thread.id]
         except Exception:
             logger.warning("%s lamp recovery skipped", ctx, exc_info=True)
 
@@ -4023,6 +4055,8 @@ class ClaudeChatCog(commands.Cog):
             # #769: thread_id routes the transcript mirror's activity to this
             # lamp, so a working turn stays 🟢 instead of going ⚠️ at 30s.
             status = StatusManager(user_message, thread_id=thread.id)
+            # #870: saved again at shutdown — see _turn_triggers.
+            self._turn_triggers[thread.id] = user_message.id
             await status.set_running()
 
             model_override = await self._get_current_model()
