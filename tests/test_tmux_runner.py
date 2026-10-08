@@ -1138,7 +1138,7 @@ class TestTmuxClaudeRunnerRun:
             async for event in runner.run("follow up"):
                 events.append(event)
 
-        tmux_manager.send_input.assert_called_once_with(12345, "follow up")
+        tmux_manager.send_input.assert_called_once_with(12345, "follow up", as_command=False)
         tmux_manager.start_claude.assert_not_called()
 
     @pytest.mark.asyncio
@@ -3618,6 +3618,77 @@ class TestUnknownPromptDedup:
         assert len(unknown_events) == 2, (
             f"expected 2 unknown_tui_prompt events (menu A then B), got {len(unknown_events)}"
         )
+
+
+# -- Regression tests for #858 (a numbered input-box suggestion is not a menu) --
+
+_I858_FIXTURES = [
+    # Real panes attached to the production "Unknown TUI prompt" warnings
+    # (09-28 13:46 / 09-30 11:37 JST, Claude Code 2.1.283).  Neither shows a
+    # menu: the input box holds a suggestion that starts with "<digits>.".
+    "i858_input_box_suggestion_2026_v2_1_283.txt",
+    "i858_input_box_suggestion_8_33_v2_1_283.txt",
+]
+
+
+class TestInputBoxNumberedSuggestion:
+    """#858: ``❯ 8.33 …`` in the live input box looked like a ``❯ 1.`` menu cursor.
+
+    The input box is drawn as ``❯ <text>`` between two rules, with the status
+    rows under the lower one.  ``_INTERACTIVE_MENU_RE`` matched any ``❯`` line
+    whose text began with digits and a period, so a suggestion such as
+    ``2026.9.6 への…`` or ``8.33 に戻して…`` raised the "stuck on an unknown
+    menu" warning on a session that was simply idle.  All 3 production alerts
+    between 09-28 and 10-02 were this.
+    """
+
+    @pytest.mark.parametrize("fixture", _I858_FIXTURES)
+    def test_real_input_box_suggestion_is_not_unknown(self, fixture: str) -> None:
+        """RED: both real captures returned True — the warning was posted."""
+        pane = _load_fixture(fixture)
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+        assert TmuxClaudeRunner._has_unknown_interactive(_normalize_capture(pane)) is False
+
+    @pytest.mark.parametrize("fixture", _I858_FIXTURES)
+    def test_real_input_box_suggestion_is_a_ready_prompt(self, fixture: str) -> None:
+        """The same misreading made the idle box look "not ready", so the turn
+        waited for the fallback instead of completing on the prompt."""
+        assert TmuxClaudeRunner._has_input_prompt(_load_fixture(fixture)) is True
+
+    def test_regular_space_does_not_matter(self) -> None:
+        """The judgement is structural (box between rules), not the ``\xa0``."""
+        pane = _load_fixture(_I858_FIXTURES[1]).replace("\xa0", " ")
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_typed_numbered_text_in_box_is_not_unknown(self) -> None:
+        """AC4's shape: the user left ``1. あ`` unsent in the box."""
+        pane = (
+            "● Done.\n\n"
+            "────────────────────\n"
+            "❯\xa01. あ\n"
+            "────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is False
+
+    def test_numbered_menu_above_the_input_box_is_still_flagged(self) -> None:
+        """Only the box itself is ignored — a real menu elsewhere still counts."""
+        pane = (
+            "Would you like to stash these changes and continue with teleport?\n"
+            "❯ 1. Yes, stash and continue\n"
+            "  2. No, abort\n"
+            "────────────────────\n"
+            "❯\xa0\n"
+            "────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert TmuxClaudeRunner._has_unknown_interactive(pane) is True
+
+    @pytest.mark.parametrize("fixture", ["unknown_menu_blank_tail.txt"])
+    def test_real_unknown_menu_is_still_flagged(self, fixture: str) -> None:
+        """#695 must not weaken: a real numbered menu with no box stays True."""
+        pane = _load_fixture(fixture)
+        assert TmuxClaudeRunner._has_unknown_interactive(_normalize_capture(pane)) is True
 
 
 # -- Regression tests for #695 (unnumbered TUI dialogs slip past every detector) --

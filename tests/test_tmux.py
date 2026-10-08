@@ -775,24 +775,21 @@ class TestTmuxSessionManager:
 
         assert result is True
 
-        # Verify send-keys -l was called with the text (marker-prefixed, #71)
+        # Verify send-keys -l was called with the text (no marker since #861)
         text_call = mock_run.call_args_list[2]
         args = text_call[0][0]
         assert "send-keys" in args
         assert "-l" in args
-        assert "\u200bmy prompt" in args
+        assert "my prompt" in args
 
         # Verify Enter was sent
         enter_call = mock_run.call_args_list[3]
         args = enter_call[0][0]
         assert "Enter" in args
 
-    def test_send_input_always_prefixes_the_zwsp_marker(self, monkeypatch) -> None:
-        """The input is prefixed with a zero-width-space so the resulting JSONL
-        ``user`` event is recognised as c-lord-originated and not double-posted
-        back to Discord (#71). Unconditional since #712 — the removed
-        ``CLORD_BRIDGE_MODE`` must not be able to strip it."""
-        monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
+    def test_send_input_never_prefixes_the_zwsp_marker(self, monkeypatch) -> None:
+        """#861: CLI 2.1.278+ holds back the first Enter of any input carrying an
+        invisible character, so the #71 marker is no longer typed."""
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
         mgr._thread_to_window[12345] = "work1"
@@ -803,16 +800,12 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0, stdout=self._INSERT_PANE),  # capture-pane (mode)
                 MagicMock(returncode=0),
                 MagicMock(returncode=0),
-                # #560: send_input now reads the box back to confirm the
-                # message actually left it.
                 MagicMock(returncode=0, stdout=self._EMPTY_BOX_PANE),
             ]
             assert mgr.send_input(12345, "hi") is True
 
-        text_call = mock_run.call_args_list[2]
-        args = text_call[0][0]
-        # ZWSP (U+200B) is prepended to the literal text.
-        assert "​hi" in args
+        args = mock_run.call_args_list[2][0][0]
+        assert args[-1] == "hi"
 
     # -- #147/#544: vim NORMAL-mode correction before literal input ---------
     #
@@ -879,7 +872,7 @@ class TestTmuxSessionManager:
         assert i_call[-1] == "i"
         # Then the literal text.
         text_call = calls[3][0][0]
-        assert "-l" in text_call and "\u200bmelon" in text_call
+        assert "-l" in text_call and "melon" in text_call
         # Then Enter.
         assert "Enter" in calls[4][0][0]
 
@@ -907,7 +900,7 @@ class TestTmuxSessionManager:
                 raise AssertionError("unexpected bare 'i' sent while already in INSERT mode")
         # send-keys -l with the text comes right after the capture.
         text_call = calls[2][0][0]
-        assert "-l" in text_call and "\u200bmelon" in text_call
+        assert "-l" in text_call and "melon" in text_call
         assert "Enter" in calls[3][0][0]
 
     # -- #172: send_literal (type onto a TUI menu's free-text row) ----------

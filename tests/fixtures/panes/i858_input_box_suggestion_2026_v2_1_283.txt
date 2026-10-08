@@ -1,0 +1,8 @@
+────────────
+❯ 2026.9.6 への破壊的変更を調べて                                                                                                      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5.5  v2.1.283  Style: default  Ctx: 68.5k  Context: [█░░░░░░░░░░░░░░░] 69k/1.0M (7%)  Ctx Used: 7.0%  Ctx(u) Used: 8.6% 
+   Cost: $0.81  Session: 40.0%  Weekly: 30.0%  Session: 3m  Reset: 1hr 13m  Weekly Reset: 4d 3hr 13m  Block: 3hr 46m  In: 64  Out: 20.6k  Cached: 1.8M  T...
+   ⎇ main  (+0,-0)  +0  -0  1515873566166483074  𖠰 main  cwd: /home/yousan/c-lord-sessions/1504670029923352597/1515873566166483074  Skill: none 
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+

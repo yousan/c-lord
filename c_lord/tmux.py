@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import api_endpoint
 from .pane_running import pane_shows_running
 from .utils.logger import log_ctx
 
@@ -287,6 +288,68 @@ def parse_work_number(window_name: str) -> int | None:
             if suffix.isdigit():
                 return int(suffix)
     return None
+
+
+#: Suffix of the per-session thread → window-name file (#113), which since #595
+#: is also the record of which ``w{N}`` each thread holds.
+_MAPPING_SUFFIX = "-window-map.json"
+
+#: Serializes read-modify-write of those files (#595). Several managers share
+#: one session (#649) and each used to overwrite the file with its own subset;
+#: now that an entry outlives its window, a lost write would lose a number.
+_MAPPING_FILE_LOCK = threading.Lock()
+
+
+def _default_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "c-lord")
+
+
+def _read_mapping_file(path: str) -> dict[str, str]:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _write_mapping_file(path: str, data: dict[str, str]) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except OSError as exc:
+        logger.warning("Failed to save window mapping to %s: %s", path, exc)
+
+
+def release_window_number(thread_id: int, cache_dir: str | None = None) -> None:
+    """Give up the ``w{N}`` *thread_id* holds, in every session (#595).
+
+    A thread keeps its number while it sleeps or is stopped — the number is the
+    handle a user follows in the sidebar — and frees it only when its workspace
+    is deleted (yousan, 2026-09-08). The delete paths know the thread but not
+    necessarily which session it last lived in, so every session's file is
+    visited.
+    """
+    directory = cache_dir if cache_dir is not None else _default_cache_dir()
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(_MAPPING_SUFFIX))
+    except OSError:
+        return
+    key = str(thread_id)
+    with _MAPPING_FILE_LOCK:
+        for name in names:
+            path = os.path.join(directory, name)
+            data = _read_mapping_file(path)
+            released = data.pop(key, None)
+            if released is None:
+                continue
+            _write_mapping_file(path, data)
+            logger.info(
+                "Released window number %s of %s (thread=%d)",
+                released,
+                name[: -len(_MAPPING_SUFFIX)],
+                thread_id,
+            )
 
 
 def _screenshot_rows_from_env() -> int:
@@ -595,6 +658,33 @@ def _pane_at_input_prompt(pane_text: str) -> bool:
     return any(anchor in _status_zone(pane_text) for anchor in _STATUS_BAR_ANCHORS)
 
 
+# #861: first characters that switch Claude Code's input box out of "message"
+# mode — ``/`` slash command, ``!`` shell, ``#`` memory, ``&`` background, a
+# lone ``?`` shortcut help. A Discord message starting with one of them is meant
+# as text, and one leading space keeps it text (measured on 2.1.283: `` /cost``
+# and `` !echo hi`` both reach Claude as ordinary messages on the first Enter).
+_MODE_KEYS = frozenset("/!#&?")
+
+
+def shield_input(text: str, *, as_command: bool = False) -> str:
+    """The form of *text* c-lord types (or hands over) so it arrives as text (#861).
+
+    Replaces the zero-width-space marker c-lord used to prepend (#71). Claude
+    Code 2.1.278+ holds back the first Enter of any input carrying an invisible
+    character ("Removed 1 invisible character · review and press Enter to
+    send"), so every message relied on the #560 re-press — and it no longer
+    stopped a leading ``/`` from running as a command either (``\u200b/cost``
+    + Enter + Enter runs ``/cost``). Recognising c-lord's own input is done
+    without any mark: the claimed transcript (#773) and ``pane_echo`` (#808).
+
+    *as_command* is for a prompt that **is** a slash command (a /skill, #762):
+    it is returned unchanged so the CLI runs it.
+    """
+    if as_command or not text or text[0] not in _MODE_KEYS:
+        return text
+    return f" {text}"
+
+
 def _squash(text: str) -> str:
     """Drop all whitespace (and the bridge ZWSP) so wrapped text can be matched.
 
@@ -837,12 +927,14 @@ class TmuxSessionManager:
         self._vim_mode: dict[str, bool] = {}
         # Persistent thread→window mapping file. Survives tmux restarts; used
         # as fallback in _rebuild_mapping when pane has cd'd away (issue #113).
+        # Since #595 it also keeps a thread's entry after its window dies, so the
+        # thread gets the same ``w{N}`` back; see :meth:`_next_window_name`.
         if mapping_path is not None:
             self._mapping_path: str = mapping_path
         else:
-            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "c-lord")
+            cache_dir = _default_cache_dir()
             os.makedirs(cache_dir, exist_ok=True)
-            self._mapping_path = os.path.join(cache_dir, f"{self.session_name}-window-map.json")
+            self._mapping_path = os.path.join(cache_dir, f"{self.session_name}{_MAPPING_SUFFIX}")
 
     @property
     def _lock(self) -> threading.Lock:
@@ -1102,8 +1194,18 @@ class TmuxSessionManager:
         self._rebuild_mapping()
         return self._thread_to_window.get(thread_id)
 
-    def _next_window_name(self) -> str:
-        """Next free ``w{N}`` name, read from live tmux state (#649).
+    def _next_window_name(self, thread_id: int | None = None, preferred: int | None = None) -> str:
+        """The ``w{N}`` name for *thread_id*'s next window, read from live tmux state (#649).
+
+        #595: a thread gets back the number it already holds. The mapping file
+        keeps a thread's entry after its window dies (sleep, stop, a tmux server
+        restart), so waking it recreates ``w5``, not ``max + 1``. *preferred* is
+        tried next — the number a window brings when it moves in from another
+        session (#427). A number is usable only when no live window carries it
+        and no other thread holds it in the file; otherwise, and for new
+        threads, the answer is one past everything live *or* held, so a
+        sleeping thread's number is never handed to somebody else. Only
+        :func:`release_window_number` (workspace deletion) frees one.
 
         The number used to come from ``self._next_work_id``, an instance
         counter. Two managers for one session each carried their own, so both
@@ -1121,13 +1223,28 @@ class TmuxSessionManager:
             self._next_work_id += 1
             return name
 
-        max_id = 0
+        # Count both ``w{N}`` and legacy ``work{N}`` so numbering stays
+        # monotonic across the prefix rename.
+        live: set[int] = set()
         for line in result.stdout.splitlines():
-            # Count both ``w{N}`` and legacy ``work{N}`` so numbering stays
-            # monotonic across the prefix rename.
             n = parse_work_number(line.strip())
             if n is not None:
-                max_id = max(max_id, n)
+                live.add(n)
+        held: dict[str, int] = {}
+        if self._mapping_path:
+            with _MAPPING_FILE_LOCK:
+                data = _read_mapping_file(self._mapping_path)
+            for tid, name in data.items():
+                n = parse_work_number(name)
+                if n is not None:
+                    held[tid] = n
+
+        mine = held.pop(str(thread_id), None) if thread_id is not None else None
+        for candidate in (mine, preferred):
+            if candidate is not None and candidate not in live and candidate not in held.values():
+                return f"{WINDOW_PREFIX}{candidate}"
+
+        max_id = max(live | set(held.values()) | {0})
         self._next_work_id = max_id + 2  # fallback value should the next call fail
         return f"{WINDOW_PREFIX}{max_id + 1}"
 
@@ -1429,17 +1546,39 @@ class TmuxSessionManager:
         holds (#649): this file exists to survive a tmux *server* restart, and a
         restart reassigns every id while tmux-resurrect restores the names.
 
+        #595: the write *merges* into what is on disk. Entries for threads whose
+        window is gone are kept — that is how a thread gets its number back —
+        and entries written by another manager for the same session (#649) are
+        not erased by this one's partial view. Only
+        :func:`release_window_number` removes an entry.
+
         No-op when mapping_path is empty (disabled or test mode).
         """
         if not self._mapping_path:
             return
         names = self._window_names()
-        try:
-            data = {str(tid): names.get(win, win) for tid, win in self._thread_to_window.items()}
-            with open(self._mapping_path, "w") as f:
-                json.dump(data, f)
-        except OSError as exc:
-            logger.warning("Failed to save window mapping to %s: %s", self._mapping_path, exc)
+        with _MAPPING_FILE_LOCK:
+            data = _read_mapping_file(self._mapping_path)
+            for tid, win in self._thread_to_window.items():
+                name = names.get(win) if _WINDOW_ID_RE.match(win) else win
+                if name:
+                    data[str(tid)] = name
+            _write_mapping_file(self._mapping_path, data)
+
+    def _forget_in_session_file(self, session_name: str, thread_id: int) -> None:
+        """Drop *thread_id* from *session_name*'s mapping file (#595).
+
+        Used when a window moves to this session (#427): the number now lives
+        here, and the source session must stop holding it for a thread that
+        will never come back there.
+        """
+        if not self._mapping_path:
+            return
+        path = os.path.join(os.path.dirname(self._mapping_path), f"{session_name}{_MAPPING_SUFFIX}")
+        with _MAPPING_FILE_LOCK:
+            data = _read_mapping_file(path)
+            if data.pop(str(thread_id), None) is not None:
+                _write_mapping_file(path, data)
 
     def _load_from_mapping_file(self, target: dict[int, str]) -> None:
         """Restore @thread_id from the persistent mapping file into *target*.
@@ -1630,6 +1769,10 @@ class TmuxSessionManager:
         # matched by path, and later lookups need the option to be there.
         self._tag_window(window_id, thread_id)
 
+        # Minted before the move (#595) so the window's own name does not count
+        # as taken: it keeps its number when the destination has it free.
+        new_name = self._next_window_name(thread_id, preferred=parse_work_number(src_name))
+
         result = _run(
             [
                 "tmux",
@@ -1653,12 +1796,11 @@ class TmuxSessionManager:
                 result.stderr.strip(),
             )
             return None
-
-        new_name = self._next_window_name()
         _run(["tmux", "rename-window", "-t", window_id, new_name])
 
         self._thread_to_window[thread_id] = window_id
         self._save_mapping()
+        self._forget_in_session_file(src_session, thread_id)
         logger.info(
             "Adopted tmux window %s (%s:%s) -> %s:%s (thread=%d, dir=%s)",
             window_id,
@@ -1732,7 +1874,7 @@ class TmuxSessionManager:
                 self._sort_windows_unlocked()
                 return migrated
 
-            window_name = self._next_window_name()
+            window_name = self._next_window_name(thread_id)
 
             result = _run(
                 [
@@ -2265,6 +2407,13 @@ class TmuxSessionManager:
         otel_attributes = _otel_resource_attributes(pane_path)
         if otel_attributes:
             cmd_parts.append(f"OTEL_RESOURCE_ATTRIBUTES='{otel_attributes}'")
+        # #258: where this bot's REST API is — the port actually bound, which
+        # need not be CLORD_API_PORT (the API walks past a taken default).
+        # Absent when no API is listening, so a curl fails loudly instead of
+        # reaching whatever else holds the port.
+        api_url = api_endpoint.current()
+        if api_url:
+            cmd_parts.append(f"CLORD_API_URL={shlex.quote(api_url)}")
         cmd_parts.append("claude")
         cmd_parts.extend(self._session_flags(pane_path, try_continue=try_continue))
         cmd_parts.extend(["--model", model])
@@ -2292,19 +2441,11 @@ class TmuxSessionManager:
         # so claude opens its TUI on the restored conversation and waits.
         # Staging an empty prompt file here would submit an empty turn instead.
         if prompt is not None:
-            # #530: mark the prompt as c-lord-originated, exactly as send_input
-            # does. Without it the jsonl mirror reads the ``user`` event Claude
-            # writes for this prompt as "a human typed into the pane" and posts
-            # the whole thing back to the thread — one duplicated line for a
-            # short message, a dozen messages burying the answer for a big one.
-            from .transcript.formatter import ZWSP_MARKER
-
-            # #762: except for a prompt that *is* a slash command (/skill).
-            # Claude Code leaves a marked ``\u200b/cmd …`` argument sitting in
-            # the input box and never submits it, so the turn ran nothing. The
-            # marker is only a supplementary echo signal (#808) — and a command
-            # is recorded as <command-message> anyway, which it cannot mark.
-            marked_prompt = prompt if as_command else f"{ZWSP_MARKER}{prompt}"
+            # #861: no invisible marker any more (#530 added one so the mirror
+            # would not post the prompt back; ``pane_echo`` below does that job
+            # now). A prompt that only *starts* with ``/`` is still text, and a
+            # /skill prompt (*as_command*, #762) still runs as a command.
+            marked_prompt = shield_input(prompt, as_command=as_command)
 
             # #529: hand the prompt over in a file rather than typing it. Anything
             # typed at the pane's prompt goes through zsh's line editor, and
@@ -2643,11 +2784,15 @@ class TmuxSessionManager:
         )
         return True
 
-    def send_input(self, thread_id: int, text: str) -> bool:
+    def send_input(self, thread_id: int, text: str, *, as_command: bool = False) -> bool:
         """Send text to the Claude process in the tmux window via ``send-keys -l``.
 
         Uses ``-l`` (literal) to prevent tmux from interpreting special
         characters in the text.  Sends Enter afterwards to submit.
+
+        *as_command* types a slash command as a command (a /skill in a thread
+        whose Claude is already running, #762); otherwise a leading ``/`` is
+        shielded so the message stays text — see :func:`shield_input`.
 
         Returns True on success.
         """
@@ -2661,13 +2806,10 @@ class TmuxSessionManager:
 
         target = self._target(window)
 
-        # Send the text literally (no tmux key interpretation).  The text is
-        # prefixed with a zero-width-space marker so the JSONL ``user`` event
-        # Claude Code subsequently writes is recognised as c-lord-originated and
-        # skipped by the transcript mirror (Issue #71) — prevents double-posting
-        # Discord input back to the same thread.
-        from .transcript.formatter import ZWSP_MARKER
-
+        # Send the text literally (no tmux key interpretation).  #861: without
+        # the zero-width-space marker #71 used to prepend — CLI 2.1.278+ held
+        # back the first Enter of every marked message.  The mirror recognises
+        # c-lord's own input through ``pane_echo`` (registered below) instead.
         # #485: if an interactive menu (AskUserQuestion / plan approval) is open
         # in the pane, a plain message's trailing Enter would SELECT the
         # highlighted option — fabricating an answer the user never made (a
@@ -2707,7 +2849,7 @@ class TmuxSessionManager:
         if visible.returncode == 0:
             self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
-        payload = f"{ZWSP_MARKER}{text}"
+        payload = shield_input(text, as_command=as_command)
         errors: list[str] = []
         if not self._type_literal(target, payload, what="send_input", errors=errors):
             self._note_send_failure(thread_id, errors)
@@ -2755,10 +2897,7 @@ class TmuxSessionManager:
         capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", self._target(window)])
         if capture.returncode != 0:
             return None
-        from .transcript.formatter import ZWSP_MARKER
-
-        payload = f"{ZWSP_MARKER}{text}"
-        return _input_box_retains(capture.stdout, payload)
+        return _input_box_retains(capture.stdout, shield_input(text))
 
     def _confirm_submitted(self, target: str, payload: str, thread_id: int) -> bool:
         """Read the input box back and make sure the message actually left it (#560).

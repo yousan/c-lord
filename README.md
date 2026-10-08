@@ -193,7 +193,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
 - **Workspace cleanup** — `/workspace-cleanup` reclaims clone directories that no running session is using (`dry_run` to preview); a directory with uncommitted changes is never removed
 - **Runtime model switching** — `/model-show` displays the current global model and per-thread session model; `/model-set` changes the model for all new sessions without restart
-- **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; the thread each one belonged to gets a 🧹 notice saying so and what survived on disk (#554). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
+- **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; each thread that is still open gets a 🧹 notice saying so and what survived on disk (#554), and is then archived; threads already closed are tidied without a post, so they stay closed (#857). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
 
 ### Security
 - **No shell injection** — `asyncio.create_subprocess_exec` only, never `shell=True`
@@ -678,10 +678,18 @@ sessions. It starts on every run — it is not tied to how answers are delivered
 uv add "c-lord[api]"
 ```
 
-It binds `CLORD_API_HOST:CLORD_API_PORT` (default `127.0.0.1:8080`). If that
-port is already in use — two clones on one host, say — the bot logs a WARNING
-and runs without the API rather than failing to start; give each clone its own
-`CLORD_API_PORT`.
+It binds `CLORD_API_HOST:CLORD_API_PORT` (default `127.0.0.1:8080`). With
+`CLORD_API_PORT` **unset**, a taken port is not a problem: the API moves to the
+next free one (8081, 8082, … then any free port) and logs where it went, so two
+clones on one host both get an API with nothing to configure (#258). A port you
+**set** is used as-is: if it is taken the bot logs a WARNING and runs without the
+API rather than failing to start.
+
+Claude in every session is told where the API is as the `CLORD_API_URL`
+environment variable — the port that was actually bound, so it never has to be
+kept in step with `CLORD_API_PORT` by hand. Set `CLORD_API_URL` yourself only to
+point sessions somewhere else (a reverse proxy, say). When the API is not
+running, sessions get no `CLORD_API_URL` at all.
 
 **It only serves the Unix user running the bot** (#457). `POST /api/spawn` starts
 a Claude Code session, so reaching this port is equivalent to a shell as that

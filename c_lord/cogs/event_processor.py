@@ -19,6 +19,7 @@ from ..claude.tmux_runner import (
     NO_RESPONSE_ERROR_PREFIX,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
+    unavailable_model,
 )
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
@@ -101,6 +102,8 @@ class EventProcessor:
 
         # Guards against duplicate embeds/messages in the same run.
         self._session_start_sent: bool = False
+        # #856: ``RunConfig.on_session_saved`` fires once per turn.
+        self._session_saved_notified: bool = False
 
         # Set when AskUserQuestion is detected. Caller should drain the runner
         # (skip events) then handle the ask after the stream ends.
@@ -243,6 +246,13 @@ class EventProcessor:
                 self._state.session_id,
                 working_dir=self._config.working_dir,
             )
+            # #856: once per turn — the row now exists, so the naming pass's
+            # stash can be written. A failure here is the hook's to log.
+            hook = self._config.on_session_saved
+            if hook is not None and not self._session_saved_notified:
+                self._session_saved_notified = True
+                with contextlib.suppress(Exception):
+                    await hook(self._config.thread.id)
 
         # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
         if not self._config.session_id and not self._session_start_sent:
@@ -354,6 +364,12 @@ class EventProcessor:
             if event.error.startswith(LOGIN_REQUIRED_ERROR_PREFIX):
                 self._config.outcome.no_response = True
                 self._config.outcome.login_required = True
+            # #484: likewise for a model Claude Code will not use — only
+            # ``/model set`` can fix it.
+            refused_model = unavailable_model(event.error)
+            if refused_model is not None:
+                self._config.outcome.no_response = True
+                self._config.outcome.model_unavailable = refused_model
             # #631: a rate-limited turn also produced nothing, but it knows why.
             # ``no_response`` is set too so no caller reads it as a completed
             # turn; ``usage_limit`` is what upgrades the wording from "send it

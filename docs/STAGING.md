@@ -36,12 +36,17 @@ session dir は `.env` の `SESSION_DIR_BASE` で決めている(上表はいま
 増設した。各台は独立した clone / bot identity / channel / E2E スレッドを持ち、**別ブランチを同時に検証**
 できる。1 つ借りられていても他の空き番号を borrow すればよい。
 
-| # | clone | bot (user id) | channel (id) | E2E スレッド id | port |
-|---|---|---|---|---|---|
-| 1 | `/home/yousan/c-lord-staging-1`† | `C-lord-staging-1` (`1503195981142032405`) | `#c-lord-staging-1` (`1503196656265597082`) | `1514085380666691664` | 8089 |
-| 2 | `/home/yousan/c-lord-staging-2` | `C-lord-staging-2` (`1514518564403413014`) | `#c-lord-staging-2` (`1514535894575743056`) | `1514545583459926117` | 8091 |
-| 3 | `/home/yousan/c-lord-staging-3` | `C-lord-staging-3` (`1503234123932635206`) | `#c-lord-staging-3` (`1503245597841559623`) | `1514546023282769920` | 8093 |
-| 4 | `/home/yousan/c-lord-staging-4` | `C-lord-staging-4` (`1514523658780016771`) | `#c-lord-staging-4` (`1514535896328700015`) | `1514546025631580260` | 8095 |
+| # | clone | bot (user id) | channel (id) | E2E スレッド id | port | webhook‡ | 信頼bot |
+|---|---|---|---|---|---|---|---|
+| 1 | `/home/yousan/c-lord-staging-1`† | `C-lord-staging-1` (`1503195981142032405`) | `#c-lord-staging-1` (`1503196656265597082`) | `1514085380666691664` | 8089 | **あり** | なし |
+| 2 | `/home/yousan/c-lord-staging-2` | `C-lord-staging-2` (`1514518564403413014`) | `#c-lord-staging-2` (`1514535894575743056`) | `1514545583459926117` | 8091 | **webhook なし** | あり |
+| 3 | `/home/yousan/c-lord-staging-3` | `C-lord-staging-3` (`1503234123932635206`) | `#c-lord-staging-3` (`1503245597841559623`) | `1514546023282769920` | 8093 | **webhook なし** | あり |
+| 4 | `/home/yousan/c-lord-staging-4` | `C-lord-staging-4` (`1514523658780016771`) | `#c-lord-staging-4` (`1514535896328700015`) | `1514546025631580260` | 8095 | **webhook なし** | あり |
+
+‡ `.env` の `E2E_TEST_WEBHOOK_URL` が実在の webhook か（2026-09-30 に `GET <URL>` で確認 — #740）。#2〜#4 は
+`...PENDING` という**プレースホルダ**で、投げても何も起きない。「信頼bot」は `.env` に
+`CLORD_TRUSTED_BOT_IDS=1475105094071750818`(prod bot) があるか。どちらが無くても
+**新しいスレッドは `POST /api/spawn` で全台立てられる**（下の「トリガー」節）。
 
 † #1 は既存 staging。2026-06-11 に bot/channel/ディレクトリを全て `staging-1` 系へ改称完了(旧名 `c-lord-parallel-3` / `C-lord-3` / `#c-lord-3`)。統合ロール名のみ `C-lord-3` のまま残る(managed ロールは API 改名不可。Portal の Application 名変更で揃う。機能には無影響)。
 
@@ -52,11 +57,44 @@ session dir は `.env` の `SESSION_DIR_BASE` で決めている(上表はいま
 - 各 clone の `.env` に `DISCORD_CHANNEL_ID` / `EXPECTED_BOT_USER_ID` / `E2E_TEST_THREAD_ID` 設定済み。
   各 staging channel は自分の clone に `channel_repo_bindings` で bind 済み(`/clord-init` 相当)。
 
-### 他エージェントからのトリガー(信頼bot方式, webhook 不要)
+### 他エージェントからのトリガー(新しいスレッド / 既存スレッドへの返信)
+
+**新しいスレッドを立てるには webhook の `!clord` か `POST /api/spawn` が要る。信頼bot方式は既存スレッドへの返信専用。**
+(#740 — これを知らずに信頼bot方式でチャンネルへ投稿し、スレッドが立たずに時間を溶かした)
+
+| やりたいこと | 使えるもの | 使えないもの |
+|---|---|---|
+| **新しいスレッドを立てる** | `POST /api/spawn`(全台) / webhook で `!clord <prompt>`(webhook がある台 = #1 のみ) | 信頼bot方式・チャンネルへの直接投稿 |
+| **既存スレッドに返信する**(2通目以降・E2E スレッド) | 信頼bot方式(#2〜#4) / webhook に `thread_id` を付けて POST(#1) | — |
+
+なぜ信頼bot方式でスレッドが立たないか(どちらもコードの挙動):
+
+1. **チャンネルへの直接投稿はそもそもスレッドを作らない。** `claude_chat.on_message` は
+   `message.channel.id == self.bot.channel_id` のメッセージを無視する(スレッドを作るのは `!clord` と `spawn_session`)。
+2. **webhook 以外の bot 投稿はテキストコマンドを起動できない。** `bot.py::process_commands` が
+   `if message.author.bot and not message.webhook_id: return` なので、prod token で `!clord` を投稿しても発火しない。
+
+#### 新しいスレッドを立てる — `POST /api/spawn`(webhook 不要・全台)
+
+REST API は #712 以降常時起動している。同じ Unix ユーザーからの呼び出しは認証ヘッダ無しで通る(#457)。
+
+```bash
+N=2                          # staging 番号
+PORT=$((8087 + 2*N))         # port = 8087 + 2×N (上表)
+CH=1514535894575743056       # 上表のその台の channel id (省略時はその bot の DISCORD_CHANNEL_ID)
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d "{\"prompt\":\"<検証入力>\",\"channel_id\":\"$CH\"}" \
+  "http://127.0.0.1:$PORT/api/spawn"
+# → {"status":"spawned","thread_id":"…","thread_name":"…"}  (201)
+```
+
+返ってきた `thread_id` への 2 通目以降は、下の信頼bot方式(または webhook の `thread_id=`)で送ればよい。
+
+#### 既存スレッドに返信する — 信頼bot方式(webhook 不要, #2〜#4)
 
 新 staging (#2–#4) は `.env` に `CLORD_TRUSTED_BOT_IDS=1475105094071750818`(prod bot) を設定済み。
-prod の bot token で各台の **E2E スレッド**に投稿すれば、その staging bot が信頼 bot として受理し
-(`claude_chat._is_message_authorized`)、Claude を起動して応答をスレッドにミラーする(jsonl の
+prod の bot token で各台の **E2E スレッド**(または `/api/spawn` で立てたスレッド)に投稿すれば、その staging bot が
+信頼 bot として受理し(`claude_chat._is_message_authorized`)、Claude を起動して応答をスレッドにミラーする(jsonl の
 `TranscriptMirrorCog` 経由)。Discord webhook も Manage Webhooks も要らない。
 
 ```bash
@@ -70,8 +108,9 @@ curl -s -X POST -H "Authorization: Bot $PTOK" -H "User-Agent: DiscordBot/1.0" \
 ```
 
 borrow → ブランチ切替(`staging.sh restart <branch>`) → トリガー → 原状復帰 → release の流れは
-下の「占有プロトコル」「検証レシピ」と同じ(対象 clone を上表で読み替えるだけ)。既存 #1 は従来どおり
-webhook (`E2E_TEST_WEBHOOK_URL`) でもトリガーできる。
+下の「占有プロトコル」「検証レシピ」と同じ(対象 clone を上表で読み替えるだけ)。#1 は信頼bot方式が
+設定されていない代わりに、実在の webhook (`E2E_TEST_WEBHOOK_URL`) でトリガーできる(新スレッドは
+`{"content":"!clord <prompt>"}` をそのまま POST、返信は `?thread_id=` 付き)。
 
 ## 安全原理(コードで強制されているもの)
 
@@ -344,6 +383,7 @@ bash scripts/staging.sh release            # 検証後の原状復帰とセッ�
 
 **前提**(これを満たさないと curl が静かに no-op して偽 GREEN になる — #322 根因C):
 - staging の `.env` に `E2E_TEST_WEBHOOK_URL` と **`E2E_TEST_THREAD_ID`** が設定されていること
+  (webhook が実在するのは #1 だけ — フリート表参照。#2〜#4 では下の webhook curl を信頼bot方式の curl に読み替える)
 - `E2E_TEST_THREAD_ID` のスレッドが staging の `sessions.db` に**セッションレコードを持つ**こと
   (持たないスレッドへの投稿は `on_message` が無視する。チャンネル直投稿も Claude を起動しない)
 - 確認/再導出: `python3 -c "import sqlite3; print(sqlite3.connect('data/sessions.db').execute('select thread_id from sessions order by last_used_at desc limit 3').fetchall())"`
@@ -377,11 +417,12 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 2. サーバに専用チャンネルを作成し、bot を招待(送信・スレッド権限)。チャンネルに Webhook を作成
 3. `git clone` で新ディレクトリ(例 `/home/yousan/c-lord-parallel-4`)を作成、`uv sync --dev`
 4. `.env` を**実ファイル**で作成(symlink 禁止 — #326)。必須: `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` /
-   **`EXPECTED_BOT_USER_ID`(新 bot の user id)** / `CLORD_API_PORT`(未使用ポート、#258 で自動化予定) /
+   **`EXPECTED_BOT_USER_ID`(新 bot の user id)** / `CLORD_API_PORT`(未使用ポート。書かなくても #258 で空きポートへずれて起動するが、フリートでは番号を固定して `port = 8087 + 2×N` に揃える) /
    **`CLORD_INSTANCE`(例 `staging-5`)** / `E2E_TEST_WEBHOOK_URL`
    - session dir は `SESSION_DIR_BASE` を書かなければ `~/.c-lord/<CLORD_INSTANCE>/sessions/` に作られる(#837)。
      `CLORD_INSTANCE` を書いておけば、あとで clone を改名しても置き場が変わらない(改名で `--resume` が切れない)
-   - `E2E_TEST_WEBHOOK_URL` は任意。webhook を作らない場合は次の信頼bot方式で代替できる。
+   - `E2E_TEST_WEBHOOK_URL` は任意。webhook を作らない場合、新スレッドは `POST /api/spawn`、既存スレッドへの
+     返信は次の信頼bot方式で代替できる。プレースホルダを入れたなら「staging フリート」節の表に **webhook なし** と書く。
    - 信頼bot方式を使うなら `CLORD_TRUSTED_BOT_IDS=<prod bot user id>` も入れる(prod token 投稿でトリガー可能になる)。
 5. **channel アクセス**: 新 bot に共有ロール **`c-lord-staging`** を付与(`PUT /guilds/{g}/members/{bot}/roles/{role}`)。
    非公開カテゴリでもこのロール 1 つで閲覧可になる(個別 overwrite は不要。「staging フリート」節参照)。
@@ -396,7 +437,8 @@ bash scripts/staging.sh restart main && rm -f .staging-lease
 | 症状 | 見る場所 | 典型原因 |
 |---|---|---|
 | `IDENTITY MISMATCH` で起動失敗 | per-run ログ | 意図と違う token(.env の token と EXPECTED_BOT_USER_ID の組を確認)。**ガードが正しく働いている** |
-| webhook を投げても無反応 | `E2E_TEST_THREAD_ID` の sessions レコード有無 | スレッドにセッションが無い / thread_id 空(前提節を参照) |
+| webhook を投げても無反応 | `E2E_TEST_THREAD_ID` の sessions レコード有無 / フリート表の webhook 列 | スレッドにセッションが無い / thread_id 空(前提節を参照) / その台の webhook が `...PENDING` プレースホルダ |
+| prod token でチャンネルに投稿してもスレッドが立たない | — | 仕様。信頼bot方式は既存スレッドへの返信専用 — 新スレッドは `POST /api/spawn`(「トリガー」節) |
 | `instances: 2+` | `staging.sh status` | 二重起動 — `stop` → `restart`。手動 kill 禁止事項を守ったか確認 |
 | 起動直後に死ぬ | per-run ログ末尾 | LoginFailure(token 不正)/ DB スキーマ不整合(古いブランチ — idle は main) |
 | `API server not listening` | per-run ログの `REST API could not bind` | ポート衝突。その clone の `CLORD_API_PORT` を空き番号に(#712 以降 API は常時起動する) |

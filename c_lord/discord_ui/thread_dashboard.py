@@ -125,6 +125,7 @@ def _completion_text(
     no_response: bool,
     usage_limit: UsageLimit | None = None,
     login_required: bool = False,
+    model_unavailable: str | None = None,
 ) -> str:
     """The turn-end ping. Says what actually happened (#562, #631, #812).
 
@@ -160,6 +161,12 @@ def _completion_text(
             "🔑 Claude Code のログインが切れているため、このターンは実行されていません。"
             "ホストで `claude` を開いて `/login` してください。"
             f"ログインするまでは送り直しても同じ結果になります。 <@{mention_id}>"
+        )
+    if model_unavailable is not None:
+        return (
+            f"🧩 Claude Code がモデル `{model_unavailable}` を使えないため、"
+            "このターンは実行されていません。`/model set` で使えるモデルに戻してください。"
+            f"戻すまでは送り直しても同じ結果になります。 <@{mention_id}>"
         )
     if no_response:
         return (
@@ -468,6 +475,7 @@ class ThreadStatusDashboard:
         usage_limit: UsageLimit | None = None,
         preempted: bool = False,
         login_required: bool = False,
+        model_unavailable: str | None = None,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -542,7 +550,13 @@ class ThreadStatusDashboard:
                 # mention pings anywhere in the content, so trailing it does not
                 # weaken the notification.
                 await thread.send(
-                    _completion_text(mention_id, no_response, usage_limit, login_required)
+                    _completion_text(
+                        mention_id,
+                        no_response,
+                        usage_limit,
+                        login_required,
+                        model_unavailable,
+                    )
                 )
             except discord.HTTPException:
                 logger.debug(

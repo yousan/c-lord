@@ -86,12 +86,14 @@ from ..session_reattach import (
     render_history,
 )
 from ..session_resume import (
+    FRESH_START_NOTICE,
     NOT_A_CLORD_THREAD,
     UNTRACKED_NOTICE,
     UNTRACKED_REACTION,
     ThreadResume,
     accepts_message,
     classify,
+    fresh_start_preamble,
     is_clord_thread,
     resume_notice,
     stopped_hint,
@@ -390,6 +392,9 @@ class ClaudeChatCog(commands.Cog):
         # Issue #414: issue/PR number resolved before the session row exists;
         # drained by _apply_thread_naming on the next call once the row is saved.
         self._pending_issue_ref: dict[int, str] = {}
+        # #856: the number the thread's own name leads with (``#812 と…``) — its
+        # origin — when it was read before the row existed. Same drain as above.
+        self._pending_origin_ref: dict[int, str] = {}
         # #512: thread ids reopened since the last turn. Consumed once, to swap the
         # #464 crash-recovery wording ("前回のセッションが落ちていたので…") for the
         # deliberate-reopen wording — a user who closed the session on purpose is
@@ -649,7 +654,12 @@ class ClaudeChatCog(commands.Cog):
         All errors are swallowed by the caller; this helper raises only
         on truly unexpected programmer mistakes.
         """
-        from ..thread_name import build_name, parse_topic_from_name
+        from ..thread_name import (
+            build_name,
+            note_own_rename,
+            parse_origin_ref_from_name,
+            parse_topic_from_name,
+        )
 
         record = await self.repo.get(thread.id)
         topic = record.topic if record else None
@@ -670,18 +680,10 @@ class ClaudeChatCog(commands.Cog):
         # Drain any topic / issue-ref / window-id pending from a previous call
         # where the session row did not yet exist.
         if record is not None:
-            pending = self._pending_topic.pop(thread.id, None)
-            if pending and not record.topic and not locked:
-                await self.repo.set_topic(thread.id, pending[0], source=pending[1])
-                topic = pending[0]
-            pending_ref = self._pending_issue_ref.pop(thread.id, None)
-            if pending_ref and not record.issue_ref:
-                await self.repo.set_issue_ref(thread.id, pending_ref)
-                issue_ref = pending_ref
-                origin_issue_ref = origin_issue_ref or pending_ref
-            pending_win = self._pending_tmux_window_id.pop(thread.id, None)
-            if pending_win and record.tmux_window_id != pending_win:
-                await self.repo.set_tmux_window_id(thread.id, pending_win)
+            drained = await self._drain_pending_naming(thread.id, record)
+            topic = drained.get("topic", topic)
+            issue_ref = drained.get("issue_ref", issue_ref)
+            origin_issue_ref = drained.get("origin_issue_ref", origin_issue_ref)
 
         # Resolve tmux window-id / work-number (the stable w{N} number).
         info = await asyncio.to_thread(tmux_manager.get_window_info, thread.id)
@@ -718,6 +720,18 @@ class ClaudeChatCog(commands.Cog):
         # for costs them that. ``CLORD_AUTO_TOPIC=1`` restores the LLM naming,
         # and ``/thread-rename`` summarises on demand at any time.
         if not topic and not locked:
+            # #856: the topic below is recovered from the name with its leading
+            # ``#NNN`` stripped off as decoration — so that number is the
+            # thread's origin and must be kept here, or no rebuild can put it
+            # back (``#769 → #718 …`` became ``#718 → #718 …`` once the branch
+            # moved to ``fix/718``; a stop rendered ``[停止] と #815 …``).
+            name_ref = parse_origin_ref_from_name(thread.name or "")
+            if name_ref and not origin_issue_ref:
+                origin_issue_ref = name_ref
+                if record is not None:
+                    await self.repo.set_origin_issue_ref(thread.id, name_ref)
+                else:
+                    self._pending_origin_ref[thread.id] = name_ref
             if not self._auto_topic:
                 topic = topic_module.initial_topic(thread.name or "", first_message or "")
                 source = "thread_name"
@@ -778,6 +792,8 @@ class ClaudeChatCog(commands.Cog):
         )
         if (thread.name or "") == new_name:
             return
+        # #856: so the echo of this edit is not recorded as a manual rename.
+        note_own_rename(thread.id, new_name)
         try:
             await asyncio.wait_for(thread.edit(name=new_name), timeout=5.0)
             logger.info(
@@ -818,6 +834,72 @@ class ClaudeChatCog(commands.Cog):
                         "-# スレッド名を自動更新できませんでした"
                         "（bot に「スレッドの管理 / Manage Threads」権限が必要）"
                     )
+
+    async def _drain_pending_naming(self, thread_id: int, record: SessionRecord) -> dict[str, str]:
+        """Persist what a naming pass stashed before ``record``'s row existed.
+
+        Returns the values it wrote (keys ``topic`` / ``issue_ref`` /
+        ``origin_issue_ref``) so a naming pass in progress can use them.
+
+        The origin goes first: :meth:`SessionRepository.set_issue_ref` seeds the
+        origin from the current number when none is recorded, and the number the
+        name led with (#856) must win that race.
+        """
+        written: dict[str, str] = {}
+        pending_origin = self._pending_origin_ref.pop(thread_id, None)
+        if pending_origin and not record.origin_issue_ref:
+            await self.repo.set_origin_issue_ref(thread_id, pending_origin)
+            written["origin_issue_ref"] = pending_origin
+        pending = self._pending_topic.pop(thread_id, None)
+        if pending and not record.topic and not record.auto_topic_locked:
+            await self.repo.set_topic(thread_id, pending[0], source=pending[1])
+            written["topic"] = pending[0]
+        pending_ref = self._pending_issue_ref.pop(thread_id, None)
+        if pending_ref and not record.issue_ref:
+            await self.repo.set_issue_ref(thread_id, pending_ref)
+            written["issue_ref"] = pending_ref
+            written.setdefault("origin_issue_ref", record.origin_issue_ref or pending_ref)
+        pending_win = self._pending_tmux_window_id.pop(thread_id, None)
+        if pending_win and record.tmux_window_id != pending_win:
+            await self.repo.set_tmux_window_id(thread_id, pending_win)
+        return written
+
+    async def on_session_saved(self, thread_id: int) -> None:
+        """The turn just saved ``thread_id``'s row — persist the naming stash (#856).
+
+        The first naming pass runs before the row exists, so what it works out
+        (topic, the ``#812`` the thread was opened for) can only be stashed in
+        memory. That stash used to be drained by the *next* naming pass — which a
+        dispatch thread (one long turn, then ``/workspace-stop``) never reaches,
+        and which a restart wipes. 23 stopped threads lost their number that way
+        in five days. Writing it here, right after the save, closes the window.
+
+        Never raises: naming is decoration and must not break the turn.
+        """
+        if not (
+            thread_id in self._pending_topic
+            or thread_id in self._pending_issue_ref
+            or thread_id in self._pending_origin_ref
+            or thread_id in self._pending_tmux_window_id
+        ):
+            return
+        try:
+            record = await self.repo.get(thread_id)
+            if record is None:
+                return
+            written = await self._drain_pending_naming(thread_id, record)
+            if written:
+                logger.info(
+                    "%s naming persisted on session save (#856): %s",
+                    log_ctx(thread_id=thread_id),
+                    written,
+                )
+        except Exception:
+            logger.warning(
+                "%s could not persist the pending thread naming",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
 
     async def _detect_issue_ref(
         self,
@@ -1056,6 +1138,20 @@ class ClaudeChatCog(commands.Cog):
             logger.info("%s reattached on arrival — running the message (#700)", ctx)
             await self._handle_thread_reply(message)
             return
+        # #862: nothing to reconnect to, but the binding still says which repo
+        # this thread works in — so start over here instead of sending the
+        # reader off to open a new thread. Only an unbound thread, where there
+        # is nothing to clone, still gets the refusal below.
+        if await self._can_start_fresh(thread, parent_channel_id):
+            logger.info(
+                "%s nothing left to reconnect to — starting a new conversation here (#862)%s",
+                ctx,
+                f" — swept at {tomb.closed_at}" if tomb is not None else "",
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(FRESH_START_NOTICE)
+            await self._handle_thread_reply(message, fresh=True)
+            return
 
         logger.info(
             "%s message not run — nothing left to reconnect to (#538)%s",
@@ -1071,6 +1167,41 @@ class ClaudeChatCog(commands.Cog):
         self._untracked_notice_sent.add(thread.id)
         with contextlib.suppress(discord.HTTPException):
             await thread.send(swept_notice(tomb) if tomb is not None else UNTRACKED_NOTICE)
+
+    async def _can_start_fresh(self, thread: discord.Thread, parent_channel_id: int) -> bool:
+        """Whether a thread with nothing to reconnect to can start over — #862.
+
+        True when a repository binding (the thread's own or its channel's)
+        resolves, because that is what tells ``_run_claude`` what to clone. It
+        is the same precondition a brand-new thread has: without it there is
+        nothing to start, and the caller keeps the old notice.
+        """
+        try:
+            sdm = await self._resolve_session_dir_manager(parent_channel_id, thread_id=thread.id)
+            tmux = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+        except Exception:
+            logger.warning(
+                "%s binding lookup failed — not starting over",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            return False
+        return sdm is not None and tmux is not None
+
+    async def _close_leftover_window(self, thread: discord.Thread) -> None:
+        """Close ``thread``'s own tmux window before a fresh start — #862. Never raises."""
+        parent_channel_id = getattr(thread, "parent_id", None) or thread.id
+        ctx = log_ctx(thread_id=thread.id)
+        try:
+            tmux_manager = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread.id)
+            if tmux_manager is None:
+                return
+            if await asyncio.to_thread(tmux_manager.kill_session, thread.id):
+                logger.info("%s closed the leftover window before starting fresh (#862)", ctx)
+        except Exception:
+            # Worst case the turn lands in the old window — the pre-#862 risk,
+            # not a reason to drop the message.
+            logger.warning("%s could not close the leftover window (#862)", ctx, exc_info=True)
 
     async def _swept_record(self, thread_id: int) -> SessionRecord | None:
         """The 30-day sweep's tombstone for ``thread_id``, if there is one — #818.
@@ -1213,6 +1344,14 @@ class ClaudeChatCog(commands.Cog):
             return False
         if await self._auto_reattach(thread, parent_channel_id) is not None:
             logger.info("%s /clord: reattached, continuing (#551/#538/#700)", ctx)
+            return True
+        if await self._can_start_fresh(thread, parent_channel_id):
+            # #862: the same answer a plain message gets — start over here.
+            # The caller finds no row and runs the prompt with no session id,
+            # which is exactly a new thread's first turn.
+            logger.info("%s /clord: nothing to reconnect to — starting fresh (#862)", ctx)
+            with contextlib.suppress(discord.HTTPException):
+                await thread.send(FRESH_START_NOTICE)
             return True
         logger.info("%s /clord: nothing left to reconnect to (#538 AC8)", ctx)
         with contextlib.suppress(discord.HTTPException):
@@ -1427,6 +1566,13 @@ class ClaudeChatCog(commands.Cog):
             # Continue in existing thread. The row was read by the #551 branch
             # above, which only lets a thread through when it has one.
             session_id = (thread_record.session_id or None) if thread_record else None
+            # #862: no row even after the branch above means it started over —
+            # the first prompt carries the "history is in the thread" line.
+            claude_prompt = (
+                prompt
+                if thread_record is not None
+                else f"{fresh_start_preamble(channel.id)}\n\n{prompt}"
+            )
             try:
                 seed_message = await channel.send(prompt)
             except discord.Forbidden:
@@ -1442,7 +1588,7 @@ class ClaudeChatCog(commands.Cog):
             # #520: the seed message above is ours, so hand the invoker down
             # explicitly — otherwise the turn would ping and credit the bot.
             await self._run_claude(
-                seed_message, channel, prompt=prompt, session_id=session_id, requester=user
+                seed_message, channel, prompt=claude_prompt, session_id=session_id, requester=user
             )
             await respond("Session completed.", silent=True)
         else:
@@ -2896,9 +3042,18 @@ class ClaudeChatCog(commands.Cog):
             await run_startup_recovery(self.bot, self.repo, self._ask_repo)
 
     async def _handle_thread_reply(
-        self, message: discord.Message, *, earlier: Sequence[discord.Message] = ()
+        self,
+        message: discord.Message,
+        *,
+        earlier: Sequence[discord.Message] = (),
+        fresh: bool = False,
     ) -> None:
         """Continue a Claude Code session in an existing thread.
+
+        ``fresh`` (#862) starts a new conversation instead: the thread had
+        nothing left to reconnect to, so there is no session to continue. It
+        forbids ``--continue``/``--resume`` outright and prepends
+        :func:`~c_lord.session_resume.fresh_start_preamble` to this one prompt.
 
         ``earlier`` (#745) carries messages that reached this thread before
         *message* while the gateway was down. They run in this same turn —
@@ -2952,9 +3107,11 @@ class ClaudeChatCog(commands.Cog):
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
             record = await self.repo.get(thread.id)
-            session_id = (record.session_id or None) if record else None
+            session_id = (record.session_id or None) if record and not fresh else None
             prompt, image_paths = await self._build_prompt_and_images(message)
             prompt = await enrich_discord_references(prompt, message, self.bot)
+            if fresh:
+                prompt = f"{fresh_start_preamble(thread.id)}\n\n{prompt}"
             if earlier:
                 prompt = merge_missed_prompt(
                     [
@@ -2995,6 +3152,13 @@ class ClaudeChatCog(commands.Cog):
             # This extends the --continue fallback (previously only on the
             # restart-resume path, #123 Part 2) to the ordinary reply path.
             try_continue = False
+            if fresh:
+                # #862: the sweep tidies the checkout, not the tmux window. A
+                # window still holding the old Claude would take this prompt as
+                # the next turn of the conversation we are starting over from —
+                # in a directory that no longer exists. It is this thread's own
+                # window, so closing it touches nobody else.
+                await self._close_leftover_window(thread)
             if session_id is not None and not had_active:
                 parent_channel_id = getattr(thread, "parent_id", None) or thread.id
                 tmux_manager = await self._resolve_tmux_manager(
@@ -4064,6 +4228,9 @@ class ClaudeChatCog(commands.Cog):
                 # #681: who hears about a turn that ended in an error. The ❌
                 # embed carries the cause; this is what makes it push.
                 failure_notify_id=failure_notify_id,
+                # #856: persist the naming pass's stash the moment the row
+                # exists, not on a next naming pass that may never come.
+                on_session_saved=self.on_session_saved,
             )
             try:
                 await run_claude_with_config(run_config)
@@ -4116,6 +4283,9 @@ class ClaudeChatCog(commands.Cog):
                         # #812: and when Claude Code is logged out, say that —
                         # only /login on the host can fix it.
                         login_required=run_config.outcome.login_required,
+                        # #484: and when it refused the configured model, point
+                        # at /model set — the only thing that can change it.
+                        model_unavailable=run_config.outcome.model_unavailable,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply

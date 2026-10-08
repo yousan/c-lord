@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  claude-nonexistent-zzz with medium effort · Claude Max
+ ▝▝   ▝▝   ~/c-lord-sessions-staging-2/1514535894575743056/1554739576826757180
+
+⚠ CLAUDE.md is over the 40.0k-char limit (41.7k chars) · /memory to free up context
+
+❯ #484 RED: こんにちは。1行で返事してください
+
+● There's an issue with the selected model (claude-nonexistent-zzz). It may not exist or you may not have access to it. Run /model to pick a different
+  model.
+
+✻ Worked for 2s · done 3:20 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: claude-nonexistent-zzz  v2.1.283  Style: default  Ctx: 0  Context: [░░░░░░░░░░░░░░░░] 0/200k (0%)  Ctx Used: 0.0%  Ctx(u) Used: 0.0% 
+   Cost: $0.00  Session: 23.0%  Weekly: 59.0%  Session: <1m  Reset: 1hr 39m  Weekly Reset: 2d 1hr 39m  Block: 3hr 20m  In: 0  Out: 0  Cached: 0  Total: 0...
+   ⎇ main  (+0,-0)  +0  -0  1554739576826757180  𖠰 main  cwd: /home/yousan/c-lord-sessions-staging-2/1514535894575743056/1554739576826757180  Skill: none 
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

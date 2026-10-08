@@ -183,7 +183,7 @@ The `repo` value is stored in clonable form. A PR / issue / file link is shrunk 
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/model show` | Show the current Claude model | Anywhere |
-| `/model set <model>` | Change the global model for new sessions. Pick a tier alias (`sonnet`/`opus`/`haiku`, each resolves to the latest of that tier) or type any model ID (e.g. `claude-fable-5`) — the CLI validates it | Anywhere |
+| `/model set <model>` | Change the global model for new sessions. Pick a tier alias (`sonnet`/`opus`/`haiku`, each resolves to the latest of that tier) or type any model ID (e.g. `claude-fable-5`) — the CLI validates it. If the CLI cannot use it, every turn in a new session ends with a ❌ "設定されたモデルを Claude Code が使えません" embed naming the model, until you `/model set` a usable one (#484) | Anywhere |
 
 Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful).
 
@@ -305,7 +305,7 @@ sqlite3 <data_dir>/sessions.db \
   "SELECT thread_id, session_id, working_dir, closed_at FROM sessions WHERE thread_id = <THREAD_ID>"
 ```
 
-A swept row is history, not a session: it is left out of `/clord-status`, the transcript mirror, and every periodic sweep, exactly as when the row was deleted. Posting into the thread later either reconnects to a checkout still on disk (#700) or — when nothing is left — answers with 「🧹 このスレッドは YYYY-MM-DD に**片付け済み**です … いま送ったメッセージは Claude に届いていません」 plus the next step, instead of dropping the message (a human-created thread with no other trace of c-lord used to get no answer at all). Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
+A swept row is history, not a session: it is left out of `/clord-status`, the transcript mirror, and every periodic sweep, exactly as when the row was deleted. Posting into the thread later either reconnects to a checkout still on disk (#700), or — when nothing is left but a repository binding still resolves — posts 「🧹 前の会話は残っていないので、新しい会話として始めます」, clones the session dir again and runs the message as the first turn of a **new** conversation in the same thread (#862; no `--continue`, and the first prompt notes that the thread's earlier exchange can be read with the `discord-read` skill). Only a thread with no binding at all still answers with 「🧹 このスレッドは YYYY-MM-DD に**片付け済み**です … いま送ったメッセージは Claude に届いていません」 plus the next step, instead of dropping the message (a human-created thread with no other trace of c-lord used to get no answer at all). Until #554 that was completely silent — one `Cleaned up 3 old sessions` line in the bot log, without even the thread ids — so the first anyone heard of it was a month later:
 
 > 古い C-lord セッションを続けようとしたところセッションが無い、って言われちゃった。消した覚えは無いはず。Discord 上にそういう事も書いてないし
 
@@ -323,6 +323,15 @@ The sweep still runs. What changed is that **each swept thread now gets a notice
 ```
 
 (The "clone only" case — a checkout the sweep **kept because it held uncommitted work** — verbatim from `c_lord/session_cleanup.py::notice_for`.)
+
+**Only open threads get the notice, and they are closed again after it (#857).** Discord un-archives a thread the moment anything is posted to it, and a thread unused for 30 days is usually already closed — on 2026-10-02 the notice reopened 27 closed threads at once. So:
+
+| The thread when it is swept | What appears in Discord |
+|---|---|
+| already archived (closed) | **nothing** — it stays closed; the checkout is tidied and the tombstone recorded all the same. Posting there later starts a new conversation (#862), or gets the 「片付け済み」 answer above when no binding resolves |
+| still open | the notice above, then the thread is archived |
+
+Each decision is one `[thread=<id>]` INFO line: `thread already archived — swept silently, no notice (#857)` or `cleanup notice posted, thread archived`.
 
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
@@ -438,10 +447,11 @@ twins are the webhook-invocable path, so these flows can be verified
 automatically (see `tests/e2e/test_text_command_twins.py`).
 
 > **Note (leading-slash is _not_ a substitute).** Typing `/skill-name` as an
-> ordinary message does **not** run the skill: c-lord prefixes every message
-> sent to the Claude TUI with a zero-width-space
-> marker, so the line no longer starts with `/` and the TUI does not treat it as
-> a slash command. Use the `!`/mention twin instead.
+> ordinary message does **not** run the skill: when a message starts with a
+> character that switches the Claude TUI's input box into another mode (`/`, `!`,
+> `#`, `&`, `?`), c-lord types it with one leading space, so the TUI takes it as
+> ordinary text (#861 — before that a zero-width-space marker did this job, until
+> CLI 2.1.278 started stripping it). Use the `!`/mention twin instead.
 
 > **Auth note.** Every text twin except the read-only `!version`,
 > `!model-show` and `!thread-archive-show` is authorized by the message-backed

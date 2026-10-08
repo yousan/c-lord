@@ -263,6 +263,29 @@ def login_required_embed(detail: str) -> discord.Embed:
     )
 
 
+def model_unavailable_embed(detail: str) -> discord.Embed:
+    """Embed for a turn Claude Code refused because it cannot use the model (#484).
+
+    ``/model set`` accepts any well-formed ID and leaves the verdict to the CLI
+    (#478).  The CLI's own line says "Run /model", which inside the pane would
+    only change that one session — the setting that keeps handing Claude the
+    bad model is c-lord's, so this names ``/model set``.
+    """
+    return discord.Embed(
+        title="\U0001f9e9 設定されたモデルを Claude Code が使えません",
+        description=(
+            f"{detail}\n\n"
+            "Claude Code がモデルを受け付けなかったため、このターンは実行されていません。\n"
+            "**モデルを変えるまでは、同じ内容を送り直しても同じ結果になります。**\n\n"
+            "**できること:**\n"
+            "\u2022 `/model show` で c-lord に設定されているモデルを確認する\n"
+            "\u2022 `/model set` で使えるモデル（`sonnet` / `opus` など）に戻す\n"
+            "\u2022 モデル ID の綴りや、そのモデルがいま提供されているかを確認する"
+        ),
+        color=COLOR_ERROR,
+    )
+
+
 def trust_stuck_embed(detail: str) -> discord.Embed:
     """Embed for a turn blocked on a folder-trust dialog that would not close (#630).
 

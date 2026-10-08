@@ -133,6 +133,13 @@ USAGE_LIMIT_ERROR_PREFIX = "Usage limit —"
 # fails identically until then.
 LOGIN_REQUIRED_ERROR_PREFIX = "Login required —"
 
+# Prefix of the RESULT error for "Claude Code will not use the configured
+# model" (#484).  ``/model set`` accepts any well-formed ID and leaves the
+# verdict to the CLI (#478), and the CLI does not fail to start on one it cannot
+# use — it starts and refuses every turn with one line.  Like LOGIN_REQUIRED the
+# cure is outside the turn (``/model set``), so resending cannot help.
+MODEL_UNAVAILABLE_ERROR_PREFIX = "Model unavailable —"
+
 # Prefix of the RESULT error for "the tmux server this pane lived in was
 # replaced while the turn was running" (#701).  The one outcome here that is
 # not about this thread at all: the fleet's tmux went down under it, so every
@@ -482,7 +489,17 @@ def extract_login_required(pane: str) -> str | None:
 
 
 def _login_refusal_after_prompt(pane: str, prompt: str) -> str | None:
-    """The login refusal drawn under THIS turn's prompt, else None (#812).
+    """The login refusal drawn under THIS turn's prompt, else None (#812)."""
+    return _refusal_after_prompt(pane, prompt, _LOGIN_REQUIRED_RE, "line")
+
+
+def _refusal_after_prompt(
+    pane: str, prompt: str, pattern: re.Pattern[str], group: str
+) -> str | None:
+    """*pattern*'s *group* for a refusal drawn under THIS turn's prompt, else None.
+
+    Shared by the login (#812) and model (#484) refusals, which have the same
+    shape: one line, drawn within a second or two of the prompt.
 
     Claude refuses in 0s, so the refusal is often on screen before the runner's
     first capture — a count taken then already includes it, and never grows.
@@ -508,9 +525,9 @@ def _login_refusal_after_prompt(pane: str, prompt: str) -> str | None:
     if echo is None:
         return None
     for line in lines[echo + 1 :]:
-        m = _LOGIN_REQUIRED_RE.search(line)
+        m = pattern.search(line)
         if m:
-            return m.group("line")
+            return m.group(group)
     return None
 
 
@@ -522,6 +539,55 @@ def _count_login_required(pane: str) -> int:
     turn is on screen when this one starts, and it says nothing about this one.
     """
     return len(_LOGIN_REQUIRED_RE.findall(pane)) if pane else 0
+
+
+# -- Unusable model (#484) ------------------------------------------------------
+#
+# Given a model it cannot use, Claude Code 2.1.283 starts normally and answers
+# every prompt with one line, then goes idle (captured on staging in
+# tests/fixtures/panes/model_not_found.txt):
+#
+#     ❯ hello
+#     ● There's an issue with the selected model (claude-nonexistent-zzz). It may
+#       not exist or you may not have access to it. Run /model to pick a different
+#       model.
+#
+# So this is not a startup failure — ``_extract_startup_error`` (gated on "no
+# answer yet") never sees it, because the refusal IS the answer.  It is the
+# #812 shape, detected the same way: anchored to a line that starts with the
+# message (after gutter chrome), so prose quoting it does not match, and tied
+# to this turn's prompt so a refusal redrawn from an earlier turn does not.
+# The start banner also names the model, but refuses nothing, so it is not
+# matched.  Only the head of the sentence is matched: the rest wraps.
+_MODEL_UNAVAILABLE_RE = re.compile(
+    r"^(?:[^\S\n]|[●⏺⎿╰│┃|>*•-])*"
+    r"There's an issue with the selected model \((?P<model>[^()\s]{1,120})\)",
+    re.MULTILINE,
+)
+
+
+def extract_model_unavailable(pane: str) -> str | None:
+    """Return the model named by the last "issue with the selected model" refusal (#484)."""
+    if not pane:
+        return None
+    found = _MODEL_UNAVAILABLE_RE.findall(pane)
+    return found[-1] if found else None
+
+
+def unavailable_model(error: str) -> str | None:
+    """The model named in a :data:`MODEL_UNAVAILABLE_ERROR_PREFIX` error, else None.
+
+    Kept next to the one place that writes that error, so the two cannot drift.
+    """
+    if not error.startswith(MODEL_UNAVAILABLE_ERROR_PREFIX):
+        return None
+    m = re.search(r'the model "([^"]+)"', error)
+    return m.group(1) if m else ""
+
+
+def _count_model_unavailable(pane: str) -> int:
+    """How many model refusals *pane* shows — same baseline rule as #812."""
+    return len(_MODEL_UNAVAILABLE_RE.findall(pane)) if pane else 0
 
 
 # -- Claude plan/usage limits (#631) --------------------------------------------
@@ -744,6 +810,48 @@ def _unknown_prompt_signature(text: str) -> str:
 
 # Regex for separator lines (all box-drawing horizontal characters).
 _SEPARATOR_RE = re.compile(r"^[─━═─\s]{10,}$")
+
+# A horizontal rule that frames the input box.  Stricter than ``_SEPARATOR_RE``,
+# which also matches a row of 10+ plain spaces — a blank row must not pass for
+# one edge of the box.
+_INPUT_BOX_RULE_RE = re.compile(r"^\s*[─━═]{4,}\s*$")
+
+
+def _input_box_rows(lines: list[str]) -> set[int]:
+    """Indices of the live input box's text rows in *lines* (#858).
+
+    Claude Code draws the box as a ``❯ <text>`` row (wrapped text continues on
+    the rows below it) between two horizontal rules, with the status rows under
+    the lower rule::
+
+        ────────────────
+        ❯ 8.33 に戻して確かめて
+        ────────────────
+           Model: Opus 5.5  v2.1.283 ...
+
+    Whatever sits in the box — a suggestion from the CLI, or text the user left
+    unsent — is not part of any menu, yet ``❯ 8.33 …`` has exactly the shape of
+    a ``❯ 1.`` menu cursor.  Only the last framed block whose first row starts
+    with ``❯`` counts: menus are not drawn between two rules, so the numbered
+    cursor of a real menu is never inside it.  Returns an empty set when the
+    pane shows no box (a menu is open instead, or the top rule scrolled off).
+    """
+    plain = [_ANSI_CSI_RE.sub("", line) for line in lines]
+    rules = [i for i, line in enumerate(plain) if _INPUT_BOX_RULE_RE.match(line)]
+    for top, bottom in reversed(list(zip(rules, rules[1:], strict=False))):
+        if bottom - top > 1 and plain[top + 1].lstrip().startswith("❯"):
+            return set(range(top + 1, bottom))
+    return set()
+
+
+def _blank_input_box(text: str) -> str:
+    """*text* with the input box rows emptied, every other row in place (#858)."""
+    lines = text.splitlines()
+    box = _input_box_rows(lines)
+    if not box:
+        return text
+    return "\n".join("" if i in box else line for i, line in enumerate(lines))
+
 
 # -- AskUserQuestion TUI menu parsing (#166) ----------------------------------
 # The AskUserQuestion tool renders a numbered menu in the pane that c-lord
@@ -1601,7 +1709,12 @@ class TmuxClaudeRunner:
                 yield stopped
                 return
             self._take_send_failure()  # #809: only this send's refusal may explain it
-            ok = await asyncio.to_thread(self._tmux.send_input, self._thread_id, prompt)
+            ok = await asyncio.to_thread(
+                self._tmux.send_input,
+                self._thread_id,
+                prompt,
+                as_command=self._slash_command,
+            )
             if not ok:
                 refused = self._take_send_failure()
                 # #560: two very different failures reach this branch. Either the
@@ -1848,6 +1961,10 @@ class TmuxClaudeRunner:
         login_required: str | None = None
         baseline_login_count = 0
         baseline_login_captured = False
+        # #484: the "issue with the selected model" refusal, same bookkeeping.
+        model_unavailable: str | None = None
+        baseline_model_count = 0
+        baseline_model_captured = False
 
         # #365: Gate completion on the NEW turn actually having started. When a
         # follow-up message is delivered to an already-running Claude
@@ -1958,6 +2075,25 @@ class TmuxClaudeRunner:
                     "%s Claude Code login required, aborting poll: %s",
                     log_ctx(thread_id=self._thread_id),
                     login_required,
+                )
+                break
+
+            # #484: the configured model is unusable.  Same shape and same
+            # reasons as the login refusal above, including NOT being gated on
+            # ``not last_response`` — the refusal is the scraped answer.
+            model_count = _count_model_unavailable(current)
+            if not baseline_model_captured:
+                baseline_model_captured = True
+                baseline_model_count = model_count
+            refused_model = _refusal_after_prompt(current, prompt, _MODEL_UNAVAILABLE_RE, "model")
+            if refused_model is None and model_count > baseline_model_count:
+                refused_model = extract_model_unavailable(current)
+            if refused_model is not None:
+                model_unavailable = refused_model
+                logger.warning(
+                    "%s Claude Code refused the configured model, aborting poll: %s",
+                    log_ctx(thread_id=self._thread_id),
+                    model_unavailable,
                 )
                 break
 
@@ -2342,6 +2478,14 @@ class TmuxClaudeRunner:
                 f'{LOGIN_REQUIRED_ERROR_PREFIX} Claude Code replied "{login_required}" '
                 "and did not run this turn. Someone has to run /login in claude on "
                 "the host; until then every message gets the same reply."
+            )
+        elif model_unavailable is not None:
+            # #484: above the ladder for the #812 reason — the refusal is the
+            # scraped answer, so the ladder would call this a normal finish.
+            error = (
+                f"{MODEL_UNAVAILABLE_ERROR_PREFIX} Claude Code cannot use the model "
+                f'"{model_unavailable}" and did not run this turn. Change it with '
+                "/model set; until then every new session gets the same reply."
             )
         elif timed_out or not last_response:
             # Reached completion without a usable response — either the hard
@@ -2955,7 +3099,10 @@ class TmuxClaudeRunner:
         """
         if not text:
             return False
-        zone = _permission_zone(text)
+        # #858: the input box is not a menu, whatever is written in it.  Blank
+        # it on the whole pane (not the zone) so a tall box whose top rule sits
+        # above the zone is still recognised.
+        zone = _permission_zone(_blank_input_box(text))
         has_menu = bool(_INTERACTIVE_MENU_RE.search(zone)) or bool(_YN_PROMPT_RE.search(zone))
         if not has_menu:
             # #695: an unnumbered menu has to be judged on its own terms.  The
@@ -3555,13 +3702,17 @@ class TmuxClaudeRunner:
         ~6–8 lines tall, so a 6-line window misses the box entirely (#62).
         """
         lines = text.rstrip().splitlines()
-        for line in lines[-_INPUT_PROMPT_SCAN_LINES:]:
-            stripped_line = line.strip()
+        # #858: inside the framed box a ``❯\xa08.33 …`` row is the box, not a
+        # numbered-menu cursor, so the menu exclusion below does not apply.
+        box = _input_box_rows(lines)
+        start = max(0, len(lines) - _INPUT_PROMPT_SCAN_LINES)
+        for i in range(start, len(lines)):
+            stripped_line = lines[i].strip()
             if stripped_line in ("❯", ">"):
                 return True
-            if (
-                stripped_line.startswith("❯\xa0") or stripped_line.startswith(">\xa0")
-            ) and not _INTERACTIVE_MENU_RE.match(stripped_line):
+            if (stripped_line.startswith("❯\xa0") or stripped_line.startswith(">\xa0")) and (
+                i in box or not _INTERACTIVE_MENU_RE.match(stripped_line)
+            ):
                 return True
         return False
 
