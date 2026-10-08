@@ -254,17 +254,6 @@ class TestWhoCanStartIt:
     """AC7 / AC8: 起動してよいのは、ふつうに投稿が通る人・担当の c-lord だけ。"""
 
     @pytest.mark.asyncio
-    async def test_webhook_message_starts_nothing(self, tmp_path) -> None:
-        cog = _cog(tmp_path, tomb=_tomb())
-        thread = _thread()
-
-        await cog._handle_untracked_thread(_message(thread, webhook=True), thread)
-        await _drain(cog)
-
-        cog._run_claude.assert_not_awaited()
-        thread.send.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_unauthorized_author_starts_nothing(self, tmp_path) -> None:
         cog = _cog(tmp_path, tomb=_tomb())
         cog._is_message_authorized = MagicMock(return_value=False)  # type: ignore[method-assign]
@@ -317,3 +306,117 @@ class TestHintMatchesBehaviour:
         text = stopped_hint(ThreadResume.UNTRACKED)
         assert "新しい会話" in text
         assert "復元できません" not in text
+
+
+class TestWebhookStartsFresh:
+    """#862 追加要件（2026-10-08）: webhook の普通の文でも新しく始める。
+
+    Claude どうしの発注（タスク管理スレッドが webhook ``?thread_id=`` で古い
+    スレッドに指示を流す）や OpenClaw の人格からの依頼が、黙って捨てられないように。
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_webhook_message_in_a_swept_thread_starts_fresh(self, tmp_path) -> None:
+        cog = _cog(tmp_path, tomb=_tomb())
+        thread = _thread()
+        message = _message(thread, webhook=True)
+
+        await cog._handle_untracked_thread(message, thread)
+        await _drain(cog)
+
+        assert FRESH_START_NOTICE in _sent(thread)
+        cog._run_claude.assert_awaited_once()
+        assert cog._run_claude.await_args.args[0] is message
+        assert cog._run_claude.await_args.kwargs["try_continue"] is False
+        assert fresh_start_preamble(THREAD_ID) in cog._run_claude.await_args.args[2]
+        message.add_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_webhook_message_with_no_row_but_a_binding_starts_fresh(self, tmp_path) -> None:
+        cog = _cog(tmp_path, tomb=None)
+        cog._thread_binding_exists = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        thread = _thread()
+
+        await cog._handle_untracked_thread(_message(thread, webhook=True), thread)
+        await _drain(cog)
+
+        assert FRESH_START_NOTICE in _sent(thread)
+        cog._run_claude.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_webhook_message_reattaches_a_surviving_checkout(self, tmp_path) -> None:
+        """#700 の再接続も webhook で効く（新しく始めるより先に、残っているものを使う）。"""
+        (tmp_path / "sessions" / str(CHANNEL_ID) / str(THREAD_ID)).mkdir(parents=True)
+        cog = _cog(tmp_path, tomb=_tomb())
+        cog._collect_thread_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        thread = _thread()
+
+        await cog._handle_untracked_thread(_message(thread, webhook=True), thread)
+        await _drain(cog)
+
+        cog.repo.save.assert_awaited_once()
+        assert FRESH_START_NOTICE not in _sent(thread)
+        cog._run_claude.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unbound_thread_stays_silent_for_webhooks(self, tmp_path) -> None:
+        """紐付けが無ければ何も起動せず、webhook には案内も ⚠️ も出さない（#556）。"""
+        cog = _cog(tmp_path, tomb=_tomb(), bound=False)
+        thread = _thread()
+        message = _message(thread, webhook=True)
+
+        await cog._handle_untracked_thread(message, thread)
+        await _drain(cog)
+
+        cog._run_claude.assert_not_awaited()
+        thread.send.assert_not_awaited()
+        message.add_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_message_another_cog_claims_starts_nothing(self, tmp_path) -> None:
+        """webhook_trigger / auto_upgrade の決まった形は、そちらの Cog のもの。"""
+        cog = _cog(tmp_path, tomb=_tomb())
+        trigger_cog = MagicMock()
+        trigger_cog.claims_message = MagicMock(return_value=True)
+        cog.bot.cogs = {"WebhookTriggerCog": trigger_cog}
+        thread = _thread()
+        message = _message(thread, webhook=True)
+
+        await cog._handle_untracked_thread(message, thread)
+        await _drain(cog)
+
+        trigger_cog.claims_message.assert_called_once_with(message)
+        cog._run_claude.assert_not_awaited()
+        thread.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unclaimed_message_is_not_held_back_by_other_cogs(self, tmp_path) -> None:
+        cog = _cog(tmp_path, tomb=_tomb())
+        trigger_cog = MagicMock()
+        trigger_cog.claims_message = MagicMock(return_value=False)
+        cog.bot.cogs = {"WebhookTriggerCog": trigger_cog, "Plain": object()}
+        thread = _thread()
+
+        await cog._handle_untracked_thread(_message(thread, webhook=True), thread)
+        await _drain(cog)
+
+        cog._run_claude.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_webhook_text_command_runs_as_a_command_not_a_conversation(
+        self, tmp_path
+    ) -> None:
+        """``!close-workspace`` などは process_commands の担当。会話は始めない。"""
+        cog = _cog(tmp_path, tomb=_tomb())
+        ctx = MagicMock()
+        ctx.valid = True
+        cog.bot.get_context = AsyncMock(return_value=ctx)
+        thread = _thread()
+        message = _message(thread, webhook=True)
+        message.content = "!close-workspace"
+
+        await cog.on_message(message)
+        await _drain(cog)
+
+        cog._run_claude.assert_not_awaited()
+        thread.send.assert_not_awaited()

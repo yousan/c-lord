@@ -163,25 +163,31 @@ class AutoUpgradeCog(commands.Cog):
         self._drain_poll_interval = drain_poll_interval
         self._lock = asyncio.Lock()
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
-        """Handle upgrade trigger messages."""
-        if not message.webhook_id:
-            return
+    def claims_message(self, message: discord.Message) -> bool:
+        """Whether *message* is this cog's upgrade trigger — #862.
 
+        ``ClaudeChatCog`` asks before turning a webhook message in a thread with
+        no session into a new conversation, so the trigger never also reaches
+        Claude as a request.
+        """
+        if not message.webhook_id:
+            return False
         if (
             self.config.allowed_webhook_ids is not None
             and message.webhook_id not in self.config.allowed_webhook_ids
         ):
-            return
-
+            return False
         if (
             self.config.channel_ids is not None
             and message.channel.id not in self.config.channel_ids
         ):
-            return
+            return False
+        return message.content.strip() == self.config.trigger_prefix
 
-        if message.content.strip() != self.config.trigger_prefix:
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Handle upgrade trigger messages."""
+        if not self.claims_message(message):
             return
 
         logger.info("Auto-upgrade trigger received: %r", self.config.trigger_prefix)

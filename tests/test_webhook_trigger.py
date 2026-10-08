@@ -422,3 +422,35 @@ class TestWebhookTriggerDataclass:
         trigger = WebhookTrigger(prompt="test")
         with pytest.raises(AttributeError):
             trigger.prompt = "changed"  # type: ignore[misc]
+
+
+class TestClaimsMessage:
+    """#862: ClaudeChatCog asks this before starting a conversation from a webhook."""
+
+    def _cog(self, **kwargs):
+        from c_lord.cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
+
+        trigger = WebhookTrigger(prompt="sync docs")
+        return WebhookTriggerCog(
+            bot=MagicMock(), runner=MagicMock(), triggers={"🔄 docs-sync": trigger}, **kwargs
+        )
+
+    def _msg(self, content: str, *, webhook_id: int | None = 1, channel_id: int = 5):
+        message = MagicMock()
+        message.webhook_id = webhook_id
+        message.content = content
+        message.channel.id = channel_id
+        return message
+
+    def test_a_matching_webhook_message_is_claimed(self) -> None:
+        assert self._cog().claims_message(self._msg("🔄 docs-sync run 42"))
+
+    def test_other_text_is_not_claimed(self) -> None:
+        assert not self._cog().claims_message(self._msg("サーバを再起動して"))
+
+    def test_a_human_message_is_not_claimed(self) -> None:
+        assert not self._cog().claims_message(self._msg("🔄 docs-sync", webhook_id=None))
+
+    def test_a_webhook_outside_the_allowlist_is_not_claimed(self) -> None:
+        cog = self._cog(allowed_webhook_ids={2})
+        assert not cog.claims_message(self._msg("🔄 docs-sync"))

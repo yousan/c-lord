@@ -15,7 +15,7 @@ import contextlib
 import logging
 import os
 import weakref
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -1071,33 +1071,12 @@ class ClaudeChatCog(commands.Cog):
         """
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
         ctx = log_ctx(thread_id=thread.id, channel_id=parent_channel_id)
-        if message.webhook_id is not None:
-            # #556: nothing that arrives from a webhook is waiting for an answer,
-            # so none of the three responses below are owed to it. #538's guard
-            # asked whether the *channel* was ours, which every thread under a
-            # /clord-init binding satisfies — including Grafana's server-alert
-            # thread, where from the #545 deploy on, each alert was given a ⚠️ and
-            # a wall of text about restoring a session, during incidents.
-            #
-            # Quiet in Discord, not quiet in the log (#678). #556 put this line at
-            # DEBUG because an alerting webhook can be chatty — and then on
-            # 2026-09-02 a probe sent into such a thread produced no reply and no
-            # INFO line at all, so "bot down / webhook broken / thread out of
-            # scope" could not be told apart without reading this file. INFO once
-            # per thread per window keeps both: the one-off probe is always
-            # visible, the flood still cannot reach INFO.
-            sample = self._untracked_webhook_log.sample(thread.id)
-            if sample.emit:
-                logger.info(
-                    "%s webhook message dropped — no session row for this thread; "
-                    "quiet by design (#556)%s",
-                    ctx,
-                    sample.suffix,
-                )
-            else:
-                logger.debug(
-                    "%s webhook message dropped — no session row (#556, rate-limited #678)", ctx
-                )
+        is_webhook = message.webhook_id is not None
+        if is_webhook and self._claimed_by_another_cog(message):
+            # #862: a webhook_trigger / auto_upgrade message is that cog's job.
+            # Starting a conversation from it as well would run the trigger twice
+            # — once as configured, once as a request to Claude.
+            logger.debug("%s webhook message left to the cog that claims it (#862)", ctx)
             return
         if thread.id in self._active_runners or self.is_processing(thread.id):
             # A freshly spawned thread has no row until Claude emits its first
@@ -1120,7 +1099,11 @@ class ClaudeChatCog(commands.Cog):
             # sent this notice into ordinary conversation threads. A thread that
             # carries no trace of c-lord at all has nothing to restore and never
             # did; there is nothing to tell its author.
-            logger.debug("%s message ignored — never a c-lord thread (#556)", ctx)
+            if is_webhook:
+                # Grafana's server-alert thread is exactly this case (#556).
+                self._log_dropped_webhook(thread, ctx, "never a c-lord thread")
+            else:
+                logger.debug("%s message ignored — never a c-lord thread (#556)", ctx)
             return
         # #700: reconnect first, and only fall back to the notice when there is
         # genuinely nothing left to reconnect to. Ordering matters — the ⚠️ below
@@ -1133,6 +1116,11 @@ class ClaudeChatCog(commands.Cog):
         # this thread works in — so start over here instead of sending the
         # reader off to open a new thread. Only an unbound thread, where there
         # is nothing to clone, still gets the refusal below.
+        #
+        # Webhooks too (2026-10-08): Claude-to-Claude dispatch posts into old
+        # threads through a webhook ``?thread_id=``, and silence there meant the
+        # order was simply lost. Both the reattach above and this start run for
+        # them; what #556 keeps quiet is only the *refusal* below.
         if await self._can_start_fresh(thread, parent_channel_id):
             logger.info(
                 "%s nothing left to reconnect to — starting a new conversation here (#862)%s",
@@ -1142,6 +1130,12 @@ class ClaudeChatCog(commands.Cog):
             with contextlib.suppress(discord.HTTPException):
                 await thread.send(FRESH_START_NOTICE)
             await self._handle_thread_reply(message, fresh=True)
+            return
+
+        if is_webhook:
+            # #556: nobody on the other end of a webhook reads a ⚠️ or a notice,
+            # and an alert thread must stay readable during an incident.
+            self._log_dropped_webhook(thread, ctx, "no repository binding to start from")
             return
 
         logger.info(
@@ -1158,6 +1152,53 @@ class ClaudeChatCog(commands.Cog):
         self._untracked_notice_sent.add(thread.id)
         with contextlib.suppress(discord.HTTPException):
             await thread.send(swept_notice(tomb) if tomb is not None else UNTRACKED_NOTICE)
+
+    def _log_dropped_webhook(self, thread: discord.Thread, ctx: str, why: str) -> None:
+        """Log a webhook message that ran nothing — quiet in Discord, not in the log.
+
+        #556 silenced the Discord side: a webhook is not waiting for an answer.
+        #678 kept the log: on 2026-09-02 a probe sent into such a thread left no
+        INFO line at all, so "bot down / webhook broken / thread out of scope"
+        could not be told apart. INFO once per thread per window, DEBUG between,
+        so a one-off probe is always visible and a chatty alert cannot flood it.
+        """
+        sample = self._untracked_webhook_log.sample(thread.id)
+        if sample.emit:
+            logger.info(
+                "%s webhook message dropped — no session row for this thread and %s; "
+                "quiet by design (#556)%s",
+                ctx,
+                why,
+                sample.suffix,
+            )
+        else:
+            logger.debug(
+                "%s webhook message dropped — no session row (#556, rate-limited #678)", ctx
+            )
+
+    def _claimed_by_another_cog(self, message: discord.Message) -> bool:
+        """Whether another cog acts on *message* itself (#862). Never raises.
+
+        Cogs with a fixed webhook format — :class:`WebhookTriggerCog`,
+        :class:`AutoUpgradeCog`, or a consumer's own — answer through a
+        ``claims_message(message) -> bool`` method. Duck-typed so a consumer cog
+        joins in by defining the method, with nothing to register.
+        """
+        cogs = getattr(self.bot, "cogs", None)
+        if not isinstance(cogs, Mapping):
+            return False
+        for name, cog in cogs.items():
+            if cog is self:
+                continue
+            claims = getattr(cog, "claims_message", None)
+            if not callable(claims):
+                continue
+            try:
+                if claims(message) is True:
+                    return True
+            except Exception:
+                logger.warning("%s.claims_message failed", name, exc_info=True)
+        return False
 
     async def _can_start_fresh(self, thread: discord.Thread, parent_channel_id: int) -> bool:
         """Whether a thread with nothing to reconnect to can start over — #862.
