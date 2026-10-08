@@ -1297,6 +1297,33 @@ class TestCogUnloadMarkForResume:
         assert called_thread_ids == {111, 222}
 
     @pytest.mark.asyncio
+    async def test_an_adopted_lamp_is_recorded_again(self) -> None:
+        """#870 A: a turn whose lamp was taken back after the last restart has
+        no runner in this process — but it is still running, and the next
+        restart must not orphan its lamp a second time."""
+        cog, repo, resume_repo = self._make_cog_with_resume_repo()
+        repo.update_trigger_message = AsyncMock()
+        cog._adopted_lamps[333] = 4444
+
+        await cog.cog_unload()
+
+        assert {c.args[0] for c in resume_repo.mark.call_args_list} == {333}
+        repo.update_trigger_message.assert_awaited_once_with(333, 4444)
+
+    @pytest.mark.asyncio
+    async def test_the_running_turns_trigger_is_saved_at_shutdown(self) -> None:
+        """#870 B: a thread's first turn writes its trigger before the session
+        row exists, so it is written again at shutdown, when the row does."""
+        cog, repo, resume_repo = self._make_cog_with_resume_repo()
+        repo.update_trigger_message = AsyncMock()
+        cog._active_runners[111] = MagicMock()
+        cog._turn_triggers[111] = 5555
+
+        await cog.cog_unload()
+
+        repo.update_trigger_message.assert_awaited_once_with(111, 5555)
+
+    @pytest.mark.asyncio
     async def test_uses_bot_shutdown_reason(self) -> None:
         """Marks sessions with reason='bot_shutdown'."""
         cog, _, resume_repo = self._make_cog_with_resume_repo()
@@ -2921,6 +2948,29 @@ class TestOnReadyLampRecovery:
         m = MagicMock()
         m.reactions = [SimpleNamespace(emoji=e, me=me) for e in lamps]
         return m
+
+    @pytest.mark.asyncio
+    async def test_an_adoption_is_tracked_until_the_lamp_is_final(self, tmp_path) -> None:
+        """#870 A: while the watcher runs, the next shutdown can see it."""
+        from unittest.mock import patch
+
+        thread = self._thread(7193)
+        trigger = MagicMock(id=4242)
+        thread.fetch_message = AsyncMock(return_value=trigger)
+        record = MagicMock(trigger_message_id=4242, working_dir=str(tmp_path))
+        cog = self._cog(record, thread)
+
+        seen: dict = {}
+
+        async def adopt(message, *, thread_id, turn_running):
+            seen.update(cog._adopted_lamps)
+
+        with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        assert seen == {7193: 4242}
+        assert cog._adopted_lamps == {}
 
     @pytest.mark.asyncio
     async def test_a_first_turn_with_no_recorded_trigger_is_found_in_history(self) -> None:
