@@ -89,11 +89,17 @@ _MAX_PER_THREAD = 32
 # Part of the text may follow the closing tag (a split paste), which dropping the
 # tags rather than extracting their contents also covers.
 _PASTED_CONTENT_TAG_RE = re.compile(r'</?pasted_content id="[^"<>]*">')
+# #864: when the *user's* text contains the tag, the CLI escapes it so it cannot
+# pass for its own wrapper — ``<pasted_content`` → ``<\pasted_content`` and
+# ``</pasted_content`` → ``<\/pasted_content`` (2.1.294, measured). Undone
+# first, so the escaped copy compares equal to what c-lord typed.
+_ESCAPED_PASTED_CONTENT_RE = re.compile(r"<\\(/?)pasted_content")
 
 
 def _normalize(text: str) -> str:
     from .formatter import ZWSP_MARKER
 
+    text = _ESCAPED_PASTED_CONTENT_RE.sub(r"<\1pasted_content", text)
     text = _PASTED_CONTENT_TAG_RE.sub("", text)
     return "".join(text.split()).replace(ZWSP_MARKER, "")
 
