@@ -54,7 +54,7 @@ _OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD)
 _FINAL_LAMPS = (EMOJI_WAITING, EMOJI_ERROR)
 
 #: How far back :func:`find_open_lamp` looks when no trigger id is on record.
-HISTORY_LIMIT = 20
+HISTORY_LIMIT = 100
 
 #: How often to look at the mirror's turn-end record (cheap, in memory).
 POLL_SECONDS = 2.0
