@@ -177,6 +177,19 @@ class Authorizer:
         return False  # owner unknown — deny rather than widen
 
 
+async def read_application_owners(bot: Any) -> tuple[set[int], str]:
+    """Ask Discord who owns this application: ``(ids, label)``. Raises on failure.
+
+    A team-owned application answers with every team member (#713). The one
+    place that reads the owner, so the #713 allowlist default and the #346
+    "someone was refused" DM can never name different people.
+    """
+    app = getattr(bot, "application", None) or await bot.application_info()
+    if getattr(app, "team", None) is not None:
+        return {m.id for m in app.team.members}, f"team {app.team.name}"
+    return {app.owner.id}, str(app.owner)
+
+
 async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
     """Resolve the default allowlist from the Discord application (#713).
 
@@ -211,13 +224,7 @@ async def resolve_fallback_owner_ids(bot: Any, authorizer: Authorizer) -> None:
         )
         return
     try:
-        app = getattr(bot, "application", None) or await bot.application_info()
-        if getattr(app, "team", None) is not None:
-            owner_ids = {m.id for m in app.team.members}
-            owner_label = f"team {app.team.name}"
-        else:
-            owner_ids = {app.owner.id}
-            owner_label = str(app.owner)
+        owner_ids, owner_label = await read_application_owners(bot)
     except Exception:
         # Fail closed: an owner we could not read is not an owner we can trust.
         # But a network blip must not be a permanent lockout, so the once-only
