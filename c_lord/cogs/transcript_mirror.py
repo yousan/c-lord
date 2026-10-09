@@ -394,10 +394,11 @@ class TranscriptMirrorCog(commands.Cog):
             if send is None:
                 return None
             # Silent: the whole point is a low-noise hint, not a notification.
-            return await send(text, silent=True)
+            # No mentions either: since #883 the line carries Claude's own prose.
+            return await send(text, silent=True, allowed_mentions=discord.AllowedMentions.none())
 
         async def edit(handle, text: str) -> None:
-            await handle.edit(content=text)
+            await handle.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
 
         async def delete(handle) -> None:
             await handle.delete()
