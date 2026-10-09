@@ -11,6 +11,7 @@ stack (faulthandler) and hard-exits.
 from __future__ import annotations
 
 import io
+import signal
 import subprocess
 import sys
 import textwrap
@@ -123,3 +124,54 @@ def test_sigterm_with_a_stuck_worker_exits_and_names_the_stack(tmp_path: Path) -
     assert elapsed < 10
     assert "did not finish within" in err  # the log line naming the watchdog
     assert "subprocess.py" in err  # faulthandler: the stuck worker's stack
+
+
+_DOUBLE_SIGTERM = textwrap.dedent(
+    """
+    import asyncio, os, signal, sys
+    sys.path.insert(0, {root!r})
+    from c_lord.main import install_shutdown_signal_handlers
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+        async def _shutdown():
+            print("shutdown", flush=True)
+            await asyncio.sleep(0.3)
+            done.set()
+        install_shutdown_signal_handlers(loop, _shutdown)
+        print("ready", flush=True)
+        await done.wait()
+        await asyncio.sleep(0.3)
+
+    asyncio.run(main())
+    """
+)
+
+
+def test_second_sigterm_does_not_start_a_second_shutdown(tmp_path: Path) -> None:
+    """#877: under systemd's default ``KillMode=control-group`` both ``uv`` and
+    python get SIGTERM, and ``uv`` forwards its copy — two signals a few
+    microseconds apart.  Each one started its own shutdown, and the two raced
+    each other through ``ApiServer.stop()``."""
+    script = tmp_path / "double_sigterm.py"
+    script.write_text(_DOUBLE_SIGTERM.format(root=str(Path(__file__).resolve().parent.parent)))
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "CLORD_SHUTDOWN_TIMEOUT_SECONDS": "5"},
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signal.SIGTERM)
+        # uv's forwarded copy lands a moment later — back-to-back signals are
+        # merged by the interpreter and would not reproduce it.
+        time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        out, _err = proc.communicate(timeout=10)
+    finally:
+        proc.kill()
+    assert out.count("shutdown") == 1, out

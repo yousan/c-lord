@@ -328,9 +328,22 @@ def install_shutdown_signal_handlers(
     never finishes — or one that finishes on the loop and then hangs in
     ``asyncio.run()``'s executor join — ends with a stack dump and an exit
     instead of a silent, live process.
+
+    Only the first signal starts *shutdown* (#877). Under systemd's default
+    ``KillMode=control-group`` both ``uv`` and python get SIGTERM and ``uv``
+    forwards its copy, so every restart delivered two — and two shutdowns raced
+    each other through ``ApiServer.stop()`` (``'NoneType' object has no
+    attribute 'pre_shutdown'``). The unit now uses ``KillMode=mixed``; this
+    holds for whoever runs c-lord another way.
     """
+    started = False
 
     def _on_signal() -> None:
+        nonlocal started
+        if started:
+            logger.info("shutdown already in progress; ignoring the repeated signal (#877)")
+            return
+        started = True
         arm_shutdown_watchdog(shutdown_timeout_from_env())
         loop.create_task(shutdown())
 

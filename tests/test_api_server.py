@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from unittest.mock import AsyncMock, MagicMock
@@ -1014,3 +1015,20 @@ class TestPromptChoiceEndpoint:
         assert resp.status == 200
         sent = thread_mock.send.call_args.kwargs.get("content", "")
         assert "yes" in sent and "no" in sent
+
+
+@pytest.mark.asyncio
+async def test_stop_twice_concurrently_does_not_raise(
+    repo: NotificationRepository, bot: MagicMock
+) -> None:
+    """#877: systemd's SIGTERM reaches python twice (once from systemd, once
+    forwarded by ``uv``), so two shutdowns call ``stop()`` together.  aiohttp's
+    ``AppRunner.cleanup()`` yields between checking ``_server`` and using it, so
+    the second call found ``None`` and logged ``'NoneType' object has no
+    attribute 'pre_shutdown'`` on every restart."""
+    api = ApiServer(repo=repo, bot=bot, default_channel_id=1, host="127.0.0.1", port=0)
+    await api.start()
+
+    results = await asyncio.gather(api.stop(), api.stop(), return_exceptions=True)
+
+    assert results == [None, None]

@@ -34,6 +34,11 @@ WorkingDirectory=%h/c-lord
 # CHANGE-ME: `command -v uv` (often %h/.local/bin/uv).
 ExecStart=%h/.local/bin/uv run python -m c_lord.main
 Restart=always
+# ExecStart is two processes (uv → python). The default KillMode=control-group
+# sends SIGTERM to both, and uv forwards its own copy, so python got it twice and
+# ran two shutdowns at once (#877). mixed: SIGTERM to the main process only (uv
+# forwards it once); a stop that times out still SIGKILLs the whole group.
+KillMode=mixed
 RestartSec=5
 # systemd --user services get a minimal PATH. Include every dir holding a CLI
 # c-lord shells out to — at least uv, the `claude` CLI, tmux and git. Adjust to
