@@ -1371,6 +1371,9 @@ _GENERATION_STATUS_MARKERS = ("Tip:", "·")
 # bare glyph) avoids false-positives on stale completed spinners in scrollback.
 _RUNNING_PROBE_LINES = 30
 _RUNNING_SPINNER_RE = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·")
+# #876: how many non-blank rows above the input box can be the live status: the
+# spinner line and the right-aligned row under it (effort indicator or a notice).
+_STATUS_ROWS_ABOVE_BOX = 2
 
 # Markers that indicate Claude has actually started producing output:
 #   ● — assistant response paragraph
@@ -3674,6 +3677,27 @@ class TmuxClaudeRunner:
             stripped = line.strip()
             if _GENERATION_STATUS_RE.match(stripped) and "…" in stripped:
                 return True
+        # #876: the status line also sits right above the input box, and with
+        # status rows under the box (ccstatusline + footer) that is ~9 rows up —
+        # out of reach of the bottom-6 scan.  Before the first token it carries
+        # no timer (``✻ Simmering…``), so neither scan saw it; a cold-cache
+        # resume of a long conversation stays there for 15s+ and the turn was
+        # finished at 20s.  Anchored on the box, so the live status line is the
+        # only one looked at; it starts at column 0, while Claude's own text is
+        # indented under its ``●``.
+        box = _input_box_rows(lines)
+        if box:
+            looked = 0
+            for line in reversed(lines[: min(box) - 1]):
+                if not line.strip():
+                    continue
+                if line[:1] != " " and _GENERATION_STATUS_RE.match(line.strip()) and "…" in line:
+                    return True
+                looked += 1
+                # The status line, and the right-aligned row under it (effort,
+                # a notice) — nothing above them is live.
+                if looked >= _STATUS_ROWS_ABOVE_BOX:
+                    break
         return False
 
     @staticmethod

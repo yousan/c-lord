@@ -2048,6 +2048,85 @@ class TestIsGenerating:
         assert TmuxClaudeRunner._is_generating(text) is True
 
 
+class TestSpinnerWithoutTimerAboveInputBox:
+    """#876: before the first token, Claude Code shows a spinner with no timer
+    (``✻ Simmering…``) on the line above the input box.  With the status rows
+    under the box (ccstatusline + footer) that line sits ~9 rows from the
+    bottom, out of the bottom-6 fallback, so the pane read as idle.  A cold-cache
+    resume of a long conversation stays in that state for 15s+, and a notice on
+    the pane (the hook's message, the weekly-limit line) became a stable
+    "response" — the turn finished at 20s and the lamp went 🟡 mid-work.
+    """
+
+    def test_real_cold_resume_pane_is_generating(self) -> None:
+        pane = _load_fixture("cold_resume_spinner_no_timer_above_box.txt")
+        assert TmuxClaudeRunner._is_generating(pane) is True
+
+    def test_completed_turn_above_box_is_not_generating(self) -> None:
+        pane = _load_fixture("waiting_completed_spinner_no_timer.txt")
+        assert TmuxClaudeRunner._is_generating(pane) is False
+
+    def test_answer_text_with_ellipsis_above_box_is_not_generating(self) -> None:
+        # Claude's own text is indented under its ``●``; only the CLI's status
+        # line starts at column 0.
+        text = "\n".join(
+            [
+                "● 次の順で進めます:",
+                "  * まず調べる…",
+                "",
+                "─" * 40,
+                "❯\xa0",
+                "─" * 40,
+                "   Model: Opus 5.5  v2.1.295",
+                "   Cost: $1.00  Session: 1.0%",
+                "   ⎇ main  (+0,-0)",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ]
+        )
+        assert TmuxClaudeRunner._is_generating(text) is False
+
+    @pytest.mark.asyncio
+    async def test_runner_does_not_finish_while_spinner_has_no_timer(
+        self, runner, tmux_manager
+    ) -> None:
+        tmux_manager.is_claude_running.return_value = True
+        thinking = _load_fixture("cold_resume_spinner_no_timer_above_box.txt")
+        # The poll before the hook's message landed: the request echoed, no
+        # "response" yet — so the message that follows reads as new output.
+        echo_only = "\n".join(
+            line for line in thinking.splitlines() if "UserPromptSubmit says" not in line
+        )
+        done = _make_pane(["● 90秒待ちました"], with_input_prompt=True)
+        thinking_polls = 20
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            # The first captures (the pre-delivery menu check, the baseline
+            # poll) predate the hook's message.
+            if calls["n"] <= 3:
+                return echo_only
+            if calls["n"] <= 3 + thinking_polls:
+                return thinking
+            return done
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._RESPONSE_STABLE_TIMEOUT", 0.03),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.0),
+        ):
+            async for event in runner.run("go"):
+                events.append(event)
+
+        assert calls["n"] > 3 + thinking_polls, (
+            f"run() finished after {calls['n']} polls while the pane still showed "
+            "the spinner above the input box"
+        )
+        assert [e.error for e in events if e.is_complete] == [None]
+
+
 class TestToolExecutionCompletion:
     """Tests that tool execution does not trigger false early completion."""
 
