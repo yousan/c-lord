@@ -658,10 +658,13 @@ def ask_undelivered_embed(
 def stopped_embed(*, shells_stopped: int = 0) -> discord.Embed:
     """Create an embed for a manually stopped session.
 
-    ``shells_stopped`` is how many background commands the stop also ended (#878).
+    ``shells_stopped`` is how many Bash tool commands (foreground or background)
+    the stop ended (#878).
     """
     background = (
-        f"Also stopped {shells_stopped} background command(s).\n\n" if shells_stopped else ""
+        f"Also stopped {shells_stopped} running command(s), including background ones.\n\n"
+        if shells_stopped
+        else ""
     )
     return discord.Embed(
         title="\u23f9\ufe0f Session stopped",
