@@ -50,8 +50,20 @@ def test_assistant_tool_use_unknown_shows_name_only() -> None:
     assert "MysteryTool" in out.body
 
 
-def test_assistant_thinking_block_is_hidden_by_default() -> None:
-    ev = _assistant([{"type": "thinking", "thinking": "secret pondering"}])
+def test_assistant_thinking_with_text_is_rendered_as_thinking() -> None:
+    """#883: the CLI writes the pane's ● progress sentence into a thinking block."""
+    ev = _assistant([{"type": "thinking", "thinking": "照合では111件が全文一致。\n\n"}])
+    out = render_event(ev)
+    assert out is not None
+    assert out.kind == "thinking"
+    assert out.body == "照合では111件が全文一致。"
+
+
+def test_assistant_empty_thinking_block_is_dropped() -> None:
+    """#883: signature-only thinking blocks are still noise."""
+    ev = _assistant([{"type": "thinking", "thinking": "", "signature": "abc"}])
+    assert render_event(ev) is None
+    ev = _assistant([{"type": "thinking", "thinking": "  \n\n "}])
     assert render_event(ev) is None
 
 

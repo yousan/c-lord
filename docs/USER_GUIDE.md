@@ -182,6 +182,11 @@ returns, so the thread never grows by more than one message at a time and ends
 the turn back at zero. When even tool activity has stopped it says
 `⏳ 待機中 …` instead, so a stall is distinguishable from progress.
 
+When Claude has written a progress sentence this turn (the "●" line in the
+Claude Code pane — stored as a `thinking` block), the line shows the newest one
+instead of the tool name: `-# ⚙️ 作業中 17:42 · 照合では111件が全文一致…` (#883).
+The sentences are never posted one by one; they land in `progress.txt`.
+
 It is never posted outside a turn: an idle thread stays silent no matter how
 long it idles. Opt out with `CLORD_TURN_PROGRESS=0`; change the threshold with
 `CLORD_TURN_PROGRESS_QUIET_SECONDS`. Full behaviour: `docs/specs/turn-progress.md`.
@@ -204,6 +209,9 @@ once it is over. At the end of a turn they are folded into a single
   session-start banner alone does not count) posts **no `progress.txt` at all**.
   The intermediate embeds are still cleaned up, so the thread simply ends with
   the answer (#542).
+- Claude's progress sentences (`💭 …`, #883) are listed in `progress.txt` in
+  order with the tool calls and results, so the file reads like the pane did.
+  A turn with no tool use gets no `progress.txt` for the sentences alone.
 - When `progress.txt` is posted on its own rather than attached to a message
   that already has text, it carries a one-line caption saying what the file is.
 

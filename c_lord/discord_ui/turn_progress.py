@@ -29,6 +29,11 @@ it starts and its ``tool_result`` when it ends, and nothing in between. Going by
 event recency alone, the line dropped the tool name it had at 60s and guessed
 "長考かコンテキスト圧縮" while the command was plainly still running. So the
 line also tracks which calls are open, and keeps saying 作業中 while one is.
+
+When Claude writes a progress sentence (#883 — the pane's "●" line, stored in a
+``thinking`` block), the line carries the newest one instead of the tool name.
+It still only changes at the usual refresh interval, so a burst of sentences
+costs no extra edits and never a new message.
 """
 
 from __future__ import annotations
@@ -58,6 +63,10 @@ DEFAULT_STALLED_SECONDS = 60.0
 
 # Tool labels can be long (a full Bash command); keep the line to one row.
 _MAX_LABEL_CHARS = 60
+
+# Claude's own progress sentence (#883) is prose a reader wants to finish, so it
+# gets more room than a tool label — still one row on a phone-width thread.
+_MAX_THOUGHT_CHARS = 80
 
 # Rendered tool bodies already start with this (see transcript.formatter), so the
 # line must not stack a second one — staging showed "🔧 🔧 Read: …".
@@ -116,6 +125,14 @@ def _shorten(label: str) -> str:
     return label[: _MAX_LABEL_CHARS - 1] + "…"
 
 
+def _shorten_thought(text: str) -> str:
+    """One row of Claude's progress sentence: whitespace folded, then truncated."""
+    text = " ".join(text.split())
+    if len(text) <= _MAX_THOUGHT_CHARS:
+        return text
+    return text[: _MAX_THOUGHT_CHARS - 1] + "…"
+
+
 class TurnProgress:
     """Shows a single subtext line while a turn is quiet, and only then.
 
@@ -160,6 +177,9 @@ class TurnProgress:
         self._last_edit = 0.0
         self._tool_label: str | None = None
         self._tool_count = 0
+        # The newest non-empty thinking sentence of this turn (#883) — what the
+        # pane shows on its "●" line.
+        self._thought: str | None = None
         # Tool calls whose ``tool_result`` has not arrived yet, oldest first,
         # mapped to the label they were started with (#757).
         self._running: dict[str, str | None] = {}
@@ -188,6 +208,7 @@ class TurnProgress:
         self._last_activity = now
         self._tool_label = None
         self._tool_count = 0
+        self._thought = None
         # A call left open by the previous turn (its result never written — the
         # session died mid-call) must not keep this one "作業中".
         self._running.clear()
@@ -232,6 +253,19 @@ class TurnProgress:
         for tool_id in finished:
             self._running.pop(tool_id, None)
 
+    def note_thought(self, text: str) -> None:
+        """Claude wrote a progress sentence into a thinking block (#883).
+
+        It replaces the tool label on the line — the sentence says *why* the
+        current tool is running, which the command alone does not. Counts as
+        activity: a fresh thought is as good a sign of life as a tool event.
+        The line is still only edited at the usual refresh interval.
+        """
+        self._last_activity = self._clock()
+        shortened = _shorten_thought(text)
+        if shortened:
+            self._thought = shortened
+
     # -- driving -----------------------------------------------------------
 
     async def tick(self) -> None:
@@ -270,6 +304,8 @@ class TurnProgress:
         # The newest call still open: with parallel calls, the one that already
         # returned is not what the reader is waiting on.
         running = next((lbl for lbl in reversed(self._running.values()) if lbl), None)
+        if self._thought is not None and (running is not None or idle < self._stalled_seconds):
+            return f"-# ⚙️ 作業中 {elapsed} · {self._thought}"
         if running is not None:
             return f"-# ⚙️ 作業中 {elapsed} · 🔧 {running} · ツール {self._tool_count} 件"
         if self._tool_label is not None and idle < self._stalled_seconds:

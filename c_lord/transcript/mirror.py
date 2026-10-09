@@ -12,9 +12,14 @@ Verbosity modes (``CLORD_MIRROR_VERBOSITY`` env var, default ``minimal``):
   ``tool_use`` / ``tool_result`` events are buffered and written to a
   temporary ``progress.txt`` file that is attached to the assistant reply
   via ``file_sink``.  When ``file_sink`` is ``None``, the assistant text is
-  posted via the plain ``sink`` (graceful degradation).
+  posted via the plain ``sink`` (graceful degradation).  Non-empty
+  ``thinking`` sentences (the pane's "●" line, #883) join the same buffer in
+  order, but alone they never earn an attachment.
 - ``full``: all rendered events are posted to ``sink`` in real time
-  (original behaviour, useful for debugging).
+  (original behaviour, useful for debugging) — except ``thinking``.
+
+In both modes a ``thinking`` sentence is never a message of its own: it only
+rewrites the ⚙️ turn progress line (#883).
 """
 
 from __future__ import annotations
@@ -451,12 +456,23 @@ _KIND_PREFIX = {
     "tool_use": "",  # tool_use bodies already start with the 🔧 emoji
     "tool_result": "↳ ",
     "user_input": "👤 ",
+    "thinking": "💭 ",  # #883: the pane's "●" progress sentence
 }
 
 
 def _format_body(rendered: RenderedEvent) -> str:
     prefix = _KIND_PREFIX.get(rendered.kind, "")
     return f"{prefix}{rendered.body}"
+
+
+def _has_tool_lines(progress: list[str]) -> bool:
+    """Whether *progress* holds more than thinking sentences (#883).
+
+    A plain Q&A turn now carries a "💭" line or two; attaching a progress.txt
+    for those alone would put a file on every short answer. Only tool activity
+    earns the attachment — the sentences then ride along, in order.
+    """
+    return any(not line.startswith(_KIND_PREFIX["thinking"]) for line in progress)
 
 
 def _unresolved_notice(report: UnresolvedTranscript) -> str:
@@ -990,9 +1006,26 @@ class TranscriptMirror:
                         started=opened,
                         finished=closed,
                     )
+                if rendered is not None and rendered.kind == "thinking":
+                    # #883: the pane's "●" sentence. It rewrites the ⚙️ line in
+                    # place (at its usual refresh interval) — never a post.
+                    self._progress.begin_turn()
+                    self._progress.note_thought(rendered.body)
                 await self._progress.tick()
 
                 if rendered is None:
+                    continue
+
+                if rendered.kind == "thinking":
+                    # #883 AC3: ~60 of these in 17 minutes — one message each
+                    # would bury the thread. Minimal mode keeps them in
+                    # progress.txt, in order with the tools; full mode, which
+                    # has no progress.txt, keeps them on the ⚙️ line only.
+                    if self._verbosity == "minimal":
+                        # Like a tool event: more work follows the held text,
+                        # so it was intermediate.
+                        await _flush_pending_silently()
+                        progress_buf.append(_format_body(rendered))
                     continue
 
                 # #631 AC7: Claude's rate-limit refusal is written to the
@@ -1219,7 +1252,7 @@ class TranscriptMirror:
         # markers are not reliably emitted (#218), so disarming here rather than
         # only on the marker is what keeps a finished thread from carrying a line.
         await self._progress.end_turn()
-        if progress and self._file_sink is not None:
+        if _has_tool_lines(progress) and self._file_sink is not None:
             await self._flush_with_progress(text, progress)
         elif self._reply_sink is not None:
             await self._try_reply_sink(text)

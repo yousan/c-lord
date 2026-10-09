@@ -452,3 +452,84 @@ class TestElapsedIsMeasuredFromTheRequest:
         await p.tick()
 
         assert "1:31" in rec.posts[0], rec.posts[0]
+
+
+class TestThinkingSentence:
+    """#883: the line carries Claude's latest progress sentence (the pane's ●)."""
+
+    @pytest.mark.asyncio
+    async def test_latest_thought_replaces_the_tool_label(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+
+        clock.advance(80.0)
+        p.note_activity("Bash: ls")
+        p.note_thought("照合では111件が全文一致でした。次に差分を確認します。")
+        clock.advance(11.0)
+        await p.tick()
+
+        assert rec.posts == [
+            "-# ⚙️ 作業中 1:31 · 照合では111件が全文一致でした。次に差分を確認します。"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_new_thought_rewrites_the_line_in_place(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, update_seconds=15.0)
+        p.begin_turn()
+
+        p.note_thought("一つ目")
+        clock.advance(91.0)
+        await p.tick()
+        p.note_thought("二つ目")
+        clock.advance(16.0)
+        await p.tick()
+
+        assert len(rec.posts) == 1
+        assert rec.edits and "二つ目" in rec.edits[-1][1]
+        assert "一つ目" not in rec.edits[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_a_thought_is_evidence_of_life(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+
+        clock.advance(80.0)
+        p.note_thought("考え中")
+        clock.advance(20.0)
+        await p.tick()
+
+        assert "作業中" in rec.posts[0], rec.posts[0]
+
+    @pytest.mark.asyncio
+    async def test_long_thought_is_one_truncated_row(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0)
+        p.begin_turn()
+
+        clock.advance(91.0)
+        p.note_thought("あ" * 300 + "\n\n二行目")
+        await p.tick()
+
+        body = rec.posts[0]
+        assert "\n" not in body
+        assert body.endswith("…")
+        assert len(body) < 130
+
+    @pytest.mark.asyncio
+    async def test_a_new_turn_forgets_the_thought(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, stalled_seconds=60.0)
+        p.begin_turn()
+        p.note_thought("前のターン")
+        p.begin_turn(restart=True)
+
+        clock.advance(80.0)
+        p.note_activity("Bash: ls")
+        clock.advance(11.0)
+        await p.tick()
+
+        assert "前のターン" not in rec.posts[0]
+        assert "Bash: ls" in rec.posts[0]
