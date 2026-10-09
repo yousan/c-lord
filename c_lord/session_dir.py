@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from .coauthor import install_coauthor_hook
+from .git_exclude import add_git_exclude
 from .git_mirrors import ensure_mirror, mirrors_root_for
+from .session_reattach import HISTORY_FILENAME
 from .skills.injector import LEGACY_SKILL_NAMES, READ_SKILL_NAME
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,12 @@ def _run(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess
 #:
 #: Exact files, not ``.claude/``: that directory is the user's too (settings,
 #: their own skills), and anything else in it stays work.
-_CLORD_FILES: frozenset[str] = frozenset({f".claude/skills/{READ_SKILL_NAME}/SKILL.md"})
+#:
+#: #882: the Discord thread c-lord exports on a WORKDIR reattach is c-lord's
+#: too — counting it as work kept dirs whose only change was that export.
+_CLORD_FILES: frozenset[str] = frozenset(
+    {f".claude/skills/{READ_SKILL_NAME}/SKILL.md", HISTORY_FILENAME}
+)
 
 #: Whole directories: c-lord ``rmtree``s these on every turn
 #: (``remove_legacy_skills``, #712), so nothing placed there can outlive the
@@ -70,6 +77,15 @@ _WORKTREE_ENTRY_RE = re.compile(r"^\.claude/worktrees/(?!\.\.?/)[^/]+/$")
 #: A worktree inside a worktree inside ... is followed this far and no further;
 #: past it the entry counts as work (i.e. the dir is kept).
 _MAX_WORKTREE_DEPTH = 2
+
+
+def exclude_thread_history(work_dir: str | Path) -> None:
+    """Keep the exported Discord thread out of the user's commits (#882).
+
+    Same mechanism as the injected skill (#779) and uploads (#528):
+    ``.git/info/exclude``, never the user's ``.gitignore``.
+    """
+    add_git_exclude(work_dir, f"/{HISTORY_FILENAME}", "Discord thread history for reattach (#882)")
 
 
 @dataclass(frozen=True)
@@ -324,6 +340,12 @@ class SessionDirManager:
             inject_read_skill(target)
         except OSError as exc:
             logger.warning("Failed to inject discord-read for thread %d: %s", thread_id, exc)
+
+        # #882: a thread history exported before the fix (or by an older
+        # c-lord) was never git-excluded. Catch it up here, every turn, so the
+        # conversation cannot ride along on Claude's next ``git add -A``.
+        if (Path(target) / HISTORY_FILENAME).is_file():
+            exclude_thread_history(target)
 
         # Issue #518: (re)install the prepare-commit-msg hook so commits made
         # in this checkout record who asked for them. Refreshed every turn —
