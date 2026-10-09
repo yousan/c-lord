@@ -1055,6 +1055,35 @@ class TestTmuxSessionManager:
         mgr._available = False
         assert mgr.send_interrupt(12345) is False
 
+    def test_stop_tool_shells_signals_the_panes_shells(self) -> None:
+        """#878: Stop also ends the Bash tool shells under this thread's pane."""
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        with (
+            patch("c_lord.tmux._run") as mock_run,
+            patch("c_lord.tmux.terminate_tool_shells", return_value=2) as term,
+        ):
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),  # _find: verify
+                MagicMock(returncode=0, stdout="4242\n"),  # display-message pane_pid
+            ]
+            assert mgr.stop_tool_shells(12345) == 2
+
+        term.assert_called_once_with(4242)
+        assert "#{pane_pid}" in mock_run.call_args_list[1][0][0]
+
+    def test_stop_tool_shells_no_window_touches_nothing(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with (
+            patch("c_lord.tmux._run", return_value=MagicMock(returncode=1, stdout="")),
+            patch("c_lord.tmux.terminate_tool_shells") as term,
+        ):
+            assert mgr.stop_tool_shells(99999) == 0
+        term.assert_not_called()
+
     def test_is_claude_running_true(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True

@@ -17,6 +17,7 @@ from ..claude.tmux_runner import (
     FLEET_TMUX_RESTART_ERROR_PREFIX,
     LOGIN_REQUIRED_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
+    STOPPED_BY_USER_ERROR,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
     unavailable_model,
@@ -336,7 +337,13 @@ class EventProcessor:
         """
         from ._run_helper import _make_error_embed
 
-        if event.error:
+        if event.error == STOPPED_BY_USER_ERROR:
+            # #878: the user asked for this. The stop reply (⏹️ Session stopped)
+            # already says so — an ❌ and an error embed with a failure ping
+            # would report a requested stop as a breakdown. 🟡: their turn now.
+            if self._config.status:
+                await self._config.status.set_done()
+        elif event.error:
             # #562: tell the caller this turn produced nothing, so the turn-end
             # ping says "応答がありませんでした" instead of "Claude has finished".
             # #630: a turn blocked on the trust dialog also produced nothing, so

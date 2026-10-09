@@ -9,9 +9,10 @@ from typing import Protocol, runtime_checkable
 
 import discord
 
+from ..session_stop import StopOutcome, StopResult, stop_reply
 from .authorization import AuthorizedViewMixin, Authorizer
-from .embeds import stopped_embed
 from .error_reporting import ErrorReportingViewMixin
+from .slash_io import followup
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class Interruptable(Protocol):
-    async def interrupt(self) -> None: ...
+    # ``False`` means the C-c could not be sent (#878); ``None`` (older
+    # implementations) counts as sent.
+    async def interrupt(self) -> bool | None: ...
 
 
 # Every message that carries a ⏹ Stop button starts with this. The startup sweep
@@ -34,8 +37,12 @@ STOP_MESSAGE_PREFIX = "-# ⏺ Session running"
 class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     """A ⏹ Stop button attached to the session status message.
 
-    Clicking it sends SIGINT to the active Claude runner (graceful interrupt,
-    like pressing Escape in Claude Code) and posts a stopped_embed.
+    Clicking it runs ``on_stop`` — the same stop ``/stop`` and ``!stop`` run
+    (``ClaudeChatCog._stop_thread_work``, #878): interrupt the turn, end the
+    background commands, and keep a self-started turn from carrying on. The
+    reply comes from :func:`c_lord.session_stop.stop_reply`, so the button
+    never says "stopped" when the stop failed. Without ``on_stop`` (older
+    callers) it falls back to ``runner.interrupt()``.
 
     After the session ends — either via the button or naturally — call
     ``disable()`` to deactivate the button on the status message.
@@ -44,9 +51,15 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     button at the bottom of the thread (most recently visible position).
     """
 
-    def __init__(self, runner: Interruptable, authorizer: Authorizer | None = None) -> None:
+    def __init__(
+        self,
+        runner: Interruptable,
+        authorizer: Authorizer | None = None,
+        on_stop: Callable[[], Awaitable[StopResult]] | None = None,
+    ) -> None:
         super().__init__(timeout=None)
         self._runner = runner
+        self._on_stop = on_stop
         self._authorizer = authorizer
         self._stopped = False
         self._message: discord.Message | None = None
@@ -78,20 +91,38 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     async def stop_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        """Interrupt the active Claude session."""
+        """Stop the thread's Claude work — the same stop as /stop and !stop (#878)."""
         if self._stopped:
             await interaction.response.defer()
             return
 
         self._stopped = True
         button.disabled = True
-        self.stop()
-
         await interaction.response.edit_message(view=self)
-        await self._runner.interrupt()
+
+        result = await self._run_stop()
+        content, embed, ephemeral = stop_reply(result)
+        if result.outcome is StopOutcome.STOPPED:
+            self.stop()
+        else:
+            # Nothing was stopped: give the button back rather than leave a
+            # dead "stopped" control over a turn that may still be running.
+            self._stopped = False
+            button.disabled = False
+            with contextlib.suppress(Exception):
+                await interaction.edit_original_response(view=self)
 
         with contextlib.suppress(Exception):
-            await interaction.followup.send(embed=stopped_embed())
+            if embed is not None:
+                await interaction.followup.send(embed=embed)
+            else:
+                await followup(interaction, content, ephemeral=ephemeral)
+
+    async def _run_stop(self) -> StopResult:
+        if self._on_stop is not None:
+            return await self._on_stop()
+        sent = await self._runner.interrupt()
+        return StopResult(StopOutcome.FAILED if sent is False else StopOutcome.STOPPED)
 
     async def disable(self, message: discord.Message | None = None) -> None:
         """Delete the stop-button message after the session ends naturally.

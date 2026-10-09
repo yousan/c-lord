@@ -436,6 +436,33 @@ class TestOnComplete:
         assert len(embed_sends) >= 1
 
     @pytest.mark.asyncio
+    async def test_user_stop_is_not_shown_as_an_error(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """#878: a turn the user stopped is not a failure — no ❌, no error embed, no ping.
+
+        The stop reply (⏹️ Session stopped) already says what happened; the
+        lamp goes to 🟡 so the thread reads as "your turn".
+        """
+        from c_lord.claude.tmux_runner import STOPPED_BY_USER_ERROR
+
+        status = MagicMock()
+        status.set_error = AsyncMock()
+        status.set_done = AsyncMock()
+        config = _make_config(thread, runner, status=status, failure_notify_id=4242)
+        p = EventProcessor(config)
+
+        await p.process(
+            StreamEvent(
+                message_type=MessageType.RESULT, is_complete=True, error=STOPPED_BY_USER_ERROR
+            )
+        )
+
+        assert [c for c in thread.send.call_args_list if "embed" in c.kwargs] == []
+        status.set_error.assert_not_called()
+        status.set_done.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_error_embed_mentions_the_failure_notify_user(
         self, thread: MagicMock, runner: MagicMock
     ) -> None:

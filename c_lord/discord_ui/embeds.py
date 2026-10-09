@@ -655,12 +655,22 @@ def ask_undelivered_embed(
     return discord.Embed(title=title[:256], description=body[:4096], color=COLOR_ERROR)
 
 
-def stopped_embed() -> discord.Embed:
-    """Create an embed for a manually stopped session."""
+def stopped_embed(*, shells_stopped: int = 0) -> discord.Embed:
+    """Create an embed for a manually stopped session.
+
+    ``shells_stopped`` is how many Bash tool commands (foreground or background)
+    the stop ended (#878).
+    """
+    background = (
+        f"Also stopped {shells_stopped} running command(s), including background ones.\n\n"
+        if shells_stopped
+        else ""
+    )
     return discord.Embed(
         title="\u23f9\ufe0f Session stopped",
         description=(
             "The session was stopped.\n\n"
+            f"{background}"
             "The session is preserved \u2014 send a message to resume, "
             "or use `/clear` to start fresh."
         ),

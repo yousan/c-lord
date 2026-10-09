@@ -101,7 +101,7 @@ tmux セッション**だけ**を指す語に予約した。利用者が名指�
 |---------|-------------|-------|
 | `/clord <prompt>` | Start a new Claude Code session | Channel; in a thread, **c-lord's own only** |
 | `/clord repo:<url> <prompt>` | Start a session on a **specific** repository | Channel only |
-| `/stop` | Stop the active session (session is preserved for resume) | Thread only |
+| `/stop` | Stop the active session — interrupts the turn and ends Claude's background commands (session is preserved for resume; same as the ⏹ Stop button, see `docs/specs/stop-button.md`) | Thread only |
 | `/clear` | Reset the session — next message starts fresh | Thread only |
 | `/compact [instructions]` | Compact (summarize) the session context to free the window | Thread only |
 | `/clord-attach <window>` | Attach this thread to an existing tmux window | Thread only |
