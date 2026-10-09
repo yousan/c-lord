@@ -82,6 +82,8 @@ from ..session_reattach import (
     Plan,
     Recovery,
     auto_reattach_notice,
+    history_handoff_pending,
+    history_handoff_preamble,
     plan_recovery,
     reattach_notice,
     render_history,
@@ -1461,6 +1463,21 @@ class ClaudeChatCog(commands.Cog):
         logger.info("%s reattached (%s) dir=%s", ctx, plan.kind.value, plan.working_dir)
         return plan
 
+    def _history_handoff(self, thread_id: int, record: SessionRecord | None) -> str | None:
+        """The #881 line for this turn, or ``None`` when there is nothing to hand off.
+
+        Only while the history exported by a WORKDIR reattach has not yet reached
+        a Claude conversation — see
+        :func:`~c_lord.session_reattach.history_handoff_pending`. A FULL recovery
+        resumes the real conversation and exports nothing, so it never gets one.
+        """
+        working_dir = getattr(record, "working_dir", None) if record is not None else None
+        if not isinstance(working_dir, str):
+            return None
+        if not history_handoff_pending(working_dir, projects_root=self._projects_root):
+            return None
+        return history_handoff_preamble(thread_id)
+
     async def _export_thread_history(
         self, thread: discord.Thread, working_dir: str, ctx: str
     ) -> None:
@@ -1632,6 +1649,11 @@ class ClaudeChatCog(commands.Cog):
                 if thread_record is not None
                 else f"{fresh_start_preamble(channel.id)}\n\n{prompt}"
             )
+            # #881: reconnected to a checkout whose conversation is gone —
+            # say where the exported history is.
+            handoff = self._history_handoff(channel.id, thread_record)
+            if handoff is not None:
+                claude_prompt = f"{handoff}\n\n{claude_prompt}"
             try:
                 seed_message = await channel.send(prompt)
             except discord.Forbidden:
@@ -3236,6 +3258,10 @@ class ClaudeChatCog(commands.Cog):
             prompt = await enrich_discord_references(prompt, message, self.bot)
             if fresh:
                 prompt = f"{fresh_start_preamble(thread.id)}\n\n{prompt}"
+            elif (handoff := self._history_handoff(thread.id, record)) is not None:
+                # #881: the reattach notice promised the history is carried
+                # over; this line is what tells Claude where it is.
+                prompt = f"{handoff}\n\n{prompt}"
             if earlier:
                 prompt = merge_missed_prompt(
                     [

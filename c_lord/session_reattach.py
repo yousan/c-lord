@@ -43,6 +43,8 @@ __all__ = [
     "Plan",
     "Recovery",
     "auto_reattach_notice",
+    "history_handoff_pending",
+    "history_handoff_preamble",
     "plan_recovery",
     "reattach_notice",
     "render_history",
@@ -131,7 +133,8 @@ _NOTICES = {
         "・書きかけの成果物は**そのまま残っています**\n"
         "・**会話の履歴は失われていました**（Claude Code 側の transcript 整理による）ので、"
         f"このスレッドの過去ログを `{HISTORY_FILENAME}` に書き出しました。"
-        "次のメッセージで Claude がそれを読み、経緯を引き継ぎます。"
+        "次のメッセージに、その場所を Claude への一行として添えます"
+        "（経緯が要る依頼なら Claude が読みます）。"
     ),
     Recovery.NONE: (
         "⚠️ **このスレッドには再接続できるものが残っていませんでした。**\n"
@@ -215,3 +218,45 @@ def render_history(messages: list[tuple[str, str, str]]) -> str:
         f"### {author} — {timestamp}\n\n{text}\n" for author, timestamp, text in messages
     )
     return head + "\n---\n\n" + body
+
+
+def history_handoff_pending(working_dir: str, *, projects_root: Path | None = None) -> bool:
+    """Has the exported thread history not been handed to Claude yet? — #881.
+
+    True while the checkout holds :data:`HISTORY_FILENAME` and no Claude
+    transcript is newer than it — i.e. the conversation that is supposed to pick
+    the history up has not started. The first turn that carries the line starts
+    that conversation, so from the second message on this is False.
+
+    Read from disk rather than remembered: a manual reattach says 「次の
+    メッセージで…」, and a deploy between the click and that message must not
+    lose the line. Never raises — an odd path means "no hand-off", not a failed
+    turn.
+    """
+    if not working_dir:
+        return False
+    try:
+        history = Path(working_dir) / HISTORY_FILENAME
+        if not history.is_file():
+            return False
+        written = history.stat().st_mtime
+        jsonl = latest_session_jsonl(derive_project_dir(working_dir, projects_root=projects_root))
+        return jsonl is None or jsonl.stat().st_mtime < written
+    except (OSError, ValueError):
+        return False
+
+
+def history_handoff_preamble(thread_id: int) -> str:
+    """The line prepended to the first prompt after a WORKDIR reattach — #881.
+
+    The notices promise 「過去ログを引き継いで再接続します」; this is what makes
+    that true on Claude's side. Same stance as #862's
+    :func:`~c_lord.session_resume.fresh_start_preamble`: Claude is told where the
+    history is, not made to read it.
+    """
+    return (
+        "（c-lord より）このスレッドの以前の会話は残っていません。"
+        f"これまでの Discord のやり取りを `{HISTORY_FILENAME}` に書き出してあります。"
+        "経緯が必要なら読んでください"
+        f"（discord-read skill でも読めます。thread_id: {thread_id}）。"
+    )
