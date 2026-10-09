@@ -178,6 +178,7 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 |---|---|
 | `.claude/skills/discord-read/SKILL.md`（untracked、または追跡されていて作業ツリーだけ違う） | c-lord が毎ターン上書きする。そこに置いた編集は次のターンで必ず消える |
 | `.claude/skills/discord-reply/` / `discord-prompt-choice/` 以下（#712 の残骸） | c-lord が毎ターンディレクトリごと消す |
+| `.claude/clord-thread-history.md`（untracked、または追跡されていて作業ツリーだけ違う — #882） | 再接続（#538 / #700 / #862）のとき c-lord が書き出す Discord の過去ログ。利用者が書いたものではない |
 | `.claude/worktrees/<name>/` で、**その worktree 自身がクリーン** | Claude Code のサブエージェントの worktree。中を開いて同じ規則で判定し、変更が1つでもあれば作業に数える |
 
 それ以外 — `.claude/settings.local.json`、利用者自身の skill、`discord-read/` の隣に
@@ -194,7 +195,12 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 ホストの `.env` の絶対パスが入っている。c-lord 自身のリポジトリにも #704 で混入していた
 （#779 で追跡を外した）。
 
-- 除外するのは **SKILL.md 1 ファイルだけ**。`discord-read/` の隣に利用者が置いた別ファイルは
+- **再接続で書き出す過去ログ `.claude/clord-thread-history.md` も同じ扱い（#882）**。中身は
+  スレッドの会話全文（他の参加者の発言・URL を含む）なので、`git add -A` で拾われると
+  #779 より重い漏洩になる。書き出した直後に `/.claude/clord-thread-history.md` を exclude に
+  足し、修正前に書き出されて除外の無いワークスペースにも、次のターンで足す（ファイルが
+  ある時だけ。再接続していないワークスペースの exclude には何も書かない）
+- 除外するのは **SKILL.md と過去ログの 2 ファイルだけ**。`discord-read/` の隣に利用者が置いた別ファイルは
   従来どおり見え、作業に数えられる
 - exclude は **untracked にしか効かない**。すでにコミットされてしまったリポジトリでは、
   上の表の「追跡されていて作業ツリーだけ違う」の行が引き続き効く
