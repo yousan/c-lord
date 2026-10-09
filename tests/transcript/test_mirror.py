@@ -2254,3 +2254,147 @@ async def test_mirror_reports_transcript_activity_to_the_turn_lamp(tmp_path: Pat
 
     assert after_tool >= 1
     assert len(seen) >= 3
+
+
+# -- #883: the thinking sentence (the pane's ●) -------------------------------
+
+
+def _assistant_thinking(text: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": text, "signature": "sig"}],
+        },
+    }
+
+
+async def _run_minimal(tmp_path: Path, events: list[dict]) -> tuple[list[str], list[str], list]:
+    """Feed *events* through a minimal mirror; return (sink posts, progress files, replies)."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    posted: list[str] = []
+    progress_files: list[str] = []
+    replies: list[tuple[str, str | None]] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    async def reply_sink(text: str) -> None:
+        replies.append((text, None))
+
+    async def file_sink(text: str, file_path: str) -> None:
+        with open(file_path, encoding="utf-8") as f:
+            progress_files.append(f.read())
+        replies.append((text, file_path))
+
+    mirror = TranscriptMirror(
+        thread_id=883,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        file_sink=file_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        for event in events:
+            _write_event(jsonl, event)
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+    return posted, progress_files, replies
+
+
+async def test_thinking_sentences_land_in_progress_txt_in_order(tmp_path: Path) -> None:
+    """#883 AC1: progress.txt reads like the pane — ● sentences between the tools."""
+    posted, files, replies = await _run_minimal(
+        tmp_path,
+        [
+            _assistant_thinking("重複を確認します。\n\n"),
+            _assistant_tool_use("Bash", "gh issue list"),
+            _user_tool_result("#877 #876"),
+            _assistant_thinking(""),  # signature-only: must not show up
+            _assistant_thinking("すでに #877 として起票済みでした。"),
+            _assistant_tool_use("Bash", "gh issue view 877"),
+            _user_tool_result("ok"),
+            _assistant_text("まとめ"),
+            {"type": "system", "subtype": "turn_duration"},
+        ],
+    )
+
+    assert len(files) == 1, (files, replies)
+    lines = files[0].splitlines()
+    order = [
+        next(i for i, ln in enumerate(lines) if "重複を確認します。" in ln),
+        next(i for i, ln in enumerate(lines) if "gh issue list" in ln),
+        next(i for i, ln in enumerate(lines) if "#877 #876" in ln),
+        next(i for i, ln in enumerate(lines) if "起票済みでした" in ln),
+        next(i for i, ln in enumerate(lines) if "gh issue view 877" in ln),
+    ]
+    assert order == sorted(order), files[0]
+    assert sum(1 for ln in lines if ln.startswith("💭")) == 2, files[0]
+    # AC3: never a message of its own.
+    assert not any("重複を確認" in p or "起票済み" in p for p in posted), posted
+    assert replies[-1][0] == "まとめ"
+
+
+async def test_thinking_alone_does_not_add_a_progress_file(tmp_path: Path) -> None:
+    """A plain Q&A turn (thinking + answer, no tools) stays a plain reply."""
+    posted, files, replies = await _run_minimal(
+        tmp_path,
+        [
+            _assistant_thinking("質問に答えます。"),
+            _assistant_text("答え"),
+            {"type": "system", "subtype": "turn_duration"},
+        ],
+    )
+
+    assert files == []
+    assert replies == [("答え", None)]
+    assert not any("質問に答えます" in p for p in posted)
+
+
+async def test_thinking_is_never_posted_in_full_mode(tmp_path: Path) -> None:
+    """#883 AC3 holds in full verbosity too — one post per sentence is the flood."""
+    project, jsonl = _fresh_jsonl(tmp_path)
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    mirror = TranscriptMirror(
+        thread_id=884, project_dir=project, sink=sink, verbosity="full", poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _assistant_thinking("内緒の進み具合"))
+        _write_event(jsonl, _assistant_text("hello"))
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    assert any("hello" in p for p in posted)
+    assert not any("内緒の進み具合" in p for p in posted), posted
+
+
+async def test_progress_line_shows_the_latest_thinking_sentence(tmp_path: Path) -> None:
+    """#883 AC2: the ⚙️ line carries the newest ● sentence instead of the tool."""
+    posts = await _progress_after_silence(
+        tmp_path,
+        [
+            _assistant_thinking("古い文"),
+            _tool_call("toolu_a", command="ls"),
+            _tool_return("toolu_a"),
+            _assistant_thinking("照合では111件が全文一致でした。"),
+            _tool_call("toolu_b", command="sleep 150"),
+        ],
+        120.0,
+    )
+
+    assert posts, "no progress line"
+    assert "作業中" in posts[0], posts[0]
+    assert "照合では111件が全文一致でした。" in posts[0], posts[0]
+    assert "古い文" not in posts[0]

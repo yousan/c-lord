@@ -1190,6 +1190,38 @@ async def test_progress_line_posts_silently(
     assert channel.send.await_args.kwargs.get("silent") is True
 
 
+async def test_progress_line_never_mentions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#883: the line now carries Claude's own prose — an @everyone in it must not ping."""
+    import discord
+
+    monkeypatch.delenv("CLORD_TURN_PROGRESS", raising=False)
+    handle = MagicMock()
+    handle.edit = AsyncMock()
+    channel = MagicMock()
+    channel.send = AsyncMock(return_value=handle)
+    bot = MagicMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    progress = cog._make_progress(123)
+    assert progress is not None
+    progress.begin_turn()
+    progress.note_thought("@everyone に知らせる前に確認します")
+    progress._last_output -= 10_000
+    await progress.tick()
+    progress._last_edit -= 10_000
+    await progress.tick()
+
+    mentions = channel.send.await_args.kwargs.get("allowed_mentions")
+    assert isinstance(mentions, discord.AllowedMentions)
+    assert mentions.everyone is False and mentions.users is False and mentions.roles is False
+    edit_mentions = handle.edit.await_args.kwargs.get("allowed_mentions")
+    assert isinstance(edit_mentions, discord.AllowedMentions)
+    assert edit_mentions.everyone is False
+
+
 async def test_progress_quiet_threshold_is_configurable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

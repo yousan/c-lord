@@ -1,7 +1,7 @@
 """Render a single JSONL event into Discord-bound text.
 
 The mirror is intentionally narrow: only events that have a visible
-counterpart in the tmux pane are rendered.  Everything else (thinking,
+counterpart in the tmux pane are rendered.  Everything else (empty thinking,
 framing meta like ``ai-title`` / ``pr-link`` / ``permission-mode``, the
 self-loopback of c-lord-driven input marked with a zero-width-space prefix)
 returns ``None`` and is dropped before it ever reaches Discord.
@@ -31,7 +31,7 @@ ZWSP_MARKER = "​"
 
 @dataclass(frozen=True)
 class RenderedEvent:
-    kind: str  # "assistant_text" | "tool_use" | "tool_result" | "user_input"
+    kind: str  # "assistant_text" | "tool_use" | "tool_result" | "user_input" | "thinking"
     body: str
     session_id: str | None = None
 
@@ -69,6 +69,7 @@ def _render_assistant(event: dict[str, Any]) -> RenderedEvent | None:
     if not isinstance(msg, dict):
         return None
     parts: list[str] = []
+    thoughts: list[str] = []
     kind = "assistant_text"
     for block in msg.get("content", []) or []:
         if not isinstance(block, dict):
@@ -82,8 +83,19 @@ def _render_assistant(event: dict[str, Any]) -> RenderedEvent | None:
         elif bt == "tool_use":
             parts.append(_format_tool_use(block))
             kind = "tool_use"
-        # thinking: deliberately suppressed (Issue #71 §4)
+        elif bt == "thinking":
+            # #883: CLI 2.1.29x writes the pane's short "●" progress sentence
+            # here; older CLIs (and many blocks still) leave it empty, signature
+            # only. Never a reply of its own — the mirror folds it into the
+            # progress line and progress.txt.
+            thought = (block.get("thinking") or "").strip()
+            if thought:
+                thoughts.append(thought)
     if not parts:
+        if thoughts:
+            return RenderedEvent(
+                kind="thinking", body="\n".join(thoughts), session_id=event.get("sessionId")
+            )
         return None
     return RenderedEvent(kind=kind, body="\n".join(parts), session_id=event.get("sessionId"))
 
