@@ -119,6 +119,24 @@ def _isolated_prompt_dir(tmp_path_factory, monkeypatch):
     monkeypatch.setattr("c_lord.tmux._prompt_file_dir", lambda: directory)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_typed_input_state():
+    """Forget what c-lord typed / interrupted in earlier tests (#879).
+
+    ``c_lord.tmux`` remembers per thread id what it last typed, so the next
+    send can clear that prompt if an interrupt put it back in the box. Tests
+    reuse thread ids, and that memory would leak one test's payload into the
+    next one's scripted pane.
+    """
+    from c_lord import tmux
+
+    tmux._last_typed.clear()
+    tmux._interrupted_at.clear()
+    yield
+    tmux._last_typed.clear()
+    tmux._interrupted_at.clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _isolated_tmux_socket():
     """Keep the whole test run off the fleet's tmux socket (#701).
