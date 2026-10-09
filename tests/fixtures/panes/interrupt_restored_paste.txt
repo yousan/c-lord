@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+ ▝▝   ▝▝   /…/a8aeb58d-9f63-4590-9195-a2d6ee165e54/scratchpad/rig/work · /rc
+
+
+❯ > 一通目の引用です。
+  Bash で sleep 20 を実行してから ok と返して
+
+  Ran 1 shell command
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ ok とだけ返して
+
+● ok
+
+✻ Brewed for 2s · done 11:47 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [Pasted text #4 +39 lines]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5.5  v2.1.295  Style: default  Ctx: 43.8k  Context: [█░░░░░░░░░░░░░░░] 44k/1.0M (4%)  Ctx Used: 4....
+   Cost: $0.16  Session: 46.0%  Weekly: 77.0%  Session: 1m  Reset: 32m  Weekly Reset: 5hr 12m  Block: 4hr 27m  In...
+   ⎇ master  (+0,-0)  +0  -0  work  𖠰 main  cwd: /tmp/claude-1000/-home-yousan-c-lord-sessions-150574783144788380...
+  paste again to expand

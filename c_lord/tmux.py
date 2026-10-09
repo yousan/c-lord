@@ -228,6 +228,32 @@ _PASTED_PLACEHOLDER = "[Pastedtext"
 # box. Long enough to be distinctive, short enough to survive the TUI's wrapping.
 _PAYLOAD_FINGERPRINT = 24
 
+# #879: Claude Code puts the prompt of a turn stopped by Ctrl+C back into the
+# input box when the turn had not produced anything yet. Measured on 2.1.295 in
+# an isolated tmux: the text is back within ~0.2s of the Ctrl+C. A send that
+# follows an interrupt waits at least this long after it before reading the box.
+_INTERRUPT_RESTORE_SETTLE = 0.5
+# How many times to try emptying the box before giving the send up.
+_CLEAR_ATTEMPTS = 3
+# Pause after the clearing keys so the next capture shows their effect.
+_CLEAR_SETTLE = 0.2
+
+# #879: thread_id -> the exact text c-lord last put into that thread's input
+# (``send_input`` or ``start_claude``'s prompt). It is how a prompt Claude Code
+# put back into the box after an interrupt is told apart from text someone
+# typed into the pane by hand: only our own words are deleted. Module-level,
+# not per manager, because a thread can be reached through more than one
+# manager instance (#427: a window moves when the thread's binding changes).
+_last_typed: dict[int, str] = {}
+# thread_id -> ``time.monotonic()`` of the last Ctrl+C c-lord sent there.
+_interrupted_at: dict[int, float] = {}
+
+
+def _remember_typed(thread_id: int, payload: str) -> None:
+    """Record *payload* as what c-lord last put into *thread_id*'s input (#879)."""
+    _last_typed[thread_id] = payload
+
+
 # #503: c-lord is usually the first process on the host to touch tmux, so the
 # server it starts inherits c-lord's *own* cgroup. systemd kills a unit's whole
 # cgroup on stop, so a plain ``systemctl --user restart c-lord.service`` took
@@ -2491,6 +2517,8 @@ class TmuxSessionManager:
             from .transcript.pane_echo import PROMPT_TTL_SECONDS, pane_echo
 
             pane_echo.register(thread_id, prompt, ttl=PROMPT_TTL_SECONDS)
+            # #879: an interrupt of this first turn puts this text back too.
+            _remember_typed(thread_id, marked_prompt)
 
         logger.info("start_claude: sent command to %s", target)
         return True
@@ -2850,11 +2878,16 @@ class TmuxSessionManager:
         if visible.returncode == 0:
             self._ensure_insert_mode(target, window, visible.stdout, thread_id)
 
+        # #879: an interrupted turn's prompt may be sitting in the box again.
+        if not self._clear_restored_prompt(target, thread_id):
+            return False
+
         payload = shield_input(text, as_command=as_command)
         errors: list[str] = []
         if not self._type_literal(target, payload, what="send_input", errors=errors):
             self._note_send_failure(thread_id, errors)
             return False
+        _remember_typed(thread_id, payload)
         # #808: CLI 2.1.278+ strips the marker before writing the ``user``
         # event, so the mirror cannot rely on it — record what was typed.
         from .transcript.pane_echo import PROMPT_TTL_SECONDS, pane_echo
@@ -2879,6 +2912,58 @@ class TmuxSessionManager:
             )
             return False
         return self._confirm_submitted(target, payload, thread_id)
+
+    def _clear_restored_prompt(self, target: str, thread_id: int) -> bool:
+        """Empty the box if it holds c-lord's own earlier prompt (#879).
+
+        Claude Code puts the prompt of a turn stopped by Ctrl+C back into the
+        input box when the turn had not produced anything yet. Typed after it,
+        the next message reached Claude as ``<stopped prompt><new message>`` —
+        the instruction the user meant to take back ran anyway.
+
+        Only positive evidence counts (#544's rule): the box must hold what
+        c-lord last typed there, or a ``[Pasted text …]`` fold. Anything else
+        is left alone, so a human's typing in the pane is never deleted.
+        ``C-u`` kills one line and ``BSpace`` joins it to the one above, so one
+        pair per line empties a multi-line box; on an empty box both are no-ops.
+
+        Returns False — with a send failure noted — when the prompt is still
+        there after :data:`_CLEAR_ATTEMPTS` tries: typing behind it would be the
+        bug itself.
+        """
+        since = _interrupted_at.pop(thread_id, None)
+        if since is not None:
+            remaining = _INTERRUPT_RESTORE_SETTLE - (time.monotonic() - since)
+            if remaining > 0:
+                time.sleep(remaining)
+        previous = _last_typed.get(thread_id)
+        if not previous:
+            return True
+        cleared = False
+        for _attempt in range(_CLEAR_ATTEMPTS):
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            if capture.returncode != 0 or not _input_box_retains(capture.stdout, previous):
+                if cleared:
+                    logger.info(
+                        "%s send_input: cleared the stopped prompt Claude Code put back "
+                        "into the input box (#879)",
+                        log_ctx(thread_id=thread_id),
+                    )
+                return True
+            lines = previous.count("\n") + 2
+            _run(["tmux", "send-keys", "-t", target, *(["C-u", "BSpace"] * lines)])
+            cleared = True
+            time.sleep(_CLEAR_SETTLE)
+        logger.error(
+            "%s send_input: the input box still holds the previous prompt after %d "
+            "attempts to clear it; not typing the new message behind it (#879)",
+            log_ctx(thread_id=thread_id),
+            _CLEAR_ATTEMPTS,
+        )
+        self._note_send_failure(
+            thread_id, ["the previous prompt could not be cleared from the input box"]
+        )
+        return False
 
     def input_box_holds(self, thread_id: int, text: str) -> bool | None:
         """Is *text* still sitting unsent in this thread's input box? (#560)
@@ -3348,6 +3433,9 @@ class TmuxSessionManager:
 
         target = self._target(window)
         result = _run(["tmux", "send-keys", "-t", target, "C-c"])
+        if result.returncode == 0:
+            # #879: the next send waits for the stopped prompt to come back.
+            _interrupted_at[thread_id] = time.monotonic()
         return result.returncode == 0
 
     def stop_tool_shells(self, thread_id: int) -> int:

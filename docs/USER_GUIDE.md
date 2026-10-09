@@ -342,6 +342,8 @@ Send a new message while Claude is working. The current operation is interrupted
 
 This also holds when the earlier message has not reached Claude yet (c-lord is still preparing it — cloning, waiting for a session slot). That earlier message is then never sent to Claude at all: only your new instruction runs (#800).
 
+Only your new instruction reaches Claude. When the interrupted turn had not started answering yet, Claude Code puts its prompt back into the terminal's input box; c-lord clears it before typing your new message, so the instruction you took back is not sent again glued to the front of the new one (#879). c-lord only clears text it typed itself — anything someone typed into the pane by hand is left alone. If the box cannot be cleared, the new message is not sent and the thread says the delivery failed, rather than sending the two joined together.
+
 A turn that does not wind down on its own within a few seconds is cancelled. If even that does not finish it within 10 seconds, c-lord stops waiting for it and starts your new instruction anyway — a stuck turn can no longer hold the thread's later messages behind it (#293). The bot log records it as an `orphan run`.
 
 ### Bot Restart
