@@ -3025,3 +3025,66 @@ class TestOnReadyLampRecovery:
             await asyncio.gather(*cog._lamp_recovery_tasks)
 
         adopt.assert_not_awaited()
+
+
+class TestOneStopPath:
+    """#878: ⏹ Stop, /stop and !stop all go through ``_stop_thread_work``."""
+
+    @pytest.mark.asyncio
+    async def test_text_and_slash_stop_use_the_shared_core(self) -> None:
+        from c_lord.session_stop import StopOutcome, StopResult
+
+        cog = _make_cog()
+        cog._stop_thread_work = AsyncMock(return_value=StopResult(StopOutcome.STOPPED))  # type: ignore[method-assign]
+        ctx = _make_thread_ctx(thread_id=12345)
+        await cog.stop_text.callback(cog, ctx)
+        interaction = _make_thread_interaction(thread_id=12345)
+        await cog.stop_session.callback(cog, interaction)
+        assert cog._stop_thread_work.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stop_button_is_wired_to_the_shared_core(self) -> None:
+        from c_lord.session_stop import StopOutcome, StopResult
+
+        cog = _make_cog()
+        cog._stop_thread_work = AsyncMock(return_value=StopResult(StopOutcome.STOPPED))  # type: ignore[method-assign]
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 12345
+        view = cog._make_stop_view(MagicMock(), thread)
+
+        btn = view.stop_button
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.response = MagicMock()
+        interaction.response.edit_message = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+        await btn.callback.callback(view, interaction, btn)
+
+        cog._stop_thread_work.assert_awaited_once_with(thread)
+
+    @pytest.mark.asyncio
+    async def test_self_started_turn_without_runner_is_stopped(self) -> None:
+        """A turn woken by a task notification has no runner but must still stop."""
+        tmux = MagicMock()
+        tmux.capture_pane = MagicMock(return_value="✶ Infusing… (4s · ↓ 140 tokens)\n❯ \n")
+        tmux.is_claude_running = MagicMock(return_value=True)
+        tmux.send_interrupt = MagicMock(return_value=True)
+        tmux.stop_tool_shells = MagicMock(return_value=0)
+        cog = _make_cog(channel_cog=_make_channel_cog_mock(tmux_manager=tmux))
+        cog._start_wakeup_guard = MagicMock()  # type: ignore[method-assign]
+        ctx = _make_thread_ctx(thread_id=12345, parent_id=999)
+
+        await cog.stop_text.callback(cog, ctx)
+
+        tmux.send_interrupt.assert_called_once_with(12345)
+        embed = ctx.send.call_args.kwargs.get("embed")
+        assert embed is not None and "stopped" in embed.title.lower()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_stop_touches_nothing(self) -> None:
+        cog = _make_cog()
+        cog._authorizer = Authorizer(allowed_user_ids={42})
+        cog._stop_thread_work = AsyncMock()  # type: ignore[method-assign]
+        ctx = _make_thread_ctx(thread_id=12345)
+        await cog.stop_text.callback(cog, ctx)
+        cog._stop_thread_work.assert_not_called()

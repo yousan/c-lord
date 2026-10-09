@@ -216,7 +216,7 @@ once it is over. At the end of a turn they are folded into a single
 | `/clord <prompt>` | Start a new Claude Code session | Available |
 | `/clord-attach <window>` | Attach a tmux window to the current thread | Available |
 | `/clord-init <repo>` | Link a repository to the current channel | Available |
-| `/stop` | Stop the current session (preserves it for resume) | Available |
+| `/stop` | Stop the current session — also ends background commands Claude started (preserves it for resume; same as ⏹ Stop) | Available |
 | `/clear` | Reset the Claude Code session for this thread | Available |
 | `/skill <name> [args]` | Run a Claude Code skill (with autocomplete) | Available |
 | `/clord-status [show_all]` | List this channel's sessions — size, attach, resume (supersedes `/sessions`, `/session-dirs`, `/resume-info`) | Available |

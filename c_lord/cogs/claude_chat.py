@@ -45,7 +45,7 @@ from ..discord_ui.authorization import (
     resolve_fallback_owner_ids,
     set_default_authorizer,
 )
-from ..discord_ui.embeds import error_embed, stopped_embed
+from ..discord_ui.embeds import error_embed
 from ..discord_ui.lamp_recovery import HISTORY_LIMIT as LAMP_HISTORY_LIMIT
 from ..discord_ui.lamp_recovery import adopt_orphaned_lamp, find_open_lamp
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
@@ -98,6 +98,13 @@ from ..session_resume import (
     resume_notice,
     stopped_hint,
     swept_notice,
+)
+from ..session_stop import (
+    StopOutcome,
+    StopResult,
+    stop_reply,
+    stop_thread_work,
+    suppress_wakeups,
 )
 from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_auto_enabled
 from ..thread_origin import inspect_origin
@@ -440,6 +447,8 @@ class ClaudeChatCog(commands.Cog):
         # (asyncio only holds a weak reference to a running task).
         self._backfill_task: asyncio.Task[None] | None = None
         self._backfill_tasks: set[asyncio.Task[None]] = set()
+        # #878: post-stop guards that interrupt a turn woken by a task notification.
+        self._stop_guard_tasks: set[asyncio.Task[int]] = set()
 
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
         """Check if a member/user is authorized to use the bot.
@@ -1816,15 +1825,54 @@ class ClaudeChatCog(commands.Cog):
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
-        runner = self._active_runners.get(channel.id)
-        if not runner:
-            await respond("No active session is running in this thread.", ephemeral=True)
-            return
-
-        await runner.interrupt()
+        result = await self._stop_thread_work(channel)
+        # The session DB is intentionally left alone so the user can resume;
         # _active_runners cleanup is handled by _run_claude's finally block.
-        # We intentionally do NOT delete from the session DB so the user can resume.
-        await respond(embed=stopped_embed())
+        content, embed, ephemeral = stop_reply(result)
+        if embed is not None:
+            await respond(embed=embed)
+        else:
+            await respond(content, ephemeral=ephemeral)
+
+    async def _stop_thread_work(self, thread: discord.Thread) -> StopResult:
+        """The one stop behind ⏹ Stop, /stop and !stop (#878) — callers authorize first.
+
+        Interrupts the turn c-lord is driving (or, when Claude started one on
+        its own after a task notification, the turn in the pane), ends the Bash
+        tool commands still running there, then guards against the turn their
+        notifications would start. Spec: ``docs/specs/stop-button.md``.
+        """
+        runner = self._active_runners.get(thread.id)
+        tmux = await self._resolve_tmux_manager(
+            getattr(thread, "parent_id", None), thread_id=thread.id
+        )
+        result = await stop_thread_work(thread.id, runner=runner, tmux=tmux)
+        if result.outcome is StopOutcome.STOPPED and tmux is not None:
+            self._start_wakeup_guard(thread.id, tmux, runner)
+        return result
+
+    def _start_wakeup_guard(
+        self, thread_id: int, tmux: TmuxSessionManager, stopped_runner: object | None
+    ) -> None:
+        """Run :func:`suppress_wakeups` in the background until the user's next turn."""
+
+        def still_ours() -> bool:
+            return self._active_runners.get(thread_id) in (None, stopped_runner)
+
+        task = asyncio.create_task(
+            suppress_wakeups(thread_id, tmux=tmux, still_ours=still_ours),
+            name=f"stop-wakeup-guard-{thread_id}",
+        )
+        self._stop_guard_tasks.add(task)
+        task.add_done_callback(self._stop_guard_tasks.discard)
+
+    def _make_stop_view(self, runner: object, thread: discord.Thread) -> StopView:
+        """The ⏹ Stop button for a turn, wired to :meth:`_stop_thread_work` (#878)."""
+        return StopView(
+            runner,  # type: ignore[arg-type]
+            authorizer=self._authorizer,
+            on_stop=lambda: self._stop_thread_work(thread),
+        )
 
     @app_commands.command(
         name="clord-reattach",
@@ -4258,7 +4306,7 @@ class ClaudeChatCog(commands.Cog):
             with contextlib.suppress(Exception):
                 await self.repo.update_trigger_message(thread.id, user_message.id)
 
-            stop_view = StopView(runner, authorizer=self._authorizer)
+            stop_view = self._make_stop_view(runner, thread)
             # #632: the Stop-button notice is decoration too. If Discord refuses
             # it (rate limit, revoked permission, closed session) the turn must
             # still run — StopView already treats a missing message as "nothing

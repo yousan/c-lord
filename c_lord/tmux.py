@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 from . import api_endpoint
 from .pane_running import pane_shows_running
+from .tool_shells import terminate_tool_shells
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -3348,6 +3349,28 @@ class TmuxSessionManager:
         target = self._target(window)
         result = _run(["tmux", "send-keys", "-t", target, "C-c"])
         return result.returncode == 0
+
+    def stop_tool_shells(self, thread_id: int) -> int:
+        """End the Bash tool commands running under *thread_id*'s pane (#878).
+
+        C-c interrupts Claude's turn but leaves its background commands alive,
+        and each one that finishes wakes Claude for a turn nobody asked for.
+        Returns how many command groups were signalled (0 when there is no
+        window, or nothing was running).
+        """
+        if not self._check_available():
+            return 0
+        window = self._find_window_for_thread(thread_id)
+        if window is None:
+            return 0
+        result = _run(["tmux", "display-message", "-p", "-t", self._target(window), "#{pane_pid}"])
+        try:
+            pane_pid = int(result.stdout.strip()) if result.returncode == 0 else 0
+        except ValueError:
+            pane_pid = 0
+        if pane_pid <= 0:
+            return 0
+        return terminate_tool_shells(pane_pid)
 
     def is_claude_running(self, thread_id: int) -> bool:
         """Check if the pane's current process is ``claude``.

@@ -5,7 +5,7 @@
 
 ## これは何か
 
-走っているターンを利用者が止めるための唯一のワンクリック導線。押すと `SIGINT`（Claude Code で Esc を押したのと同じ）が走行中のランナーへ届く。
+走っているターンを利用者が止めるための唯一のワンクリック導線。**`/stop` と `!stop` と同じ停止処理を通る**（#878 — `ClaudeChatCog._stop_thread_work` → `c_lord/session_stop.py`）。ボタンは webhook から押せないので、`!stop` を webhook で打つことがボタンの E2E 検証になる。
 
 **このボタンはプロセス内のランナーを直接握っている。** DB にも Discord にも「どのランナーか」は書かれていないので、**bot のプロセスが変わった瞬間、そのボタンは何も指していない**。ここが以下の規律の根拠になる。
 
@@ -15,7 +15,30 @@
 
 - ターンが始まると、スレッドの末尾に `-# ⏺ Session running (\`w1\`)` と **⏹ Stop** が出る
 - Claude のメッセージが増えるたびにボタンは**下へ付け直される**（古い方は消える）。スレッドに同時に存在する Stop ボタンは **1個だけ**
-- 押すと、そのターンが止まり、ボタンは無効になって「停止しました」が出る
+- 押すと、そのターンが止まり、ボタンは無効になって「⏹️ Session stopped」が出る
+- トリガーメッセージのランプは **🟡**（あなたの番）になる。止めたのは利用者なので ❌ も「❌ Error: Stopped by user」も出さず、失敗通知のメンションも飛ばさない（#878）
+- 次のメッセージは普通に受け付けられ、同じセッションの続きとして走る
+
+### 「止める」が止めるもの（#878）
+
+`⏹ Stop` / `/stop` / `!stop` はどれも次の順で動く:
+
+1. **c-lord が走らせているターン**に C-c を送る
+2. c-lord が走らせていないのに **ペインで Claude が作業中**（スピナーが出ている）なら、そのペインに C-c を送る。バックグラウンドの作業の完了通知で Claude が自分で始めたターンはこれにあたる。以前は「No active session is running in this thread.」と答えて何もしなかった
+3. **Claude が Bash ツールで動かしているコマンド（バックグラウンドも含む）を止める**。いまの Claude Code は長いコマンドを自分でバックグラウンドに回し（120 秒を超えたコマンド、フォアグラウンドの `sleep` など）、C-c はそこに届かない。残しておくと、終わったときの通知で **Claude が勝手に次のターンを始める**。止めると「Also stopped N background command(s).」と件数が出る
+4. 止めてから **20 秒間**、止めたコマンドの通知などで Claude が自分でターンを始めたら、それにも C-c を送る（最大 3 回、3 秒以上あけて）。利用者が新しいメッセージを送った時点でこの見張りはやめる — 利用者のターンは止めない
+
+アイドルのペインには C-c を送らない（アイドルで C-c を2回受けると Claude Code が終了するため）。
+
+### 止められなかったとき
+
+- 何も走っていなければ「No active session is running in this thread.」（本人にだけ見える返答）。ボタンの場合はボタンが押せる状態に戻る
+- C-c を送れなかったとき（tmux のウィンドウが見つからない等）は「⚠️ 止められませんでした …」と出し、**「Session stopped」とは言わない**。ボタンは押せる状態に戻る
+
+### 止めないもの
+
+- バックグラウンドの**エージェント**（Agent ツールの `run_in_background`）は Claude Code のプロセスの中で動いているので、ここでは止めない（Claude Code 自身の `ctrl+x ctrl+k` ×2 の担当）
+- Bash ツール以外の方法で立ち上がったプロセス（Claude が `nohup` / `setsid` で切り離したもの等）
 
 ### ターンが終わったとき
 
@@ -59,6 +82,7 @@
 - #466 — ボタンの押下は allowlist で認可される（`AuthorizedViewMixin`）
 - #634 — 起動時の掃除。本番で残骸が46件、いずれもシャットダウン時のログとして残っていた
 - #752 — 掃除が末尾100件 × 200スレッドの窓しか見ておらず、窓の外の Stop が残り続けていた（本番 2026-09-23: 押せる見た目の Stop 65件、うち約17件は走行中のターンの正当なもの）。カーソル方式にして窓を無くした。同じ掃除で ❓ 質問メニューの残骸も外す（[ask-menu-lifecycle.md](./ask-menu-lifecycle.md)）
+- #878 — ⏹ を押しても「止まらない」。staging で再現: C-c はフォアグラウンドのコマンドを止めるが、バックグラウンドのシェルは生き残り、その完了通知（C-c の時点でキューにあった通知も CLI は捨てない）で Claude が直後に次のターンを始めた。そのターンは c-lord の管理外なのでボタンも出ず `!stop` も効かなかった。ボタンだけ別経路（ランナーの `interrupt()` を直接）で、失敗しても常に「Session stopped」を出していた
 - #796 — #752 の残り。自動採番の `custom_id` を持つ非永続 View（本番 2026-09-23: 押せる見た目の「⚡ これは新しい指示でした」3件、すべてアーカイブ済みスレッド）も同じ掃除で外す
 
 ## 実装
@@ -66,6 +90,9 @@
 | 関心事 | 場所 |
 |---|---|
 | ボタンと本文 | `c_lord/discord_ui/views.py::StopView` / `STOP_MESSAGE_PREFIX` |
+| 停止処理（ボタン・`/stop`・`!stop` 共通, #878） | `c_lord/cogs/claude_chat.py::_stop_thread_work` → `c_lord/session_stop.py::stop_thread_work` / `suppress_wakeups` / `stop_reply` |
+| Bash ツールのシェルを探して止める (#878) | `c_lord/tool_shells.py`（`TmuxSessionManager.stop_tool_shells`） |
+| 止めたターンを ❌ にしない (#878) | `c_lord/cogs/event_processor.py::_on_complete`（`STOPPED_BY_USER_ERROR`） |
 | 末尾へ付け直す | `views.py::StopView.bump` |
 | ターン終了で消す | `views.py::StopView.disable` |
 | 起動時の掃除 (#634/#752/#796) | `c_lord/stale_stop_buttons.py::sweep_dead_buttons`（`startup_recovery.py` 経由で `cogs/claude_chat.py::on_ready` から起動） |

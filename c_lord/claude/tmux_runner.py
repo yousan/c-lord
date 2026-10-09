@@ -71,6 +71,9 @@ _TURN_START_GRACE = 120.0
 # Prefix of the RESULT error for "this turn never produced anything" (#562).
 # Exported so callers can recognise the outcome without string-sniffing.
 NO_RESPONSE_ERROR_PREFIX = "No response —"
+#: The RESULT error of a turn the user stopped (⏹ / /stop / !stop). Shown as a
+#: stop, not a failure (#878) — ``EventProcessor`` matches it exactly.
+STOPPED_BY_USER_ERROR = "Stopped by user"
 
 # Prefix of the RESULT error for "the folder-trust dialog would not close"
 # (#630).  Distinct from NO_RESPONSE: the turn produced nothing either way,
@@ -2468,7 +2471,7 @@ class TmuxClaudeRunner:
         # surface an error, not a silent "done").
         timed_out = raw_static_seconds >= self.timeout_seconds
         if self._stopped:
-            error = None if self._silent_stop else "Stopped by user"
+            error = None if self._silent_stop else STOPPED_BY_USER_ERROR
         elif login_required is not None:
             # #812: above the whole ladder, because the ladder only runs for a
             # turn with no scraped answer — and here the refusal IS the scraped
@@ -2799,11 +2802,14 @@ class TmuxClaudeRunner:
             raw={},
             message_type=MessageType.RESULT,
             is_complete=True,
-            error=None if self._silent_stop else "Stopped by user",
+            error=None if self._silent_stop else STOPPED_BY_USER_ERROR,
         )
 
-    async def interrupt(self, *, silent: bool = False) -> None:
+    async def interrupt(self, *, silent: bool = False) -> bool:
         """Send C-c to the tmux pane (graceful interrupt).
+
+        Returns whether the C-c went out — False when the thread has no window
+        (#878: the stop reply must not claim a stop that never reached Claude).
 
         Args:
             silent: When True, the RESULT event will have ``error=None``
@@ -2814,7 +2820,7 @@ class TmuxClaudeRunner:
         """
         self._stopped = True
         self._silent_stop = silent
-        await asyncio.to_thread(self._tmux.send_interrupt, self._thread_id)
+        return bool(await asyncio.to_thread(self._tmux.send_interrupt, self._thread_id))
 
     def withdraw(self, *, silent: bool = False) -> None:
         """Stop a turn that has not delivered its prompt yet, without C-c (#800).

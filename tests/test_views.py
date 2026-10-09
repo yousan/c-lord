@@ -260,3 +260,49 @@ class TestStopViewBump:
         thread.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "rate limited"))
 
         await view.bump(thread)  # should not raise
+
+
+class TestStopViewSharedStopPath:
+    """#878: the button runs the same stop as /stop and !stop (``on_stop``)."""
+
+    @pytest.mark.asyncio
+    async def test_click_runs_on_stop_instead_of_the_runner(self) -> None:
+        from c_lord.session_stop import StopOutcome, StopResult
+
+        runner = _make_runner()
+        on_stop = AsyncMock(return_value=StopResult(StopOutcome.STOPPED, shells_stopped=1))
+        view = StopView(runner, on_stop=on_stop)
+
+        await _click(view, _make_interaction())
+
+        on_stop.assert_awaited_once()
+        runner.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_stop_is_not_announced_as_stopped(self) -> None:
+        from c_lord.session_stop import FAILED_MESSAGE, StopOutcome, StopResult
+
+        on_stop = AsyncMock(return_value=StopResult(StopOutcome.FAILED))
+        view = StopView(_make_runner(), on_stop=on_stop)
+        interaction = _make_interaction()
+        interaction.edit_original_response = AsyncMock()
+
+        await _click(view, interaction)
+
+        kwargs = interaction.followup.send.call_args.kwargs
+        assert kwargs.get("embed") is None
+        assert interaction.followup.send.call_args.args[0] == FAILED_MESSAGE
+        # The button comes back so the user can try again.
+        assert view.stop_button.disabled is False
+
+    @pytest.mark.asyncio
+    async def test_runner_reporting_no_c_c_is_a_failure_without_on_stop(self) -> None:
+        runner = _make_runner()
+        runner.interrupt = AsyncMock(return_value=False)
+        view = StopView(runner)
+        interaction = _make_interaction()
+        interaction.edit_original_response = AsyncMock()
+
+        await _click(view, interaction)
+
+        assert interaction.followup.send.call_args.kwargs.get("embed") is None
