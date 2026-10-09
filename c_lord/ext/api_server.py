@@ -309,10 +309,14 @@ class ApiServer:
         raise error
 
     async def stop(self) -> None:
-        """Stop the API server."""
+        """Stop the API server. Safe to call more than once, even concurrently (#877)."""
         api_endpoint.clear()
-        if self._runner:
-            await self._runner.cleanup()
+        # Taken before the await: ``AppRunner.cleanup()`` yields between checking
+        # its server and using it, so a second caller reaching it meanwhile hit
+        # ``'NoneType' object has no attribute 'pre_shutdown'``.
+        runner, self._runner = self._runner, None
+        if runner:
+            await runner.cleanup()
 
     async def health(self, request: web.Request) -> web.Response:
         """GET /api/health — health check."""

@@ -63,3 +63,14 @@ def test_resets_failed_state_before_starting(tmp_path: Path) -> None:
     assert calls.index("systemctl --user reset-failed c-lord.service") < calls.index(
         "systemctl --user enable --now c-lord.service"
     )
+
+
+def test_unit_signals_only_the_main_process(tmp_path: Path) -> None:
+    """#877: ``ExecStart`` is ``uv run python …`` — two processes. With the
+    default ``KillMode=control-group`` systemd sends SIGTERM to both and ``uv``
+    forwards its own, so python got it twice on every restart. ``mixed`` sends
+    SIGTERM to the main process (``uv``, which forwards it once) and keeps the
+    SIGKILL of the whole group for a stop that times out."""
+    _result, unit_dir, _log = _run(tmp_path)
+    lines = [line.strip() for line in (unit_dir / "c-lord.service").read_text().splitlines()]
+    assert "KillMode=mixed" in lines
