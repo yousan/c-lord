@@ -533,3 +533,17 @@ class TestThinkingSentence:
 
         assert "前のターン" not in rec.posts[0]
         assert "Bash: ls" in rec.posts[0]
+
+    @pytest.mark.asyncio
+    async def test_backticks_are_dropped_so_truncation_cannot_open_a_code_span(self) -> None:
+        """A cut in the middle of `code` would leave a stray backtick in the line."""
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0)
+        p.begin_turn()
+
+        clock.advance(91.0)
+        p.note_thought("最新の`send_input()`で" + "あ" * 100 + "`<pasted_content>`")
+        await p.tick()
+
+        assert "`" not in rec.posts[0], rec.posts[0]
+        assert "send_input()" in rec.posts[0]

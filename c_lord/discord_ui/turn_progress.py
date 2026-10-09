@@ -126,8 +126,12 @@ def _shorten(label: str) -> str:
 
 
 def _shorten_thought(text: str) -> str:
-    """One row of Claude's progress sentence: whitespace folded, then truncated."""
-    text = " ".join(text.split())
+    """One row of Claude's progress sentence: whitespace folded, then truncated.
+
+    Backticks go, as on tool labels — a cut inside `code` would otherwise leave
+    one unpaired and the rest of the line would render as a broken code span.
+    """
+    text = " ".join(text.replace("`", "").split())
     if len(text) <= _MAX_THOUGHT_CHARS:
         return text
     return text[: _MAX_THOUGHT_CHARS - 1] + "…"
