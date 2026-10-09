@@ -60,6 +60,9 @@ This means the bot token is **readable by the Claude session** (it `grep`s the
   the user's commits: the injector lists it in the clone's `.git/info/exclude`
   (#779), so `git add -A` does not pick it up. Before #779 it was committed
   into c-lord's own public repository by an unrelated PR (#704).
+- The Discord thread history c-lord writes into the checkout on a reattach
+  (`.claude/clord-thread-history.md`, #538/#862) — the whole conversation,
+  other participants included — gets the same `.git/info/exclude` line (#882).
 
 > Note: the env stripping described under "Environment Isolation" below **is**
 > implemented (#353, closing the #458 drift), but it does **not** make the token

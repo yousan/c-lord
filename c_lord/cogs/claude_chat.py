@@ -76,6 +76,7 @@ from ..host_restart_notice import stopped_mid_turn
 from ..log_sampler import LogSampler
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed, was_auto_stopped
+from ..session_dir import exclude_thread_history
 from ..session_reattach import (
     HISTORY_FILENAME,
     Plan,
@@ -1469,6 +1470,8 @@ class ClaudeChatCog(commands.Cog):
             target = Path(working_dir) / HISTORY_FILENAME
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(render_history(messages), encoding="utf-8")
+            # #882: the whole conversation must not ride along on `git add -A`.
+            exclude_thread_history(working_dir)
             logger.info("%s wrote %d message(s) to %s", ctx, len(messages), HISTORY_FILENAME)
         except Exception:
             # Never fatal — see _reattach_thread's docstring.
