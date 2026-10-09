@@ -7,10 +7,13 @@ semver tag + short commit + commit date (https://qiita.com/yousan/items/cffa19f6
 
 from __future__ import annotations
 
+import subprocess
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
+from c_lord import version
 from c_lord.version import (
     STALE_BUILD_DAYS,
     _baked_commit_date,
@@ -285,9 +288,7 @@ class TestInstalledVersion:
         assert _installed_version() == "v1.4.197-20260915"
 
     def test_dev_wheel_keeps_its_commit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            "c_lord.version._distribution_version", lambda: "1.4.198.dev1+g3f06814"
-        )
+        monkeypatch.setattr("c_lord.version._distribution_version", lambda: "1.4.198.dev1+g3f06814")
         monkeypatch.setattr("c_lord.version._baked_commit_date", lambda: "20260915")
         assert _installed_version() == "v1.4.198-b3f06814-20260915"
 
@@ -319,3 +320,49 @@ class TestInstalledVersion:
         assert _baked_commit_date() is None
         mod.COMMIT_DATE = "20260915"  # type: ignore[attr-defined]
         assert _baked_commit_date() == "20260915"
+
+
+def _git_repo(path: Path, *tags_per_commit: tuple[str, ...]) -> None:
+    """A repo with one commit per entry, each carrying the given tags."""
+    env_args = ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    for i, tags in enumerate(tags_per_commit):
+        subprocess.run(
+            ["git", *env_args, "-C", str(path), "commit", "-q", "--allow-empty", "-m", f"c{i}"],
+            check=True,
+        )
+        for tag in tags:
+            subprocess.run(["git", "-C", str(path), "tag", tag], check=True)
+
+
+class TestVersionFromCheckout:
+    """#880: the number used to be "the newest tag this clone has fetched", so
+    a staging clone that never fetched tags announced itself as v1.4.197 while
+    production, on the same commit, said v1.4.261 — 64 versions apart for
+    identical code."""
+
+    def test_on_a_tag_is_that_tag(self, tmp_path: Path) -> None:
+        _git_repo(tmp_path, ("v1.4.1",), (), ("v1.4.3",))
+        assert version._version_from_checkout(tmp_path).startswith("v1.4.3-b")
+
+    def test_past_the_newest_known_tag_says_how_far(self, tmp_path: Path) -> None:
+        _git_repo(tmp_path, ("v1.4.1",), (), ())
+        assert version._version_from_checkout(tmp_path).startswith("v1.4.1+2-b")
+
+    def test_same_commit_with_and_without_the_newer_tags(self, tmp_path: Path) -> None:
+        full = tmp_path / "prod"
+        _git_repo(full, ("v1.4.1",), ("v1.4.2",), ("v1.4.3",))
+        stale = tmp_path / "staging"
+        subprocess.run(["git", "clone", "-q", "--no-tags", str(full), str(stale)], check=True)
+        subprocess.run(
+            ["git", "-C", str(stale), "fetch", "-q", "origin", "tag", "v1.4.1"], check=True
+        )
+
+        prod = version._version_from_checkout(full)
+        staging = version._version_from_checkout(stale)
+
+        assert prod.startswith("v1.4.3-b")
+        # Same commit and date; the number says it is two commits past v1.4.1
+        # instead of claiming to be v1.4.1.
+        assert staging == prod.replace("v1.4.3-", "v1.4.1+2-")
+        assert version.build_date(staging) == version.build_date(prod)
