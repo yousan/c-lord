@@ -45,6 +45,9 @@ _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 #: ``(Nd)`` after the version in the 📊 footer (#756). One place, on purpose.
 STALE_BUILD_DAYS = 7
 
+# ``git describe --tags --long``: "v1.4.197-73-g867cc9f" -> tag, distance (#880).
+_DESCRIBE_LONG_RE = re.compile(r"^(?P<tag>.+)-(?P<distance>\d+)-g[0-9a-f]+$")
+
 # The article format's date tail: "v1.4.197-b3f06814-20260915" -> "20260915".
 _DATE_TAIL_RE = re.compile(r"-(\d{8})$")
 
@@ -274,20 +277,38 @@ def resolve_version() -> str:
     repo_root = Path(__file__).resolve().parent.parent
 
     if (repo_root / ".git").exists():
-        tag = _git(["describe", "--tags", "--abbrev=0"], repo_root)
-        commit = _git(["rev-parse", "--short=7", "HEAD"], repo_root)
-        date = _git(
-            ["log", "-1", "--date=format:%Y%m%d", "--format=%cd"],
-            repo_root,
-        )
-        base = (tag or "").lstrip("v")
-        if not base:
-            # No tags yet — fall back to distribution version's base if any.
-            dist = _distribution_version()
-            base = parse_local_version(dist)[0] if dist else "0.0.0"
-        return format_version_string(base, commit, date)
+        return _version_from_checkout(repo_root)
 
     return _installed_version() or "unknown"
+
+
+def _version_from_checkout(repo_root: Path) -> str:
+    """The article-format version of the checkout at *repo_root*.
+
+    The number is the newest tag **this clone has fetched**, which need not be
+    the newest tag there is: a clone updated with ``git fetch origin main``
+    never receives the tags made since (#880 — staging said v1.4.197 while
+    production, on the same commit, said v1.4.261). Which tag that is cannot be
+    known offline, so when HEAD is past the tag the string says by how much —
+    ``v1.4.197+73-b867cc9f-20261009`` — instead of claiming to be v1.4.197.
+    Commit and date are unaffected, so the build-age check (#756) is too.
+    """
+    described = _git(["describe", "--tags", "--long"], repo_root)
+    commit = _git(["rev-parse", "--short=7", "HEAD"], repo_root)
+    date = _git(
+        ["log", "-1", "--date=format:%Y%m%d", "--format=%cd"],
+        repo_root,
+    )
+    base = ""
+    if described and (m := _DESCRIBE_LONG_RE.match(described)):
+        base = m.group("tag").lstrip("v")
+        if base and m.group("distance") != "0":
+            base += f"+{m.group('distance')}"
+    if not base:
+        # No tags yet — fall back to distribution version's base if any.
+        dist = _distribution_version()
+        base = parse_local_version(dist)[0] if dist else "0.0.0"
+    return format_version_string(base, commit, date)
 
 
 @lru_cache(maxsize=1)
