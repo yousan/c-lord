@@ -783,6 +783,25 @@ def _input_box_retains(pane_text: str, payload: str) -> bool | None:
     return head in box or tail in box
 
 
+def _input_box_lost_head(pane_text: str, payload: str) -> bool:
+    """Does the box hold *payload*'s end but not its start? (#872)
+
+    Only meaningful for a payload typed in more than one piece: the first piece
+    always folds into ``[Pasted text …]``, so a box with neither that fold nor
+    the payload's first characters — yet with its last ones — lost the first
+    piece. Anything less certain is ``False``.
+    """
+    box = _input_box_text(pane_text)
+    if not box or _PASTED_PLACEHOLDER in box:
+        return False
+    squashed = _squash(payload)
+    if len(squashed) < 2 * _PAYLOAD_FINGERPRINT:
+        return False
+    if squashed[:_PAYLOAD_FINGERPRINT] in box:
+        return False
+    return squashed[-_PAYLOAD_FINGERPRINT:] in box
+
+
 def _pane_has_open_menu(pane_text: str) -> bool:
     """True if the pane shows an open AskUserQuestion / plan-approval menu (#485).
 
@@ -2902,6 +2921,12 @@ class TmuxSessionManager:
         if len(payload) >= _PASTE_FOLD_MIN_CHARS:
             time.sleep(_PASTE_SETTLE)
 
+        # #872: a message typed in pieces must not go out without its first one.
+        if len(_chunk_for_send_keys(payload)) > 1 and not self._ensure_head_landed(
+            target, payload, thread_id
+        ):
+            return False
+
         # Press Enter to submit
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
         if result.returncode != 0:
@@ -2939,21 +2964,16 @@ class TmuxSessionManager:
         previous = _last_typed.get(thread_id)
         if not previous:
             return True
-        cleared = False
-        for _attempt in range(_CLEAR_ATTEMPTS):
-            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
-            if capture.returncode != 0 or not _input_box_retains(capture.stdout, previous):
-                if cleared:
-                    logger.info(
-                        "%s send_input: cleared the stopped prompt Claude Code put back "
-                        "into the input box (#879)",
-                        log_ctx(thread_id=thread_id),
-                    )
-                return True
-            lines = previous.count("\n") + 2
-            _run(["tmux", "send-keys", "-t", target, *(["C-u", "BSpace"] * lines)])
-            cleared = True
-            time.sleep(_CLEAR_SETTLE)
+        cleared = self._clear_box(target, previous)
+        if cleared is None:
+            return True
+        if cleared:
+            logger.info(
+                "%s send_input: cleared the stopped prompt Claude Code put back "
+                "into the input box (#879)",
+                log_ctx(thread_id=thread_id),
+            )
+            return True
         logger.error(
             "%s send_input: the input box still holds the previous prompt after %d "
             "attempts to clear it; not typing the new message behind it (#879)",
@@ -2962,6 +2982,77 @@ class TmuxSessionManager:
         )
         self._note_send_failure(
             thread_id, ["the previous prompt could not be cleared from the input box"]
+        )
+        return False
+
+    def _clear_box(self, target: str, payload: str) -> bool | None:
+        """Empty the input box of *payload*; ``None`` if it never held it.
+
+        Acts only while :func:`_input_box_retains` sees *payload* (or a
+        ``[Pasted text …]`` fold) in the box — positive evidence, #544's rule.
+        ``C-u`` kills one line and ``BSpace`` joins it to the one above, so one
+        pair per line empties a multi-line box; on an empty box both are no-ops.
+        Returns True once the box is clear, False if it still holds *payload*
+        after :data:`_CLEAR_ATTEMPTS` rounds.
+        """
+        pressed = False
+        for _attempt in range(_CLEAR_ATTEMPTS):
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            if capture.returncode != 0 or not _input_box_retains(capture.stdout, payload):
+                return True if pressed else None
+            lines = payload.count("\n") + 2
+            _run(["tmux", "send-keys", "-t", target, *(["C-u", "BSpace"] * lines)])
+            pressed = True
+            time.sleep(_CLEAR_SETTLE)
+        return False
+
+    def _ensure_head_landed(self, target: str, payload: str, thread_id: int) -> bool:
+        """Make sure the first piece of a multi-piece message is in the box (#872).
+
+        A message over one ``send-keys`` is typed in pieces (#527). The first is
+        a ~3,000-byte burst that the TUI folds into ``[Pasted text …]``; the rest
+        follow as text. In production (CLI 2.1.283, panes idle for 20–80
+        minutes) the first piece twice never arrived, Enter submitted the rest,
+        and Claude started on the second half of a sentence. The CLI-side cause
+        was not reproduced, so this checks the result instead: a box holding
+        the message's end but neither the fold nor its start has lost its head.
+
+        Such a box is cleared and the message typed once more. Still wrong, it
+        is cleared again and the send fails — a delivery failure the user sees
+        beats Claude working from half an instruction. Anything that cannot be
+        read is let through (#544: act only on positive evidence).
+        """
+        for attempt in range(1, 3):
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            if capture.returncode != 0 or not _input_box_lost_head(capture.stdout, payload):
+                if attempt > 1:
+                    logger.info(
+                        "%s send_input: the retyped message arrived whole (#872)",
+                        log_ctx(thread_id=thread_id),
+                    )
+                return True
+            logger.warning(
+                "%s send_input: the input box holds the end of the %d-character message "
+                "but not its first part (attempt %d/2); clearing it%s (#872)",
+                log_ctx(thread_id=thread_id),
+                len(payload),
+                attempt,
+                " and typing it again" if attempt == 1 else "",
+            )
+            if self._clear_box(target, payload) is False or attempt == 2:
+                break
+            errors: list[str] = []
+            if not self._type_literal(target, payload, what="send_input", errors=errors):
+                self._note_send_failure(thread_id, errors)
+                return False
+            time.sleep(_PASTE_SETTLE)
+        logger.error(
+            "%s send_input: the first part of the message did not reach the input box "
+            "twice; not submitting the rest on its own (#872)",
+            log_ctx(thread_id=thread_id),
+        )
+        self._note_send_failure(
+            thread_id, ["the first part of the message did not reach Claude's input box"]
         )
         return False
 

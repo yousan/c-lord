@@ -50,6 +50,7 @@ from ..usage_limit import (
     is_refusal_shaped,
     usage_limit_notices,
 )
+from ..utils.logger import log_ctx
 from .formatter import ZWSP_MARKER, RenderedEvent, render_event
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
@@ -983,6 +984,19 @@ class TranscriptMirror:
                         self.thread_id,
                     )
                     rendered = None
+                elif rendered.kind == "user_input" and (
+                    cut := pane_echo.consume_partial(self.thread_id, rendered.body)
+                ):
+                    # #872: Claude got only part of a message c-lord typed. The
+                    # line still goes out (it is what Claude is working from),
+                    # but the log has to say a message was cut.
+                    logger.warning(
+                        "%s TranscriptMirror: Claude received only %d of the %d characters "
+                        "c-lord typed for this message — the rest never reached it (#872)",
+                        log_ctx(thread_id=self.thread_id),
+                        cut[1],
+                        cut[0],
+                    )
 
                 # #539: record this event's activity BEFORE ticking, so the line
                 # reflects what we just read rather than the state before it —

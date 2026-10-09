@@ -79,6 +79,10 @@ _TTL_SECONDS = 300.0
 PROMPT_TTL_SECONDS = 6 * 3600.0
 # Enough for a burst of messages queued behind one long turn (#808).
 _MAX_PER_THREAD = 32
+# #872: shortest recorded text (whitespace-free) that counts as evidence of a
+# message cut short. "ok" sits inside countless messages; 20 characters of one
+# of them arriving on their own does not happen by accident.
+_PARTIAL_MIN_CHARS = 20
 
 
 # #808 (reopened): Claude Code folds input of ~800+ characters into a
@@ -150,6 +154,29 @@ class PaneEchoRegistry:
         if not bucket:
             self._entries.pop(thread_id, None)
         return False
+
+    def consume_partial(self, thread_id: int, text: str) -> tuple[int, int] | None:
+        """``(typed, recorded)`` sizes if *text* is a strict part of a live entry (#872).
+
+        Claude Code once recorded only the last 342 of 1,660 characters c-lord
+        typed. Such an event is no echo (the exact match fails), but it is not a
+        person's pane input either — it is c-lord's message, cut. The entry is
+        spent on a hit, like :meth:`consume_match`. Sizes are whitespace-free.
+        """
+        bucket = self._entries.get(thread_id)
+        if not bucket:
+            return None
+        norm = _normalize(text)
+        if len(norm) < _PARTIAL_MIN_CHARS:
+            return None
+        now = time.monotonic()
+        for i, (expires, cand) in enumerate(bucket):
+            if now < expires and norm != cand and norm in cand:
+                del bucket[i]
+                if not bucket:
+                    self._entries.pop(thread_id, None)
+                return len(cand), len(norm)
+        return None
 
     def clear(self) -> None:
         """Drop all entries (test isolation)."""
