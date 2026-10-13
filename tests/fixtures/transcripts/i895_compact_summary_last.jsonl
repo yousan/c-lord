@@ -1,0 +1,40 @@
+{"type": "pr-link", "timestamp": "2026-10-12T10:18:28.880Z"}
+{"type": "user", "isSidechain": false, "timestamp": "2026-10-12T10:18:28.923Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01FuuTZC9ffCpMBNKJLo91TB", "content": "(redacted)"}]}}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T10:18:28.931Z"}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T10:18:32.422Z"}
+{"type": "assistant", "isSidechain": false, "timestamp": "2026-10-12T10:18:32.421Z", "message": {"role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_01JEw53LE5vi9eanPHPa14pQ", "name": "Bash", "input": {}}]}}
+{"type": "user", "isSidechain": false, "timestamp": "2026-10-12T10:18:33.824Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01JEw53LE5vi9eanPHPa14pQ", "content": "(redacted)"}]}}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T10:18:33.833Z"}
+{"type": "assistant", "isSidechain": false, "timestamp": "2026-10-12T10:18:38.698Z", "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "(redacted)"}]}}
+{"type": "system", "subtype": "turn_duration", "isMeta": false, "isSidechain": false, "timestamp": "2026-10-12T10:18:38.744Z"}
+{"type": "last-prompt"}
+{"type": "ai-title"}
+{"type": "mode"}
+{"type": "permission-mode"}
+{"type": "atis-latch"}
+{"type": "pr-link", "timestamp": "2026-10-12T10:18:38.856Z"}
+{"type": "bridge-session"}
+{"type": "last-prompt"}
+{"type": "ai-title"}
+{"type": "mode"}
+{"type": "permission-mode"}
+{"type": "atis-latch"}
+{"type": "pr-link", "timestamp": "2026-10-12T11:13:18.212Z"}
+{"type": "bridge-session"}
+{"type": "system", "subtype": "compact_boundary", "isMeta": false, "isSidechain": false, "timestamp": "2026-10-12T11:13:18.213Z"}
+{"type": "user", "isSidechain": false, "isCompactSummary": true, "isVisibleInTranscriptOnly": true, "timestamp": "2026-10-12T11:13:18.211Z", "message": {"role": "user", "content": "This session is being continued from a previous conversation that ran out of context. (summary redacted)"}}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T11:13:18.226Z"}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T11:13:18.232Z"}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T11:13:18.232Z"}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T11:13:18.232Z"}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T11:13:18.232Z"}
+{"type": "attachment", "isSidechain": false, "timestamp": "2026-10-12T11:13:18.232Z"}
+{"type": "system", "subtype": "informational", "isMeta": false, "isSidechain": false, "timestamp": "2026-10-12T11:13:18.258Z"}
+{"type": "last-prompt"}
+{"type": "ai-title"}
+{"type": "mode"}
+{"type": "permission-mode"}
+{"type": "atis-latch"}
+{"type": "pr-link", "timestamp": "2026-10-12T11:13:18.527Z"}
+{"type": "bridge-session"}
+{"type": "cost-state"}

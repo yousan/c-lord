@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, TypeGuard
 
 import discord
 
+from .transcript.formatter import is_harness_user_record
 from .transcript.resolver import ThreadSessionResolver, derive_project_dir
 from .utils.logger import log_ctx
 
@@ -46,10 +47,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: The one line posted into a thread whose Claude died mid-turn.
+#: The one line posted into a thread whose Claude died mid-turn. It says what
+#: was observed, not why: tmux going down with the host is the usual cause, but
+#: c-lord cannot tell that apart from tmux dying any other way (#895).
 HOST_RESTART_NOTICE = (
-    "⚠️ ホストの再起動で、作業の途中で Claude が止まりました。"
-    "続けるなら、このスレに「続けて」と投稿してください。"
+    "⚠️ 作業の途中で Claude が止まっていました。続けるなら、このスレに「続けて」と投稿してください。"
+)
+
+# Earlier wordings of the same notice. One already in a thread still counts as
+# "told them", so changing the wording does not post the same stop again.
+_PAST_NOTICES = frozenset(
+    {
+        "⚠️ ホストの再起動で、作業の途中で Claude が止まりました。"
+        "続けるなら、このスレに「続けて」と投稿してください。",
+    }
 )
 
 # Reading backwards from the end: the last message usually sits under a handful
@@ -63,10 +74,13 @@ _TAIL_MAX_BYTES = 32 * 1024 * 1024
 # the last message someone else wrote matters, so this is generous.
 _DEDUP_SCAN_MESSAGES = 50
 
-# User rows that are not a request for Claude to do anything: a turn the user
-# stopped themselves (Esc), and slash-command bookkeeping.
-_NOT_A_TURN_PREFIXES = (
-    "[Request interrupted by user",
+# A turn the user stopped themselves (Esc): Claude stopped because it was told to.
+_INTERRUPTED_PREFIX = "[Request interrupted by user"
+
+# Slash-command bookkeeping the formatter's well-formed-record test does not
+# cover (a lone or unclosed tag). Like the formatter's harness rows, nobody
+# asked Claude anything with these, so they are looked past (#895).
+_BOOKKEEPING_PREFIXES = (
     "<command-name>",
     "<command-message>",
     "<local-command-stdout>",
@@ -80,12 +94,27 @@ _MID_TURN_STOP_REASONS = (None, "tool_use", "pause_turn")
 
 
 def _is_message(event: object) -> TypeGuard[dict[str, Any]]:
-    """A user/assistant row of the main conversation — the rows a turn is made of."""
+    """A row of the main conversation that says where the turn stood.
+
+    User rows nobody typed — the compaction summary, slash-command records, task
+    notifications (#895) — are not: the summary is written *after* a finished
+    turn, so stopping on it reads "waiting" as "never answered". Judge the row
+    before them instead.
+    """
     if not isinstance(event, dict) or event.get("type") not in ("user", "assistant"):
         return False
     if event.get("isMeta") or event.get("isSidechain"):
         return False
-    return isinstance(event.get("message"), dict)
+    if not isinstance(event.get("message"), dict):
+        return False
+    return event["type"] == "assistant" or not _is_bookkeeping(event)
+
+
+def _is_bookkeeping(event: dict[str, Any]) -> bool:
+    if is_harness_user_record(event):
+        return True
+    text = _user_text(event["message"].get("content"))
+    return text is not None and text.lstrip().startswith(_BOOKKEEPING_PREFIXES)
 
 
 def _is_turn_end(event: object) -> bool:
@@ -163,7 +192,9 @@ def transcript_stopped_mid_turn(path: Path) -> bool:
     - assistant asking for a tool / a streamed block with no stop yet → mid-turn;
     - ``tool_result`` → mid-turn (Claude had not seen it yet);
     - a user prompt → mid-turn (Claude never answered it);
-    - ``[Request interrupted by user…]`` or a slash command → not a turn.
+    - ``[Request interrupted by user…]`` → the user stopped it, not a stop;
+    - rows nobody typed (compaction summary, slash command, task notification)
+      → looked past; the row before them decides (#895).
 
     Blocking.
     """
@@ -177,7 +208,7 @@ def transcript_stopped_mid_turn(path: Path) -> bool:
         return message.get("stop_reason") in _MID_TURN_STOP_REASONS
     text = _user_text(message.get("content"))
     # A tool_result, or a prompt Claude never answered: cut off mid-turn.
-    return text is None or not text.lstrip().startswith(_NOT_A_TURN_PREFIXES)
+    return text is None or not text.lstrip().startswith(_INTERRUPTED_PREFIX)
 
 
 def stopped_mid_turn(project_dir: Path) -> bool:
@@ -191,7 +222,7 @@ async def _already_noticed(thread: discord.Thread, my_id: int | None) -> bool:
     async for message in thread.history(limit=_DEDUP_SCAN_MESSAGES):
         if getattr(message.author, "id", None) != my_id:
             return False
-        if message.content == HOST_RESTART_NOTICE:
+        if message.content == HOST_RESTART_NOTICE or message.content in _PAST_NOTICES:
             return True
     return False
 
