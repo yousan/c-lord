@@ -767,6 +767,8 @@ class SessionManageCog(commands.Cog):
             has_window=window_name is not None,
             db_state=rec.state if rec else None,
             dir_exists=True,
+            # #896: slept by the 4-hour sleep and not closed since
+            asleep=bool(rec and rec.slept_at and not rec.closed_at),
         )
         if status is None:  # dir exists -> never None, but stay defensive
             return None

@@ -39,6 +39,7 @@ def _rec(thread_id: int, topic: str, **kw):
         "working_dir": f"/home/y/c-lord-sessions/{CHANNEL_ID}/{thread_id}",
         "closed_reason": None,
         "closed_at": None,
+        "slept_at": None,
     }
     fields.update(kw)
     return SimpleNamespace(**fields)
@@ -318,3 +319,41 @@ async def test_a_recorded_thread_whose_dir_is_gone(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_sweep_cap(monkeypatch):
     monkeypatch.delenv("CLORD_STOP_SWEEP_MAX", raising=False)
+
+
+# ── #896: a sleeping workspace shows as `sleep`, in both views ───────────────
+
+
+async def test_a_sleeping_thread_is_a_sleep_row_in_the_channel_view(monkeypatch):
+    records = {
+        MINE: _rec(MINE, "寝ている作業", slept_at="2026-10-13 05:00:00"),
+        OTHER: _rec(OTHER, "閉じた作業", closed_at="2026-10-01", closed_reason="manual"),
+    }
+    cog = _make_cog(monkeypatch, records=records, windows=[])
+    content, _ = await _run(cog, _channel())
+
+    line = next(ln for ln in content.splitlines() if "寝ている作業" in ln)
+    assert "sleep" in line
+    assert "+ 1 closed" in content
+    assert "閉じた作業" not in content
+
+
+async def test_a_sleeping_thread_says_sleep_in_its_own_view(monkeypatch):
+    records = {MINE: _rec(MINE, "寝ている作業", slept_at="2026-10-13 05:00:00")}
+    cog = _make_cog(monkeypatch, records=records, windows=[])
+    content, _ = await _run(cog, _thread())
+
+    line = next(ln for ln in content.splitlines() if "寝ている作業" in ln)
+    assert "sleep" in line and "closed" not in line
+
+
+async def test_a_closed_thread_that_also_slept_is_still_closed(monkeypatch):
+    records = {
+        MINE: _rec(
+            MINE, "閉じた", slept_at="2026-10-01", closed_at="2026-10-02", closed_reason="idle"
+        )
+    }
+    cog = _make_cog(monkeypatch, records=records, windows=[])
+    content, _ = await _run(cog, _thread())
+    line = next(ln for ln in content.splitlines() if "閉じた" in ln)
+    assert "closed" in line

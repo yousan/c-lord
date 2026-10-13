@@ -13,7 +13,8 @@ table word    emoji     truth (the only source)
 ``run``       🟢        tmux window exists + pane shows a spinner
 ``wait``      🟡        tmux window exists + pane shows the ``❯`` prompt
 ``err``       🔴        tmux window exists + pane shows an error
-``closed``    ⚪        no tmux window + session dir exists
+``sleep``     💤        no tmux window + session dir + slept, not closed (#896)
+``closed``    ⚪        no tmux window + session dir exists (otherwise)
 (deleted)     —         no tmux window + no session dir  → never a row
 ============  ========  ==================================================
 
@@ -39,17 +40,23 @@ _LIVE_STATE_WORD = {
 }
 
 
-def classify_status(*, has_window: bool, db_state: str | None, dir_exists: bool) -> str | None:
+def classify_status(
+    *, has_window: bool, db_state: str | None, dir_exists: bool, asleep: bool = False
+) -> str | None:
     """Return the table word for a session, or ``None`` when it has no row.
 
     Truth is observation: a tmux window means "live" (``run``/``wait``/``err``,
     refined by ``db_state``); no window but a session dir means ``closed``; no
     window and no dir means deleted → ``None`` (counted, never a row).
+
+    ``asleep`` (#896) is a workspace the 4-hour sleep stopped and nobody closed
+    (``slept_at`` set, ``closed_at`` empty): it has no window either, but the
+    next post resumes it silently, so it is ``sleep`` — a row, not a closed one.
     """
     if has_window:
         return _LIVE_STATE_WORD.get((db_state or "").lower(), "run")
     if dir_exists:
-        return "closed"
+        return "sleep" if asleep else "closed"
     return None
 
 
@@ -96,7 +103,7 @@ class StatusRow:
 
     window_number: int | None
     attach: str | None
-    status: str  # run | wait | err | closed
+    status: str  # run | wait | err | sleep | closed
     topic: str
     size_bytes: int
     last_used: str  # ISO-ish "YYYY-MM-DD HH:MM:SS"
@@ -194,32 +201,36 @@ def render_status(
     There is no channel-wide session name any more (#615/#616): a channel's
     threads can sit in several tmux sessions, so the attach target is per row.
     """
-    live = [r for r in rows if r.status != "closed"]
+    live = [r for r in rows if r.status not in ("closed", "sleep")]
+    # #896: asleep is not closed — the next post resumes it — so it is listed
+    # in the default view, after the live rows, and never counted as closed.
+    sleeping = [r for r in rows if r.status == "sleep"]
     closed = [r for r in rows if r.status == "closed"]
-    # Sort live rows by window number ascending (#363 feedback); closed have no
-    # window number so they trail, in given order.
+    # Sort live rows by window number ascending (#363 feedback); sleeping and
+    # closed have no window number so they trail, in given order.
     live.sort(key=lambda r: r.window_number if r.window_number is not None else 10**9)
-    total_live = sum(r.size_bytes for r in live)
-    total_all = total_live + sum(r.size_bytes for r in closed)
+    total_shown = sum(r.size_bytes for r in live) + sum(r.size_bytes for r in sleeping)
+    total_all = total_shown + sum(r.size_bytes for r in closed)
     closed_bytes = sum(r.size_bytes for r in closed)
 
+    counts = f"{len(live)} active"
+    if sleeping:
+        counts += f" · {len(sleeping)} sleep"
     title = "c-lord status (all)" if show_all else "c-lord status"
     if show_all:
         head = (
             f"{title} · #{channel_name} · {repo} · "
-            f"{len(live)} active · {len(closed)} closed · {format_size(total_all)}"
+            f"{counts} · {len(closed)} closed · {format_size(total_all)}"
         )
     else:
-        head = (
-            f"{title} · #{channel_name} · {repo} · {len(live)} active · {format_size(total_live)}"
-        )
+        head = f"{title} · #{channel_name} · {repo} · {counts} · {format_size(total_shown)}"
 
     # attach pattern in its own copyable code block (#363 feedback: attach-only, pre).
     # #616: it names no session — rows disagree, so it points at the column that
     # carries the measured target instead of building one from a template.
     attach_block = "```\ntmux attach -t <attach 欄をコピペ>\n```"
 
-    table_rows = (live + closed) if show_all else live
+    table_rows = (live + sleeping + closed) if show_all else (live + sleeping)
     table = _build_table(table_rows, now=now, max_rows=max_rows, include_session=show_all)
 
     parts = [head, attach_block, f"```\n{table}\n```"]
