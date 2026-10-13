@@ -281,8 +281,10 @@ tmux session gone (killed together with the bot / tmux-server death):
     ↓
 Host reboot (tmux and every Claude go down with it):
               on startup, threads whose Claude was cut off mid-turn get one
-              line — "⚠️ ホストの再起動で、作業の途中で Claude が止まりました…"
-              — decided from the last entry of Claude's own transcript. No
+              line — "⚠️ 作業の途中で Claude が止まっていました…"
+              — decided from the last entry of Claude's own transcript
+              (rows nobody typed, like a compaction summary, are looked
+              past — #895). No
               mention, no button, no auto-resume; post 「続けて」 to continue
               (#807, see specs/host-restart-notice.md).
 ```

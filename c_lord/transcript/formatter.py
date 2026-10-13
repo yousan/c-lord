@@ -416,6 +416,30 @@ def _render_bash_mode(text: str, session_id: str | None) -> RenderedEvent | None
     return RenderedEvent(kind="tool_result", body=stripped, session_id=session_id)
 
 
+def is_harness_user_record(event: dict[str, Any]) -> bool:
+    """True when a ``user`` row is something the harness wrote, not a person's request.
+
+    The same rows :func:`_render_user` refuses to show as a 👤 bubble: the
+    post-compaction summary (#628), slash-command records (#628), task
+    notifications (#380) and bash-mode markers (#487).  Shared so that other
+    readers of the transcript — #807's "did Claude stop mid-turn?" — do not
+    mistake them for a prompt Claude never answered (#895).
+    """
+    msg = event.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        first = content[0] if content else None
+        is_text = isinstance(first, dict) and first.get("type") == "text"
+        content = str(first.get("text", "")) if is_text else None  # type: ignore[union-attr]
+    text = content.strip() if isinstance(content, str) else ""
+    return (
+        _is_compact_summary(event, text)
+        or _is_bash_mode_marker(text)
+        or _is_task_notification(text)
+        or _is_slash_command_marker(text)
+    )
+
+
 def _render_user(event: dict[str, Any]) -> RenderedEvent | None:
     if event.get("isMeta"):
         return None

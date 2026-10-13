@@ -123,6 +123,89 @@ def test_last_entry_decides(tmp_path: Path, events: list[dict], mid_turn: bool) 
     assert transcript_stopped_mid_turn(_write(tmp_path / "t.jsonl", events)) is mid_turn
 
 
+COMPACT_BOUNDARY = {"type": "system", "subtype": "compact_boundary"}
+COMPACT_SUMMARY = _user(
+    "This session is being continued from a previous conversation that ran out of context.",
+    isCompactSummary=True,
+    isVisibleInTranscriptOnly=True,
+)
+TASK_NOTIFICATION = _user(
+    "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n"
+    "<summary>Background command done</summary>\n</task-notification>"
+)
+
+
+@pytest.mark.parametrize(
+    ("events", "mid_turn"),
+    [
+        # #895: rows nobody typed are not a request — judge the row before them.
+        (
+            [
+                _user("hi"),
+                _assistant("end_turn", TEXT),
+                TURN_END,
+                COMPACT_BOUNDARY,
+                COMPACT_SUMMARY,
+                *META,
+            ],
+            False,
+        ),
+        ([_user("hi"), _assistant("end_turn", TEXT), COMPACT_SUMMARY], False),
+        (
+            [
+                _user("hi"),
+                _assistant("end_turn", TEXT),
+                TURN_END,
+                COMPACT_BOUNDARY,
+                COMPACT_SUMMARY,
+                _user("<command-name>/compact</command-name>"),
+                _user("<local-command-stdout>Compacted</local-command-stdout>"),
+            ],
+            False,
+        ),
+        ([_user("hi"), _assistant("end_turn", TEXT), TURN_END, TASK_NOTIFICATION], False),
+        ([_user("hi"), _assistant("end_turn", TEXT), _user("<bash-input>ls</bash-input>")], False),
+        # …but a turn that really was cut off stays cut off underneath them.
+        ([_user("hi"), _assistant("tool_use", TOOL_USE), COMPACT_BOUNDARY, COMPACT_SUMMARY], True),
+        (
+            [_user("hi"), _assistant("tool_use", TOOL_USE), _user(TOOL_RESULT), TASK_NOTIFICATION],
+            True,
+        ),
+        ([_user("hi"), COMPACT_SUMMARY], True),
+    ],
+)
+def test_rows_nobody_typed_are_looked_past(
+    tmp_path: Path, events: list[dict], mid_turn: bool
+) -> None:
+    assert transcript_stopped_mid_turn(_write(tmp_path / "t.jsonl", events)) is mid_turn
+
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "transcripts"
+# The transcript #895 misread (こぷー管理, 2026-10-13). Read only; absent off the host.
+_KOPUU = Path(
+    "/home/yousan/.claude/projects/-home-yousan-c-lord-sessions-1504670029923352597-"
+    "1530372563858096321/9efbdfaa-5df4-46a2-855a-84fc9edb2c72.jsonl"
+)
+
+
+def test_compact_summary_last_is_not_mid_turn_895() -> None:
+    """The last 40 rows of the misread transcript, contents redacted, shape kept."""
+    fixture = _FIXTURES / "i895_compact_summary_last.jsonl"
+    assert transcript_stopped_mid_turn(fixture) is False
+
+
+@pytest.mark.skipif(not _KOPUU.exists(), reason="the production transcript lives on the bot host")
+def test_the_real_kopuu_transcript_is_not_mid_turn_895() -> None:
+    assert transcript_stopped_mid_turn(_KOPUU) is False
+
+
+def test_notice_does_not_blame_a_host_reboot_895() -> None:
+    """A c-lord-only restart can post it too, so it must not claim the host rebooted."""
+    assert "ホストの再起動" not in HOST_RESTART_NOTICE
+    assert "止まっていました" in HOST_RESTART_NOTICE
+    assert "続けて" in HOST_RESTART_NOTICE
+
+
 def test_only_the_last_entry_matters(tmp_path: Path) -> None:
     """An old mid-turn stretch earlier in the file must not count."""
     events = [_user("a"), _assistant("tool_use", TOOL_USE), _user(TOOL_RESULT)]
@@ -314,6 +397,20 @@ async def test_unknown_tmux_says_nothing(home: Path) -> None:
 async def test_repeated_restarts_post_once(home: Path) -> None:
     """Dedup is read off the thread itself: our notice since the last human message."""
     thread = _thread([_message(2, "やって"), _message(1, HOST_RESTART_NOTICE)])
+    bot = _bot({10: thread})
+    assert (
+        await notify_host_restart_stops(bot, [(10, _workspace(home, "a", MID))], live=NOBODY) == 0
+    )
+    thread.send.assert_not_awaited()
+
+
+async def test_the_old_wording_still_counts_as_told_895(home: Path) -> None:
+    """Rewording the notice must not post the same stop again under the new text."""
+    old = (
+        "⚠️ ホストの再起動で、作業の途中で Claude が止まりました。"
+        "続けるなら、このスレに「続けて」と投稿してください。"
+    )
+    thread = _thread([_message(2, "やって"), _message(1, old)])
     bot = _bot({10: thread})
     assert (
         await notify_host_restart_stops(bot, [(10, _workspace(home, "a", MID))], live=NOBODY) == 0
