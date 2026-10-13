@@ -267,3 +267,37 @@ class TextAnsweredMenuView(AuthorizedViewMixin, ErrorReportingViewMixin, discord
 
         await self._on_rerun(interaction)
         self.stop()
+
+
+class StatusShowAllView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+    """「すべてを表示」 under a thread's own ``/clord-status`` reply (#893).
+
+    In a thread ``/clord-status`` shows that thread's row only; this button
+    shows the channel-wide list — exactly what ``/clord-status`` in the channel
+    answers — to whoever pressed it, ephemerally, so the thread gains nothing.
+
+    ``on_show_all`` takes the button's :class:`discord.Interaction` and does the
+    answering; injecting it keeps this class free of cog imports.
+
+    Not persistent: the button gets discord.py's random ``custom_id``, so after
+    a restart nothing can answer it. The startup sweep retires such buttons
+    (:mod:`c_lord.stale_stop_buttons`, #796), and the command only draws it in a
+    thread that sweep visits (``sweep_will_visit``). Pressing it again just
+    shows a fresh list, so it is not disabled after use.
+    """
+
+    def __init__(
+        self,
+        on_show_all: Callable[[discord.Interaction], Awaitable[None]],
+        authorizer: Authorizer | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self._on_show_all = on_show_all
+        self._authorizer = authorizer
+
+    @discord.ui.button(label="すべてを表示", emoji="📋", style=discord.ButtonStyle.secondary)
+    async def show_all_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show the channel-wide status to the presser only."""
+        await self._on_show_all(interaction)

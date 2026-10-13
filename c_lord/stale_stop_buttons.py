@@ -24,7 +24,9 @@ next turn. Three kinds of residue are cleared:
   go, the question stays readable.
 
 - **every other view's buttons** (#796) — 「⚡ これは新しい指示でした」
-  (``TextAnsweredMenuView``), 「▶️ 再開する」 (``ReopenSessionView``). They are
+  (``TextAnsweredMenuView``), 「▶️ 再開する」 (``ReopenSessionView``),
+  「📋 すべてを表示」 under a thread's ``/clord-status`` (``StatusShowAllView``,
+  #893 — drawn only where :func:`sweep_will_visit` says this sweep reaches). They are
   ``timeout=None`` but not persistent: discord.py gives their buttons a random
   ``custom_id`` and nothing re-registers a handler for them, so after a restart
   no process can answer. Production 2026-09-23: 3 live-looking ⚡ buttons, all
@@ -131,6 +133,21 @@ def _max_threads() -> int | None:
     except ValueError:
         logger.warning("%s=%r is not a number — visiting every thread", _MAX_THREADS_ENV, raw)
         return None
+
+
+def sweep_will_visit(record: object) -> bool:
+    """True when the startup sweep will read *record*'s thread (#893).
+
+    A non-persistent button is only safe to draw where this sweep comes to
+    retire it after a restart. It walks :meth:`SessionRepository.list_alive`
+    (``state = 'alive'`` and not a swept tombstone), and nothing at all when
+    ``CLORD_STOP_SWEEP_MAX=0``. A thread with no row is never visited.
+    """
+    if record is None or _max_threads() == 0:
+        return False
+    if getattr(record, "closed_reason", None) == "swept":
+        return False
+    return getattr(record, "state", None) == "alive"
 
 
 @dataclass

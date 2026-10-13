@@ -21,22 +21,23 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..command_gate import NOT_AUTHORIZED, authorize_command
-from ..database.repository import SessionRepository
+from ..database.repository import SessionRecord, SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
 from ..discord_ui.authorization import Authorizer, get_default_authorizer
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..discord_ui.slash_io import slash_io
+from ..discord_ui.views import StatusShowAllView
 from ..session_close import (
     apply_closed_name,
     apply_open_name,
     is_closed,
     reopen_rename_notice,
 )
-from ..session_dir import SessionDirManager
+from ..session_dir import SessionDirInfo, SessionDirManager
 from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
-from ..status_view import StatusRow, classify_status, render_status
+from ..status_view import StatusRow, classify_status, render_status, render_thread_status
 from ..thread_owner import foreign_owner_notice_for
 from ..thread_rename import rename_thread_topic
 from ..thread_settings import (
@@ -634,15 +635,25 @@ class SessionManageCog(commands.Cog):
         return jsonl.stem if jsonl is not None else ""
 
     async def _clord_status_impl(
-        self, *, channel: object, show_all: bool, respond: _Responder, ack: _Acknowledger
+        self,
+        *,
+        channel: object,
+        show_all: bool,
+        respond: _Responder,
+        ack: _Acknowledger,
+        thread_scope: bool = False,
     ) -> None:
         """Shared core for /clord-status and !clord-status (#363).
 
         Lists only the sessions of the *invoking channel* (per-channel — this is
         what structurally avoids the all-channels 25-field crash that froze the
         old /session-dirs). Live + closed get table rows; deleted is a count.
+
+        ``thread_scope`` (#893, slash only): typed inside a thread without
+        ``all``, the reply is that thread's row alone plus a 「すべてを表示」
+        button that shows this channel-wide output privately. The text twin
+        cannot answer privately, so it keeps the channel-wide view.
         """
-        import asyncio
         from datetime import datetime
 
         channel_id = getattr(channel, "id", None)
@@ -666,51 +677,26 @@ class SessionManageCog(commands.Cog):
 
         await ack()
 
-        from ..thread_state_sync import _list_all_windows
+        in_thread = isinstance(channel, discord.Thread) and channel_id != parent_id
+        channel_name = getattr(getattr(channel, "parent", None), "name", None) or getattr(
+            channel, "name", str(parent_id)
+        )
+        if thread_scope and in_thread and not show_all and isinstance(channel_id, int):
+            await self._respond_thread_status(
+                sdm, thread_id=channel_id, channel_name=channel_name, respond=respond
+            )
+            return
+
+        import asyncio
 
         dirs = await asyncio.to_thread(sdm.find_session_dirs)
-        # #616: read every session on the tmux server, not just this channel's.
-        # A thread bound to another repo lives elsewhere, and the whole point of
-        # the attach column is that it is measured rather than assembled.
-        windows = await asyncio.to_thread(_list_all_windows)
-        window_by_thread: dict[int, str] = {}
-        attach_by_thread: dict[int, str] = {}
-        for w in windows:
-            tid = w.get("thread_id")
-            window_name = w.get("window_name") or ""
-            session = w.get("session_name") or ""
-            if not tid or not window_name:
-                continue
-            with contextlib.suppress(ValueError, TypeError):
-                key = int(tid)
-                window_by_thread[key] = window_name
-                attach_by_thread[key] = f"{session}:{window_name}" if session else window_name
+        window_by_thread, attach_by_thread = await self._measured_windows()
 
         rows: list[StatusRow] = []
         for d in dirs:
-            rec = await self.repo.get(d.thread_id)
-            window_name = window_by_thread.get(d.thread_id)
-            has_window = window_name is not None
-            status = classify_status(
-                has_window=has_window,
-                db_state=rec.state if rec else None,
-                dir_exists=True,
-            )
-            if status is None:  # dir exists -> never None, but stay defensive
-                continue
-            size = await asyncio.to_thread(_dir_size_bytes, d.path)
-            topic = (rec.topic or rec.summary if rec else None) or "(no topic)"
-            rows.append(
-                StatusRow(
-                    window_number=parse_work_number(window_name) if window_name else None,
-                    attach=attach_by_thread.get(d.thread_id),
-                    status=status,
-                    topic=topic,
-                    size_bytes=size,
-                    last_used=rec.last_used_at if rec else "",
-                    session_id=self._resume_uuid_for((rec.working_dir if rec else None) or d.path),
-                )
-            )
+            row = await self._status_row(d, window_by_thread, attach_by_thread)
+            if row is not None:
+                rows.append(row)
 
         # deleted = this channel's DB sessions whose working dir is gone and which
         # have no live window (workspace-delete removed the clone). Count only.
@@ -726,9 +712,6 @@ class SessionManageCog(commands.Cog):
         )
 
         repo_label = _short_repo(dirs[0].source_repo if dirs else None)
-        channel_name = getattr(getattr(channel, "parent", None), "name", None) or getattr(
-            channel, "name", str(parent_id)
-        )
         content = render_status(
             rows=rows,
             show_all=show_all,
@@ -739,18 +722,163 @@ class SessionManageCog(commands.Cog):
         )
         await respond(content)
 
+    @staticmethod
+    async def _measured_windows() -> tuple[dict[int, str], dict[int, str]]:
+        """``(window_by_thread, attach_by_thread)`` read back from tmux (#616).
+
+        Every session on the tmux server, not just this channel's: a thread
+        bound to another repo lives elsewhere, and the whole point of the attach
+        column is that it is measured rather than assembled.
+        """
+        import asyncio
+
+        from ..thread_state_sync import _list_all_windows
+
+        windows = await asyncio.to_thread(_list_all_windows)
+        window_by_thread: dict[int, str] = {}
+        attach_by_thread: dict[int, str] = {}
+        for w in windows:
+            tid = w.get("thread_id")
+            window_name = w.get("window_name") or ""
+            session = w.get("session_name") or ""
+            if not tid or not window_name:
+                continue
+            with contextlib.suppress(ValueError, TypeError):
+                key = int(tid)
+                window_by_thread[key] = window_name
+                attach_by_thread[key] = f"{session}:{window_name}" if session else window_name
+        return window_by_thread, attach_by_thread
+
+    async def _status_row(
+        self,
+        d: SessionDirInfo,
+        window_by_thread: dict[int, str],
+        attach_by_thread: dict[int, str],
+        rec: SessionRecord | None = None,
+    ) -> StatusRow | None:
+        """One session dir's row — the same for the channel and the thread view."""
+        import asyncio
+
+        thread_id, path = d.thread_id, d.path
+        if rec is None:
+            rec = await self.repo.get(thread_id)
+        window_name = window_by_thread.get(thread_id)
+        status = classify_status(
+            has_window=window_name is not None,
+            db_state=rec.state if rec else None,
+            dir_exists=True,
+        )
+        if status is None:  # dir exists -> never None, but stay defensive
+            return None
+        size = await asyncio.to_thread(_dir_size_bytes, path)
+        topic = (rec.topic or rec.summary if rec else None) or "(no topic)"
+        return StatusRow(
+            window_number=parse_work_number(window_name) if window_name else None,
+            attach=attach_by_thread.get(thread_id),
+            status=status,
+            topic=topic,
+            size_bytes=size,
+            last_used=rec.last_used_at if rec else "",
+            session_id=self._resume_uuid_for((rec.working_dir if rec else None) or path),
+        )
+
+    async def _respond_thread_status(
+        self,
+        sdm: SessionDirManager,
+        *,
+        thread_id: int,
+        channel_name: str,
+        respond: _Responder,
+    ) -> None:
+        """``/clord-status`` in a thread: this thread's row only (#893)."""
+        import asyncio
+        from datetime import datetime
+
+        from ..stale_stop_buttons import sweep_will_visit
+
+        rec = await self.repo.get(thread_id)
+        dirs = await asyncio.to_thread(sdm.find_session_dirs)
+        mine = next((d for d in dirs if d.thread_id == thread_id), None)
+        row: StatusRow | None = None
+        missing: str | None = None
+        if mine is not None:
+            window_by_thread, attach_by_thread = await self._measured_windows()
+            row = await self._status_row(mine, window_by_thread, attach_by_thread, rec)
+        elif rec is not None:
+            missing = (
+                "このスレッドの作業ディレクトリは削除済みです（deleted）。"
+                "会話は残っているので、このスレッドにメッセージを送ると再開します。"
+            )
+        else:
+            swept = None
+            with contextlib.suppress(Exception):
+                swept = await self.repo.get_swept(thread_id)
+            if swept is not None:
+                when = (swept.closed_at or "")[:10] or "以前"
+                missing = (
+                    f"🧹 このスレッドは {when} に片付け済みです。"
+                    "このスレッドにメッセージを送ると、新しく始められます。"
+                )
+            else:
+                missing = (
+                    "このスレッドには c-lord のセッション記録がありません"
+                    "（c-lord が作ったスレッドではないか、記録が残っていません）。"
+                )
+
+        # A non-persistent button is drawn only where the startup sweep will
+        # come and retire it after a restart (#796 / #893).
+        offer_button = sweep_will_visit(rec)
+        content = render_thread_status(
+            row=row,
+            channel_name=channel_name,
+            repo=_short_repo(mine.source_repo if mine is not None else None),
+            now=datetime.now(),
+            missing=missing,
+            show_all_hint=offer_button,
+        )
+        if offer_button:
+            view = StatusShowAllView(
+                self._show_channel_status, authorizer=self._command_authorizer()
+            )
+            await respond(content, view=view)
+        else:
+            await respond(content)
+
+    async def _show_channel_status(self, interaction: discord.Interaction) -> None:
+        """「すべてを表示」: the channel-wide ``/clord-status``, to the presser only (#893)."""
+        inner_respond, inner_ack = self._slash_io(interaction)
+
+        async def respond(content: str | None = None, **kwargs: object) -> None:
+            kwargs.pop("view", None)
+            kwargs["ephemeral"] = True
+            await inner_respond(content, **kwargs)
+
+        async def ack(*, ephemeral: bool = True) -> None:
+            await inner_ack(ephemeral=True)
+
+        await self._clord_status_impl(
+            channel=interaction.channel, show_all=False, respond=respond, ack=ack
+        )
+
     @app_commands.command(
         name="clord-status",
         description="List this channel's Claude sessions (size, attach, resume)",
     )
     @app_commands.describe(show_all="Include closed sessions too (like `docker ps -a`)")
     async def clord_status(self, interaction: discord.Interaction, show_all: bool = False) -> None:
-        """Per-channel session status. ``show_all`` adds closed sessions (#363)."""
+        """Per-channel session status. ``show_all`` adds closed sessions (#363).
+
+        Inside a thread (without ``show_all``) it shows that thread only (#893).
+        """
         respond, ack = self._slash_io(interaction)
         if not await self._admit(interaction, respond):
             return
         await self._clord_status_impl(
-            channel=interaction.channel, show_all=show_all, respond=respond, ack=ack
+            channel=interaction.channel,
+            show_all=show_all,
+            respond=respond,
+            ack=ack,
+            thread_scope=True,
         )
 
     @commands.command(name="clord-status")
