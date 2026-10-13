@@ -49,6 +49,8 @@ def _rec(thread_id: int, topic: str):
         summary=topic,
         last_used_at="2026-09-01 10:00:00",
         working_dir=f"/home/y/c-lord-sessions/999/{thread_id}",
+        closed_at=None,
+        slept_at=None,
     )
 
 

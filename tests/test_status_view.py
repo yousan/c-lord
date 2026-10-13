@@ -354,3 +354,59 @@ class TestAttachColumn:
         # ...and it must not name one session, because rows disagree.
         assert "qiita-article" not in attach_block
         assert "claude_base" not in attach_block
+
+
+# ── sleep (#896): a slept workspace is a row, not a "closed" count ───────────
+
+
+def test_classify_status_sleep_needs_no_window_and_a_sleep_mark():
+    assert classify_status(has_window=False, db_state="alive", dir_exists=True, asleep=True) == (
+        "sleep"
+    )
+    # a window wins: it was woken up
+    assert classify_status(has_window=True, db_state="waiting", dir_exists=True, asleep=True) == (
+        "wait"
+    )
+    assert classify_status(has_window=False, db_state=None, dir_exists=True) == "closed"
+
+
+def _sleep_row(topic: str = "napping", window_number=None):
+    return StatusRow(
+        window_number=window_number,
+        attach=None,
+        status="sleep",
+        topic=topic,
+        size_bytes=50_000_000,
+        last_used="2026-06-11 06:00:00",
+        session_id="d9e8f7a6-4444",
+    )
+
+
+def test_default_view_lists_sleeping_rows_and_does_not_count_them_closed():
+    out = _render(show_all=False, rows=[*_rows(), _sleep_row()])
+    assert "napping" in out
+    sleep_line = next(ln for ln in _table_rows(out) if "napping" in ln)
+    assert " sleep " in f" {sleep_line} " and sleep_line.lstrip().startswith("-")
+    assert "1 sleep" in out.splitlines()[0]
+    assert "+ 1 closed" in out, "only the really-closed row is counted closed"
+    # live rows first, then sleeping
+    assert [ln.split()[2] for ln in _table_rows(out)][-1] == "napping"
+
+
+def test_only_sleeping_rows_still_print_a_table_and_no_closed_footer():
+    out = _render(show_all=False, rows=[_sleep_row()], deleted_count=0)
+    assert "0 active" in out and "1 sleep" in out
+    assert "napping" in out
+    assert "closed" not in out
+
+
+def test_all_view_counts_sleep_separately():
+    out = _render(show_all=True, rows=[*_rows(), _sleep_row()])
+    head = out.splitlines()[0]
+    assert "2 active" in head and "1 sleep" in head and "1 closed" in head
+    assert len(_table_rows(out)) == 4
+
+
+def test_views_without_sleep_keep_their_header():
+    assert "sleep" not in _render(show_all=False)
+    assert "sleep" not in _render(show_all=True)
