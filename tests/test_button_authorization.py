@@ -36,7 +36,7 @@ from c_lord.discord_ui.authorization import (
 from c_lord.discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from c_lord.discord_ui.permission_view import PermissionView
 from c_lord.discord_ui.plan_view import PlanApprovalView
-from c_lord.discord_ui.views import ReopenSessionView, StopView
+from c_lord.discord_ui.views import ReopenSessionView, StatusShowAllView, StopView
 
 # ---------------------------------------------------------------------------
 # Mock helpers (mirror tests/test_role_access.py)
@@ -196,6 +196,9 @@ def _build_view(cls_name: str, authorizer: Authorizer | None):
         # #512: reopening a closed session resumes work, so it must be gated by
         # the same allowlist as sending a message — not clickable by any member.
         return ReopenSessionView(AsyncMock(), authorizer=authorizer)
+    if cls_name == "StatusShowAllView":
+        # #893: the channel-wide list is the same data /clord-status gates.
+        return StatusShowAllView(AsyncMock(), authorizer=authorizer)
     if cls_name == "AskView":
         question = AskQuestion(
             question="pick one",
@@ -216,6 +219,7 @@ ALL_VIEWS = [
     "ElicitationFormView",
     "StopView",
     "ReopenSessionView",
+    "StatusShowAllView",
     "AskView",
     "UpgradeApprovalView",
 ]

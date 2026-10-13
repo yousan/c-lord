@@ -152,7 +152,11 @@ def test_the_real_views_get_random_custom_ids() -> None:
     If one ever gets a fixed id, it must also get a handler after restart."""
     import asyncio
 
-    from c_lord.discord_ui.views import ReopenSessionView, TextAnsweredMenuView
+    from c_lord.discord_ui.views import (
+        ReopenSessionView,
+        StatusShowAllView,
+        TextAnsweredMenuView,
+    )
     from c_lord.stale_stop_buttons import is_unroutable_custom_id
 
     async def _noop(_i) -> None:
@@ -160,7 +164,7 @@ def test_the_real_views_get_random_custom_ids() -> None:
 
     async def _build() -> list[str]:
         ids = []
-        for cls in (TextAnsweredMenuView, ReopenSessionView):
+        for cls in (TextAnsweredMenuView, ReopenSessionView, StatusShowAllView):
             ids += [c.custom_id for c in cls(_noop).children]  # type: ignore[attr-defined]
         return ids
 

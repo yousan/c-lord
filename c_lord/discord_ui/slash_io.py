@@ -88,7 +88,7 @@ def slash_io(interaction: discord.Interaction) -> tuple[Responder, Acknowledger]
     """``(respond, ack)`` for a slash command's shared ``_*_impl`` core (#209).
 
     ``ack(ephemeral=False)`` defers; ``respond(content, *, embed, file,
-    ephemeral, silent)`` answers — on the initial response before ``ack()``,
+    ephemeral, silent, view)`` answers — on the initial response before ``ack()``,
     through :func:`followup` after it.
     """
     state = {"acked": False}
@@ -107,8 +107,11 @@ def slash_io(interaction: discord.Interaction) -> tuple[Responder, Acknowledger]
         file: discord.File | None = None,
         ephemeral: bool = False,
         silent: bool = False,
+        view: discord.ui.View | None = None,
     ) -> None:
         extra: dict[str, Any] = {}
+        if view is not None:
+            extra["view"] = view
         if embed is not None:
             extra["embed"] = embed
         if file is not None:

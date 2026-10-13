@@ -235,3 +235,38 @@ def render_status(
         )
 
     return "\n".join(parts)
+
+
+def render_thread_status(
+    *,
+    row: StatusRow | None,
+    channel_name: str,
+    repo: str,
+    now: datetime,
+    missing: str | None = None,
+    show_all_hint: bool = True,
+) -> str:
+    """Render ``/clord-status`` typed inside a thread: that thread only (#893).
+
+    With a ``row`` it is the same table as :func:`render_status`, one row long,
+    and — because there is only one row — the attach command is the exact one.
+    Without a row, ``missing`` is the plain-words reason (no record, swept,
+    working dir deleted) and no table is drawn.
+
+    ``show_all_hint`` says where the channel-wide list went: the 「すべてを表示」
+    button when the reply has one, the channel itself when it does not.
+    """
+    head = f"c-lord status · このスレッド · #{channel_name} · {repo}"
+    parts = [head]
+    if row is None:
+        parts.append(missing or "このスレッドの状態は分かりませんでした。")
+    else:
+        if row.attach:
+            parts.append(f"```\ntmux attach -t {_cell(row.attach, cap=24)}\n```")
+        table = _build_table([row], now=now, max_rows=1, include_session=False)
+        parts.append(f"```\n{table}\n```")
+    if show_all_hint:
+        parts.append("-# チャンネル全体の一覧は「すべてを表示」（押した人にだけ見えます）")
+    else:
+        parts.append(f"-# チャンネル全体の一覧は #{channel_name} で `/clord-status`")
+    return "\n".join(parts)
