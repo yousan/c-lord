@@ -213,8 +213,9 @@ def test_real_tmux_types_dash_leading_text_verbatim() -> None:
     base = ["tmux", "-L", sock, "-f", "/dev/null"]
     # -icanon: a cooked tty caps one line at MAX_CANON — 1024 bytes on macOS
     # (#899) — and the long chunk is longer. Claude's TUI reads raw, so the cap
-    # is the test harness's, not c-lord's.
-    reader = "stty -icanon; exec cat"
+    # is the test harness's, not c-lord's. -echo: otherwise the echo and cat's copy
+    # interleave mid-line once input is no longer held until Enter.
+    reader = "stty -icanon -echo; exec cat"
     subprocess.run(
         [*base, "new-session", "-d", "-s", "t", "-x", "400", "-y", "80", reader], check=True
     )
