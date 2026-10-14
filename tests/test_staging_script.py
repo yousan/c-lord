@@ -13,10 +13,17 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
+
+# scripts/staging.sh is the maintainers' Linux fleet tool — it finds bots through
+# /proc and hands production to systemd. Not something a Mac user runs (#899).
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux", reason="staging.sh is Linux-only (/proc, systemd)"
+)
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "staging.sh"
 

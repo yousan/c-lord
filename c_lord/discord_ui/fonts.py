@@ -87,6 +87,9 @@ MONO_FONT_PATHS = (
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
     "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    # macOS (#899) — after the Linux paths, so a Linux host picks what it always did.
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
 )
 
 # Color emoji fonts (CBDT/COLR) Pillow can render with embedded_color=True.

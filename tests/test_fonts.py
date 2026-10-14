@@ -69,3 +69,13 @@ def test_has_cjk_glyphs_detects_missing_coverage():
     path = fonts.first_existing(fonts.JP_FONT_PATHS)
     if path is not None:
         assert fonts.has_cjk_glyphs(ImageFont.truetype(path, 14))
+
+
+def test_a_mac_finds_a_monospace_font(monkeypatch):
+    """macOS ships Menlo, not DejaVu (#899) — without it every pane screenshot was None."""
+    monkeypatch.setattr(fonts.os.path, "exists", lambda p: p == "/System/Library/Fonts/Menlo.ttc")
+    assert fonts.first_existing(fonts.MONO_FONT_PATHS) == "/System/Library/Fonts/Menlo.ttc"
+
+
+def test_linux_monospace_fonts_still_come_first():
+    assert fonts.MONO_FONT_PATHS[0] == "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
