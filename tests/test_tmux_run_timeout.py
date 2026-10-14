@@ -40,3 +40,17 @@ class TestRunTimeout:
             elapsed = time.monotonic() - started
         assert result.returncode != 0
         assert elapsed < 5
+
+
+class TestMissingCommand:
+    """A command that is not installed is a failure, not a raise (#899).
+
+    macOS has no ``systemd-run``; the exception escaped ``_ensure_session`` and
+    the thread got no session at all whenever no tmux server was running yet.
+    """
+
+    def test_missing_binary_returns_a_failed_result(self) -> None:
+        result = tmux._run(["clord-no-such-command-899"])
+        assert result.returncode != 0
+        assert result.stdout == ""
+        assert "clord-no-such-command-899" in result.stderr

@@ -43,3 +43,33 @@ jobs:
 
       - name: Test
         run: uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing
+
+  # macOS (#899). Not a substitute for trying c-lord on a real Mac — it only
+  # proves the suite does not lean on Linux-only things (/proc, systemd, GNU du).
+  # A separate job, not a matrix axis, so the required `test (3.x)` check names
+  # stay as they are.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tmux
+        run: brew install tmux
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Test
+        run: uv run pytest tests/ -v

@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -591,6 +592,10 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
             stdout="",
             stderr=f"timed out after {_RUN_TIMEOUT_SECONDS:.0f}s",
         )
+    except FileNotFoundError:
+        # Not installed (``systemd-run`` on macOS, #899). Same contract as a
+        # timeout: a failed result the caller already knows how to handle.
+        return subprocess.CompletedProcess(args, 127, stdout="", stderr=f"{args[0]}: not found")
 
 
 # OTEL_RESOURCE_ATTRIBUTES is comma/equals separated and gets typed into a
@@ -1181,6 +1186,11 @@ class TmuxSessionManager:
         that starts the unit but whose tmux then dies is reported as failure and
         the caller can fall back.
         """
+        if shutil.which(_SYSTEMD_RUN_ARGS[0]) is None:
+            # No systemd at all (macOS, #899): there is no unit cgroup to escape,
+            # so the warning below would be false. tmux daemonizes on its own.
+            logger.info("systemd-run not found — starting the tmux server directly")
+            return False
         forwarded = [
             f"--setenv={name}={os.environ[name]}"
             for name in _SYSTEMD_RUN_FORWARDED_ENV

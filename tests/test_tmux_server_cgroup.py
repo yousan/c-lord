@@ -13,9 +13,19 @@ server must keep using plain tmux, and hosts without systemd must still work.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from c_lord.tmux import TmuxSessionManager
+
+
+@pytest.fixture(autouse=True)
+def _systemd_run_installed() -> Iterator[None]:
+    """These tests are about a systemd host, whatever OS runs them (macOS CI, #899)."""
+    with patch("c_lord.tmux.shutil.which", return_value="/usr/bin/systemd-run"):
+        yield
 
 
 def _mgr() -> TmuxSessionManager:
@@ -163,3 +173,24 @@ def test_existing_session_touches_nothing() -> None:
 
     assert not fake.used_systemd_run()
     assert fake.direct_new_session_calls() == []
+
+
+def test_no_systemd_run_binary_starts_tmux_directly_without_the_cgroup_warning(caplog) -> None:
+    """macOS / systemd-less hosts (#899): no cgroup to escape, so no attempt and no scare.
+
+    The WARNING says a c-lord restart will kill every tmux session — true under
+    systemd, false where there is no systemd at all.
+    """
+    fake = _Tmux(server_running=False)
+
+    with (
+        patch("c_lord.tmux._run", side_effect=fake),
+        patch("c_lord.tmux.shutil.which", return_value=None),
+        caplog.at_level("WARNING", logger="c_lord.tmux"),
+    ):
+        mgr = _mgr()
+        assert mgr._ensure_session() is True
+
+    assert not fake.used_systemd_run()
+    assert fake.direct_new_session_calls() == [["tmux", "new-session", "-d", "-s", "clord"]]
+    assert "systemd unit" not in caplog.text

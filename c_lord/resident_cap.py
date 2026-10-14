@@ -56,6 +56,7 @@ import datetime
 import logging
 import math
 import os
+import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -77,6 +78,7 @@ __all__ = [
     "compute_limit",
     "max_resident_workspaces",
     "memory_available",
+    "memory_snapshot",
     "memory_total",
     "select_lru_victims",
 ]
@@ -107,6 +109,7 @@ EMERGENCY_CONSECUTIVE_SAMPLES = 3
 #: both reads are cheap (one ``/proc/meminfo`` read, one ``tmux list-panes -a``).
 _TICK_INTERVAL_SECONDS = 30.0
 
+_PROC_MEMINFO = Path("/proc/meminfo")
 _CGROUP_V2_MAX = Path("/sys/fs/cgroup/memory.max")
 _CGROUP_V2_CURRENT = Path("/sys/fs/cgroup/memory.current")
 _CGROUP_V1_MAX = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
@@ -140,7 +143,7 @@ def _read_meminfo_total() -> int:
 
 def _read_meminfo_field(field: str) -> int:
     try:
-        with open("/proc/meminfo", encoding="utf-8") as fh:
+        with _PROC_MEMINFO.open(encoding="utf-8") as fh:
             for line in fh:
                 if line.startswith(field + ":"):
                     return int(line.split()[1]) * 1024
@@ -166,9 +169,44 @@ def _cgroup_limit() -> int | None:
     return None
 
 
+def _physical_memory() -> int:
+    """Installed RAM in bytes from ``sysconf`` — for hosts without procfs (macOS, #899)."""
+    try:
+        return max(0, os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError, TypeError):
+        return 0
+
+
+def _darwin_available(total: int) -> int | None:
+    """Free memory on macOS, or ``None`` when it cannot be read (#899).
+
+    ``kern.memorystatus_level`` is the percentage of memory the kernel considers
+    available — the number behind Activity Monitor's memory-pressure graph.
+    """
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_level"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        level = int(result.stdout.strip())
+    except ValueError:
+        return None
+    if not 0 <= level <= 100:
+        return None
+    return total * level // 100
+
+
 def memory_total() -> int:
     """Memory this process may use, in bytes. cgroup limit wins over the host's."""
-    return _cgroup_limit() or _read_meminfo_total()
+    return _cgroup_limit() or _read_meminfo_total() or _physical_memory()
 
 
 def memory_available() -> int:
@@ -185,6 +223,24 @@ def memory_available() -> int:
         if used is not None:
             return max(0, limit - used)
     return _read_meminfo_field("MemAvailable")
+
+
+def memory_snapshot() -> tuple[int, int]:
+    """``(total, available)`` for the emergency brake.
+
+    ``(0, 0)`` when available memory cannot be read: the brake reads a zero
+    total as "cannot judge" and stays off. Pairing a real total with an unread
+    0 would instead look like a host out of memory and sleep every idle
+    workspace on every tick. Only reachable without procfs (macOS, #899) —
+    on Linux both numbers come from the same file, as before.
+    """
+    total = memory_total()
+    if _cgroup_limit() is not None or _PROC_MEMINFO.exists():
+        return total, memory_available()
+    available = _darwin_available(total) if total > 0 else None
+    if available is None:
+        return 0, 0
+    return total, available
 
 
 def compute_limit(total_bytes: int) -> int:
@@ -304,7 +360,7 @@ class ResidentCapLoop:
         self._interval = interval_seconds
         self._resident_fn = resident_fn
         self._in_flight_fn = in_flight_fn
-        self._mem_fn = mem_fn or (lambda: (memory_total(), memory_available()))
+        self._mem_fn = mem_fn or memory_snapshot
         self._low_streak = 0
         self._braking = False
         # One "episode" = one stretch of braking, from engaged to released. The
