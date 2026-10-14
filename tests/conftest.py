@@ -212,31 +212,3 @@ def _reset_fallback_owner_ids():
         authorization.set_fallback_owner_ids(None)
         authorization.set_default_authorizer(None)
 
-
-# ── macOS: the REST API cannot prove the caller's uid yet (#899 A) ───────────
-#
-# ``c_lord/ext/peer_uid.py`` reads /proc/net/tcp, which macOS does not have, so
-# every same-uid request is refused with 403 — fail closed, as intended. These
-# tests assert the *Linux* outcome (own uid gets in). Marked, not deleted, so the
-# macOS job shows them as a known gap; remove this when #899 A lands.
-_NEEDS_PEER_UID = (
-    "tests/test_api_server.py::",
-    "tests/test_api_tasks.py::",
-    "tests/test_api_peer_auth.py::TestOwnUidIsAllowed::",
-    "tests/test_api_peer_auth.py::TestResolvePeerUid::test_resolves_a_real_loopback_",
-    "tests/test_api_peer_auth.py::TestSecretOpensTheGate::test_own_uid_needs_no_bearer_",
-    "tests/test_lounge.py::TestLoungeApiEndpoints::",
-    "tests/test_jsonl_only_delivery.py::TestControlPlaneEndpoints::",
-)
-
-
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    if sys.platform != "darwin":
-        return
-    mark = pytest.mark.xfail(
-        reason="#899 A: no /proc/net/tcp on macOS — the API refuses its own uid (fail closed)",
-        strict=False,
-    )
-    for item in items:
-        if item.nodeid.startswith(_NEEDS_PEER_UID):
-            item.add_marker(mark)

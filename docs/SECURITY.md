@@ -275,7 +275,10 @@ running under a different user.
 
 1. **Same Unix user.** The peer's UID is read from `/proc/net/tcp`(`6`) by
    matching the connection's 4-tuple (`c_lord/ext/peer_uid.py`) and compared
-   with the bot's own UID. `root` also passes — it can read `.env`, `ptrace` the
+   with the bot's own UID. On macOS, which has no `/proc`, the same 4-tuple is
+   looked up with `lsof` (#899): only the socket whose *local* end is the peer
+   counts (the bot's own accepted socket names the peer as its *remote* end and
+   must never be mistaken for the caller). `root` also passes — it can read `.env`, `ptrace` the
    process, or simply become that user, so refusing it would protect nothing.
 2. **`Authorization: Bearer <CLORD_API_SECRET>`**, when a secret is configured.
    This is how you deliberately let *another* user or another host in.
@@ -294,8 +297,11 @@ Notes and limits:
   Demanding it would protect nothing (that user can read the secret) and would
   break the control plane: `CLORD_API_SECRET` is in `SENSITIVE_ENV_KEYS`, so a
   Claude session cannot read it from its environment (#353).
-- **If the peer's UID cannot be proven** — no `/proc` (non-Linux), or a peer
-  from another host — the request is refused. Set `CLORD_API_SECRET` for those
+- **If the peer's UID cannot be proven** — no `/proc` on Linux, no usable
+  `lsof` on macOS (missing, timed out, no matching socket, or rows that
+  disagree), any other OS, or a peer from another host — the request is
+  refused. A non-root `lsof` cannot see other users' processes, so on macOS a
+  caller from another account finds no row and is refused the same way. Set `CLORD_API_SECRET` for those
   callers, or `CLORD_API_ALLOW_ANY_PEER=1` to serve unverified local callers;
   the escape hatch logs a WARNING naming itself at every start.
 - **Every start logs who is served**, e.g.

@@ -14,6 +14,13 @@ whose *remote* end is our own socket yields exactly the connecting process's
 UID — no guessing, no race with PID reuse (the row exists for as long as the
 connection we are serving does).
 
+macOS has no ``/proc`` (#899). There the same question goes to ``lsof``, which
+lists each socket as ``local->remote`` with its owner's UID. Our own accepted
+socket shows up too (its *remote* end is the peer), so only the row whose
+*local* end is the peer and whose remote end is us counts. A non-root lsof
+cannot see another user's processes at all, so a foreign caller simply finds
+no row — and no row is a refusal.
+
 Deliberately strict: anything that does not resolve to exactly one UID returns
 ``None``, which the caller must treat as "unproven" and refuse. A wrong UID
 here is an authorization bypass; no answer is always better than a guess.
@@ -23,13 +30,19 @@ from __future__ import annotations
 
 import logging
 import socket
-from collections.abc import Iterable, Sequence
+import subprocess
+import sys
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 #: Kernel tables listing every TCP socket and its owning UID.
 PROC_NET_TCP: tuple[Path, ...] = (Path("/proc/net/tcp"), Path("/proc/net/tcp6"))
+
+#: Bound on one ``lsof`` call. It runs per request, and a hung one must not
+#: hold the request open — a timeout is just another "unproven".
+_LSOF_TIMEOUT_SECONDS = 5.0
 
 #: Column indexes in a ``/proc/net/tcp`` row (after ``str.split()``).
 _LOCAL, _REMOTE, _UID = 1, 2, 7
@@ -87,10 +100,72 @@ def _uids_for_connection(table: Path, local: str, remote: str) -> set[int]:
     return uids
 
 
+def _run_lsof(args: list[str]) -> str | None:
+    """stdout of ``lsof``, or ``None`` when it is missing, hangs or fails."""
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_LSOF_TIMEOUT_SECONDS, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("peer UID lookup via lsof failed: %s", exc)
+        return None
+    # lsof exits 1 when nothing matched; that is an empty answer, not an error.
+    if result.returncode not in (0, 1):
+        logger.warning("peer UID lookup via lsof exited %d", result.returncode)
+        return None
+    return result.stdout
+
+
+def _lsof_endpoint(ip: str, port: int) -> str:
+    """``ip:port`` as ``lsof -nP`` prints it (IPv6 in brackets)."""
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+def _lsof_peer_uid(
+    peer: tuple[str, int], ours: tuple[str, int], lsof: Callable[[list[str]], str | None]
+) -> int | None:
+    """UID owning the socket whose local end is *peer* and remote end is *ours*."""
+    for ip in (peer[0], ours[0]):
+        try:
+            socket.inet_pton(socket.AF_INET6 if ":" in ip else socket.AF_INET, ip)
+        except (OSError, UnicodeEncodeError):
+            return None  # never hand lsof anything but a literal address
+
+    host = f"[{peer[0]}]" if ":" in peer[0] else peer[0]
+    out = lsof(["lsof", "-nP", "-w", f"-iTCP@{host}:{peer[1]}", "-Fpun"])
+    if out is None:
+        return None
+
+    wanted = f"{_lsof_endpoint(*peer)}->{_lsof_endpoint(*ours)}"
+    uids: set[int] = set()
+    uid: int | None = None
+    for line in out.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p":
+            uid = None  # a new process; its u line follows
+        elif tag == "u":
+            try:
+                uid = int(value)
+            except ValueError:
+                uid = None
+        elif tag == "n" and value == wanted:
+            if uid is None:
+                return None  # a match we cannot attribute is not an answer
+            uids.add(uid)
+    if len(uids) == 1:
+        return uids.pop()
+    if uids:
+        logger.warning("peer UID lookup via lsof was ambiguous for %s: %s", wanted, sorted(uids))
+    return None
+
+
 def resolve_peer_uid(
     peer: Sequence[object] | None,
     sockname: Sequence[object] | None,
     tables: Iterable[Path] = PROC_NET_TCP,
+    *,
+    platform: str = sys.platform,
+    lsof: Callable[[list[str]], str | None] = _run_lsof,
 ) -> int | None:
     """UID of the process that opened the connection, or ``None`` if unproven.
 
@@ -99,16 +174,23 @@ def resolve_peer_uid(
             server, the client.
         sockname: Our own end, as ``socket.getsockname()`` returns it.
         tables: Kernel socket tables to search (overridable for tests).
+        platform: ``sys.platform``; only ``darwin`` falls back to ``lsof``,
+            and only when none of *tables* exists.
+        lsof: Runs ``lsof`` and returns its stdout (overridable for tests).
 
     Returns:
-        The connecting user's UID. ``None`` when the platform has no such table
-        (non-Linux), when the connection is not in it (a remote peer — its
+        The connecting user's UID. ``None`` when neither the tables nor (on
+        macOS) ``lsof`` can prove it, when the connection is not in it (a remote peer — its
         socket lives on another host), or when the rows disagree.
     """
     peer_addr = _address_of(peer)
     sock_addr = _address_of(sockname)
     if peer_addr is None or sock_addr is None:
         return None
+
+    tables = tuple(tables)
+    if platform == "darwin" and not any(t.exists() for t in tables):
+        return _lsof_peer_uid(peer_addr, sock_addr, lsof)
 
     local = encode_address(*peer_addr)
     remote = encode_address(*sock_addr)
