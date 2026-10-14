@@ -741,3 +741,20 @@ class TestScreenshotWakesStoppedWorkspace:
 
         assert all(s["file"] is None for s in sent)
         assert "メッセージを送れば" in (sent[-1]["content"] or "")
+
+
+def test_dir_size_falls_back_when_du_has_no_dash_b(tmp_path, monkeypatch) -> None:
+    """BSD du (macOS) rejects ``-b`` (#899): the size comes from walking the tree instead."""
+    import subprocess
+
+    from c_lord.cogs import session_manage as sm
+
+    (tmp_path / "a.txt").write_bytes(b"x" * 1000)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.txt").write_bytes(b"y" * 234)
+
+    def bsd_du(args, **kwargs):
+        return subprocess.CompletedProcess(args, 64, stdout="", stderr="du: illegal option -- b\n")
+
+    monkeypatch.setattr(subprocess, "run", bsd_du)
+    assert sm._dir_size_bytes(str(tmp_path)) == 1234

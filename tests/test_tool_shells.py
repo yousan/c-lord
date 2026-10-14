@@ -87,3 +87,39 @@ class TestReadProcs:
     def test_vanished_process_is_skipped(self, tmp_path: Path) -> None:
         (tmp_path / "5").mkdir()  # no stat file — exited between listdir and read
         assert read_procs(tmp_path) == []
+
+
+class TestReadProcsWithoutProcfs:
+    """macOS has no ``/proc`` (#899): read the same four columns from ``ps``.
+
+    Without this the list came back empty and ⏹ Stop silently left Claude's
+    background commands running (#878 did nothing on a Mac).
+    """
+
+    PS = (
+        "  100     1   100 -zsh\n"
+        "  200   100   200 claude --session-id x\n"
+        "  400   200   400 /bin/zsh -c source /Users/u/.claude/shell-snapshots/s.sh\n"
+        "garbage line\n"
+    )
+
+    def test_parses_ps_output(self, tmp_path: Path) -> None:
+        procs = read_procs(tmp_path / "missing", ps=lambda: self.PS)
+        assert procs[:2] == [
+            ProcInfo(pid=100, ppid=1, pgid=100, cmdline="-zsh"),
+            ProcInfo(pid=200, ppid=100, pgid=200, cmdline="claude --session-id x"),
+        ]
+        assert len(procs) == 3
+        assert tool_shell_groups(100, procs) == [400]
+
+    def test_ps_failure_yields_nothing(self, tmp_path: Path) -> None:
+        def fail() -> str:
+            raise OSError("no ps")
+
+        assert read_procs(tmp_path / "missing", ps=fail) == []
+
+    def test_procfs_is_preferred_when_present(self, tmp_path: Path) -> None:
+        def never() -> str:
+            raise AssertionError("ps must not run when /proc exists")
+
+        assert read_procs(tmp_path, ps=never) == []

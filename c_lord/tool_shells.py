@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,8 +37,47 @@ class ProcInfo:
     cmdline: str
 
 
-def read_procs(proc_root: Path = Path("/proc")) -> list[ProcInfo]:
-    """Snapshot pid / ppid / pgid / cmdline of every process, skipping the vanished."""
+def _run_ps() -> str:
+    """``ps`` listing of every process — pid, ppid, pgid, full command line."""
+    return subprocess.run(
+        ["ps", "-axww", "-o", "pid=,ppid=,pgid=,command="],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout
+
+
+def _procs_from_ps(ps: Callable[[], str]) -> list[ProcInfo]:
+    try:
+        out = ps()
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("could not list processes with ps", exc_info=True)
+        return []
+    procs: list[ProcInfo] = []
+    for line in out.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 3:
+            continue
+        try:
+            pid, ppid, pgid = int(fields[0]), int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        cmdline = fields[3].strip() if len(fields) > 3 else ""
+        procs.append(ProcInfo(pid=pid, ppid=ppid, pgid=pgid, cmdline=cmdline))
+    return procs
+
+
+def read_procs(
+    proc_root: Path = Path("/proc"), *, ps: Callable[[], str] = _run_ps
+) -> list[ProcInfo]:
+    """Snapshot pid / ppid / pgid / cmdline of every process, skipping the vanished.
+
+    Without procfs (macOS, #899) the same columns come from ``ps``; an empty list
+    there would make ⏹ Stop leave Claude's background commands running.
+    """
+    if not proc_root.is_dir():
+        return _procs_from_ps(ps)
     procs: list[ProcInfo] = []
     try:
         entries = list(proc_root.iterdir())
