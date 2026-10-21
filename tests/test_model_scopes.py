@@ -404,14 +404,37 @@ async def test_a_turn_never_sees_a_half_applied_pair(svc):
     assert seen <= {("opus", "high"), ("sonnet", "low")}
 
 
-async def test_sessions_from_before_the_feature_get_a_row_when_reflected(svc):
+async def test_sessions_from_before_the_feature_are_reflected_and_counted(svc):
     # A live session with no settings row (created before #918).
     await session(svc, 7, A, turn=False)
+    r = await svc.change(
+        scope="channel",
+        model="sonnet",
+        channel_id=A,
+        include_existing=True,
+        channel_map={7: A},
+    )
+    assert (await saved(svc, 7))[0] == "sonnet"
+    assert r.fields[0].applied == 1  # it ran opus before: a real change, not "same value"
+    nxt = await svc.begin_turn(7, A)
+    assert nxt.needs_restart  # its process is assumed to carry the pre-change pair
+
+
+async def test_sessions_from_before_the_feature_do_not_drift_without_include_existing(svc):
+    await session(svc, 7, A, turn=False)
+    await svc.change(scope="channel", model="sonnet", channel_id=A, channel_map={7: A})
+    await svc.change(scope="global", model="haiku", channel_map={7: A})
+    assert (await saved(svc, 7))[0] == "opus"
+    assert await svc.legacy_thread_ids() == []  # everything open now has a row
+
+
+async def test_legacy_session_of_another_channel_is_left_alone(svc):
+    await session(svc, 7, B, turn=False)
     await svc.change(
         scope="channel",
         model="sonnet",
         channel_id=A,
         include_existing=True,
-        channel_of=lambda tid: A,
+        channel_map={7: B},
     )
-    assert (await saved(svc, 7))[0] == "sonnet"
+    assert (await saved(svc, 7))[0] == "opus"

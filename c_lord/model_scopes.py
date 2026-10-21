@@ -35,7 +35,7 @@ import contextlib
 import logging
 import re
 import unicodedata
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -428,13 +428,15 @@ class ModelScopeService:
         include_existing: bool = False,
         thread_id: int | None = None,
         channel_id: int | None = None,
-        channel_of: Callable[[int], int | None] | None = None,
+        channel_map: dict[int, int | None] | None = None,
     ) -> ChangeResult:
         """Apply one change as a single transaction; a rejected change writes nothing.
 
         ``model`` / ``effort``: ``None`` leave alone, ``"inherit"`` clear the
-        layer's explicit value, anything else set it.  ``channel_of`` resolves a
-        thread's channel for sessions from before this feature (no row yet).
+        layer's explicit value, anything else set it.  ``channel_map`` says which
+        channel each session from before this feature (no row yet, see
+        :meth:`legacy_thread_ids`) belongs to; looked up by the caller *before*
+        the transaction so no network call is made while the write lock is held.
         """
         self.validate(
             scope=scope,
@@ -463,14 +465,18 @@ class ModelScopeService:
         async with self._tx() as db:
             if scope == SCOPE_SESSION:
                 await self._change_session(db, result, thread_id, channel_id, model, effort)
-            elif scope == SCOPE_CHANNEL:
-                await self._write_channel(db, channel_id, model, effort)
-                if include_existing:
-                    await self._reflect(db, result, SCOPE_CHANNEL, channel_id, channel_of)
             else:
-                await self._write_global(db, model, effort)
+                # Sessions from before this feature have no row.  Give them one
+                # *first*, from the layers as they were before this change (which
+                # is what their process was launched with), so the change below
+                # neither silently drags them along nor is invisible to them.
+                await self._materialize_legacy(db, channel_map or {})
+                if scope == SCOPE_CHANNEL:
+                    await self._write_channel(db, channel_id, model, effort)
+                else:
+                    await self._write_global(db, model, effort)
                 if include_existing:
-                    await self._reflect(db, result, SCOPE_GLOBAL, None, channel_of)
+                    await self._reflect(db, result, scope, channel_id)
         return result
 
     async def _change_session(
@@ -600,35 +606,56 @@ class ModelScopeService:
                     (key, value),
                 )
 
-    async def _reflect(
-        self,
-        db: aiosqlite.Connection,
-        result: ChangeResult,
-        scope: str,
-        channel_id: int | None,
-        channel_of: Callable[[int], int | None] | None,
+    async def legacy_thread_ids(self) -> list[int]:
+        """Open sessions that have no model row yet (they predate #918)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT s.thread_id FROM sessions s WHERE s.closed_at IS NULL "
+                "AND s.closed_reason IS NOT 'swept' AND NOT EXISTS "
+                "(SELECT 1 FROM session_model_settings m WHERE m.thread_id = s.thread_id)"
+            )
+            return [r[0] for r in await cur.fetchall()]
+
+    async def _materialize_legacy(
+        self, db: aiosqlite.Connection, channel_map: dict[int, int | None]
     ) -> None:
-        """Push the (already written) layer into live sessions, per field, with protection."""
-        global_ = await self._global(db)
-        # Sessions from before this feature have no row: give them one first,
-        # from the layers *as they were seen by that session*, then treat alike.
         cur = await db.execute(
             "SELECT s.thread_id FROM sessions s WHERE s.closed_at IS NULL "
             "AND s.closed_reason IS NOT 'swept' AND NOT EXISTS "
             "(SELECT 1 FROM session_model_settings m WHERE m.thread_id = s.thread_id)"
         )
         legacy = [r["thread_id"] for r in await cur.fetchall()]
+        global_ = await self._global(db)
         for tid in legacy:
-            ch = channel_of(tid) if channel_of is not None else None
-            if scope == SCOPE_CHANNEL and ch != channel_id:
-                continue
+            ch = channel_map.get(tid)
             res = self._resolve((None, None), await self._channel(db, ch), global_)
+            # ``applied`` = the best known account of what its process runs, so a
+            # reflected change makes the next turn restart it.
             await db.execute(
                 "INSERT INTO session_model_settings "
-                "(thread_id, channel_id, model, model_src, effort, effort_src) "
-                "VALUES (?,?,?,?,?,?)",
-                (tid, ch, res.model, res.model_src, res.effort, res.effort_src),
+                "(thread_id, channel_id, model, model_src, effort, effort_src, "
+                " applied_model, applied_effort) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    tid,
+                    ch,
+                    res.model,
+                    res.model_src,
+                    res.effort,
+                    res.effort_src,
+                    res.model,
+                    res.effort,
+                ),
             )
+
+    async def _reflect(
+        self,
+        db: aiosqlite.Connection,
+        result: ChangeResult,
+        scope: str,
+        channel_id: int | None,
+    ) -> None:
+        """Push the (already written) layer into live sessions, per field, with protection."""
+        global_ = await self._global(db)
 
         where = "m.channel_id = ?" if scope == SCOPE_CHANNEL else "1 = 1"
         params: tuple[object, ...] = (channel_id,) if scope == SCOPE_CHANNEL else ()

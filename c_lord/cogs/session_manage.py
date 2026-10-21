@@ -427,14 +427,23 @@ class SessionManageCog(commands.Cog):
     def _model_scopes(self) -> ModelScopeService | None:
         return service_for(self.bot, self.settings_repo, self._get_runner())
 
-    def _channel_of_thread(self, thread_id: int) -> int | None:
-        """The parent channel of a thread, if the gateway cache knows it (sync)."""
-        with contextlib.suppress(Exception):
-            ch = self.bot.get_channel(thread_id)
-            parent = getattr(ch, "parent_id", None)
-            if isinstance(parent, int):
-                return parent
-        return None
+    async def _channel_map(self, svc: ModelScopeService) -> dict[int, int | None]:
+        """Parent channel of every open session that predates #918 (cache, then API).
+
+        Done before the write transaction: a Discord call must not sit inside it.
+        A thread Discord no longer knows maps to ``None`` (no channel layer).
+        """
+        out: dict[int, int | None] = {}
+        for tid in await svc.legacy_thread_ids():
+            parent: int | None = None
+            with contextlib.suppress(Exception):
+                ch = self.bot.get_channel(tid)
+                if ch is None:
+                    ch = await self.bot.fetch_channel(tid)
+                value = getattr(ch, "parent_id", None)
+                parent = value if isinstance(value, int) else None
+            out[tid] = parent
+        return out
 
     async def _model_command_impl(
         self,
@@ -504,7 +513,7 @@ class SessionManageCog(commands.Cog):
                 include_existing=include,
                 thread_id=thread_id,
                 channel_id=channel_id,
-                channel_of=self._channel_of_thread,
+                channel_map=(await self._channel_map(svc) if eff_scope != SCOPE_SESSION else None),
             )
         except ModelScopeError as exc:
             await fail(str(exc))
