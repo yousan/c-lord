@@ -94,13 +94,13 @@ Claude Code はログインが切れていると、どの依頼にも `Login exp
 ### 設定されたモデルを Claude Code が使えなかったターン (#484)
 
 ```
-🧩 Claude Code がモデル `claude-nonexistent-zzz` を使えないため、このターンは実行されていません。`/model set` で使えるモデルに戻してください。戻すまでは送り直しても同じ結果になります。 @依頼者
+🧩 Claude Code がモデル `claude-nonexistent-zzz` を使えないため、このターンは実行されていません。`/model` で使えるモデルに戻してください。戻すまでは送り直しても同じ結果になります。 @依頼者
 ```
 
-`/model set` は形の正しいモデル ID なら何でも受け付け、使えるかどうかは Claude Code に任せています (#478)。Claude Code（2.1.283 で実測）は知らない／使えないモデルを渡されても**起動には失敗しません**。起動したうえで、どの依頼にも `There's an issue with the selected model (<モデル>). It may not exist or you may not have access to it. Run /model to pick a different model.` の1行だけを返して止まります。以前の c-lord はこれを普通の回答として扱い、🟡「終わりました」で閉じていました。
+`/model` は形の正しいモデル ID なら何でも受け付け、使えるかどうかは Claude Code に任せています (#478)。Claude Code（2.1.283 で実測）は知らない／使えないモデルを渡されても**起動には失敗しません**。起動したうえで、どの依頼にも `There's an issue with the selected model (<モデル>). It may not exist or you may not have access to it. Run /model to pick a different model.` の1行だけを返して止まります。以前の c-lord はこれを普通の回答として扱い、🟡「終わりました」で閉じていました。
 
-- **「終わりました」「もう一度送る」とは言わない。** 直すには c-lord の `/model set` を変えるしかない
-- あわせて `🧩 設定されたモデルを Claude Code が使えません` の embed が出る（❌）。`/model show` で現在の設定を確認し、`/model set` で戻すよう案内する。Claude Code の文言にある `/model` はペインの中のその1セッションしか変えないので、c-lord の設定である `/model set` を名指しする
+- **「終わりました」「もう一度送る」とは言わない。** 直すには c-lord の `/model` を変えるしかない
+- あわせて `🧩 設定されたモデルを Claude Code が使えません` の embed が出る（❌）。`/model`（引数なし）で現在の設定を確認し、`/model` で戻すよう案内する。Claude Code の文言にある `/model` はペインの中のその1セッションしか変えないので、c-lord の設定である `/model` を名指しする
 - 判定はログインのときと同じ: ペインの「`There's an issue with the selected model (…)` で始まる行」が**このターンのプロンプトの下に**出たとき（または、このターンで行数が増えたとき）。起動バナーに出るモデル名、前のターンの行の再描画、文中で引用された文言では判定しない
 - Claude が返した英語の1行は transcript ミラーがそのまま転送する（こちらは変えていない）
 

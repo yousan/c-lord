@@ -1,6 +1,6 @@
 """#484: a turn Claude refused because the configured model is unusable says so.
 
-``/model set`` accepts any well-formed model ID and leaves the verdict to the
+``/model`` accepts any well-formed model ID and leaves the verdict to the
 CLI (#478).  Claude Code 2.1.283 does NOT fail to start on a model it does not
 know — it starts, and answers every prompt with one line, then goes idle::
 
@@ -129,7 +129,7 @@ class TestRunnerReportsModel:
         assert error is not None
         assert error.startswith(MODEL_UNAVAILABLE_ERROR_PREFIX), error
         assert "claude-nonexistent-zzz" in error
-        assert "/model set" in error
+        assert "/model" in error
         for phrase in _FORBIDDEN:
             assert phrase not in error
 
@@ -146,7 +146,7 @@ class TestRunnerReportsModel:
     async def test_refusal_from_an_earlier_turn_does_not_refuse_this_one(
         self, runner: TmuxClaudeRunner
     ) -> None:
-        """After ``/model set`` fixes it, a --resume redraws the old refusal above."""
+        """After ``/model`` fixes it, a --resume redraws the old refusal above."""
         runner._tmux.is_claude_running.return_value = False  # type: ignore[attr-defined]
         runner.timeout_seconds = 1
         pane = (
@@ -171,7 +171,7 @@ class TestDiscordWording:
         body = f"{embed.title}\n{embed.description}"
         assert "モデル" in (embed.title or "")
         assert "claude-nonexistent-zzz" in body
-        assert "/model set" in body
+        assert "/model" in body
         for phrase in _FORBIDDEN:
             assert phrase not in body, body
 
@@ -179,7 +179,7 @@ class TestDiscordWording:
         from c_lord.discord_ui.thread_dashboard import _completion_text
 
         text = _completion_text(42, True, None, model_unavailable="claude-nonexistent-zzz")
-        assert "/model set" in text
+        assert "/model" in text
         assert "claude-nonexistent-zzz" in text
         assert "<@42>" in text
         for phrase in _FORBIDDEN:

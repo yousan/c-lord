@@ -109,6 +109,36 @@ CREATE TABLE IF NOT EXISTS ui_sweep_cursors (
     last_message_id INTEGER NOT NULL,
     swept_at        TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+-- #918: model / effort per layer. A NULL column is "not set at this layer".
+CREATE TABLE IF NOT EXISTS channel_model_settings (
+    channel_id INTEGER PRIMARY KEY,
+    model      TEXT,
+    effort     TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- #918: one row per session (= Discord thread). ``explicit_*`` is what the
+-- session itself was told (protected from include-existing); ``model``/``effort``
+-- with ``*_src`` are the effective values saved when the session was created or
+-- last changed, and the layer they came from. ``applied_*`` is the pair the
+-- Claude process was last launched with, so a differing saved pair is "pending
+-- for the next turn" — all of it survives a restart.
+CREATE TABLE IF NOT EXISTS session_model_settings (
+    thread_id        INTEGER PRIMARY KEY,
+    channel_id       INTEGER,
+    explicit_model   TEXT,
+    explicit_effort  TEXT,
+    model            TEXT,
+    model_src        TEXT NOT NULL DEFAULT 'env',
+    effort           TEXT,
+    effort_src       TEXT NOT NULL DEFAULT 'env',
+    applied_model    TEXT,
+    applied_effort   TEXT,
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_model_channel ON session_model_settings(channel_id);
 """
 
 # Migrations for existing databases that lack new columns.

@@ -167,7 +167,7 @@ class TestSessionManageRefusesStrangers:
     def test_the_destructive_ones_are_in_the_parametrization(self) -> None:
         """If a rename dropped one of these, the tests above would silently shrink."""
         slash, text = _session_manage_slash(), _session_manage_text()
-        for name in ("workspace-delete", "workspace-stop", "model set", "workspace-cleanup"):
+        for name in ("workspace-delete", "workspace-stop", "workspace-cleanup"):
             assert name in slash
         for name in ("workspace-delete", "workspace-stop", "model-set", "workspace-cleanup"):
             assert name in text
@@ -178,7 +178,7 @@ class TestSessionManageLetsTheRightPeopleThrough:
     async def test_owner_can_set_the_model(self) -> None:
         cog, _, settings_repo = _session_manage_cog()
 
-        await cog.model_set.callback(cog, _interaction(OWNER), "opus")
+        await cog.model_set_text.callback(cog, _ctx(_message(OWNER)), "opus")
 
         settings_repo.set.assert_awaited_once_with(SETTING_CLAUDE_MODEL, "opus")
 
@@ -207,7 +207,7 @@ class TestSessionManageLetsTheRightPeopleThrough:
         repo.get = AsyncMock(return_value=None)
         interaction = _interaction(STRANGER)
 
-        await cog.model_show.callback(cog, interaction)
+        await cog.thread_archive_show.callback(cog, interaction)
 
         _, kwargs = interaction.response.send_message.call_args
         assert "embed" in kwargs
@@ -226,11 +226,11 @@ class TestSessionManageLetsTheRightPeopleThrough:
             settings_repo.set = AsyncMock()
             cog = SessionManageCog(bot=bot, repo=MagicMock(), settings_repo=settings_repo)
 
-            stranger = _interaction(STRANGER)
-            await cog.model_set.callback(cog, stranger, "opus")
-            _assert_refused_slash(stranger)
+            stranger = _ctx(_message(STRANGER))
+            await cog.model_set_text.callback(cog, stranger, "opus")
+            _assert_refused_text(stranger)
 
-            await cog.model_set.callback(cog, _interaction(OWNER), "opus")
+            await cog.model_set_text.callback(cog, _ctx(_message(OWNER)), "opus")
             settings_repo.set.assert_awaited_once_with(SETTING_CLAUDE_MODEL, "opus")
         finally:
             set_default_authorizer(None)
@@ -243,11 +243,11 @@ class TestSessionManageLetsTheRightPeopleThrough:
         settings_repo = MagicMock()
         settings_repo.set = AsyncMock()
         cog = SessionManageCog(bot=bot, repo=MagicMock(), settings_repo=settings_repo)
-        interaction = _interaction(OWNER)
+        ctx = _ctx(_message(OWNER))
 
-        await cog.model_set.callback(cog, interaction, "opus")
+        await cog.model_set_text.callback(cog, ctx, "opus")
 
-        _assert_refused_slash(interaction)
+        _assert_refused_text(ctx)
         settings_repo.set.assert_not_called()
 
 

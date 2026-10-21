@@ -33,3 +33,8 @@ class ClaudeConfig:
     # via ``CLAUDE_CODE_EFFORT_LEVEL`` / the ``/effort`` command, not this
     # flag).  Override per instance or via ``CLAUDE_EFFORT``.
     effort: str | None = None
+    # #918: where ``model`` / ``effort`` were read from at start-up, for the
+    # ``/model`` display (".env", "環境変数", "組み込み既定", "未設定").  ``None`` ⇒
+    # the consumer built this by hand and did not say.  Labels only — never a value.
+    model_source: str | None = None
+    effort_source: str | None = None

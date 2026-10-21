@@ -229,8 +229,8 @@ once it is over. At the end of a turn they are folded into a single
 | `/skill <name> [args]` | Run a Claude Code skill (with autocomplete) | Available |
 | `/clord-status [show_all]` | List this channel's sessions — size, attach, resume (supersedes `/sessions`, `/session-dirs`, `/resume-info`) | Available |
 | `/sync-sessions` | Import CLI sessions as Discord threads | Available |
-| `/model show` | Show current model (global + per-thread) | Available |
-| `/model set <model>` | Change model for all new sessions | Available |
+| `/model` | Show model / effort at every layer (session, channel, global, `.env`) | Available |
+| `/model <model> [effort] [scope] [include-existing]` | Change model and/or effort for this session, this channel's new sessions, or all new sessions (details: `docs/specs/model-scopes.md`) | Available |
 | `/workspace-cleanup` | Reclaim the working directories of workspaces nothing is using (old name `/session-cleanup` still works) | Available |
 | `/tmux-list` | List all active tmux windows | Available |
 | `/close-workspace` | 終了: close the tmux window, keep the session (thread renamed `[終了] …`; a later message is held and offers a 再開 button) | Available |

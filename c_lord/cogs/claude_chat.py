@@ -74,6 +74,7 @@ from ..gateway_backfill import (
 )
 from ..host_restart_notice import stopped_mid_turn
 from ..log_sampler import LogSampler
+from ..model_scopes import TurnSettings, begin_turn_for, effort_for_launch
 from ..notify_policy import Kind, owner_notify_id
 from ..session_close import apply_open_name, closed_notice_embed, is_closed, was_auto_stopped
 from ..session_dir import exclude_thread_history
@@ -623,6 +624,14 @@ class ClaudeChatCog(commands.Cog):
         from .session_manage import SETTING_CLAUDE_MODEL
 
         return await self._settings_repo.get(SETTING_CLAUDE_MODEL)
+
+    async def _fix_turn_settings(
+        self, thread_id: int, channel_id: int | None
+    ) -> TurnSettings | None:
+        """Decide this turn's model/effort once, as a pair (#918); ``None`` ⇒ instance defaults."""
+        return await begin_turn_for(
+            self.bot, self._settings_repo, self.runner, thread_id, channel_id
+        )
 
     def _get_coordination(self) -> CoordinationService:
         """Return the coordination service (zero-config: auto-creates from env if needed).
@@ -3702,7 +3711,10 @@ class ClaudeChatCog(commands.Cog):
             )
         await _asyncio.to_thread(tmux_manager.create_session, thread.id, working_dir or ".")
 
-        model = await self._get_current_model() or self.runner.model
+        turn = await self._fix_turn_settings(thread.id, parent_channel_id)
+        model = (
+            (turn.model if turn else None) or await self._get_current_model() or self.runner.model
+        )
         runner = TmuxClaudeRunner(
             tmux_manager=tmux_manager,
             thread_id=thread.id,
@@ -3710,7 +3722,7 @@ class ClaudeChatCog(commands.Cog):
             working_dir=working_dir,
             timeout_seconds=self.runner.timeout_seconds,
             dangerously_skip_permissions=True,
-            effort=self.runner.effort,
+            effort=effort_for_launch(model, turn.effort if turn else self.runner.effort),
         )
         if not await runner.wake():
             return False
@@ -4177,7 +4189,30 @@ class ClaudeChatCog(commands.Cog):
             self._turn_triggers[thread.id] = user_message.id
             await status.set_running()
 
-            model_override = await self._get_current_model()
+            # #918: model and effort are fixed together, once, for this turn. A
+            # change made while the turn runs waits for the next one.
+            turn = await self._fix_turn_settings(thread.id, parent_channel_id)
+            model_override = turn.model if turn else await self._get_current_model()
+            if turn is not None and turn.needs_restart and tmux_manager is not None:
+                # The Claude in the pane was launched with a different pair, and
+                # typing /model into it would save the choice for every Claude on
+                # the host. Restart it with --resume and the new flags instead.
+                alive = await asyncio.to_thread(tmux_manager.is_claude_running, thread.id)
+                if alive:
+                    await asyncio.to_thread(tmux_manager.kill_session, thread.id)
+                    try_continue = session_id is not None
+                    logger.info(
+                        "%s restarting claude for new model/effort %s/%s (was %s) (#918)",
+                        log_ctx(thread_id=thread.id),
+                        turn.model,
+                        turn.effort,
+                        turn.previously_applied,
+                    )
+                    with contextlib.suppress(discord.HTTPException):
+                        await thread.send(
+                            "-# 🔄 モデル設定が変わったため、会話を保ったまま Claude を"
+                            f"立て直します（{turn.model} / {turn.effort or '—'}）。"
+                        )
 
             # Create session directory (git clone) and tmux session if configured
             import asyncio as _asyncio
@@ -4309,7 +4344,10 @@ class ClaudeChatCog(commands.Cog):
                 timeout_seconds=self.runner.timeout_seconds,
                 dangerously_skip_permissions=True,
                 try_continue=try_continue,
-                effort=self.runner.effort,
+                effort=effort_for_launch(
+                    model_override or self.runner.model,
+                    turn.effort if turn else self.runner.effort,
+                ),
             )
 
             self._register_runner(thread.id, runner, current_task)

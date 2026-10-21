@@ -29,6 +29,16 @@ from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.views import StatusShowAllView
+from ..model_scopes import (
+    INHERIT,
+    SCOPE_CHANNEL,
+    SCOPE_SESSION,
+    ModelScopeError,
+    ModelScopeService,
+    render_result,
+    render_view,
+    service_for,
+)
 from ..session_close import (
     apply_closed_name,
     apply_open_name,
@@ -79,6 +89,16 @@ _MODEL_CHOICES = [
     app_commands.Choice(name="Sonnet — latest balanced (default)", value="sonnet"),
     app_commands.Choice(name="Opus — most capable, deep reasoning", value="opus"),
     app_commands.Choice(name="Haiku — fastest, low cost", value="haiku"),
+]
+
+_EFFORT_CHOICES = [
+    app_commands.Choice(name=level, value=level)
+    for level in ("low", "medium", "high", "xhigh", "max", "inherit")
+]
+_SCOPE_CHOICES = [
+    app_commands.Choice(name="session — この会話だけ", value="session"),
+    app_commands.Choice(name="channel — このチャンネルの新規用", value="channel"),
+    app_commands.Choice(name="global — この C-lord 全体の新規用", value="global"),
 ]
 
 # A model string is either a tier alias or a full model ID passed straight to the
@@ -296,13 +316,28 @@ class SessionManageCog(commands.Cog):
 
     # ── Model commands ────────────────────────────────────────────────────────
 
-    model_group = app_commands.Group(
-        name="model",
-        description="View and change the Claude model used for new sessions",
-    )
-
     async def _model_show_impl(self, *, channel: object, respond: _Responder) -> None:
-        """Shared core for /model show and !model-show (#209 follow-up)."""
+        """Core of ``!model-show`` (the old ``/model show``): the table ``/model`` shows (#918)."""
+        svc = self._model_scopes()
+        if svc is not None:
+            in_thread = isinstance(channel, discord.Thread)
+            channel_id = (
+                (getattr(channel, "parent_id", None) or channel.id)  # type: ignore[attr-defined]
+                if isinstance(getattr(channel, "id", None), int)
+                else None
+            )
+            view = await svc.view(
+                channel_id=channel_id,
+                thread_id=channel.id if in_thread else None,  # type: ignore[attr-defined]
+            )
+            await respond(
+                embed=discord.Embed(
+                    title="🤖 Current Claude Model",
+                    description=render_view(view, svc),
+                    color=COLOR_INFO,
+                )
+            )
+            return
         effective_model = await self._get_effective_model()
 
         embed = discord.Embed(
@@ -320,8 +355,7 @@ class SessionManageCog(commands.Cog):
             )
         else:
             embed.description = (
-                f"**Default model:** `{runner_model}`\n"
-                "*(no override set — use `/model set` to change)*"
+                f"**Default model:** `{runner_model}`\n*(no override set — use `/model` to change)*"
             )
 
         # Per-thread session model (if inside a thread)
@@ -337,12 +371,6 @@ class SessionManageCog(commands.Cog):
         embed.set_footer(text=f"Effective model for new sessions: {effective_model}")
         await respond(embed=embed)
 
-    @model_group.command(name="show", description="Show the current Claude model")
-    async def model_show(self, interaction: discord.Interaction) -> None:
-        """Display the current global model and, if in a thread, the per-session model."""
-        respond, _ = self._slash_io(interaction)
-        await self._model_show_impl(channel=interaction.channel, respond=respond)
-
     @commands.command(name="model-show")
     async def model_show_text(self, ctx: commands.Context) -> None:
         """Text/mention twin of /model show — webhook-invokable for E2E (#209)."""
@@ -350,7 +378,7 @@ class SessionManageCog(commands.Cog):
         await self._model_show_impl(channel=ctx.channel, respond=respond)
 
     async def _model_set_impl(self, *, model: str, respond: _Responder) -> None:
-        """Shared core for /model set and !model-set (#209 follow-up)."""
+        """Core of ``!model-set``: set the global model (the old ``/model set``)."""
         model = (model or "").strip()
         if not _is_valid_model_id(model):
             await respond(
@@ -394,15 +422,191 @@ class SessionManageCog(commands.Cog):
             )
         return choices[:25]
 
-    @model_group.command(name="set", description="Change the global Claude model for new sessions")
-    @app_commands.describe(model="Alias (sonnet/opus/haiku) or a model ID like claude-fable-5")
-    @app_commands.autocomplete(model=_model_autocomplete)
-    async def model_set(self, interaction: discord.Interaction, model: str) -> None:
-        """Set the global default model stored in settings_repo."""
-        respond, _ = self._slash_io(interaction)
-        if not await self._admit(interaction, respond):
+    # ── /model: session / channel / global scopes (#918) ──────────────────────
+
+    def _model_scopes(self) -> ModelScopeService | None:
+        return service_for(self.bot, self.settings_repo, self._get_runner())
+
+    def _channel_of_thread(self, thread_id: int) -> int | None:
+        """The parent channel of a thread, if the gateway cache knows it (sync)."""
+        with contextlib.suppress(Exception):
+            ch = self.bot.get_channel(thread_id)
+            parent = getattr(ch, "parent_id", None)
+            if isinstance(parent, int):
+                return parent
+        return None
+
+    async def _model_command_impl(
+        self,
+        *,
+        channel: object,
+        respond: _Responder,
+        admit: Callable[[], Awaitable[bool]],
+        model: str | None,
+        effort: str | None,
+        scope: str | None,
+        include_existing: bool | None,
+    ) -> None:
+        """Shared core for ``/model`` and ``!model``: show, or change one scope.
+
+        A request with no ``model`` / ``effort`` / ``include-existing`` only
+        *reads* — it needs no allowlist and writes nothing.  Anything that would
+        change a setting goes through the allowlist first (the same boundary
+        ``/model set`` had), and a rejected request changes nothing.
+        """
+
+        async def fail(message: str) -> None:
+            await respond(f"❌ {message}", ephemeral=True)
+
+        in_thread = isinstance(channel, discord.Thread)
+        if in_thread:
+            thread_id: int | None = channel.id  # type: ignore[attr-defined]
+            channel_id = getattr(channel, "parent_id", None) or channel.id  # type: ignore[attr-defined]
+        elif isinstance(getattr(channel, "id", None), int):
+            thread_id, channel_id = None, channel.id  # type: ignore[attr-defined]
+        else:
+            await fail("チャンネルかスレッドの中で実行してください。")
             return
-        await self._model_set_impl(model=model, respond=respond)
+
+        model = (model or "").strip() or None
+        effort = (effort or "").strip().lower() or None
+        if model is not None and model.lower() == INHERIT:
+            model = INHERIT
+        scope_given = (scope or "").strip().lower() or None
+        eff_scope = scope_given or (SCOPE_SESSION if in_thread else SCOPE_CHANNEL)
+        include = bool(include_existing)
+        wants_change = model is not None or effort is not None or include_existing is not None
+
+        if wants_change and not await admit():
+            return
+
+        svc = self._model_scopes()
+        if svc is None:
+            await fail("設定の保存先が使えないため、モデル設定を扱えません。")
+            return
+
+        try:
+            svc.validate(
+                scope=eff_scope,
+                model=model,
+                effort=effort,
+                include_existing=include,
+                in_thread=in_thread,
+            )
+            if model is None and effort is None:
+                view = await svc.view(channel_id=channel_id, thread_id=thread_id)
+                await respond(render_view(view, svc))
+                return
+            result = await svc.change(
+                scope=eff_scope,
+                model=model,
+                effort=effort,
+                include_existing=include,
+                thread_id=thread_id,
+                channel_id=channel_id,
+                channel_of=self._channel_of_thread,
+            )
+        except ModelScopeError as exc:
+            await fail(str(exc))
+            return
+        logger.info(
+            "%s /model changed scope=%s model=%s effort=%s include_existing=%s (#918)",
+            log_ctx(thread_id=thread_id, channel_id=channel_id),
+            eff_scope,
+            model,
+            effort,
+            include,
+        )
+        await respond(render_result(result))
+
+    async def _model_value_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        choices = await self._model_autocomplete(interaction, current)
+        if "inherit".startswith((current or "").strip().lower()):
+            choices.append(app_commands.Choice(name="inherit — 指定を解除", value=INHERIT))
+        return choices[:25]
+
+    @app_commands.command(
+        name="model",
+        description="Show or change the Claude model / effort (session, channel or global)",
+    )
+    @app_commands.describe(
+        model="Alias (sonnet/opus/haiku), a model ID, or inherit. Omit to leave unchanged",
+        effort="low / medium / high / xhigh / max, or inherit. Omit to leave unchanged",
+        scope="Where to apply it (default: this session in a thread, this channel otherwise)",
+        include_existing="channel/global only: also apply to existing open sessions",
+    )
+    @app_commands.rename(include_existing="include-existing")
+    @app_commands.autocomplete(model=_model_value_autocomplete)
+    @app_commands.choices(effort=_EFFORT_CHOICES, scope=_SCOPE_CHOICES)
+    async def model_command(
+        self,
+        interaction: discord.Interaction,
+        model: str | None = None,
+        effort: str | None = None,
+        scope: str | None = None,
+        include_existing: bool | None = None,
+    ) -> None:
+        """``/model`` — with no arguments, display; otherwise change one scope."""
+        respond, _ = self._slash_io(interaction)
+
+        async def admit() -> bool:
+            return await self._admit(interaction, respond)
+
+        await self._model_command_impl(
+            channel=interaction.channel,
+            respond=respond,
+            admit=admit,
+            model=model,
+            effort=effort,
+            scope=scope,
+            include_existing=include_existing,
+        )
+
+    @commands.command(name="model")
+    async def model_text(self, ctx: commands.Context, *args: str) -> None:
+        """Text twin of ``/model``: ``!model [MODEL] [effort:E] [scope:S] [include-existing:B]``."""
+        respond, _ = self._ctx_io(ctx)
+        model: str | None = None
+        effort: str | None = None
+        scope: str | None = None
+        include: bool | None = None
+        for arg in args:
+            key, sep, value = arg.partition(":")
+            low = key.lower()
+            if sep and low == "effort":
+                effort = value
+            elif sep and low == "scope":
+                scope = value
+            elif sep and low in ("include-existing", "include_existing"):
+                if value.lower() not in ("true", "false"):
+                    await respond("❌ `include-existing` は true か false です。", ephemeral=True)
+                    return
+                include = value.lower() == "true"
+            elif not sep and model is None:
+                model = arg
+            else:
+                await respond(
+                    f"❌ `{arg}` を解釈できません。"
+                    "`!model [MODEL] [effort:E] [scope:S] [include-existing:true]` "
+                    "の形で指定してください。",
+                    ephemeral=True,
+                )
+                return
+
+        async def admit() -> bool:
+            return await self._admit(ctx, respond)
+
+        await self._model_command_impl(
+            channel=ctx.channel,
+            respond=respond,
+            admit=admit,
+            model=model,
+            effort=effort,
+            scope=scope,
+            include_existing=include,
+        )
 
     @commands.command(name="model-set")
     async def model_set_text(self, ctx: commands.Context, model: str | None = None) -> None:

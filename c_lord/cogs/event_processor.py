@@ -372,7 +372,7 @@ class EventProcessor:
                 self._config.outcome.no_response = True
                 self._config.outcome.login_required = True
             # #484: likewise for a model Claude Code will not use — only
-            # ``/model set`` can fix it.
+            # ``/model`` can fix it.
             refused_model = unavailable_model(event.error)
             if refused_model is not None:
                 self._config.outcome.no_response = True
