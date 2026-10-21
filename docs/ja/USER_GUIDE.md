@@ -241,8 +241,8 @@ TODO リスト）は、実行中は役に立ちますが終わるとノイズに
 | `/skill <名前> [引数]` | Claude Code スキルを実行（オートコンプリート付き） | 利用可能 |
 | `/clord-status [show_all]` | このチャンネルのセッション一覧（容量・attach・resume。`/sessions`・`/session-dirs`・`/resume-info` を統合） | 利用可能 |
 | `/sync-sessions` | CLI セッションを Discord スレッドにインポート | 利用可能 |
-| `/model show` | 現在のモデル表示（グローバル + スレッド別） | 利用可能 |
-| `/model set <モデル>` | 新規セッションのモデルを変更（再起動不要） | 利用可能 |
+| `/model` | model / effort を各階層（セッション・チャンネル・グローバル・`.env`）で表示 | 利用可能 |
+| `/model <モデル> [effort] [scope] [include-existing]` | このセッション／このチャンネルの新規用／全体の新規用の model・effort を変更（詳細 `docs/specs/model-scopes.md`） | 利用可能 |
 | `/workspace-cleanup` | 使われていないワークスペースの作業ディレクトリを回収（旧名 `/session-cleanup` も動きます） | 利用可能 |
 | `/tmux-list` | アクティブな tmux ウィンドウ一覧 | 利用可能 |
 | `/workspace-delete` | このスレッドの tmux ウィンドウとセッションディレクトリを削除 | 利用可能 |

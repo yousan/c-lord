@@ -2,7 +2,7 @@
 
 #405 gated ``/clear``. Scanning the other cogs the same way showed that most
 commands still asked nobody: anyone who could type in a thread could run
-``/workspace-delete`` (removes the working directory), ``/model set`` (changes
+``/workspace-delete`` (removes the working directory), ``/model`` (changes
 the model for every thread), ``/stop``, ``/compact``, ``/upgrade`` … The
 "nothing configured → owner only" default of #713 never reached them either,
 because a default only applies where the gate is called.
@@ -40,7 +40,11 @@ PUBLIC_COMMANDS = frozenset(
     {
         "/version",
         "!version",
-        "/model show",
+        # #918: bare ``/model`` only *displays*. Every argument that would change
+        # anything is gated inside (``tests/test_model_command_scopes.py``
+        # holds that: a stranger's change is refused and writes nothing).
+        "/model",
+        "!model",
         "!model-show",
         "/thread-archive show",
         "!thread-archive-show",
@@ -136,7 +140,7 @@ def test_scan_finds_the_commands_it_should() -> None:
     for expected in (
         "/workspace-delete",
         "!workspace-delete",
-        "/model set",
+        "/model",
         "!model-set",
         "/stop",
         "!stop",
