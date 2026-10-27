@@ -12,13 +12,16 @@ are not available — only plain text deltas.  However, users can
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..tmux import TmuxSessionManager, pane_command_is_dead
+from ..clord_home import clord_home
+from ..tmux import SENSITIVE_ENV_KEYS, TmuxSessionManager, pane_command_is_dead
 from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import count_usage_limit, extract_usage_limit
@@ -168,10 +171,32 @@ _UNKNOWN_ALERT_DELAY = 5.0
 # expected prompt — but still guards against a half-drawn menu frame (#166).
 _ASK_ALERT_DELAY = 1.5
 
-# /context probe: how many times to re-capture the pane while waiting for the
-# (locally-rendered) /context output to settle, and the gap between captures.
-_CONTEXT_PROBE_ATTEMPTS = 6
-_CONTEXT_PROBE_INTERVAL = 0.5
+# /context probe (#924): a throwaway ``claude -p`` outside the conversation.
+# Measured at 4-14 s on the production host; the cap only guards a hang.
+_CONTEXT_PROBE_TIMEOUT = 60.0
+# Where it runs. Fixed, so the CLI keeps one (empty) project dir for it rather
+# than one per probe, and never the thread's own working copy.
+_CONTEXT_PROBE_DIRNAME = "context-probe"
+# A model spelling's tier suffix, e.g. the ``[1m]`` of ``opus[1m]``.
+_MODEL_TIER_RE = re.compile(r"\[[^\]]*\]$")
+
+
+def _probe_model(configured: str | None, observed: str | None) -> str | None:
+    """Which ``--model`` the window probe should ask for (#924).
+
+    The pane was started with *configured* (``opus[1m]``, ``sonnet``), and its
+    tier suffix decides the window, so that spelling is preferred while it still
+    names the model the transcript *observed* (``claude-opus-5-5``). When the
+    two disagree — ``/model`` was used in the pane — the observed one wins.
+    """
+    if not observed:
+        return configured
+    if configured:
+        base = _MODEL_TIER_RE.sub("", configured).strip().lower()
+        if base and base in observed.lower():
+            return configured
+    return observed
+
 
 # Delay between individual menu-navigation keystrokes (seconds).  Keys must be
 # sent one at a time with a gap — batching `Down Down Enter` into one send-keys
@@ -2843,38 +2868,75 @@ class TmuxClaudeRunner:
         self._stopped = True
         await asyncio.to_thread(self._tmux.kill_session, self._thread_id)
 
-    async def probe_context_window(self) -> int | None:
-        """Learn the real context-window total by scraping ``/context``.
+    async def probe_context_window(self, model: str | None = None) -> int | None:
+        """Learn the real context-window total from ``/context`` — out of band.
 
-        ``/context`` renders locally and consumes no model turn (verified: it
-        writes no ``usage``-bearing assistant entry to the transcript), so it is
-        safe to fire between turns.  It must only be called when Claude is idle
-        at the prompt — the caller is responsible for that ordering.
+        Runs ``claude -p --no-session-persistence -- /context`` as a separate,
+        throwaway process (#924). It used to type ``/context`` into this
+        thread's pane, on the belief that it "renders locally and consumes no
+        model turn". It consumes no turn, but the CLI records its output as a
+        user message the model reads: the next turn — one a background
+        notification started, with nobody asking — answered it in the thread
+        ("Context is at 79k of 1M tokens"). A separate process puts nothing in
+        this conversation, and needs no idle pane either.
+
+        *model* is the one the transcript says this session uses; see
+        :func:`_probe_model` for how it is combined with the configured one.
 
         Returns the window total in absolute tokens (e.g. ``1_000_000`` for a
-        1M tier), or ``None`` if Claude is not running or the pane could not be
-        parsed (the caller then falls back to a per-model default).
+        1M tier), or ``None`` if the probe failed (the caller then falls back
+        to a per-model default).
         """
-        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+        argv = ["claude", "-p", "--no-session-persistence", "--strict-mcp-config"]
+        chosen = _probe_model(self.model, model)
+        if chosen:
+            argv.extend(["--model", chosen])
+        argv.extend(["--", "/context"])
+        # #353: the secrets stay out of every process c-lord starts.
+        env = {
+            k: v for k, v in os.environ.items() if k not in SENSITIVE_ENV_KEYS and k != "CLAUDECODE"
+        }
+        cwd = clord_home() / _CONTEXT_PROBE_DIRNAME
+        proc = None
+        try:
+            await asyncio.to_thread(cwd.mkdir, parents=True, exist_ok=True)
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), _CONTEXT_PROBE_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as exc:  # noqa: UP041 — 3.10 alias
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            logger.info(
+                "probe_context_window: /context probe failed (thread=%d): %r",
+                self._thread_id,
+                exc,
+            )
             return None
-
-        # ``send_literal`` (not ``send_input``) so the jsonl-bridge ZWSP marker
-        # is not prepended — a leading invisible char would stop Claude from
-        # recognising ``/context`` as a slash command.
-        if not await asyncio.to_thread(self._tmux.send_literal, self._thread_id, "/context"):
+        total = None
+        if proc.returncode == 0:
+            total = parse_context_total(stdout.decode("utf-8", errors="replace"))
+        if total is None:
+            logger.info(
+                "probe_context_window: could not read /context (thread=%d, model=%s, rc=%s)",
+                self._thread_id,
+                chosen,
+                proc.returncode,
+            )
             return None
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
-
-        for _ in range(_CONTEXT_PROBE_ATTEMPTS):
-            await asyncio.sleep(_CONTEXT_PROBE_INTERVAL)
-            pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
-            total = parse_context_total(_normalize_capture(pane))
-            if total is not None:
-                logger.info("probe_context_window: total=%d (thread=%d)", total, self._thread_id)
-                return total
-
-        logger.info("probe_context_window: could not parse /context (thread=%d)", self._thread_id)
-        return None
+        logger.info(
+            "probe_context_window: total=%d (thread=%d, model=%s)",
+            total,
+            self._thread_id,
+            chosen,
+        )
+        return total
 
     async def get_cost_from_pane(self) -> float | None:
         """Extract the per-turn cost from the ccstatusline ``Cost: $X.XXXX`` row.

@@ -41,6 +41,10 @@ _CONTEXT_TOTAL_RE = re.compile(
     r"[\d.]+\s*[kmb]?\s*/\s*([\d.]+)\s*([kmb]?)\s*tokens",
     re.IGNORECASE,
 )
+_CONTEXT_TOTAL_MD_RE = re.compile(
+    r"\*\*Tokens:\*\*\s*[\d.]+\s*[kmb]?\s*/\s*([\d.]+)\s*([kmb]?)\b",
+    re.IGNORECASE,
+)
 
 # ``Cost: $X.XXXX  Session: ...`` ccstatusline row 2.
 _COST_RE = re.compile(r"Cost:\s+\$([\d.]+)")
@@ -155,6 +159,7 @@ def _scale(suffix: str) -> int:
 def parse_context_total(pane_text: str) -> int | None:
     """Extract the context-window total from ``/context`` output.
 
+    Reads both the TUI rendering and the markdown ``claude -p`` prints (#924).
     Looks for the ``<used>/<total> tokens`` line and returns ``<total>`` in
     absolute tokens (e.g. ``1m`` → ``1_000_000``).  Anchors on the latest
     ``Context Usage`` header so a stray ``X/Y tokens`` string elsewhere in the
@@ -165,6 +170,9 @@ def parse_context_total(pane_text: str) -> int | None:
     if anchor_idx == -1:
         return None
     match = _CONTEXT_TOTAL_RE.search(pane_text, pos=anchor_idx)
+    if match is None:
+        # #924: ``claude -p /context`` prints markdown — ``**Tokens:** 79k / 1m``.
+        match = _CONTEXT_TOTAL_MD_RE.search(pane_text, pos=anchor_idx)
     if match is None:
         return None
     value, suffix = match.group(1), match.group(2)
