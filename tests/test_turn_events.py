@@ -554,3 +554,21 @@ def test_the_signing_secret_is_not_inherited_by_claude_panes():
 
     assert turn_events.ENV_SECRET in SENSITIVE_ENV_KEYS
     assert turn_events.ENV_URL in SENSITIVE_ENV_KEYS
+
+
+class TestClordInvocationKeepsItsOrigin:
+    """``!clord`` runs the turn on a seed message c-lord posts, so the webhook that
+    invoked it is only on the command's message (found on staging, #917)."""
+
+    async def test_a_webhook_invoker_is_classified_from_the_invoking_message(self):
+        invoking = SimpleNamespace(webhook_id=31337, author=SimpleNamespace(id=31337, name="Hook"))
+        got = turn_events.started_by_from_message(
+            invoking, requester=invoking.author, bot_is_author=False
+        )
+        assert got == StartedBy("webhook", "31337", "Hook")
+
+    async def test_run_claude_uses_the_started_by_it_is_given(self):
+        from c_lord.cogs.claude_chat import ClaudeChatCog
+
+        assert "started_by" in ClaudeChatCog._run_claude.__code__.co_varnames
+        assert "started_by" in ClaudeChatCog.spawn_session.__code__.co_varnames

@@ -1557,6 +1557,15 @@ class ClaudeChatCog(commands.Cog):
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
+        # #917: who asked, for the turn-end event. The turn runs on a seed message
+        # c-lord posts, so the invoking message (a webhook's, for ``!clord``) has to
+        # be classified here, where it is still in hand.
+        started_by = (
+            turn_events.started_by_from_message(message, requester=user, bot_is_author=False)
+            if message is not None
+            else turn_events.StartedBy("user", str(user.id))
+        )
+
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         if repo is not None:
             from ..database.channel_repo import validate_repo_url
@@ -1670,7 +1679,12 @@ class ClaudeChatCog(commands.Cog):
             # #520: the seed message above is ours, so hand the invoker down
             # explicitly — otherwise the turn would ping and credit the bot.
             await self._run_claude(
-                seed_message, channel, prompt=claude_prompt, session_id=session_id, requester=user
+                seed_message,
+                channel,
+                prompt=claude_prompt,
+                session_id=session_id,
+                requester=user,
+                started_by=started_by,
             )
             await respond("Session completed.", silent=True)
         else:
@@ -1679,7 +1693,9 @@ class ClaudeChatCog(commands.Cog):
                 await respond("This command must be used in a text channel.", ephemeral=True)
                 return
             try:
-                thread = await self.spawn_session(channel, prompt, repo=repo, requester=user)
+                thread = await self.spawn_session(
+                    channel, prompt, repo=repo, requester=user, started_by=started_by
+                )
             except ThreadCreateForbiddenError:
                 # #443: bot lacks View Channel / Create Public Threads here.
                 # Reply via the interaction (ephemeral) — the channel itself is
@@ -2586,6 +2602,7 @@ class ClaudeChatCog(commands.Cog):
         session_id: str | None = None,
         repo: str | None = None,
         requester: discord.Member | discord.User | None = None,
+        started_by: turn_events.StartedBy | None = None,
     ) -> discord.Thread:
         """Create a new thread and start a Claude Code session without a user message.
 
@@ -2675,7 +2692,12 @@ class ClaudeChatCog(commands.Cog):
         # The caller gets the thread reference without waiting for Claude to finish.
         task = asyncio.create_task(
             self._run_claude(
-                seed_message, thread, prompt, session_id=session_id, requester=requester
+                seed_message,
+                thread,
+                prompt,
+                session_id=session_id,
+                requester=requester,
+                started_by=started_by,
             )
         )
         # #477: the reply path has had this since #565; the spawn path did not,
@@ -4099,6 +4121,7 @@ class ClaudeChatCog(commands.Cog):
         image_paths: list[str] | None = None,
         try_continue: bool = False,
         requester: discord.Member | discord.User | None = None,
+        started_by: turn_events.StartedBy | None = None,
     ) -> None:
         """Execute Claude Code CLI and stream results to the thread.
 
@@ -4122,9 +4145,14 @@ class ClaudeChatCog(commands.Cog):
         # each died at startup under the default policy and nobody was told.
         failure_notify_id = _notify_target(requester, self.bot, kind="failure")
         # #917: who started this turn, for the turn-end event.
-        started_by = turn_events.started_by_from_message(
-            user_message, requester=requester, bot_is_author=_is_self(user_message.author, self.bot)
-        )
+        # ``!clord`` / ``/clord`` seed the thread with a message c-lord posts, so
+        # the caller that still holds the invoking message passes it down.
+        if started_by is None:
+            started_by = turn_events.started_by_from_message(
+                user_message,
+                requester=requester,
+                bot_is_author=_is_self(user_message.author, self.bot),
+            )
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id

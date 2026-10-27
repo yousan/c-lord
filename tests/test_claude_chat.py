@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -1446,7 +1446,7 @@ class TestStartSessionCommand:
 
         interaction.response.defer.assert_called_once()
         cog.spawn_session.assert_called_once_with(
-            channel, "build a feature", repo=None, requester=interaction.user
+            channel, "build a feature", repo=None, requester=interaction.user, started_by=ANY
         )
         interaction.followup.send.assert_called_once()
         sent_text = interaction.followup.send.call_args.args[0]
@@ -1584,7 +1584,7 @@ class TestStartSessionCommand:
 
         interaction.response.defer.assert_called_once()
         cog.spawn_session.assert_called_once_with(
-            channel, "hello", repo=None, requester=interaction.user
+            channel, "hello", repo=None, requester=interaction.user, started_by=ANY
         )
 
 
@@ -1622,7 +1622,7 @@ class TestClordTextCommand:
         await cog.clord_text.callback(cog, ctx, prompt="build a feature")
 
         cog.spawn_session.assert_called_once_with(
-            ctx.channel, "build a feature", repo=None, requester=ctx.author
+            ctx.channel, "build a feature", repo=None, requester=ctx.author, started_by=ANY
         )
         assert "<#12345>" in ctx.send.call_args.args[0]
 
