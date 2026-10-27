@@ -1693,6 +1693,16 @@ class TmuxClaudeRunner:
             session_id=synthetic_session_id,
         )
 
+        # #583: the baseline for "did MY turn end?" — the bus only counts an
+        # instruction Claude read after this moment, and an ending after that
+        # instruction.  Taken *before* anything is typed (#916): the CLI dates
+        # the prompt at the keypress, so a baseline taken after the post-send
+        # settle was later than every prompt Claude picked up at once, and the
+        # transcript's turn end almost never closed the turn.  #365 does not
+        # need a late baseline: the turn this prompt displaces has its prompt
+        # before this moment, so its ending never follows a prompt of ours.
+        turn_started_at = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
+
         # Start Claude or send a new prompt to an already-running instance.
         claude_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)
 
@@ -1858,14 +1868,6 @@ class TmuxClaudeRunner:
 
         # Wait a moment then snapshot.
         await asyncio.sleep(_POST_STARTUP_DELAY)
-
-        # #583: the baseline for "did MY turn end?" — the bus only counts an
-        # instruction Claude read after this moment (and the ending that
-        # follows it).  Taken *after* the prompt has been delivered and the TUI
-        # has settled: a turn displaced by this prompt finishes within
-        # milliseconds of the submit, and dating the baseline earlier would let
-        # its ending count as this turn's (#365).
-        turn_started_at = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
 
         # Poll capture-pane and extract response text.
         # Completion is detected by the response text stabilising (not changing
