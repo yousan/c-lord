@@ -476,6 +476,7 @@ class ThreadStatusDashboard:
         preempted: bool = False,
         login_required: bool = False,
         model_unavailable: str | None = None,
+        already_pinged: int | None = None,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
 
@@ -505,6 +506,11 @@ class ThreadStatusDashboard:
             over — but nobody is summoned: the ping would land seconds after
             they typed, tell them their reply is needed, and be answered by a
             new turn one second later. They are already here.
+        already_pinged:
+            #915: the user the turn's ❌ embed already mentioned. For a turn
+            whose cause is known (usage limit / login / model) that embed says
+            everything the turn-end line would, so the line is skipped when it
+            would ping the same person a second time.
         """
         async with self._lock:
             prev_state = self._threads[thread_id].state if thread_id in self._threads else None
@@ -537,6 +543,14 @@ class ThreadStatusDashboard:
                 # #583: a turn the user replaced summons nobody.
                 and not preempted
             )
+            known_cause = usage_limit is not None or login_required or model_unavailable is not None
+            if should_mention and known_cause and already_pinged == mention_id:
+                should_mention = False
+                logger.info(
+                    "%s turn-end line skipped — the error embed already pinged <@%s> (#915)",
+                    log_ctx(thread_id=thread_id),
+                    mention_id,
+                )
 
             await self._refresh_dashboard()
 

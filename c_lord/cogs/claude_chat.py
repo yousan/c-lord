@@ -4525,6 +4525,9 @@ class ClaudeChatCog(commands.Cog):
                         # #484: and when it refused the configured model, point
                         # at /model set — the only thing that can change it.
                         model_unavailable=run_config.outcome.model_unavailable,
+                        # #915: …and when the ❌ embed for one of those already
+                        # pinged this person, do not ping them a second time.
+                        already_pinged=run_config.outcome.pinged_user_id,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply
