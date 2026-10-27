@@ -2439,3 +2439,48 @@ async def test_progress_line_shows_the_latest_thinking_sentence(tmp_path: Path) 
     assert "作業中" in posts[0], posts[0]
     assert "照合では111件が全文一致でした。" in posts[0], posts[0]
     assert "古い文" not in posts[0]
+
+
+async def test_request_copy_does_not_arm_the_progress_line(tmp_path: Path) -> None:
+    """#906: an ``api-request-blob`` is a copy of the API request, not activity.
+
+    Its tool blocks are calls that already happened.  Read outside a turn — the
+    tail used to re-read them whenever the CLI touched an idle transcript — they
+    put "⏳ 待機中 · 長考の可能性" on a thread that had finished hours before.
+    """
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=906,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(
+            jsonl,
+            {
+                "type": "api-request-blob",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_old", "name": "Bash", "input": {}},
+                    ],
+                },
+            },
+        )
+        await asyncio.sleep(0.25)
+        clock.advance(6000.0)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert spy.posts == []
