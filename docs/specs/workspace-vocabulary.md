@@ -157,6 +157,8 @@ Discord は放置されたスレッドを自動アーカイブする。**自動�
 | 状況 | どうするか | なぜ |
 |---|---|---|
 | 未コミットの変更がある | **残す** | 失われた作業は戻らない |
+| **どの remote ブランチにも載っていないコミット**・stash がある（#903） | **残す** | `git status` には出ないが、push していない作業はここにしか無い |
+| **git が無視するファイル**がある（`.env`・`info/exclude` で隠した手順書など — #903） | **残す**（再生成できるものと c-lord のものは除く — 下の「#903」） | `git status` には出ないが、利用者が置いたものかもしれない |
 | 変更が **c-lord 自身が置いたファイルだけ** | **消す** | 下の「c-lord の持ち物は作業に数えない」 |
 | git ですらない | **残す** | クリーンか確かめる手段が無く、残骸と生成物を区別できない |
 | `<root>/<数字>/<数字>` の形でない | **見ない** | root の下の他人のディレクトリは管轄外 |
@@ -183,6 +185,43 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 
 それ以外 — `.claude/settings.local.json`、利用者自身の skill、`discord-read/` の隣に
 置かれた別ファイル、**`git add` 済みの変更**（誰かの判断なので）— はすべて作業に数え、残す。
+
+#### push していないコミットと、git が無視するファイル（#903）
+
+`git status` が空でも消してよいとは限らない。**次の2つは `git status` に出ない**ので、
+#903 まではどちらも「クリーン」と見なされて消えていた（2026-10-16 に本番コードで確認）:
+
+- **どの remote ブランチにも載っていないコミット** — Claude がブランチに commit したが
+  push していない作業。HEAD（detached を含む）・すべてのローカルブランチ・stash から辿れて、
+  `refs/remotes/*` のどれからも辿れないコミットを数える（`git rev-list --count HEAD --branches refs/stash --not --remotes`）。
+  1 件でもあれば残す。remote が1つも無いリポジトリでは全コミットがこれに当たる（他にどこにも無いので）。
+  squash マージ後に remote ブランチが prune された作業ブランチもここに入る — 残す側に倒した結果として受け入れる
+- **git が無視するファイル** — `.gitignore` / `.git/info/exclude` に当たるもの。`git status --ignored=matching`
+  で `!!` として拾い、次のものだけを**作業に数えない**。それ以外（`.env`、`AUDIT.md`、無視された
+  `notes/` の中身など）は作業として残す:
+
+| 作業に数えない無視ファイル | 例 | なぜ |
+|---|---|---|
+| c-lord が自分で書いたもの | `discord-read/SKILL.md`（#779 以降は exclude 済みで `!!` になる）・過去ログ（#882）・`.clord/attachments/`（#528。元は Discord にある） | c-lord の持ち物 |
+| パスのどこかに次のディレクトリ名を含む | `node_modules` `bower_components` `.venv` `venv` `vendor` `.eggs` `__pycache__` `.pytest_cache` `.ruff_cache` `.mypy_cache` `.tox` `.nox` `.cache` `.gradle` `.dart_tool` `.parcel-cache` `.turbo` `.terraform` `build` `dist` `target` `.build` `.next` `.nuxt` `.svelte-kit` `.angular` `.expo` `.godot` `build_web` `coverage` `htmlcov` | パッケージマネージャ・キャッシュ・ビルド出力。ツールが作り直せる |
+| ファイル名 | `.DS_Store` `.coverage` `.phpunit.result.cache` `_version.py` `_build_info.py`、拡張子 `.pyc` `.pyo` `.egg-info` | 同上（`_version.py` / `_build_info.py` はインストール時にビルドバックエンドが書く） |
+| フレームワークの実行時ディレクトリ（どの深さでも） | `storage/framework/` `storage/logs/` `bootstrap/cache/`（Laravel） | 同上 |
+
+**線引きの理由**: 再生成できるものまで「作業」に数えると、スイープがほぼ効かなくなる（#749 の 118 GB の再来）。
+本番実測（2026-10-28、git 管理下 192 件）では無視ファイルを持つものが 185 件あり、その大半が上の表のもの
+だった。表に無いものは**残す**側。無視されたディレクトリが `dir/` の1行で返ってきたときは中を開いて
+ファイルごとに同じ規則で判定する（2000 ファイルを超えたら作業とみなす）— リポジトリが `.claude/` を丸ごと
+無視していても、c-lord の SKILL.md だけなら消え、利用者自身の skill があれば残る。
+
+残した理由は INFO に出る:
+
+```
+session cleanup: keeping /…/1559120173389062204 — 1 unpushed commit(s) on no remote branch (thread=…)
+session cleanup: keeping /…/1559120173389062204 — uncommitted user work: !! AUDIT.md (thread=…)
+```
+
+この判定は `worktree_status()`（`c_lord/session_dir.py`）にあり、**30日スイープ・孤児スイープ（#613）・
+`/workspace-cleanup`（dry を含む）のすべてが同じものを使う**。
 
 #### そもそも git に見せない（#779）
 

@@ -186,18 +186,26 @@ _MAX_LOGGED_CHANGES = 5
 
 
 def describe_changes(status: WorktreeStatus) -> str:
-    """Why a directory is being kept, for the INFO line (#749).
+    """Why a directory is being kept, for the INFO line (#749, #903).
 
     Names the entries, because "uncommitted work" alone read as 80 dirs of user
-    work when 60 of them held nothing but c-lord's own SKILL.md.
+    work when 60 of them held nothing but c-lord's own SKILL.md. Ignored files
+    show as ``!! name``; commits on no remote branch as a count.
     """
     if not status.is_repo:
         return "not a git repo (cannot tell work from leftovers)"
-    shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
-    more = len(status.user_changes) - _MAX_LOGGED_CHANGES
-    if more > 0:
-        shown += f" (+{more} more)"
-    return f"uncommitted user work: {shown}"
+    reasons: list[str] = []
+    if status.unpushed_commits is None:
+        reasons.append("unpushed commits unknown (git rev-list failed)")
+    elif status.unpushed_commits:
+        reasons.append(f"{status.unpushed_commits} unpushed commit(s) on no remote branch")
+    if status.user_changes:
+        shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
+        more = len(status.user_changes) - _MAX_LOGGED_CHANGES
+        if more > 0:
+            shown += f" (+{more} more)"
+        reasons.append(f"uncommitted user work: {shown}")
+    return "; ".join(reasons)
 
 
 #: A session dir is always ``<base>/<channel_id>/<thread_id>`` — at least three
