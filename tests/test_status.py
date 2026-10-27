@@ -445,6 +445,43 @@ class TestActivityFromTheTranscript:
         assert sm._last_activity == 0.0
 
 
+class TestARunningToolIsNotAStall:
+    """#905: one long command writes nothing until it returns — that is work.
+
+    The progress line already says 作業中 while a call is open (#757); the lamp
+    used to go ⚠️ after 30s of jsonl silence regardless, so the two contradicted
+    each other on every long build or CI wait.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_stall_lamp_while_a_call_is_open(self) -> None:
+        from c_lord.turn_activity import turn_activity
+
+        msg = _make_message()
+        sm = StatusManager(msg, thread_id=9050)
+        await sm.set_running()
+        turn_activity.note(9050, started=["toolu_sleep90"])
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_RUNNING
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_silence_after_the_result_still_warns(self) -> None:
+        """AC2: the call returned, then nothing for 30s → ⚠️ as before."""
+        from c_lord.turn_activity import turn_activity
+
+        msg = _make_message()
+        sm = StatusManager(msg, thread_id=9051)
+        await sm.set_running()
+        turn_activity.note(9051, started=["toolu_a"])
+        turn_activity.note(9051, finished=["toolu_a"])
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        assert sm._current_emoji == EMOJI_STALL_HARD
+        await sm.cleanup()
+
+
 class _FlakyMessage:
     """Reactions as Discord holds them, with chosen calls failing (#871)."""
 

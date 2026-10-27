@@ -58,3 +58,47 @@ def test_a_failing_listener_does_not_propagate() -> None:
         turn_activity.note(16)  # the mirror must never die for the lamp's sake
     finally:
         unsubscribe()
+
+
+class TestOpenToolCalls:
+    """#905: a call whose result has not arrived is the session working."""
+
+    def test_a_started_call_is_running_until_it_finishes(self) -> None:
+        unsubscribe = turn_activity.subscribe(20, lambda: None)
+        try:
+            turn_activity.note(20, started=["toolu_a"])
+            assert turn_activity.running(20)
+            turn_activity.note(20, finished=["toolu_a"])
+            assert not turn_activity.running(20)
+        finally:
+            unsubscribe()
+
+    def test_parallel_calls_run_until_the_last_one_finishes(self) -> None:
+        unsubscribe = turn_activity.subscribe(21, lambda: None)
+        try:
+            turn_activity.note(21, started=["a", "b"])
+            turn_activity.note(21, finished=["a"])
+            assert turn_activity.running(21)
+            turn_activity.note(21, finished=["b"])
+            assert not turn_activity.running(21)
+        finally:
+            unsubscribe()
+
+    def test_a_new_turn_forgets_a_call_the_last_one_left_open(self) -> None:
+        """The session died mid-call: its result is never written."""
+        old = turn_activity.subscribe(22, lambda: None)
+        turn_activity.note(22, started=["orphan"])
+        old()
+        new = turn_activity.subscribe(22, lambda: None)
+        try:
+            assert not turn_activity.running(22)
+        finally:
+            new()
+
+    def test_threads_do_not_share_calls(self) -> None:
+        unsubscribe = turn_activity.subscribe(23, lambda: None)
+        try:
+            turn_activity.note(23, started=["x"])
+            assert not turn_activity.running(24)
+        finally:
+            unsubscribe()

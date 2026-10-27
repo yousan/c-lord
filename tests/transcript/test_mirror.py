@@ -2256,6 +2256,47 @@ async def test_mirror_reports_transcript_activity_to_the_turn_lamp(tmp_path: Pat
     assert len(seen) >= 3
 
 
+async def test_mirror_tells_the_lamp_a_call_is_still_running(tmp_path: Path) -> None:
+    """#905: between a ``tool_use`` and its ``tool_result`` the lamp sees work."""
+    from c_lord.turn_activity import turn_activity
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    async def sink(text: str) -> None:
+        pass
+
+    use = _assistant_tool_use("Bash", "sleep 90")
+    use["message"]["content"][0]["id"] = "toolu_sleep"
+    result = _user_tool_result("done")
+    result["message"]["content"][0]["tool_use_id"] = "toolu_sleep"
+
+    unsubscribe = turn_activity.subscribe(9052, lambda: None)
+    mirror = TranscriptMirror(
+        thread_id=9052, project_dir=project, sink=sink, verbosity="minimal", poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, use)
+        await asyncio.sleep(0.25)
+        during = turn_activity.running(9052)
+        _write_event(jsonl, result)
+        await asyncio.sleep(0.25)
+        after = turn_activity.running(9052)
+    finally:
+        await mirror.stop()
+        unsubscribe()
+
+    assert during is True
+    assert after is False
+
+
 # -- #883: the thinking sentence (the pane's ●) -------------------------------
 
 
