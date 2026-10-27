@@ -1084,31 +1084,15 @@ class TranscriptMirror:
                     turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                     _limit_reported = False
                     usage_limit_notices.clear_thread(self.thread_id)
-                    started_by = _prompt_kind(event)
-                    # #912: Claude has read a new instruction, so a text still
-                    # held is the end of the turn before — deliver it now, as
-                    # that turn's answer, before this turn can claim it. (A
-                    # c-lord prompt is never rendered, so the user_input branch
-                    # below would not get the chance.) Only a person's prompt:
-                    # a notification landing mid-turn does not end the turn
-                    # (#913), and flushing there would post a mid-turn text as
-                    # the answer.
-                    if (
-                        started_by == "person"
-                        and self._verbosity == "minimal"
-                        and _pending_text is not None
-                    ):
-                        await _flush_pending_as_reply()
-                        await _commit_cursor()
                     # #913: a notification only *starts* a turn between turns;
                     # one that lands in a person's turn leaves it theirs.
+                    started_by = _prompt_kind(event)
                     if started_by == "person":
                         self._turn_by_notification = False
                     elif started_by == "notification" and not self._turn_open:
                         self._turn_by_notification = True
                     if started_by is not None:
                         self._turn_open = True
-                    self._turn_trigger = self._latest_trigger
 
                 if _is_turn_end(event):
                     # #773: nobody is waiting on this mirror until the next turn.
@@ -1187,6 +1171,37 @@ class TranscriptMirror:
                         cut[1],
                         cut[0],
                     )
+
+                # #912: Claude has read a new instruction — a prompt, not a
+                # bash-mode line (those are user strings too, rendered as tool
+                # activity). A text still held is the end of the turn before:
+                # deliver it now, as that turn's answer, before this turn can
+                # claim it. (A c-lord prompt is never rendered, so the
+                # user_input branch below would not get the chance.)
+                # Only a person's prompt: a notification landing mid-turn does
+                # not end the turn (#913), and flushing there would post a
+                # mid-turn text as the answer.
+                if (
+                    _is_user_prompt(event)
+                    and _prompt_kind(event) == "person"
+                    and (rendered is None or rendered.kind == "user_input")
+                ):
+                    if self._verbosity == "minimal" and _pending_text is not None:
+                        await _flush_pending_as_reply()
+                        await _commit_cursor()
+                    # Tool lines the turn before left with no text to ride on
+                    # (it was interrupted mid-tool) are that turn's log, not
+                    # this one's: carried over, they went out as the new
+                    # answer's progress.txt (staging 2026-10-28).
+                    if progress_buf:
+                        logger.info(
+                            "%s TranscriptMirror: dropping %d progress line(s) of the turn "
+                            "before — no answer of theirs to attach to (#912)",
+                            log_ctx(thread_id=self.thread_id),
+                            len(progress_buf),
+                        )
+                        progress_buf.clear()
+                    self._turn_trigger = self._latest_trigger
 
                 # #539: record this event's activity BEFORE ticking, so the line
                 # reflects what we just read rather than the state before it —

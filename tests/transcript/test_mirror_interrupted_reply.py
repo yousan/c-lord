@@ -192,3 +192,30 @@ async def test_a_mirror_that_never_saw_the_request_keeps_quoting_the_current_one
         await mirror.stop()
 
     assert [(t, _quoted(kw)) for t, kw in sinks.all()] == [("途中の文", "current")]
+
+
+async def test_an_interrupted_turns_tool_log_is_not_attached_to_the_new_answer(
+    tmp_path: Path,
+) -> None:
+    """AC3 — staging 2026-10-28: the interrupted turn ran a Write and wrote no
+    text after it; the new instruction's 「了解」 went out with that turn's
+    progress.txt. A tool log never crosses into the next instruction's turn."""
+    sinks = _Sinks()
+    mirror, jsonl = await _mirror(tmp_path, sinks)
+    try:
+        mirror.note_turn_started(trigger_id=OLD)
+        _write(jsonl, _prompt("旅行記を書いて"))
+        _write(jsonl, _text("ジュンビオーケー"))
+        _write(jsonl, _tool())
+        _write(jsonl, _tool_result())
+        await asyncio.sleep(0.2)
+        mirror.note_turn_started(trigger_id=NEW)
+        _write(jsonl, _prompt("やっぱりやめて「了解」とだけ返して"))
+        _write(jsonl, _text("了解"))
+        _write(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert sinks.files == [], f"the new answer carried the old turn's progress.txt: {sinks.files}"
+    assert [(t, _quoted(kw)) for t, kw in sinks.replies] == [("了解", "current")]
