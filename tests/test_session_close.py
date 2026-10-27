@@ -299,3 +299,72 @@ class TestClosedThreadBlocksMessages:
 
         cog.repo.set_closed.assert_awaited_once_with(555, False)
         assert cog._run_claude.called
+
+
+class TestStopEndsTheRunningTurn:
+    """#909: stopping the workspace mid-turn ends that turn as a user stop.
+
+    The teardown killed the window but left ``run_claude`` polling it; five
+    minutes later the turn ended as "Claude exited without producing a
+    response (possible startup failure or crash)", with ❌ and a failure ping
+    for a stop the user asked for.
+    """
+
+    def _cog(self, chat: object):
+        from c_lord.cogs.session_manage import SessionManageCog
+
+        bot = MagicMock()
+        bot.channel_id = 999
+        bot.get_cog = MagicMock(side_effect=lambda name: chat if name == "ClaudeChatCog" else None)
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=_record())
+        repo.set_closed = AsyncMock()
+        cog = SessionManageCog(bot=bot, repo=repo)
+        order: list[str] = []
+        tmux_mgr = MagicMock()
+        tmux_mgr.kill_session = MagicMock(side_effect=lambda *_a: order.append("kill"))
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        return cog, order
+
+    def _ctx(self, thread: MagicMock) -> MagicMock:
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.channel = thread
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_the_running_turn_is_ended_before_the_window_goes(self) -> None:
+        chat = MagicMock()
+        cog, order = self._cog(chat)
+        chat.end_turn_for_workspace_stop = MagicMock(side_effect=lambda _t: order.append("end"))
+        await cog.close_workspace_text.callback(cog, self._ctx(_thread()))
+        chat.end_turn_for_workspace_stop.assert_called_once_with(555)
+        assert order == ["end", "kill"]
+
+    @pytest.mark.asyncio
+    async def test_no_chat_cog_still_stops(self) -> None:
+        cog, order = self._cog(None)
+        await cog.close_workspace_text.callback(cog, self._ctx(_thread()))
+        assert order == ["kill"]
+
+
+class TestChatCogEndsTheRun:
+    """#909: the chat cog half — the turn's runner is told it was stopped."""
+
+    def _chat(self):
+        from c_lord.cogs.claude_chat import ClaudeChatCog
+
+        bot = MagicMock()
+        bot.channel_id = 999
+        return ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+
+    def test_a_running_turn_is_withdrawn_as_a_user_stop(self) -> None:
+        chat = self._chat()
+        runner = MagicMock()
+        chat._active_runners[555] = runner
+        assert chat.end_turn_for_workspace_stop(555) is True
+        runner.withdraw.assert_called_once_with(silent=False)
+
+    def test_nothing_running_is_a_no_op(self) -> None:
+        assert self._chat().end_turn_for_workspace_stop(555) is False

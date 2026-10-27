@@ -1889,6 +1889,21 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
+        # #909: end the turn that is running here first. Killing the window
+        # under it left the run polling a pane that no longer exists until the
+        # 5-minute backstop, which then reported a crash (❌ + failure ping) for
+        # a stop the user asked for. Loose-coupled through bot.get_cog (#512).
+        end_turn = getattr(self.bot.get_cog("ClaudeChatCog"), "end_turn_for_workspace_stop", None)
+        if end_turn is not None:
+            try:
+                end_turn(thread_id)
+            except Exception:
+                logger.warning(
+                    "%s workspace stop: could not end the running turn (#909)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+
         # Stop the mirror BEFORE kill/archive so the kill's task-notification can't
         # be echoed (👤) into the thread after we archive it and un-archive it (#379).
         await self._stop_transcript_mirror(thread_id)

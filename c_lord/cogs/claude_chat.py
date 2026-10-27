@@ -3775,6 +3775,30 @@ class ClaudeChatCog(commands.Cog):
         logger.info("%s workspace woken for capture (#642)", log_ctx(thread_id=thread.id))
         return True
 
+    def end_turn_for_workspace_stop(self, thread_id: int) -> bool:
+        """End the turn running in ``thread_id`` because its workspace is stopping (#909).
+
+        ``/workspace-stop`` kills the tmux window, but the turn's run kept
+        polling it: five minutes later it ended as "Claude exited without
+        producing a response (possible startup failure or crash)", with ❌ and
+        a failure ping — for a stop the user asked for. Withdrawing the runner
+        ends the run on its next poll with the ⏹ Stop outcome (``Stopped by
+        user`` → 🟡, no error embed, no failure ping — ``docs/specs/stop-button.md``).
+        No C-c: the window is about to be killed anyway.
+
+        Public so ``SessionManageCog`` can reach it through ``bot.get_cog``,
+        like :meth:`mark_reopened`. Returns whether a turn was running.
+        """
+        runner = self._active_runners.get(thread_id)
+        if runner is None:
+            return False
+        runner.withdraw(silent=False)
+        logger.info(
+            "%s workspace stop: ending the running turn as a user stop (#909)",
+            log_ctx(thread_id=thread_id),
+        )
+        return True
+
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).
 
