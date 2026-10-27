@@ -4493,27 +4493,6 @@ class ClaudeChatCog(commands.Cog):
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
 
-                # #910: the name is built when a message arrives, while Claude is
-                # still on the previous job's branch. Rebuild it now that the turn
-                # is over, so a branch switched to during the turn shows as
-                # ``→#<new>``. Renames only if the name changed (#241). A turn the
-                # user's next message replaced leaves it to that turn.
-                if tmux_manager is not None and not runner.preempted:
-                    try:
-                        await self._apply_thread_naming(
-                            thread=thread,
-                            tmux_manager=tmux_manager,
-                            first_message=prompt,
-                            working_dir=working_dir,
-                            retitle=False,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "%s turn-end thread naming failed",
-                            log_ctx(thread_id=thread.id),
-                            exc_info=True,
-                        )
-
                 # #246: no per-turn thread rename here. The turn-end 🟡 lamp is
                 # the StatusManager reaction (set via set_done() on the RESULT
                 # event); the thread-name lamp flips to 🟡 on the next state-sync
@@ -4555,3 +4534,25 @@ class ClaudeChatCog(commands.Cog):
                         # second later.
                         preempted=runner.preempted,
                     )
+
+                # #910: the name is built when a message arrives, while Claude is
+                # still on the previous job's branch. Rebuild it now that the turn
+                # is over, so a branch switched to during the turn shows as
+                # ``→#<new>``. Renames only if the name changed (#241). A turn the
+                # user's next message replaced leaves it to that turn. After the
+                # turn-end ping, so a rate-limited rename (5s timeout) cannot delay it.
+                if tmux_manager is not None and not runner.preempted:
+                    try:
+                        await self._apply_thread_naming(
+                            thread=thread,
+                            tmux_manager=tmux_manager,
+                            first_message=prompt,
+                            working_dir=working_dir,
+                            retitle=False,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "%s turn-end thread naming failed",
+                            log_ctx(thread_id=thread.id),
+                            exc_info=True,
+                        )
