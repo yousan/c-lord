@@ -51,7 +51,7 @@ share one. See [specs/tmux-layout.md](specs/tmux-layout.md).
 | `workspace` | スレッドに紐づく作業一式 | `/workspace-start` `/workspace-stop` `/workspace-delete` `/workspace-cleanup` |
 | `tmux` | tmux セッション / ウィンドウ | `/tmux-list` `/tmux-screenshot` |
 | `thread` | Discord スレッド | `/thread-archive` `/thread-rename` |
-| `model` | Claude のモデル設定 | `/model show` `/model set` |
+| `model` | Claude のモデル設定 | `/model` |
 
 **`session` は目的語に使わない。** #571 で「セッション」は Claude の `session_id` と
 tmux セッション**だけ**を指す語に予約した。利用者が名指しで操作する目的語にこの語を
@@ -182,8 +182,7 @@ The `repo` value is stored in clonable form. A PR / issue / file link is shrunk 
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/model show` | Show the current Claude model | Anywhere |
-| `/model set <model>` | Change the global model for new sessions. Pick a tier alias (`sonnet`/`opus`/`haiku`, each resolves to the latest of that tier) or type any model ID (e.g. `claude-fable-5`) — the CLI validates it. If the CLI cannot use it, every turn in a new session ends with a ❌ "設定されたモデルを Claude Code が使えません" embed naming the model, until you `/model set` a usable one (#484) | Anywhere |
+| `/model [model] [effort] [scope] [include-existing]` | Show or change the Claude **model and effort**, each independently, at one of three scopes (`session` / `channel` / `global`). With no arguments it only displays (see [specs/model-scopes.md](specs/model-scopes.md)). Model: a tier alias (`sonnet`/`opus`/`haiku`) or any model ID (e.g. `claude-fable-5`, the CLI validates it); effort: `low`/`medium`/`high`/`xhigh`/`max`; `inherit` clears that layer's setting. Default scope: this session inside a thread, this channel's new sessions outside one. `include-existing:true` (channel/global only) also applies it to open sessions from their next turn, except where the session (or, for `global`, the channel) set that field itself. If the CLI cannot use the model, every turn ends with a ❌ "設定されたモデルを Claude Code が使えません" embed naming it, until you `/model` a usable one (#484). Changing anything needs the allowlist; displaying does not | Anywhere |
 
 Available models: `haiku` (fast), `sonnet` (balanced, default), `opus` (powerful).
 
@@ -409,7 +408,8 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!stop` | Stop the active session (preserved for resume) | `!stop` | `/stop` |
 | `!clear` | Reset the session — next message starts fresh | `!clear` | `/clear` |
 | `!compact [instructions]` | Compact (summarize) the session context | `!compact keep open tasks` | `/compact` |
-| `!model-show` | Show the current Claude model | `!model-show` | `/model show` |
+| `!model [MODEL] [effort:E] [scope:S] [include-existing:true]` | Text twin of `/model` | `!model sonnet effort:medium scope:global` | `/model` |
+| `!model-show` | Show the current Claude model (same table as `/model`) | `!model-show` | `/model` |
 | `!clord-status [all]` | List this channel's sessions (`all` = include closed) | `!clord-status all` | `/clord-status` |
 | `!tmux-list` | List active tmux windows | `!tmux-list` | `/tmux-list` |
 | `!tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane (restores a stopped workspace first) | `!tmux-screenshot` | `/tmux-screenshot` |
@@ -417,7 +417,7 @@ Only available when the bot operator has enabled the upgrade slash command.
 | `!claude-restart` | Restart the Claude process (keeps the conversation) | `!claude-restart` | `/claude-restart` |
 | `!clord-init [repo\|remove]` | Bind / unbind / show channel→repo | `!clord-init https://…` | `/clord-init` |
 | `!clord-thread-init [repo\|remove]` | Bind / unbind / show thread→repo | `!clord-thread-init remove` | `/clord-thread-init` |
-| `!model-set <model>` | Change the global Claude model | `!model-set opus` | `/model set` |
+| `!model-set <model>` | Change the global Claude model (kept spelling) | `!model-set opus` | `/model scope:global` |
 | `!workspace-cleanup [dry]` | Reclaim unused workspaces' working dirs (`dry` = preview) | `!workspace-cleanup dry` | `/workspace-cleanup` |
 | `!workspace-stop` | 停止: close the tmux window, keep the session | `!workspace-stop` | `/workspace-stop` |
 | `!workspace-start` | Reopen a 停止 thread | `!workspace-start` | `/workspace-start` |
@@ -494,9 +494,9 @@ nothing happens. That includes `/clear` / `!clear` (#405): it throws the convers
 away (#803: by typing `/clear` into Claude Code), so a stranger in the thread must not be
 able to run it on someone else's conversation.
 
-The same goes for **every** command except `/version`, `/model show` and
-`/thread-archive show` (and their `!` twins), which only display harmless
-settings (#781). Before #781, `/workspace-delete`, `/model set`, `/stop`,
+The same goes for **every** command except `/version`, `/model` (without arguments it only
+displays; every argument is gated, #918) and `/thread-archive show` (and their
+`!` twins), which only display harmless settings (#781). Before #781, `/workspace-delete`, `/model set`, `/stop`,
 `/compact`, `/upgrade` and ~30 others ran for anyone who could type in the
 thread. `tests/test_command_authorization_coverage.py` fails CI if a new command
 skips the gate.

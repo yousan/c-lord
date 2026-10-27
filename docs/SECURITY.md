@@ -187,7 +187,7 @@ class ClaudeChatCog(commands.Cog):
 - The same check applies to `SkillCommandCog`, `ChannelRepoCog` and
   `SessionManageCog` — they hold the same `Authorizer` instance rather than a
   copy of the rule. Every slash / text command goes through it except the
-  read-only `/version`, `/model show`, `/thread-archive show`; an AST test
+  read-only `/version`, `/model` (arguments are gated inside, #918), `/thread-archive show`; an AST test
   (`tests/test_command_authorization_coverage.py`) fails CI for a new command
   that skips it (#781)
 

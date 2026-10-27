@@ -136,6 +136,26 @@ def resolve_data_dir(env_path: Path | None) -> Path:
     return base / "data"
 
 
+def _env_source(key: str, env_path: str | None, fallback: str) -> str:
+    """Where *key* was read from at start-up: ``.env``, ``環境変数``, or *fallback* (#918).
+
+    Only a label — the value is never looked at here.  ``.env`` wins over the
+    process environment (``override=True`` above), so a key present in the file
+    is reported as the file's even when the shell also set it.
+    """
+    if env_path:
+        try:
+            from dotenv import dotenv_values
+
+            if dotenv_values(env_path).get(key):
+                return ".env"
+        except Exception:  # an unreadable .env must not stop start-up
+            pass
+    if os.environ.get(key):
+        return "環境変数"
+    return fallback
+
+
 def load_config(env_path: Path | None = None) -> dict[str, str]:
     """Load and validate configuration from environment.
 
@@ -207,6 +227,9 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "claude_command": os.getenv("CLAUDE_COMMAND", "claude"),
         "claude_model": os.getenv("CLAUDE_MODEL", "sonnet"),
         "claude_effort": os.getenv("CLAUDE_EFFORT", ""),
+        # #918: where those two came from, for the /model display.
+        "claude_model_source": _env_source("CLAUDE_MODEL", resolved_env_path, "組み込み既定"),
+        "claude_effort_source": _env_source("CLAUDE_EFFORT", resolved_env_path, "未設定"),
         "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
         "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT_SESSIONS", "3"),
@@ -378,6 +401,8 @@ async def main(env_path: Path | None = None) -> None:
         command=config["claude_command"],
         model=config["claude_model"],
         effort=config["claude_effort"] or None,
+        model_source=config.get("claude_model_source"),
+        effort_source=config.get("claude_effort_source"),
         permission_mode=config["claude_permission_mode"],
         working_dir=config["claude_working_dir"] or None,
         timeout_seconds=int(config["timeout"]),

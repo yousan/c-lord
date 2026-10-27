@@ -68,8 +68,7 @@ tmux セッションはチャンネルではなく**リポジトリ**に従い�
 
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
-| `/model show` | 現在の Claude モデルを表示 | どこでも |
-| `/model set <model>` | 新規セッション用のグローバルモデルを変更。tier エイリアス（`sonnet`/`opus`/`haiku`、各 tier の最新に解決）を選ぶか、任意のモデルID（例 `claude-fable-5`）を直接入力できる（可否は CLI が判定） | どこでも |
+| `/model [model] [effort] [scope] [include-existing]` | Claude の **model と effort** を、それぞれ独立に、`session` / `channel` / `global` のどれかの範囲で表示・変更。引数なしは表示だけ（[specs/model-scopes.md](../specs/model-scopes.md)）。model は tier エイリアス（`sonnet`/`opus`/`haiku`）か任意のモデルID（可否は CLI が判定）、effort は `low`/`medium`/`high`/`xhigh`/`max`、`inherit` でその範囲の指定を解除。範囲の既定はスレッド内ならそのセッション、チャンネル直下ならそのチャンネルの新規用。`include-existing:true`（channel/global のみ）は、終了していない既存セッションへも次のターンから反映する（セッション自身が、`global` ではチャンネルが指定した項目は維持）。変更は許可リスト、表示は誰でも | どこでも |
 
 選択可能なモデル: `haiku`（高速）、`sonnet`（バランス型、デフォルト）、`opus`（高性能）。
 

@@ -56,7 +56,7 @@ class RunOutcome:
     # /login on the host.
     login_required: bool = False
     # #484: the model Claude Code refused to use for this turn, when it did.
-    # Only ``/model set`` can fix it, so the turn-end line must say that.
+    # Only ``/model`` can fix it, so the turn-end line must say that.
     model_unavailable: str | None = None
 
 

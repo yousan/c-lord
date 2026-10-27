@@ -137,10 +137,10 @@ USAGE_LIMIT_ERROR_PREFIX = "Usage limit —"
 LOGIN_REQUIRED_ERROR_PREFIX = "Login required —"
 
 # Prefix of the RESULT error for "Claude Code will not use the configured
-# model" (#484).  ``/model set`` accepts any well-formed ID and leaves the
+# model" (#484).  ``/model`` accepts any well-formed ID and leaves the
 # verdict to the CLI (#478), and the CLI does not fail to start on one it cannot
 # use — it starts and refuses every turn with one line.  Like LOGIN_REQUIRED the
-# cure is outside the turn (``/model set``), so resending cannot help.
+# cure is outside the turn (``/model``), so resending cannot help.
 MODEL_UNAVAILABLE_ERROR_PREFIX = "Model unavailable —"
 
 # Prefix of the RESULT error for "the tmux server this pane lived in was
@@ -2491,7 +2491,7 @@ class TmuxClaudeRunner:
             error = (
                 f"{MODEL_UNAVAILABLE_ERROR_PREFIX} Claude Code cannot use the model "
                 f'"{model_unavailable}" and did not run this turn. Change it with '
-                "/model set; until then every new session gets the same reply."
+                "/model; until then every new session gets the same reply."
             )
         elif timed_out or not last_response:
             # Reached completion without a usable response — either the hard
