@@ -588,7 +588,7 @@ class SessionDirManager:
                 path=path,
                 thread_id=thread_id,
                 removed=False,
-                reason="session directory has unpushed or uncommitted work — kept",
+                reason="session directory has uncommitted changes — skipped to prevent data loss",
             )
 
         try:
