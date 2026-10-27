@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime, timedelta
@@ -130,6 +131,10 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
+
+# ``!clord repo:<URL> <prompt>`` (#514). The URL ends at the first whitespace of
+# any kind — a newline included (#923).
+_REPO_PREFIX_RE = re.compile(r"repo:(?P<repo>\S+)\s+(?P<rest>.*)", re.DOTALL)
 
 # Longest sentence still treated as an answer to an open menu (#536 AC7).
 # Matches AskModal's free-text limit: the two are the same affordance reached
@@ -1789,14 +1794,16 @@ class ClaudeChatCog(commands.Cog):
         Mirrors the slash option's spelling so the two twins read the same. Only
         the *first* token counts, and only when something follows it — a prompt
         that merely starts with the word "repository" is left alone.
+
+        The token ends at the first whitespace of any kind (#923): a dispatcher
+        that writes ``repo:<URL>`` and then the request on the next line used to
+        get the request's first line glued onto the URL — the clone failed and
+        nothing ran — or, with no space anywhere, the prefix silently ignored.
         """
-        if not prompt.startswith("repo:"):
+        match = _REPO_PREFIX_RE.match(prompt)
+        if match is None or not match.group("rest").strip():
             return None, prompt
-        head, sep, rest = prompt.partition(" ")
-        repo = head[len("repo:") :]
-        if not sep or not repo or not rest.strip():
-            return None, prompt
-        return repo, rest.strip()
+        return match.group("repo"), match.group("rest").strip()
 
     @commands.command(name="clord")
     async def clord_text(self, ctx: commands.Context, *, prompt: str | None = None) -> None:

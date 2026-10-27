@@ -133,6 +133,8 @@ Before this, `/clord` checked only whether *a repository* was reachable from the
 
 The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476). The thread's tmux session follows the chosen repository too (#427).
 
+In the text twin `!clord repo:<URL> <prompt>`, the URL ends at the first whitespace — a space, a tab **or a newline** (#923). Writing the request on the line after `repo:<URL>` therefore works the same as writing it after a space. A repository value that still contains a line break or tab (e.g. from a hand-built `/clord repo:`) is refused before anything is cloned, with a one-line reason.
+
 `repo:` only applies when a thread is being **created**. Inside an existing thread it is refused with a pointer to `/clord-thread-init`, because that thread's working copy is already cloned and would not change.
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.

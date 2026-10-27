@@ -104,6 +104,10 @@ def validate_repo_url(url: str) -> str:
     url = url.strip()
     if not url:
         raise ValueError("リポジトリ URL が空です")
+    if any(ch in url for ch in "\r\n\t\v\f"):
+        # #923: a URL never spans lines. One that does is a request glued onto
+        # the URL, and cloning it can only fail after the thread is opened.
+        raise ValueError(f"リポジトリ URL に改行（またはタブ）が含まれています: {url!r}")
     if url.startswith("-"):
         raise ValueError(f"リポジトリ URL が `-` で始まっています: {url!r}")
     if _EXEC_TRANSPORT_RE.match(url):
