@@ -27,6 +27,7 @@ from discord.ext import commands
 
 from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
+from .. import turn_events
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
@@ -1565,6 +1566,15 @@ class ClaudeChatCog(commands.Cog):
             await respond("You are not authorized to use this command.", ephemeral=True)
             return
 
+        # #917: who asked, for the turn-end event. The turn runs on a seed message
+        # c-lord posts, so the invoking message (a webhook's, for ``!clord``) has to
+        # be classified here, where it is still in hand.
+        started_by = (
+            turn_events.started_by_from_message(message, requester=user, bot_is_author=False)
+            if message is not None
+            else turn_events.StartedBy("user", str(user.id))
+        )
+
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         if repo is not None:
             from ..database.channel_repo import validate_repo_url
@@ -1678,7 +1688,12 @@ class ClaudeChatCog(commands.Cog):
             # #520: the seed message above is ours, so hand the invoker down
             # explicitly — otherwise the turn would ping and credit the bot.
             await self._run_claude(
-                seed_message, channel, prompt=claude_prompt, session_id=session_id, requester=user
+                seed_message,
+                channel,
+                prompt=claude_prompt,
+                session_id=session_id,
+                requester=user,
+                started_by=started_by,
             )
             await respond("Session completed.", silent=True)
         else:
@@ -1687,7 +1702,9 @@ class ClaudeChatCog(commands.Cog):
                 await respond("This command must be used in a text channel.", ephemeral=True)
                 return
             try:
-                thread = await self.spawn_session(channel, prompt, repo=repo, requester=user)
+                thread = await self.spawn_session(
+                    channel, prompt, repo=repo, requester=user, started_by=started_by
+                )
             except ThreadCreateForbiddenError:
                 # #443: bot lacks View Channel / Create Public Threads here.
                 # Reply via the interaction (ephemeral) — the channel itself is
@@ -2594,6 +2611,7 @@ class ClaudeChatCog(commands.Cog):
         session_id: str | None = None,
         repo: str | None = None,
         requester: discord.Member | discord.User | None = None,
+        started_by: turn_events.StartedBy | None = None,
     ) -> discord.Thread:
         """Create a new thread and start a Claude Code session without a user message.
 
@@ -2683,7 +2701,12 @@ class ClaudeChatCog(commands.Cog):
         # The caller gets the thread reference without waiting for Claude to finish.
         task = asyncio.create_task(
             self._run_claude(
-                seed_message, thread, prompt, session_id=session_id, requester=requester
+                seed_message,
+                thread,
+                prompt,
+                session_id=session_id,
+                requester=requester,
+                started_by=started_by,
             )
         )
         # #477: the reply path has had this since #565; the spawn path did not,
@@ -4050,6 +4073,7 @@ class ClaudeChatCog(commands.Cog):
         dashboard: ThreadStatusDashboard | None,
         description: str,
         current_task: asyncio.Task | None,
+        started_by: turn_events.StartedBy | None = None,
     ) -> None:
         """End a turn whose checkout or tmux window could not be set up (#477).
 
@@ -4081,6 +4105,18 @@ class ClaudeChatCog(commands.Cog):
             )
         with contextlib.suppress(Exception):
             await status.set_error()
+        # #917: this turn never reaches ``run_claude_with_config``, so it tells
+        # the event outlet itself — a dispatcher waiting on it hears it is dead.
+        try:
+            info = turn_events.begin_turn(thread, started_by or turn_events.StartedBy("user"))
+            turn_events.end_turn(info)
+            turn_events.finish_turn(info, failure_reason="workspace_setup")
+        except Exception:
+            logger.warning(
+                "%s could not hand the failed start to the event outlet (#917)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
         if self._active_tasks.get(thread.id) is current_task:
             self._active_tasks.pop(thread.id, None)
         if dashboard is not None:
@@ -4097,6 +4133,7 @@ class ClaudeChatCog(commands.Cog):
         image_paths: list[str] | None = None,
         try_continue: bool = False,
         requester: discord.Member | discord.User | None = None,
+        started_by: turn_events.StartedBy | None = None,
     ) -> None:
         """Execute Claude Code CLI and stream results to the thread.
 
@@ -4119,6 +4156,15 @@ class ClaudeChatCog(commands.Cog):
         # anything". Muting the routine 🟡 must not mute this one: #677/#678
         # each died at startup under the default policy and nobody was told.
         failure_notify_id = _notify_target(requester, self.bot, kind="failure")
+        # #917: who started this turn, for the turn-end event.
+        # ``!clord`` / ``/clord`` seed the thread with a message c-lord posts, so
+        # the caller that still holds the invoking message passes it down.
+        if started_by is None:
+            started_by = turn_events.started_by_from_message(
+                user_message,
+                requester=requester,
+                bot_is_author=_is_self(user_message.author, self.bot),
+            )
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
@@ -4276,6 +4322,7 @@ class ClaudeChatCog(commands.Cog):
                         dashboard=dashboard,
                         description=description,
                         current_task=current_task,
+                        started_by=started_by,
                     )
                     return
                 working_dir = session_dir
@@ -4302,6 +4349,7 @@ class ClaudeChatCog(commands.Cog):
                         dashboard=dashboard,
                         description=description,
                         current_task=current_task,
+                        started_by=started_by,
                     )
                     return
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
@@ -4421,6 +4469,7 @@ class ClaudeChatCog(commands.Cog):
                 # #856: persist the naming pass's stash the moment the row
                 # exists, not on a next naming pass that may never come.
                 on_session_saved=self.on_session_saved,
+                started_by=started_by,
             )
             try:
                 await run_claude_with_config(run_config)

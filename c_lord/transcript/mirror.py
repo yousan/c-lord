@@ -29,12 +29,14 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .. import turn_events
 from ..claude.types import AskQuestion, UsageLimit, _parse_ask_questions
 from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
@@ -556,6 +558,61 @@ async def note_run_ended(thread_id: int) -> None:
         await mirror.note_run_ended()
 
 
+def has_pending_final(thread_id: int) -> bool:
+    """Is *thread_id*'s mirror holding an assistant text it has not yet posted? (#917)
+
+    Such a text is the turn's final answer until the turn-end marker (or the idle
+    flush) says so, and the turn-end event must not go out ahead of it.
+    """
+    mirror = _LIVE_MIRRORS.get(thread_id)
+    return mirror is not None and mirror._holding_final
+
+
+_AGENT_LAUNCHED_RE = re.compile(r"Async agent launched successfully.*?agentId:\s*(\w+)", re.DOTALL)
+_TASK_ID_RE = re.compile(r"<task-id>\s*(\w+)\s*</task-id>")
+
+
+def _launched_agent_ids(event: dict) -> list[str]:
+    """Ids of the background agents *event* reports as launched (#917).
+
+    The launch is the ``tool_result`` of the ``Agent`` / ``Task`` call that had
+    ``run_in_background``; its text carries the agent's id.
+    """
+    if event.get("type") != "user" or event.get("isSidechain"):
+        return []
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    ids: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        result = block.get("content")
+        if isinstance(result, list):
+            result = " ".join(part.get("text", "") for part in result if isinstance(part, dict))
+        if isinstance(result, str):
+            match = _AGENT_LAUNCHED_RE.search(result)
+            if match:
+                ids.append(match.group(1))
+    return ids
+
+
+def _reported_task_id(event: dict) -> str | None:
+    """The id of the background task a ``<task-notification>`` event reports on (#917).
+
+    Claude Code queues one when an agent (or background command) stops, whatever
+    its status — completed, failed, killed — so all of them release the agent.
+    """
+    if event.get("type") != "queue-operation" or event.get("operation") != "enqueue":
+        return None
+    content = event.get("content")
+    if not isinstance(content, str) or "<task-notification>" not in content:
+        return None
+    match = _TASK_ID_RE.search(content)
+    return match.group(1) if match else None
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -630,6 +687,11 @@ class TranscriptMirror:
         # One notice per turn: the tail keeps reporting for as long as the
         # outage lasts, which is what lets the *next* turn be told too.
         self._unresolved_told = False
+        # #917: an assistant text read but not yet posted — the turn's final
+        # answer until a marker or the idle flush says so.
+        self._holding_final = False
+        # #917: background agents launched and not yet reported back.
+        self._background_agents: set[str] = set()
 
     def note_turn_started(self) -> None:
         """Tell the progress line a turn just began (#539).
@@ -714,6 +776,13 @@ class TranscriptMirror:
         its next tool event re-arms the line, as it does for any turn.
         """
         await self._progress.end_turn()
+
+    def _track_background_agents(self, event: dict) -> None:
+        """Keep the set of background agents that have not yet reported back (#917)."""
+        self._background_agents.update(_launched_agent_ids(event))
+        reported = _reported_task_id(event)
+        if reported is not None:
+            self._background_agents.discard(reported)
 
     async def _cancel_ask_bridge(self) -> None:
         t = self._ask_bridge_task
@@ -834,6 +903,7 @@ class TranscriptMirror:
             # Merge the snapshot back so subsequent tool output accumulates.
             progress_buf[:0] = _pending_progress
             _pending_text = None
+            self._holding_final = False
             _pending_progress = []
             # #553: an intermediate message is NOT a final answer, so it must not
             # move the delivery cursor.
@@ -851,6 +921,7 @@ class TranscriptMirror:
             if _pending_uuid:
                 _delivered_uuid = _pending_uuid
             _pending_text = None
+            self._holding_final = False
             _pending_progress = []
             _pending_uuid = None
 
@@ -911,6 +982,7 @@ class TranscriptMirror:
                 # producers it used to hear from are gone (#723), and without
                 # this every turn past 30s read ⚠️ however busy Claude was.
                 turn_activity.note(self.thread_id)
+                self._track_background_agents(event)
 
                 # #232: bridge an open AskUserQuestion menu regardless of
                 # verbosity / turn-end / who triggered the turn.
@@ -959,6 +1031,9 @@ class TranscriptMirror:
                     # ending the turn (and posting the 📊 context footer), and
                     # that must never overtake the answer the footer belongs to.
                     if not event.get("isSidechain"):
+                        # #917: after the answer is out, before the runner hears
+                        # of the end — see :func:`turn_events.note_turn_end`.
+                        turn_events.note_turn_end(self.thread_id, len(self._background_agents))
                         turn_end_bus.mark(self.thread_id, at=_event_time(event))
                     continue
 
@@ -1127,6 +1202,7 @@ class TranscriptMirror:
                         if _pending_text is not None:
                             await _flush_pending_silently()
                         _pending_text = body
+                        self._holding_final = True
                         _pending_progress = list(progress_buf)
                         _pending_uuid = event.get("uuid")
                         progress_buf.clear()

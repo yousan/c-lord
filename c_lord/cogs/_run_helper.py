@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import discord
 
+from .. import turn_events
 from ..claude.context_usage import (
     fallback_window,
     format_context_line,
@@ -38,6 +39,7 @@ from ..claude.tmux_runner import (
     LOGIN_REQUIRED_ERROR_PREFIX,
     MODEL_UNAVAILABLE_ERROR_PREFIX,
     NO_RESPONSE_ERROR_PREFIX,
+    STOPPED_BY_USER_ERROR,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
     TmuxClaudeRunner,
@@ -140,6 +142,32 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     if error.startswith(NO_RESPONSE_ERROR_PREFIX):
         return no_response_embed(error)
     return error_embed(error)
+
+
+def _failure_reason(config: RunConfig, outcome: str) -> str | None:
+    """A short code for why the turn failed, or ``None`` if it did not (#917).
+
+    Deliberately a code and not the error text: the event leaves the host, and
+    error text carries paths and pane contents.
+    """
+    if outcome == "crashed":
+        return "crashed"
+    result = config.outcome
+    if result.error is None:
+        return None
+    if result.usage_limit is not None:
+        return "usage_limit"
+    if result.login_required:
+        return "login_required"
+    if result.model_unavailable is not None:
+        return "model_unavailable"
+    if result.error == STOPPED_BY_USER_ERROR:
+        return "stopped"
+    if _TIMEOUT_PATTERN.match(result.error):
+        return "timeout"
+    if result.no_response or result.error.startswith(NO_RESPONSE_ERROR_PREFIX):
+        return "no_response"
+    return "error"
 
 
 def _truncate_result(content: str) -> str:
@@ -467,6 +495,15 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     _note_orphans(thread_id, run, ctx)
     _IN_FLIGHT.setdefault(thread_id, []).append(run)
 
+    # #917: the outermost run of a turn announces its end. The AskUserQuestion
+    # resume below re-enters this function with a copy of the config that shares
+    # ``outcome``, and finds the turn already begun.
+    announces_end = config.outcome.turn is None
+    if announces_end:
+        config.outcome.turn = turn_events.begin_turn(
+            config.thread, config.started_by or turn_events.StartedBy("user")
+        )
+
     outcome = "crashed"
     session_id = config.session_id
     try:
@@ -504,6 +541,21 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             except Exception:
                 logger.warning(
                     "%s could not end the progress line",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+        # #917: told after the answer is out and the footer is posted, and never
+        # for a turn something else displaced or cancelled — the turn that took
+        # its place announces the thread's end.
+        if announces_end:
+            try:
+                turn = config.outcome.turn
+                turn_events.end_turn(turn)
+                if outcome in ("ok", "error", "crashed"):
+                    turn_events.finish_turn(turn, failure_reason=_failure_reason(config, outcome))
+            except Exception:
+                logger.warning(
+                    "%s could not hand the turn end to the event outlet (#917)",
                     log_ctx(thread_id=thread_id),
                     exc_info=True,
                 )

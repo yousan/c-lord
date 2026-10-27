@@ -397,6 +397,9 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_ALLOW_ANYONE` | `1` lets **every** member of the server drive the bot — which means running shell commands on the host. Warned about at startup | `false` |
 | `CLORD_NOTIFY_DENIED` | `0` stops the DM the application owner gets when someone not allowed posts in a bot thread (the sender never sees anything; the refusal is still logged — #346) | `true` |
 | `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end 🟡 + pauses + failures), `blocked` (pauses + failures — quiet when it works, loud when it breaks), `off` (never, failures included) | `blocked` |
+| `CLORD_EVENT_LOG` | Append one JSON line per turn end (`completion` / `blocked` / `failure`) to this file, after the last reply is posted — for a dispatching agent or CI to `tail -F` instead of polling the thread. Server-side only; see [docs/specs/turn-end-events.md](docs/specs/turn-end-events.md) (#917) | (off) |
+| `CLORD_EVENT_WEBHOOK_URL` / `CLORD_EVENT_WEBHOOK_SECRET` | POST the same event as JSON to this URL, with `X-Clord-Signature: sha256=<HMAC-SHA256 of the body>`. Nothing is sent without the secret. Failures are retried a few times and never block the turn (#917) | (off) |
+| `CLORD_EVENT_DEFER_MAX_SECONDS` | How long a `completion` is held while background sub-agents are still running before it is sent anyway | `3600` |
 | `COORDINATION_CHANNEL_ID` | Channel that gets a one-line notice when a session's turn ends; also the default AI Lounge channel | (optional) |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |

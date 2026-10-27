@@ -38,6 +38,7 @@ from ..discord_ui.slash_io import slash_io
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
+from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -393,6 +394,7 @@ class SkillCommandCog(commands.Cog):
                         authorizer=self._authorizer,
                         # #480: ping the invoking user if a question-mode pause blocks the skill.
                         notify_user_id=user.id,
+                        started_by=StartedBy("user", str(user.id)),
                     )
                 )
             return
@@ -454,6 +456,7 @@ class SkillCommandCog(commands.Cog):
                     authorizer=self._authorizer,
                     # #480: ping the invoking user if a question-mode pause blocks the skill.
                     notify_user_id=user.id,
+                    started_by=StartedBy("user", str(user.id)),
                 )
             )
 

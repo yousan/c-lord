@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from .. import turn_events
 from ..claude.types import AskQuestion, ask_question_to_dict
 from ..database.ask_repo import PendingAskRepository
 from ..menu_ledger import menu_fingerprint, shared_ledger
@@ -820,6 +821,8 @@ async def _bridge_claimed_menu(
     # #536: while this menu is answerable it must be reachable, so that
     # resolving any OTHER copy can blank this one out (and vice versa).
     _ask_menus.register(thread.id, msg)
+    # #917: the turn is parked until somebody answers this.
+    turn_events.emit_blocked(thread, message_id=getattr(msg, "id", None))
     # #671: write the menu down NOW, while the process that drew it is still
     # alive. Every route that puts a menu on screen ends up here, and none of
     # them recorded anything — so the restart-recovery table
@@ -1057,6 +1060,8 @@ async def collect_ask_answers(
             view=view,
         )
         _ask_menus.register(thread.id, msg)  # #536: keep stale copies addressable
+        if q_idx == 0:  # #917: one event per ask, however many questions it carries
+            turn_events.emit_blocked(thread, message_id=getattr(msg, "id", None))
 
         try:
             selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)

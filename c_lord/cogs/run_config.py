@@ -23,6 +23,7 @@ from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_ui.authorization import Authorizer
 from ..discord_ui.status import StatusManager
+from ..turn_events import StartedBy, TurnInfo
 
 if TYPE_CHECKING:
     from ..discord_ui.views import StopView
@@ -58,6 +59,11 @@ class RunOutcome:
     # #484: the model Claude Code refused to use for this turn, when it did.
     # Only ``/model`` can fix it, so the turn-end line must say that.
     model_unavailable: str | None = None
+    # #917: the turn-end event's bookkeeping for this turn, ``None`` while no
+    # outlet is configured. Shared by every copy of the config (``with_prompt``
+    # keeps this object), which is how the AskUserQuestion resume — a nested run
+    # inside the same turn — knows it is not the one to announce the turn's end.
+    turn: TurnInfo | None = None
 
 
 @dataclass
@@ -141,6 +147,9 @@ class RunConfig:
     # pass's topic and origin number) is persisted *now* — not on a next turn
     # that a one-turn dispatch thread never has. ``None`` ⇒ nothing waits.
     on_session_saved: Callable[[int], Awaitable[None]] | None = None
+    # #917: who started this turn, for the turn-end event (``CLORD_EVENT_LOG`` /
+    # ``CLORD_EVENT_WEBHOOK_URL``). ``None`` ⇒ a user.
+    started_by: StartedBy | None = None
 
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is

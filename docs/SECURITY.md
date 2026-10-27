@@ -116,7 +116,12 @@ Skill names are passed to Claude Code as `/{name}`. The regex ensures only alpha
 
 ```python
 # c_lord/tmux.py
-SENSITIVE_ENV_KEYS = ("DISCORD_BOT_TOKEN", "CLORD_API_SECRET")
+SENSITIVE_ENV_KEYS = (
+    "DISCORD_BOT_TOKEN",
+    "CLORD_API_SECRET",
+    "CLORD_EVENT_WEBHOOK_SECRET",  # #917: signing key of the turn-end event POST
+    "CLORD_EVENT_WEBHOOK_URL",
+)
 ```
 
 A tmux **server** inherits the environment of whichever process first runs a

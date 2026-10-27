@@ -25,6 +25,7 @@ from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..model_scopes import begin_turn_for, effort_for_launch
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
+from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
@@ -259,6 +260,8 @@ class SchedulerCog(commands.Cog):
                 # scheduled thread, so silence here is indistinguishable from
                 # success.
                 failure_notify_id=owner_notify_id(self.bot, kind="failure"),
+                # #917: the turn-end event names the task that started the run.
+                started_by=StartedBy("scheduler", str(task["id"]), str(task["name"])),
             )
             # #754: a scheduled run is a live session like any other, so it is
             # on 📊 Session Status while it runs. It used to be invisible there.
