@@ -117,7 +117,7 @@ View に `_authorizer` を渡し忘れた場合は、**プロセスが実際に�
 | 公開（誰でも叩ける） | 理由 |
 |---|---|
 | `/version` `!version` | 走っているビルドの版を表示するだけ |
-| `/model show` `!model-show` | 現在のモデル名を表示するだけ |
+| `/model`（引数なし）`!model` `!model-show` | 現在のモデル設定を表示するだけ。**引数を付けた変更は本体に入る前に同じ規則で判定する**（#918） |
 | `/thread-archive show` `!thread-archive-show` | 自動アーカイブ期間を表示するだけ |
 
 表示だけでも `/tmux-screenshot`（ペインの中身）・`/clord-status`・`/tmux-list`（ワークスペースの

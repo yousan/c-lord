@@ -22,6 +22,7 @@ import discord
 from discord.ext import commands, tasks
 
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
+from ..model_scopes import begin_turn_for, effort_for_launch
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
@@ -212,14 +213,23 @@ class SchedulerCog(commands.Cog):
             # this path.
             await self._start_transcript_mirror(task_id, thread.id, working_dir)
 
+            # #918: the same layered model/effort a user turn would get.
+            turn = await begin_turn_for(
+                self.bot,
+                getattr(self, "settings_repo", None) or getattr(self.bot, "settings_repo", None),
+                self.runner,
+                thread.id,
+                getattr(thread, "parent_id", None),
+            )
+            model = (turn.model if turn else None) or self.runner.model
             runner = TmuxClaudeRunner(
                 tmux_manager=tmux,
                 thread_id=thread.id,
-                model=self.runner.model,
+                model=model,
                 working_dir=working_dir,
                 timeout_seconds=self.runner.timeout_seconds,
                 dangerously_skip_permissions=True,
-                effort=self.runner.effort,
+                effort=effort_for_launch(model, turn.effort if turn else self.runner.effort),
             )
 
             registry = getattr(self.bot, "session_registry", None)

@@ -192,7 +192,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
 - **Workspace cleanup** — `/workspace-cleanup` reclaims clone directories that no running session is using (`dry_run` to preview); a directory with uncommitted changes is never removed
-- **Runtime model switching** — `/model-show` displays the current global model and per-thread session model; `/model-set` changes the model for all new sessions without restart
+- **Runtime model switching** — `/model` shows and changes the model and effort at session, channel or global scope (`include-existing` also moves open sessions from their next turn)
 - **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; each thread that is still open gets a 🧹 notice saying so and what survived on disk (#554), and is then archived; threads already closed are tidied without a post, so they stay closed (#857). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
 
 ### Security

@@ -165,7 +165,7 @@ def _completion_text(
     if model_unavailable is not None:
         return (
             f"🧩 Claude Code がモデル `{model_unavailable}` を使えないため、"
-            "このターンは実行されていません。`/model set` で使えるモデルに戻してください。"
+            "このターンは実行されていません。`/model` で使えるモデルに戻してください。"
             f"戻すまでは送り直しても同じ結果になります。 <@{mention_id}>"
         )
     if no_response:
