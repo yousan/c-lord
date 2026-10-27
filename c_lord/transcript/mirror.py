@@ -237,7 +237,13 @@ def _tool_call_ids(event: dict) -> tuple[list[str], list[str]]:
     (``sleep 150``) renders to ``None``, and missing its ``tool_result`` would
     leave the call looking open for the rest of the turn. Like every helper run
     on each tailed event, it never assumes a shape.
+
+    Only conversation events count (#906). CLI 2.1.29x+ also writes an
+    ``api-request-blob`` — a copy of the request it sent, history included —
+    whose tool blocks are calls that finished long ago.
     """
+    if event.get("type") not in ("assistant", "user"):
+        return [], []
     message = event.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
