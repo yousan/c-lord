@@ -221,6 +221,20 @@ def error_embed(error: str) -> discord.Embed:
     )
 
 
+def api_error_embed(detail: str, advice: str) -> discord.Embed:
+    """Embed for a turn Claude Code ended on an API error (#908).
+
+    *detail* is the CLI's own first sentence (kept: it is what a reader would
+    search for), *advice* the Japanese line saying what can be done from
+    Discord. The CLI's keyboard steps ("Double press esc…") are never shown.
+    """
+    return discord.Embed(
+        title="\u274c Claude Code が API エラーで止まりました",
+        description=f"{advice}\n\n-# {detail[:3800]}",
+        color=COLOR_ERROR,
+    )
+
+
 def no_response_embed(detail: str) -> discord.Embed:
     """Embed for a turn that never produced anything (#562).
 

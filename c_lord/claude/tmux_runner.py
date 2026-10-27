@@ -18,6 +18,7 @@ from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..api_error import runner_error
 from ..tmux import TmuxSessionManager, pane_command_is_dead
 from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
@@ -2493,6 +2494,14 @@ class TmuxClaudeRunner:
                 f'"{model_unavailable}" and did not run this turn. Change it with '
                 "/model; until then every new session gets the same reply."
             )
+        elif (
+            api_error := turn_end_bus.api_error_since(self._thread_id, turn_started_at)
+        ) is not None:
+            # #908: Claude Code ended the turn on its own synthetic API error
+            # (connection lost mid-response, safeguards, …). The transcript says
+            # so exactly; reading it as a normal finish painted 🟡 and left the
+            # reader to notice the English text by themselves.
+            error = runner_error(api_error)
         elif timed_out or not last_response:
             # Reached completion without a usable response — either the hard
             # inactivity backstop fired (``timed_out``) or we never extracted
