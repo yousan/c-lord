@@ -666,6 +666,28 @@ async def test_file_sink_uses_reference(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert ref.message_id == 8888
 
 
+async def test_sinks_quote_the_request_an_interrupted_turn_answered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#912: ``reply_to`` names an earlier request — the text quotes that one,
+    not the instruction that interrupted it."""
+    monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
+
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog.set_trigger_message(7, 2222)  # the new instruction is the current trigger
+    await cog._make_reply_sink(7)("old turn's text", reply_to=1111)
+    assert channel.send.call_args.kwargs["reference"].message_id == 1111
+    await cog._make_file_sink(7)("old turn's text", str(progress_file), reply_to=1111)
+    assert channel.send.call_args.kwargs["reference"].message_id == 1111
+
+
 # ---------------------------------------------------------------------------
 # Issue #149: DB fallback for trigger_message_id when in-memory is absent
 # ---------------------------------------------------------------------------
