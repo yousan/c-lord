@@ -290,3 +290,15 @@ async def test_ask_resume_is_not_an_orphan(caplog) -> None:
         await run_claude_with_config(_config(_runner([_started(), asking], [_done()])))
 
     assert _orphan_warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_a_turn_the_user_stopped_is_not_an_error(caplog) -> None:
+    """#909 AC1: ⏹ Stop / workspace-stop end the turn as ``stopped``, not ``error``."""
+    from c_lord.claude.tmux_runner import STOPPED_BY_USER_ERROR
+
+    await run_claude_with_config(_config(_runner([_done(error=STOPPED_BY_USER_ERROR)])))
+
+    exits = _lines(caplog, "exit")
+    assert len(exits) == 1
+    assert _outcome(exits[0]) == "stopped"

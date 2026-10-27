@@ -334,13 +334,24 @@ class TestStopEndsTheRunningTurn:
         return ctx
 
     @pytest.mark.asyncio
-    async def test_the_running_turn_is_ended_before_the_window_goes(self) -> None:
+    async def test_the_turn_ends_before_the_window_goes_and_is_over_before_the_archive(
+        self,
+    ) -> None:
+        """The final 🟡 must land before the archive: Discord refuses reactions in
+        an archived thread (50083), which left the request with no lamp at all."""
         chat = MagicMock()
         cog, order = self._cog(chat)
         chat.end_turn_for_workspace_stop = MagicMock(side_effect=lambda _t: order.append("end"))
-        await cog.close_workspace_text.callback(cog, self._ctx(_thread()))
+
+        async def wait(_t: int, **_kw: object) -> None:
+            order.append("turn over")
+
+        chat.wait_for_turn_end = AsyncMock(side_effect=wait)
+        thread = _thread()
+        thread.edit = AsyncMock(side_effect=lambda **_kw: order.append("archive"))
+        await cog.close_workspace_text.callback(cog, self._ctx(thread))
         chat.end_turn_for_workspace_stop.assert_called_once_with(555)
-        assert order == ["end", "kill"]
+        assert order == ["end", "kill", "turn over", "archive"]
 
     @pytest.mark.asyncio
     async def test_no_chat_cog_still_stops(self) -> None:
@@ -368,3 +379,31 @@ class TestChatCogEndsTheRun:
 
     def test_nothing_running_is_a_no_op(self) -> None:
         assert self._chat().end_turn_for_workspace_stop(555) is False
+
+    @pytest.mark.asyncio
+    async def test_waiting_returns_once_the_turn_task_is_done(self) -> None:
+        import asyncio
+
+        chat = self._chat()
+        done = asyncio.Event()
+
+        async def turn() -> None:
+            await done.wait()
+
+        chat._active_tasks[555] = asyncio.create_task(turn())
+        asyncio.get_running_loop().call_later(0.05, done.set)
+        await asyncio.wait_for(chat.wait_for_turn_end(555, timeout=2.0), 1.0)
+        assert chat._active_tasks[555].done()
+
+    @pytest.mark.asyncio
+    async def test_waiting_gives_up_after_the_timeout(self) -> None:
+        import asyncio
+
+        chat = self._chat()
+        chat._active_tasks[555] = asyncio.create_task(asyncio.sleep(10))
+        await asyncio.wait_for(chat.wait_for_turn_end(555, timeout=0.05), 1.0)
+        chat._active_tasks[555].cancel()
+
+    @pytest.mark.asyncio
+    async def test_waiting_with_nothing_running_returns(self) -> None:
+        await self._chat().wait_for_turn_end(555, timeout=0.05)
