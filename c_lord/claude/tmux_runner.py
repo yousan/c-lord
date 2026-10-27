@@ -3517,6 +3517,25 @@ class TmuxClaudeRunner:
         menu = _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
         return menu, capture_ok
 
+    async def peek_menu_closed(self) -> bool | None:
+        """True only when the pane positively shows no menu at all (#911).
+
+        The evidence for a menu Claude Code draws itself (e.g. "Model switch"),
+        which writes nothing to the transcript. Stricter than
+        :meth:`peek_menu_state`: the multi-question Submit screen counts as a
+        menu (its ask is still unwritten), and a dead pane or an empty capture
+        is None — they say nothing about what the menu took.
+        """
+        if await self._pane_is_dead():
+            return None
+        raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        if not raw.strip():
+            return None
+        pane = _normalize_capture(raw)
+        if _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane):
+            return False
+        return not _is_ask_submit_screen(pane)
+
     @staticmethod
     def _extract_response(pane_text: str) -> str:
         """Extract Claude's latest response from the TUI pane text.
