@@ -81,7 +81,7 @@ class TestRemovesOnlyWhatIsSafe:
     def test_a_directory_that_is_not_a_git_repo_is_kept(self, tmp_path) -> None:
         """Cleanliness cannot be established, so nothing is destroyed."""
         d = tmp_path / "s" / "9" / "1"
-        d.mkdir()
+        d.mkdir(parents=True)
         (d / "notes.md").write_text("something", encoding="utf-8")
 
         assert (
