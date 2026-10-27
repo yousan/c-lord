@@ -47,10 +47,10 @@ def _rec(path: Path | None) -> SessionRecord:
 
 class TestRemovesOnlyWhatIsSafe:
     def test_a_clean_worktree_is_removed(self, tmp_path) -> None:
-        d = tmp_path / "ws"
+        d = tmp_path / "s" / "9" / "1"
         _repo(d)
 
-        outcome = remove_clean_session_dir(_rec(d))
+        outcome = remove_clean_session_dir(_rec(d), sessions_root=tmp_path / "s")
 
         assert outcome is DirOutcome.REMOVED
         assert not d.exists()
@@ -58,10 +58,10 @@ class TestRemovesOnlyWhatIsSafe:
     def test_uncommitted_work_is_never_removed(self, tmp_path) -> None:
         """The whole point of the guard. Losing a half-written change to a
         background sweep nobody asked for is unrecoverable."""
-        d = tmp_path / "ws"
+        d = tmp_path / "s" / "9" / "1"
         _repo(d, dirty=True)
 
-        outcome = remove_clean_session_dir(_rec(d))
+        outcome = remove_clean_session_dir(_rec(d), sessions_root=tmp_path / "s")
 
         assert outcome is DirOutcome.KEPT_DIRTY
         assert (d / "uncommitted.txt").exists()
@@ -69,27 +69,34 @@ class TestRemovesOnlyWhatIsSafe:
     def test_an_untracked_file_counts_as_dirty(self, tmp_path) -> None:
         """``git status --porcelain`` reports untracked files, and it should:
         an image someone dropped in is work too."""
-        d = tmp_path / "ws"
+        d = tmp_path / "s" / "9" / "1"
         _repo(d)
         (d / "screenshot.png").write_bytes(b"\x89PNG")
 
-        assert remove_clean_session_dir(_rec(d)) is DirOutcome.KEPT_DIRTY
+        assert (
+            remove_clean_session_dir(_rec(d), sessions_root=tmp_path / "s") is DirOutcome.KEPT_DIRTY
+        )
         assert (d / "screenshot.png").exists()
 
     def test_a_directory_that_is_not_a_git_repo_is_kept(self, tmp_path) -> None:
         """Cleanliness cannot be established, so nothing is destroyed."""
-        d = tmp_path / "plain"
+        d = tmp_path / "s" / "9" / "1"
         d.mkdir()
         (d / "notes.md").write_text("something", encoding="utf-8")
 
-        assert remove_clean_session_dir(_rec(d)) is DirOutcome.KEPT_DIRTY
+        assert (
+            remove_clean_session_dir(_rec(d), sessions_root=tmp_path / "s") is DirOutcome.KEPT_DIRTY
+        )
         assert d.exists()
 
     def test_an_already_gone_directory_is_reported_as_absent(self, tmp_path) -> None:
-        assert remove_clean_session_dir(_rec(tmp_path / "nope")) is DirOutcome.ABSENT
+        assert (
+            remove_clean_session_dir(_rec(tmp_path / "nope"), sessions_root=tmp_path / "s")
+            is DirOutcome.ABSENT
+        )
 
     def test_a_record_without_a_working_dir_is_absent(self) -> None:
-        assert remove_clean_session_dir(_rec(None)) is DirOutcome.ABSENT
+        assert remove_clean_session_dir(_rec(None), sessions_root=None) is DirOutcome.ABSENT
 
     @pytest.mark.parametrize("bad", ["/", "/home", "/home/yousan"])
     def test_refuses_suspiciously_shallow_paths(self, bad: str) -> None:
@@ -108,7 +115,7 @@ class TestRemovesOnlyWhatIsSafe:
             created_at="2026-01-01 00:00:00",
             last_used_at="2026-01-01 00:00:00",
         )
-        assert remove_clean_session_dir(rec) is DirOutcome.KEPT_UNSAFE
+        assert remove_clean_session_dir(rec, sessions_root="/") is DirOutcome.KEPT_UNSAFE
 
 
 class TestPeriodFollowsClaudeCode:
@@ -149,10 +156,13 @@ class TestSweepFreesWindowNumber:
 
         released: list[int] = []
         monkeypatch.setattr(session_cleanup, "release_window_number", released.append)
-        _repo(tmp_path / "c-lord-sessions" / "1" / "2")
+        _repo(tmp_path / "c-lord-sessions" / "2" / "1")
 
-        rec = _rec(tmp_path / "c-lord-sessions" / "1" / "2")
-        assert session_cleanup.retire_swept_workspace(rec) is DirOutcome.REMOVED
+        rec = _rec(tmp_path / "c-lord-sessions" / "2" / "1")
+        assert (
+            session_cleanup.retire_swept_workspace(rec, sessions_root=tmp_path / "c-lord-sessions")
+            is DirOutcome.REMOVED
+        )
         assert released == [1]
 
     def test_missing_checkout_releases_the_number(self, tmp_path: Path, monkeypatch) -> None:
@@ -161,7 +171,10 @@ class TestSweepFreesWindowNumber:
         released: list[int] = []
         monkeypatch.setattr(session_cleanup, "release_window_number", released.append)
 
-        assert session_cleanup.retire_swept_workspace(_rec(None)) is DirOutcome.ABSENT
+        assert (
+            session_cleanup.retire_swept_workspace(_rec(None), sessions_root=None)
+            is DirOutcome.ABSENT
+        )
         assert released == [1]
 
     def test_dirty_checkout_keeps_the_number(self, tmp_path: Path, monkeypatch) -> None:
@@ -169,8 +182,11 @@ class TestSweepFreesWindowNumber:
 
         released: list[int] = []
         monkeypatch.setattr(session_cleanup, "release_window_number", released.append)
-        _repo(tmp_path / "c-lord-sessions" / "1" / "2", dirty=True)
+        _repo(tmp_path / "c-lord-sessions" / "2" / "1", dirty=True)
 
-        rec = _rec(tmp_path / "c-lord-sessions" / "1" / "2")
-        assert session_cleanup.retire_swept_workspace(rec) is DirOutcome.KEPT_DIRTY
+        rec = _rec(tmp_path / "c-lord-sessions" / "2" / "1")
+        assert (
+            session_cleanup.retire_swept_workspace(rec, sessions_root=tmp_path / "c-lord-sessions")
+            is DirOutcome.KEPT_DIRTY
+        )
         assert released == []
