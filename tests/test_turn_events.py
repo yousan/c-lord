@@ -505,7 +505,7 @@ class TestRunHelperWiring:
         (event,) = _lines(log)
         assert event["kind"] == "failure"
         assert event["reason"] == "timeout"
-        assert "300" not in json.dumps(event)
+        assert "Timed out" not in json.dumps(event)  # the reason is a code, not the error text
 
     async def test_a_runner_that_raises_is_a_failure(self, log, monkeypatch):
         from c_lord.cogs import _run_helper
