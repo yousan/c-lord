@@ -33,6 +33,7 @@ from ..claude.tmux_runner import TmuxClaudeRunner
 from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
+from ..database.settings_repo import SettingsRepository
 from ..discord_ui.authorization import Authorizer
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
@@ -113,8 +114,12 @@ class SkillCommandCog(commands.Cog):
         registry: SessionRegistry | None = None,
         allowed_role_name: str | None = None,
         authorizer: Authorizer | None = None,
+        settings_repo: SettingsRepository | None = None,
     ) -> None:
         self.bot = bot
+        # #927: where /model's settings live. Optional (zero-config) — see
+        # :meth:`_settings_repo_for_turn` for the fallback.
+        self._settings_repo = settings_repo
         self.repo = repo
         self.runner = runner
         self.claude_channel_id = claude_channel_id
@@ -233,6 +238,23 @@ class SkillCommandCog(commands.Cog):
             try_continue=try_continue,
         )
 
+    def _settings_repo_for_turn(self) -> SettingsRepository | None:
+        """The settings repository /model writes to (#927).
+
+        Right after a restart nothing has cached the model-scope service yet, so
+        it has to be built from this. A consumer that constructs the cog without
+        ``settings_repo`` still gets /model through the chat cog's repository —
+        the same DB — rather than silently running on the instance defaults.
+        """
+        if self._settings_repo is not None:
+            return self._settings_repo
+        chat = self.bot.get_cog("ClaudeChatCog")
+        repo = getattr(chat, "_settings_repo", None)
+        if isinstance(repo, SettingsRepository):
+            return repo
+        repo = getattr(self.bot, "settings_repo", None)
+        return repo if isinstance(repo, SettingsRepository) else None
+
     async def _fix_turn(
         self, thread: discord.Thread, channel_id: int | None, tmux: TmuxSessionManager
     ) -> tuple[TurnSettings | None, bool]:
@@ -246,7 +268,7 @@ class SkillCommandCog(commands.Cog):
         """
         turn = await begin_turn_for(
             self.bot,
-            getattr(self.bot, "settings_repo", None),
+            self._settings_repo_for_turn(),
             self.runner,
             thread.id,
             channel_id,

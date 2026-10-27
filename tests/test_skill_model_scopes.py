@@ -156,3 +156,70 @@ async def test_settings_failure_falls_back_to_instance_defaults(env):
     svc.begin_turn = AsyncMock(side_effect=RuntimeError("db locked"))  # type: ignore[method-assign]
     seen = await _launch(cog, _in_thread())
     assert (seen["model"], seen["effort"]) == ("opus", "high")
+
+
+# -- staging finding: a freshly started bot has no cached service yet --------
+
+
+@pytest.fixture
+async def fresh(tmp_path):
+    """Like ``env`` but the bot has not cached a service — the state right after
+    a restart, before any chat turn ran. Only the settings DB exists."""
+    from c_lord.database.settings_repo import SettingsRepository
+
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    settings = SettingsRepository(db)
+    svc = ModelScopeService(db, StartupEnv("opus", "high", ".env", ".env"))
+    await svc.change(scope="channel", model="sonnet", effort="medium", channel_id=CHANNEL)
+    return db, settings
+
+
+def _fresh_cog(db: str, **kwargs) -> SkillCommandCog:
+    bot = MagicMock(spec=["get_channel", "get_cog", "transcript_mirror_cog"])
+    bot.transcript_mirror_cog = MagicMock()
+    repo = MagicMock()
+    repo.get = AsyncMock(return_value=None)
+    runner = MagicMock()
+    runner.model = "opus"
+    runner.effort = "high"
+    runner.working_dir = "/srv/default"
+    runner.timeout_seconds = 300
+    cog = SkillCommandCog(
+        bot=bot,
+        repo=repo,
+        runner=runner,
+        claude_channel_id=CHANNEL,
+        skills_dir="/nonexistent/skills",
+        authorizer=Authorizer(allow_anyone=True),
+        **kwargs,
+    )
+    cog._skills = [{"name": "todoist", "description": "Tasks"}]
+    tmux = MagicMock()
+    tmux.create_session = MagicMock(return_value="w7")
+    tmux.is_claude_running = MagicMock(return_value=False)
+    sdm = MagicMock()
+    sdm.create_session_dir = MagicMock(return_value=_SESSION_DIR)
+    cog._resolve_tmux_manager = AsyncMock(return_value=tmux)  # type: ignore[method-assign]
+    cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)  # type: ignore[method-assign]
+    return cog
+
+
+async def test_resolves_on_a_fresh_bot_with_the_settings_repo_it_was_given(fresh):
+    db, settings = fresh
+    cog = _fresh_cog(db, settings_repo=settings)
+    cog.bot.get_cog = MagicMock(return_value=None)
+    seen = await _launch(cog, _channel_for_new_thread(cog))
+    assert (seen["model"], seen["effort"]) == ("sonnet", "medium")
+
+
+async def test_resolves_on_a_fresh_bot_via_the_chat_cog_when_not_given_one(fresh):
+    """Zero-config: a consumer that builds the cog without settings_repo still
+    gets /model, through the chat cog's repository."""
+    db, settings = fresh
+    cog = _fresh_cog(db)
+    chat = MagicMock()
+    chat._settings_repo = settings
+    cog.bot.get_cog = MagicMock(side_effect=lambda n: chat if n == "ClaudeChatCog" else None)
+    seen = await _launch(cog, _channel_for_new_thread(cog))
+    assert (seen["model"], seen["effort"]) == ("sonnet", "medium")
