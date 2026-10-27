@@ -404,8 +404,8 @@ class EventProcessor:
             )
             if err_msg is not None:
                 self._last_response_msg = err_msg
-            # #915: the turn-end line must not ping the same person again.
-            self._config.outcome.pinged_user_id = self._failure_notify_uid
+                # #915: the turn-end line must not ping the same person again.
+                self._config.outcome.pinged_user_id = self._failure_notify_uid
             if self._config.status:
                 await self._config.status.set_error()
         else:
