@@ -2991,6 +2991,7 @@ class ClaudeChatCog(commands.Cog):
             prompt="(restart)",
             session_id=session_id,
             settings_repo=self._settings_repo,
+            authorizer=self._authorizer,
         )
         try:
             await _post_context_usage(footer, session_id)
