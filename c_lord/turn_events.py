@@ -160,10 +160,8 @@ def _http_target() -> tuple[str, bytes] | None:
     secret = os.getenv(ENV_SECRET, "")
     if not secret:
         logger.warning(
-            "%s is set but %s is not — an unsigned event cannot be told from a forgery, "
-            "so nothing is sent",
-            ENV_URL,
-            ENV_SECRET,
+            "CLORD_EVENT_WEBHOOK_URL is set but its signing secret is not — an unsigned "
+            "event cannot be told from a forgery, so nothing is sent"
         )
         return None
     return url, secret.encode()
