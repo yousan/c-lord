@@ -53,7 +53,13 @@ from ..usage_limit import (
     usage_limit_notices,
 )
 from ..utils.logger import log_ctx
-from .formatter import ZWSP_MARKER, RenderedEvent, render_event
+from .formatter import (
+    TASK_NOTIFICATION_BODY_PREFIX,
+    ZWSP_MARKER,
+    RenderedEvent,
+    is_task_notification,
+    render_event,
+)
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
@@ -474,14 +480,41 @@ def _format_body(rendered: RenderedEvent) -> str:
     return f"{prefix}{rendered.body}"
 
 
+# The progress.txt line of a background task's notification (#913).
+_NOTIFICATION_LINE = _KIND_PREFIX["tool_result"] + TASK_NOTIFICATION_BODY_PREFIX
+
+
 def _has_tool_lines(progress: list[str]) -> bool:
     """Whether *progress* holds more than thinking sentences (#883).
 
     A plain Q&A turn now carries a "💭" line or two; attaching a progress.txt
     for those alone would put a file on every short answer. Only tool activity
     earns the attachment — the sentences then ride along, in order.
+
+    Nor does a background task's notification (#913): a turn it started holds
+    that one line and a "Still running.", and a file per notification — 16 in
+    five minutes — buried the thread's real reports.
     """
-    return any(not line.startswith(_KIND_PREFIX["thinking"]) for line in progress)
+    return any(
+        not line.startswith(_KIND_PREFIX["thinking"]) and not line.startswith(_NOTIFICATION_LINE)
+        for line in progress
+    )
+
+
+def _prompt_kind(event: dict) -> str | None:
+    """Who started the turn *event* opens: ``"notification"``, ``"person"``, or None (#913).
+
+    Only meaningful for an event :func:`_is_user_prompt` accepts. A bare
+    ``<system-reminder>`` is harness context written alongside a notification,
+    not the start of anybody's turn.
+    """
+    content = (event.get("message") or {}).get("content")
+    text = content.strip() if isinstance(content, str) else ""
+    if is_task_notification(text):
+        return "notification"
+    if text.startswith("<system-reminder>"):
+        return None
+    return "person"
 
 
 def _unresolved_notice(report: UnresolvedTranscript) -> str:
@@ -698,6 +731,11 @@ class TranscriptMirror:
         self._holding_final = False
         # #917: background agents launched and not yet reported back.
         self._background_agents: set[str] = set()
+        # #913: is a turn open, and did a background notification (rather than
+        # a person) open it?  Such a turn answers nobody's message, so its
+        # answer is not a reply to the last one.
+        self._turn_open = expect_turn
+        self._turn_by_notification = False
 
     def note_turn_started(self) -> None:
         """Tell the progress line a turn just began (#539).
@@ -710,6 +748,8 @@ class TranscriptMirror:
         # #773: from here on, silence is a symptom rather than an idle thread.
         self._turn_active = True
         self._unresolved_told = False
+        self._turn_open = True
+        self._turn_by_notification = False
 
     async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
         """Say out loud that this thread's transcript cannot be found (#773/#585).
@@ -1001,10 +1041,20 @@ class TranscriptMirror:
                     turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                     _limit_reported = False
                     usage_limit_notices.clear_thread(self.thread_id)
+                    # #913: a notification only *starts* a turn between turns;
+                    # one that lands in a person's turn leaves it theirs.
+                    started_by = _prompt_kind(event)
+                    if started_by == "person":
+                        self._turn_by_notification = False
+                    elif started_by == "notification" and not self._turn_open:
+                        self._turn_by_notification = True
+                    if started_by is not None:
+                        self._turn_open = True
 
                 if _is_turn_end(event):
                     # #773: nobody is waiting on this mirror until the next turn.
                     self._turn_active = False
+                    self._turn_open = False
                     # #631: a limit reported for the turn that just ended says
                     # nothing about the next one — the limit may well have reset
                     # in between, and a thread that silently stops explaining why
@@ -1350,6 +1400,10 @@ class TranscriptMirror:
         await self._progress.end_turn()
         if _has_tool_lines(progress) and self._file_sink is not None:
             await self._flush_with_progress(text, progress)
+        elif self._turn_by_notification:
+            # #913: nobody asked — "Still running." after a Monitor event is
+            # not an answer to the last message, so it is not quoted under it.
+            await self._try_sink(text)
         elif self._reply_sink is not None:
             await self._try_reply_sink(text)
         else:
