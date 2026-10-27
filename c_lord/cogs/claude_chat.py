@@ -27,6 +27,7 @@ from discord.ext import commands
 
 from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
+from .. import turn_events
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
@@ -4038,6 +4039,7 @@ class ClaudeChatCog(commands.Cog):
         dashboard: ThreadStatusDashboard | None,
         description: str,
         current_task: asyncio.Task | None,
+        started_by: turn_events.StartedBy | None = None,
     ) -> None:
         """End a turn whose checkout or tmux window could not be set up (#477).
 
@@ -4069,6 +4071,18 @@ class ClaudeChatCog(commands.Cog):
             )
         with contextlib.suppress(Exception):
             await status.set_error()
+        # #917: this turn never reaches ``run_claude_with_config``, so it tells
+        # the event outlet itself — a dispatcher waiting on it hears it is dead.
+        try:
+            info = turn_events.begin_turn(thread, started_by or turn_events.StartedBy("user"))
+            turn_events.end_turn(info)
+            turn_events.finish_turn(info, failure_reason="workspace_setup")
+        except Exception:
+            logger.warning(
+                "%s could not hand the failed start to the event outlet (#917)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
         if self._active_tasks.get(thread.id) is current_task:
             self._active_tasks.pop(thread.id, None)
         if dashboard is not None:
@@ -4107,6 +4121,10 @@ class ClaudeChatCog(commands.Cog):
         # anything". Muting the routine 🟡 must not mute this one: #677/#678
         # each died at startup under the default policy and nobody was told.
         failure_notify_id = _notify_target(requester, self.bot, kind="failure")
+        # #917: who started this turn, for the turn-end event.
+        started_by = turn_events.started_by_from_message(
+            user_message, requester=requester, bot_is_author=_is_self(user_message.author, self.bot)
+        )
 
         # Unbound channel check: verify /clord-init or /clord-thread-init binding
         parent_channel_id = getattr(thread, "parent_id", None) or thread.id
@@ -4241,6 +4259,7 @@ class ClaudeChatCog(commands.Cog):
                         dashboard=dashboard,
                         description=description,
                         current_task=current_task,
+                        started_by=started_by,
                     )
                     return
                 working_dir = session_dir
@@ -4267,6 +4286,7 @@ class ClaudeChatCog(commands.Cog):
                         dashboard=dashboard,
                         description=description,
                         current_task=current_task,
+                        started_by=started_by,
                     )
                     return
                 logger.info("tmux window for thread %d: %s", thread.id, window_name)
@@ -4383,6 +4403,7 @@ class ClaudeChatCog(commands.Cog):
                 # #856: persist the naming pass's stash the moment the row
                 # exists, not on a next naming pass that may never come.
                 on_session_saved=self.on_session_saved,
+                started_by=started_by,
             )
             try:
                 await run_claude_with_config(run_config)

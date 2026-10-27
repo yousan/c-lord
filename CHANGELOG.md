@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **ターンが終わったら外へ 1 件知らせる** — webhook で発注する側（OpenClaw のエージェント・CI など）は、C-lord のターン終わりを Discord のスレッドを読んで推測するしかなかった（実測 98 件: 気づくまで中央値 18 分・最大 62 分、終わっていたのに伝わらなかった件が 3 件）。`CLORD_EVENT_LOG=<path>` を設定すると JSONL を 1 行追記し、`CLORD_EVENT_WEBHOOK_URL` + `CLORD_EVENT_WEBHOOK_SECRET` を設定すると HMAC-SHA256 署名つきで POST する。種類は `completion` / `blocked` / `failure`（`notify_policy.Kind` と同じ）で、**最後の返事を投稿し終えたあと**に出す。背景のサブエージェントが残ったままターンが終わったときは、残りが無くなったターンの終わりまで `completion` を保留する。**どちらも既定は無効で、宛先はサーバの環境変数でしか決まらない**（Discord や発注文から指定させない）。未設定なら動きは変わらない。形・署名の検証・受け手の例は `docs/specs/turn-end-events.md` (#917)
+
 ### Security
 - **REST API は bot を動かしている Unix ユーザーにしか応答しなくなった** — `POST /api/spawn` は新しいスレッドを立てて Claude Code を起動するので、この control-plane ポートに届くことは**そのユーザーのシェルを取ること**と同じ。ところが `127.0.0.1` バインドは*ネットワーク*境界であって *UID* 境界ではなく、同一ホストの**別 Unix ユーザーが無認証で到達できていた**（実測 2026-09-14: `/api/health` 200 / `/api/tasks` 200（スケジュールタスクのプロンプト本文が読める）/ `/api/spawn` 400 = 認証で弾かれずバリデーションまで到達。人間アカウントが11個あり、別ユーザーがもう1つ c-lord を動かしているホスト）。#712 で API が既定起動になるまでは #543 のバグが偶然この露出を止めていた。接続元の UID を `/proc/net/tcp(6)` の 4-tuple 照合で引き（`c_lord/ext/peer_uid.py`）、bot 自身の UID（と root）以外は **403** にした。**`/api/health` も対象** — 以前は誰にでも 200 を返し、ポートスキャンがホスト上の c-lord の一覧になっていた。**利用者の設定は不要**で、自分のユーザーからの呼び出し（セッション内 Claude の curl、`scripts/fuzz`、`staging.sh`）は今までどおり通る。別ユーザー・別ホストを通したいときは `CLORD_API_SECRET` を設定して `Authorization: Bearer …` を送る（自分のユーザーはヘッダー不要 — その secret は同 UID から読めるので要求しても何も守れないうえ、#353 で tmux env から除去されるためセッションは送れない）。UID を証明できない環境（非 Linux）は deny + 起動時 WARNING、明示的な逃がし口は `CLORD_API_ALLOW_ANY_PEER=1`（有効時は起動のたびに警告）。起動ログに毎回「誰に応答するか」が1行出る (#457)
 

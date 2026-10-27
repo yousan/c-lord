@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from .. import turn_events
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
@@ -277,6 +278,10 @@ class WebhookTriggerCog(commands.Cog):
                         # nobody notices — there is no human in the thread to see
                         # the red embed. This is the ping that makes it visible.
                         failure_notify_id=owner_notify_id(self.bot, kind="failure"),
+                        # #917: the turn-end event names the webhook that fired it.
+                        started_by=turn_events.started_by_from_message(
+                            message, requester=None, bot_is_author=False
+                        ),
                     )
                 )
 

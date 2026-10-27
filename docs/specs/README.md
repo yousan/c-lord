@@ -28,6 +28,7 @@
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
 | [input-delivery.md](./input-delivery.md) | 送ったメッセージが Claude に届くこと | 本文・貼り付け・テキスト添付は長さに関係なく全文が届く。届かないときは理由と次の一手が出る |
+| [turn-end-events.md](./turn-end-events.md) | ターン終わりを外へ知らせる | 最後の返事を投稿し終えたあとに `completion` / `blocked` / `failure` を 1 件、JSONL 追記か署名付き POST で出す（既定オフ・宛先はサーバ設定のみ）。背景サブエージェントが残るターンの `completion` は保留する |
 | [attachments.md](./attachments.md) | 添付ファイル | 添付は Claude が開ける実ファイルとして渡る。渡せないときは名前と理由がスレッドに出る（黙って捨てない） |
 | [user-file-delivery.md](./user-file-delivery.md) | Claude が渡すファイル | `SendUserFile` で渡したファイルが実名でスレッドに添付される。渡せないときは名前と理由が出る（黙って捨てない） |
 | [ask-menu-lifecycle.md](./ask-menu-lifecycle.md) | 質問メニュー（❓ ボタン）の一生 | 1質問1枚。押したら本当に届く。**bot を再起動しても押せて、届く**（メニューは出し直さない） (#671) |

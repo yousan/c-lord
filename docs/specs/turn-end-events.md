@@ -1,0 +1,129 @@
+# あるべき動き: ターンが終わったことを、外のプログラムへ1件知らせる
+
+> これは「あるべき動き」。理念 [`docs/PHILOSOPHY.md`](../PHILOSOPHY.md) の下位。迷ったら理念に照らす。
+
+## これは何か・なぜ要るか
+
+webhook で C-lord に仕事を出す側（OpenClaw のエージェント、CI、ダッシュボード）は、これまで
+「ターンが終わったか」を **Discord のスレッドを定期的に読んで推測**するしかなかった。
+実測（2026-09-28〜10-14、発注 98 件）では、終わってから発注側が気づくまで **中央値 18 分・最大 62 分**。
+依頼主の催促 9 件のうち 3 件は、C-lord はもう終わっていたのに伝わっていなかった（最長 約 26 時間）。
+
+C-lord 自身はターンの終わり方を知っている（`c_lord/notify_policy.py` の `completion` / `blocked` / `failure`）。
+その事実を **サーバ側の設定でだけ**外へ出す口がこの機能。特定のツール向けの作りではなく、
+JSONL を `tail -F` する CI も、署名付き POST を受ける別のエージェントも、同じ口を使える。
+
+Claude Code の Stop フックでは足りない。**最後の返事が Discord に投稿される前に鳴る**ので、
+受け手がスレッドを読みに行くと「まだ」に見える。ここでは**最後の返事を投稿し終えたあと**に出す。
+
+## 使い方（設定）
+
+どちらも**既定は無効**。両方とも未設定なら C-lord は何も書かず、何も送らず、動きは今までと同じ。
+
+| 環境変数 | 意味 |
+|---|---|
+| `CLORD_EVENT_LOG=<path>` | 1行1イベントの JSONL を追記する（ディレクトリは無ければ作る） |
+| `CLORD_EVENT_WEBHOOK_URL=<url>` | イベントの JSON を POST する送り先（`http://` / `https://` のみ） |
+| `CLORD_EVENT_WEBHOOK_SECRET=<secret>` | POST の署名鍵。**無いと POST しない**（署名の無い通知は偽物と見分けがつかない） |
+| `CLORD_EVENT_DEFER_MAX_SECONDS=<秒>` | 背景サブエージェントを待つ `completion` の保留の上限。既定 `3600` |
+
+宛先は**サーバの環境変数でだけ**決まる。発注文・Discord のメッセージ・REST API からは指定できない
+（誰でも書き込めるところから宛先を変えられると、内部アドレスへの送信（SSRF）やイベントの横取りになる）。
+
+## イベント
+
+```json
+{
+  "v": 1,
+  "event_id": "5f0c…",
+  "kind": "completion",
+  "guild_id": "1285582352596209694",
+  "channel_id": "1505747831447883806",
+  "thread_id": "1564455512194424852",
+  "last_message_id": "1566000000000000000",
+  "started_by": {"type": "webhook", "id": "1500000000000000000", "name": "Captain Hook"},
+  "turn_started_at": "2026-10-27T00:00:00Z",
+  "ended_at": "2026-10-27T00:12:34Z"
+}
+```
+
+ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で丸まるため）。
+
+| フィールド | 意味 |
+|---|---|
+| `v` | 形のバージョン。いまは `1`。フィールドが増えることはあっても、意味が変わることはない |
+| `event_id` | イベント1件ごとの一意な ID。再送で同じ本文が2回届いたときの重複排除に使う |
+| `kind` | `completion`（ターンが終わった）/ `blocked`（メニューで止まっている）/ `failure`（失敗した） |
+| `last_message_id` | `completion` / `failure`: そのターンで C-lord が**最後に投稿した返事**（本文）のメッセージ。無ければ `null`。`blocked`: 選択メニューのメッセージ |
+| `started_by.type` | `user` / `webhook` / `scheduler` / `api`。`webhook` のときは webhook の id と表示名、`scheduler` のときはタスクの id と名前が入る |
+| `reason` | `failure` のときだけ（と、後述の `completion` の保留が時間切れになったとき）。短いコード。**エラー本文は入れない**（パスやペインの内容が混ざるため） |
+
+`last_message_id` は**返事の本文**であって、その後ろに付く `📊 …context` の統計行や 🟡 のメンションではない。
+受け手が「ここから読む」ための印として使う。
+
+### `kind` と出るタイミング
+
+- **`completion`**: 普通にターンが終わった。最後の返事と統計行を投稿し終えたあとに **1 件だけ**。
+- **`blocked`**: AskUserQuestion や plan 承認のメニューが Discord に出て、誰かの答えを待っている。**メニューを出した時点**で 1 件（質問が複数でも 1 件）。答えが返ってターンが終わると、あとで `completion` が出る。
+  許可プロンプトはペイン内で自動承認されて Discord に出ないので、`blocked` にはならない。
+- **`failure`**: 起動できなかった（`workspace_setup`）・クラッシュした（`crashed`）・タイムアウトした（`timeout`）・
+  プラン上限に当たった（`usage_limit`）・ログアウトしている（`login_required`）・モデルが使えない（`model_unavailable`）・
+  応答が無かった（`no_response`）・ユーザーが止めた（`stopped`）・その他のエラー（`error`）。
+- **出ないとき**: 次のメッセージで置き換えられたターン（`preempted`）と、キャンセルされたターンは出さない。
+  そのスレッドの次のターンの終わりが出す。
+
+### 背景のサブエージェントが残っているとき
+
+Claude のターンが、`run_in_background` で起動した**サブエージェントを待たずに終わる**ことがある。
+そのあと各エージェントが戻ってくるたび、Claude Code が**自動で次のターンを始める**。
+最初の終わりで `completion` を出すと、答えができる何分も前に「終わった」と伝えてしまう。
+
+そこで、ターンが終わった時点でサブエージェントが残っていると**判別できる**ときは、
+`completion` を出さずに保留し、**残りが無い状態で終わったターン**の終わりに 1 件出す（`last_message_id` はその最後の返事）。
+
+判別できないときは**待たずに出す**。限界は次のとおり:
+
+- 数えているのは Claude Code の記録（jsonl）に出る**サブエージェント**だけ。背景で動かしたシェルコマンドは数えない。
+- 数は C-lord のメモリ上にしか無い。**C-lord を再起動すると忘れる**ので、再起動をまたいだ保留は最初のターン終わりで出てしまう。
+- ターン終わりの印（`turn_duration`）を記録に書かない古い Claude Code では、残りを読めないので待たずに出す。
+- 戻ってこないエージェントのせいで永遠に出ないことを避けるため、保留は `CLORD_EVENT_DEFER_MAX_SECONDS`（既定 1 時間）で解け、
+  `"reason": "background_agents_unresolved"` を付けて出す。
+- 保留中に同じスレッドへ新しいメッセージが来て新しいターンが始まったら、保留していた `completion` は捨てる。
+  その新しいターンの終わりが、スレッドの終わりとして出る（`started_by` は新しいターンのもの）。
+
+## 受け手の例
+
+### JSONL を `tail -F` する
+
+```bash
+tail -n0 -F /home/yousan/c-lord/data/turn-events.jsonl | while read -r line; do
+  kind=$(jq -r .kind <<<"$line"); thread=$(jq -r .thread_id <<<"$line")
+  [ "$kind" = completion ] && echo "thread $thread finished; read from $(jq -r .last_message_id <<<"$line")"
+done
+```
+
+発注した `thread_id` の行だけを見る。同じファイルに全スレッドのイベントが流れる。
+
+### 署名を検証して POST を受ける
+
+署名は**本文のバイト列そのもの**の HMAC-SHA256（16進）を `X-Clord-Signature: sha256=<hex>` に入れる。
+JSON にパースし直してから検証しない（キーの順や空白が変わると合わなくなる）。
+
+```python
+import hashlib, hmac, json
+
+def verify(secret: bytes, body: bytes, header: str) -> dict | None:
+    expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, header):
+        return None  # 偽物 — 捨てる
+    return json.loads(body)
+```
+
+送信は 2xx が返れば成功。5xx・408・429・接続失敗は 1 秒・5 秒・30 秒あけて最大 3 回再送する
+（同じ `event_id` で届く）。それ以外の 4xx は再送しない。リダイレクトは辿らない。
+どの失敗もログに残るだけで、**ターンの後処理と Discord への投稿は止まらない**。
+
+## 変えていないこと
+
+- 両方の環境変数が未設定のとき、C-lord の動きは変わらない。
+- Discord に出るメッセージ・リアクション・メンションは変わらない（`notify_policy` の `CLORD_OWNER_FALLBACK` とは独立）。

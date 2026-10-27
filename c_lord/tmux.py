@@ -97,7 +97,14 @@ SESSION_NAME = "clord"
 # This is NOT confidentiality. The token stays readable at the bot's ``.env``,
 # and the injected ``discord-read`` skill (#259) tells Claude to read it there —
 # see docs/SECURITY.md. What this prevents is *accidental inheritance*.
-SENSITIVE_ENV_KEYS = ("DISCORD_BOT_TOKEN", "CLORD_API_SECRET")
+SENSITIVE_ENV_KEYS = (
+    "DISCORD_BOT_TOKEN",
+    "CLORD_API_SECRET",
+    # #917: the signing key of the turn-end event POST, and its URL, which may
+    # carry a token of its own.
+    "CLORD_EVENT_WEBHOOK_SECRET",
+    "CLORD_EVENT_WEBHOOK_URL",
+)
 # Short window prefix (#356): windows are named ``w1``, ``w2``, … so the tmux
 # window list / status bar stays compact (``w73`` instead of ``work73``).
 WINDOW_PREFIX = "w"
