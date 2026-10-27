@@ -230,7 +230,7 @@ def api_error_embed(detail: str, advice: str) -> discord.Embed:
     """
     return discord.Embed(
         title="\u274c Claude Code が API エラーで止まりました",
-        description=f"{advice}\n\n-# {detail[:3800]}",
+        description=f"{advice}\n\n原文: {detail[:3800]}",
         color=COLOR_ERROR,
     )
 
