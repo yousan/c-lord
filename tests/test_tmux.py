@@ -99,9 +99,8 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=0),
                 # _ensure_session → new-session
                 MagicMock(returncode=0),
-                # #353: set-environment -r ×2 (secrets removed for new windows)
-                MagicMock(returncode=0),
-                MagicMock(returncode=0),
+                # #353: set-environment -r ×len(SENSITIVE_ENV_KEYS) (secrets removed for new windows)
+                *[MagicMock(returncode=0)] * len(SENSITIVE_ENV_KEYS),
                 # #649: re-check under the session lock → _rebuild_mapping → list-windows
                 MagicMock(returncode=1, stdout=""),
                 # _find_window_by_working_dir → list-windows (no windows yet)
@@ -183,8 +182,8 @@ class TestTmuxSessionManager:
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout=""),  # rebuild: list-windows
                 MagicMock(returncode=0),  # has-session (exists)
-                MagicMock(returncode=0),  # #353 set-environment -r ×2
-                MagicMock(returncode=0),
+                # #353 set-environment -r, once per secret
+                *[MagicMock(returncode=0)] * len(SENSITIVE_ENV_KEYS),
                 MagicMock(returncode=1, stdout=""),  # #649 re-check under lock: list-windows
                 MagicMock(
                     returncode=0, stdout=""
@@ -494,8 +493,8 @@ class TestTmuxSessionManager:
             mock_run.return_value = MagicMock(returncode=0)
             assert mgr._ensure_session() is True
 
-        # has-session + 2× set-environment -r (#353); no new-session
-        assert mock_run.call_count == 3
+        # has-session + one set-environment -r per secret (#353); no new-session
+        assert mock_run.call_count == 1 + len(SENSITIVE_ENV_KEYS)
         marked = {c[0][0][-1] for c in mock_run.call_args_list if "set-environment" in c[0][0]}
         assert marked == set(SENSITIVE_ENV_KEYS)
 
@@ -513,8 +512,8 @@ class TestTmuxSessionManager:
                 # systemd-run) is covered in tests/test_tmux_server_cgroup.py.
                 MagicMock(returncode=0),
                 MagicMock(returncode=0),  # new-session → success
-                MagicMock(returncode=0),  # #353 set-environment -r ×2
-                MagicMock(returncode=0),
+                # #353 set-environment -r, once per secret
+                *[MagicMock(returncode=0)] * len(SENSITIVE_ENV_KEYS),
             ]
             assert mgr._ensure_session() is True
 
@@ -1161,8 +1160,8 @@ class TestTmuxSessionManager:
                 MagicMock(returncode=1),  # has-session → not exists
                 MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session → success
-                MagicMock(returncode=0),  # #353 set-environment -r ×2
-                MagicMock(returncode=0),
+                # #353 set-environment -r, once per secret
+                *[MagicMock(returncode=0)] * len(SENSITIVE_ENV_KEYS),
             ]
             assert mgr._ensure_session() is True
 
@@ -1944,8 +1943,8 @@ class TestSortWindows:
                 MagicMock(returncode=1),  # has-session (no)
                 MagicMock(returncode=0),  # #503: list-sessions → server already up
                 MagicMock(returncode=0),  # new-session
-                MagicMock(returncode=0),  # #353 set-environment -r ×2
-                MagicMock(returncode=0),
+                # #353 set-environment -r, once per secret
+                *[MagicMock(returncode=0)] * len(SENSITIVE_ENV_KEYS),
                 MagicMock(returncode=1, stdout=""),  # #649 re-check under the lock
                 MagicMock(returncode=1, stdout=""),  # _find_window_by_working_dir
                 MagicMock(returncode=1, stdout=""),  # #427 list-windows -a: nothing elsewhere
