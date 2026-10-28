@@ -2524,3 +2524,62 @@ async def test_human_turn_is_still_a_reply(tmp_path: Path) -> None:
         tmp_path, _user_str("進捗どう？"), _assistant_text("半分まで来ました。")
     )
     assert reply_calls == ["半分まで来ました。"]
+
+
+async def test_an_api_error_is_one_line_without_the_terminal_steps(tmp_path: Path) -> None:
+    """#908 AC4: the CLI's 'Double press esc…' never reaches Discord, and the
+    runner learns the turn ended on the error."""
+    from datetime import datetime, timedelta, timezone
+
+    from c_lord.turn_end_bus import turn_end_bus
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    flagged = (
+        "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup)."
+        " You may be seeing this for the first time.\n\n"
+        "Double press esc to edit your last message, or try a different model with /model."
+    )
+    start = datetime.now(timezone.utc) - timedelta(seconds=5)  # noqa: UP017
+    turn_end_bus.forget(9081)
+    turn_end_bus.note_prompt(9081)
+    mirror = TranscriptMirror(
+        thread_id=9081, project_dir=project, sink=sink, verbosity="minimal", poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(
+            jsonl,
+            {
+                "type": "assistant",
+                "isApiErrorMessage": True,
+                "error": "invalid_request",
+                "message": {
+                    "model": "<synthetic>",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": flagged}],
+                },
+            },
+        )
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration", "durationMs": 10})
+        await asyncio.sleep(0.4)
+        ended_on = turn_end_bus.api_error_since(9081, start)
+    finally:
+        await mirror.stop()
+        turn_end_bus.forget(9081)
+
+    joined = "\n".join(posted)
+    assert "Double press esc" not in joined
+    assert "-# ⚠️ API Error: Opus 5.5's safeguards flagged this session" in joined
+    assert ended_on is not None and "safeguards flagged" in ended_on

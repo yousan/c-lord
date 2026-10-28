@@ -628,6 +628,21 @@ the final state after the keystrokes, from the best evidence available:
 2. **The pane**, when there is no transcript to read: "the menu is gone". Weaker
    — it cannot tell a real answer from a discarded one — but far better than the
    pre-#651 answer of not looking at all.
+3. **The pane, for a menu the transcript never records (#911).** Claude Code
+   draws some menus of its own — the safeguard "Model switch" (Stay on Opus /
+   Switch to Sonnet) — in the AskUserQuestion layout, so they are bridged like
+   one, but the CLI writes **no** ask for them and the watch for "the next ask
+   written" never ended (⏳ for days, production 2026-10-13). While no ask has
+   been found for the menu, `_MenuRef` also asks the runner's
+   `peek_menu_closed()`: once the pane has positively shown **no menu at all**
+   for `_PANE_CLOSED_GRACE = 3s` and the transcript still holds no ask, the menu
+   is taken as answered (logged `… a menu of the CLI's own, taken as answered (#911)`).
+   "No menu" excludes the next question of the same ask, the multi-question
+   Submit screen, an empty capture and a dead pane — those reset the clock. The
+   3s dwell lets a real ask whose `tool_use` is written together with its result
+   as the menu closes be judged by that result instead. The restart recovery
+   below resolves each thread's pane the same way, so a ⏳ left on such a menu is
+   corrected on startup.
 
 | verified outcome | what the thread shows |
 |---|---|
