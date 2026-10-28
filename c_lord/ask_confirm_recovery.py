@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -80,11 +81,18 @@ async def resume_confirming_menus(
     *,
     projects_root: Path | None = None,
     started_at: dt.datetime | None = None,
+    runner_factory: Callable[[Bot, int], Awaitable[Any]] | None = None,
 ) -> int:
     """Restart the watch of every ⏳ menu a previous process left. Never raises.
 
-    Returns how many menus are being watched again.
+    Returns how many menus are being watched again. *runner_factory* resolves a
+    thread's pane: a menu the CLI drew itself writes no ask, and the pane is
+    the only thing that can say it closed (#911).
     """
+    if runner_factory is None:
+        from .ask_menu_recovery import _default_runner_factory
+
+        runner_factory = _default_runner_factory
     me = getattr(bot, "user", None)
     if me is None:
         return 0
@@ -108,7 +116,9 @@ async def resume_confirming_menus(
             if not last or discord.utils.snowflake_time(last) < oldest:
                 continue
             try:
-                resumed += await _resume_thread(thread, repo, me.id, before, oldest, projects_root)
+                resumed += await _resume_thread(
+                    thread, repo, me.id, before, oldest, projects_root, bot, runner_factory
+                )
             except Exception:
                 logger.info(
                     "%s confirming-menu recovery: could not read this thread — its ⏳ menus "
@@ -131,6 +141,8 @@ async def _resume_thread(
     before: discord.Object,
     oldest: dt.datetime,
     projects_root: Path | None,
+    bot: Bot,
+    runner_factory: Callable[[Bot, int], Awaitable[Any]],
 ) -> int:
     record = await repo.get(thread.id)
     working_dir = getattr(record, "working_dir", None)
@@ -149,13 +161,20 @@ async def _resume_thread(
         )
         if menu is None:
             continue
-        await _resume_one(message, menu, project_dir, thread.id)
+        pane = None
+        with contextlib.suppress(Exception):
+            pane = await runner_factory(bot, thread.id)
+        await _resume_one(message, menu, project_dir, thread.id, pane)
         resumed += 1
     return resumed
 
 
 async def _resume_one(
-    message: discord.Message, menu: ConfirmingMenu, project_dir: Path, thread_id: int
+    message: discord.Message,
+    menu: ConfirmingMenu,
+    project_dir: Path,
+    thread_id: int,
+    pane: object | None = None,
 ) -> None:
     menu_at = _transcript_stamp(message.created_at)
     found: FoundAsk | None = None
@@ -166,6 +185,7 @@ async def _resume_one(
         ask=(found.tool_use_id, found.session_path) if found else None,
         after=menu_at,
         question=menu.question,
+        pane=pane,
     )
     logger.info(
         "%s confirming-menu recovery: watching menu %s again for %s (#786)",

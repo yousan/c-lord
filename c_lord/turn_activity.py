@@ -12,6 +12,13 @@ This module is the hand-off, in the same spirit as
 :mod:`c_lord.turn_end_bus`: the mirror :meth:`~TurnActivity.note` s each event,
 and the turn's lamp :meth:`~TurnActivity.subscribe` s while the turn runs.
 
+Silence is not the only test, though (#905): one long command — a build, a
+CI wait — writes its ``tool_use`` when it starts and its ``tool_result`` when
+it returns, and nothing in between.  So :meth:`~TurnActivity.note` also takes
+the ids of the calls an event opened and closed, and
+:meth:`~TurnActivity.running` tells the lamp a call is still out — the same
+rule the progress line has used since #757.
+
 One listener per thread — a thread runs one turn at a time, and the newest
 turn is the one whose lamp is live.  Everything runs on the asyncio loop, so no
 locking is needed.  A listener that raises is logged and ignored: the lamp is
@@ -21,7 +28,7 @@ decoration and must never take the mirror (the delivery path) down with it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +40,26 @@ class TurnActivity:
 
     def __init__(self) -> None:
         self._listeners: dict[int, Listener] = {}
+        # Tool calls whose result has not been written yet, per thread (#905).
+        self._open: dict[int, set[str]] = {}
 
     def subscribe(self, thread_id: int, listener: Listener) -> Callable[[], None]:
         """Route *thread_id*'s activity to *listener*; returns the unsubscriber.
 
         The unsubscriber only removes *this* listener — a turn unwinding after
         the next one has already subscribed must not silence the next one.
+
+        A new turn starts with no open calls: one the previous turn left open
+        (the session died mid-call, so its result was never written) must not
+        keep this one looking busy.
         """
         self._listeners[thread_id] = listener
+        self._open.pop(thread_id, None)
 
         def unsubscribe() -> None:
             if self._listeners.get(thread_id) is listener:
                 del self._listeners[thread_id]
+                self._open.pop(thread_id, None)
 
         return unsubscribe
 
@@ -56,11 +71,28 @@ class TurnActivity:
         """
         return self._listeners.get(thread_id) is listener
 
-    def note(self, thread_id: int) -> None:
-        """The transcript showed *thread_id*'s session doing something."""
+    def running(self, thread_id: int) -> bool:
+        """Is a tool call in *thread_id* still waiting for its result? (#905)"""
+        return bool(self._open.get(thread_id))
+
+    def note(
+        self,
+        thread_id: int,
+        *,
+        started: Iterable[str] = (),
+        finished: Iterable[str] = (),
+    ) -> None:
+        """The transcript showed *thread_id*'s session doing something.
+
+        *started* / *finished* are the ids of the tool calls the event opened
+        (``tool_use``) and closed (``tool_result``).
+        """
         listener = self._listeners.get(thread_id)
         if listener is None:
             return
+        open_calls = self._open.setdefault(thread_id, set())
+        open_calls.update(started)
+        open_calls.difference_update(finished)
         try:
             listener()
         except Exception:

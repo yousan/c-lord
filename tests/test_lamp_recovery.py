@@ -146,3 +146,48 @@ async def test_a_lamp_that_cannot_be_read_is_skipped() -> None:
     msg = MagicMock()
     type(msg).reactions = property(lambda self: (_ for _ in ()).throw(RuntimeError("x")))
     await adopt_orphaned_lamp(msg, thread_id=7187, turn_running=_running(False), **FAST)
+
+
+# ── #907: how the watch ended decides whether the turn gets its closing ─────
+
+
+@pytest.mark.asyncio
+async def test_a_turn_over_at_adoption_reports_over() -> None:
+    msg = _Message(EMOJI_RUNNING)
+    got = await adopt_orphaned_lamp(msg, thread_id=9070, turn_running=_running(False), **FAST)
+    assert got == "over"
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_ends_while_watched_reports_ended() -> None:
+    msg = _Message(EMOJI_RUNNING)
+    task = asyncio.create_task(
+        adopt_orphaned_lamp(msg, thread_id=9071, turn_running=_running(True), **FAST)
+    )
+    await asyncio.sleep(0.1)
+    turn_end_bus.mark(9071)
+    assert await asyncio.wait_for(task, 1) == "ended"
+
+
+@pytest.mark.asyncio
+async def test_a_displaced_turn_reports_nothing() -> None:
+    """Like an interrupted turn (#583): the newer turn does the closing."""
+    msg = _Message(EMOJI_RUNNING)
+    task = asyncio.create_task(
+        adopt_orphaned_lamp(msg, thread_id=9072, turn_running=_running(True), **FAST)
+    )
+    await asyncio.sleep(0.1)
+    new = StatusManager(_Message(), thread_id=9072)
+    await new.set_running()
+    try:
+        assert await asyncio.wait_for(task, 1) is None
+    finally:
+        await new.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_no_open_lamp_reports_nothing() -> None:
+    msg = _Message(EMOJI_WAITING)
+    assert (
+        await adopt_orphaned_lamp(msg, thread_id=9073, turn_running=_running(False), **FAST) is None
+    )

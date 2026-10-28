@@ -294,6 +294,11 @@ class StatusManager:
                 )
                 await self.set_waiting()
                 return
+            if self._thread_id is not None and turn_activity.running(self._thread_id):
+                # #905: a call is still out — one long command writes nothing
+                # until it returns. That is work, not a stall: the progress
+                # line says 作業中 for the same reason (#757).
+                self._reset_stall_timer()
             elapsed = asyncio.get_running_loop().time() - self._last_activity
 
             if elapsed < STALL_SOFT_SECONDS and self._current_emoji in (
