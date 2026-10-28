@@ -339,6 +339,25 @@ def _is_slash_command_marker(text: str) -> bool:
     return _COMMAND_MARKER_RE.match(text) is not None
 
 
+def local_command_record(event: dict[str, Any]) -> str | None:
+    """``"name"`` / ``"output"`` for a pane slash command's records, else ``None`` (#944).
+
+    A local command (``/compact``, ``/config``, …) runs no model turn, so no
+    ``turn_duration`` follows it: its ``<local-command-stdout>`` — written even
+    when empty — is the only sign it finished.
+    """
+    if event.get("type") != "user" or event.get("isMeta"):
+        return None
+    msg = event.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, str):
+        return None
+    stripped = content.strip()
+    if not _is_slash_command_marker(stripped):
+        return None
+    return "output" if _LOCAL_STDOUT_RE.match(stripped) else "name"
+
+
 def _render_slash_command(text: str, session_id: str | None) -> RenderedEvent | None:
     """Render a slash-command marker as tool activity, or ``None`` to drop it.
 

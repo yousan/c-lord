@@ -54,7 +54,7 @@ from ..usage_limit import (
     usage_limit_notices,
 )
 from ..utils.logger import log_ctx
-from .formatter import ZWSP_MARKER, RenderedEvent, render_event
+from .formatter import ZWSP_MARKER, RenderedEvent, local_command_record, render_event
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
@@ -1101,7 +1101,12 @@ class TranscriptMirror:
                 # yet) from a turn that has genuinely gone quiet.
                 opened, closed = _tool_call_ids(event)
                 is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
-                if is_tool or opened or closed:
+                # #944: a slash command typed in the pane is not model work, and
+                # nothing but its output says it is over (no ``turn_duration``).
+                local_command = local_command_record(event)
+                if local_command == "output":
+                    await self._progress.end_turn()
+                elif local_command is None and (is_tool or opened or closed):
                     self._progress.begin_turn()
                     self._progress.note_activity(
                         rendered.body

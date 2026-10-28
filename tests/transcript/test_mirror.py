@@ -2502,3 +2502,71 @@ async def test_an_api_error_is_one_line_without_the_terminal_steps(tmp_path: Pat
     assert "Double press esc" not in joined
     assert "-# ⚠️ API Error: Opus 5.5's safeguards flagged this session" in joined
     assert ended_on is not None and "safeguards flagged" in ended_on
+
+
+# -- #944: a local slash command typed in the pane is not a model turn --------
+
+
+def _local_compact_events() -> list[dict]:
+    """What CLI 2.1.312 writes for ``/compact`` typed in the pane (#944)."""
+    return [
+        _user_str("/compact"),
+        _user_str("<command-name>/compact</command-name>"),
+        {"type": "system", "subtype": "compact_boundary"},
+        _user_str(
+            "<local-command-stdout>\x1b[2mCompacted (ctrl+o to see full summary)\x1b[22m"
+            "</local-command-stdout>"
+        ),
+    ]
+
+
+async def _run_progress(tmp_path: Path, thread_id: int, events: list[dict]) -> _ProgressSpy:
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=thread_id,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        for ev in events:
+            _write_event(jsonl, ev)
+        await asyncio.sleep(0.3)
+        clock.advance(178.0)
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+    return spy
+
+
+async def test_pane_compact_leaves_no_waiting_line(tmp_path: Path) -> None:
+    """AC1: no ``turn_duration`` follows a local command, so its output ends it."""
+    spy = await _run_progress(tmp_path, 9441, _local_compact_events())
+    assert spy.posts == [], spy.posts
+
+
+async def test_local_command_with_empty_output_also_ends_it(tmp_path: Path) -> None:
+    """``/clear`` & co. write an empty ``<local-command-stdout>`` — still the end."""
+    events = [
+        _user_str("/config"),
+        _user_str("<command-name>/config</command-name>"),
+        _user_str("<local-command-stdout></local-command-stdout>"),
+    ]
+    spy = await _run_progress(tmp_path, 9442, events)
+    assert spy.posts == [], spy.posts
+
+
+async def test_a_real_request_after_a_local_command_still_gets_its_line(tmp_path: Path) -> None:
+    """AC2's neighbour: the next human prompt arms the line as usual."""
+    events = [*_local_compact_events(), _user_str("続きを調べて"), _assistant_tool_use("Bash", "ls")]
+    spy = await _run_progress(tmp_path, 9443, events)
+    assert spy.posts, "the next real request lost its progress line"
