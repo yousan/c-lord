@@ -758,3 +758,73 @@ def test_dir_size_falls_back_when_du_has_no_dash_b(tmp_path, monkeypatch) -> Non
 
     monkeypatch.setattr(subprocess, "run", bsd_du)
     assert sm._dir_size_bytes(str(tmp_path)) == 1234
+
+
+class TestWorkspaceCleanupFieldLimit:
+    """候補が多くても embed field の 1024 字上限を超えない (#824)。"""
+
+    def _cog_with_dirs(self, n: int):
+        from c_lord.session_dir import SessionDirInfo
+
+        cog = _make_cog()
+        cog.bot.session_registry.list_active = MagicMock(return_value=[])
+        dirs = [
+            SessionDirInfo(
+                path=f"/home/user/c-lord-sessions/1505747831447883806/{1550000000000000000 + i}",
+                thread_id=1550000000000000000 + i,
+                source_repo="https://github.com/yousan/c-lord",
+                commit="abc",
+                is_clean=i % 2 == 0,
+            )
+            for i in range(n)
+        ]
+        sdm = MagicMock()
+        sdm.find_session_dirs = MagicMock(return_value=dirs)
+        cog._get_all_bindings = AsyncMock(return_value=[{"channel_id": 1}])
+        cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
+        return cog
+
+    async def test_dry_run_with_many_candidates_fits_every_field(self):
+        cog = self._cog_with_dirs(60)
+        respond, ack, sent = _capture_responder()
+
+        await cog._workspace_cleanup_impl(dry_run=True, respond=respond, ack=ack)
+
+        embed = sent[-1]["embed"]
+        assert embed is not None
+        assert len(embed.fields) == 2
+        for field in embed.fields:
+            assert len(field.value) <= 1024, f"{field.name}: {len(field.value)} chars"
+        assert len(embed) <= 6000
+
+    async def test_dry_run_says_how_many_paths_were_left_out(self):
+        cog = self._cog_with_dirs(60)
+        respond, ack, sent = _capture_responder()
+
+        await cog._workspace_cleanup_impl(dry_run=True, respond=respond, ack=ack)
+
+        embed = sent[-1]["embed"]
+        for field, total in zip(embed.fields, (30, 30), strict=True):
+            shown = field.value.count("`/home/user/")
+            assert 0 < shown < total
+            assert field.value.endswith(f"…他 {total - shown} 件")
+
+    async def test_dry_run_with_few_candidates_lists_them_all(self):
+        cog = self._cog_with_dirs(4)
+        respond, ack, sent = _capture_responder()
+
+        await cog._workspace_cleanup_impl(dry_run=True, respond=respond, ack=ack)
+
+        embed = sent[-1]["embed"]
+        assert [f.value.count("`/home/user/") for f in embed.fields] == [2, 2]
+        assert all("他" not in f.value for f in embed.fields)
+
+
+def test_fit_field_lines_edges() -> None:
+    """空は「—」、1行が上限より長くても件数だけは出る (#824)。"""
+    from c_lord.cogs.session_manage import _fit_field_lines
+
+    assert _fit_field_lines([]) == "—"
+    assert _fit_field_lines(["x" * 2000]) == "…他 1 件"
+    out = _fit_field_lines(["y" * 100] * 50)
+    assert len(out) <= 1024 and out.endswith(f"…他 {50 - out.count('y' * 100)} 件")

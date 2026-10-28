@@ -236,7 +236,7 @@ first message). See [specs/thread-name.md](specs/thread-name.md).
 
 | Command | Description | Where |
 |---------|-------------|-------|
-| `/workspace-cleanup [dry_run]` | Reclaim the working directories of workspaces nothing is using | Anywhere |
+| `/workspace-cleanup [dry_run]` | Reclaim the working directories of workspaces nothing is using. Long lists show what fits and end with `…他 N 件` (#824) | Anywhere |
 | `/tmux-list` | List all active tmux windows | Anywhere |
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane — a stopped workspace is restored first (debug) | Thread only |
 | `/workspace-stop` | **停止**: close the tmux window, keep the session (see below) | Thread only |
