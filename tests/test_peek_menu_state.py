@@ -87,3 +87,33 @@ async def test_peek_pending_ask_ignores_dead_pane() -> None:
     """The post-turn recovery peek must not resurrect a corpse either."""
     ghost = (_FIX / "ghost_menu_dead_pane.txt").read_text()
     assert await _runner_with_command(ghost, "zsh").peek_pending_ask() is None
+
+
+# -- #911: peek_menu_closed — the evidence for a menu the CLI draws itself ------
+# Stricter than peek_menu_state: only a healthy capture of a live claude with no
+# menu, and no Submit screen, says "closed". Anything else is "cannot say".
+
+
+async def test_closed_when_live_pane_shows_no_menu() -> None:
+    runner = _runner_with_command("● Done.\n\n❯ \n", "claude")
+    assert await runner.peek_menu_closed() is True
+
+
+async def test_not_closed_while_a_menu_is_open() -> None:
+    menu_text = (_FIX / "ask_context_prose_above_menu.txt").read_text()
+    assert await _runner_with_command(menu_text, "claude").peek_menu_closed() is False
+
+
+async def test_not_closed_on_the_submit_screen() -> None:
+    """A multi-question ask's answers are written only after Submit."""
+    submit = (_FIX / "ask_user_question_submit_screen.txt").read_text()
+    assert await _runner_with_command(submit, "claude").peek_menu_closed() is False
+
+
+async def test_empty_capture_cannot_say() -> None:
+    assert await _runner_with_command("  \n", "claude").peek_menu_closed() is None
+
+
+async def test_dead_pane_cannot_say() -> None:
+    ghost = (_FIX / "ghost_menu_dead_pane.txt").read_text()
+    assert await _runner_with_command(ghost, "zsh").peek_menu_closed() is None
