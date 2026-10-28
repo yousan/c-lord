@@ -19,6 +19,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from c_lord.transcript.mirror import TranscriptMirror
 
 from .helpers import clord_transcript
@@ -219,3 +221,39 @@ async def test_an_interrupted_turns_tool_log_is_not_attached_to_the_new_answer(
 
     assert sinks.files == [], f"the new answer carried the old turn's progress.txt: {sinks.files}"
     assert [(t, _quoted(kw)) for t, kw in sinks.replies] == [("了解", "current")]
+
+
+@pytest.mark.parametrize(
+    "notification",
+    [
+        "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n"
+        "</task-notification>",
+        # Nothing to show: rendered as nothing at all, which is also what a
+        # c-lord prompt looks like to the flush below — still not a person.
+        "<task-notification>\n</task-notification>",
+    ],
+)
+async def test_a_notification_landing_mid_turn_does_not_end_the_turn(
+    tmp_path: Path, notification: str
+) -> None:
+    """#913 × #912: a background task's notification is a ``user`` string too,
+    but it does not end the person's turn — the text held when it lands is a
+    mid-turn line, not the answer, and must not go out as a reply."""
+    sinks = _Sinks()
+    mirror, jsonl = await _mirror(tmp_path, sinks)
+    try:
+        mirror.note_turn_started(trigger_id=OLD)
+        _write(jsonl, _prompt("調べて"))
+        _write(jsonl, _text("裏で調査を走らせました。"))
+        await asyncio.sleep(0.2)
+        _write(jsonl, _prompt(notification))
+        await asyncio.sleep(0.2)
+        _write(jsonl, _text("調査が終わりました。原因は X です。"))
+        _write(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert [(t, _quoted(kw)) for t, kw in sinks.all()] == [
+        ("調査が終わりました。原因は X です。", "current")
+    ]
