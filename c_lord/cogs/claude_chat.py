@@ -19,7 +19,8 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import discord
 from discord import app_commands
@@ -62,11 +63,13 @@ from ..discord_ui.views import (
 )
 from ..gateway_backfill import (
     HISTORY_LIMIT,
+    OUTAGE_SETTING,
     Cause,
     GatewayWatch,
     MissedEntry,
     Outage,
     Outcome,
+    PreviousOutage,
     SeenMessages,
     Startup,
     last_mark_before,
@@ -121,7 +124,7 @@ from ..utils.logger import log_ctx
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
 from ..workspace_notice import restored_devenv_notice
-from ._run_helper import run_claude_with_config
+from ._run_helper import _post_context_usage, run_claude_with_config
 from .run_config import RunConfig
 
 if TYPE_CHECKING:
@@ -218,6 +221,11 @@ def _explicit_thread_name(thread_name: str | None) -> str:
         if line.strip():
             return line.strip()[:_DISCORD_NAME_LEN]
     return ""
+
+
+# #907: how long the closing of a turn that ended while c-lord was down waits,
+# so the mirror's catch-up of its answer (#215) is posted first.
+RECOVERED_TURN_END_GRACE_SECONDS = 10.0
 
 
 def _requester_of_turn(
@@ -2927,12 +2935,88 @@ class ClaudeChatCog(commands.Cog):
             # #870: visible to the next shutdown while the watch lasts.
             self._adopted_lamps[thread.id] = message.id
             try:
-                await adopt_orphaned_lamp(message, thread_id=thread.id, turn_running=turn_running)
+                ended = await adopt_orphaned_lamp(
+                    message, thread_id=thread.id, turn_running=turn_running
+                )
             finally:
                 if self._adopted_lamps.get(thread.id) == message.id:
                     del self._adopted_lamps[thread.id]
+            if ended is not None:
+                await self._close_recovered_turn(
+                    thread,
+                    message,
+                    working_dir=working_dir,
+                    session_id=getattr(record, "session_id", None),
+                    already_over=ended == "over",
+                )
         except Exception:
             logger.warning("%s lamp recovery skipped", ctx, exc_info=True)
+
+    async def _close_recovered_turn(
+        self,
+        thread: discord.Thread,
+        message: discord.Message,
+        *,
+        working_dir: str,
+        session_id: str | None,
+        already_over: bool,
+    ) -> None:
+        """Post the closing a restart took from a turn: 📊, then 🟡 @requester (#907).
+
+        Both normally come from the run's own epilogue, and that run died with
+        the old process (``outcome=cancelled``). Same order and same rules as
+        a turn that ended in this process: footer first (#455), then the
+        dashboard's WAITING_INPUT transition, which pings once — the
+        requester, or for a webhook / bot turn the owner fallback (#520/#525).
+
+        Not when this process has already started another turn in the thread
+        (the startup pick-up, #776): that turn closes the thread itself.
+        """
+        if already_over:
+            # The answer of a turn that ended while nobody was listening is
+            # posted by the mirror's catch-up (#215) in parallel with this
+            # recovery; the summons must not overtake it.
+            await asyncio.sleep(RECOVERED_TURN_END_GRACE_SECONDS)
+        if thread.id in self._active_tasks:
+            logger.info(
+                "%s restart-crossed turn ended, but a newer turn is running — no closing (#907)",
+                log_ctx(thread_id=thread.id),
+            )
+            return
+        logger.info(
+            "%s restart-crossed turn ended — posting its footer and summons (#907)",
+            log_ctx(thread_id=thread.id, session_id=session_id),
+        )
+        # Effort is left out: the run that knew it is gone, and the footer
+        # omits what it does not know rather than guessing (#693).
+        footer = RunConfig(
+            thread=thread,
+            runner=cast(Any, SimpleNamespace(working_dir=working_dir, effort=None)),
+            prompt="(restart)",
+            session_id=session_id,
+            settings_repo=self._settings_repo,
+            authorizer=self._authorizer,
+        )
+        try:
+            await _post_context_usage(footer, session_id)
+        except Exception:
+            logger.warning(
+                "%s could not post the footer of a restart-crossed turn (#907)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+        dashboard = self._get_dashboard()
+        if dashboard is None:
+            return
+        requester = _requester_of_turn(message, None, self.bot)
+        await _safe_set_state(
+            dashboard,
+            thread.id,
+            ThreadState.WAITING_INPUT,
+            (getattr(message, "content", "") or "")[:100].replace("\n", " "),
+            thread=thread,
+            notify_user_id=_notify_target(requester, self.bot, kind="completion"),
+        )
 
     # ── #745: messages posted while the gateway was down ────────────────────
 
@@ -2950,6 +3034,32 @@ class ClaudeChatCog(commands.Cog):
                 "read back on reconnect (#745)",
                 _local_stamp(now),
             )
+            # #920: if this process dies before it reconnects, the next one
+            # reads back from here instead of from an hour before it started.
+            await self._keep_open_outage()
+
+    async def _keep_open_outage(self) -> None:
+        """Store (or clear) the outage in progress for the next process (#920)."""
+        if self._settings_repo is None:
+            return
+        outage = self._gateway.open_outage()
+        try:
+            if outage is None:
+                await self._settings_repo.delete(OUTAGE_SETTING)
+            else:
+                await self._settings_repo.set(OUTAGE_SETTING, outage.dumps())
+        except Exception:
+            logger.warning("could not store the open gateway outage (#920)", exc_info=True)
+
+    async def _previous_outage(self) -> PreviousOutage | None:
+        """The outage the previous process went away in, if it recorded one (#920)."""
+        if self._settings_repo is None:
+            return None
+        try:
+            return PreviousOutage.loads(await self._settings_repo.get(OUTAGE_SETTING))
+        except Exception:
+            logger.warning("could not read the previous gateway outage (#920)", exc_info=True)
+            return None
 
     @commands.Cog.listener()
     async def on_resumed(self) -> None:
@@ -2965,15 +3075,7 @@ class ClaudeChatCog(commands.Cog):
         """
         startup = self._gateway.first_connect()
         if startup is not None:
-            logger.info(
-                "Discord gateway up (%s) at %s — process started %s; reading back messages "
-                "posted while c-lord was not running, from %s (#776)",
-                via,
-                _local_stamp(startup.up_at),
-                _local_stamp(startup.started_at),
-                _local_stamp(startup.since),
-            )
-            self._start_backfill(self._backfill_startup(startup))
+            self._start_backfill(self._backfill_startup(startup, via))
             return
         outage = self._gateway.connected()
         if outage is None:
@@ -2996,15 +3098,33 @@ class ClaudeChatCog(commands.Cog):
         task.add_done_callback(self._backfill_tasks.discard)
         self._backfill_task = task
 
-    async def _backfill_startup(self, startup: Startup) -> None:
-        """Read back and run what the restart gap kept from us (#776). Never raises."""
+    async def _backfill_startup(self, startup: Startup, via: str = "ready") -> None:
+        """Read back and run what the restart gap kept from us (#776). Never raises.
+
+        When the previous process lost its gateway before it went away (#920),
+        the gap began then, and so does the reading.
+        """
         async with self._backfill_lock:
+            startup = startup.after(await self._previous_outage())
+            previous = startup.previous
+            logger.info(
+                "Discord gateway up (%s) at %s — process started %s; reading back messages "
+                "posted while c-lord was not running, from %s%s (#776)",
+                via,
+                _local_stamp(startup.up_at),
+                _local_stamp(startup.started_at),
+                _local_stamp(startup.since),
+                ""
+                if previous is None
+                else f" — the previous process lost the gateway at "
+                f"{_local_stamp(previous.down_at)} (#920)",
+            )
             try:
                 picked, threads_hit, read_back = await self._pick_up_missed(
                     since=startup.since,
-                    down_at=startup.up_at,
+                    down_at=startup.up_at if previous is None else previous.down_at,
                     back_at=startup.up_at,
-                    cause="restart",
+                    cause="restart" if previous is None else "gateway",
                     startup=startup,
                 )
             except Exception:
@@ -3014,6 +3134,8 @@ class ClaudeChatCog(commands.Cog):
                     _local_stamp(startup.up_at),
                 )
                 return
+            if previous is not None:
+                await self._keep_open_outage()
             logger.info(
                 "Startup pick-up %s → %s: picked up %d message(s) in %d thread(s) posted "
                 "while c-lord was not running; %d thread(s) read back (#776)",
@@ -3030,6 +3152,9 @@ class ClaudeChatCog(commands.Cog):
         Serialised: a second reconnect while the first pick-up is still walking
         waits for it, so the two never read the same message at once.
         """
+        # #920: the outage is over — or, if the gateway dropped again in the
+        # meantime, the new one is what the next process should read from.
+        await self._keep_open_outage()
         async with self._backfill_lock:
             try:
                 picked, threads_hit, read_back = await self._pick_up_missed(
@@ -4527,6 +4652,12 @@ class ClaudeChatCog(commands.Cog):
                         # #484: and when it refused the configured model, point
                         # at /model set — the only thing that can change it.
                         model_unavailable=run_config.outcome.model_unavailable,
+                        # #908: and when Claude Code stopped on an API error,
+                        # say so and how to go on — not "finished".
+                        api_error=run_config.outcome.api_error,
+                        # #915: …and when the ❌ embed for one of those already
+                        # pinged this person, do not ping them a second time.
+                        already_pinged=run_config.outcome.pinged_user_id,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply

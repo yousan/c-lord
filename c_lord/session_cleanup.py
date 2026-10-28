@@ -50,6 +50,8 @@ from .tmux import release_window_number
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from .database.repository import SessionRecord
 
 logger = logging.getLogger(__name__)
@@ -174,6 +176,8 @@ class DirOutcome(Enum):
     """Uncommitted work present, or cleanliness could not be established."""
     KEPT_UNSAFE = "kept_unsafe"
     """The path did not look like a session directory at all."""
+    KEPT_FOREIGN = "kept_foreign"
+    """Not this thread's own session dir — a fixed checkout, or still in use (#902)."""
     ABSENT = "absent"
 
 
@@ -215,17 +219,63 @@ def sweep_days() -> int:
     return claude_transcript_retention_days()
 
 
-def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
+def _resolved(path: str | Path) -> Path | None:
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def foreign_reason(
+    record: SessionRecord,
+    path: Path,
+    *,
+    sessions_root: str | Path | None,
+    claimed: Collection[str] = (),
+) -> str | None:
+    """Why *path* is not the swept thread's to delete, or ``None`` if it is (#902).
+
+    c-lord clones exactly one directory per thread, ``<root>/<channel>/<thread>``
+    (:class:`c_lord.session_dir.SessionDirManager`). Anything else a row points
+    at — a scheduled task's fixed checkout (#687), another thread's clone — was
+    made by someone else and may be in use this week: the 30-day sweep deleted
+    ``/home/yousan/c-lord-audit`` and its hand-written ``AUDIT.md`` that way.
+    Paths are compared resolved, so a relative root (``data/sessions``) and a
+    symlinked one agree with what the rows recorded.
+    """
+    resolved = _resolved(path)
+    root = _resolved(sessions_root) if sessions_root else None
+    if resolved is None or root is None:
+        return "not a session dir (session dir root unknown)"
+    if (
+        resolved.name != str(record.thread_id)
+        or resolved.parent.parent != root
+        or not resolved.parent.name.isdigit()
+    ):
+        return "not a session dir (fixed checkout)"
+    if any(_resolved(other) == resolved for other in claimed if other):
+        return "still used by another session"
+    return None
+
+
+def remove_clean_session_dir(
+    record: SessionRecord,
+    *,
+    sessions_root: str | Path | None,
+    claimed: Collection[str] = (),
+) -> DirOutcome:
     """Delete *record*'s working directory when it is safe to. Never raises.
 
-    Safe means: the path looks like a session directory, it exists, and ``git``
-    reports no uncommitted or untracked changes other than the files c-lord
-    wrote there itself (#749 — see :func:`c_lord.session_dir.worktree_status`).
-    Anything else is kept.
+    Safe means: the path is this thread's own session dir under *sessions_root*
+    and no live row in *claimed* still points at it (#902 — see
+    :func:`foreign_reason`), it exists, and ``git`` reports no uncommitted or
+    untracked changes other than the files c-lord wrote there itself (#749 — see
+    :func:`c_lord.session_dir.worktree_status`). Anything else is kept.
 
     Losing a half-finished change to a background sweep nobody asked for is
     unrecoverable, so every uncertainty resolves to *keep* — including "this is
-    not a git repository at all", where cleanliness cannot be established.
+    not a git repository at all", where cleanliness cannot be established, and
+    "where session dirs live is unknown" (``sessions_root=None``).
     """
     working_dir = (record.working_dir or "").strip()
     if not working_dir:
@@ -244,6 +294,11 @@ def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
             return DirOutcome.ABSENT
     except (OSError, ValueError):
         return DirOutcome.ABSENT
+
+    reason = foreign_reason(record, path, sessions_root=sessions_root, claimed=claimed)
+    if reason is not None:
+        logger.info("session cleanup: keeping %s — %s (thread=%s)", path, reason, record.thread_id)
+        return DirOutcome.KEPT_FOREIGN
 
     status = worktree_status(str(path))
     if not status.clean:
@@ -264,15 +319,22 @@ def remove_clean_session_dir(record: SessionRecord) -> DirOutcome:
     return DirOutcome.REMOVED
 
 
-def retire_swept_workspace(record: SessionRecord) -> DirOutcome:
+def retire_swept_workspace(
+    record: SessionRecord,
+    *,
+    sessions_root: str | Path | None,
+    claimed: Collection[str] = (),
+) -> DirOutcome:
     """Finish the sweep of one swept row: its checkout, then its ``w{N}``. Never raises.
 
     #595: the 30-day sweep is the automatic delete, and deletion is when a
     thread's window number is freed. A checkout kept for uncommitted work means
-    the workspace was not deleted, so the thread keeps its number.
+    the workspace was not deleted, so the thread keeps its number. A directory
+    that was never the thread's own (#902) is left alone, but the thread itself
+    is done with, so its number is freed.
     """
-    outcome = remove_clean_session_dir(record)
-    if outcome in (DirOutcome.REMOVED, DirOutcome.ABSENT):
+    outcome = remove_clean_session_dir(record, sessions_root=sessions_root, claimed=claimed)
+    if outcome in (DirOutcome.REMOVED, DirOutcome.ABSENT, DirOutcome.KEPT_FOREIGN):
         try:
             release_window_number(record.thread_id)
         except Exception:  # never let a number cost the sweep
