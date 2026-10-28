@@ -5895,6 +5895,42 @@ class TestTurnEndFromTranscript:
         assert result[0].error is None
 
     @pytest.mark.asyncio
+    async def test_a_withdrawn_run_ends_at_once_as_a_user_stop(self, tmux_manager) -> None:
+        """#909: workspace-stop kills the window; the run must not wait it out."""
+        from c_lord.claude.tmux_runner import STOPPED_BY_USER_ERROR
+
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager, thread_id=9090, model="sonnet", timeout_seconds=600
+        )
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            if calls["n"] == 4:
+                runner.withdraw(silent=False)
+            return self._generating(calls["n"])
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+
+            async def _drain():
+                async for event in runner.run("test"):
+                    events.append(event)
+
+            await asyncio.wait_for(_drain(), timeout=5.0)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error == STOPPED_BY_USER_ERROR
+        assert calls["n"] <= 8
+
+    @pytest.mark.asyncio
     async def test_marker_from_the_previous_turn_does_not_close_this_one(
         self, tmux_manager
     ) -> None:
