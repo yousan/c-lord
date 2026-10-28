@@ -77,6 +77,33 @@ logger = logging.getLogger(__name__)
 _Responder = Callable[..., Awaitable[None]]
 _Acknowledger = Callable[..., Awaitable[None]]
 
+# Discord rejects an embed whose field value exceeds this (400, code 50035 — #824).
+_EMBED_FIELD_LIMIT = 1024
+
+
+def _fit_field_lines(lines: list[str], limit: int = _EMBED_FIELD_LIMIT) -> str:
+    """Join *lines* into one embed field value that Discord will accept (#824).
+
+    Lines that don't fit are dropped from the end and counted as ``…他 N 件``,
+    so the reader still learns how many there were.
+    """
+    if not lines:
+        return "—"
+    joined = "\n".join(lines)
+    if len(joined) <= limit:
+        return joined
+    shown: list[str] = []
+    for i, line in enumerate(lines):
+        rest = len(lines) - i - 1
+        tail = f"\n…他 {rest} 件" if rest else ""
+        if len("\n".join([*shown, line])) + len(tail) > limit:
+            break
+        shown.append(line)
+    rest = len(lines) - len(shown)
+    tail = f"…他 {rest} 件"
+    return "\n".join([*shown, tail]) if shown else tail
+
+
 # Model management
 SETTING_CLAUDE_MODEL = "claude_model"
 
@@ -1169,13 +1196,13 @@ class SessionManageCog(commands.Cog):
             if candidates:
                 embed.add_field(
                     name=f"Would remove ({len(candidates)})",
-                    value="\n".join(f"`{d.path}`" for d in candidates) or "—",
+                    value=_fit_field_lines([f"`{d.path}`" for d in candidates]),
                     inline=False,
                 )
             if skipped:
                 embed.add_field(
                     name=f"Would skip ({len(skipped)})",
-                    value="\n".join(f"`{d.path}` — {reason}" for d, reason in skipped) or "—",
+                    value=_fit_field_lines([f"`{d.path}` — {reason}" for d, reason in skipped]),
                     inline=False,
                 )
             if not candidates and not skipped:
@@ -1209,19 +1236,19 @@ class SessionManageCog(commands.Cog):
         )
         embed.add_field(
             name=f"✅ Removed ({len(removed)})",
-            value="\n".join(f"`{r.path}`" for r in removed) or "—",
+            value=_fit_field_lines([f"`{r.path}`" for r in removed]),
             inline=False,
         )
         if dirty:
             embed.add_field(
                 name=f"⚠️ Dirty — not removed ({len(dirty)})",
-                value="\n".join(f"`{r.path}`" for r in dirty) or "—",
+                value=_fit_field_lines([f"`{r.path}`" for r in dirty]),
                 inline=False,
             )
         if other_skipped:
             embed.add_field(
                 name=f"ℹ️ Skipped ({len(other_skipped)})",
-                value="\n".join(f"`{r.path}` — {r.reason}" for r in other_skipped) or "—",
+                value=_fit_field_lines([f"`{r.path}` — {r.reason}" for r in other_skipped]),
                 inline=False,
             )
 
