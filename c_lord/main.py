@@ -463,10 +463,18 @@ async def main(env_path: Path | None = None) -> None:
 
         # The rows are kept as swept tombstones (#818), but no longer claim their
         # directories, so the sweep removes those here. Clean checkouts go;
-        # anything with uncommitted or untracked work is kept (#575).
+        # anything with uncommitted or untracked work is kept (#575). Only the
+        # thread's own clone is ever deleted: a fixed checkout, or a dir a live
+        # row still points at, is someone else's (#902).
+        claimed = await components.session_repo.all_working_dirs()
         for record in deleted:
             # #595: a workspace deleted here also frees its thread's w{N}.
-            outcome = await asyncio.to_thread(retire_swept_workspace, record)
+            outcome = await asyncio.to_thread(
+                retire_swept_workspace,
+                record,
+                sessions_root=components.session_dir_base,
+                claimed=claimed,
+            )
             if outcome is DirOutcome.KEPT_DIRTY:
                 logger.info(
                     "Session cleanup: kept %s (uncommitted work) thread=%s",

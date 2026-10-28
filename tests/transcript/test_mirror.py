@@ -2398,3 +2398,107 @@ async def test_progress_line_shows_the_latest_thinking_sentence(tmp_path: Path) 
     assert "作業中" in posts[0], posts[0]
     assert "照合では111件が全文一致でした。" in posts[0], posts[0]
     assert "古い文" not in posts[0]
+
+
+async def test_request_copy_does_not_arm_the_progress_line(tmp_path: Path) -> None:
+    """#906: an ``api-request-blob`` is a copy of the API request, not activity.
+
+    Its tool blocks are calls that already happened.  Read outside a turn — the
+    tail used to re-read them whenever the CLI touched an idle transcript — they
+    put "⏳ 待機中 · 長考の可能性" on a thread that had finished hours before.
+    """
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=906,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(
+            jsonl,
+            {
+                "type": "api-request-blob",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_old", "name": "Bash", "input": {}},
+                    ],
+                },
+            },
+        )
+        await asyncio.sleep(0.25)
+        clock.advance(6000.0)
+        await asyncio.sleep(0.25)
+    finally:
+        await mirror.stop()
+
+    assert spy.posts == []
+
+
+async def test_an_api_error_is_one_line_without_the_terminal_steps(tmp_path: Path) -> None:
+    """#908 AC4: the CLI's 'Double press esc…' never reaches Discord, and the
+    runner learns the turn ended on the error."""
+    from datetime import datetime, timedelta, timezone
+
+    from c_lord.turn_end_bus import turn_end_bus
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+    posted: list[str] = []
+
+    async def sink(text: str) -> None:
+        posted.append(text)
+
+    flagged = (
+        "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup)."
+        " You may be seeing this for the first time.\n\n"
+        "Double press esc to edit your last message, or try a different model with /model."
+    )
+    start = datetime.now(timezone.utc) - timedelta(seconds=5)  # noqa: UP017
+    turn_end_bus.forget(9081)
+    turn_end_bus.note_prompt(9081)
+    mirror = TranscriptMirror(
+        thread_id=9081, project_dir=project, sink=sink, verbosity="minimal", poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(
+            jsonl,
+            {
+                "type": "assistant",
+                "isApiErrorMessage": True,
+                "error": "invalid_request",
+                "message": {
+                    "model": "<synthetic>",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": flagged}],
+                },
+            },
+        )
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration", "durationMs": 10})
+        await asyncio.sleep(0.4)
+        ended_on = turn_end_bus.api_error_since(9081, start)
+    finally:
+        await mirror.stop()
+        turn_end_bus.forget(9081)
+
+    joined = "\n".join(posted)
+    assert "Double press esc" not in joined
+    assert "-# ⚠️ API Error: Opus 5.5's safeguards flagged this session" in joined
+    assert ended_on is not None and "safeguards flagged" in ended_on

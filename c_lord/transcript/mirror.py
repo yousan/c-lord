@@ -37,6 +37,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .. import turn_events
+from ..api_error import api_error_text, headline
 from ..claude.types import AskQuestion, UsageLimit, _parse_ask_questions
 from ..discord_ui.ask_bus import ask_bus
 from ..discord_ui.bridged_context import bridged_context
@@ -236,7 +237,13 @@ def _tool_call_ids(event: dict) -> tuple[list[str], list[str]]:
     (``sleep 150``) renders to ``None``, and missing its ``tool_result`` would
     leave the call looking open for the rest of the turn. Like every helper run
     on each tailed event, it never assumes a shape.
+
+    Only conversation events count (#906). CLI 2.1.29x+ also writes an
+    ``api-request-blob`` — a copy of the request it sent, history included —
+    whose tool blocks are calls that finished long ago.
     """
+    if event.get("type") not in ("assistant", "user"):
+        return [], []
     message = event.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
@@ -982,6 +989,14 @@ class TranscriptMirror:
                 # producers it used to hear from are gone (#723), and without
                 # this every turn past 30s read ⚠️ however busy Claude was.
                 turn_activity.note(self.thread_id)
+                # #908: whether this turn's latest reply is Claude Code's own
+                # API-error message — the runner reads it when the turn ends.
+                if (
+                    event.get("type") == "assistant"
+                    and not event.get("isSidechain")
+                    and not is_rate_limit_event(event)
+                ):
+                    turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
                 self._track_background_agents(event)
 
                 # #232: bridge an open AskUserQuestion menu regardless of
@@ -1134,6 +1149,22 @@ class TranscriptMirror:
                 # is that the notice can precede it in the thread, which is only
                 # an ordering wobble in a case the banner rarely takes (it is
                 # normally the turn's first assistant event).
+                if (
+                    rendered.kind == "assistant_text"
+                    and (failed := api_error_text(event)) is not None
+                ):
+                    # #908: Claude Code's synthetic API error. Not an answer —
+                    # never held as the turn's final text — and its advice
+                    # ("Double press esc…") is for someone at the terminal. One
+                    # line of what happened; the runner reports the turn as ❌
+                    # with what to do from Discord.
+                    logger.info(
+                        "TranscriptMirror: folded API error thread=%d: %s",
+                        self.thread_id,
+                        headline(failed)[:200],
+                    )
+                    await self._try_sink(f"-# ⚠️ {headline(failed)}")
+                    continue
                 if rendered.kind == "assistant_text":
                     limit = banner_only(rendered.body)
                     marked = is_rate_limit_event(event) and is_refusal_shaped(rendered.body)

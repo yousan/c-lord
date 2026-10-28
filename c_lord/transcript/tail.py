@@ -83,6 +83,12 @@ _SEED_CHUNK_BYTES = 1 << 20
 # repeats immediately instead of sleeping, so catching up is not slowed down.
 _READ_CHUNK_BYTES = 8 << 20
 
+# How many bytes just before the read position stand in for "what we have
+# already read" (#906).  Claude Code touches an idle transcript about once an
+# hour without writing to it; comparing this slice is what tells that touch
+# from a real same-size rewrite without re-reading a 100 MB file to find out.
+_SIGNATURE_BYTES = 4096
+
 # Worker pool for the follow loops.  Deliberately **not** ``asyncio.to_thread``,
 # which shares one bounded pool with the rest of c-lord (git checkouts, the #215
 # recovery scans, ``_transcript_has_ask_result``): 250 mirrors polling twice a
@@ -203,6 +209,8 @@ class _FollowState:
     # Whether the last poll had a transcript to read at all (#773).  Starts
     # True so a tail that has not polled yet is never reported as broken.
     resolved: bool = True
+    # The bytes just before ``offset`` as they were when we got there (#906).
+    signature: bytes = b""
 
 
 def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
@@ -236,6 +244,17 @@ def _size_of(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _signature(path: Path, offset: int) -> bytes:
+    """The last :data:`_SIGNATURE_BYTES` bytes of ``path`` before ``offset`` (#906)."""
+    start = max(0, offset - _SIGNATURE_BYTES)
+    try:
+        with path.open("rb") as f:
+            f.seek(start)
+            return f.read(offset - start)
+    except OSError:
+        return b""
 
 
 def _start_offset(state: _FollowState, path: Path) -> int:
@@ -281,6 +300,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         state.current_path = active
         state.buffer = ""
         state.last_mtime = -1.0
+        state.signature = _signature(active, state.offset)
 
     try:
         stat = active.stat()
@@ -294,9 +314,16 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         # Truncation — reset and re-read from start.
         state.offset = 0
         state.buffer = ""
-    elif size == state.offset and mtime > state.last_mtime > 0:
+    elif (
+        size == state.offset
+        and mtime > state.last_mtime > 0
+        and _signature(active, state.offset) != state.signature
+    ):
         # In-place rewrite with identical size: rare, but recover by
-        # restarting the read from byte 0.
+        # restarting the read from byte 0.  Only when the bytes actually
+        # changed (#906): the CLI touches an idle transcript about once an hour,
+        # and treating that as a rewrite re-read every uuid-less event — whose
+        # tool blocks then woke the progress line on a finished thread.
         state.offset = 0
         state.buffer = ""
 
@@ -315,6 +342,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         return []
 
     state.more_to_read = state.offset < size
+    state.signature = _signature(active, state.offset)
 
     state.buffer += chunk
     lines = state.buffer.split("\n")

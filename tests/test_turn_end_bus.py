@@ -97,3 +97,54 @@ class TestTurnEndBus:
         assert turn_end_bus.size() <= _MAX_THREADS
         for tid in range(10_000, 10_000 + _MAX_THREADS + 50):
             turn_end_bus.forget(tid)
+
+
+class TestApiErrorEnding:
+    """#908: whether this turn's last reply was Claude Code's synthetic API error."""
+
+    def _bus(self):
+        from c_lord.turn_end_bus import TurnEndBus
+
+        return TurnEndBus()
+
+    def test_an_error_as_the_last_reply_is_reported(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        bus = self._bus()
+        start = datetime.now(timezone.utc) - timedelta(seconds=5)  # noqa: UP017
+        bus.note_prompt(1)
+        bus.note_reply(1, api_error="API Error: Connection lost mid-response.")
+        bus.mark(1)
+        assert bus.api_error_since(1, start) == "API Error: Connection lost mid-response."
+
+    def test_a_reply_after_the_error_clears_it(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        bus = self._bus()
+        start = datetime.now(timezone.utc) - timedelta(seconds=5)  # noqa: UP017
+        bus.note_prompt(1)
+        bus.note_reply(1, api_error="API Error: Server error mid-response.")
+        bus.note_reply(1, api_error=None)
+        bus.mark(1)
+        assert bus.api_error_since(1, start) is None
+
+    def test_the_previous_turns_error_is_not_this_ones(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        bus = self._bus()
+        bus.note_prompt(1)
+        bus.note_reply(1, api_error="API Error: old")
+        bus.mark(1)
+        later = datetime.now(timezone.utc) + timedelta(seconds=1)  # noqa: UP017
+        assert bus.api_error_since(1, later) is None
+
+    def test_a_new_prompt_starts_clean(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        bus = self._bus()
+        start = datetime.now(timezone.utc) - timedelta(seconds=5)  # noqa: UP017
+        bus.note_prompt(1)
+        bus.note_reply(1, api_error="API Error: old")
+        bus.note_prompt(1)
+        bus.mark(1)
+        assert bus.api_error_since(1, start) is None

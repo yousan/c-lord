@@ -276,3 +276,75 @@ async def test_tail_does_not_re_yield_already_followed_event_on_rewrite(tmp_path
 
     # "live" is yielded once (when appended), "fresh" once; "base" never; no dup.
     assert [e["uuid"] for e in events] == ["live", "fresh"]
+
+
+def _api_request_blob(tool_id: str) -> dict:
+    """CLI 2.1.29x+'s copy of the API request — no uuid, but tool blocks inside (#906)."""
+    return {
+        "type": "api-request-blob",
+        "sessionId": "s",
+        "hash": "h",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_use", "id": tool_id, "name": "Bash", "input": {}}],
+        },
+    }
+
+
+async def test_tail_does_not_re_read_when_only_mtime_moves(tmp_path: Path) -> None:
+    # Issue #906: Claude Code touches an idle transcript about once an hour —
+    # mtime moves, content and size do not.  That used to count as a same-size
+    # rewrite: the offset went back to 0 and every uuid-less event (the
+    # ``api-request-blob`` copies carry tool_use blocks) came out a second time.
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = clord_transcript(project / "s.jsonl")
+    os.utime(jsonl, (1, 1))
+
+    agen = tail_events(project, poll_interval=0.05).__aiter__()
+
+    async def producer() -> None:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, _api_request_blob("toolu_1"))
+        _write_event(jsonl, {"type": "assistant", "uuid": "a1"})
+        os.utime(jsonl, (40, 40))
+        await asyncio.sleep(0.25)
+        # The hourly touch: same bytes, newer mtime.
+        os.utime(jsonl, (4000, 4000))
+
+    prod = asyncio.create_task(producer())
+    try:
+        events = await _collect_for(agen, 0.8)
+    finally:
+        prod.cancel()
+        await asyncio.gather(prod, return_exceptions=True)
+
+    assert [e["type"] for e in events] == ["api-request-blob", "assistant"]
+
+
+async def test_tail_recovers_from_a_same_size_rewrite(tmp_path: Path) -> None:
+    # #433's same-size case still re-reads: when the bytes really changed, the
+    # new event is delivered and the old ones are not.
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = clord_transcript(project / "s.jsonl")
+    _write_event(jsonl, {"type": "assistant", "uuid": "u1", "n": "aa"})
+    os.utime(jsonl, (1, 1))
+
+    agen = tail_events(project, poll_interval=0.05).__aiter__()
+
+    async def producer() -> None:
+        await asyncio.sleep(0.15)
+        # Same length, different content: u1 → u9.
+        clord_transcript(jsonl)
+        _write_event(jsonl, {"type": "assistant", "uuid": "u9", "n": "bb"})
+        os.utime(jsonl, (50, 50))
+
+    prod = asyncio.create_task(producer())
+    try:
+        events = await _collect_for(agen, 0.5)
+    finally:
+        prod.cancel()
+        await asyncio.gather(prod, return_exceptions=True)
+
+    assert [e["uuid"] for e in events] == ["u9"]

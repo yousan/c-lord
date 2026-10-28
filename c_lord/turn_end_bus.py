@@ -75,6 +75,9 @@ class _ThreadTurns:
 
     prompt_at: datetime | None = None
     ended_at: datetime | None = None
+    # #908: the text of this turn's latest reply when that reply was Claude
+    # Code's synthetic API error; ``None`` once anything else follows it.
+    api_error: str | None = None
 
 
 class TurnEndBus:
@@ -103,7 +106,9 @@ class TurnEndBus:
         was read is then the closest thing to the truth available.
         """
         moment = _as_utc(at) if at is not None else datetime.now(_UTC)
-        self._record(thread_id).prompt_at = moment
+        record = self._record(thread_id)
+        record.prompt_at = moment
+        record.api_error = None
         logger.debug("turn_end_bus: prompt thread=%d at=%s", thread_id, moment.isoformat())
 
     def mark(self, thread_id: int, *, at: datetime | None = None) -> None:
@@ -111,6 +116,26 @@ class TurnEndBus:
         moment = _as_utc(at) if at is not None else datetime.now(_UTC)
         self._record(thread_id).ended_at = moment
         logger.debug("turn_end_bus: marked thread=%d at=%s", thread_id, moment.isoformat())
+
+    def note_reply(self, thread_id: int, *, api_error: str | None) -> None:
+        """Record Claude's latest reply in *thread_id* (#908).
+
+        *api_error* is the CLI's text when the reply was its synthetic API-error
+        message, ``None`` for anything else.  Only the latest reply counts: an
+        error the CLI retried past, with Claude answering after it, is not how
+        the turn ended.
+        """
+        self._record(thread_id).api_error = api_error
+
+    def api_error_since(self, thread_id: int, started_at: datetime) -> str | None:
+        """The API error *this* turn ended on, if it ended on one (#908).
+
+        Same ownership rule as :meth:`ended_after`: the turn must have started
+        after *started_at* and ended since.
+        """
+        if not self.ended_after(thread_id, started_at):
+            return None
+        return self._threads[thread_id].api_error
 
     def ended_after(self, thread_id: int, started_at: datetime) -> bool:
         """Has a turn started after *started_at* and then ended, in *thread_id*?
