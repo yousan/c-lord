@@ -133,6 +133,8 @@ Before this, `/clord` checked only whether *a repository* was reachable from the
 
 The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476). The thread's tmux session follows the chosen repository too (#427).
 
+In the text twin `!clord repo:<URL> <prompt>`, the URL ends at the first whitespace — a space, a tab **or a newline** (#923). Writing the request on the line after `repo:<URL>` therefore works the same as writing it after a space. A repository value that still contains a line break or tab (e.g. from a hand-built `/clord repo:`) is refused before anything is cloned, with a one-line reason.
+
 `repo:` only applies when a thread is being **created**. Inside an existing thread it is refused with a pointer to `/clord-thread-init`, because that thread's working copy is already cloned and would not change.
 
 **`/stop`** gracefully interrupts the running process. The session is saved — just send another message in the thread to resume.
@@ -337,10 +339,12 @@ Each decision is one `[thread=<id>]` INFO line: `thread already archived — swe
 
 **The notice names the way back.** When the checkout survived, it offers `/clord-reattach` — the thread reconnects to the work still on disk rather than starting over (#538). When nothing survived it does not, because there would be nothing to reattach to.
 
-**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `<session dir base>/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). The rule is `remove_clean_session_dir` (`c_lord/session_cleanup.py`), and every doubt resolves to *keep*:
+**What is tidied is the checkout, never the record.** The row ties a Discord thread to its Claude session and is kept (#818); the git clone under `<session dir base>/<channel>/<thread>/` is removed only when it has no uncommitted work (#575). **A working directory outside that — one you set up yourself and point scheduled runs at — is never deleted by the sweep**, however long the row pointing at it went unused (#902: a weekly task's checkout and its hand-written runbook were lost that way). The rule is `remove_clean_session_dir` (`c_lord/session_cleanup.py`), and every doubt resolves to *keep*:
 
 | The checkout | The sweep |
 |---|---|
+| not this thread's own clone — anything other than `<session dir base>/<channel>/<this thread>/`, e.g. a scheduled task's fixed checkout (#687) or another thread's clone | **never touches it** (#902). INFO `session cleanup: keeping <dir> — not a session dir (fixed checkout)`. The thread's `w{N}` is still freed |
+| this thread's clone, but a row that was not swept still points at it | keeps it — INFO `… — still used by another session` (#902) |
 | `git` reports nothing uncommitted or untracked, apart from the files c-lord wrote there itself (#749) | **removes it** |
 | uncommitted or untracked work | keeps it, half-finished edits included |
 | not a git repository, or `git` cannot tell | keeps it — cleanliness cannot be established |

@@ -29,9 +29,22 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .claim import claimed_transcript, clear_successor, cleared_at, read_claim, write_claim
+from .claim import (
+    claim_path,
+    claimed_transcript,
+    clear_successor,
+    cleared_at,
+    read_claim,
+    write_claim,
+)
 
 logger = logging.getLogger(__name__)
+
+#: How long a transcript c-lord has named (``--session-id``, #773) may stay
+#: unwritten before its absence is reported (#926). The CLI writes nothing until
+#: the folder-trust dialog is answered — seconds after the mirror starts looking
+#: on the first turn of every new workspace — and that is not a lost transcript.
+CLAIM_GRACE_SECONDS = 120.0
 
 # How c-lord recognises *its own* session among the many in a project dir.
 #
@@ -210,6 +223,8 @@ class ThreadSessionResolver:
     # successor is a candidate that is *not* in here (rule 2).
     _known_at_pin: set[Path] = field(default_factory=set)
     _warned_none: bool = False
+    # #926: the claimed session id we already said we are waiting for (INFO).
+    _noted_waiting_for: str | None = None
     # The session id c-lord claimed for this project dir, as of the last
     # resolve.  Reported to the reader when nothing resolves (#773), so the
     # message can say whether c-lord even got as far as naming a session.
@@ -303,6 +318,8 @@ class ThreadSessionResolver:
             return path
 
         if self._pinned is None:
+            if self._awaiting_claimed_transcript():
+                return None
             if not self._warned_none:
                 self._warned_none = True
                 logger.warning(
@@ -316,6 +333,36 @@ class ThreadSessionResolver:
                 )
             return None
         return self._pinned
+
+    def _awaiting_claimed_transcript(self) -> bool:
+        """True while the transcript c-lord named is still young enough to be unwritten (#926).
+
+        The CLI creates ``<session-id>.jsonl`` only once the trust dialog is
+        answered, so for the first seconds of a new workspace "nothing resolves"
+        is the normal state, not the #773 one. Said once at INFO (#678) — the
+        WARNING follows if the file has still not appeared after
+        :data:`CLAIM_GRACE_SECONDS`.
+        """
+        claimed_id = self._claimed_session_id
+        if claimed_id is None:
+            return False
+        try:
+            age = time.time() - claim_path(self.project_dir).stat().st_mtime
+        except OSError:
+            return False
+        if age >= CLAIM_GRACE_SECONDS:
+            return False
+        if self._noted_waiting_for != claimed_id:
+            self._noted_waiting_for = claimed_id
+            logger.info(
+                "TranscriptMirror: claimed transcript %s.jsonl not written yet in %s "
+                "(claimed %.0fs ago) — waiting up to %.0fs before reporting it missing (#926)",
+                claimed_id,
+                self.project_dir,
+                age,
+                CLAIM_GRACE_SECONDS,
+            )
+        return True
 
     def _clear_successor(self, claimed_id: str) -> Path | None:
         """The transcript a ``/clear`` of the claimed session started, if any (#803).
