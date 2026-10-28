@@ -30,7 +30,10 @@ This module is the bookkeeping for going back. It does not talk to Discord —
   instead: every turn leaves a reaction on its trigger message and every
   other way of handling a message posts in the thread, so a request newer
   than the previous process's last such mark is one it never saw. No DB
-  state is kept for it.
+  state is kept for what ran — only for *when the previous process lost its
+  gateway* (:class:`PreviousOutage`, #920): a host that is going down usually
+  drops off Discord first, and the restart gap then starts at that moment, not
+  at the restart.
 * :func:`missed_notice` / :func:`merge_missed_prompt` — **what to say.** One
   line in the thread explaining the delay, and — when several messages were
   missed in one thread — one prompt carrying all of them, because replaying
@@ -41,9 +44,10 @@ The behaviour is written down in ``docs/specs/gateway-backfill.md``.
 
 from __future__ import annotations
 
+import json
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, tzinfo
 from typing import Literal
 
@@ -68,6 +72,17 @@ HISTORY_LIMIT = 100
 # message is no longer "a moment ago" — and a thread whose tail is an unmarked
 # request that old is more likely one c-lord deliberately left alone.
 STARTUP_LOOKBACK = timedelta(hours=1)
+
+# How far back the first connect reads at most when the previous process
+# recorded losing its gateway (#920). On 2026-10-21 the host lost Discord at
+# 12:38 and was restarted at 14:26; the hour above started reading at 13:26.
+# A day covers a host that limps along overnight; older than that the thread
+# has most likely moved on, and the mark rule below still keeps anything the
+# previous process handled from running twice.
+STARTUP_MAX_LOOKBACK = timedelta(hours=24)
+
+# The ``settings`` key the open outage is kept under between processes (#920).
+OUTAGE_SETTING = "gateway_outage"
 
 Outcome = Literal["run", "held", "superseded"]
 Cause = Literal["gateway", "restart"]
@@ -143,6 +158,17 @@ class GatewayWatch:
         if self.started_at is None:
             self.started_at = self.clock()
 
+    def open_outage(self) -> PreviousOutage | None:
+        """The outage in progress, if the gateway is down right now (#920).
+
+        What a process that is about to die without reconnecting leaves for
+        the next one, so the next one reads back from here.
+        """
+        if self._down_at is None:
+            return None
+        last_alive = min(self._alive_at_down or self._down_at, self._down_at)
+        return PreviousOutage(down_at=self._down_at, last_alive_at=last_alive)
+
     def first_connect(self, now: datetime | None = None) -> Startup | None:
         """Record ``ready`` if it is this process's first (#776).
 
@@ -208,7 +234,55 @@ class Startup:
     """When the first ``on_ready`` fired. Later messages are delivered live."""
 
     since: datetime
-    """Where to start reading: :data:`STARTUP_LOOKBACK` before ``started_at``."""
+    """Where to start reading: :data:`STARTUP_LOOKBACK` before ``started_at``,
+    or earlier when the previous process lost its gateway (:meth:`after`)."""
+
+    previous: PreviousOutage | None = None
+    """The outage the previous process was in when it went away (#920)."""
+
+    def after(self, previous: PreviousOutage | None) -> Startup:
+        """This startup, reading back from where the previous process went deaf.
+
+        A margin before its last sign of life, like a reconnect does — but
+        never later than the usual hour and never earlier than
+        :data:`STARTUP_MAX_LOOKBACK`.
+        """
+        if previous is None:
+            return self
+        earliest = self.started_at - STARTUP_MAX_LOOKBACK
+        since = max(earliest, min(self.since, previous.last_alive_at - MARGIN))
+        return replace(self, since=since, previous=previous)
+
+
+@dataclass(frozen=True)
+class PreviousOutage:
+    """A gateway outage a process went away in, kept for the next one (#920)."""
+
+    down_at: datetime
+    """When the disconnect was first noticed."""
+
+    last_alive_at: datetime
+    """The newest moment the gateway was known to deliver before that."""
+
+    def dumps(self) -> str:
+        return json.dumps(
+            {"down_at": self.down_at.isoformat(), "last_alive_at": self.last_alive_at.isoformat()}
+        )
+
+    @classmethod
+    def loads(cls, raw: str | None) -> PreviousOutage | None:
+        """Parse :meth:`dumps`. ``None`` for nothing stored or anything unreadable."""
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            down_at = datetime.fromisoformat(data["down_at"])
+            last_alive_at = datetime.fromisoformat(data["last_alive_at"])
+        except (ValueError, TypeError, KeyError):
+            return None
+        if down_at.tzinfo is None or last_alive_at.tzinfo is None:
+            return None
+        return cls(down_at=down_at, last_alive_at=last_alive_at)
 
 
 def last_mark_before(

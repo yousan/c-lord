@@ -234,7 +234,7 @@ def test_not_a_git_repo_is_never_clean(tmp_path: Path) -> None:
 
 
 def test_orphan_with_only_clord_files_is_removed(tmp_path: Path) -> None:
-    ws = _clone(tmp_path / "111" / "222")
+    ws = _clone(tmp_path / "111" / "1535220696232370267")
     inject_read_skill(ws)
     _legacy_skill(ws, "discord-reply")
 
@@ -244,7 +244,7 @@ def test_orphan_with_only_clord_files_is_removed(tmp_path: Path) -> None:
 
 def test_orphan_with_user_work_is_kept(tmp_path: Path) -> None:
     """AC2: 本番の残り 20 件の形。"""
-    ws = _clone(tmp_path / "111" / "222")
+    ws = _clone(tmp_path / "111" / "1535220696232370267")
     inject_read_skill(ws)
     (ws / ".env.dev-local").write_text("SECRET=1\n")
 
@@ -256,7 +256,7 @@ def test_orphan_with_user_work_is_kept(tmp_path: Path) -> None:
 
 
 def test_keeping_logs_the_entries_at_info(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    ws = _clone(tmp_path / "111" / "222")
+    ws = _clone(tmp_path / "111" / "1535220696232370267")
     inject_read_skill(ws)
     (ws / "wip.md").write_text("x\n")
 
@@ -333,11 +333,11 @@ def _record(path: Path) -> SessionRecord:
 
 def test_thirty_day_notice_does_not_claim_leftover_work(tmp_path: Path) -> None:
     """本番で 7 件が受け取った嘘の案内の再現。中身は c-lord の SKILL.md だけ。"""
-    ws = _clone(tmp_path / "111" / "222")
+    ws = _clone(tmp_path / "111" / "1535220696232370267")
     inject_read_skill(ws)
     record = _record(ws)
 
-    assert remove_clean_session_dir(record) is DirOutcome.REMOVED
+    assert remove_clean_session_dir(record, sessions_root=tmp_path) is DirOutcome.REMOVED
     text = notice_for(record, inspect_survivors(record, projects_root=tmp_path / "projects"))
 
     assert "書きかけの成果物" not in text
@@ -345,12 +345,12 @@ def test_thirty_day_notice_does_not_claim_leftover_work(tmp_path: Path) -> None:
 
 
 def test_thirty_day_notice_still_points_at_real_leftover_work(tmp_path: Path) -> None:
-    ws = _clone(tmp_path / "111" / "222")
+    ws = _clone(tmp_path / "111" / "1535220696232370267")
     inject_read_skill(ws)
     (ws / "article.md").write_text("半分書いた記事\n")
     record = _record(ws)
 
-    assert remove_clean_session_dir(record) is DirOutcome.KEPT_DIRTY
+    assert remove_clean_session_dir(record, sessions_root=tmp_path) is DirOutcome.KEPT_DIRTY
     text = notice_for(record, inspect_survivors(record, projects_root=tmp_path / "projects"))
 
     assert "書きかけの成果物" in text

@@ -558,3 +558,78 @@ class TestAFailedReactionCallLeavesNoSecondLamp:
             await sm._paint_stall(EMOJI_STALL_SOFT)
         assert any("remove" in r.getMessage() for r in caplog.records)
         await sm.cleanup()
+
+
+class _NetworkDownMessage:
+    """Reactions whose HTTP calls fail below discord.py (#904).
+
+    A DNS failure or a timeout is not a ``discord.HTTPException``: aiohttp and
+    asyncio raise their own types, and those used to escape ``_react``.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.down = False
+        self.reactions: list[str] = []
+        self.guild = MagicMock()
+
+    async def add_reaction(self, emoji: str) -> None:
+        if self.down:
+            raise self.exc
+        if emoji not in self.reactions:
+            self.reactions.append(emoji)
+
+    async def remove_reaction(self, emoji: str, member: object) -> None:
+        if self.down:
+            raise self.exc
+        if emoji in self.reactions:
+            self.reactions.remove(emoji)
+
+
+def _dns_error() -> BaseException:
+    import aiohttp
+
+    return aiohttp.ClientConnectionError(
+        "Cannot connect to host discord.com:443 [Temporary failure in name resolution]"
+    )
+
+
+class TestANetworkFailureIsNotATurnFailure:
+    """#904: the lamp is decoration — a network blip must not end the turn."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("make_exc", [_dns_error, asyncio.TimeoutError, OSError])
+    async def test_set_done_returns_quietly(self, make_exc, caplog) -> None:
+        msg = _NetworkDownMessage(make_exc())
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        msg.down = True
+        with caplog.at_level("WARNING", logger="c_lord.discord_ui.status"):
+            await sm.set_done()  # must not raise
+        assert sm._out_of_sync is True
+        assert any("lamp: could not" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_the_next_final_paint_cleans_up_after_the_network_returns(self) -> None:
+        msg = _NetworkDownMessage(TimeoutError())
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        msg.down = True
+        await sm._paint_stall(EMOJI_STALL_SOFT)
+        msg.down = False
+        await sm.set_waiting()
+        assert msg.reactions == [EMOJI_WAITING]
+
+    @pytest.mark.asyncio
+    async def test_the_stall_monitor_survives_a_timeout(self) -> None:
+        msg = _NetworkDownMessage(TimeoutError())
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        msg.down = True
+        sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
+        await asyncio.sleep(2.5)
+        task = sm._stall_task
+        assert task is not None and not task.done()
+        msg.down = False
+        await sm.set_waiting()
+        assert msg.reactions == [EMOJI_WAITING]
