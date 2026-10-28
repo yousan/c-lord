@@ -214,6 +214,14 @@ class TestParseContextTotal:
         )
         assert parse_context_total(pane) == 1_000_000
 
+    def test_parses_print_mode_markdown(self) -> None:
+        """#924: ``claude -p /context`` prints markdown, not the TUI block."""
+        out = (
+            "## Context Usage\n\n**Model:** claude-haiku-5-5  \n"
+            "**Tokens:** 17.3k / 1m (2%)\n\n### Estimated usage by category\n"
+        )
+        assert parse_context_total(out) == 1_000_000
+
     def test_no_context_usage_header_returns_none(self) -> None:
         """Without the anchor the parse must return None (safer than guessing)."""
         assert parse_context_total("scrollback: 56.6k/200k tokens (28%)") is None

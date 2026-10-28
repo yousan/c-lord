@@ -83,7 +83,7 @@ _context_window_cache: dict[str, tuple[str | None, int]] = {}
 
 # #370: settings-table key prefix for the per-model context-window total.  The
 # in-memory cache above is cleared on every bot restart, so the /context probe
-# (which renders into the human-visible tmux pane) re-fires once per session
+# (a separate ``claude -p`` process since #924) re-fires once per session
 # after each restart.  Persisting the learned total per model — the tier is
 # stable per (host, account, model) — lets the probe fire at most once per model
 # per host instead.  One scalar key per model (not a JSON blob) so concurrent
@@ -289,9 +289,9 @@ async def _resolve_context_window(
     """Return the context-window total for ``session_id`` running ``model``.
 
     Resolution order: in-memory cache → disk (``settings`` KV, keyed by model,
-    #370) → live ``/context`` probe → per-model fallback.  The probe scrapes
-    ``/context`` (Claude is idle at the prompt after a turn completes) and
-    renders into the human-visible tmux pane, so it is avoided whenever the
+    #370) → live ``/context`` probe → per-model fallback.  The probe runs
+    ``/context`` in a throwaway ``claude -p`` outside this conversation (#924)
+    — a few seconds of a separate process — so it is avoided whenever the
     total is already known on disk.  A re-probe is forced when ``model`` differs
     from the value cached for this session, since the window size can change
     with the model.  Falls back to a per-model default when the runner cannot
@@ -305,8 +305,8 @@ async def _resolve_context_window(
     settings_repo = getattr(config, "settings_repo", None)
 
     # Disk layer (#370): the total is stable per (host, account, model), so a
-    # value learned once survives bot restarts and other sessions — no probe,
-    # no tmux-pane pollution.  Keyed by model; skipped when model is unknown.
+    # value learned once survives bot restarts and other sessions — no probe.
+    # Keyed by model; skipped when model is unknown.
     if settings_repo is not None and model:
         persisted = await _load_persisted_window(settings_repo, model)
         if persisted is not None:
@@ -317,7 +317,7 @@ async def _resolve_context_window(
     probe = getattr(config.runner, "probe_context_window", None)
     if probe is not None:
         with contextlib.suppress(Exception):
-            result = await probe()
+            result = await probe(model)
             total = result if isinstance(result, int) else None
     if total is not None:
         # Cache only successful probes — a transient pane-parse failure must
