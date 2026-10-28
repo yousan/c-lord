@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 
+from ..api_error import API_ERROR_PREFIX, advice_for_error
 from ..claude.tmux_runner import (
     FLEET_TMUX_RESTART_ERROR_PREFIX,
     LOGIN_REQUIRED_ERROR_PREFIX,
@@ -169,10 +170,16 @@ class EventProcessor:
         still pings the same person it would have pinged for a parked turn,
         rather than silently regressing to no mention at all.
         """
+        uid = self._failure_notify_uid
+        return f"<@{uid}>" if uid is not None else None
+
+    @property
+    def _failure_notify_uid(self) -> int | None:
+        """Who :attr:`_failure_mention` pings (#681), or ``None``."""
         uid = self._config.failure_notify_id
         if uid is None:
             uid = self._config.notify_user_id
-        return f"<@{uid}>" if uid is not None else None
+        return uid
 
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
@@ -377,6 +384,11 @@ class EventProcessor:
             if refused_model is not None:
                 self._config.outcome.no_response = True
                 self._config.outcome.model_unavailable = refused_model
+            # #908: Claude Code ended the turn on its own API error. It did
+            # produce output before that, so this is not ``no_response`` — but
+            # the turn-end line must say what stopped it and how to go on.
+            if event.error.startswith(API_ERROR_PREFIX):
+                self._config.outcome.api_error = advice_for_error(event.error)
             # #631: a rate-limited turn also produced nothing, but it knows why.
             # ``no_response`` is set too so no caller reads it as a completed
             # turn; ``usage_limit`` is what upgrades the wording from "send it
@@ -398,6 +410,8 @@ class EventProcessor:
             )
             if err_msg is not None:
                 self._last_response_msg = err_msg
+                # #915: the turn-end line must not ping the same person again.
+                self._config.outcome.pinged_user_id = self._failure_notify_uid
             if self._config.status:
                 await self._config.status.set_error()
         else:
