@@ -18,6 +18,8 @@ import logging
 
 import discord
 
+from ..discord_failures import DISCORD_CALL_FAILURES
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,7 +58,7 @@ class CoordinationService:
         """Send a message, swallowing HTTP errors so lifecycle events never crash."""
         try:
             await channel.send(content)
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             logger.warning(
                 "Failed to post to coordination channel %d", self._channel_id, exc_info=True
             )

@@ -368,6 +368,67 @@ class TestNeverBreaksTheTurn:
         assert len(rec.posts) == 2
 
 
+class TestUndeletedLineIsRetried:
+    """#930 AC3: a line whose delete failed mid-outage is taken away once the network is back.
+
+    Before: the handle was dropped on the first failed delete, so a line that
+    could not be removed during a DNS blip stayed in the thread for good
+    (10/12, ``1559124356435804171``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_end_turn_deletes_the_line_left_behind(self) -> None:
+        import aiohttp
+
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, update_seconds=15.0)
+        p.begin_turn()
+        clock.advance(91.0)
+        await p.tick()
+
+        rec.delete_error = aiohttp.ClientConnectionError("Cannot connect to host discord.com")
+        await p.note_output()  # must not raise
+        assert rec.deletes == []
+
+        rec.delete_error = None  # the network is back
+        clock.advance(20.0)
+        await p.end_turn()
+        assert rec.deletes == ["msg1"]
+
+    @pytest.mark.asyncio
+    async def test_a_later_tick_retries_without_waiting_for_the_end(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, update_seconds=15.0)
+        p.begin_turn()
+        clock.advance(91.0)
+        await p.tick()
+
+        rec.delete_error = TimeoutError()
+        await p.note_output()
+        rec.delete_error = None
+
+        await p.tick()  # too soon — do not hammer Discord on every poll
+        assert rec.deletes == []
+        clock.advance(16.0)
+        await p.tick()
+        assert rec.deletes == ["msg1"]
+
+    @pytest.mark.asyncio
+    async def test_retried_once_deleted_and_not_again(self) -> None:
+        rec, clock = _Recorder(), _Clock()
+        p = _make(rec, clock, quiet_seconds=90.0, update_seconds=15.0)
+        p.begin_turn()
+        clock.advance(91.0)
+        await p.tick()
+        rec.delete_error = OSError("Temporary failure in name resolution")
+        await p.end_turn()
+        rec.delete_error = None
+        clock.advance(16.0)
+        await p.end_turn()
+        await p.end_turn()
+        assert rec.deletes == ["msg1"]
+
+
 class TestLabelReadability:
     """Defects found by looking at the real staging output, not the mockup."""
 

@@ -401,7 +401,9 @@ class TranscriptMirrorCog(commands.Cog):
             await handle.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
 
         async def delete(handle) -> None:
-            await handle.delete()
+            # Already gone (someone removed it) is done, not a reason to retry (#930).
+            with contextlib.suppress(discord.NotFound):
+                await handle.delete()
 
         return TurnProgress(
             post=post,

@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from .discord_failures import DISCORD_CALL_FAILURES
 from .log_sampler import LogSampler
 from .menu_ledger import (
     _MAX_REBRIDGES_PER_MENU,
@@ -576,6 +577,10 @@ class ThreadStateSyncLoop:
                 thread_id,
                 _DEFAULT_RENAME_BACKOFF_SECONDS,
             )
+        except DISCORD_CALL_FAILURES as exc:
+            # #930: the network itself failed (DNS, refused connection) — not a
+            # rate limit, so no backoff. The rename is retried on the next sync.
+            logger.warning("state-sync: rename failed for thread %d: %r", thread_id, exc)
 
     async def _persist_backoff(self, thread_id: int, retry_after_seconds: float | None) -> None:
         """Persist (or clear) the rename backoff deadline to the DB (#281).

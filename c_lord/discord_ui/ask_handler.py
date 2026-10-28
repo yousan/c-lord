@@ -27,6 +27,7 @@ import discord
 from .. import turn_events
 from ..claude.types import AskQuestion, ask_question_to_dict
 from ..database.ask_repo import PendingAskRepository
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..menu_ledger import menu_fingerprint, shared_ledger
 from ..transcript.ask_result import (
     ASK_ANSWERED,
@@ -775,7 +776,7 @@ async def _bridge_claimed_menu(
             try:
                 for chunk in chunks:
                     posted.append(await thread.send(content=chunk, silent=True))
-            except discord.HTTPException:
+            except DISCORD_CALL_FAILURES:
                 logger.warning(
                     "bridge_pane_ask: context post failed for thread %d", thread.id, exc_info=True
                 )
@@ -918,7 +919,7 @@ async def _bridge_claimed_menu(
     if not done:
         # 24h timeout with the menu still open → dismiss it.
         await _close(thread.id, CLOSE_TIMEOUT, msg, ask_repo)
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await msg.edit(
                 content="-# ⏰ Question timed out — send a new message to continue.",
                 embed=None,
@@ -930,7 +931,7 @@ async def _bridge_claimed_menu(
     if click_task not in done:
         # Menu was answered/cancelled directly in the pane — buttons are stale.
         await _close(thread.id, CLOSE_TERMINAL, msg, ask_repo)
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await msg.edit(content=resolved_note, embed=None, view=None)
         return
 
@@ -939,7 +940,7 @@ async def _bridge_claimed_menu(
     # arrived; sending keystrokes then would leak into the idle prompt (#359).
     if hasattr(runner, "peek_pending_ask") and await runner.peek_pending_ask() is None:
         await _close(thread.id, CLOSE_TERMINAL, msg, ask_repo)
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await msg.edit(content=resolved_note, embed=None, view=None)
         return
 
@@ -949,7 +950,7 @@ async def _bridge_claimed_menu(
         # leaving them live is what produced menus that stayed clickable long
         # after the question was gone.
         await _close(thread.id, CLOSE_INTERRUPTED, msg, ask_repo)
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await msg.edit(
                 content="-# ⚡ 新しい指示が届いたので、この質問は取り消しました。",
                 embed=None,
@@ -1071,7 +1072,7 @@ async def collect_ask_answers(
             if ask_repo is not None:
                 await ask_repo.delete(thread.id)
             # Remove buttons from the timed-out message so they stay inert.
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await msg.edit(
                     content="-# ⏰ Question timed out — please send a new message to continue.",
                     embed=None,

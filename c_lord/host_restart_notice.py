@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, TypeGuard
 
 import discord
 
+from .discord_failures import DISCORD_CALL_FAILURES
 from .transcript.formatter import is_harness_user_record
 from .transcript.resolver import ThreadSessionResolver, derive_project_dir
 from .utils.logger import log_ctx
@@ -230,7 +231,7 @@ async def _already_noticed(thread: discord.Thread, my_id: int | None) -> bool:
 async def _resolve_thread(bot: Bot, thread_id: int) -> discord.Thread | None:
     channel = bot.get_channel(thread_id)
     if channel is None:
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             channel = await bot.fetch_channel(thread_id)
     return channel if isinstance(channel, discord.Thread) else None
 

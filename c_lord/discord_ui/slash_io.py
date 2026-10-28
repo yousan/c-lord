@@ -39,6 +39,8 @@ from typing import Any
 
 import discord
 
+from ..discord_failures import DISCORD_CALL_FAILURES
+
 logger = logging.getLogger(__name__)
 
 Responder = Callable[..., Awaitable[None]]
@@ -66,7 +68,7 @@ async def followup(
     if ephemeral and _public_placeholder_pending(interaction):
         try:
             await interaction.delete_original_response()
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             # Nothing better is left: the reply below lands in the public
             # placeholder. Say so, since that is the leak this module exists
             # to prevent.

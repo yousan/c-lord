@@ -33,6 +33,7 @@ from ..claude.tmux_runner import TmuxClaudeRunner
 from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.authorization import Authorizer
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
@@ -255,7 +256,7 @@ class SkillCommandCog(commands.Cog):
             except Exception:
                 # #477: a failed clone must end the run visibly, not escape it.
                 logger.exception("%s could not prepare the checkout for /skill", ctx)
-                with contextlib.suppress(discord.HTTPException):
+                with contextlib.suppress(*DISCORD_CALL_FAILURES):
                     await thread.send("❌ この /skill の作業ディレクトリを用意できませんでした。")
                 return False, None
             working_dir = made if isinstance(made, str) and made else None
@@ -266,7 +267,7 @@ class SkillCommandCog(commands.Cog):
         # so only an existing window proves Claude has somewhere to start.
         if not await asyncio.to_thread(tmux.session_exists, thread.id):
             logger.error("%s could not create a tmux window for /skill — aborting the run", ctx)
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await thread.send(
                     "❌ この /skill を動かす tmux ウィンドウを作れませんでした。"
                     "ホストで tmux が使えるか、チャンネルが `/clord-init` で repo に"

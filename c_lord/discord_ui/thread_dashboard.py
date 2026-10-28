@@ -40,6 +40,7 @@ from enum import Enum
 import discord
 
 from ..claude.types import UsageLimit
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..notify_policy import owner_fallback_allowed
 from ..utils.logger import log_ctx
 
@@ -334,7 +335,7 @@ class ThreadStatusDashboard:
         """Try to take over *candidate* as the live board. True when adopted."""
         try:
             await candidate.edit(embed=embed)
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             logger.warning(
                 "Could not take over Session Status board %s; treating it as dead",
                 getattr(candidate, "id", "?"),
@@ -359,7 +360,7 @@ class ThreadStatusDashboard:
             return
         try:
             await message.pin()
-        except discord.HTTPException as exc:
+        except DISCORD_CALL_FAILURES as exc:
             logger.warning(
                 "Session Status board %s is NOT pinned (%s) — 📌 will not show the "
                 "live board. Give the bot Manage Messages, or free a pin slot "
@@ -410,7 +411,7 @@ class ThreadStatusDashboard:
                 async for message in _as_async_iter(source()):
                     if self._is_own_board(message, bot_user_id):
                         found.setdefault(message.id, message)
-            except discord.HTTPException:
+            except DISCORD_CALL_FAILURES:
                 logger.warning(
                     "Could not read channel %s %s while looking for the Session Status board",
                     getattr(self._channel, "id", "?"),
@@ -643,9 +644,9 @@ class ThreadStatusDashboard:
             logger.debug("Dashboard message was deleted; re-posting")
             try:
                 self._dashboard_message = await self._channel.send(embed=embed)
-            except discord.HTTPException:
+            except DISCORD_CALL_FAILURES:
                 logger.warning("Failed to re-post dashboard message", exc_info=True)
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             logger.debug("Failed to edit dashboard message", exc_info=True)
 
     def _prune_stale(self) -> list[int]:

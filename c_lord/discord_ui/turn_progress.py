@@ -62,6 +62,10 @@ DEFAULT_UPDATE_SECONDS = 15.0
 DEFAULT_STALLED_SECONDS = 60.0
 
 # Tool labels can be long (a full Bash command); keep the line to one row.
+# How many times a line whose delete failed is tried again before it is given
+# up on (#930). Retries are ``update_seconds`` apart, so ~10 minutes of outage.
+_MAX_DELETE_RETRIES = 40
+
 _MAX_LABEL_CHARS = 60
 
 # Claude's own progress sentence (#883) is prose a reader wants to finish, so it
@@ -151,7 +155,9 @@ class TurnProgress:
     turn, so failures are logged and swallowed. A failed ``post`` simply means
     the line does not appear; a failed ``delete`` still drops the handle so the
     next gap starts from a clean state rather than editing a message that may
-    no longer exist.
+    no longer exist — but the line is remembered and deleted again on a later
+    tick or at the end of the turn, so a network blip cannot leave it in the
+    thread for good (#930). ``delete`` should treat "already gone" as success.
     """
 
     def __init__(
@@ -187,6 +193,9 @@ class TurnProgress:
         # Tool calls whose ``tool_result`` has not arrived yet, oldest first,
         # mapped to the label they were started with (#757).
         self._running: dict[str, str | None] = {}
+        # Lines whose delete failed, with the number of attempts so far (#930).
+        self._leftovers: list[tuple[object, int]] = []
+        self._leftover_tried = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -221,6 +230,7 @@ class TurnProgress:
         """Disarm and take the line away. Safe to call when nothing is shown."""
         self._armed = False
         await self._remove()
+        await self._retry_leftovers(force=True)
 
     # -- signals -----------------------------------------------------------
 
@@ -280,6 +290,7 @@ class TurnProgress:
         which is finer than the 15s refresh, and it avoids a second task whose
         lifetime would have to be kept in sync with the mirror's.
         """
+        await self._retry_leftovers(force=False)
         if not self._armed:
             await self._remove()
             return
@@ -323,7 +334,39 @@ class TurnProgress:
         handle, self._handle = self._handle, None
         if handle is None:
             return
-        await self._safely(self._delete(handle), "delete")
+        await self._delete_or_keep(handle, attempts=0)
+
+    async def _delete_or_keep(self, handle: object, *, attempts: int) -> None:
+        """Delete *handle*; on failure remember it for :meth:`_retry_leftovers` (#930)."""
+        try:
+            await self._delete(handle)
+        except Exception as exc:
+            attempts += 1
+            self._leftover_tried = self._clock()
+            if attempts >= _MAX_DELETE_RETRIES:
+                logger.warning(
+                    "TurnProgress: giving up deleting a progress line after %d tries (%r)",
+                    attempts,
+                    exc,
+                )
+                return
+            self._leftovers.append((handle, attempts))
+            logger.warning("TurnProgress: could not delete a progress line (%r) — will retry", exc)
+
+    async def _retry_leftovers(self, *, force: bool) -> None:
+        """Try again to delete lines a failed delete left in the thread (#930).
+
+        Not on every poll: during an outage that would hit Discord several
+        times a second. ``force`` is the end of the turn — the last moment the
+        line is known to be stale for sure.
+        """
+        if not self._leftovers:
+            return
+        if not force and self._clock() - self._leftover_tried < self._update_seconds:
+            return
+        pending, self._leftovers = self._leftovers, []
+        for handle, attempts in pending:
+            await self._delete_or_keep(handle, attempts=attempts)
 
     async def _safely(self, awaitable: Awaitable[object | None], what: str) -> object | None:
         """Await *awaitable*, swallowing anything that goes wrong.
