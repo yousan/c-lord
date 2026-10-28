@@ -1073,6 +1073,38 @@ class TestTmuxSessionManager:
         term.assert_called_once_with(4242)
         assert "#{pane_pid}" in mock_run.call_args_list[1][0][0]
 
+    def test_count_tool_shells_counts_the_panes_shells(self) -> None:
+        """#922: idle-sleep asks this before killing a window."""
+        from c_lord.tool_shells import ProcInfo
+
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+        procs = [
+            ProcInfo(pid=4242, ppid=1, pgid=4242, cmdline="claude"),
+            ProcInfo(
+                pid=5000,
+                ppid=4242,
+                pgid=5000,
+                cmdline="bash -c source ~/.claude/shell-snapshots/s.sh && sleep 600",
+            ),
+        ]
+        with (
+            patch("c_lord.tmux._run") as mock_run,
+            patch("c_lord.tmux.read_procs", return_value=procs),
+        ):
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="12345\n"),
+                MagicMock(returncode=0, stdout="4242\n"),
+            ]
+            assert mgr.count_tool_shells(12345) == 1
+
+    def test_count_tool_shells_no_window_is_zero(self) -> None:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        with patch("c_lord.tmux._run", return_value=MagicMock(returncode=1, stdout="")):
+            assert mgr.count_tool_shells(99999) == 0
+
     def test_stop_tool_shells_no_window_touches_nothing(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
         mgr._available = True
