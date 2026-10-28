@@ -22,10 +22,10 @@ c-lord has already said it in Japanese.
 
 The wording comes from the CLI's own builders (verified against the shipped
 2.1.252 binary): ``"You've hit your ${label}${suffix}"`` where ``suffix`` is
-``" · resets ${when}"`` and ``label`` is one of "weekly limit" (seven_day),
-"session limit" (five_hour), "Opus limit" / "Sonnet limit" (seven_day_opus /
-seven_day_sonnet), "usage limit" (overage), "org's monthly usage limit",
-"monthly spend limit", or a bare "limit"; plus
+``" · resets ${when}"`` (possibly after other clauses, #921) and ``label``
+is one of "weekly limit" (seven_day), "session limit" (five_hour), "Opus limit"
+/ "Sonnet limit" (seven_day_opus / seven_day_sonnet), "usage limit" (overage),
+"org's monthly usage limit", "monthly spend limit", or a bare "limit"; plus
 ``"You're out of usage credits${suffix}"``.  ``when`` is rendered as
 ``"Aug 29, 4pm (Asia/Tokyo)"`` more than a day out and as a bare
 ``"4pm (Asia/Tokyo)"`` within the day, and the whole clause is absent when the
@@ -80,10 +80,27 @@ _USAGE_LIMIT_RE = re.compile(
     + r"(?:You've hit your (?P<scope>[^·\n]+?)"
     + r"|You(?:'|’)re out of (?P<credits>usage credits))"
     + r"[^\S\n]*"
-    + r"(?:·[^\S\n]*resets[^\S\n]+(?P<reset>[^·\n]+?)[^\S\n]*)?"
-    + r"(?:·[^\n]*)?$",
+    + r"(?P<tail>·[^\n]*)?$",
     re.MULTILINE,
 )
+
+# The reset time is one ``·``-separated clause of the tail, but not always the
+# first: a monthly spend limit renders
+# ``· raise it at <URL> · your session limit resets 1:50pm (Asia/Tokyo)`` (#921).
+# Each clause is tested on its own, so "resets" must open the clause or follow a
+# space — a URL that merely contains ``/resets`` is not a reset time.
+_RESET_CLAUSE_RE = re.compile(r"(?:^|[^\S\n])resets[^\S\n]+(?P<reset>\S.*?)[^\S\n]*$")
+
+
+def _reset_from_tail(tail: str | None) -> str | None:
+    """The reset time named in the banner's trailing clauses, or None."""
+    if not tail:
+        return None
+    for clause in tail.split("·"):
+        match = _RESET_CLAUSE_RE.search(clause.strip())
+        if match is not None:
+            return match.group("reset")
+    return None
 
 
 # The banner's two variable parts end up in Discord — the reset time inside an
@@ -126,8 +143,7 @@ def extract_usage_limit(text: str) -> UsageLimit | None:
     scope = (match.group("scope") or match.group("credits") or "").strip()
     if not _LIMIT_SCOPE_RE.match(scope):
         return None
-    reset = match.group("reset")
-    reset = reset.strip() if reset else None
+    reset = _reset_from_tail(match.group("tail"))
     if reset is not None and not _LIMIT_RESET_RE.match(reset):
         # A banner whose reset clause is not a plain localised time is not one
         # we will quote at a user.  Keep the limit (it is real) but drop the

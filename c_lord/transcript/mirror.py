@@ -1029,7 +1029,10 @@ class TranscriptMirror:
                 # This is the stall lamp's only live feed: the runner-side
                 # producers it used to hear from are gone (#723), and without
                 # this every turn past 30s read ⚠️ however busy Claude was.
-                turn_activity.note(self.thread_id)
+                # #905: and a call still waiting for its result is the session
+                # working, however long it stays quiet.
+                opened, closed = _tool_call_ids(event)
+                turn_activity.note(self.thread_id, started=opened, finished=closed)
                 # #908: whether this turn's latest reply is Claude Code's own
                 # API-error message — the runner reads it when the turn ends.
                 if (
@@ -1149,8 +1152,8 @@ class TranscriptMirror:
                 # covers turns started outside Discord (scheduler / webhook / the
                 # tmux pane).
                 # #757: the ids tell a call that is still running (no result
-                # yet) from a turn that has genuinely gone quiet.
-                opened, closed = _tool_call_ids(event)
+                # yet) from a turn that has genuinely gone quiet (``opened`` /
+                # ``closed`` were read above, where the lamp got them — #905).
                 is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
                 if is_tool or opened or closed:
                     self._progress.begin_turn()

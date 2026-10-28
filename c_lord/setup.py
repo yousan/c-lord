@@ -308,6 +308,7 @@ async def setup_bridge(
             allowed_user_ids=allowed_user_ids,
             allowed_role_name=allowed_role_name,
             authorizer=authorizer,
+            settings_repo=settings_repo,
         )
         await bot.add_cog(skill_cog)
         logger.info("Registered SkillCommandCog")
