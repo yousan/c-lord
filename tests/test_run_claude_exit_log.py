@@ -290,3 +290,24 @@ async def test_ask_resume_is_not_an_orphan(caplog) -> None:
         await run_claude_with_config(_config(_runner([_started(), asking], [_done()])))
 
     assert _orphan_warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [TimeoutError(), OSError("name resolution")])
+async def test_a_lamp_lost_to_the_network_is_still_an_ok_turn(caplog, exc) -> None:
+    """#904: the turn-end 🟡 failing on DNS/timeout used to end the turn as error."""
+    from c_lord.discord_ui.status import StatusManager
+
+    trigger = MagicMock(spec=discord.Message)
+    trigger.guild = MagicMock()
+    trigger.add_reaction = AsyncMock()
+    trigger.remove_reaction = AsyncMock(side_effect=exc)
+    config = _config(_runner([_started(), _done()]))
+    config.status = StatusManager(trigger)
+    await config.status.set_running()
+
+    await run_claude_with_config(config)
+
+    exits = _lines(caplog, "exit")
+    assert len(exits) == 1
+    assert _outcome(exits[0]) == "ok"
