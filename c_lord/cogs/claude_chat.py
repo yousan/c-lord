@@ -63,11 +63,13 @@ from ..discord_ui.views import (
 )
 from ..gateway_backfill import (
     HISTORY_LIMIT,
+    OUTAGE_SETTING,
     Cause,
     GatewayWatch,
     MissedEntry,
     Outage,
     Outcome,
+    PreviousOutage,
     SeenMessages,
     Startup,
     last_mark_before,
@@ -3032,6 +3034,32 @@ class ClaudeChatCog(commands.Cog):
                 "read back on reconnect (#745)",
                 _local_stamp(now),
             )
+            # #920: if this process dies before it reconnects, the next one
+            # reads back from here instead of from an hour before it started.
+            await self._keep_open_outage()
+
+    async def _keep_open_outage(self) -> None:
+        """Store (or clear) the outage in progress for the next process (#920)."""
+        if self._settings_repo is None:
+            return
+        outage = self._gateway.open_outage()
+        try:
+            if outage is None:
+                await self._settings_repo.delete(OUTAGE_SETTING)
+            else:
+                await self._settings_repo.set(OUTAGE_SETTING, outage.dumps())
+        except Exception:
+            logger.warning("could not store the open gateway outage (#920)", exc_info=True)
+
+    async def _previous_outage(self) -> PreviousOutage | None:
+        """The outage the previous process went away in, if it recorded one (#920)."""
+        if self._settings_repo is None:
+            return None
+        try:
+            return PreviousOutage.loads(await self._settings_repo.get(OUTAGE_SETTING))
+        except Exception:
+            logger.warning("could not read the previous gateway outage (#920)", exc_info=True)
+            return None
 
     @commands.Cog.listener()
     async def on_resumed(self) -> None:
@@ -3047,15 +3075,7 @@ class ClaudeChatCog(commands.Cog):
         """
         startup = self._gateway.first_connect()
         if startup is not None:
-            logger.info(
-                "Discord gateway up (%s) at %s — process started %s; reading back messages "
-                "posted while c-lord was not running, from %s (#776)",
-                via,
-                _local_stamp(startup.up_at),
-                _local_stamp(startup.started_at),
-                _local_stamp(startup.since),
-            )
-            self._start_backfill(self._backfill_startup(startup))
+            self._start_backfill(self._backfill_startup(startup, via))
             return
         outage = self._gateway.connected()
         if outage is None:
@@ -3078,15 +3098,33 @@ class ClaudeChatCog(commands.Cog):
         task.add_done_callback(self._backfill_tasks.discard)
         self._backfill_task = task
 
-    async def _backfill_startup(self, startup: Startup) -> None:
-        """Read back and run what the restart gap kept from us (#776). Never raises."""
+    async def _backfill_startup(self, startup: Startup, via: str = "ready") -> None:
+        """Read back and run what the restart gap kept from us (#776). Never raises.
+
+        When the previous process lost its gateway before it went away (#920),
+        the gap began then, and so does the reading.
+        """
         async with self._backfill_lock:
+            startup = startup.after(await self._previous_outage())
+            previous = startup.previous
+            logger.info(
+                "Discord gateway up (%s) at %s — process started %s; reading back messages "
+                "posted while c-lord was not running, from %s%s (#776)",
+                via,
+                _local_stamp(startup.up_at),
+                _local_stamp(startup.started_at),
+                _local_stamp(startup.since),
+                ""
+                if previous is None
+                else f" — the previous process lost the gateway at "
+                f"{_local_stamp(previous.down_at)} (#920)",
+            )
             try:
                 picked, threads_hit, read_back = await self._pick_up_missed(
                     since=startup.since,
-                    down_at=startup.up_at,
+                    down_at=startup.up_at if previous is None else previous.down_at,
                     back_at=startup.up_at,
-                    cause="restart",
+                    cause="restart" if previous is None else "gateway",
                     startup=startup,
                 )
             except Exception:
@@ -3096,6 +3134,8 @@ class ClaudeChatCog(commands.Cog):
                     _local_stamp(startup.up_at),
                 )
                 return
+            if previous is not None:
+                await self._keep_open_outage()
             logger.info(
                 "Startup pick-up %s → %s: picked up %d message(s) in %d thread(s) posted "
                 "while c-lord was not running; %d thread(s) read back (#776)",
@@ -3112,6 +3152,9 @@ class ClaudeChatCog(commands.Cog):
         Serialised: a second reconnect while the first pick-up is still walking
         waits for it, so the two never read the same message at once.
         """
+        # #920: the outage is over — or, if the gateway dropped again in the
+        # meantime, the new one is what the next process should read from.
+        await self._keep_open_outage()
         async with self._backfill_lock:
             try:
                 picked, threads_hit, read_back = await self._pick_up_missed(
