@@ -43,6 +43,9 @@ class BridgeComponents:
     task_repo: TaskRepository | None = None
     lounge_repo: LoungeRepository | None = None
     resume_repo: PendingResumeRepository | None = None
+    #: Where per-thread session dirs are cloned (``<base>/<channel>/<thread>``),
+    #: as resolved by setup — the 30-day sweep deletes only under it (#902).
+    session_dir_base: str | None = None
 
     def apply_to_api_server(self, api_server: ApiServer) -> None:
         """Wire all optional repos to an ApiServer instance.
@@ -508,11 +511,14 @@ async def setup_bridge(
         menu_watchdog.start()
         bot.menu_watchdog = menu_watchdog  # type: ignore[attr-defined]
 
+    from .clord_home import LEGACY_SESSION_DIR_BASE
+
     components = BridgeComponents(
         session_repo=session_repo,
         task_repo=task_repo,
         lounge_repo=lounge_repo,
         resume_repo=resume_repo,
+        session_dir_base=session_dir_base or LEGACY_SESSION_DIR_BASE,
     )
 
     # Auto-wire repos to ApiServer if provided
