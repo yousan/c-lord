@@ -170,10 +170,16 @@ class EventProcessor:
         still pings the same person it would have pinged for a parked turn,
         rather than silently regressing to no mention at all.
         """
+        uid = self._failure_notify_uid
+        return f"<@{uid}>" if uid is not None else None
+
+    @property
+    def _failure_notify_uid(self) -> int | None:
+        """Who :attr:`_failure_mention` pings (#681), or ``None``."""
         uid = self._config.failure_notify_id
         if uid is None:
             uid = self._config.notify_user_id
-        return f"<@{uid}>" if uid is not None else None
+        return uid
 
     async def process(self, event: StreamEvent) -> None:
         """Dispatch a single stream event to the appropriate handler."""
@@ -404,6 +410,8 @@ class EventProcessor:
             )
             if err_msg is not None:
                 self._last_response_msg = err_msg
+                # #915: the turn-end line must not ping the same person again.
+                self._config.outcome.pinged_user_id = self._failure_notify_uid
             if self._config.status:
                 await self._config.status.set_error()
         else:
