@@ -19,10 +19,10 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
-import aiohttp
 import discord
 
 from ..claude.types import ToolCategory  # noqa: F401  — kept for set_tool signature
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..turn_activity import turn_activity
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,7 @@ EMOJI_COMPACT = "\U0001f5dc️"  # 🗜️
 _OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD, EMOJI_COMPACT)
 
 # What a reaction call can fail with without the turn being in trouble (#904).
-# ``asyncio.TimeoutError`` is spelled out: before 3.11 it is not an OSError.
-_LAMP_FAILURES = (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, OSError)
+_LAMP_FAILURES = DISCORD_CALL_FAILURES
 
 STALL_SOFT_SECONDS = 10
 STALL_HARD_SECONDS = 30

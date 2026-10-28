@@ -25,6 +25,7 @@ from .. import turn_events
 from ..cogs._run_helper import run_claude_with_config
 from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..model_scopes import begin_turn_for, effort_for_launch
 from ..notify_policy import owner_notify_id
@@ -186,7 +187,7 @@ class WebhookTriggerCog(commands.Cog):
         """
         owner = owner_notify_id(self.bot, kind="failure")
         mention = f"<@{owner}> " if owner is not None else ""
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await thread.send(
                 f"{mention}❌ この webhook トリガーを動かす tmux ウィンドウを作れませんでした。"
                 "ホストで tmux が使えるか、チャンネルが `/clord-init` で repo に"

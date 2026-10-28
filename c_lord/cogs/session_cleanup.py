@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..session_cleanup import inspect_survivors, notice_for
 from ..utils.logger import log_ctx
 
@@ -128,7 +129,7 @@ class SessionCleanupCog(commands.Cog):
             return
         try:
             await thread.send(notice_for(record, survivors, days=self._days))
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             logger.warning("%s cleanup notice failed to send (#554)", ctx)
             return
         # Leave the thread as closed as it would have been without us: an open
@@ -136,7 +137,7 @@ class SessionCleanupCog(commands.Cog):
         try:
             if isinstance(thread, discord.Thread):
                 await thread.edit(archived=True)
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             logger.warning(
                 "%s cleanup notice posted but re-archiving failed — thread left open (#857)",
                 ctx,

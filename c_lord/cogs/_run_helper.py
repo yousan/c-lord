@@ -46,6 +46,7 @@ from ..claude.tmux_runner import (
     TmuxClaudeRunner,
 )
 from ..claude.types import UsageLimit
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
     bridge_pane_ask,
@@ -428,7 +429,7 @@ async def _post_context_usage(config: RunConfig, session_id: str | None) -> None
     from ..transcript.mirror import show_url_embeds_enabled
 
     suppress_embeds = not show_url_embeds_enabled()
-    with contextlib.suppress(discord.HTTPException):
+    with contextlib.suppress(*DISCORD_CALL_FAILURES):
         await config.thread.send(line, suppress_embeds=suppress_embeds)
 
 

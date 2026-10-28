@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 
+from .discord_failures import DISCORD_CALL_FAILURES
+
 if TYPE_CHECKING:
     from .database.repository import SessionRepository
 
@@ -45,7 +47,7 @@ async def _is_bot_user(bot: Any, user_id: int) -> bool:
     if user is None:
         try:
             user = await bot.fetch_user(user_id)
-        except discord.HTTPException:
+        except DISCORD_CALL_FAILURES:
             return False
     return getattr(user, "bot", False) is True
 

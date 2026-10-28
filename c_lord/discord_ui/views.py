@@ -9,6 +9,7 @@ from typing import Protocol, runtime_checkable
 
 import discord
 
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..session_stop import StopOutcome, StopResult, stop_reply
 from .authorization import AuthorizedViewMixin, Authorizer
 from .error_reporting import ErrorReportingViewMixin
@@ -79,12 +80,12 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             return
 
         old_message = self._message
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             new_message = await thread.send(STOP_MESSAGE_PREFIX, view=self)
             self._message = new_message
 
         if old_message:
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await old_message.delete()
 
     @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger)
@@ -199,12 +200,12 @@ class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui
 
         button.disabled = True
         button.label = "再開しました"
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await interaction.response.defer()
         # ``interaction.message`` is None for interactions that did not originate
         # from a message (never the case for a button, but the type allows it).
         if interaction.message is not None:
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await interaction.message.edit(view=self)
 
         await self._on_reopen(interaction)
@@ -259,10 +260,10 @@ class TextAnsweredMenuView(AuthorizedViewMixin, ErrorReportingViewMixin, discord
 
         button.disabled = True
         button.label = "新しい指示として実行しました"
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await interaction.response.defer()
         if interaction.message is not None:
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await interaction.message.edit(view=self)
 
         await self._on_rerun(interaction)

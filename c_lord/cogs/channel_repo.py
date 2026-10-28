@@ -36,6 +36,7 @@ from ..database.channel_repo import (
     normalize_repo_url,
     validate_repo_url,
 )
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.authorization import Authorizer
 from ..session_dir import SessionDirManager
 from ..session_resume import NOT_A_CLORD_THREAD_BINDING, classify, is_clord_thread
@@ -562,7 +563,7 @@ class ChannelRepoCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            except discord.HTTPException:
+            except DISCORD_CALL_FAILURES:
                 pass  # 他のエラーは無視してbindを続行
 
         # --- Bind thread to repo ---

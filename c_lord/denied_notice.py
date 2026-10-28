@@ -44,6 +44,7 @@ from typing import Any
 import discord
 
 from .command_gate import owns_channel
+from .discord_failures import DISCORD_CALL_FAILURES
 from .discord_ui.authorization import get_fallback_owner_ids, read_application_owners
 from .log_sampler import LogSampler
 from .utils.logger import log_ctx
@@ -212,7 +213,7 @@ class DeniedNotifier:
                     suppress_embeds=True,  # no previews of links the outsider wrote
                 )
                 sent.append(owner_id)
-            except discord.HTTPException as exc:
+            except DISCORD_CALL_FAILURES as exc:
                 # Forbidden = the owner does not accept DMs. Say so and move on.
                 logger.warning(
                     "could not DM owner %s about a refused message (%s: %s) (#346)",

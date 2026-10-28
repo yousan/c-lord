@@ -42,6 +42,7 @@ from ..database.repository import SessionRecord, SessionRepository
 from ..database.resume_repo import PendingResumeRepository
 from ..database.settings_repo import SettingsRepository
 from ..denied_notice import DeniedNotifier
+from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ref import enrich_discord_references
 from ..discord_ui.authorization import (
     Authorizer,
@@ -1179,7 +1180,7 @@ class ClaudeChatCog(commands.Cog):
                 ctx,
                 f" — swept at {tomb.closed_at}" if tomb is not None else "",
             )
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await thread.send(FRESH_START_NOTICE)
             await self._handle_thread_reply(message, fresh=True)
             return
@@ -1196,7 +1197,7 @@ class ClaudeChatCog(commands.Cog):
             f" — swept at {tomb.closed_at} (#818)" if tomb is not None else "",
         )
 
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await message.add_reaction(UNTRACKED_REACTION)
 
         if thread.id in self._untracked_notice_sent:
@@ -1328,7 +1329,7 @@ class ClaudeChatCog(commands.Cog):
         if plan.kind is Recovery.NONE:
             return None
 
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await thread.send(auto_reattach_notice(plan))
         self._resume_announced.add(thread.id)
         done = await self._reattach_thread(thread)
@@ -1434,11 +1435,11 @@ class ClaudeChatCog(commands.Cog):
             # The caller finds no row and runs the prompt with no session id,
             # which is exactly a new thread's first turn.
             logger.info("%s /clord: nothing to reconnect to — starting fresh (#862)", ctx)
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await thread.send(FRESH_START_NOTICE)
             return True
         logger.info("%s /clord: nothing left to reconnect to (#538 AC8)", ctx)
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await thread.send(swept_notice(tomb) if tomb is not None else UNTRACKED_NOTICE)
         await respond(
             "ℹ️ このスレッドの記録が見つかりませんでした。スレッドに案内を出しました。",
@@ -2294,7 +2295,7 @@ class ClaudeChatCog(commands.Cog):
                 )
             if ack is not None:
                 await ack()
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await thread.send(
                     f"-# 🔄 停止していたワークスペースを復元してから `{command}` を送ります。"
                 )
@@ -2711,7 +2712,7 @@ class ClaudeChatCog(commands.Cog):
                 log_ctx(thread_id=thread.id),
                 exc_info=True,
             )
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await channel.send(_SEND_PERMISSION_HELP)
             raise
         # Run Claude in the background so /api/spawn returns immediately.
@@ -3326,7 +3327,7 @@ class ClaudeChatCog(commands.Cog):
             _local_stamp(newest.created_at),
             outcome,
         )
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await thread.send(
                 missed_notice(
                     down_at=down_at,
@@ -3515,7 +3516,7 @@ class ClaudeChatCog(commands.Cog):
                     already_announced=announced,
                 )
                 if notice is not None:
-                    with contextlib.suppress(discord.HTTPException):
+                    with contextlib.suppress(*DISCORD_CALL_FAILURES):
                         await thread.send(notice)
                 elif slept:
                     # Invisible to the user, but not to whoever reads the log:
@@ -3641,7 +3642,7 @@ class ClaudeChatCog(commands.Cog):
         # its prompt, and a prompt can still take the answer. Menu keystrokes
         # typed at it could not, which is why this does not just wake and send.
         if await self._menu_window_is_gone(thread):
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await thread.send(
                     "-# 🔄 この質問が出ていたワークスペースが停止していました。"
                     "復元してから、いただいた文章を新しい指示として送ります。"
@@ -3678,7 +3679,7 @@ class ClaudeChatCog(commands.Cog):
             # this same message with what actually happened, so the thread can
             # never hold two accounts of one answer (#804 AC4).
             notice = None
-            with contextlib.suppress(discord.HTTPException):
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 notice = await thread.send(
                     content=(
                         f"-# ⏳ この文章を、開いていた質問への回答として送っています: {text[:150]}"
@@ -3800,7 +3801,7 @@ class ClaudeChatCog(commands.Cog):
                 return
             except Exception:
                 logger.debug("could not rewrite the answer notice — posting instead")
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             if view is not None:
                 await thread.send(content=content, view=view)
             else:
@@ -4238,7 +4239,7 @@ class ClaudeChatCog(commands.Cog):
         if not skipped:
             return
         body = "\n".join(f"- {line}" for line in skipped)
-        with contextlib.suppress(discord.HTTPException):
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await thread.send(f"⚠️ 次の添付は Claude に渡せませんでした:\n{body}")
 
     async def _abort_turn_on_workspace_failure(
@@ -4432,7 +4433,7 @@ class ClaudeChatCog(commands.Cog):
                         turn.effort,
                         turn.previously_applied,
                     )
-                    with contextlib.suppress(discord.HTTPException):
+                    with contextlib.suppress(*DISCORD_CALL_FAILURES):
                         await thread.send(
                             "-# 🔄 モデル設定が変わったため、会話を保ったまま Claude を"
                             f"立て直します（{turn.model} / {turn.effort or '—'}）。"
