@@ -173,7 +173,7 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
 起動時に過去分は流さない。しかし、
 
 - truncation（`size < offset`）
-- 同一サイズの in-place rewrite（`size == offset && mtime 更新`）
+- 同一サイズの in-place rewrite（`size == offset && mtime 更新` **かつ読了位置の直前 4 KB が変わった**）
 - 新しい active jsonl への切り替え（`/clear`）
 
 を検知すると **読み取り offset を 0 にリセットして先頭から読み直す**。
@@ -195,6 +195,11 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
 - 起動時（`from_start=False`）は、ファイルに既に存在する `uuid` を baseline として
   seen に投入する。これにより、起動直後に `--resume` で offset が 0 にリセットされ
   ても、**起動前から在った履歴は「配信済み」として二度と流れない**。
+- **mtime だけが進んだ（中身もサイズも同じ）ときは読み直さない**（#906）。Claude Code は
+  アイドルの transcript をおよそ 1 時間ごとに触る。これを同一サイズの書き換えとみなすと、
+  `uuid` を持たない `api-request-blob`（リクエストの写し。中に過去の `tool_use` を持つ）が
+  再び流れ、終わったスレッドに進捗行「⏳ 待機中」が立っていた。判定は読了位置の直前 4 KB を
+  覚えておき、同サイズで mtime が進んだときにだけ比べる（100 MB の transcript を読み直さない）。
 - `from_start=True`（明示的な全リプレイ）では baseline seeding を行わず、各イベントは
   一度だけ流れる（リセットが起きても重複しない）。
 - **読み位置はファイルごとに覚える**（#627）。乗り換えて戻ってきても、読了済みの
@@ -206,7 +211,9 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
 
 テスト: `tests/transcript/test_tail.py`
 (`test_tail_does_not_replay_history_on_resume_rewrite`,
-`test_tail_does_not_re_yield_already_followed_event_on_rewrite`) と
+`test_tail_does_not_re_yield_already_followed_event_on_rewrite`,
+`test_tail_does_not_re_read_when_only_mtime_moves`,
+`test_tail_recovers_from_a_same_size_rewrite`) と
 `tests/transcript/test_mirror.py`
 (`test_mirror_does_not_repost_history_on_resume_rewrite`)。
 
