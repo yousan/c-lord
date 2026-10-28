@@ -801,12 +801,33 @@ def render_result(result: ChangeResult) -> str:
     return "\n".join(lines)
 
 
+def _settings_repo_of(bot: object) -> object | None:
+    """Where ``/model`` writes, for a caller that was not handed it (#954).
+
+    Right after a restart nothing has cached the service yet, and the
+    scheduler / webhook cogs take no ``settings_repo`` — so look where the cogs
+    that own ``/model`` keep it, rather than launching on the instance defaults.
+    """
+    get_cog = getattr(bot, "get_cog", None)
+    if callable(get_cog):
+        for name, attr in (
+            ("ClaudeChatCog", "_settings_repo"),
+            ("SessionManageCog", "settings_repo"),
+        ):
+            repo = getattr(get_cog(name), attr, None)
+            if isinstance(getattr(repo, "db_path", None), str):
+                return repo
+    return getattr(bot, "settings_repo", None)
+
+
 def service_for(bot: object, settings_repo: SettingsRepository | None, runner: object | None):
     """The process-wide service, created on first use (zero-config for consumers)."""
     existing = getattr(bot, "_clord_model_scopes", None)
     if isinstance(existing, ModelScopeService):
         return existing
     db_path = getattr(settings_repo, "db_path", None)
+    if not isinstance(db_path, str):
+        db_path = getattr(_settings_repo_of(bot), "db_path", None)
     if not isinstance(db_path, str):
         return None
 
