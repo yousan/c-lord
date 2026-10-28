@@ -15,14 +15,28 @@ p95 = 2.42h。4時間なら**影響を受ける復帰は 3.89%**（26回に1回�
 打てるようにすると「停止とどう違う?」という説明の要る概念が1つ増える。3操作
 （スリープ ⊂ 停止 ⊂ 削除）のうち、利用者が名前で呼ぶ必要があるのは下2つだけ。
 
+**「人が触っていない」だけでは眠らせない (#922)。** ``last_used_at`` は c-lord が
+ターンを始めた時刻なので、ターンが終わったあとも Claude が自分で続けている作業
+（バックグラウンドの書き出し・Monitor の待ち・サブエージェント）は数えない。
+2026-10-17 はそれで 40 分の書き出しがウィンドウごと消えた。だから次のどちらかが
+あるワークスペースは、まだアイドルではない:
+
+* Claude の Bash ツールのシェルがペインの下でまだ生きている
+  (:func:`c_lord.tool_shells.tool_shell_groups` — ⏹ Stop が止めるのと同じもの)
+* transcript（サブエージェントのものを含む）が閾値以内に書かれている。
+  tmux の ``window_activity`` と違い、transcript は Claude が何かしたときにしか
+  書かれないので、スピナーの再描画では動かない。
+
 あるべき動きは ``docs/specs/workspace-sleep.md``。
 """
 
 from __future__ import annotations
 
 import datetime
+import inspect
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .idle_sweep import IdleSweepLoop
@@ -38,6 +52,7 @@ __all__ = [
     "IdleSleepLoop",
     "idle_label_for_hours",
     "idle_sleep_hours",
+    "last_transcript_write",
 ]
 
 #: Hours of no human activity before a workspace's Claude is stopped.
@@ -87,6 +102,26 @@ def idle_label_for_hours(hours: float) -> str:
     return f"{hours:g}時間"
 
 
+def last_transcript_write(project_dir: Path) -> datetime.datetime | None:
+    """When Claude last wrote any transcript of *project_dir* (#922), local time.
+
+    Every ``*.jsonl`` below it counts — the session's own and its subagents'
+    (``<session>/subagents/*.jsonl``). ``None`` when there are none.
+    """
+    newest: float | None = None
+    try:
+        for path in project_dir.rglob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    except OSError:
+        return None
+    return None if newest is None else datetime.datetime.fromtimestamp(newest)
+
+
 class IdleSleepLoop(IdleSweepLoop):
     """Puts the Claude of untouched workspaces to sleep.
 
@@ -121,6 +156,12 @@ class IdleSleepLoop(IdleSweepLoop):
         # thread_id -> the ``last_used_at`` this loop already acted on. See
         # :meth:`_needs_action`.
         self._visited: dict[int, str] = {}
+        # #922: threads skipped this tick because Claude was still at work. They
+        # must not be marked visited, or they would never be looked at again.
+        self._busy: set[int] = set()
+        # Where Claude Code keeps its transcripts. None = its real location;
+        # tests point it at a tmp dir.
+        self._projects_root: Path | None = None
 
     def _threshold_label(self) -> str:
         return idle_label_for_hours(self._hours)
@@ -144,9 +185,35 @@ class IdleSleepLoop(IdleSweepLoop):
         rebuilt from scratch after a restart, which costs exactly one extra
         sweep.
         """
-        return self._visited.get(record.thread_id) != record.last_used_at
+        if self._visited.get(record.thread_id) == record.last_used_at:
+            return False
+        return not self._transcript_recent(record)
+
+    def _transcript_recent(self, record: SessionRecord) -> bool:
+        """Claude wrote its transcript within the threshold: not idle yet (#922)."""
+        if not record.working_dir:
+            return False
+        from .transcript.resolver import derive_project_dir
+
+        project_dir = derive_project_dir(record.working_dir, projects_root=self._projects_root)
+        written = last_transcript_write(project_dir)
+        if written is None:
+            return False
+        now = self._now()  # type: ignore[operator]
+        if now - written >= self._threshold:
+            return False
+        logger.info(
+            "idle-sleep: thread=%d not slept — Claude wrote its transcript at %s, within %s (#922)",
+            record.thread_id,
+            written.strftime("%Y-%m-%d %H:%M:%S"),
+            idle_label_for_hours(self._hours),
+        )
+        return True
 
     def _mark_visited(self, record: SessionRecord) -> None:
+        if record.thread_id in self._busy:
+            self._busy.discard(record.thread_id)
+            return
         self._visited[record.thread_id] = record.last_used_at
 
     # ── the operation ────────────────────────────────────────────────────
@@ -159,6 +226,30 @@ class IdleSleepLoop(IdleSweepLoop):
                 "idle-sleep: SessionManageCog unavailable — skipping thread=%d", thread_id
             )
             return False
+
+        # #922: a background command (a render, a build) is Claude's work in
+        # progress; killing the window kills it.
+        count = getattr(type(cog), "_count_tool_shells", None)
+        if inspect.iscoroutinefunction(count):
+            try:
+                shells = int(await cog._count_tool_shells(channel))  # type: ignore[union-attr]
+            except Exception:
+                logger.warning(
+                    "idle-sleep: could not look for running commands in thread=%d — "
+                    "not sleeping it this tick",
+                    thread_id,
+                    exc_info=True,
+                )
+                shells = 1
+            if shells:
+                logger.info(
+                    "idle-sleep: thread=%d not slept — %d command(s) Claude started are "
+                    "still running (#922)",
+                    thread_id,
+                    shells,
+                )
+                self._busy.add(thread_id)
+                return False
 
         from .workspace_notice import WorkspaceReason
 
