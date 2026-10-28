@@ -1747,6 +1747,24 @@ class SessionManageCog(commands.Cog):
             return
         await self._workspace_delete_impl(channel=ctx.channel, respond=respond, ack=ack)
 
+    async def _count_tool_shells(self, channel: object) -> int:
+        """Commands Claude started in this thread's pane that are still running (#922).
+
+        Asked by :class:`c_lord.idle_sleep.IdleSleepLoop` before it sleeps a
+        workspace: the window going takes them with it. 0 when there is no pane.
+        """
+        if not isinstance(channel, discord.Thread):
+            return 0
+        import asyncio
+
+        thread_id = channel.id
+        tmux_mgr = await self._resolve_tmux_manager(
+            channel.parent_id or thread_id, thread_id=thread_id
+        )
+        if tmux_mgr is None:
+            return 0
+        return int(await asyncio.to_thread(tmux_mgr.count_tool_shells, thread_id))
+
     async def _sleep_workspace_impl(
         self,
         *,
