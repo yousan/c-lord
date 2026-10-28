@@ -70,20 +70,26 @@ class _LoopWatchdog:
     def __init__(self, tick: float = 0.005) -> None:
         self._tick = tick
         self.max_gap = 0.0
+        self._last = 0.0
         self._task: asyncio.Task | None = None
 
     async def _run(self) -> None:
-        last = time.perf_counter()
+        self._last = time.perf_counter()
         while True:
             await asyncio.sleep(self._tick)
             now = time.perf_counter()
-            self.max_gap = max(self.max_gap, now - last - self._tick)
-            last = now
+            self.max_gap = max(self.max_gap, now - self._last - self._tick)
+            self._last = now
 
     def start(self) -> None:
+        self._last = time.perf_counter()
         self._task = asyncio.create_task(self._run(), name="loop-watchdog")
 
     async def stop(self) -> None:
+        # The gap still open when we stop counts too (#960): a loop that is
+        # blocked for the whole window never lets ``_run`` take a second
+        # sample, and would otherwise report a perfect 0.0.
+        self.max_gap = max(self.max_gap, time.perf_counter() - self._last - self._tick)
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
@@ -246,16 +252,29 @@ async def test_a_slow_poll_cycle_does_not_stall_the_event_loop(
 
 
 async def test_many_concurrent_tails_keep_the_event_loop_responsive(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC-b at unit scale: production runs 252-255 mirrors on one loop.
 
     Each project dir here holds enough jsonl files that the per-poll
     ``glob``+``stat`` is not free, which is exactly the shape that saturated the
     loop in production.  The watchdog must still be serviced.
+
+    #960: the poll's cost is injected as a known ``sleep``, like
+    :func:`test_a_slow_poll_cycle_does_not_stall_the_event_loop`, so the test
+    measures **where** the polls run rather than how busy the CI runner is.
+    With only the real glob+stat as the cost it could not tell the two apart:
+    run inline the 60 polls blocked the loop ~0.1 s — under the threshold, so
+    the regression passed — while off the loop the eight workers, saturated by
+    3,000 polls/s of CPU-bound ``stat``, kept the loop waiting for the GIL for
+    up to 0.27 s on a CI runner.  The directories are also aged, as every
+    production one is: a directory changed less than a second ago is re-listed
+    on every poll (the resolver's settle window), which no long-lived mirror
+    ever sees.
     """
     mirrors = 60
     files_per_dir = 40
+    poll_cost = 0.05  # one poll of a large project dir; 60 of them inline ≈ 3 s
     projects: list[Path] = []
     for i in range(mirrors):
         project = tmp_path / f"p{i}"
@@ -265,7 +284,16 @@ async def test_many_concurrent_tails_keep_the_event_loop_responsive(
             os.utime(decoy, (1 + j, 1 + j))
         active = _clord_jsonl(project / "active.jsonl")
         os.utime(active, (1000, 1000))
+        os.utime(project, (500, 500))
         projects.append(project)
+
+    real = resolver_mod.ThreadSessionResolver.resolve
+
+    def slow(self):
+        time.sleep(poll_cost)
+        return real(self)
+
+    monkeypatch.setattr(resolver_mod.ThreadSessionResolver, "resolve", slow)
 
     agens = [tail_events(p, poll_interval=0.02).__aiter__() for p in projects]
 
@@ -273,9 +301,9 @@ async def test_many_concurrent_tails_keep_the_event_loop_responsive(
         async for _ in agen:
             pass
 
-    consumers = [asyncio.create_task(consume(a)) for a in agens]
     watchdog = _LoopWatchdog()
     watchdog.start()
+    consumers = [asyncio.create_task(consume(a)) for a in agens]
     try:
         await asyncio.sleep(1.0)
     finally:
@@ -286,9 +314,13 @@ async def test_many_concurrent_tails_keep_the_event_loop_responsive(
         for agen in agens:
             await agen.aclose()
 
-    # The Discord heartbeat warning fires at 10 s; 0.25 s is a wide margin that
-    # still fails loudly if 60 tails are polling inline.
-    assert watchdog.max_gap < 0.25, (
+    # The Discord heartbeat warning fires at 10 s.  Run inline, the start-up
+    # polls alone block the loop for mirrors x poll_cost = 3 s in one stretch
+    # (measured 6-7 s); off the loop the gap is CPU noise — 0.02-0.1 s here,
+    # 0.27 s at worst on a CI runner.  A third of the inline cost sits well
+    # clear of both.
+    limit = mirrors * poll_cost / 3
+    assert watchdog.max_gap < limit, (
         f"loop blocked {watchdog.max_gap:.3f}s with {mirrors} concurrent tails — "
         "production runs 4x this many"
     )
