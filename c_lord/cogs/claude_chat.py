@@ -665,6 +665,7 @@ class ClaudeChatCog(commands.Cog):
         tmux_manager: TmuxSessionManager,
         first_message: str,
         working_dir: str | None = None,
+        retitle: bool = True,
     ) -> None:
         """Apply the Issue #95 / #414 naming scheme to ``thread``.
 
@@ -683,7 +684,8 @@ class ClaudeChatCog(commands.Cog):
           (#593).
 
         Mid-conversation topic re-titling (#121) is gated on ``self._thread_retitle``
-        (off by default, #414).
+        (off by default, #414), and skipped when *retitle* is False — the
+        turn-end pass (#910) is about the branch, not a second summary.
 
         All errors are swallowed by the caller; this helper raises only
         on truly unexpected programmer mistakes.
@@ -735,7 +737,7 @@ class ClaudeChatCog(commands.Cog):
         # CLORD_THREAD_RETITLE=1. Only runs when a topic already exists and the
         # thread is not manually renamed (locked). Returns None when the LLM
         # deems the current topic still valid — so no rename API call is fired.
-        if topic and not locked and self._thread_retitle:
+        if topic and not locked and self._thread_retitle and retitle:
             with contextlib.suppress(Exception):
                 new_topic = await topic_module.maybe_retitle(first_message or "", topic)
                 if new_topic is not None:
@@ -4614,3 +4616,25 @@ class ClaudeChatCog(commands.Cog):
                         # second later.
                         preempted=runner.preempted,
                     )
+
+                # #910: the name is built when a message arrives, while Claude is
+                # still on the previous job's branch. Rebuild it now that the turn
+                # is over, so a branch switched to during the turn shows as
+                # ``→#<new>``. Renames only if the name changed (#241). A turn the
+                # user's next message replaced leaves it to that turn. After the
+                # turn-end ping, so a rate-limited rename (5s timeout) cannot delay it.
+                if tmux_manager is not None and not runner.preempted:
+                    try:
+                        await self._apply_thread_naming(
+                            thread=thread,
+                            tmux_manager=tmux_manager,
+                            first_message=prompt,
+                            working_dir=working_dir,
+                            retitle=False,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "%s turn-end thread naming failed",
+                            log_ctx(thread_id=thread.id),
+                            exc_info=True,
+                        )
