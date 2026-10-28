@@ -103,7 +103,8 @@ def test_compaction_is_reported_as_a_single_line() -> None:
     rendered = render_event(_compact_event())
     assert rendered is not None
     assert rendered.body == "🗜️ コンテキストを圧縮しました"
-    assert rendered.kind == "tool_result"
+    # #914: a notice for the thread, not a tool result folded into progress.txt.
+    assert rendered.kind == "notice"
     assert rendered.session_id == _compact_event()["sessionId"]
 
 
@@ -226,3 +227,96 @@ def test_an_assistant_message_is_not_mistaken_for_a_compact_summary() -> None:
     assert rendered is not None
     assert rendered.kind == "assistant_text"
     assert "This session is being continued" in rendered.body
+
+
+# ── #914: the one line reaches the thread, not just progress.txt ─────────
+
+
+async def _mirror_compaction(tmp_path: Path, *before: dict, after: tuple[dict, ...] = ()):
+    """Run a minimal-mode mirror over a compaction; return (sink, file, progress posts)."""
+    import asyncio
+    import os
+
+    from c_lord.discord_ui.turn_progress import TurnProgress
+    from c_lord.transcript.mirror import TranscriptMirror
+
+    from .helpers import clord_transcript
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = clord_transcript(project / "s.jsonl")
+    os.utime(jsonl, (1, 1))
+    sink_calls: list[str] = []
+    file_calls: list[tuple[str, str]] = []
+    progress_posts: list[str] = []
+    clock = {"t": 1000.0}
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def file_sink(text: str, path: str) -> None:
+        file_calls.append((text, Path(path).read_text(encoding="utf-8")))
+
+    async def p_post(text: str):
+        progress_posts.append(text)
+        return "m"
+
+    async def p_noop(*_a: object) -> None:
+        return None
+
+    mirror = TranscriptMirror(
+        thread_id=914,
+        project_dir=project,
+        sink=sink,
+        file_sink=file_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=TurnProgress(
+            post=p_post, edit=p_noop, delete=p_noop, clock=lambda: clock["t"]
+        ),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        with jsonl.open("a", encoding="utf-8") as f:
+            for event in (*before, _compact_event(), *after):
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        await asyncio.sleep(0.3)
+        clock["t"] += 6000.0  # an idle thread stays idle
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+    return sink_calls, file_calls, progress_posts
+
+
+async def test_idle_compaction_posts_one_line_to_the_thread(tmp_path: Path) -> None:
+    """AC1/AC3: compacted while waiting — exactly one 🗜️ line, nothing else."""
+    sink_calls, file_calls, progress_posts = await _mirror_compaction(tmp_path)
+    assert [c for c in sink_calls if "🗜️" in c] == ["-# 🗜️ コンテキストを圧縮しました"]
+    assert file_calls == []
+    # Not mistaken for tool activity: no "⏳ 待機中" on an idle thread.
+    assert progress_posts == []
+
+
+async def test_compaction_mid_turn_is_in_the_thread_not_the_attachment(tmp_path: Path) -> None:
+    """AC1/AC2: in a turn, the line is posted and the summary text goes nowhere."""
+    tool = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}],
+        },
+    }
+    answer = {
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "続きです"}]},
+    }
+    sink_calls, file_calls, _ = await _mirror_compaction(
+        tmp_path, tool, after=(answer, {"type": "system", "subtype": "turn_duration"})
+    )
+    assert [c for c in sink_calls if "🗜️" in c] == ["-# 🗜️ コンテキストを圧縮しました"]
+    for text, progress in file_calls:
+        assert "🗜️" not in progress
+        assert "This session is being continued" not in text + progress
+    assert not any("This session is being continued" in c for c in sink_calls)

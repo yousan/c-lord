@@ -21,7 +21,7 @@
 
 | 項目 | 何を言っているか | 出どころ |
 |---|---|---|
-| `7% context (69k/1.0M)` | いまコンテキスト窓をどれだけ使っているか | そのターンの transcript の `usage`（分子）／`/context` の実測または既定値（分母） |
+| `7% context (69k/1.0M)` | いまコンテキスト窓をどれだけ使っているか | そのターンの transcript の `usage`（分子）／`/context` の実測または既定値（分母）。実測は**会話の外の使い捨てプロセス**（`claude -p --no-session-persistence -- /context`）で、モデルごとに一度だけ行う。スレッドのペインには打たない（#924 — ペインに打った `/context` の出力は Claude の会話に残り、Claude が誰も聞いていないのに「コンテキストは 79k/1M です」と返していた） |
 | `fable-5` | 実際に答えたモデル | そのターンの transcript の `model` |
 | `xhigh` | そのターンの effort | c-lord がその実行に渡した値 |
 | `CLI 2.1.260` | **そのターンを動かした Claude Code の版数** | **そのターンの transcript の `version`** |

@@ -19,6 +19,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+import aiohttp
 import discord
 
 from ..claude.types import ToolCategory  # noqa: F401  — kept for set_tool signature
@@ -38,6 +39,10 @@ EMOJI_COMPACT = "\U0001f5dc️"  # 🗜️
 # Lamps that say "this turn is not over" — what a final paint must not leave
 # behind (#871).
 _OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD, EMOJI_COMPACT)
+
+# What a reaction call can fail with without the turn being in trouble (#904).
+# ``asyncio.TimeoutError`` is spelled out: before 3.11 it is not an OSError.
+_LAMP_FAILURES = (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, OSError)
 
 STALL_SOFT_SECONDS = 10
 STALL_HARD_SECONDS = 30
@@ -189,10 +194,15 @@ class StatusManager:
 
         Failures are still not raised — the lamp is decoration (#632) — but they
         are no longer silent, and the turn's final paint knows to clean up.
+
+        A network failure (DNS, refused connection, timeout) is not an
+        ``HTTPException`` — aiohttp and asyncio raise their own types — and it
+        used to escape here and end the whole turn as ``error``, leaving 🟢 on
+        a request whose work went on and finished (#904).
         """
         try:
             await call
-        except discord.HTTPException as exc:
+        except _LAMP_FAILURES as exc:
             self._out_of_sync = True
             logger.warning("lamp: could not %s %s (%s)", what, emoji, exc)
         except asyncio.CancelledError:
@@ -284,6 +294,11 @@ class StatusManager:
                 )
                 await self.set_waiting()
                 return
+            if self._thread_id is not None and turn_activity.running(self._thread_id):
+                # #905: a call is still out — one long command writes nothing
+                # until it returns. That is work, not a stall: the progress
+                # line says 作業中 for the same reason (#757).
+                self._reset_stall_timer()
             elapsed = asyncio.get_running_loop().time() - self._last_activity
 
             if elapsed < STALL_SOFT_SECONDS and self._current_emoji in (

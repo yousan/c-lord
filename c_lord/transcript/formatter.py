@@ -31,7 +31,8 @@ ZWSP_MARKER = "​"
 
 @dataclass(frozen=True)
 class RenderedEvent:
-    kind: str  # "assistant_text" | "tool_use" | "tool_result" | "user_input" | "thinking"
+    # "assistant_text" | "tool_use" | "tool_result" | "user_input" | "thinking" | "notice"
+    kind: str
     body: str
     session_id: str | None = None
 
@@ -144,6 +145,16 @@ _TASK_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.DOTALL)
 _TASK_TAG_RE = re.compile(r"</?task-notification>|<[^>]+>")
 
 
+# What a task notification renders to (#380).  The mirror recognises its own
+# progress.txt line by it (#913).
+TASK_NOTIFICATION_BODY_PREFIX = "⏹ バックグラウンド: "
+
+
+def is_task_notification(text: str) -> bool:
+    """True when *text* (already stripped) is a harness task notification (#913)."""
+    return _is_task_notification(text)
+
+
 def _is_task_notification(text: str) -> bool:
     """True when *text* (already stripped) is a harness task notification."""
     return text.startswith(_TASK_NOTIFICATION_OPEN)
@@ -180,7 +191,7 @@ def _render_task_notification(text: str, session_id: str | None) -> RenderedEven
         return None
     return RenderedEvent(
         kind="tool_result",
-        body=f"⏹ バックグラウンド: {detail}",
+        body=f"{TASK_NOTIFICATION_BODY_PREFIX}{detail}",
         session_id=session_id,
     )
 
@@ -321,11 +332,15 @@ def _render_compact_summary(session_id: str | None) -> RenderedEvent:
     Not dropped silently (#628 AC3): compaction is why Claude can suddenly seem
     to have forgotten the earlier part of a thread, so the fact that it happened
     is worth keeping.  What is not worth keeping is the wall of harness prompt it
-    arrived in.  ``tool_result`` folds it into ``progress.txt`` in minimal mode —
-    the same treatment ``<task-notification>`` got in #380 — so the record
-    survives without spending a Discord message on it.
+    arrived in.
+
+    A ``notice``, not a ``tool_result`` (#914): minimal mode folds tool results
+    into ``progress.txt``, and the one line meant to explain a sudden change in
+    Claude ended up inside an attachment nobody opens — 0 of 40 compactions in
+    a week reached a thread.  A notice is posted to the thread on its own, and
+    is not tool activity, so an idle compaction does not wake the progress line.
     """
-    return RenderedEvent(kind="tool_result", body=_COMPACT_NOTICE, session_id=session_id)
+    return RenderedEvent(kind="notice", body=_COMPACT_NOTICE, session_id=session_id)
 
 
 def _is_slash_command_marker(text: str) -> bool:
