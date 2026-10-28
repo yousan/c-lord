@@ -489,7 +489,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     nowhere else, and ``exit`` is logged in a ``finally`` — so every ``enter``
     gets its ``exit``, whether the turn finished, failed, was pre-empted by the
     next message or was cancelled outright. The line says which
-    (``outcome=ok|error|preempted|cancelled|crashed``) and how long the turn ran.
+    (``outcome=ok|error|stopped|preempted|cancelled|crashed``) and how long the turn ran.
     ``exit`` used to sit at the end of the turn body, where a cancel, an
     exception or the AskUserQuestion resume all skipped it — and an ``enter``
     with no ``exit`` read as a hang every time.
@@ -518,7 +518,11 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     session_id = config.session_id
     try:
         session_id = await _run_turn(config, ctx)
-        if config.outcome.error:
+        if config.outcome.error == STOPPED_BY_USER_ERROR:
+            # #909: the user stopped it (⏹ Stop, /stop, workspace stop). Not a
+            # failure — the turn-end event still says so (``reason: stopped``).
+            outcome = "stopped"
+        elif config.outcome.error:
             outcome = "error"
         elif getattr(config.runner, "preempted", False) is True:
             outcome = "preempted"
@@ -545,7 +549,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         # only hears that from the transcript, and a claude that died mid-turn
         # writes nothing there. Not on ``preempted`` / ``cancelled``: the next
         # message already restarted the line for its own turn.
-        if outcome in ("ok", "error", "crashed"):
+        if outcome in ("ok", "error", "stopped", "crashed"):
             try:
                 await note_run_ended(thread_id)
             except Exception:
@@ -561,7 +565,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             try:
                 turn = config.outcome.turn
                 turn_events.end_turn(turn)
-                if outcome in ("ok", "error", "crashed"):
+                if outcome in ("ok", "error", "stopped", "crashed"):
                     turn_events.finish_turn(turn, failure_reason=_failure_reason(config, outcome))
             except Exception:
                 logger.warning(

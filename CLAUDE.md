@@ -185,7 +185,7 @@ Bot の挙動が怪しいとき、最初に見るべき情報源は **bot ログ
   - ビルドが 7 日以上前なら直後に `WARNING … this c-lord build is N days old (…)` が1行続く (#756)。
     📊 フッタの版数にも `(Nd)` が付く（`docs/specs/context-footer.md`）
 - `_run_helper.py:run_claude_with_config` — `run_claude: enter` / `run_claude: exit (outcome=…, 12.3s)` (Claude 実行 1 回ごと)。
-  **`exit` は `finally` で必ず出る** (#293) — `outcome` は `ok` / `error` / `preempted`(次のメッセージで割り込まれた) /
+  **`exit` は `finally` で必ず出る** (#293) — `outcome` は `ok` / `error` / `stopped`(利用者が ⏹ Stop・`/workspace-stop` で止めた — #909) / `preempted`(次のメッセージで割り込まれた) /
   `cancelled`(割り込みで task ごと止めた) / `crashed`。だから **`enter` だけあって `exit` が無い = そのターンはまだ走っている**。
   同じスレッドで次のターンが始まった時点で前の run がまだ走っていれば `run_claude: orphan — …` の WARNING、
   割り込みで止めた前のターンが cancel 後も終わらなければ `prior turn is still running … (orphan run, #293)` の ERROR が出る
