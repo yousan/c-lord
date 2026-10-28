@@ -3027,6 +3027,94 @@ class TestOnReadyLampRecovery:
         adopt.assert_not_awaited()
 
 
+class TestTurnEndAfterRestart:
+    """#907: a turn that crossed a restart still closes with 📊 and 🟡 @requester.
+
+    The run that would have posted them died with the old process
+    (``outcome=cancelled``); the new process only adopts the lamp (#718). The
+    lamp watcher is what sees the turn end, so it hands the closing on.
+    """
+
+    def _setup(self, tmp_path, *, author_bot: bool = False):
+        thread = TestOnReadyLampRecovery()._thread(9075)
+        trigger = MagicMock(id=4242)
+        trigger.content = "60秒待ってから一言返して"
+        trigger.author = MagicMock(id=777, bot=author_bot)
+        thread.fetch_message = AsyncMock(return_value=trigger)
+        record = MagicMock(
+            trigger_message_id=4242, working_dir=str(tmp_path), session_id="sess-907"
+        )
+        cog = TestOnReadyLampRecovery()._cog(record, thread)
+        dashboard = MagicMock()
+        order: list[str] = []
+
+        async def set_state(*args, **kwargs):
+            order.append("summons")
+
+        dashboard.set_state = AsyncMock(side_effect=set_state)
+        cog._dashboard = dashboard
+
+        async def footer(config, session_id):
+            order.append("footer")
+
+        return cog, thread, dashboard, order, footer
+
+    async def _run(self, cog, adopt, footer) -> None:
+        from unittest.mock import patch
+
+        with (
+            patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt),
+            patch("c_lord.cogs.claude_chat._post_context_usage", footer),
+            patch("c_lord.cogs.claude_chat.RECOVERED_TURN_END_GRACE_SECONDS", 0),
+        ):
+            await cog.on_ready()
+            await asyncio.gather(*cog._lamp_recovery_tasks)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["ended", "over"])
+    async def test_footer_then_summons_once(self, tmp_path, how) -> None:
+        """AC1/AC2/AC3. RED before #907: neither is posted."""
+        from c_lord.discord_ui.thread_dashboard import ThreadState
+
+        cog, thread, dashboard, order, footer = self._setup(tmp_path)
+        await self._run(cog, AsyncMock(return_value=how), footer)
+
+        assert order == ["footer", "summons"]
+        call = dashboard.set_state.await_args
+        assert call.args[1] == ThreadState.WAITING_INPUT
+        assert call.kwargs["thread"] is thread
+        assert call.kwargs["notify_user_id"] == 777
+
+    @pytest.mark.asyncio
+    async def test_nothing_when_a_newer_turn_took_over(self, tmp_path) -> None:
+        cog, _thread, dashboard, order, footer = self._setup(tmp_path)
+        await self._run(cog, AsyncMock(return_value=None), footer)
+        assert order == []
+
+    @pytest.mark.asyncio
+    async def test_nothing_when_a_turn_is_running_in_this_process(self, tmp_path) -> None:
+        """The startup pick-up (#776) may already have started the next turn."""
+        cog, thread, dashboard, order, footer = self._setup(tmp_path)
+
+        async def adopt(message, *, thread_id, turn_running):
+            cog._active_tasks[thread_id] = MagicMock()
+            return "over"
+
+        await self._run(cog, adopt, footer)
+        assert order == []
+
+    @pytest.mark.asyncio
+    async def test_webhook_turn_follows_the_owner_fallback(self, tmp_path) -> None:
+        """AC4: same rule as a turn that ended in this process (``_notify_target``)."""
+        from unittest.mock import patch
+
+        cog, _thread, dashboard, order, footer = self._setup(tmp_path, author_bot=True)
+        with patch("c_lord.cogs.claude_chat.owner_notify_id", return_value=None) as owner:
+            await self._run(cog, AsyncMock(return_value="ended"), footer)
+        owner.assert_called_with(cog.bot, kind="completion")
+        assert dashboard.set_state.await_args.kwargs["notify_user_id"] is None
+
+
 class TestOneStopPath:
     """#878: ⏹ Stop, /stop and !stop all go through ``_stop_thread_work``."""
 

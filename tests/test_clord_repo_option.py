@@ -223,6 +223,26 @@ class TestClordTextTwinRepoOption:
         assert kwargs["repo"] == REPO_B
         assert kwargs["prompt"] == "Claude 5 系に対応する"
 
+    @pytest.mark.parametrize(
+        ("raw", "repo", "prompt"),
+        [
+            # #923: a newline ends the repo value just like a space does.
+            (f"repo:{REPO_B}\n本文 です", REPO_B, "本文 です"),
+            (f"repo:{REPO_B}\n本文", REPO_B, "本文"),
+            (f"repo:{REPO_B}\t本文", REPO_B, "本文"),
+            (f"repo:{REPO_B}  本文", REPO_B, "本文"),
+        ],
+    )
+    def test_any_whitespace_ends_the_repo_token(self, raw: str, repo: str, prompt: str) -> None:
+        from c_lord.cogs.claude_chat import ClaudeChatCog
+
+        assert ClaudeChatCog._split_repo_prefix(raw) == (repo, prompt)
+
+    def test_repo_token_without_a_prompt_is_left_alone(self) -> None:
+        from c_lord.cogs.claude_chat import ClaudeChatCog
+
+        assert ClaudeChatCog._split_repo_prefix(f"repo:{REPO_B}\n") == (None, f"repo:{REPO_B}\n")
+
     async def test_plain_prompt_is_unchanged(self, channel_cog) -> None:
         cog = _make_cog(channel_cog)
         ctx = MagicMock()
@@ -264,6 +284,21 @@ class TestRepoUrlValidation:
 
         with pytest.raises(ValueError):
             validate_repo_url(hostile)
+
+    @pytest.mark.parametrize(
+        "multiline",
+        [
+            "git@github.com:o/r.git\n本文",
+            "https://github.com/o/r\r\nx",
+            "git@github.com:o/r.git\tx",
+        ],
+    )
+    def test_rejects_repo_urls_spanning_lines(self, multiline: str) -> None:
+        """#923: a request line glued onto the URL must not reach ``git clone``."""
+        from c_lord.database.channel_repo import validate_repo_url
+
+        with pytest.raises(ValueError, match="改行"):
+            validate_repo_url(multiline)
 
     @pytest.mark.parametrize(
         "ok",

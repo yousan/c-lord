@@ -113,43 +113,6 @@ def _running_script(*values: bool):
     return _next
 
 
-class TestProbeContextWindow:
-    """probe_context_window scrapes /context to learn the real window total."""
-
-    _PANE = (
-        "❯ /context\n"
-        "  ⎿  Context Usage\n"
-        "     claude-opus-4-7[1m]\n"
-        "     11.7k/1m tokens (1%)\n"
-        "──────────────────\n"
-        "❯\n"
-    )
-
-    def test_parses_total_from_context_pane(self, runner, tmux_manager) -> None:
-        tmux_manager.is_claude_running.return_value = True
-        tmux_manager.send_literal.return_value = True
-        tmux_manager.send_keys.return_value = True
-        tmux_manager.capture_pane.return_value = self._PANE
-
-        total = asyncio.run(runner.probe_context_window())
-
-        assert total == 1_000_000
-        # /context must be typed without submitting it as a user turn first.
-        tmux_manager.send_literal.assert_called_once_with(12345, "/context")
-        tmux_manager.send_keys.assert_called_once_with(12345, "Enter")
-
-    def test_returns_none_when_claude_not_running(self, runner, tmux_manager) -> None:
-        tmux_manager.is_claude_running.return_value = False
-        assert asyncio.run(runner.probe_context_window()) is None
-        tmux_manager.send_literal.assert_not_called()
-
-    def test_returns_none_when_pane_unparseable(self, runner, tmux_manager) -> None:
-        tmux_manager.is_claude_running.return_value = True
-        tmux_manager.send_literal.return_value = True
-        tmux_manager.capture_pane.return_value = "no token info here"
-        assert asyncio.run(runner.probe_context_window()) is None
-
-
 # -- Tests for _extract_response --------------------------------------------
 
 
@@ -5932,6 +5895,42 @@ class TestTurnEndFromTranscript:
         assert result[0].error is None
 
     @pytest.mark.asyncio
+    async def test_a_withdrawn_run_ends_at_once_as_a_user_stop(self, tmux_manager) -> None:
+        """#909: workspace-stop kills the window; the run must not wait it out."""
+        from c_lord.claude.tmux_runner import STOPPED_BY_USER_ERROR
+
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager, thread_id=9090, model="sonnet", timeout_seconds=600
+        )
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            if calls["n"] == 4:
+                runner.withdraw(silent=False)
+            return self._generating(calls["n"])
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        events = []
+        with (
+            patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+            patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+        ):
+
+            async def _drain():
+                async for event in runner.run("test"):
+                    events.append(event)
+
+            await asyncio.wait_for(_drain(), timeout=5.0)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        assert result[0].error == STOPPED_BY_USER_ERROR
+        assert calls["n"] <= 8
+
+    @pytest.mark.asyncio
     async def test_marker_from_the_previous_turn_does_not_close_this_one(
         self, tmux_manager
     ) -> None:
@@ -6159,3 +6158,77 @@ class TestTurnEndFromTranscript:
         assert len(result) == 1
         assert result[0].error is None, result[0].error
         assert calls["n"] <= 12, f"took {calls['n']} polls to notice the turn ended"
+
+
+class TestContextProbeStaysOutOfTheConversation:
+    """#924: the window probe must not put ``/context`` into Claude's conversation.
+
+    The CLI records a ``/context`` typed into the pane as a user message the
+    model reads, so a turn started later by a background notification answered
+    it — "Context is at 79k of 1M tokens" in a thread where nobody asked.
+    """
+
+    _OUTPUT = b"## Context Usage\n\n**Model:** claude-opus-5-5  \n**Tokens:** 79k / 1m (8%)\n"
+
+    def _proc(self, stdout: bytes = _OUTPUT, returncode: int = 0) -> MagicMock:
+        proc = MagicMock()
+        proc.returncode = returncode
+
+        async def communicate():
+            return stdout, b""
+
+        proc.communicate = communicate
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_probe_never_types_into_the_pane(self, tmux_manager, monkeypatch) -> None:
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "secret-token")
+        runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=924, model="opus[1m]")
+        seen: dict = {}
+
+        async def fake_exec(*argv, **kwargs):
+            seen["argv"] = argv
+            seen["env"] = kwargs.get("env")
+            return self._proc()
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            total = await runner.probe_context_window("claude-opus-5-5")
+
+        assert total == 1_000_000
+        tmux_manager.send_literal.assert_not_called()
+        tmux_manager.send_keys.assert_not_called()
+        tmux_manager.send_input.assert_not_called()
+        argv = list(seen["argv"])
+        assert argv[0] == "claude"
+        assert "-p" in argv and "--no-session-persistence" in argv
+        # The pane's own model spelling, so a ``[1m]`` tier is what gets measured.
+        assert argv[argv.index("--model") + 1] == "opus[1m]"
+        assert argv[-2:] == ["--", "/context"]
+        assert "DISCORD_BOT_TOKEN" not in seen["env"]
+
+    @pytest.mark.asyncio
+    async def test_a_model_switched_in_the_pane_is_probed_by_its_own_name(
+        self, tmux_manager
+    ) -> None:
+        runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=924, model="sonnet")
+        seen: dict = {}
+
+        async def fake_exec(*argv, **kwargs):
+            seen["argv"] = argv
+            return self._proc()
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await runner.probe_context_window("claude-haiku-5-5")
+
+        argv = list(seen["argv"])
+        assert argv[argv.index("--model") + 1] == "claude-haiku-5-5"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_probe_returns_none(self, tmux_manager) -> None:
+        runner = TmuxClaudeRunner(tmux_manager=tmux_manager, thread_id=924, model="sonnet")
+
+        async def fake_exec(*argv, **kwargs):
+            return self._proc(stdout=b"error", returncode=1)
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            assert await runner.probe_context_window("claude-sonnet-5-5") is None
