@@ -467,6 +467,7 @@ _KIND_PREFIX = {
     "tool_result": "↳ ",
     "user_input": "👤 ",
     "thinking": "💭 ",  # #883: the pane's "●" progress sentence
+    "notice": "-# ",  # #914: a one-line fact about the session, in small print
 }
 
 
