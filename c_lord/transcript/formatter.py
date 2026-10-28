@@ -145,6 +145,16 @@ _TASK_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.DOTALL)
 _TASK_TAG_RE = re.compile(r"</?task-notification>|<[^>]+>")
 
 
+# What a task notification renders to (#380).  The mirror recognises its own
+# progress.txt line by it (#913).
+TASK_NOTIFICATION_BODY_PREFIX = "⏹ バックグラウンド: "
+
+
+def is_task_notification(text: str) -> bool:
+    """True when *text* (already stripped) is a harness task notification (#913)."""
+    return _is_task_notification(text)
+
+
 def _is_task_notification(text: str) -> bool:
     """True when *text* (already stripped) is a harness task notification."""
     return text.startswith(_TASK_NOTIFICATION_OPEN)
@@ -181,7 +191,7 @@ def _render_task_notification(text: str, session_id: str | None) -> RenderedEven
         return None
     return RenderedEvent(
         kind="tool_result",
-        body=f"⏹ バックグラウンド: {detail}",
+        body=f"{TASK_NOTIFICATION_BODY_PREFIX}{detail}",
         session_id=session_id,
     )
 
