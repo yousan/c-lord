@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 
+from ..api_error import API_ERROR_PREFIX, advice_for_error
 from ..claude.tmux_runner import (
     FLEET_TMUX_RESTART_ERROR_PREFIX,
     LOGIN_REQUIRED_ERROR_PREFIX,
@@ -383,6 +384,11 @@ class EventProcessor:
             if refused_model is not None:
                 self._config.outcome.no_response = True
                 self._config.outcome.model_unavailable = refused_model
+            # #908: Claude Code ended the turn on its own API error. It did
+            # produce output before that, so this is not ``no_response`` — but
+            # the turn-end line must say what stopped it and how to go on.
+            if event.error.startswith(API_ERROR_PREFIX):
+                self._config.outcome.api_error = advice_for_error(event.error)
             # #631: a rate-limited turn also produced nothing, but it knows why.
             # ``no_response`` is set too so no caller reads it as a completed
             # turn; ``usage_limit`` is what upgrades the wording from "send it

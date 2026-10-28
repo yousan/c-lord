@@ -126,6 +126,7 @@ def _completion_text(
     usage_limit: UsageLimit | None = None,
     login_required: bool = False,
     model_unavailable: str | None = None,
+    api_error: str | None = None,
 ) -> str:
     """The turn-end ping. Says what actually happened (#562, #631, #812).
 
@@ -168,6 +169,9 @@ def _completion_text(
             "このターンは実行されていません。`/model` で使えるモデルに戻してください。"
             f"戻すまでは送り直しても同じ結果になります。 <@{mention_id}>"
         )
+    if api_error is not None:
+        # #908: the turn stopped on Claude Code's API error — not "finished".
+        return f"❌ Claude Code が API エラーで止まりました。{api_error} <@{mention_id}>"
     if no_response:
         return (
             "⚠️ 応答がありませんでした — Claude がこのターンを開始しませんでした。"
@@ -476,6 +480,7 @@ class ThreadStatusDashboard:
         preempted: bool = False,
         login_required: bool = False,
         model_unavailable: str | None = None,
+        api_error: str | None = None,
         already_pinged: int | None = None,
     ) -> None:
         """Update a thread's state and refresh the dashboard embed.
@@ -570,6 +575,7 @@ class ThreadStatusDashboard:
                         usage_limit,
                         login_required,
                         model_unavailable,
+                        api_error,
                     )
                 )
             except discord.HTTPException:

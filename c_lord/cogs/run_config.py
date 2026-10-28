@@ -59,6 +59,9 @@ class RunOutcome:
     # #484: the model Claude Code refused to use for this turn, when it did.
     # Only ``/model`` can fix it, so the turn-end line must say that.
     model_unavailable: str | None = None
+    # #908: what to do next when Claude Code ended this turn on an API error
+    # (the Japanese advice line). The turn-end line must not say "finished".
+    api_error: str | None = None
     # #915: who the ❌ embed's mention pinged, if anyone. For a turn whose cause
     # is known the embed already says everything the turn-end line would, so the
     # line is not posted when it would ping the same person a second time.
