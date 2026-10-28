@@ -213,3 +213,44 @@ def test_notices_registry_expires() -> None:
     usage_limit_notices.note(4003, at=0.0)
     assert usage_limit_notices.announced(4003, now=1.0) is True
     assert usage_limit_notices.announced(4003, now=1e9) is False
+
+
+# ---------------------------------------------------------------------------
+# #921: a clause between the label and the reset time ("· raise it at <URL>")
+# ---------------------------------------------------------------------------
+
+_I921_RAISE_IT_AT = (
+    "You've hit your monthly spend limit · raise it at "
+    "https://claude.ai/settings/usage?from=cc_cli_limit_message · "
+    "your session limit resets 1:50pm (Asia/Tokyo)"
+)
+
+
+def test_reset_time_is_found_behind_a_raise_it_at_clause() -> None:
+    limit = extract_usage_limit(_I921_RAISE_IT_AT)
+    assert limit is not None
+    assert limit.scope == "monthly spend limit"
+    assert limit.resets_at == "1:50pm (Asia/Tokyo)"
+    assert banner_only(_I921_RAISE_IT_AT) is not None
+
+
+def test_plain_resets_clause_still_parses() -> None:
+    limit = extract_usage_limit("You've hit your session limit · resets 1:50pm (Asia/Tokyo)")
+    assert limit is not None
+    assert limit.resets_at == "1:50pm (Asia/Tokyo)"
+
+
+def test_extra_clause_without_a_reset_time_invents_none() -> None:
+    limit = extract_usage_limit(
+        "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage"
+    )
+    assert limit is not None
+    assert limit.resets_at is None
+
+
+def test_word_resets_inside_a_url_is_not_a_reset_time() -> None:
+    limit = extract_usage_limit(
+        "You've hit your monthly spend limit · raise it at https://x.example/resets 3pm"
+    )
+    assert limit is not None
+    assert limit.resets_at is None
