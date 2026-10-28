@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -930,6 +930,41 @@ def _is_ask_meta_label(label: str) -> bool:
     return label in ("Chat about this", "Submit") or label.startswith("Type something")
 
 
+# #925: shown in the menu's footer only while the free-text row is being edited
+# ("Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel",
+# Claude Code v2.1.312).
+_ASK_EDIT_HINT = "ctrl+g to edit"
+
+
+def _typed_free_text_row(
+    lines: list[str],
+    opt_indices: list[int],
+    menu_text: str,
+    cut: Callable[[str], str],
+) -> int | None:
+    """The line index of a "Type something." row that holds typed text, or None.
+
+    Typing onto that row replaces its label with the sentence, so neither the
+    label nor ``_free_text_mode`` can recognise it any more. It is still the
+    same row (#925, real capture ``i925_ask_free_text_typed_v2_1_312.txt``):
+    the last numbered row that is not a meta row, under the cursor, while the
+    footer advertises editing. A preview menu (``Notes:`` field) has no such
+    row, so its last row is a real option and is never taken.
+    """
+    if _ASK_EDIT_HINT not in menu_text or _ASK_NOTES_AFFORDANCE in menu_text:
+        return None
+    for i in reversed(opt_indices):
+        text = cut(lines[i])
+        m = _ASK_OPTION_RE.match(text)
+        if m is None:
+            continue
+        label = _ASK_CHECKBOX_RE.sub("", m.group(1).strip(), count=1).strip()
+        if _is_ask_meta_label(label):
+            continue
+        return i if text.lstrip().startswith("❯") else None
+    return None
+
+
 def _is_ask_question(text: str) -> bool:
     """True iff the pane shows an AskUserQuestion TUI menu (current variant)."""
     return _ASK_SIGNATURE in text and bool(_ASK_OPTION_RE.search(text))
@@ -1035,6 +1070,12 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(_menu_text(lines[i]))
     ]
 
+    # #925: while a typed answer sits in the "Type something." row, that row
+    # shows the sentence instead of its label — read naively, a new last option.
+    typed_row = _typed_free_text_row(
+        lines, all_opt_indices, "\n".join(lines[scan_from:]), _menu_text
+    )
+
     options: list[AskOption] = []
     first_opt_idx: int | None = None
     multi_select = False
@@ -1044,7 +1085,7 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         if _ASK_CHECKBOX_RE.match(label):
             label = _ASK_CHECKBOX_RE.sub("", label, count=1).strip()
             multi_select = True
-        if _is_ask_meta_label(label):
+        if i == typed_row or _is_ask_meta_label(label):
             continue
         if first_opt_idx is None:
             first_opt_idx = i
@@ -1113,6 +1154,8 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     # menu's own start to the end of the capture so the hint line is included
     # and an older menu higher up in the scrollback is not.
     free_text_mode = _free_text_mode("\n".join(lines[scan_from:]))
+    if typed_row is not None:
+        free_text_mode = FREE_TEXT_ROW
 
     return AskQuestion(
         question=question,
