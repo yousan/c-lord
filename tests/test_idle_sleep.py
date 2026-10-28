@@ -289,3 +289,108 @@ class TestObservability:
             await IdleSleepLoop(bot, repo, threshold_hours=4, now_fn=lambda: NOW).tick()
 
         assert "idle-sleep: slept" not in caplog.text
+
+
+# ── #922: Claude working on its own is not idle ─────────────────────────────
+
+
+class _Cog:
+    """The two things the loop asks of SessionManageCog."""
+
+    def __init__(self, shells: int = 0) -> None:
+        self.shells = shells
+        self._sleep_workspace_impl = AsyncMock(return_value=True)
+
+    async def _count_tool_shells(self, channel: object) -> int:
+        return self.shells
+
+
+class TestClaudeAtWorkIsNotIdle:
+    """#922: 2026-10-17 00:38 a workspace was slept 4h after the dispatcher's last
+    message while Claude was waiting on its own 40-minute render (background
+    Bash) — the window, and the render with it, were killed.
+
+    ``last_used_at`` only moves when c-lord starts a turn. What Claude does on
+    its own after that shows up in two places: a Bash tool shell still alive
+    under the pane, and its transcript being written.
+    """
+
+    def _bot(self, cog: _Cog) -> MagicMock:
+        bot = MagicMock()
+        bot.get_cog = MagicMock(return_value=cog)
+        bot.get_channel = MagicMock(side_effect=lambda t: MagicMock(id=t))
+        return bot
+
+    def _repo(self, tmp_path) -> MagicMock:
+        rec = replace(_rec(1, hours_ago=9), working_dir=str(tmp_path / "w"))
+        repo = MagicMock()
+        repo.list_all = AsyncMock(return_value=[rec])
+        return repo
+
+    def _transcript(self, tmp_path, *, hours_ago: float, sub: bool = False):
+        import os
+
+        from c_lord.transcript.resolver import derive_project_dir
+
+        project = derive_project_dir(str(tmp_path / "w"), projects_root=tmp_path / "projects")
+        path = project / ("s/subagents/agent-1.jsonl" if sub else "s.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+        moment = (NOW - datetime.timedelta(hours=hours_ago)).timestamp()
+        os.utime(path, (moment, moment))
+
+    def _loop(self, cog: _Cog, repo: MagicMock, tmp_path, now=NOW) -> IdleSleepLoop:
+        loop = IdleSleepLoop(self._bot(cog), repo, threshold_hours=4, now_fn=lambda: now)
+        loop._projects_root = tmp_path / "projects"
+        return loop
+
+    @pytest.mark.asyncio
+    async def test_a_running_background_command_keeps_it_awake(self, tmp_path) -> None:
+        """AC1. RED before #922: slept with the render still running."""
+        cog = _Cog(shells=1)
+        repo = self._repo(tmp_path)
+        loop = self._loop(cog, repo, tmp_path)
+
+        assert await loop.tick() == 0
+        cog._sleep_workspace_impl.assert_not_awaited()
+
+        # The command finished: the next tick sleeps it — it was not written off.
+        cog.shells = 0
+        assert await loop.tick() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_recent_transcript_write_keeps_it_awake(self, tmp_path) -> None:
+        """Monitor waits and subagents write the transcript as they go."""
+        self._transcript(tmp_path, hours_ago=1, sub=True)
+        cog = _Cog()
+        repo = self._repo(tmp_path)
+
+        assert await self._loop(cog, repo, tmp_path).tick() == 0
+        cog._sleep_workspace_impl.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idle_counts_from_the_last_transcript_write(self, tmp_path) -> None:
+        """Once Claude is quiet for the threshold too, it sleeps."""
+        self._transcript(tmp_path, hours_ago=1)
+        cog = _Cog()
+        repo = self._repo(tmp_path)
+        loop = self._loop(cog, repo, tmp_path)
+        assert await loop.tick() == 0
+
+        later = self._loop(cog, repo, tmp_path, now=NOW + datetime.timedelta(hours=3, minutes=1))
+        assert await later.tick() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_workspace_still_sleeps(self, tmp_path) -> None:
+        """AC2: no shell, transcript last written before the threshold."""
+        self._transcript(tmp_path, hours_ago=5)
+        cog = _Cog()
+        repo = self._repo(tmp_path)
+
+        assert await self._loop(cog, repo, tmp_path).tick() == 1
+        cog._sleep_workspace_impl.assert_awaited_once()
+
+    def test_the_cog_really_has_the_shell_count(self) -> None:
+        from c_lord.cogs.session_manage import SessionManageCog
+
+        assert callable(getattr(SessionManageCog, "_count_tool_shells", None))
