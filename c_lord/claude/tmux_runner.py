@@ -12,14 +12,17 @@ are not available — only plain text deltas.  However, users can
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..api_error import runner_error
-from ..tmux import TmuxSessionManager, pane_command_is_dead
+from ..clord_home import clord_home
+from ..tmux import SENSITIVE_ENV_KEYS, TmuxSessionManager, pane_command_is_dead
 from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import count_usage_limit, extract_usage_limit
@@ -169,10 +172,32 @@ _UNKNOWN_ALERT_DELAY = 5.0
 # expected prompt — but still guards against a half-drawn menu frame (#166).
 _ASK_ALERT_DELAY = 1.5
 
-# /context probe: how many times to re-capture the pane while waiting for the
-# (locally-rendered) /context output to settle, and the gap between captures.
-_CONTEXT_PROBE_ATTEMPTS = 6
-_CONTEXT_PROBE_INTERVAL = 0.5
+# /context probe (#924): a throwaway ``claude -p`` outside the conversation.
+# Measured at 4-14 s on the production host; the cap only guards a hang.
+_CONTEXT_PROBE_TIMEOUT = 60.0
+# Where it runs. Fixed, so the CLI keeps one (empty) project dir for it rather
+# than one per probe, and never the thread's own working copy.
+_CONTEXT_PROBE_DIRNAME = "context-probe"
+# A model spelling's tier suffix, e.g. the ``[1m]`` of ``opus[1m]``.
+_MODEL_TIER_RE = re.compile(r"\[[^\]]*\]$")
+
+
+def _probe_model(configured: str | None, observed: str | None) -> str | None:
+    """Which ``--model`` the window probe should ask for (#924).
+
+    The pane was started with *configured* (``opus[1m]``, ``sonnet``), and its
+    tier suffix decides the window, so that spelling is preferred while it still
+    names the model the transcript *observed* (``claude-opus-5-5``). When the
+    two disagree — ``/model`` was used in the pane — the observed one wins.
+    """
+    if not observed:
+        return configured
+    if configured:
+        base = _MODEL_TIER_RE.sub("", configured).strip().lower()
+        if base and base in observed.lower():
+            return configured
+    return observed
+
 
 # Delay between individual menu-navigation keystrokes (seconds).  Keys must be
 # sent one at a time with a gap — batching `Down Down Enter` into one send-keys
@@ -930,6 +955,41 @@ def _is_ask_meta_label(label: str) -> bool:
     return label in ("Chat about this", "Submit") or label.startswith("Type something")
 
 
+# #925: shown in the menu's footer only while the free-text row is being edited
+# ("Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel",
+# Claude Code v2.1.312).
+_ASK_EDIT_HINT = "ctrl+g to edit"
+
+
+def _typed_free_text_row(
+    lines: list[str],
+    opt_indices: list[int],
+    menu_text: str,
+    cut: Callable[[str], str],
+) -> int | None:
+    """The line index of a "Type something." row that holds typed text, or None.
+
+    Typing onto that row replaces its label with the sentence, so neither the
+    label nor ``_free_text_mode`` can recognise it any more. It is still the
+    same row (#925, real capture ``i925_ask_free_text_typed_v2_1_312.txt``):
+    the last numbered row that is not a meta row, under the cursor, while the
+    footer advertises editing. A preview menu (``Notes:`` field) has no such
+    row, so its last row is a real option and is never taken.
+    """
+    if _ASK_EDIT_HINT not in menu_text or _ASK_NOTES_AFFORDANCE in menu_text:
+        return None
+    for i in reversed(opt_indices):
+        text = cut(lines[i])
+        m = _ASK_OPTION_RE.match(text)
+        if m is None:
+            continue
+        label = _ASK_CHECKBOX_RE.sub("", m.group(1).strip(), count=1).strip()
+        if _is_ask_meta_label(label):
+            continue
+        return i if text.lstrip().startswith("❯") else None
+    return None
+
+
 def _is_ask_question(text: str) -> bool:
     """True iff the pane shows an AskUserQuestion TUI menu (current variant)."""
     return _ASK_SIGNATURE in text and bool(_ASK_OPTION_RE.search(text))
@@ -1035,6 +1095,12 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         i for i in range(scan_from, end_idx + 1) if _ASK_OPTION_RE.match(_menu_text(lines[i]))
     ]
 
+    # #925: while a typed answer sits in the "Type something." row, that row
+    # shows the sentence instead of its label — read naively, a new last option.
+    typed_row = _typed_free_text_row(
+        lines, all_opt_indices, "\n".join(lines[scan_from:]), _menu_text
+    )
+
     options: list[AskOption] = []
     first_opt_idx: int | None = None
     multi_select = False
@@ -1044,7 +1110,7 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
         if _ASK_CHECKBOX_RE.match(label):
             label = _ASK_CHECKBOX_RE.sub("", label, count=1).strip()
             multi_select = True
-        if _is_ask_meta_label(label):
+        if i == typed_row or _is_ask_meta_label(label):
             continue
         if first_opt_idx is None:
             first_opt_idx = i
@@ -1113,6 +1179,8 @@ def _parse_ask_from_pane(text: str) -> AskQuestion | None:
     # menu's own start to the end of the capture so the hint line is included
     # and an older menu higher up in the scrollback is not.
     free_text_mode = _free_text_mode("\n".join(lines[scan_from:]))
+    if typed_row is not None:
+        free_text_mode = FREE_TEXT_ROW
 
     return AskQuestion(
         question=question,
@@ -2852,38 +2920,75 @@ class TmuxClaudeRunner:
         self._stopped = True
         await asyncio.to_thread(self._tmux.kill_session, self._thread_id)
 
-    async def probe_context_window(self) -> int | None:
-        """Learn the real context-window total by scraping ``/context``.
+    async def probe_context_window(self, model: str | None = None) -> int | None:
+        """Learn the real context-window total from ``/context`` — out of band.
 
-        ``/context`` renders locally and consumes no model turn (verified: it
-        writes no ``usage``-bearing assistant entry to the transcript), so it is
-        safe to fire between turns.  It must only be called when Claude is idle
-        at the prompt — the caller is responsible for that ordering.
+        Runs ``claude -p --no-session-persistence -- /context`` as a separate,
+        throwaway process (#924). It used to type ``/context`` into this
+        thread's pane, on the belief that it "renders locally and consumes no
+        model turn". It consumes no turn, but the CLI records its output as a
+        user message the model reads: the next turn — one a background
+        notification started, with nobody asking — answered it in the thread
+        ("Context is at 79k of 1M tokens"). A separate process puts nothing in
+        this conversation, and needs no idle pane either.
+
+        *model* is the one the transcript says this session uses; see
+        :func:`_probe_model` for how it is combined with the configured one.
 
         Returns the window total in absolute tokens (e.g. ``1_000_000`` for a
-        1M tier), or ``None`` if Claude is not running or the pane could not be
-        parsed (the caller then falls back to a per-model default).
+        1M tier), or ``None`` if the probe failed (the caller then falls back
+        to a per-model default).
         """
-        if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+        argv = ["claude", "-p", "--no-session-persistence", "--strict-mcp-config"]
+        chosen = _probe_model(self.model, model)
+        if chosen:
+            argv.extend(["--model", chosen])
+        argv.extend(["--", "/context"])
+        # #353: the secrets stay out of every process c-lord starts.
+        env = {
+            k: v for k, v in os.environ.items() if k not in SENSITIVE_ENV_KEYS and k != "CLAUDECODE"
+        }
+        cwd = clord_home() / _CONTEXT_PROBE_DIRNAME
+        proc = None
+        try:
+            await asyncio.to_thread(cwd.mkdir, parents=True, exist_ok=True)
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), _CONTEXT_PROBE_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as exc:  # noqa: UP041 — 3.10 alias
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            logger.info(
+                "probe_context_window: /context probe failed (thread=%d): %r",
+                self._thread_id,
+                exc,
+            )
             return None
-
-        # ``send_literal`` (not ``send_input``) so the jsonl-bridge ZWSP marker
-        # is not prepended — a leading invisible char would stop Claude from
-        # recognising ``/context`` as a slash command.
-        if not await asyncio.to_thread(self._tmux.send_literal, self._thread_id, "/context"):
+        total = None
+        if proc.returncode == 0:
+            total = parse_context_total(stdout.decode("utf-8", errors="replace"))
+        if total is None:
+            logger.info(
+                "probe_context_window: could not read /context (thread=%d, model=%s, rc=%s)",
+                self._thread_id,
+                chosen,
+                proc.returncode,
+            )
             return None
-        await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Enter")
-
-        for _ in range(_CONTEXT_PROBE_ATTEMPTS):
-            await asyncio.sleep(_CONTEXT_PROBE_INTERVAL)
-            pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
-            total = parse_context_total(_normalize_capture(pane))
-            if total is not None:
-                logger.info("probe_context_window: total=%d (thread=%d)", total, self._thread_id)
-                return total
-
-        logger.info("probe_context_window: could not parse /context (thread=%d)", self._thread_id)
-        return None
+        logger.info(
+            "probe_context_window: total=%d (thread=%d, model=%s)",
+            total,
+            self._thread_id,
+            chosen,
+        )
+        return total
 
     async def get_cost_from_pane(self) -> float | None:
         """Extract the per-turn cost from the ccstatusline ``Cost: $X.XXXX`` row.
@@ -3527,6 +3632,25 @@ class TmuxClaudeRunner:
         pane = _normalize_capture(raw)
         menu = _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
         return menu, capture_ok
+
+    async def peek_menu_closed(self) -> bool | None:
+        """True only when the pane positively shows no menu at all (#911).
+
+        The evidence for a menu Claude Code draws itself (e.g. "Model switch"),
+        which writes nothing to the transcript. Stricter than
+        :meth:`peek_menu_state`: the multi-question Submit screen counts as a
+        menu (its ask is still unwritten), and a dead pane or an empty capture
+        is None — they say nothing about what the menu took.
+        """
+        if await self._pane_is_dead():
+            return None
+        raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+        if not raw.strip():
+            return None
+        pane = _normalize_capture(raw)
+        if _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane):
+            return False
+        return not _is_ask_submit_screen(pane)
 
     @staticmethod
     def _extract_response(pane_text: str) -> str:

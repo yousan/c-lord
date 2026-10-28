@@ -62,6 +62,10 @@ class RunOutcome:
     # #908: what to do next when Claude Code ended this turn on an API error
     # (the Japanese advice line). The turn-end line must not say "finished".
     api_error: str | None = None
+    # #915: who the ❌ embed's mention pinged, if anyone. For a turn whose cause
+    # is known the embed already says everything the turn-end line would, so the
+    # line is not posted when it would ping the same person a second time.
+    pinged_user_id: int | None = None
     # #917: the turn-end event's bookkeeping for this turn, ``None`` while no
     # outlet is configured. Shared by every copy of the config (``with_prompt``
     # keeps this object), which is how the AskUserQuestion resume — a nested run

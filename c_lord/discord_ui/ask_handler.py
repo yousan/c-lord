@@ -18,7 +18,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -109,6 +109,17 @@ _ANSWER_CONFIRM_POLL = 0.5
 _LATE_CONFIRM_TIMEOUT = float(ASK_ANSWER_TIMEOUT + 3_600)
 _LATE_CONFIRM_POLL_MIN = 1.0
 _LATE_CONFIRM_POLL_MAX = 10.0
+
+# #911: Claude Code draws some menus of its own — the safeguard "Model switch"
+# (Stay on Opus / Switch to Sonnet) — in the same "Chat about this" layout as an
+# AskUserQuestion, so they are bridged like one. But the CLI writes no
+# AskUserQuestion for them, so the transcript never has anything to say and the
+# menu sat at ⏳ 確認中 for days. For a menu the transcript has not recorded, the
+# pane is asked as well: no menu on screen for this long, and still no ask
+# written, means the menu took the answer and was never an ask. The dwell is
+# there for a real ask whose tool_use the CLI writes together with its result
+# as the menu closes (#746) — that lands within about a second.
+_PANE_CLOSED_GRACE = 3.0
 
 # Strong references to the running watchers: the event loop only keeps weak
 # ones, and a collected task would silently stop correcting its menu.
@@ -289,6 +300,9 @@ class _MenuRef:
     question: str | None = None
     """#786: a menu re-found after a restart is identified by its question text
     (drawn at *after*) rather than by being the next ask written."""
+    pane: object | None = None
+    """#911: the runner whose pane speaks for a menu the transcript never records."""
+    _closed_since: float | None = field(default=None, repr=False)
 
     def describe(self) -> str:
         if self.ask is not None:
@@ -310,11 +324,49 @@ class _MenuRef:
                     first_ask_tool_use_after, self.project_dir, self.after
                 )
             if self.ask is None:
-                return ASK_UNKNOWN
+                return await self._closed_on_the_pane()
         tool_use_id, session_path = self.ask
         return classify_ask_result(
             await asyncio.to_thread(read_ask_result, self.project_dir, tool_use_id, session_path)
         )
+
+    async def _closed_on_the_pane(self) -> AskOutcome:
+        """#911: a menu with no ask in the transcript is answered once the pane has
+        shown no menu for ``_PANE_CLOSED_GRACE`` — a CLI menu writes no ask at all.
+
+        Only a positive "nothing is open" counts: the next question of the same
+        ask on screen, the Submit screen, an unreadable or dead pane all reset
+        the clock, and the transcript is consulted first on every read.
+        """
+        if await _pane_menu_closed(self.pane) is not True:
+            self._closed_since = None
+            return ASK_UNKNOWN
+        now = asyncio.get_running_loop().time()
+        if self._closed_since is None:
+            self._closed_since = now
+        if now - self._closed_since < _PANE_CLOSED_GRACE:
+            return ASK_UNKNOWN
+        logger.info(
+            "ask answer: the menu closed on the pane %.0fs ago and no AskUserQuestion was "
+            "written for it — a menu of the CLI's own, taken as answered (#911)",
+            now - self._closed_since,
+        )
+        return ASK_ANSWERED
+
+
+async def _pane_menu_closed(runner: object | None) -> bool | None:
+    """The runner's ``peek_menu_closed``, or None when it has none or cannot say."""
+    probe = getattr(runner, "peek_menu_closed", None) if runner is not None else None
+    if not callable(probe):
+        return None
+    try:
+        result = probe()
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:
+        logger.debug("pane check failed while confirming a CLI menu (#911)", exc_info=True)
+        return None
+    return result if isinstance(result, bool) else None
 
 
 async def _locate_menu(runner: TmuxClaudeRunner, question: AskQuestion) -> _MenuRef | None:
@@ -341,11 +393,11 @@ async def _locate_menu(runner: TmuxClaudeRunner, question: AskQuestion) -> _Menu
     if asks:
         ts, tool_use_id, session_path = asks[-1]
         if await asyncio.to_thread(read_ask_result, project_dir, tool_use_id, session_path) is None:
-            return _MenuRef(project_dir, ask=(tool_use_id, session_path))
+            return _MenuRef(project_dir, ask=(tool_use_id, session_path), pane=runner)
         after = ts
     if not question.allow_other:
         return None
-    return _MenuRef(project_dir, after=after)
+    return _MenuRef(project_dir, after=after, pane=runner)
 
 
 async def _menu_is_gone(runner: TmuxClaudeRunner) -> bool | None:

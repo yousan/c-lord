@@ -2256,6 +2256,47 @@ async def test_mirror_reports_transcript_activity_to_the_turn_lamp(tmp_path: Pat
     assert len(seen) >= 3
 
 
+async def test_mirror_tells_the_lamp_a_call_is_still_running(tmp_path: Path) -> None:
+    """#905: between a ``tool_use`` and its ``tool_result`` the lamp sees work."""
+    from c_lord.turn_activity import turn_activity
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    import os
+
+    os.utime(jsonl, (1, 1))
+
+    async def sink(text: str) -> None:
+        pass
+
+    use = _assistant_tool_use("Bash", "sleep 90")
+    use["message"]["content"][0]["id"] = "toolu_sleep"
+    result = _user_tool_result("done")
+    result["message"]["content"][0]["tool_use_id"] = "toolu_sleep"
+
+    unsubscribe = turn_activity.subscribe(9052, lambda: None)
+    mirror = TranscriptMirror(
+        thread_id=9052, project_dir=project, sink=sink, verbosity="minimal", poll_interval=0.05
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write_event(jsonl, use)
+        await asyncio.sleep(0.25)
+        during = turn_activity.running(9052)
+        _write_event(jsonl, result)
+        await asyncio.sleep(0.25)
+        after = turn_activity.running(9052)
+    finally:
+        await mirror.stop()
+        unsubscribe()
+
+    assert during is True
+    assert after is False
+
+
 # -- #883: the thinking sentence (the pane's ●) -------------------------------
 
 
@@ -2445,6 +2486,87 @@ async def test_request_copy_does_not_arm_the_progress_line(tmp_path: Path) -> No
     assert spy.posts == []
 
 
+# -- #913: a turn a background notification started is not a reply ---------
+
+_MONITOR_EVENT = (
+    "<task-notification>\n<task-id>b1</task-id>\n<status>running</status>\n"
+    '<summary>Monitor event: "surviving playthrough run"</summary>\n</task-notification>'
+)
+
+
+async def _run_notification_turn(tmp_path: Path, *events: dict):
+    """Feed *events* after a finished human turn; return (sink, reply, file) calls."""
+    import os
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    os.utime(jsonl, (1, 1))
+    sink_calls: list[str] = []
+    reply_calls: list[str] = []
+    file_calls: list[tuple[str, str]] = []
+
+    async def sink(text: str) -> None:
+        sink_calls.append(text)
+
+    async def reply_sink(text: str) -> None:
+        reply_calls.append(text)
+
+    async def file_sink(text: str, path: str) -> None:
+        file_calls.append((text, path))
+
+    mirror = TranscriptMirror(
+        thread_id=913,
+        project_dir=project,
+        sink=sink,
+        reply_sink=reply_sink,
+        file_sink=file_sink,
+        verbosity="minimal",
+        poll_interval=0.05,
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        for event in events:
+            _write_event(jsonl, event)
+        _write_event(jsonl, {"type": "system", "subtype": "turn_duration"})
+        await asyncio.sleep(0.4)
+    finally:
+        await mirror.stop()
+    return sink_calls, reply_calls, file_calls
+
+
+async def test_notification_turn_one_liner_has_no_progress_txt(tmp_path: Path) -> None:
+    """#913 AC1/AC3: "Still running." after a Monitor event — no file, no quote-reply."""
+    sink_calls, reply_calls, file_calls = await _run_notification_turn(
+        tmp_path, _user_str(_MONITOR_EVENT), _assistant_text("Still running.")
+    )
+    assert file_calls == []
+    assert reply_calls == []
+    assert sink_calls == ["Still running."]
+
+
+async def test_notification_turn_with_tools_keeps_its_progress_txt(tmp_path: Path) -> None:
+    """#913 AC2: real tool work in that turn still earns the attachment."""
+    _, _, file_calls = await _run_notification_turn(
+        tmp_path,
+        _user_str(_MONITOR_EVENT),
+        _assistant_tool_use("Bash", "tail -5 run.log"),
+        _user_tool_result("lap 2"),
+        _assistant_text("Lap 2 is under way."),
+    )
+    assert [text for text, _ in file_calls] == ["Lap 2 is under way."]
+
+
+async def test_human_turn_is_still_a_reply(tmp_path: Path) -> None:
+    """#913: only a notification-started turn changes — a person's turn is answered."""
+    _, reply_calls, _ = await _run_notification_turn(
+        tmp_path, _user_str("進捗どう？"), _assistant_text("半分まで来ました。")
+    )
+    assert reply_calls == ["半分まで来ました。"]
+
+
 async def test_an_api_error_is_one_line_without_the_terminal_steps(tmp_path: Path) -> None:
     """#908 AC4: the CLI's 'Double press esc…' never reaches Discord, and the
     runner learns the turn ended on the error."""
@@ -2502,3 +2624,71 @@ async def test_an_api_error_is_one_line_without_the_terminal_steps(tmp_path: Pat
     assert "Double press esc" not in joined
     assert "-# ⚠️ API Error: Opus 5.5's safeguards flagged this session" in joined
     assert ended_on is not None and "safeguards flagged" in ended_on
+
+
+# -- #944: a local slash command typed in the pane is not a model turn --------
+
+
+def _local_compact_events() -> list[dict]:
+    """What CLI 2.1.312 writes for ``/compact`` typed in the pane (#944)."""
+    return [
+        _user_str("/compact"),
+        _user_str("<command-name>/compact</command-name>"),
+        {"type": "system", "subtype": "compact_boundary"},
+        _user_str(
+            "<local-command-stdout>\x1b[2mCompacted (ctrl+o to see full summary)\x1b[22m"
+            "</local-command-stdout>"
+        ),
+    ]
+
+
+async def _run_progress(tmp_path: Path, thread_id: int, events: list[dict]) -> _ProgressSpy:
+    project, jsonl = _fresh_jsonl(tmp_path)
+    spy, clock = _ProgressSpy(), _FakeClock()
+
+    async def sink(text: str) -> None:
+        pass
+
+    mirror = TranscriptMirror(
+        thread_id=thread_id,
+        project_dir=project,
+        sink=sink,
+        poll_interval=0.05,
+        idle_flush_seconds=0.05,
+        progress=_progress(spy, clock),
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        for ev in events:
+            _write_event(jsonl, ev)
+        await asyncio.sleep(0.3)
+        clock.advance(178.0)
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+    return spy
+
+
+async def test_pane_compact_leaves_no_waiting_line(tmp_path: Path) -> None:
+    """AC1: no ``turn_duration`` follows a local command, so its output ends it."""
+    spy = await _run_progress(tmp_path, 9441, _local_compact_events())
+    assert spy.posts == [], spy.posts
+
+
+async def test_local_command_with_empty_output_also_ends_it(tmp_path: Path) -> None:
+    """``/clear`` & co. write an empty ``<local-command-stdout>`` — still the end."""
+    events = [
+        _user_str("/config"),
+        _user_str("<command-name>/config</command-name>"),
+        _user_str("<local-command-stdout></local-command-stdout>"),
+    ]
+    spy = await _run_progress(tmp_path, 9442, events)
+    assert spy.posts == [], spy.posts
+
+
+async def test_a_real_request_after_a_local_command_still_gets_its_line(tmp_path: Path) -> None:
+    """AC2's neighbour: the next human prompt arms the line as usual."""
+    events = [*_local_compact_events(), _user_str("続きを調べて"), _assistant_tool_use("Bash", "ls")]
+    spy = await _run_progress(tmp_path, 9443, events)
+    assert spy.posts, "the next real request lost its progress line"

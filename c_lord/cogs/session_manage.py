@@ -77,6 +77,33 @@ logger = logging.getLogger(__name__)
 _Responder = Callable[..., Awaitable[None]]
 _Acknowledger = Callable[..., Awaitable[None]]
 
+# Discord rejects an embed whose field value exceeds this (400, code 50035 — #824).
+_EMBED_FIELD_LIMIT = 1024
+
+
+def _fit_field_lines(lines: list[str], limit: int = _EMBED_FIELD_LIMIT) -> str:
+    """Join *lines* into one embed field value that Discord will accept (#824).
+
+    Lines that don't fit are dropped from the end and counted as ``…他 N 件``,
+    so the reader still learns how many there were.
+    """
+    if not lines:
+        return "—"
+    joined = "\n".join(lines)
+    if len(joined) <= limit:
+        return joined
+    shown: list[str] = []
+    for i, line in enumerate(lines):
+        rest = len(lines) - i - 1
+        tail = f"\n…他 {rest} 件" if rest else ""
+        if len("\n".join([*shown, line])) + len(tail) > limit:
+            break
+        shown.append(line)
+    rest = len(lines) - len(shown)
+    tail = f"…他 {rest} 件"
+    return "\n".join([*shown, tail]) if shown else tail
+
+
 # Model management
 SETTING_CLAUDE_MODEL = "claude_model"
 
@@ -1169,13 +1196,13 @@ class SessionManageCog(commands.Cog):
             if candidates:
                 embed.add_field(
                     name=f"Would remove ({len(candidates)})",
-                    value="\n".join(f"`{d.path}`" for d in candidates) or "—",
+                    value=_fit_field_lines([f"`{d.path}`" for d in candidates]),
                     inline=False,
                 )
             if skipped:
                 embed.add_field(
                     name=f"Would skip ({len(skipped)})",
-                    value="\n".join(f"`{d.path}` — {reason}" for d, reason in skipped) or "—",
+                    value=_fit_field_lines([f"`{d.path}` — {reason}" for d, reason in skipped]),
                     inline=False,
                 )
             if not candidates and not skipped:
@@ -1209,19 +1236,19 @@ class SessionManageCog(commands.Cog):
         )
         embed.add_field(
             name=f"✅ Removed ({len(removed)})",
-            value="\n".join(f"`{r.path}`" for r in removed) or "—",
+            value=_fit_field_lines([f"`{r.path}`" for r in removed]),
             inline=False,
         )
         if dirty:
             embed.add_field(
                 name=f"⚠️ Dirty — not removed ({len(dirty)})",
-                value="\n".join(f"`{r.path}`" for r in dirty) or "—",
+                value=_fit_field_lines([f"`{r.path}`" for r in dirty]),
                 inline=False,
             )
         if other_skipped:
             embed.add_field(
                 name=f"ℹ️ Skipped ({len(other_skipped)})",
-                value="\n".join(f"`{r.path}` — {r.reason}" for r in other_skipped) or "—",
+                value=_fit_field_lines([f"`{r.path}` — {r.reason}" for r in other_skipped]),
                 inline=False,
             )
 
@@ -1907,6 +1934,21 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
+        # #909: end the turn that is running here first. Killing the window
+        # under it left the run polling a pane that no longer exists until the
+        # 5-minute backstop, which then reported a crash (❌ + failure ping) for
+        # a stop the user asked for. Loose-coupled through bot.get_cog (#512).
+        end_turn = getattr(self.bot.get_cog("ClaudeChatCog"), "end_turn_for_workspace_stop", None)
+        if end_turn is not None:
+            try:
+                end_turn(thread_id)
+            except Exception:
+                logger.warning(
+                    "%s workspace stop: could not end the running turn (#909)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+
         # Stop the mirror BEFORE kill/archive so the kill's task-notification can't
         # be echoed (👤) into the thread after we archive it and un-archive it (#379).
         await self._stop_transcript_mirror(thread_id)
@@ -1922,6 +1964,19 @@ class SessionManageCog(commands.Cog):
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
                 " `/clord-init` で設定してください。"
             )
+
+        # #909: let the turn ended above paint its final 🟡 before the archive
+        # below — Discord refuses reactions in an archived thread.
+        wait_for_turn_end = getattr(self.bot.get_cog("ClaudeChatCog"), "wait_for_turn_end", None)
+        if wait_for_turn_end is not None:
+            try:
+                await wait_for_turn_end(thread_id)
+            except Exception:
+                logger.warning(
+                    "%s workspace stop: could not wait for the turn to end (#909)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
 
         # #512: record the close so a later message can tell this apart from a
         # pane that merely died — the latter still auto-resumes via --continue

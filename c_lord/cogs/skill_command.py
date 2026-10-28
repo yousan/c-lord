@@ -33,10 +33,12 @@ from ..claude.tmux_runner import TmuxClaudeRunner
 from ..command_gate import is_message_authorized
 from ..concurrency import SessionRegistry
 from ..database.repository import SessionRepository
+from ..database.settings_repo import SettingsRepository
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.authorization import Authorizer
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
+from ..model_scopes import TurnSettings, begin_turn_for, effort_for_launch
 from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
@@ -113,8 +115,12 @@ class SkillCommandCog(commands.Cog):
         registry: SessionRegistry | None = None,
         allowed_role_name: str | None = None,
         authorizer: Authorizer | None = None,
+        settings_repo: SettingsRepository | None = None,
     ) -> None:
         self.bot = bot
+        # #927: where /model's settings live. Optional (zero-config) — see
+        # :meth:`_settings_repo_for_turn` for the fallback.
+        self._settings_repo = settings_repo
         self.repo = repo
         self.runner = runner
         self.claude_channel_id = claude_channel_id
@@ -206,20 +212,86 @@ class SkillCommandCog(commands.Cog):
         return choices
 
     def _make_runner(
-        self, tmux: TmuxSessionManager, thread_id: int, working_dir: str | None = None
+        self,
+        tmux: TmuxSessionManager,
+        thread_id: int,
+        working_dir: str | None = None,
+        *,
+        turn: TurnSettings | None = None,
+        try_continue: bool = False,
     ) -> TmuxClaudeRunner:
-        """Create a TmuxClaudeRunner from the stored config and resolved tmux manager."""
+        """Create a TmuxClaudeRunner for this turn's model/effort (#927).
+
+        *turn* is the pair :func:`begin_turn_for` fixed; ``None`` means the
+        settings could not be read and the instance defaults apply (#918).
+        """
+        model = (turn.model if turn else None) or self.runner.model
         return TmuxClaudeRunner(
             tmux_manager=tmux,
             thread_id=thread_id,
-            model=self.runner.model,
+            model=model,
             working_dir=working_dir or self.runner.working_dir,
             timeout_seconds=self.runner.timeout_seconds,
             dangerously_skip_permissions=True,
-            effort=self.runner.effort,
+            effort=effort_for_launch(model, turn.effort if turn else self.runner.effort),
             # #762: a /skill prompt is ``/<name> …`` — a command, not a message.
             slash_command=True,
+            try_continue=try_continue,
         )
+
+    def _settings_repo_for_turn(self) -> SettingsRepository | None:
+        """The settings repository /model writes to (#927).
+
+        Right after a restart nothing has cached the model-scope service yet, so
+        it has to be built from this. A consumer that constructs the cog without
+        ``settings_repo`` still gets /model through the chat cog's repository —
+        the same DB — rather than silently running on the instance defaults.
+        """
+        if self._settings_repo is not None:
+            return self._settings_repo
+        chat = self.bot.get_cog("ClaudeChatCog")
+        repo = getattr(chat, "_settings_repo", None)
+        if isinstance(repo, SettingsRepository):
+            return repo
+        repo = getattr(self.bot, "settings_repo", None)
+        return repo if isinstance(repo, SettingsRepository) else None
+
+    async def _fix_turn(
+        self, thread: discord.Thread, channel_id: int | None, tmux: TmuxSessionManager
+    ) -> tuple[TurnSettings | None, bool]:
+        """Fix this turn's model/effort pair, as a chat turn does (#918/#927).
+
+        Returns ``(turn, restarted)``. When the Claude already in the thread's
+        pane was launched with a different pair, it is stopped here — before the
+        window is (re)made — so the run starts it again with the new flags and
+        ``--resume``, instead of typing ``/model`` into it (which would rewrite
+        the host's user settings for every Claude).
+        """
+        turn = await begin_turn_for(
+            self.bot,
+            self._settings_repo_for_turn(),
+            self.runner,
+            thread.id,
+            channel_id,
+        )
+        if turn is None or not turn.needs_restart:
+            return turn, False
+        if not await asyncio.to_thread(tmux.is_claude_running, thread.id):
+            return turn, False
+        await asyncio.to_thread(tmux.kill_session, thread.id)
+        logger.info(
+            "%s restarting claude for new model/effort %s/%s (was %s) (#927)",
+            log_ctx(thread_id=thread.id),
+            turn.model,
+            turn.effort,
+            turn.previously_applied,
+        )
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
+            await thread.send(
+                "-# 🔄 モデル設定が変わったため、会話を保ったまま Claude を"
+                f"立て直します（{turn.model} / {turn.effort or '—'}）。"
+            )
+        return turn, True
 
     def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:
         """Check if the channel is a thread under the configured claude channel."""
@@ -366,6 +438,9 @@ class SkillCommandCog(commands.Cog):
             display = f"`/{name} {args}`" if args else f"`/{name}`"
             await respond(f"Running {display} in this thread…")
 
+            # #927: before the workspace — a restart for a new pair closes the
+            # window, and _prepare_workspace is what opens it again.
+            turn, restarted = await self._fix_turn(channel, parent_channel_id, tmux)
             ready, working_dir = await self._prepare_workspace(
                 thread=channel,
                 tmux=tmux,
@@ -375,7 +450,13 @@ class SkillCommandCog(commands.Cog):
             )
             if not ready:
                 return
-            runner = self._make_runner(tmux, channel.id, working_dir)
+            runner = self._make_runner(
+                tmux,
+                channel.id,
+                working_dir,
+                turn=turn,
+                try_continue=restarted and session_id is not None,
+            )
             # #754: a /skill run is on 📊 Session Status while it runs.
             async with board_turn(dashboard_of(self.bot), channel.id, prompt):
                 await run_claude_with_config(
@@ -434,12 +515,14 @@ class SkillCommandCog(commands.Cog):
         display = f"`/{name} {args}`" if args else f"`/{name}`"
         await respond(f"Running {display} → {thread.mention}")
 
+        # #927: a new thread has no running Claude, so this never restarts.
+        turn, _ = await self._fix_turn(thread, claude_channel.id, tmux)
         ready, working_dir = await self._prepare_workspace(
             thread=thread, tmux=tmux, sdm=sdm, recorded_dir=None, requester=user
         )
         if not ready:
             return
-        runner = self._make_runner(tmux, thread.id, working_dir)
+        runner = self._make_runner(tmux, thread.id, working_dir, turn=turn)
         # #754: see above.
         async with board_turn(dashboard_of(self.bot), thread.id, prompt):
             await run_claude_with_config(

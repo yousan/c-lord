@@ -84,7 +84,7 @@ _context_window_cache: dict[str, tuple[str | None, int]] = {}
 
 # #370: settings-table key prefix for the per-model context-window total.  The
 # in-memory cache above is cleared on every bot restart, so the /context probe
-# (which renders into the human-visible tmux pane) re-fires once per session
+# (a separate ``claude -p`` process since #924) re-fires once per session
 # after each restart.  Persisting the learned total per model — the tier is
 # stable per (host, account, model) — lets the probe fire at most once per model
 # per host instead.  One scalar key per model (not a JSON blob) so concurrent
@@ -290,9 +290,9 @@ async def _resolve_context_window(
     """Return the context-window total for ``session_id`` running ``model``.
 
     Resolution order: in-memory cache → disk (``settings`` KV, keyed by model,
-    #370) → live ``/context`` probe → per-model fallback.  The probe scrapes
-    ``/context`` (Claude is idle at the prompt after a turn completes) and
-    renders into the human-visible tmux pane, so it is avoided whenever the
+    #370) → live ``/context`` probe → per-model fallback.  The probe runs
+    ``/context`` in a throwaway ``claude -p`` outside this conversation (#924)
+    — a few seconds of a separate process — so it is avoided whenever the
     total is already known on disk.  A re-probe is forced when ``model`` differs
     from the value cached for this session, since the window size can change
     with the model.  Falls back to a per-model default when the runner cannot
@@ -306,8 +306,8 @@ async def _resolve_context_window(
     settings_repo = getattr(config, "settings_repo", None)
 
     # Disk layer (#370): the total is stable per (host, account, model), so a
-    # value learned once survives bot restarts and other sessions — no probe,
-    # no tmux-pane pollution.  Keyed by model; skipped when model is unknown.
+    # value learned once survives bot restarts and other sessions — no probe.
+    # Keyed by model; skipped when model is unknown.
     if settings_repo is not None and model:
         persisted = await _load_persisted_window(settings_repo, model)
         if persisted is not None:
@@ -318,7 +318,7 @@ async def _resolve_context_window(
     probe = getattr(config.runner, "probe_context_window", None)
     if probe is not None:
         with contextlib.suppress(Exception):
-            result = await probe()
+            result = await probe(model)
             total = result if isinstance(result, int) else None
     if total is not None:
         # Cache only successful probes — a transient pane-parse failure must
@@ -490,7 +490,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     nowhere else, and ``exit`` is logged in a ``finally`` — so every ``enter``
     gets its ``exit``, whether the turn finished, failed, was pre-empted by the
     next message or was cancelled outright. The line says which
-    (``outcome=ok|error|preempted|cancelled|crashed``) and how long the turn ran.
+    (``outcome=ok|error|stopped|preempted|cancelled|crashed``) and how long the turn ran.
     ``exit`` used to sit at the end of the turn body, where a cancel, an
     exception or the AskUserQuestion resume all skipped it — and an ``enter``
     with no ``exit`` read as a hang every time.
@@ -519,7 +519,11 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     session_id = config.session_id
     try:
         session_id = await _run_turn(config, ctx)
-        if config.outcome.error:
+        if config.outcome.error == STOPPED_BY_USER_ERROR:
+            # #909: the user stopped it (⏹ Stop, /stop, workspace stop). Not a
+            # failure — the turn-end event still says so (``reason: stopped``).
+            outcome = "stopped"
+        elif config.outcome.error:
             outcome = "error"
         elif getattr(config.runner, "preempted", False) is True:
             outcome = "preempted"
@@ -546,7 +550,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
         # only hears that from the transcript, and a claude that died mid-turn
         # writes nothing there. Not on ``preempted`` / ``cancelled``: the next
         # message already restarted the line for its own turn.
-        if outcome in ("ok", "error", "crashed"):
+        if outcome in ("ok", "error", "stopped", "crashed"):
             try:
                 await note_run_ended(thread_id)
             except Exception:
@@ -562,7 +566,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             try:
                 turn = config.outcome.turn
                 turn_events.end_turn(turn)
-                if outcome in ("ok", "error", "crashed"):
+                if outcome in ("ok", "error", "stopped", "crashed"):
                     turn_events.finish_turn(turn, failure_reason=_failure_reason(config, outcome))
             except Exception:
                 logger.warning(

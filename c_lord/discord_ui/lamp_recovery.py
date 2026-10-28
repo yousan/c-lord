@@ -20,6 +20,11 @@ lamp is adopted by a new manager:
 
 Only lamps are touched: the bot's own 🟢/⏳/⚠️. A 🟡 or ❌ is already final.
 Failures are logged and dropped — the lamp is decoration (#632).
+
+How the watch ended is returned (#907): a turn that reached its end gets the
+rest of its closing — the 📊 footer and the 🟡 summons — from the caller, since
+the run that would have posted them died with the old process. A turn a newer
+one displaced gets none, exactly like a turn interrupted in this process (#583).
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
+from typing import Literal
 
 import discord
 
@@ -66,6 +72,10 @@ RECHECK_SECONDS = 15.0
 #: the watcher stops so it cannot live for ever.
 MAX_SECONDS = 6 * 3600.0
 
+#: How an adopted lamp's turn ended (#907). ``"over"``: it had already ended
+#: when the new process looked; ``"ended"``: it ended while being watched.
+TurnEnd = Literal["over", "ended"]
+
 
 def _open_lamp(message: discord.Message) -> str | None:
     """The bot's own not-yet-final lamp on *message*, if there is one."""
@@ -100,28 +110,31 @@ async def adopt_orphaned_lamp(
     poll_seconds: float = POLL_SECONDS,
     recheck_seconds: float = RECHECK_SECONDS,
     max_seconds: float = MAX_SECONDS,
-) -> None:
+) -> TurnEnd | None:
     """Bring *message*'s orphaned lamp back in line with the turn it belongs to.
 
     *turn_running* answers "is this thread's turn still going?" from the
     transcript. Returns once the lamp is final (or the watch gave up). Run it
     as its own task: while the turn is running it waits for the turn's end.
+
+    Returns how the turn ended when it reached its end (#907); ``None`` when
+    there was no lamp to adopt, a newer turn took over, or the watch gave up.
     """
     ctx = log_ctx(thread_id=thread_id)
     try:
         emoji = _open_lamp(message)
     except Exception:
         logger.warning("%s lamp recovery: could not read the reactions", ctx, exc_info=True)
-        return
+        return None
     if emoji is None:
-        return
+        return None
 
     manager = StatusManager.adopt(message, emoji, thread_id=thread_id)
     try:
         if not await turn_running():
             logger.info("%s lamp recovery: %s left by a restart, turn is over → 🟡", ctx, emoji)
             await manager.set_waiting()
-            return
+            return "over"
 
         logger.info("%s lamp recovery: %s left by a restart, turn still running", ctx, emoji)
         since = datetime.now(_UTC)
@@ -150,12 +163,14 @@ async def adopt_orphaned_lamp(
                     "%s lamp recovery: still running after %.0fs, giving up", ctx, now - started
                 )
                 await manager.cleanup_monitor()
-                return
+                return None
         logger.info("%s lamp recovery: %s → 🟡", ctx, reason)
         await manager.set_waiting()
+        return None if reason == "a newer turn took over" else "ended"
     except asyncio.CancelledError:
         await manager.cleanup_monitor()
         raise
     except Exception:
         logger.warning("%s lamp recovery failed", ctx, exc_info=True)
         await manager.cleanup_monitor()
+        return None

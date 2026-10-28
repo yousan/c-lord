@@ -93,6 +93,7 @@ Claude Code 2.1.252 は、上限に当たると文言だけでなく選択メニ
 
 ### 境界
 
+- **回復時刻は `·` で区切られたどの節にあっても拾う。** 月の利用上限では間に `raise it at <URL>` が挟まり、`You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage?… · your session limit resets 1:50pm (Asia/Tokyo)` の形になる。このときも「1:50pm (Asia/Tokyo) に回復します」と出す（#921。以前は読めずに「回復時刻は報告されませんでした」と出ていた）。`resets` は節の先頭か空白の後ろにあるものだけを数える（URL の中の `/resets` は時刻ではない）
 - **回復時刻が無いことがある。** API が `resetsAt` を返さなかったときは、Claude 自身も時刻を出しません。そのときは「回復時刻は報告されませんでした」と書き、**時刻をでっち上げない**
 - **上限の種類は Claude が出した名前をそのまま使う**（`weekly limit` / `session limit` / `Opus limit` / `Sonnet limit` / `usage limit` / `org's monthly usage limit`）。翻訳や言い換えで別の枠と混同させない
 - **「残り◯%」は上限ではない。** `You've used 79% of your weekly limit` / `Approaching weekly limit` / `You're close to your usage limit` は**警告**で、Claude は普通に応答します。これを上限として扱ってはいけません（元気なセッションを止めることになる）
@@ -112,6 +113,7 @@ Claude Code 2.1.252 は、上限に当たると文言だけでなく選択メニ
 - 上限の文言を畳んだ結果、**上限中に何も出なくなる**（止まっていることが伝わらない。#585 に戻る）
 - 上限に当たったのに `🟡 Claude has finished` と出る（終わっていない）
 - 回復時刻が出ない、または c-lord が勝手に計算した時刻が出る
+- CLI が `· raise it at <URL> · your session limit resets 1:50pm (Asia/Tokyo)` と時刻を出しているのに「回復時刻は報告されませんでした」と出る（#921、実測 2026-10-20）
 - `You've used 91% of your weekly limit`（警告）でターンが止まる
 - 上限を検知してから報告までに、猶予時間（2 分）ぶん待たされる
 - 上限のメニューが開いたまま残り、次に送ったメッセージがメニューに吸い込まれる
