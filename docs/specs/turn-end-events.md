@@ -68,6 +68,7 @@ ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で
   許可プロンプトはペイン内で自動承認されて Discord に出ないので、`blocked` にはならない。
 - **`failure`**: 起動できなかった（`workspace_setup`）・クラッシュした（`crashed`）・タイムアウトした（`timeout`）・
   プラン上限に当たった（`usage_limit`）・ログアウトしている（`login_required`）・モデルが使えない（`model_unavailable`）・
+  Claude Code が API エラーで止まった（`api_error`、#908）・
   応答が無かった（`no_response`）・ユーザーが止めた（`stopped`）・その他のエラー（`error`）。
 - **出ないとき**: 次のメッセージで置き換えられたターン（`preempted`）と、キャンセルされたターンは出さない。
   そのスレッドの次のターンの終わりが出す。
