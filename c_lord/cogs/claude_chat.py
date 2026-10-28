@@ -4655,6 +4655,9 @@ class ClaudeChatCog(commands.Cog):
                         # #908: and when Claude Code stopped on an API error,
                         # say so and how to go on — not "finished".
                         api_error=run_config.outcome.api_error,
+                        # #915: …and when the ❌ embed for one of those already
+                        # pinged this person, do not ping them a second time.
+                        already_pinged=run_config.outcome.pinged_user_id,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply
