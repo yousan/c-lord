@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 
 from . import api_endpoint
 from .pane_running import pane_shows_running
-from .tool_shells import terminate_tool_shells
+from .tool_shells import read_procs, terminate_tool_shells, tool_shell_groups
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -3554,6 +3554,24 @@ class TmuxSessionManager:
         Returns how many command groups were signalled (0 when there is no
         window, or nothing was running).
         """
+        pane_pid = self._pane_pid(thread_id)
+        if pane_pid <= 0:
+            return 0
+        return terminate_tool_shells(pane_pid)
+
+    def count_tool_shells(self, thread_id: int) -> int:
+        """How many Bash tool commands are still running under *thread_id*'s pane (#922).
+
+        The ones :meth:`stop_tool_shells` would stop: a background render or
+        build Claude is waiting on. 0 when there is no window.
+        """
+        pane_pid = self._pane_pid(thread_id)
+        if pane_pid <= 0:
+            return 0
+        return len(tool_shell_groups(pane_pid, read_procs()))
+
+    def _pane_pid(self, thread_id: int) -> int:
+        """The pid of the process in *thread_id*'s pane, or 0."""
         if not self._check_available():
             return 0
         window = self._find_window_for_thread(thread_id)
@@ -3561,12 +3579,9 @@ class TmuxSessionManager:
             return 0
         result = _run(["tmux", "display-message", "-p", "-t", self._target(window), "#{pane_pid}"])
         try:
-            pane_pid = int(result.stdout.strip()) if result.returncode == 0 else 0
+            return int(result.stdout.strip()) if result.returncode == 0 else 0
         except ValueError:
-            pane_pid = 0
-        if pane_pid <= 0:
             return 0
-        return terminate_tool_shells(pane_pid)
 
     def is_claude_running(self, thread_id: int) -> bool:
         """Check if the pane's current process is ``claude``.

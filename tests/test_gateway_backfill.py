@@ -26,9 +26,13 @@ from c_lord.database.repository import SessionRecord
 from c_lord.discord_ui.authorization import Authorizer
 from c_lord.gateway_backfill import (
     MARGIN,
+    STARTUP_LOOKBACK,
+    STARTUP_MAX_LOOKBACK,
     GatewayWatch,
     MissedEntry,
+    PreviousOutage,
     SeenMessages,
+    Startup,
     merge_missed_prompt,
     missed_notice,
 )
@@ -804,3 +808,144 @@ class TestStartupPicksUpWhatTheRestartMissed:
         assert summary, infos
         assert _at(-60).astimezone().strftime("%Y-%m-%d %H:%M") in summary[0]
         assert _at(0.1).astimezone().strftime("%Y-%m-%d %H:%M") in summary[0]
+
+
+# ── #920: the previous process lost its gateway before it went away ─────────
+
+
+class _Settings:
+    """The ``settings`` table, shared by the processes of one test."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    async def get(self, key: str, *, default: str | None = None) -> str | None:
+        return self.values.get(key, default)
+
+    async def set(self, key: str, value: str) -> None:
+        self.values[key] = value
+
+    async def delete(self, key: str) -> bool:
+        return self.values.pop(key, None) is not None
+
+
+def _process(
+    threads: list[MagicMock],
+    records: dict[int, SessionRecord],
+    settings: _Settings,
+    *,
+    started_at: datetime,
+) -> _Harness:
+    h = _Harness(threads, records)
+    h.cog._settings_repo = settings  # type: ignore[assignment]
+    h.cog._gateway = GatewayWatch(clock=lambda: h.clock[0], started_at=started_at)
+    return h
+
+
+class TestStartupReadsFromWhereThePreviousProcessWentDeaf:
+    """#920: 2026-10-21 the host lost Discord at 12:38, limped on and was
+    restarted at 14:26. The startup pick-up read from 13:26 (an hour before
+    the start), so anything posted 12:38〜13:26 was never run.
+
+    Here the previous process came up at ``_at(-300)``, lost the gateway at
+    ``_at(-120)`` and died; the next one starts at ``_at(0)``.
+    """
+
+    async def _previous_process_goes_deaf(self, settings: _Settings) -> None:
+        prev = _process([], {}, settings, started_at=_at(-300))
+        await prev.connect(-300)
+        prev.cog._gateway.seen(_at(-121))
+        await prev.disconnect(-120)
+        await prev.disconnect(-100)  # a failed retry: still the same outage
+
+    @pytest.mark.asyncio
+    async def test_message_sent_after_the_disconnect_runs_on_the_next_startup(self) -> None:
+        """AC1. RED before #920: reading starts at _at(-60), the message is older."""
+        settings = _Settings()
+        await self._previous_process_goes_deaf(settings)
+        answer = _bot_says(MagicMock(), _at(-125))
+        lost = _message(MagicMock(), _at(-90), content="切れている間に送った依頼")
+        thread = _in_thread(501, [answer, lost])
+
+        h = _process([thread], {501: _record(501)}, settings, started_at=_at(0))
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_awaited_once()
+        assert h.cog._handle_thread_reply.await_args.args[0] is lost
+        line = thread.send.await_args.args[0]
+        assert "Discord と接続できておらず" in line
+        assert "いまから処理します" in line
+        # The start shown is the previous process's disconnect.
+        assert _at(-120).astimezone().strftime("%H:%M") in line
+
+    @pytest.mark.asyncio
+    async def test_the_record_is_used_once(self) -> None:
+        settings = _Settings()
+        await self._previous_process_goes_deaf(settings)
+        assert settings.values  # written by the disconnect
+        h = _process([], {}, settings, started_at=_at(0))
+        await h.connect(0.1)
+        assert not settings.values
+
+    @pytest.mark.asyncio
+    async def test_a_reconnect_clears_the_record(self) -> None:
+        """The outage ended inside the process: the next startup has no reason
+        to read further back than usual."""
+        settings = _Settings()
+        prev = _process([], {}, settings, started_at=_at(-300))
+        await prev.connect(-300)
+        await prev.disconnect(-120)
+        await prev.connect(-110)
+        assert not settings.values
+
+    @pytest.mark.asyncio
+    async def test_without_a_record_the_hour_still_applies(self) -> None:
+        """AC2."""
+        stale = _message(MagicMock(), _at(-90))
+        thread = _in_thread(501, [stale])
+        h = _process([thread], {501: _record(501)}, _Settings(), started_at=_at(0))
+
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_what_the_previous_process_ran_before_going_deaf_is_not_run_again(
+        self,
+    ) -> None:
+        settings = _Settings()
+        await self._previous_process_goes_deaf(settings)
+        ran = _message(MagicMock(), _at(-122), reacted=True)
+        thread = _in_thread(501, [ran])
+
+        h = _process([thread], {501: _record(501)}, settings, started_at=_at(0))
+        await h.connect(0.1)
+
+        h.cog._handle_thread_reply.assert_not_awaited()
+
+
+class TestStartupSince:
+    def _startup(self) -> Startup:
+        return Startup(started_at=_at(0), up_at=_at(0.1), since=_at(0) - STARTUP_LOOKBACK)
+
+    def test_no_record_keeps_the_hour(self) -> None:
+        assert self._startup().after(None).since == _at(-60)
+
+    def test_reads_from_a_margin_before_the_last_sign_of_life(self) -> None:
+        prev = PreviousOutage(down_at=_at(-120), last_alive_at=_at(-121))
+        assert self._startup().after(prev).since == _at(-121) - MARGIN
+
+    def test_a_recent_outage_does_not_shorten_the_hour(self) -> None:
+        prev = PreviousOutage(down_at=_at(-5), last_alive_at=_at(-6))
+        assert self._startup().after(prev).since == _at(-60)
+
+    def test_never_further_back_than_the_cap(self) -> None:
+        prev = PreviousOutage(down_at=_at(-60 * 72), last_alive_at=_at(-60 * 72))
+        assert self._startup().after(prev).since == _at(0) - STARTUP_MAX_LOOKBACK
+
+    def test_round_trips_and_rejects_junk(self) -> None:
+        prev = PreviousOutage(down_at=_at(-120), last_alive_at=_at(-121))
+        assert PreviousOutage.loads(prev.dumps()) == prev
+        assert PreviousOutage.loads(None) is None
+        assert PreviousOutage.loads("not json") is None
+        assert PreviousOutage.loads('{"down_at": "2026-10-21T12:38:31"}') is None
