@@ -77,7 +77,11 @@ logger = logging.getLogger(__name__)
 _idle_unresolved_log = LogSampler(3600.0)
 
 Sink = Callable[[str], Awaitable[None]]
-FileSink = Callable[[str, str], Awaitable[None]]
+# The final-answer sinks: ``(text)`` / ``(text, progress_path)``, plus a keyword
+# ``reply_to=<message id>`` passed only when the answer belongs to an earlier
+# request than the current one (#912).
+ReplySink = Callable[..., Awaitable[None]]
+FileSink = Callable[..., Awaitable[None]]
 # Called with the first AskUserQuestion of a tool_use to bridge it to Discord
 # buttons (#232). Constructed by TranscriptMirrorCog (knows tmux + thread).
 AskBridgeCb = Callable[[AskQuestion], Coroutine[object, object, None]]
@@ -664,7 +668,7 @@ class TranscriptMirror:
         thread_id: int,
         project_dir: Path,
         sink: Sink,
-        reply_sink: Sink | None = None,
+        reply_sink: ReplySink | None = None,
         file_sink: FileSink | None = None,
         user_file_sink: UserFileSink | None = None,
         reply_cursor_sink: Sink | None = None,
@@ -739,14 +743,23 @@ class TranscriptMirror:
         # answer is not a reply to the last one.
         self._turn_open = expect_turn
         self._turn_by_notification = False
+        # #912: the Discord message that asked for the turn c-lord accepted last,
+        # and the one that asked for the turn the transcript is in. They differ
+        # from the moment a new instruction is accepted until Claude reads it —
+        # exactly when an interrupted turn's held text gets flushed.
+        self._latest_trigger: int | None = None
+        self._turn_trigger: int | None = None
 
-    def note_turn_started(self) -> None:
+    def note_turn_started(self, trigger_id: int | None = None) -> None:
         """Tell the progress line a turn just began (#539).
 
         Called when c-lord *accepts* the prompt, which is earlier and more honest
         than the first transcript event: Claude's startup happens in between, and
-        the reader has been waiting for all of it.
+        the reader has been waiting for all of it. *trigger_id* is the message
+        that asked for it (#912).
         """
+        if trigger_id is not None:
+            self._latest_trigger = trigger_id
         self._progress.begin_turn(restart=True)
         # #773: from here on, silence is a symptom rather than an idle thread.
         self._turn_active = True
@@ -905,6 +918,8 @@ class TranscriptMirror:
         # uuid of the text currently held in _pending_text — not yet known to be
         # the turn's final answer.
         _pending_uuid: str | None = None
+        # #912: the request the held text was written for (see _turn_trigger).
+        _pending_trigger: int | None = None
         # Issue #215: uuid of the last text actually DELIVERED as a final answer.
         # Committed at each turn boundary so a restart knows it was delivered.
         #
@@ -964,7 +979,21 @@ class TranscriptMirror:
                 return
             # #747: the answer is never folded, and it ends any loop before it.
             await self._fold.reset()
-            await self._flush_as_reply(_pending_text, _pending_progress)
+            # #912: a text written before a newer instruction was accepted answers
+            # the request it was written for — quoting "the trigger" would make
+            # an interrupted turn's leftover read as the answer to the new one.
+            stale = _pending_trigger is not None and _pending_trigger != self._latest_trigger
+            if stale:
+                logger.info(
+                    "%s TranscriptMirror: the held text predates the newest instruction — "
+                    "replying to the request it was written for (%d, not %s) (#912)",
+                    log_ctx(thread_id=self.thread_id),
+                    _pending_trigger,
+                    self._latest_trigger,
+                )
+            await self._flush_as_reply(
+                _pending_text, _pending_progress, reply_to=_pending_trigger if stale else None
+            )
             # This IS the final answer for the turn — the one delivery that may
             # advance the cursor (#553).
             if _pending_uuid:
@@ -1143,6 +1172,37 @@ class TranscriptMirror:
                         cut[0],
                     )
 
+                # #912: Claude has read a new instruction — a prompt, not a
+                # bash-mode line (those are user strings too, rendered as tool
+                # activity). A text still held is the end of the turn before:
+                # deliver it now, as that turn's answer, before this turn can
+                # claim it. (A c-lord prompt is never rendered, so the
+                # user_input branch below would not get the chance.)
+                # Only a person's prompt: a notification landing mid-turn does
+                # not end the turn (#913), and flushing there would post a
+                # mid-turn text as the answer.
+                if (
+                    _is_user_prompt(event)
+                    and _prompt_kind(event) == "person"
+                    and (rendered is None or rendered.kind == "user_input")
+                ):
+                    if self._verbosity == "minimal" and _pending_text is not None:
+                        await _flush_pending_as_reply()
+                        await _commit_cursor()
+                    # Tool lines the turn before left with no text to ride on
+                    # (it was interrupted mid-tool) are that turn's log, not
+                    # this one's: carried over, they went out as the new
+                    # answer's progress.txt (staging 2026-10-28).
+                    if progress_buf:
+                        logger.info(
+                            "%s TranscriptMirror: dropping %d progress line(s) of the turn "
+                            "before — no answer of theirs to attach to (#912)",
+                            log_ctx(thread_id=self.thread_id),
+                            len(progress_buf),
+                        )
+                        progress_buf.clear()
+                    self._turn_trigger = self._latest_trigger
+
                 # #539: record this event's activity BEFORE ticking, so the line
                 # reflects what we just read rather than the state before it —
                 # otherwise the tick that fires on a fresh tool event still
@@ -1296,6 +1356,7 @@ class TranscriptMirror:
                         self._holding_final = True
                         _pending_progress = list(progress_buf)
                         _pending_uuid = event.get("uuid")
+                        _pending_trigger = self._turn_trigger
                         progress_buf.clear()
                     elif rendered.kind == "user_input":
                         # #539: a new prompt both closes the previous turn's line
@@ -1427,24 +1488,31 @@ class TranscriptMirror:
                     exc_info=True,
                 )
 
-    async def _flush_as_reply(self, text: str, progress: list[str]) -> None:
-        """Flush pending text as the final reply for the current turn."""
+    async def _flush_as_reply(
+        self, text: str, progress: list[str], *, reply_to: int | None = None
+    ) -> None:
+        """Flush pending text as the final reply for the current turn.
+
+        *reply_to* names the request to quote when it is not the current one
+        (#912); the sinks are only told when it is set.
+        """
         # #539: this IS the end of a turn from the reader's point of view. Turn-end
         # markers are not reliably emitted (#218), so disarming here rather than
         # only on the marker is what keeps a finished thread from carrying a line.
         await self._progress.end_turn()
+        target = {} if reply_to is None else {"reply_to": reply_to}
         if _has_tool_lines(progress) and self._file_sink is not None:
-            await self._flush_with_progress(text, progress)
+            await self._flush_with_progress(text, progress, **target)
         elif self._turn_by_notification:
             # #913: nobody asked — "Still running." after a Monitor event is
             # not an answer to the last message, so it is not quoted under it.
             await self._try_sink(text)
         elif self._reply_sink is not None:
-            await self._try_reply_sink(text)
+            await self._try_reply_sink(text, **target)
         else:
             await self._try_sink(text)
 
-    async def _flush_with_progress(self, body: str, progress_buf: list[str]) -> None:
+    async def _flush_with_progress(self, body: str, progress_buf: list[str], **target: int) -> None:
         """Write buffered tool lines to a tempfile and call file_sink."""
         await self._progress.note_output()
         assert self._file_sink is not None
@@ -1460,7 +1528,7 @@ class TranscriptMirror:
                 f.write(_truncate_progress("\n".join(progress_buf)))
                 tmp_path = f.name
             try:
-                await self._file_sink(body, tmp_path)
+                await self._file_sink(body, tmp_path, **target)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1494,11 +1562,11 @@ class TranscriptMirror:
                 exc_info=True,
             )
 
-    async def _try_reply_sink(self, body: str) -> None:
+    async def _try_reply_sink(self, body: str, **target: int) -> None:
         await self._progress.note_output()
         assert self._reply_sink is not None
         try:
-            await self._reply_sink(body)
+            await self._reply_sink(body, **target)
         except asyncio.CancelledError:
             raise
         except Exception:

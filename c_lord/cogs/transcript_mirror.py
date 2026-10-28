@@ -123,7 +123,7 @@ class TranscriptMirrorCog(commands.Cog):
         # where the "how long have I been waiting" clock should start.
         mirror = self._mirrors.get(thread_id)
         if mirror is not None:
-            mirror.note_turn_started()
+            mirror.note_turn_started(trigger_id=message_id)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -551,14 +551,14 @@ class TranscriptMirrorCog(commands.Cog):
         """
         bot = self.bot
 
-        async def reply_sink(text: str) -> None:
+        async def reply_sink(text: str, *, reply_to: int | None = None) -> None:
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            reference = await self._build_trigger_reference(thread_id)
+            reference = await self._build_trigger_reference(thread_id, reply_to)
             try:
                 last_msg = await self._send_chunks(send, text, reference=reference, tables=True)
             except discord.HTTPException as exc:
@@ -586,7 +586,7 @@ class TranscriptMirrorCog(commands.Cog):
         """
         bot = self.bot
 
-        async def file_sink(text: str, file_path: str) -> None:
+        async def file_sink(text: str, file_path: str, *, reply_to: int | None = None) -> None:
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
@@ -597,7 +597,7 @@ class TranscriptMirrorCog(commands.Cog):
             # attachment slots; _send_chunks gives that message's tables one
             # fewer — the turn log must never be the thing dropped (#683).
             files = [discord.File(file_path, filename="progress.txt")]
-            reference = await self._build_trigger_reference(thread_id)
+            reference = await self._build_trigger_reference(thread_id, reply_to)
 
             from ..skills.reply_tracker import record_reply_message
 
@@ -819,15 +819,19 @@ class TranscriptMirrorCog(commands.Cog):
             for images in get_table_images_per_chunk(text, chunks, limits=limits)
         ]
 
-    async def _build_trigger_reference(self, thread_id: int) -> discord.MessageReference | None:
+    async def _build_trigger_reference(
+        self, thread_id: int, reply_to: int | None = None
+    ) -> discord.MessageReference | None:
         """Resolve the trigger message for ``thread_id`` into a reply reference.
 
         Returns ``None`` when reply-to-trigger is disabled or no trigger id is
-        known. Shared by ``reply_sink`` and ``file_sink``.
+        known. Shared by ``reply_sink`` and ``file_sink``. *reply_to* overrides
+        the current trigger: an interrupted turn's text answers its own request,
+        not the instruction that interrupted it (#912).
         """
         if not reply_to_trigger_enabled():
             return None
-        trigger_id = self._trigger_messages.get(thread_id)
+        trigger_id = reply_to if reply_to is not None else self._trigger_messages.get(thread_id)
         if trigger_id is None:
             with contextlib.suppress(Exception):
                 record = await self._session_repo.get(thread_id)
