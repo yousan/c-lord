@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import discord
 
 from .. import turn_events
+from ..api_error import API_ERROR_PREFIX, advice_for_error
 from ..claude.context_usage import (
     fallback_window,
     format_context_line,
@@ -51,6 +52,7 @@ from ..discord_ui.ask_handler import (  # noqa: F401
     collect_ask_answers,
 )
 from ..discord_ui.embeds import (
+    api_error_embed,
     claude_vanished_embed,
     error_embed,
     fleet_tmux_restart_embed,
@@ -134,6 +136,12 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
     # (resending cannot help) and because the fix is a c-lord setting.
     if error.startswith(MODEL_UNAVAILABLE_ERROR_PREFIX):
         return model_unavailable_embed(error)
+    # #908: Claude Code's own API error — it says what failed; the embed adds
+    # what can be done about it from Discord.
+    if error.startswith(API_ERROR_PREFIX):
+        return api_error_embed(
+            error.removeprefix(API_ERROR_PREFIX).strip(), advice_for_error(error)
+        )
     m = _TIMEOUT_PATTERN.match(error)
     if m:
         return timeout_embed(int(m.group(1)))
@@ -161,6 +169,8 @@ def _failure_reason(config: RunConfig, outcome: str) -> str | None:
         return "login_required"
     if result.model_unavailable is not None:
         return "model_unavailable"
+    if result.api_error is not None:
+        return "api_error"
     if result.error == STOPPED_BY_USER_ERROR:
         return "stopped"
     if _TIMEOUT_PATTERN.match(result.error):

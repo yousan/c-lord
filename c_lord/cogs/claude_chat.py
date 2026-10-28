@@ -4571,6 +4571,9 @@ class ClaudeChatCog(commands.Cog):
                         # #484: and when it refused the configured model, point
                         # at /model set — the only thing that can change it.
                         model_unavailable=run_config.outcome.model_unavailable,
+                        # #908: and when Claude Code stopped on an API error,
+                        # say so and how to go on — not "finished".
+                        api_error=run_config.outcome.api_error,
                         # #583: …and when the user's own next message is what
                         # ended this turn, say nothing at all. The ping would
                         # arrive seconds after they typed, tell them their reply

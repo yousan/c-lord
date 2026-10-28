@@ -5802,6 +5802,68 @@ class TestTurnEndFromTranscript:
         # the marker to be noticed.
         assert calls["n"] <= 12, f"took {calls['n']} polls to notice the turn ended"
 
+    @pytest.mark.parametrize(
+        ("last_reply", "expect_error"),
+        [
+            ("API Error: Connection lost mid-response. The response above may be incomplete.", True),
+            (None, False),  # #908 AC2: the CLI retried and Claude went on answering
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_turn_that_ended_on_an_api_error_is_an_error(
+        self, tmux_manager, last_reply: str | None, expect_error: bool
+    ) -> None:
+        """#908 AC1/AC2: the turn's LAST entry decides, not the error's presence."""
+        from c_lord.api_error import API_ERROR_PREFIX
+        from c_lord.turn_end_bus import turn_end_bus
+
+        thread_id = 9080
+        turn_end_bus.forget(thread_id)
+        runner = TmuxClaudeRunner(
+            tmux_manager=tmux_manager, thread_id=thread_id, model="sonnet", timeout_seconds=600
+        )
+        tmux_manager.is_claude_running.return_value = True
+        tmux_manager._find_window_for_thread.return_value = "work1"
+        error_text = "API Error: Connection lost mid-response. The response above may be incomplete."
+        calls = {"n": 0}
+
+        def capture_fn(_tid):
+            calls["n"] += 1
+            n = calls["n"]
+            if n == 2:
+                turn_end_bus.note_prompt(thread_id)
+            if n == 4:
+                turn_end_bus.note_reply(thread_id, api_error=error_text)
+            if n == 5:
+                if last_reply is None:
+                    turn_end_bus.note_reply(thread_id, api_error=None)
+                turn_end_bus.mark(thread_id)
+            return self._generating(n) if n <= 4 else self._ticking(n)
+
+        tmux_manager.capture_pane.side_effect = capture_fn
+        events = []
+        try:
+            with (
+                patch("c_lord.claude.tmux_runner._POLL_INTERVAL", 0.01),
+                patch("c_lord.claude.tmux_runner._POST_STARTUP_DELAY", 0.01),
+            ):
+
+                async def _drain():
+                    async for event in runner.run("test"):
+                        events.append(event)
+
+                await asyncio.wait_for(_drain(), timeout=5.0)
+        finally:
+            turn_end_bus.forget(thread_id)
+
+        result = [e for e in events if e.is_complete]
+        assert len(result) == 1
+        if expect_error:
+            assert result[0].error is not None
+            assert result[0].error.startswith(API_ERROR_PREFIX)
+        else:
+            assert result[0].error is None
+
     @pytest.mark.asyncio
     async def test_a_prompt_dated_at_the_keypress_still_counts(self, tmux_manager) -> None:
         """#916: the CLI dates c-lord's prompt at the Enter, not after the settle.
