@@ -397,12 +397,15 @@ class TestTasksErrors:
         assert task["interval_seconds"] == 3600
         assert task["working_dir"] == "/srv/repo"
 
-    async def test_patch_with_no_known_field_is_404(self, client: TestClient) -> None:
-        """Nothing to update reads as "not found" — current behaviour: the
-        handler only knows whether a row changed."""
+    async def test_patch_with_no_known_field_is_400(self, client: TestClient) -> None:
+        """Nothing to update is not "not found" (#1066): a 400 naming the fields."""
         task_id = await self._create(client)
         resp = await client.patch(f"/api/tasks/{task_id}", json={"colour": "red"})
-        assert resp.status == 404
+        assert resp.status == 400
+        assert (await resp.json()) == {
+            "error": "No field to update. Accepted fields: "
+            "enabled, prompt, interval_seconds, working_dir"
+        }
 
     async def test_create_with_zero_interval_is_rejected_as_missing(
         self, client: TestClient
