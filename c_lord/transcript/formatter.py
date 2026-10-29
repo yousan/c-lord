@@ -62,6 +62,9 @@ def _format_tool_use(block: dict[str, Any]) -> str:
         return f"🔧 Grep: `{inp.get('pattern', '')}`"
     if name == "Glob":
         return f"🔧 Glob: `{inp.get('pattern', '')}`"
+    if name in ("Agent", "Task") and inp.get("description"):
+        # #970: which agent this was — the receipt below no longer says.
+        return f"🔧 {name}: {inp.get('description')}"
     return f"🔧 {name}"
 
 
@@ -101,15 +104,25 @@ def _render_assistant(event: dict[str, Any]) -> RenderedEvent | None:
     return RenderedEvent(kind=kind, body="\n".join(parts), session_id=event.get("sessionId"))
 
 
+# #970: what the Agent tool returns when it starts an agent is addressed to
+# Claude — the agent's id, its output file under /tmp and "never quote this to
+# the user" — and progress.txt is read by the user. Same reasoning as #380.
+_AGENT_RECEIPT_PREFIXES = ("Async agent launched successfully", "Spawned successfully")
+AGENT_RECEIPT_BODY = "サブエージェントを起動しました"
+
+
 def _tool_result_body(block: dict[str, Any]) -> str:
     content = block.get("content")
+    text = ""
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
             b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
         )
-    return ""
+    if text.lstrip().startswith(_AGENT_RECEIPT_PREFIXES):
+        return AGENT_RECEIPT_BODY
+    return text
 
 
 # Claude Code bash-mode (``! command``) markers (#487).  A ``!``-prefixed pane
@@ -355,11 +368,12 @@ def _is_slash_command_marker(text: str) -> bool:
 
 
 def local_command_record(event: dict[str, Any]) -> str | None:
-    """``"name"`` / ``"output"`` for a pane slash command's records, else ``None`` (#944).
+    """``"name"`` / ``"output"`` for a command typed in the pane, else ``None`` (#944).
 
     A local command (``/compact``, ``/config``, …) runs no model turn, so no
     ``turn_duration`` follows it: its ``<local-command-stdout>`` — written even
-    when empty — is the only sign it finished.
+    when empty — is the only sign it finished.  A ``!`` command (bash mode) is
+    the same: ``<bash-input>`` is its name, ``<bash-stdout>`` its end (#1013).
     """
     if event.get("type") != "user" or event.get("isMeta"):
         return None
@@ -368,6 +382,8 @@ def local_command_record(event: dict[str, Any]) -> str | None:
     if not isinstance(content, str):
         return None
     stripped = content.strip()
+    if _is_bash_mode_marker(stripped):
+        return "name" if stripped.startswith("<bash-input>") else "output"
     if not _is_slash_command_marker(stripped):
         return None
     return "output" if _LOCAL_STDOUT_RE.match(stripped) else "name"

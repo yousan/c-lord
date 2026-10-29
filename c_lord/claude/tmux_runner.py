@@ -698,8 +698,14 @@ def _usage_limit_wait_option(pane: str) -> int | None:
     """
     if not pane:
         return None
+    # #989: read only what is under the (last) menu header. capture-pane
+    # includes scrollback, and a "1. / 2." list in Claude's answer above the
+    # menu used to be taken for it — the real menu was never read.
+    header = pane.rfind(_LIMIT_MENU_HEADER)
+    if header < 0:
+        return None
     options: list[str] = []
-    for line in pane.splitlines():
+    for line in pane[header:].splitlines():
         match = _LIMIT_MENU_OPTION_RE.match(line)
         if match is None:
             if options:

@@ -125,10 +125,17 @@ from ..tmux import live_claude_panes
 from ..transcript.claim import adopt_cleared_session, list_transcripts
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
+from ..voice_webhooks import is_voice_message
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
 from ..workspace_notice import restored_devenv_notice
-from ._run_helper import _post_context_usage, has_other_run_in_flight, run_claude_with_config
+from ._run_helper import (
+    _post_context_usage,
+    has_other_run_in_flight,
+    in_flight_tasks,
+    run_claude_with_config,
+    withdraw_in_flight,
+)
 from .run_config import RunConfig
 
 if TYPE_CHECKING:
@@ -1008,6 +1015,10 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
+        # #971: c-lord's own voice for a sub-agent — never a request, and not a
+        # refused one either (the owner would be DM'd for every agent message).
+        if is_voice_message(message):
+            return
         # #745: bookkeeping for the reconnect pick-up. Before any await, so a
         # pick-up that starts after this event was dispatched always sees it.
         if not self._note_delivered(message):
@@ -3978,15 +3989,20 @@ class ClaudeChatCog(commands.Cog):
         user`` → 🟡, no error embed, no failure ping — ``docs/specs/stop-button.md``).
         No C-c: the window is about to be killed anyway.
 
+        #1010: whatever started the turn — a ``/skill`` run is not in this
+        cog's tables, but every run is in ``_run_helper``'s in-flight ledger.
+
         Public so ``SessionManageCog`` can reach it through ``bot.get_cog``,
         like :meth:`mark_reopened`. Returns whether a turn was running.
         """
         runner = self._active_runners.get(thread_id)
-        if runner is None:
+        if runner is not None:
+            runner.withdraw(silent=False)
+        others = withdraw_in_flight(thread_id)
+        if runner is None and not others:
             return False
-        runner.withdraw(silent=False)
         logger.info(
-            "%s workspace stop: ending the running turn as a user stop (#909)",
+            "%s workspace stop: ending the running turn as a user stop (#909/#1010)",
             log_ctx(thread_id=thread_id),
         )
         return True
@@ -4004,18 +4020,22 @@ class ClaudeChatCog(commands.Cog):
         not outlive its workspace. Its runner was withdrawn, so the run still
         logs ``outcome=stopped``. The stop goes ahead regardless.
         """
-        task = self._active_tasks.get(thread_id)
-        if task is None or task.done() or task is asyncio.current_task():
+        tasks = {self._active_tasks.get(thread_id), *in_flight_tasks(thread_id)}
+        running = {
+            t for t in tasks if t is not None and not t.done() and t is not asyncio.current_task()
+        }
+        if not running:
             return
-        _done, pending = await asyncio.wait({task}, timeout=timeout)
+        _done, pending = await asyncio.wait(running, timeout=timeout)
         if pending:
             logger.warning(
                 "%s workspace stop: the turn did not end within %.0fs; cancelling it (#909/#977)",
                 log_ctx(thread_id=thread_id),
                 timeout,
             )
-            task.cancel()
-            await asyncio.wait({task}, timeout=_PREEMPT_CANCEL_GRACE)
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=_PREEMPT_CANCEL_GRACE)
 
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).

@@ -115,8 +115,8 @@ WINDOW_PREFIX = "w"
 _LEGACY_WINDOW_PREFIX = "work"
 
 # #677: foreground commands that mean "this pane is an idle shell", i.e. a
-# corpse. Used only by the reaper's untagged branch, where "not claude" is too
-# weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
+# corpse. Used by both reaper branches (untagged #677, tagged #986), where "not
+# claude" is too weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
 # must survive. A login shell reports itself as ``-zsh``.
 _SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"})
 
@@ -1468,12 +1468,13 @@ class TmuxSessionManager:
         """True when **every** pane in *window* sits at a plain shell (#677).
 
         The reaper's untagged branch has no ``@thread_id`` to check against
-        ``active_thread_ids``, so this is the whole of its liveness test — it has
-        to be stricter than :meth:`_window_has_claude`'s "not claude". A window
-        whose panes are all idle shells is a corpse whatever created it; one
-        running anything else (a dev server, a build, a Claude) is somebody's
-        work. A failed probe reads as "not idle", so tmux trouble keeps windows
-        rather than killing them.
+        ``active_thread_ids``, so this is the whole of its liveness test; the
+        tagged branch uses it too (#986). It has to be stricter than
+        :meth:`_window_has_claude`'s "not claude". A window whose panes are all
+        idle shells is a corpse whatever created it; one running anything else
+        (a dev server, a build, a Claude) is somebody's work. A failed probe
+        reads as "not idle", so tmux trouble keeps windows rather than killing
+        them.
         """
         result = _run(
             [
@@ -3723,12 +3724,13 @@ class TmuxSessionManager:
         is never one of them** in either case.
 
         **Tagged** — it carries an ``@thread_id``, its thread is not in
-        *active_thread_ids*, and its pane is not running Claude. The last
+        *active_thread_ids*, and every pane in it is an idle shell. The last
         condition is what makes this callable at all (#570): callers pass
         ``active_thread_ids=set()`` at startup, so membership alone would mark
         *every* window orphaned and kill live sessions. The pane's foreground
         command is read fresh from tmux rather than inferred from our own
-        bookkeeping.
+        bookkeeping. It used to be "not running Claude", which reaped a dev
+        server or a window tmux failed to describe (#986).
 
         **Untagged with a c-lord name** (#677) — it has *no* ``@thread_id``, its
         name is one only :meth:`_next_window_name` hands out (``w{N}``, or the
@@ -3774,7 +3776,11 @@ class TmuxSessionManager:
                 continue
 
             if not tid_str.isdigit():
-                if self._is_reapable_untagged(window, target) and self._kill_window(target):
+                if (
+                    self._is_reapable_untagged(window, target)
+                    and self._tag_unchanged(target, tid_str)
+                    and self._kill_window(target)
+                ):
                     self._log_reaped(window=window, reason="no @thread_id, idle c-lord window")
                     killed += 1
                 continue
@@ -3782,18 +3788,59 @@ class TmuxSessionManager:
             thread_id = int(tid_str)
             if thread_id in active_thread_ids:
                 continue
-            if target and self._window_has_claude(target):
+            if target and not self._window_is_idle_shell(target):
+                # #986: "not claude" is not "idle". A dev server, a build, or a
+                # probe tmux did not answer is somebody's work, exactly as in the
+                # untagged branch below.
                 logger.debug(
-                    "cleanup_orphaned: %s still runs Claude — keeping (thread=%d)",
+                    "cleanup_orphaned: %s is not an idle shell — keeping (thread=%d)",
                     self._describe(target),
                     thread_id,
                 )
                 continue
-            if self.kill_session(thread_id):
+            if target and not self._tag_unchanged(target, tid_str):
+                continue
+            # Kill the window just probed, not ``kill_session``'s pick: with two
+            # windows carrying one tag (#501/#649) that is the mapped one, which
+            # may be the busy twin the probe above kept.
+            if target and self._kill_window(target):
+                if self._thread_to_window.get(thread_id) in (target, window.get("window_name")):
+                    self._thread_to_window.pop(thread_id, None)
+                    self._save_mapping()
+                self._log_reaped(window=window, reason=f"thread={thread_id} inactive, idle shell")
+                killed += 1
+            elif not target and self.kill_session(thread_id):
                 self._log_reaped(window=window, reason=f"thread={thread_id} inactive, no Claude")
                 killed += 1
 
         return killed
+
+    def _tag_unchanged(self, target: str, listed: str) -> bool:
+        """Does ``target`` still carry the ``@thread_id`` the listing showed? (#1060)
+
+        The reaper decides from one listing and then probes every pane, which
+        takes a while at startup — long enough for ``/attach`` (``remap_window``)
+        or ``create_session``'s adoption to hand that very window, an idle shell
+        tagged with an inactive thread, to *another* thread. Killing by window id
+        (#1009) dropped the re-check ``kill_session`` used to make, so the window
+        a user had just been told was attached vanished. tmux answers rc=1 both
+        for "no such window" and "option unset", so both read as untagged.
+
+        A window handed back to the *same* thread keeps its tag and is not
+        caught here — that race predates #1009 (``kill_session`` checked the
+        same tag) and is not what this guards.
+        """
+        result = _run(["tmux", "show-option", "-w", "-v", "-t", self._target(target), "@thread_id"])
+        current = result.stdout.strip() if result.returncode == 0 else ""
+        if current == listed:
+            return True
+        logger.info(
+            "cleanup_orphaned: %s was re-tagged %r → %r since the listing — keeping",
+            self._describe(target),
+            listed,
+            current,
+        )
+        return False
 
     def _is_reapable_untagged(self, window: dict[str, str], target: str) -> bool:
         """Does this ``@thread_id``-less row belong to c-lord and hold nothing? (#677)"""

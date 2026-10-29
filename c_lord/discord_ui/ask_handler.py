@@ -789,6 +789,33 @@ async def bridge_pane_ask(
         _ask_bus.unregister(thread.id)
 
 
+def _preempted(runner: object) -> bool:
+    """Was *runner* stopped by the next message rather than by a stop (#1007)?"""
+    return getattr(runner, "preempted", False) is True
+
+
+async def _close_interrupted(
+    thread_id: int,
+    msg: discord.Message,
+    runner: TmuxClaudeRunner,
+    ask_repo: PendingAskRepository | None,
+) -> None:
+    """Close the card because a new message replaced the turn (#315).
+
+    The menu is about to be Esc'd away, so its buttons must go with it (#536) —
+    leaving them live is what produced menus that stayed clickable long after
+    the question was gone.
+    """
+    await _close(thread_id, CLOSE_INTERRUPTED, msg, ask_repo)
+    with contextlib.suppress(*DISCORD_CALL_FAILURES):
+        await msg.edit(
+            content="-# ⚡ 新しい指示が届いたので、この質問は取り消しました。",
+            embed=None,
+            view=None,
+        )
+    await runner.cancel_menu()
+
+
 async def _bridge_claimed_menu(
     thread: discord.Thread,
     question: AskQuestion,
@@ -989,12 +1016,19 @@ async def _bridge_claimed_menu(
                 misses = 0
 
     async def _wait_runner_stopped() -> None:
-        """Return once the turn has been stopped (#977).
+        """Return once the turn has been stopped or pre-empted (#977, #1040).
 
         A workspace stop withdraws the runner and then kills the window. Every
         capture after that fails, which :func:`_wait_tui_resolved` rightly reads
         as "unknown", so without this the turn waited out the 24h timeout.
         ``is True``: a bare mock runner's attribute is truthy.
+
+        A pre-empted runner (the next message's silent interrupt) returns here
+        too, and the caller tells the two apart (#1007): a pre-emption closes
+        the card as "new instruction" and Esc's the menu, not as "⏹ 停止". It
+        must not be left to the empty answer alone (#1040): when the interrupt
+        lands before this bridge registered, that answer had no receiver and
+        was dropped, and the card stayed clickable.
         """
         while getattr(runner, "stopped", False) is not True:
             await asyncio.sleep(_PANE_RESOLVE_POLL)
@@ -1027,6 +1061,10 @@ async def _bridge_claimed_menu(
         await runner.cancel_menu()
         return
 
+    if stop_task in done and click_task not in done and _preempted(runner):
+        await _close_interrupted(thread.id, msg, runner, ask_repo)
+        return
+
     if stop_task in done and click_task not in done:
         # #977: the turn was stopped. No keystrokes — the window is going away
         # (or ⏹ Stop already sent C-c); the run ends as a user stop right after.
@@ -1056,18 +1094,8 @@ async def _bridge_claimed_menu(
         return
 
     if not selected:
-        # An EMPTY answer is the #315 pre-emption signal, not a choice. The menu
-        # is about to be Esc'd away, so its buttons must go with it (#536) —
-        # leaving them live is what produced menus that stayed clickable long
-        # after the question was gone.
-        await _close(thread.id, CLOSE_INTERRUPTED, msg, ask_repo)
-        with contextlib.suppress(*DISCORD_CALL_FAILURES):
-            await msg.edit(
-                content="-# ⚡ 新しい指示が届いたので、この質問は取り消しました。",
-                embed=None,
-                view=None,
-            )
-        await runner.cancel_menu()
+        # An EMPTY answer is the #315 pre-emption signal, not a choice.
+        await _close_interrupted(thread.id, msg, runner, ask_repo)
         return
 
     await _close(thread.id, CLOSE_ANSWERED, msg, ask_repo)
