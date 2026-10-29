@@ -64,6 +64,16 @@ class TestParsing:
         assert _launched_agent_ids(_launch("aaa111")) == ["aaa111"]
         assert _launched_agent_ids(_launch("bbb222", as_list=False)) == ["bbb222"]
 
+    def test_a_bash_output_that_mentions_the_launch_text_launches_nothing(self):
+        """#1089. RED: ``['a6cf3f7a95d208c56']`` — Claude ``sed``-ed this very file."""
+        shown = '"""The mirror counts background sub-agents…\n' + LAUNCH_TEXT + '\n"""'
+        for content in (shown, [{"type": "text", "text": shown}]):
+            event = {
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "content": content}]},
+            }
+            assert _launched_agent_ids(event) == []
+
     def test_an_ordinary_tool_result_launches_nothing(self):
         event = {
             "type": "user",
@@ -179,6 +189,7 @@ async def test_one_notification_for_two_agents_releases_both_live(tmp_path, monk
         await mirror.stop()
 
     assert seen == [2, 0]
+
 
 async def test_final_answer_counts_as_pending_until_it_is_posted(tmp_path):
     project = tmp_path / "proj"
