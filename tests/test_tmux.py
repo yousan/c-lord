@@ -345,6 +345,14 @@ class TestTmuxSessionManager:
                 return MagicMock(returncode=0, stdout=f"{entry[1]}\n")
             if "list-panes" in argv:
                 return MagicMock(returncode=0, stdout="zsh\n")
+            if "if-shell" in argv:
+                # #1085: compare-and-kill in one tmux command.
+                target = argv[argv.index("-t") + 1]
+                entry = windows.get(target)
+                if entry is not None and argv[-2] == f"#{{==:#{{@thread_id}},{entry[1]}}}":
+                    killed_targets.append(target)
+                    del windows[target]
+                return MagicMock(returncode=0, stdout="")
             if "kill-window" in argv:
                 killed_targets.append(argv[argv.index("-t") + 1])
                 return MagicMock(returncode=0, stdout="")
