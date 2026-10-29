@@ -368,11 +368,12 @@ def _is_slash_command_marker(text: str) -> bool:
 
 
 def local_command_record(event: dict[str, Any]) -> str | None:
-    """``"name"`` / ``"output"`` for a pane slash command's records, else ``None`` (#944).
+    """``"name"`` / ``"output"`` for a command typed in the pane, else ``None`` (#944).
 
     A local command (``/compact``, ``/config``, …) runs no model turn, so no
     ``turn_duration`` follows it: its ``<local-command-stdout>`` — written even
-    when empty — is the only sign it finished.
+    when empty — is the only sign it finished.  A ``!`` command (bash mode) is
+    the same: ``<bash-input>`` is its name, ``<bash-stdout>`` its end (#1013).
     """
     if event.get("type") != "user" or event.get("isMeta"):
         return None
@@ -381,6 +382,8 @@ def local_command_record(event: dict[str, Any]) -> str | None:
     if not isinstance(content, str):
         return None
     stripped = content.strip()
+    if _is_bash_mode_marker(stripped):
+        return "name" if stripped.startswith("<bash-input>") else "output"
     if not _is_slash_command_marker(stripped):
         return None
     return "output" if _LOCAL_STDOUT_RE.match(stripped) else "name"

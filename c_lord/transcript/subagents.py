@@ -172,7 +172,9 @@ def sent_messages(event: dict) -> list[tuple[str, str]]:
             continue
         if block.get("name") != "SendMessage":
             continue
-        inp = block.get("input") or {}
+        inp = block.get("input")
+        if not isinstance(inp, dict):
+            continue
         to = inp.get("to") or inp.get("recipient")
         text = inp.get("message") or inp.get("content")
         if isinstance(to, str) and isinstance(text, str) and text.strip():
