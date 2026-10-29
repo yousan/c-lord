@@ -3809,12 +3809,16 @@ class TmuxSessionManager:
         The reaper decides from one listing and then probes every pane, which
         takes a while at startup — long enough for ``/attach`` (``remap_window``)
         or ``create_session``'s adoption to hand that very window, an idle shell
-        tagged with an inactive thread, to a live thread. Killing by window id
+        tagged with an inactive thread, to *another* thread. Killing by window id
         (#1009) dropped the re-check ``kill_session`` used to make, so the window
         a user had just been told was attached vanished. tmux answers rc=1 both
         for "no such window" and "option unset", so both read as untagged.
+
+        A window handed back to the *same* thread keeps its tag and is not
+        caught here — that race predates #1009 (``kill_session`` checked the
+        same tag) and is not what this guards.
         """
-        result = _run(["tmux", "show-option", "-w", "-v", "-t", target, "@thread_id"])
+        result = _run(["tmux", "show-option", "-w", "-v", "-t", self._target(target), "@thread_id"])
         current = result.stdout.strip() if result.returncode == 0 else ""
         if current == listed:
             return True
