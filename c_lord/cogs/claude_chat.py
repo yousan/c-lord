@@ -30,6 +30,7 @@ from discord.ext import commands
 from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from .. import turn_events
+from ..api_error import advice
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
@@ -78,7 +79,7 @@ from ..gateway_backfill import (
     merge_missed_prompt,
     missed_notice,
 )
-from ..host_restart_notice import stopped_mid_turn
+from ..host_restart_notice import TurnEnding, recovered_turn_ending, stopped_mid_turn
 from ..log_sampler import LogSampler
 from ..model_scopes import TurnSettings, begin_turn_for, effort_for_launch
 from ..notify_policy import Kind, owner_notify_id
@@ -3023,10 +3024,48 @@ class ClaudeChatCog(commands.Cog):
                 log_ctx(thread_id=thread.id),
                 exc_info=True,
             )
+        # #978: how it ended decides the wording, as for a turn that ended in
+        # this process (#908/#631) — an API error or a plan limit is not "done".
+        try:
+            ending = await asyncio.to_thread(recovered_turn_ending, derive_project_dir(working_dir))
+        except Exception:
+            logger.warning(
+                "%s could not read how a restart-crossed turn ended (#978)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            ending = TurnEnding()
+        api_error = advice(ending.api_error) if ending.api_error is not None else None
+        requester = _requester_of_turn(message, None, self.bot)
+        # #978: and the turn-end event the dead run can no longer send (#917).
+        try:
+            turn_events.announce_recovered_turn(
+                thread,
+                turn_events.started_by_from_message(
+                    message,
+                    requester=requester,
+                    bot_is_author=_is_self(getattr(message, "author", None), self.bot),
+                ),
+                started_at=(
+                    message.created_at if isinstance(message.created_at, datetime) else None
+                ),
+                failure_reason=(
+                    "usage_limit"
+                    if ending.usage_limit is not None
+                    else "api_error"
+                    if api_error is not None
+                    else None
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "%s could not announce a restart-crossed turn's end (#978)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
         dashboard = self._get_dashboard()
         if dashboard is None:
             return
-        requester = _requester_of_turn(message, None, self.bot)
         await _safe_set_state(
             dashboard,
             thread.id,
@@ -3034,6 +3073,9 @@ class ClaudeChatCog(commands.Cog):
             (getattr(message, "content", "") or "")[:100].replace("\n", " "),
             thread=thread,
             notify_user_id=_notify_target(requester, self.bot, kind="completion"),
+            no_response=ending.usage_limit is not None,
+            usage_limit=ending.usage_limit,
+            api_error=api_error,
         )
 
     # ── #745: messages posted while the gateway was down ────────────────────

@@ -32,13 +32,16 @@ import json
 import logging
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import discord
 
+from .api_error import api_error_text
+from .claude.types import UsageLimit
 from .discord_failures import DISCORD_CALL_FAILURES
 from .transcript.formatter import is_harness_user_record
 from .transcript.resolver import ThreadSessionResolver, derive_project_dir
+from .usage_limit import extract_usage_limit, is_rate_limit_event
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -126,11 +129,12 @@ def _is_turn_end(event: object) -> bool:
     return kind == "result" or (kind == "system" and event.get("subtype") == "turn_duration")
 
 
-def _last_message(path: Path) -> dict[str, Any] | None:
+def _last_message(path: Path, *, through_turn_end: bool = False) -> dict[str, Any] | None:
     """The last conversation row in ``path``, reading from the end. Blocking.
 
     ``None`` also when a turn-end marker comes after it: that turn finished,
-    whatever its last message looks like.
+    whatever its last message looks like — unless *through_turn_end*, for a
+    caller that already knows the turn finished and asks how (#978).
     """
     try:
         with path.open("rb") as f:
@@ -149,13 +153,13 @@ def _last_message(path: Path) -> dict[str, Any] | None:
                 partial = lines.pop(0) if pos > 0 else b""
                 for raw in reversed(lines):
                     event = _parse(raw)
-                    if _is_turn_end(event):
+                    if _is_turn_end(event) and not through_turn_end:
                         return None
                     if _is_message(event):
                         return event
             if pos == 0 and partial:
                 event = _parse(partial)
-                if not _is_turn_end(event) and _is_message(event):
+                if (through_turn_end or not _is_turn_end(event)) and _is_message(event):
                     return event
     except OSError:
         return None
@@ -210,6 +214,54 @@ def transcript_stopped_mid_turn(path: Path) -> bool:
     text = _user_text(message.get("content"))
     # A tool_result, or a prompt Claude never answered: cut off mid-turn.
     return text is None or not text.lstrip().startswith(_INTERRUPTED_PREFIX)
+
+
+class TurnEnding(NamedTuple):
+    """How a finished turn ended, as its transcript says (#978).
+
+    Both ``None``: an ordinary end. ``api_error`` is the CLI's own error text,
+    ``usage_limit`` the plan limit it stopped on.
+    """
+
+    api_error: str | None = None
+    usage_limit: UsageLimit | None = None
+
+
+def transcript_turn_ending(path: Path) -> TurnEnding:
+    """How the last turn in ``path`` ended — read from its last message. Blocking.
+
+    Same reading as the live mirror (#908): only the latest reply counts, so an
+    error Claude answered past is not how the turn ended. Unreadable → an
+    ordinary end: "could not tell" must not become an error report.
+    """
+    event = _last_message(path, through_turn_end=True)
+    if event is None or event["type"] != "assistant":
+        return TurnEnding()
+    if is_rate_limit_event(event):
+        text = _assistant_text(event["message"].get("content"))
+        limit = extract_usage_limit(text) or UsageLimit(
+            scope="usage limit", resets_at=None, line=text.strip()[:200]
+        )
+        return TurnEnding(usage_limit=limit)
+    return TurnEnding(api_error=api_error_text(event))
+
+
+def _assistant_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    )
+
+
+def recovered_turn_ending(project_dir: Path) -> TurnEnding:
+    """:func:`transcript_turn_ending` on the transcript this thread owns. Blocking."""
+    jsonl = ThreadSessionResolver(project_dir).resolve()
+    return transcript_turn_ending(jsonl) if jsonl is not None else TurnEnding()
 
 
 def stopped_mid_turn(project_dir: Path) -> bool:
