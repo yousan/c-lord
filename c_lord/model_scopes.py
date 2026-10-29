@@ -319,11 +319,18 @@ class ModelScopeService:
 
     # ── the turn ────────────────────────────────────────────────────────────
 
-    async def begin_turn(self, thread_id: int, channel_id: int | None) -> TurnSettings:
+    async def begin_turn(
+        self, thread_id: int, channel_id: int | None, *, keep_running: bool = False
+    ) -> TurnSettings:
         """Fix the model/effort pair for the turn that is starting — once, atomically.
 
         Creates the session's row on the first turn (saving effective values and
         origin), and records the pair as the one the process is launched with.
+
+        ``keep_running`` (#976): another run is still using the thread's Claude,
+        so it must not be restarted. A changed pair then waits — the turn gets
+        the pair the process already carries, and ``applied`` is left alone so
+        the first turn with nothing in flight still sees the change and restarts.
         """
         async with self._tx() as db:
             cur = await db.execute(
@@ -358,6 +365,10 @@ class ModelScopeService:
                 if row["applied_model"] is not None
                 else None
             )
+            if keep_running and previous is not None and previous != (row["model"], row["effort"]):
+                return TurnSettings(
+                    previous[0], previous[1], row["model_src"], row["effort_src"], previous
+                )
             await db.execute(
                 "UPDATE session_model_settings SET applied_model = ?, applied_effort = ?, "
                 "channel_id = COALESCE(?, channel_id), updated_at = datetime('now','localtime') "
@@ -853,8 +864,12 @@ async def begin_turn_for(
     runner: object | None,
     thread_id: int,
     channel_id: int | None,
+    *,
+    keep_running: bool = False,
 ) -> TurnSettings | None:
     """Fix a turn's pair, or ``None`` when the settings cannot be read (#918).
+
+    ``keep_running``: see :meth:`ModelScopeService.begin_turn` (#976).
 
     ``None`` means "launch with the instance defaults" (``runner.model`` /
     ``runner.effort``) — a settings hiccup must never be the reason a turn does
@@ -864,7 +879,7 @@ async def begin_turn_for(
     if svc is None:
         return None
     try:
-        return await svc.begin_turn(thread_id, channel_id)
+        return await svc.begin_turn(thread_id, channel_id, keep_running=keep_running)
     except Exception:
         logger.warning(
             "model scopes: could not fix the model/effort for thread=%s — using instance defaults",
