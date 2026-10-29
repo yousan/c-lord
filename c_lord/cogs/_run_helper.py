@@ -439,6 +439,9 @@ class _InFlightRun:
 
     task: asyncio.Task | None
     started: float
+    #: the run's runner, so a workspace stop can withdraw it whatever entry
+    #: point started the run (#1010).
+    runner: object | None = None
 
 
 # #293: every run that has logged ``enter`` and not yet ``exit``, per thread.
@@ -460,6 +463,33 @@ def has_other_run_in_flight(thread_id: int) -> bool:
         run.task is not current and not (run.task is not None and run.task.done())
         for run in _IN_FLIGHT.get(thread_id, ())
     )
+
+
+def in_flight_tasks(thread_id: int) -> list[asyncio.Task]:
+    """The tasks of the runs still going for *thread_id*, whoever started them (#1010)."""
+    tasks: list[asyncio.Task] = []
+    for run in _IN_FLIGHT.get(thread_id, ()):
+        if run.task is not None and not run.task.done() and run.task not in tasks:
+            tasks.append(run.task)
+    return tasks
+
+
+def withdraw_in_flight(thread_id: int) -> bool:
+    """Withdraw the runner of every run in flight for *thread_id* (#1010).
+
+    A workspace stop used to reach only the runs ``ClaudeChatCog`` started; a
+    ``/skill`` run is in no table of its own, but every run is in this ledger.
+    Returns whether there was one.
+    """
+    withdrew = False
+    for run in _IN_FLIGHT.get(thread_id, ()):
+        if run.task is not None and run.task.done():
+            continue
+        withdraw = getattr(run.runner, "withdraw", None)
+        if withdraw is not None:
+            withdraw(silent=False)
+            withdrew = True
+    return withdrew
 
 
 def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
@@ -515,7 +545,7 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
     ctx = log_ctx(thread_id=thread_id, session_id=config.session_id)
     logger.info("%s run_claude: enter (prompt=%d chars)", ctx, len(config.prompt))
 
-    run = _InFlightRun(task=asyncio.current_task(), started=time.monotonic())
+    run = _InFlightRun(task=asyncio.current_task(), started=time.monotonic(), runner=config.runner)
     _note_orphans(thread_id, run, ctx)
     _IN_FLIGHT.setdefault(thread_id, []).append(run)
 
