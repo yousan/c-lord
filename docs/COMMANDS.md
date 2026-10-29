@@ -584,6 +584,10 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
   }'
 ```
 
+`interval_seconds` and `channel_id` must be integers — anything else is a `400` naming the field.
+`409` means only that a task with that `name` already exists. Every endpoint that reads a body
+answers `400 {"error": "Body must be a JSON object"}` to valid JSON that is not an object (#1037).
+
 `run_immediately`（`POST`）と `enabled`（`PATCH /api/tasks/{id}`）は JSON の `true` / `false` だけを受け付ける。
 `"false"` や `0` を送ると `400 {"error": "enabled must be true or false"}` が返り、何も変わらない
 （以前は文字列の `"false"` で有効になっていた — #1038）。

@@ -110,6 +110,23 @@ class TestEnabledMustBeABoolean:
         task = next(t for t in await task_repo.get_all() if t["id"] == task_id)
         assert task["prompt"] == "p"
 
+    @pytest.mark.asyncio
+    async def test_a_bad_interval_does_not_half_apply_enabled(
+        self, task_client: TestClient, repos
+    ) -> None:
+        """#1037 の interval_seconds の 400 でも、同じ本文の enabled を先に書き込まない。"""
+        _, task_repo = repos
+        task_id = (await (await _create(task_client)).json())["id"]
+        await task_client.patch(f"/api/tasks/{task_id}", json={"enabled": False})
+
+        resp = await task_client.patch(
+            f"/api/tasks/{task_id}", json={"enabled": True, "interval_seconds": "soon"}
+        )
+
+        assert resp.status == 400
+        task = next(t for t in await task_repo.get_all() if t["id"] == task_id)
+        assert not task["enabled"]
+
 
 class TestRunImmediatelyMustBeABoolean:
     @pytest.mark.asyncio

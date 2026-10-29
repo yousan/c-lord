@@ -36,8 +36,8 @@ back. Announcing ``completion`` at the first end would tell the requester "done"
 minutes before the answer exists. The transcript mirror counts the agents
 launched and not yet reported (:func:`note_turn_end`); when the turn that just
 ended left some running, the ``completion`` is held until a later turn end finds
-none. Limits: the count comes from the transcript, so a bot restart forgets it
-(the completion then goes out at the first turn end), a turn-end marker the
+none. Limits: the count comes from the transcript, so a bot restart re-reads it
+(the restored mirror reads the transcript back — #1012), a turn-end marker the
 transcript does not carry (older Claude Code builds) cannot be read at all (the
 completion goes out at once), and only agents are counted, not background shell
 commands. An agent that never reports back cannot hold the event forever:
@@ -369,7 +369,8 @@ def announce_recovered_turn(
     ``reason: "restart_crossed"``. *started_at* is when the turn's trigger was
     posted — the old process's own record of the start is gone. Any reply this
     process has posted in the thread is the turn's (the catch-up included), so
-    ``last_message_id`` is the latest of them.
+    ``last_message_id`` is the latest of them. Background agents still out hold
+    the ``completion`` as for any turn (#917/#1012).
     """
     if not enabled():
         return
@@ -379,6 +380,14 @@ def announce_recovered_turn(
         info.started_at = _as_utc(started_at)
     if failure_reason is not None:
         _spawn(_deliver("failure", info, reason=failure_reason))
+        return
+    # #1012: as for any turn end (#917), not while background agents are out.
+    # The mirror read back the ones launched before the restart.
+    from .transcript.mirror import background_agents_running
+
+    outstanding = background_agents_running(thread.id)
+    if outstanding > 0:
+        _hold(info, outstanding, reason="restart_crossed")
     else:
         _spawn(_deliver("completion", info, reason="restart_crossed"))
 
