@@ -368,6 +368,10 @@ class ResidentCapLoop:
         # says so once, not 120 times — see :meth:`_emergency_brake` (#742 AC5).
         self._episode = 0
         self._quiet = LogSampler()
+        # Threads Discord says do not exist (or we may not see). Their tmux window
+        # can outlive them, and leaving them at the head of the LRU order is what
+        # kept the cap at limit+1 forever (#1033, the #593 shape).
+        self._unresolvable: set[int] = set()
         self._task: object | None = None
 
     @property
@@ -460,16 +464,41 @@ class ResidentCapLoop:
     async def _running_on_host(self, candidates: set[int]) -> set[int]:
         """Of *candidates*, whose pane is mid-turn — the restart-proof half.
 
+        **A pane that cannot be read counts as running** (#1034). Right after a
+        restart the in-memory ledger is empty, so the pane is the only guard
+        left; reading "could not tell" as "idle" handed the oldest running turn
+        to the eviction — #742 by another road. Erring this way costs one tick
+        of staying over the cap; erring the other way costs someone's turn.
+
         Off the event loop: a ``capture-pane`` per candidate is ~10 ms and the
         brake may be holding thirty of them.
         """
         if not candidates:
             return set()
-        from .tmux import running_thread_ids
+        from .tmux import pane_turn_states
 
-        with contextlib.suppress(Exception):
-            return await asyncio.to_thread(running_thread_ids, candidates)
-        return set()
+        try:
+            states = await asyncio.to_thread(pane_turn_states, candidates)
+        except Exception as exc:
+            running: set[int] = set()
+            unreadable = set(candidates)
+            cause = f"{type(exc).__name__}: {exc}"
+        else:
+            running = set(states.running)
+            unreadable = set(states.unreadable)
+            cause = "capture failed"
+        if unreadable:
+            quiet = self._quiet.sample("pane-unreadable")
+            if quiet.emit:
+                logger.info(
+                    "resident-cap: %d pane(s) could not be read (%s) — treating them "
+                    "as running this tick: %s%s",
+                    len(unreadable),
+                    cause,
+                    sorted(unreadable),
+                    quiet.suffix,
+                )
+        return running | unreadable
 
     def _memory(self) -> tuple[int, int]:
         with contextlib.suppress(Exception):
@@ -616,12 +645,22 @@ class ResidentCapLoop:
         if len(resident) <= self._limit:
             return 0
 
-        victims = select_lru_victims(
-            records,
-            resident=resident,
-            target=self._limit,
-            in_flight=await self._turns_in_flight(resident),
-        )
+        over = len(resident) - self._limit
+        # The whole LRU order, not just the oldest *over*: a candidate that
+        # cannot be slept (its thread is gone from Discord, a sleep that failed)
+        # is made up for by the next one, so one tick gets back under the limit
+        # (#1033 — slicing first let one dead thread hold the cap at limit+1
+        # forever, the #593 shape).
+        victims = [
+            tid
+            for tid in select_lru_victims(
+                records,
+                resident=resident,
+                target=0,
+                in_flight=await self._turns_in_flight(resident),
+            )
+            if tid not in self._unresolvable
+        ]
         if not victims:
             # Say so: "over the cap and doing nothing" must not look like "fine".
             # Sampled, because a fleet that is entirely busy stays over the cap
@@ -642,7 +681,7 @@ class ResidentCapLoop:
             "resident-cap: %d resident > limit %d — sleeping %d longest-idle workspace(s)",
             len(resident),
             self._limit,
-            len(victims),
+            over,
         )
 
         from .workspace_notice import WorkspaceReason
@@ -650,10 +689,22 @@ class ResidentCapLoop:
         label = f"{self._limit}本"
         slept = 0
         for thread_id in victims:
+            if slept >= over:
+                break
             if await self._sleep_one(thread_id, WorkspaceReason.CAP, label):
                 slept += 1
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
+        if slept < over:
+            short = self._quiet.sample("cap-short")
+            if short.emit:
+                logger.info(
+                    "resident-cap: still %d over limit %d — the rest are running or "
+                    "could not be slept%s",
+                    over - slept,
+                    self._limit,
+                    short.suffix,
+                )
         return slept
 
     async def _sleep_one(self, thread_id: int, reason: object, label: str | None) -> bool:
@@ -684,9 +735,14 @@ class ResidentCapLoop:
         channel = self._bot.get_channel(thread_id)  # type: ignore[attr-defined]
         if channel is not None:
             return channel
+        if thread_id in self._unresolvable:
+            return None
         try:
             return await self._bot.fetch_channel(thread_id)  # type: ignore[attr-defined]
         except (discord.NotFound, discord.Forbidden):
+            # Remembered for the life of the process, so it neither blocks the
+            # LRU order nor costs an API call every tick (#1033, as #593).
+            self._unresolvable.add(thread_id)
             logger.info("resident-cap: thread=%d is not reachable — skipping", thread_id)
             return None
         except Exception as exc:
