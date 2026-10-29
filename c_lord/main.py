@@ -199,26 +199,30 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         logger.error("DISCORD_CHANNEL_ID is required")
         sys.exit(1)
 
-    # Issue #323: optional identity guard. A garbage value must fail loudly —
-    # a guard that silently disables itself is worse than no guard.
+    # Every Discord ID is "ASCII digits only" (#1084). ``isdigit()`` alone is
+    # True for ``²`` and full-width digits, and the channel id was only checked
+    # for being non-empty — so ``int()`` further down raised ValueError and the
+    # user got a traceback that named no setting. A garbage value must fail
+    # loudly (#323), with the value and how to fix it (#451).
     expected_bot_user_id = os.getenv("EXPECTED_BOT_USER_ID", "")
-    if expected_bot_user_id and not expected_bot_user_id.isdigit():
-        logger.error(
-            "EXPECTED_BOT_USER_ID must be a numeric Discord user id, got: %r",
-            expected_bot_user_id,
-        )
-        sys.exit(1)
-
-    # Issue #451: DISCORD_OWNER_ID must be a numeric Discord snowflake.
-    # Fail loudly so users don't enter their username by mistake.
     owner_id_raw = os.getenv("DISCORD_OWNER_ID", "")
-    if owner_id_raw and not owner_id_raw.isdigit():
-        logger.error(
-            "DISCORD_OWNER_ID must be a numeric Discord user ID (snowflake), got %r."
-            " Enable Developer Mode in Discord, then right-click your username → Copy User ID.",
-            owner_id_raw,
-        )
-        sys.exit(1)
+    coordination_raw = os.getenv("COORDINATION_CHANNEL_ID", "")
+    for key, value, what in (
+        ("DISCORD_CHANNEL_ID", channel_id, "channel ID"),
+        ("DISCORD_OWNER_ID", owner_id_raw, "user ID (snowflake)"),
+        ("COORDINATION_CHANNEL_ID", coordination_raw, "channel ID"),
+        ("EXPECTED_BOT_USER_ID", expected_bot_user_id, "user id"),
+    ):
+        if value and not (value.isascii() and value.isdigit()):
+            logger.error(
+                "%s must be a numeric Discord %s, got %r."
+                " Enable Developer Mode in Discord, then right-click it → Copy ID"
+                " (the number, not a name or a link).",
+                key,
+                what,
+                value,
+            )
+            sys.exit(1)
 
     return {
         "token": token,
@@ -235,7 +239,7 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "max_concurrent": os.getenv("MAX_CONCURRENT_SESSIONS", "3"),
         "timeout": os.getenv("SESSION_TIMEOUT_SECONDS", "300"),
         "owner_id": owner_id_raw,
-        "coordination_channel_id": os.getenv("COORDINATION_CHANNEL_ID", ""),
+        "coordination_channel_id": coordination_raw,
     }
 
 
