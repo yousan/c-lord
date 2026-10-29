@@ -1173,26 +1173,35 @@ class TranscriptMirror:
                 # TimeoutError on Python 3.10 (merged only in 3.11); the project
                 # supports 3.10, so the aliased form is required for correctness.
                 except asyncio.TimeoutError:  # noqa: UP041
-                    # #539: the idle window is also the progress line's heartbeat.
-                    # It is finer than the line's refresh interval, so no separate
-                    # timer task (with a lifetime to keep in sync) is needed.
-                    await self._progress.tick()
-                    # #747: a loop that stalled still shows its latest count.
-                    await self._fold.flush()
-                    # Idle: no new JSONL event within the window. Flush any held
-                    # final answer as a pinging reply — independent of whether a
-                    # ``result`` / ``turn_duration`` marker was ever written.
-                    if self._verbosity == "minimal" and _pending_text is not None:
-                        logger.info(
-                            "TranscriptMirror idle-flush: thread=%d "
-                            "(final answer with no turn-end marker within %.1fs)",
+                    # #1067: the idle branch is outside the per-row try below, and
+                    # a failure here (a full /tmp for progress.txt) ended the loop
+                    # just the same — every later reply of the thread was lost.
+                    try:
+                        # #539: the idle window is also the progress line's heartbeat.
+                        # It is finer than the line's refresh interval, so no separate
+                        # timer task (with a lifetime to keep in sync) is needed.
+                        await self._progress.tick()
+                        # #747: a loop that stalled still shows its latest count.
+                        await self._fold.flush()
+                        # Idle: no new JSONL event within the window. Flush any held
+                        # final answer as a pinging reply — independent of whether a
+                        # ``result`` / ``turn_duration`` marker was ever written.
+                        if self._verbosity == "minimal" and _pending_text is not None:
+                            logger.info(
+                                "TranscriptMirror idle-flush: thread=%d "
+                                "(final answer with no turn-end marker within %.1fs)",
+                                self.thread_id,
+                                idle_timeout,
+                            )
+                            await _flush_pending_as_reply()
+                            # Record delivery (Issue #215) so a restart does not
+                            # re-post this idle-flushed final answer.
+                            await _commit_cursor()
+                    except Exception:
+                        logger.exception(
+                            "TranscriptMirror: idle flush failed — mirror goes on thread=%d",
                             self.thread_id,
-                            idle_timeout,
                         )
-                        await _flush_pending_as_reply()
-                        # Record delivery (Issue #215) so a restart does not
-                        # re-post this idle-flushed final answer.
-                        await _commit_cursor()
                     continue
 
                 # #1041: one row this loop cannot handle must not end it — the mirror is
