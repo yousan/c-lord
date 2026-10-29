@@ -278,6 +278,20 @@ def _start_offset(state: _FollowState, path: Path) -> int:
     return 0
 
 
+def _drop_current(state: _FollowState) -> None:
+    """Let go of the current file after a failed read, keeping our place in it.
+
+    The next poll re-resolves and, for the same file, resumes from the banked
+    offset. Without banking it (#987), re-adoption fell back to the offset the
+    tail *started* with and re-read everything since — uuid events are deduped,
+    but the uuid-less ones (whose tool blocks wake the progress line, #906)
+    came out twice.
+    """
+    if state.current_path is not None:
+        state.offsets[state.current_path] = state.offset
+    state.current_path = None
+
+
 def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     """One follow-loop cycle: resolve, stat, read, parse.  Returns new events.
 
@@ -305,7 +319,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     try:
         stat = active.stat()
     except FileNotFoundError:
-        state.current_path = None
+        _drop_current(state)
         return []
     size = stat.st_size
     mtime = stat.st_mtime
@@ -338,7 +352,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             chunk = f.read(_READ_CHUNK_BYTES)
             state.offset = f.tell()
     except OSError:
-        state.current_path = None
+        _drop_current(state)
         return []
 
     state.more_to_read = state.offset < size
