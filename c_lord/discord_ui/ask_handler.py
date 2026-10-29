@@ -813,7 +813,27 @@ async def _close_interrupted(
             embed=None,
             view=None,
         )
+    # Esc only a menu that is still there (#1076). A slash command (/compact,
+    # /clear) pre-empts the turn too, and by the time this runs it has been
+    # typed: an Esc then lands on the command, not on the menu. Unknown (the
+    # capture failed) still gets the Esc — leaving a menu open is the worse miss.
+    if await _menu_known_gone(runner):
+        return
     await runner.cancel_menu()
+
+
+async def _menu_known_gone(runner: object) -> bool:
+    """True only when a pane capture succeeded and showed no menu (#1076)."""
+    peek = getattr(runner, "peek_menu_state", None)
+    if peek is None:
+        return False
+    try:
+        state = peek()
+        menu, capture_ok = await state if inspect.isawaitable(state) else state
+    except Exception:
+        logger.debug("could not read the pane before Esc — sending it anyway", exc_info=True)
+        return False
+    return capture_ok is True and menu is None
 
 
 async def _bridge_claimed_menu(

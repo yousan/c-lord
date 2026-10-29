@@ -153,13 +153,21 @@ def task_notifications(event: dict) -> list[tuple[str, str]]:
     return [(task.group(1), status.group(1) if status else "completed")]
 
 
+#: ``toolUseResult.status`` values that end a foreground run. A receipt that
+#: something *started* — ``async_launched``, a teammate's ``teammate_spawned``
+#: (#1077) — is not one, and neither is a status the CLI adds later: an unknown
+#: run is closed by its notice or its rows going quiet instead.
+_FOREGROUND_END_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "error"})
+
+
 def foreground_results(event: dict) -> list[tuple[str, str]]:
     """``(agent id, status)`` of a foreground ``Agent`` call that returned in *event*.
 
     A foreground call gets no ``<task-notification>`` (CLI 2.1.312, #1027): the
     run ends with the parent's ``tool_result`` for that call, whose
     ``toolUseResult`` names the agent. A background launch has a
-    ``toolUseResult`` too — ``status: async_launched`` — and is not an end.
+    ``toolUseResult`` too — ``status: async_launched`` — and is not an end; nor
+    is a teammate's ``teammate_spawned`` (#1077).
     """
     if event.get("type") != "user" or event.get("isSidechain"):
         return []
@@ -168,9 +176,7 @@ def foreground_results(event: dict) -> list[tuple[str, str]]:
         return []
     agent_id = result.get("agentId")
     status = result.get("status")
-    if not isinstance(agent_id, str) or not isinstance(status, str):
-        return []
-    if status == "async_launched":
+    if not isinstance(agent_id, str) or status not in _FOREGROUND_END_STATUSES:
         return []
     return [(agent_id, status)]
 
@@ -224,7 +230,11 @@ def _assistant_text(event: dict) -> str:
     content = _content(event)
     if event.get("type") != "assistant" or not isinstance(content, list):
         return ""
-    parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+    parts = [
+        b["text"]
+        for b in content
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+    ]
     return "\n".join(p for p in parts if p.strip()).strip()
 
 
@@ -367,6 +377,11 @@ class StatusFile:
     filename: str
 
 
+#: Pass as ``file`` to :meth:`SubagentPoster.edit_status` to change the text and
+#: leave the line's attachment as it is (#1078). ``None`` removes it.
+KEEP_ATTACHMENT = StatusFile(path="", filename="")
+
+
 class SubagentPoster(Protocol):
     """Discord side of the log; :class:`TranscriptMirrorCog` supplies the real one.
 
@@ -484,8 +499,10 @@ class SubagentLog:
                 continue
             text = f"-# 🤖 {entry.get('label', 'サブエージェント')}{entry.get('word', '開始')}"
             await self._safe(
+                # The progress file is the only record of the run before the
+                # restart, so it stays (#1078).
                 self._poster.edit_status(
-                    handle, f"{text}（記録が途切れました — c-lord の再起動など）", None
+                    handle, f"{text}（記録が途切れました — c-lord の再起動など）", KEEP_ATTACHMENT
                 )
             )
         logger.info("%s SubagentLog: closed %d run(s) left open", self._ctx, len(left))
