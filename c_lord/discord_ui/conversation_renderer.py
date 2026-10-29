@@ -489,6 +489,8 @@ _EMOJI_RANGES: tuple[tuple[int, int], ...] = (
     (0x1F000, 0x1FAFF),  # mahjong … symbols & pictographs ext-A, regional indicators
     (0x2600, 0x27BF),  # misc symbols + dingbats (☀ ✅ ❤ ✓)
     (0x2B00, 0x2BFF),  # misc symbols and arrows (⭐ ⬛ ⭕)
+    (0x2194, 0x2199),  # ↔ ↕ ↖ … — emoji-capable arrows the body face lacks
+    (0x21A9, 0x21AA),  # ↩ ↪
     (0x231A, 0x231B),  # ⌚ ⌛
     (0x2328, 0x2328),  # ⌨
     (0x23CF, 0x23CF),  # ⏏

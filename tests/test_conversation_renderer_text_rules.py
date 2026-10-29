@@ -50,6 +50,7 @@ class TestEmojiDetectionIsEmojiOnly:
             "❤️",  # U+2764 + VS16
             "☀",  # U+2600
             "🇯🇵",  # regional indicators
+            "↪ 引用返信",  # U+21AA — 本文フォントに無く豆腐になる（実測）
         ],
     )
     def test_emoji_is_still_emoji(self, text: str) -> None:
