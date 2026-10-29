@@ -31,6 +31,7 @@ from ..model_scopes import begin_turn_for, effort_for_launch
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
+from ..voice_webhooks import is_voice_message
 
 if TYPE_CHECKING:
     from ..claude.config import ClaudeConfig
@@ -98,8 +99,8 @@ class WebhookTriggerCog(commands.Cog):
 
     def _match(self, message: discord.Message) -> tuple[str, WebhookTrigger] | None:
         """The trigger *message* fires, or ``None`` when it is not one of ours."""
-        if not message.webhook_id:
-            return None
+        if not message.webhook_id or is_voice_message(message):
+            return None  # #971: c-lord speaking for a sub-agent triggers nothing
 
         if (
             self.allowed_webhook_ids is not None

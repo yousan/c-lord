@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING, Any
 
 import discord
 
+from .voice_webhooks import is_voice_message
+
 if TYPE_CHECKING:
     from .discord_ui.authorization import Authorizer
 
@@ -81,7 +83,9 @@ def is_message_authorized(
     directly.
     """
     if message.webhook_id:
-        return True
+        # #971: except c-lord's own voice for a sub-agent — obeying it would
+        # hand every message an agent said back to the parent as an order.
+        return not is_voice_message(message)
     if message.author.bot:
         return message.author.id in _trusted_bot_ids()
     return is_allowed(message.author)
