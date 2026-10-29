@@ -56,14 +56,15 @@ def _stamp(path: Path) -> tuple[int, int] | None:
     return (st.st_mtime_ns, st.st_size)
 
 
-def _read_file(path: Path) -> set[int]:
+def _read_file(path: Path) -> set[int] | None:
+    """The ids in *path*; ``None`` when it could not be read (not the same as empty)."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return set()
     except (OSError, ValueError):
         logger.warning("voice webhooks: could not read %s", path, exc_info=True)
-        return set()
+        return None
     if not isinstance(raw, list):
         return set()
     return {int(x) for x in raw if isinstance(x, int | str) and str(x).isdigit()}
@@ -84,7 +85,13 @@ def _load(*, refresh: bool = False) -> set[int]:
         path = registry_path()
         stamp = _stamp(path)
         if stamp is not None and stamp != _seen_stamp:
-            _ids |= _read_file(path)
+            read = _read_file(path)
+            if read is None:
+                # Not read, so not seen (#1075): remembering the stamp would skip
+                # the file until it changes, and another instance's voice would
+                # pass as an order until then.
+                return _ids
+            _ids |= read
         _seen_stamp = stamp
     return _ids
 
@@ -118,7 +125,7 @@ def register(webhook_id: int) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with _file_lock(path):
-                on_disk = _read_file(path)
+                on_disk = _read_file(path) or set()
                 ids |= on_disk
                 if webhook_id in on_disk:
                     _seen_stamp = _stamp(path)

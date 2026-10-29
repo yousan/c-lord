@@ -117,8 +117,11 @@ def _tool_result_body(block: dict[str, Any]) -> str:
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
+        # ``text`` can be null (#1079): skipping it, not failing the row.
         text = "".join(
-            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+            b["text"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
         )
     if text.lstrip().startswith(_AGENT_RECEIPT_PREFIXES):
         return AGENT_RECEIPT_BODY

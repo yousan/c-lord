@@ -66,7 +66,7 @@ class FakePoster:
 
 
 def _read(file) -> str | None:
-    if file is None:
+    if file is None or not file.path:  # KEEP_ATTACHMENT (#1078)
         return None
     return Path(file.path).read_text(encoding="utf-8")
 

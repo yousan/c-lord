@@ -24,7 +24,7 @@ from typing import Any
 
 import discord
 
-from ..transcript.subagents import StatusFile
+from ..transcript.subagents import KEEP_ATTACHMENT, StatusFile
 from ..utils.logger import log_ctx
 from ..voice_webhooks import VOICE_WEBHOOK_NAME, register
 
@@ -142,12 +142,16 @@ class DiscordSubagentPoster:
         return get(message_id) if get is not None else None
 
     async def edit_status(self, handle: object, text: str, file: StatusFile | None) -> None:
-        attachments = [] if file is None else [discord.File(file.path, filename=file.filename)]
+        kwargs: dict[str, Any] = {"content": text, "allowed_mentions": _NO_MENTIONS}
+        if file is not KEEP_ATTACHMENT:  # #1078: no ``attachments`` keeps the current one
+            kwargs["attachments"] = (
+                [] if file is None else [discord.File(file.path, filename=file.filename)]
+            )
         edit = getattr(handle, "edit", None)
         if edit is None:
             return
         with contextlib.suppress(discord.NotFound):  # someone deleted the line
-            await edit(content=text, attachments=attachments, allowed_mentions=_NO_MENTIONS)
+            await edit(**kwargs)
 
     async def post_voice(self, speaker: str, text: str) -> None:
         channel = await self._resolve(self._thread_id)

@@ -311,3 +311,33 @@ async def test_a_foreground_agent_gets_one_start_and_one_end(tmp_path: Path) -> 
     assert texts[0] == "-# 🤖 サブエージェント「fg probe explicit」開始"
     assert sum("終了" in t for t in texts) == 1, texts
     assert not any("記録が止まりました" in t for t in texts)
+
+
+# --- #1078: closing a crossed run keeps its progress attachment --------------
+
+
+async def test_closing_a_crossed_run_keeps_its_progress_attachment(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from c_lord.discord_ui.subagent_poster import DiscordSubagentPoster
+
+    project, _ = _project(tmp_path, SESSION)
+    (project / subagents_mod.OPEN_RUNS_FILE).write_text(
+        '{"x": {"message_id": 1001, "label": "サブエージェント「b」", "word": "開始"}}'
+    )
+    message = MagicMock()
+    message.edit = AsyncMock()
+    channel = MagicMock()
+    channel.get_partial_message = MagicMock(return_value=message)
+
+    async def resolve(_tid):
+        return channel
+
+    poster = DiscordSubagentPoster(
+        bot=MagicMock(), thread_id=1, resolve_channel=resolve, send_chunks=MagicMock()
+    )
+    log = SubagentLog(thread_id=1, project_dir=project, poster=poster)
+    await log.prime()
+    kwargs = message.edit.await_args.kwargs
+    assert "途切れ" in kwargs["content"]
+    assert "attachments" not in kwargs, kwargs
