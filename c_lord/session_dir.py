@@ -423,6 +423,41 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
     )
 
 
+#: How many changed paths a "keeping" log line names before it abbreviates.
+_MAX_LOGGED_CHANGES = 5
+
+
+def describe_changes(status: WorktreeStatus) -> str:
+    """Why a directory is being kept, for the INFO line (#749, #903).
+
+    Names the entries, because "uncommitted work" alone read as 80 dirs of user
+    work when 60 of them held nothing but c-lord's own SKILL.md. Ignored files
+    show as ``!! name``; commits on no remote branch as a count.
+    """
+    if not status.is_repo:
+        return "not a git repo (cannot tell work from leftovers)"
+    reasons: list[str] = []
+    if status.unpushed_commits is None:
+        reasons.append("unpushed commits unknown (git rev-list failed)")
+    elif status.unpushed_commits:
+        reason = f"{status.unpushed_commits} unpushed commit(s) on no remote branch"
+        if status.remote_unchecked:
+            reason += " (ls-remote failed; pushed branches could not be checked)"
+        reasons.append(reason)
+    if status.user_changes:
+        shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
+        more = len(status.user_changes) - _MAX_LOGGED_CHANGES
+        if more > 0:
+            shown += f" (+{more} more)"
+        reasons.append(f"uncommitted user work: {shown}")
+    return "; ".join(reasons)
+
+
+def kept_reason(path: str) -> str:
+    """:func:`describe_changes` for the checkout at *path*. Blocking (#1016)."""
+    return describe_changes(worktree_status(path))
+
+
 def _is_clean(path: str) -> bool:
     """Return True if the directory has no uncommitted changes of the user's.
 
@@ -479,6 +514,8 @@ class CleanupResult:
     thread_id: int | None
     removed: bool
     reason: str
+    #: kept because it holds work (#903) — *reason* says which (#1016).
+    kept_work: bool = False
 
 
 class SessionDirManager:
@@ -697,16 +734,12 @@ class SessionDirManager:
     def _try_remove(self, path: str, thread_id: int | None) -> CleanupResult:
         """Check cleanliness and remove the directory if safe."""
         if not _is_clean(path):
-            logger.warning(
-                "Skipping session dir removal (dirty): %s (thread_id=%s)",
-                path,
-                thread_id,
-            )
+            # #1016: say what the work is — an unpushed commit or a ``.env``
+            # shows nothing in ``git status``, so "uncommitted changes" misled.
+            why = kept_reason(path)
+            logger.info("Keeping session dir %s (thread_id=%s) — %s (#1016)", path, thread_id, why)
             return CleanupResult(
-                path=path,
-                thread_id=thread_id,
-                removed=False,
-                reason="session directory has uncommitted changes — skipped to prevent data loss",
+                path=path, thread_id=thread_id, removed=False, reason=why, kept_work=True
             )
 
         try:

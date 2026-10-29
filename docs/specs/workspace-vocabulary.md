@@ -231,6 +231,12 @@ session cleanup: keeping /…/1559120173389062204 — uncommitted user work: !! 
 この判定は `worktree_status()`（`c_lord/session_dir.py`）にあり、**30日スイープ・孤児スイープ（#613）・
 `/workspace-cleanup`（dry を含む）のすべてが同じものを使う**。
 
+**`/workspace-cleanup` も残した理由を同じ言い方で出す**（#1016）。Discord の「⚠️ Dirty — not removed」欄の
+各行は `` `<パス>` — 2 unpushed commit(s) on no remote branch `` / `` `<パス>` — uncommitted user work: !! .env `` の形で、
+dry run の「Would skip」欄も同じ理由を出す。ログは INFO 1 行
+（`Keeping session dir <パス> (thread_id=…) — <理由> (#1016)`）。以前は一律
+「session directory has uncommitted changes」で、`git status` に何も出ないフォルダの理由が分からなかった。
+
 #### そもそも git に見せない（#779）
 
 上の判定は「見えてしまったものを数えない」側。**#779 以降は、注入した SKILL.md が git に

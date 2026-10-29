@@ -46,7 +46,7 @@ from ..session_close import (
     is_closed,
     reopen_rename_notice,
 )
-from ..session_dir import SessionDirInfo, SessionDirManager
+from ..session_dir import SessionDirInfo, SessionDirManager, kept_reason
 from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
 from ..status_view import StatusRow, classify_status, render_status, render_thread_status
 from ..thread_owner import foreign_owner_notice_for
@@ -1188,7 +1188,8 @@ class SessionManageCog(commands.Cog):
                 if d.is_clean:
                     candidates.append(d)
                 else:
-                    skipped.append((d, "dirty"))
+                    # #1016: the same reason the real run would give.
+                    skipped.append((d, await asyncio.to_thread(kept_reason, d.path)))
 
             embed = discord.Embed(
                 title="📁 ワークスペースの作業ディレクトリ回収 — Dry Run",
@@ -1218,13 +1219,11 @@ class SessionManageCog(commands.Cog):
             all_results.extend(results)
 
         removed = [r for r in all_results if r.removed]
-        dirty = [r for r in all_results if not r.removed and "uncommitted changes" in r.reason]
+        dirty = [r for r in all_results if r.kept_work]
         other_skipped = [
             r
             for r in all_results
-            if not r.removed
-            and "uncommitted changes" not in r.reason
-            and r.reason != "session is still active"
+            if not r.removed and not r.kept_work and r.reason != "session is still active"
         ]
 
         color = COLOR_SUCCESS if removed else COLOR_INFO
@@ -1243,7 +1242,7 @@ class SessionManageCog(commands.Cog):
         if dirty:
             embed.add_field(
                 name=f"⚠️ Dirty — not removed ({len(dirty)})",
-                value=_fit_field_lines([f"`{r.path}`" for r in dirty]),
+                value=_fit_field_lines([f"`{r.path}` — {r.reason}" for r in dirty]),
                 inline=False,
             )
         if other_skipped:

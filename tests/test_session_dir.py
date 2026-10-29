@@ -298,7 +298,8 @@ class TestCleanupForThread:
             result = mgr.cleanup_for_thread(999)
 
         assert result.removed is False
-        assert "uncommitted changes" in result.reason
+        assert result.kept_work is True
+        assert result.reason  # what the work is (#1016)
         assert session.exists()
 
     def test_noop_when_dir_missing(self, tmp_path: Path) -> None:
