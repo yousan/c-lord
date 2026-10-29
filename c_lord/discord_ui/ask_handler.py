@@ -55,6 +55,7 @@ from .ask_bus import (
 )
 from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
+from .ask_menus import disable_stale_copies
 from .ask_view import AskView
 from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
@@ -172,6 +173,31 @@ async def _close(
     if ask_repo is not None:
         with contextlib.suppress(Exception):
             await ask_repo.delete(thread_id)
+
+
+# #977: written over a card whose turn was stopped (workspace stop, ⏹ Stop).
+STOPPED_NOTE = "-# ⏹ 停止したので、この質問は取り消しました。"
+
+
+async def retire_menus_for_stop(
+    thread_id: int, *, ask_repo: PendingAskRepository | None = None
+) -> None:
+    """Strip the buttons of every live card in *thread_id* — its workspace stopped (#977).
+
+    The turn-side bridge retires its own card when the runner is stopped, but a
+    card the transcript mirror bridged has a runner of its own that nobody
+    stops, and the mirror's teardown cancels it with the buttons left on — in a
+    thread that is about to be archived. Never raises.
+    """
+    try:
+        await _close(thread_id, CLOSE_STOPPED, None, ask_repo)
+        await disable_stale_copies(thread_id, None, STOPPED_NOTE)
+    except Exception:
+        logger.warning(
+            "%s could not retire the cards of a stopped workspace (#977)",
+            log_ctx(thread_id=thread_id),
+            exc_info=True,
+        )
 
 
 # #752: written over the buttons of a menu a newer question has replaced. Only
@@ -999,7 +1025,7 @@ async def _bridge_claimed_menu(
         await _close(thread.id, CLOSE_STOPPED, msg, ask_repo)
         with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await msg.edit(
-                content="-# ⏹ 停止したので、この質問は取り消しました。",
+                content=STOPPED_NOTE,
                 embed=None,
                 view=None,
             )

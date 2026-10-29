@@ -140,3 +140,47 @@ class TestTheStopDoesNotLeaveTheTurnRunning:
             finally:
                 _run_helper._run_turn = orig  # type: ignore[assignment]
         assert "outcome=stopped" in caplog.text
+
+
+class TestTheStopRetiresEveryLiveCard:
+    """#977 on staging: a card the *mirror* bridged (its own runner, never
+    withdrawn) was cancelled with the mirror and kept its buttons in the
+    archived thread. The workspace stop retires every live card itself."""
+
+    async def test_live_cards_lose_their_buttons(self) -> None:
+        from c_lord.discord_ui.ask_handler import retire_menus_for_stop
+        from c_lord.discord_ui.ask_menus import ask_menus
+
+        card = MagicMock()
+        card.id = 1
+        card.edit = AsyncMock()
+        ask_menus.register(THREAD, card)
+        repo = MagicMock()
+        repo.delete = AsyncMock()
+
+        await retire_menus_for_stop(THREAD, ask_repo=repo)
+
+        kwargs = card.edit.await_args.kwargs
+        assert kwargs["view"] is None and "停止" in kwargs["content"]
+        assert ask_bus.closed_reason(THREAD) == "stopped"
+        repo.delete.assert_awaited_once_with(THREAD)
+
+    async def test_the_workspace_stop_retires_cards_before_the_archive(self) -> None:
+        from unittest.mock import patch
+
+        from tests.test_session_close import TestStopEndsTheRunningTurn, _thread
+
+        helper = TestStopEndsTheRunningTurn()
+        chat = MagicMock()
+        cog, order = helper._cog(chat)
+        chat.end_turn_for_workspace_stop = MagicMock()
+        chat.wait_for_turn_end = AsyncMock()
+        thread = _thread()
+        thread.edit = AsyncMock(side_effect=lambda **_kw: order.append("archive"))
+
+        async def retire(_tid: int, **_kw: object) -> None:
+            order.append("retire")
+
+        with patch("c_lord.cogs.session_manage.retire_menus_for_stop", side_effect=retire):
+            await cog.close_workspace_text.callback(cog, helper._ctx(thread))
+        assert order == ["kill", "retire", "archive"]
