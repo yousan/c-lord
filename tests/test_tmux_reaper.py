@@ -694,3 +694,39 @@ class TestInstanceOwner:
         monkeypatch.setenv("CLORD_INSTANCE_ID", "prod;")
         monkeypatch.setattr(tmux_mod, "_instance_owner", None)
         assert tmux_mod.instance_owner() == "prod"
+
+
+class TestReaperKillsTheWindowItProbed:
+    """Two windows carrying one ``@thread_id`` (#501/#649): the idle one is reaped,
+    never its busy twin that the thread→window mapping happens to point at."""
+
+    def test_idle_twin_is_reaped_and_the_busy_one_survives(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w1", "w2"]},
+            thread_ids={"clord:w1": "111", "clord:w2": "111"},
+            pane_commands={"clord:w1": "node", "clord:w2": "zsh"},
+        )
+        mgr = _manager()
+        mgr._thread_to_window[111] = "@1"  # the busy w1
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert fake.killed == ["clord:w2"]
+        assert killed == 1
+        assert mgr._thread_to_window[111] == "@1"
+
+    def test_reaping_the_mapped_window_forgets_the_mapping(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w1"]},
+            thread_ids={"clord:w1": "111"},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        mgr = _manager()
+        mgr._thread_to_window[111] = "@1"
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert fake.killed == ["clord:w1"]
+        assert 111 not in mgr._thread_to_window
