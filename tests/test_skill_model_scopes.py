@@ -223,3 +223,27 @@ async def test_resolves_on_a_fresh_bot_via_the_chat_cog_when_not_given_one(fresh
     cog.bot.get_cog = MagicMock(side_effect=lambda n: chat if n == "ClaudeChatCog" else None)
     seen = await _launch(cog, _channel_for_new_thread(cog))
     assert (seen["model"], seen["effort"]) == ("sonnet", "medium")
+
+
+async def test_changed_pair_does_not_kill_a_thread_with_a_run_in_flight(env):
+    """#976: a chat turn still running in the thread keeps its Claude."""
+    import asyncio
+
+    from c_lord.cogs import _run_helper
+
+    cog, svc, tmux = env
+    await _launch(cog, _in_thread())  # launched with opus/high
+    await svc.change(scope="session", model="sonnet", thread_id=THREAD, channel_id=CHANNEL)
+    busy = asyncio.get_running_loop().create_future()
+    _run_helper._IN_FLIGHT[THREAD] = [_run_helper._InFlightRun(task=busy, started=0.0)]  # type: ignore[arg-type]
+    try:
+        seen = await _launch(cog, _in_thread())
+    finally:
+        _run_helper._IN_FLIGHT.pop(THREAD, None)
+        busy.cancel()
+    tmux.kill_session.assert_not_called()
+    assert seen["model"] == "opus"
+    assert seen.get("try_continue", False) is False
+    seen = await _launch(cog, _in_thread())  # idle now: the deferred restart happens
+    tmux.kill_session.assert_called_once_with(THREAD)
+    assert seen["model"] == "sonnet"

@@ -1,6 +1,6 @@
 """#915: a turn whose cause is known pings its requester once, not twice.
 
-A logged-out / rate-limited / model-refused turn posted the ❌ embed with a
+A logged-out / rate-limited / model-refused / API-error (#967) turn posted the ❌ embed with a
 mention (#681) and then the turn-end line with a mention (#812 / #631 / #484).
 Same person, same content, two pings — and a summons that repeats itself stops
 being read. The embed carries everything the line says (and more), so when it
@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from c_lord.api_error import API_ERROR_PREFIX
 from c_lord.claude.tmux_runner import LOGIN_REQUIRED_ERROR_PREFIX, MODEL_UNAVAILABLE_ERROR_PREFIX
 from c_lord.claude.types import MessageType, StreamEvent, UsageLimit
 from c_lord.cogs.event_processor import EventProcessor
@@ -59,6 +60,7 @@ async def _turn(event: StreamEvent) -> MagicMock:
         usage_limit=config.outcome.usage_limit,
         login_required=config.outcome.login_required,
         model_unavailable=config.outcome.model_unavailable,
+        api_error=config.outcome.api_error,
         already_pinged=config.outcome.pinged_user_id,
     )
     return thread
@@ -86,6 +88,11 @@ def _result(error: str, usage_limit: UsageLimit | None = None) -> StreamEvent:
         pytest.param(
             _result(f'{MODEL_UNAVAILABLE_ERROR_PREFIX} Claude Code cannot use the model "bogus".'),
             id="model-unavailable",
+        ),
+        pytest.param(
+            # #967: #908 added API errors as a fourth known cause after #915.
+            _result(f"{API_ERROR_PREFIX} API Error: Connection lost mid-response"),
+            id="api-error",
         ),
     ],
 )
@@ -124,3 +131,21 @@ async def test_ordinary_turn_end_is_unchanged() -> None:
         1, ThreadState.WAITING_INPUT, "x", thread=thread, notify_user_id=USER, already_pinged=USER
     )
     assert "Claude has finished" in thread.send.await_args.args[0]
+
+
+async def test_api_error_line_still_pings_when_the_embed_pinged_nobody() -> None:
+    """#967 AC2: the API-error line keeps its mention when the embed summoned no one."""
+    thread = MagicMock()
+    thread.send = AsyncMock()
+    d = _dash()
+    await d.set_state(1, ThreadState.PROCESSING, "x", thread=thread, notify_user_id=USER)
+    await d.set_state(
+        1,
+        ThreadState.WAITING_INPUT,
+        "x",
+        thread=thread,
+        notify_user_id=USER,
+        api_error="通信が途中で切れて、返事が途中で止まりました。",
+        already_pinged=None,
+    )
+    assert _mentions(thread) == 1

@@ -449,6 +449,19 @@ class _InFlightRun:
 _IN_FLIGHT: dict[int, list[_InFlightRun]] = {}
 
 
+def has_other_run_in_flight(thread_id: int) -> bool:
+    """Another run for *thread_id* is still running its turn (#976).
+
+    The calling task's own run (if it has entered) does not count. A run whose
+    task has already ended is not running anything, so it does not count either.
+    """
+    current = asyncio.current_task()
+    return any(
+        run.task is not current and not (run.task is not None and run.task.done())
+        for run in _IN_FLIGHT.get(thread_id, ())
+    )
+
+
 def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
     """Say so when *run* starts while an earlier run for its thread never exited.
 
