@@ -755,9 +755,26 @@ class TestAnUnreachableThreadDoesNotBlockTheCap:
     次の候補で補い、1回の tick で上限まで戻す。
     """
 
-    @staticmethod
-    def _unreachable_head_loop(resident: set[int], *, limit: int, gone: int) -> ResidentCapLoop:
+    @pytest.fixture(autouse=True)
+    def _closing_removes_the_window(self):  # type: ignore[no-untyped-def]
+        """#1086: a thread Discord answers NotFound for has its window closed
+        (and is never counted). Here, closing takes it off the resident set."""
+        self._residents: list[set[int]] = []
+
+        def close(thread_id: int) -> int:
+            for resident in self._residents:
+                resident.discard(thread_id)
+            return 1
+
+        with patch("c_lord.tmux.close_thread_windows", side_effect=close):
+            yield
+
+    def _unreachable_head_loop(
+        self, resident: set[int], *, limit: int, gone: int
+    ) -> ResidentCapLoop:
         import discord
+
+        self._residents.append(resident)
 
         cog = MagicMock()
 
@@ -796,13 +813,13 @@ class TestAnUnreachableThreadDoesNotBlockTheCap:
 
     @pytest.mark.asyncio
     async def test_one_tick_is_enough(self) -> None:
-        """失敗した分を次の候補で補うので、1 tick で上限まで戻る。"""
+        """引けない 5 は窓を閉じ、残りを古い順に上限まで眠らせる — 1 tick で戻る (#1086)。"""
         resident = {1, 2, 3, 4, 5}
         loop = self._unreachable_head_loop(resident, limit=2, gone=5)
 
-        assert await loop.tick() == 3
-        assert resident == {1, 5}
-        assert _slept_ids(loop) == [4, 3, 2]  # 古い順のまま、5 だけ飛ばす
+        assert await loop.tick() == 2
+        assert resident == {1, 2}
+        assert _slept_ids(loop) == [4, 3]  # 古い順のまま、5 は眠らせず閉じる
 
     @pytest.mark.asyncio
     async def test_it_never_sleeps_more_than_it_needs(self) -> None:
