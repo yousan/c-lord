@@ -35,6 +35,10 @@ Claude Code は同じダイアログを 2 つの形で出してきた実績が�
 | ≤ 2.1.247 | `❯ 1. Yes, I trust this folder` / `  2. No, exit` | **Yes** |
 | ≥ 2.1.248 | `❯ No, exit` / `  Yes, I trust this folder` | **No** |
 
+画面は**色を剥がしてから**読む。実物のダイアログはカーソル行に色を付けて描く（CLI 2.1.312 の `capture-pane -e` で確認。
+`ESC[38;5;153m❯ESC[39m ESC[38;5;153mNo,ESC[39m …`）。剥がさないとカーソルの位置が読めず、起動直後の処理だけが
+素の Enter で「No, exit」を答えていた（#1046）。
+
 **どちらでも「Yes」に当たるまで動かしてから確定する**こと。決め打ちで Enter を押すと、後者では
 **「No, exit」を選んで claude を終了させます**。
 

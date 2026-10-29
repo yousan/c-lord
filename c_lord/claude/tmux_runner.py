@@ -3087,7 +3087,12 @@ class TmuxClaudeRunner:
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 
-            pane = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            # #1046: ``capture_pane`` keeps the colours (``-e``) and the live
+            # dialog colours its cursor line — unnormalised, the cursor reads as
+            # unknown and the confirm answers "No, exit".
+            pane = _normalize_capture(
+                await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            )
 
             if not trust_handled and self._has_trust_prompt(pane):
                 await self._accept_trust_prompt(pane)
