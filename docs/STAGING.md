@@ -369,7 +369,24 @@ bash scripts/staging.sh restart <branch>   # ← 有効な自リースが無い�
 bash scripts/staging.sh stop               # ← 他人の有効リース中は拒否される
 
 bash scripts/staging.sh release            # 検証後の原状復帰とセットで必ず実行
+#   → このリース中に立った検証窓を寝かせてから返す (#955):
+#     検証窓: 2 本寝かせた / 約 612 MB（API 2 本）
 ```
+
+**release で検証窓は寝かされる (#955)。** 検証用スレッドは1本ごとに tmux 窓（Claude 1本 230〜320MB）を
+立て、tmux サーバは bot とは別なので `restart` でも窓は残る。以前は 4 時間スリープ (#572) まで居座り、
+検証が集中すると積み上がった（2026-10-28: 1.5 時間で 25 本・約 6.2GB）。いまは `release` が:
+
+- **対象**: `@clord_owner` がこの clone の bot（`CLORD_INSTANCE_ID`、無ければ clone の realpath）**かつ**
+  `@thread_id` がこの clone の `data/sessions.db` で**リース開始（`acquired_epoch`）以降に作られた**スレッドの窓だけ。
+  リース前から居る窓（E2E 固定スレッドなど）・他の台・本番の窓は触らない
+- **閉じ方**: bot の `POST /api/threads/<id>/sleep`（`.env` の `CLORD_API_PORT`）で、4 時間スリープと同じ
+  bot 自身のスリープを頼む。ミラーを先に止めて窓を閉じ、**次にそのスレッドへ発言すると無言で復元する**
+- **bot に届かないとき**（落ちている・ポート未設定）だけ、同じ対象の窓の pane を **id 指定で `kill-pane`** する。
+  `kill-server` / `kill-session` は打たない（#701）。この経路で閉じたスレッドに後で発言すると、
+  「前回のワークスペースが落ちていた」側の案内になる
+- 閉じた本数と、閉じる前に測った窓のプロセスツリーの PSS 合計を1行出す
+- **失効したリースを `borrow` で奪うときも**、旧リース中に立った窓を同じ手順で寝かせる（返し忘れの取りこぼし防止）
 
 **ルール**: `restart` は常に自リース必須(borrow → restart → … → restart main → release)。
 `stop` はリースが無ければ可(掃除目的)、他人の有効リース中は不可(検証中の bot を殺さない)。
@@ -403,8 +420,8 @@ curl -X POST -H "Content-Type: application/json" \
 bash scripts/staging.sh restart <fix-branch>
 curl -X POST ...(同じ入力)
 
-# 3. 原状復帰(必須)
-bash scripts/staging.sh restart main && rm -f .staging-lease
+# 3. 原状復帰(必須)。release が検証で立てた窓を寝かせる (#955) — rm -f .staging-lease で済ませない
+bash scripts/staging.sh restart main && bash scripts/staging.sh release
 ```
 
 証跡の規約(スクショ主・ログ従)は CLAUDE.md の DoD を参照。
