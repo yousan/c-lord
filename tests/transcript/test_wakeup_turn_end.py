@@ -207,8 +207,8 @@ def test_read_back_sees_a_wakeup_turn_still_open(tmp_path):
     path = tmp_path / "s.jsonl"
     rows = [*_wakeup("2026-10-29T18:00:00.000Z"), _reply("2026-10-29T18:00:05.000Z")]
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    assert _turn_state_at_end(path) == ("wakeup", set())
+    assert _turn_state_at_end(path) == ("wakeup", "2026-10-29T18:00:00.000Z", set())
 
     with path.open("a") as f:
         f.write(json.dumps(_end("2026-10-29T18:00:06.000Z")) + "\n")
-    assert _turn_state_at_end(path) == (None, set())
+    assert _turn_state_at_end(path) == (None, None, set())
