@@ -43,7 +43,7 @@ from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
-from ._run_helper import run_claude_with_config
+from ._run_helper import has_other_run_in_flight, run_claude_with_config
 from .run_config import RunConfig
 
 if TYPE_CHECKING:
@@ -266,6 +266,10 @@ class SkillCommandCog(commands.Cog):
         window is (re)made — so the run starts it again with the new flags and
         ``--resume``, instead of typing ``/model`` into it (which would rewrite
         the host's user settings for every Claude).
+
+        #976: not while another run (a chat turn) is using that Claude — killing
+        it would kill that turn. The change then waits for a turn with nothing
+        in flight.
         """
         turn = await begin_turn_for(
             self.bot,
@@ -273,6 +277,7 @@ class SkillCommandCog(commands.Cog):
             self.runner,
             thread.id,
             channel_id,
+            keep_running=has_other_run_in_flight(thread.id),
         )
         if turn is None or not turn.needs_restart:
             return turn, False

@@ -150,3 +150,37 @@ async def test_a_settings_failure_falls_back_to_instance_defaults(env):
     svc.begin_turn = AsyncMock(side_effect=RuntimeError("db locked"))  # type: ignore[method-assign]
     seen = await _launch(cog)
     assert (seen["model"], seen["effort"]) == ("opus", "high")
+
+
+@contextlib.contextmanager
+def _another_run_in_flight():
+    """#976: another run (e.g. a /skill turn) for the same thread is still running."""
+    import asyncio
+
+    from c_lord.cogs import _run_helper
+
+    task = asyncio.get_running_loop().create_future()  # never done
+    run = _run_helper._InFlightRun(task=task, started=0.0)  # type: ignore[arg-type]
+    _run_helper._IN_FLIGHT.setdefault(THREAD, []).append(run)
+    try:
+        yield
+    finally:
+        _run_helper._IN_FLIGHT.pop(THREAD, None)
+        task.cancel()
+
+
+async def test_changed_pair_does_not_kill_a_thread_with_a_run_in_flight(env):
+    """#976: the running turn keeps its Claude; the restart waits for an idle turn."""
+    cog, svc, tmux, repo = env
+    await _launch(cog)  # launched with opus/high
+    await svc.change(
+        scope="session", model="sonnet", effort="low", thread_id=THREAD, channel_id=CHANNEL
+    )
+    with _another_run_in_flight():
+        seen = await _launch(cog, session_id="abc")
+    tmux.kill_session.assert_not_called()
+    assert (seen["model"], seen["effort"]) == ("opus", "high")  # the pane's pair
+    # Nothing in flight any more: now the restart happens.
+    seen = await _launch(cog, session_id="abc")
+    tmux.kill_session.assert_called_once_with(THREAD)
+    assert (seen["model"], seen["effort"]) == ("sonnet", "low")
