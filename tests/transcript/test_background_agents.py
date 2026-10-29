@@ -139,6 +139,47 @@ async def test_turn_end_reports_how_many_agents_are_still_running(tmp_path, monk
     assert seen == [1, 0]
 
 
+async def test_one_notification_for_two_agents_releases_both_live(tmp_path, monkeypatch):
+    """#1042 AC1, on the live #917 path. RED: ``[2, 1]`` — the second id stayed out."""
+    monkeypatch.setenv(turn_events.ENV_LOG, str(tmp_path / "events.jsonl"))
+    turn_events.reset()
+    seen: list[int] = []
+    monkeypatch.setattr(
+        turn_events, "note_turn_end", lambda _tid, outstanding, **_: seen.append(outstanding)
+    )
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    os.utime(jsonl, (1, 1))
+
+    async def sink(text: str) -> None:
+        pass
+
+    both = {
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": (
+            "<task-notification>\n<task-id>aaa111</task-id>\n<task-id>bbb222</task-id>\n"
+            "<status>stopped</status>\n</task-notification>"
+        ),
+    }
+    mirror = TranscriptMirror(thread_id=79, project_dir=project, sink=sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write(jsonl, _launch("aaa111"))
+        _write(jsonl, _launch("bbb222"))
+        _write(jsonl, TURN_END)
+        await asyncio.sleep(0.3)
+        _write(jsonl, both)
+        _write(jsonl, TURN_END)
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    assert seen == [2, 0]
+
 async def test_final_answer_counts_as_pending_until_it_is_posted(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
