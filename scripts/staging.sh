@@ -131,6 +131,8 @@ cmd_borrow() {
   elif [ -f "$LEASE_FILE" ]; then
     # 失効リースの奪取: 旧内容をログに残す (奪取の監査痕跡)
     echo "takeover: 失効リースを奪取 — old: $(lease_describe)"
+    # #955: 返し忘れたリースの検証窓も、ここで寝かせる
+    sleep_lease_windows "$(lease_field acquired_epoch)"
   fi
   branch="$(git -C "$CLONE_DIR" branch --show-current 2>/dev/null || echo '')"
   LEASE_PATH="$LEASE_FILE" LEASE_OWNER="$owner" LEASE_PURPOSE="$purpose" LEASE_TTL="$ttl" LEASE_BRANCH="$branch" python3 - <<'PYEOF'
@@ -160,6 +162,8 @@ cmd_release() {
     echo "lease: $(lease_describe)" >&2
     die "release 拒否 — リースの owner ($holder) ではない"
   fi
+  # #955: 検証が終わった窓を、リースを返す前に寝かせる
+  sleep_lease_windows "$(lease_field acquired_epoch)"
   rm -f "$LEASE_FILE"
   echo "released."
 }
@@ -168,6 +172,145 @@ env_get() {
   # .env から key の値を取る (最後の定義が勝ち)。secrets は呼び出し側で
   # 出力しないこと。
   /usr/bin/grep "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+sleep_lease_windows() {
+  # sleep_lease_windows <since_epoch> — このリース中に立った検証窓を寝かせる (#955)。
+  #
+  # 検証用スレッド1本ごとに tmux 窓が1つ立ち、Claude (230〜320MB) を抱えたまま
+  # 4時間スリープ (#572) まで居座る。tmux サーバは bot とは別なので restart でも
+  # release でも消えない (2026-10-28: 1.5h で 25 本・6.2GB)。
+  #
+  # 対象は次の両方を満たす窓だけ:
+  #   - @clord_owner がこの clone の bot (CLORD_INSTANCE_ID、無ければ clone の realpath)
+  #   - @thread_id が、この clone の sessions.db でリース開始以降に作られたスレッド
+  # リース前から居る窓・他の台・本番の窓は条件に合わないので触らない。
+  #
+  # 閉じ方: bot の REST (POST /api/threads/<id>/sleep) に頼む — ミラーを先に止め
+  # (#379)、set_slept で次の発言を無言で復元する、bot 自身のスリープ。
+  # API に届かないとき (bot が落ちている等) だけ、その窓の pane を id 指定で kill。
+  # kill-server / kill-session は打たない (#701 — 1 台の tmux サーバ = フリート全体)。
+  local since="$1"
+  [ -n "$since" ] || return 0
+  CLONE_DIR="$CLONE_DIR" CLONE_DIR_REAL="$CLONE_DIR_REAL" SINCE="$since" \
+    API_PORT="$(env_get CLORD_API_PORT)" API_SECRET="$(env_get CLORD_API_SECRET)" \
+    INSTANCE_ID="$(env_get CLORD_INSTANCE_ID)" python3 - <<'PYEOF' || true
+import json, os, sqlite3, subprocess, time, urllib.request
+from pathlib import Path
+
+clone = Path(os.environ["CLONE_DIR"])
+db_path = clone / "data" / "sessions.db"
+if not db_path.is_file():
+    raise SystemExit(0)
+owner = (os.environ.get("INSTANCE_ID", "").strip() or os.environ["CLONE_DIR_REAL"]).rstrip(";")
+since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(os.environ["SINCE"])))
+try:
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    threads = {
+        str(row[0])
+        for row in db.execute(
+            "SELECT thread_id FROM sessions WHERE created_at >= ? "
+            "AND closed_reason IS NOT 'swept'",
+            (since,),
+        )
+    }
+except sqlite3.Error as exc:
+    print(f"検証窓: sessions.db を読めないので寝かせない ({exc})")
+    raise SystemExit(0)
+if not threads:
+    print("検証窓: このリース中に立ったスレッドは無い")
+    raise SystemExit(0)
+
+
+def panes() -> list[tuple[str, int, str, str]]:
+    fmt = "#{pane_id}\t#{pane_pid}\t#{@clord_owner}\t#{@thread_id}"
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", fmt], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    rows = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[1].isdigit():
+            rows.append((parts[0], int(parts[1]), parts[2], parts[3]))
+    return rows
+
+
+def tree_kb(root: int) -> int:
+    """PSS of *root* and its descendants (smaps_rollup; Rss when unreadable)."""
+    children: dict[int, list[int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            ppid = int(stat[stat.rfind(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry.name))
+    total, stack = 0, [root]
+    while stack:
+        pid = stack.pop()
+        stack.extend(children.get(pid, []))
+        for name, key in (("smaps_rollup", "Pss:"), ("status", "VmRSS:")):
+            try:
+                for line in Path(f"/proc/{pid}/{name}").read_text().splitlines():
+                    if line.startswith(key):
+                        total += int(line.split()[1])
+                        break
+                else:
+                    continue
+                break
+            except (OSError, ValueError):
+                continue
+    return total
+
+
+def ask_api(thread_id: str) -> bool:
+    port = os.environ.get("API_PORT", "").strip()
+    if not port.isdigit():
+        return False
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/threads/{thread_id}/sleep", data=b"", method="POST"
+    )
+    if os.environ.get("API_SECRET"):
+        req.add_header("Authorization", f"Bearer {os.environ['API_SECRET']}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.load(resp).get("status") == "slept"
+    except Exception:
+        return False
+
+
+targets = [p for p in panes() if p[2] == owner and p[3] in threads]
+if not targets:
+    print("検証窓: 寝かせる窓は無い")
+    raise SystemExit(0)
+sizes = {pane: tree_kb(pid) for pane, pid, _, _ in targets}
+via_api = via_kill = 0
+for pane, _pid, _owner, thread_id in targets:
+    if ask_api(thread_id):
+        via_api += 1
+        continue
+    # API に届かない: この pane だけを id で閉じる (窓・セッション・サーバ単位ではない)
+    subprocess.run(["tmux", "kill-pane", "-t", pane], capture_output=True, timeout=10)
+    via_kill += 1
+for _ in range(20):
+    alive = {p[0] for p in panes()}
+    if not alive & set(sizes):
+        break
+    time.sleep(0.25)
+closed = [pane for pane in sizes if pane not in alive]
+mb = sum(sizes[pane] for pane in closed) // 1024
+left = len(sizes) - len(closed)
+how = f"API {via_api} 本" + (f" / pane kill {via_kill} 本" if via_kill else "")
+tail = f" — {left} 本は閉じられなかった" if left else ""
+print(f"検証窓: {len(closed)} 本寝かせた / 約 {mb} MB（{how}）{tail}")
+PYEOF
 }
 
 find_pids() {
