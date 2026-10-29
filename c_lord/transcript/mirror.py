@@ -65,6 +65,7 @@ from .formatter import (
 )
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
+from .resolver import ThreadSessionResolver
 from .subagents import SubagentLog
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
@@ -616,6 +617,12 @@ def has_pending_final(thread_id: int) -> bool:
     return mirror is not None and mirror._holding_final
 
 
+def background_agents_running(thread_id: int) -> int:
+    """How many background agents *thread_id*'s mirror knows are still out (#1012)."""
+    mirror = _LIVE_MIRRORS.get(thread_id)
+    return len(mirror._background_agents) if mirror is not None else 0
+
+
 _AGENT_LAUNCHED_RE = re.compile(r"Async agent launched successfully.*?agentId:\s*(\w+)", re.DOTALL)
 _TASK_ID_RE = re.compile(r"<task-id>\s*(\w+)\s*</task-id>")
 
@@ -661,6 +668,58 @@ def _reported_task_id(event: dict) -> str | None:
     return match.group(1) if match else None
 
 
+#: How much of the transcript a restored mirror reads back (#1011/#1012). An
+#: agent launched further back than this is not counted.
+_READ_BACK_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _turn_state_at_end(path: Path) -> tuple[str | None, set[str]]:
+    """Who opened the turn still open at the end of *path*, and the agents still out.
+
+    ``("person" | "notification" | None, agent ids)``. Replays the live loop's
+    own rules (#913/#979/#917) over what the old process already read, so a
+    mirror restored after a restart picks up where it left off (#1011/#1012).
+    Blocking; ``(None, set())`` when the file cannot be read.
+    """
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - _READ_BACK_MAX_BYTES)
+            f.seek(start)
+            lines = f.read().split(b"\n")
+    except OSError:
+        return None, set()
+    if start > 0:
+        lines = lines[1:]  # the tail of a line that began before the window
+    opened_by: str | None = None
+    spoke = False
+    agents: set[str] = set()
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue  # blank, torn or garbage — not evidence either way
+        if not isinstance(event, dict):
+            continue
+        agents.update(_launched_agent_ids(event))
+        reported = _reported_task_id(event)
+        if reported is not None:
+            agents.discard(reported)
+        if _is_user_prompt(event):
+            kind = _prompt_kind(event)
+            if kind == "person" and is_harness_user_record(event):
+                kind = None
+            if kind == "person" or (kind == "notification" and opened_by is None):
+                opened_by = kind
+            if kind is not None:
+                spoke = False
+        if event.get("type") == "assistant" and not event.get("isSidechain"):
+            spoke = True
+        if _is_turn_end(event) or (local_command_record(event) == "output" and not spoke):
+            opened_by = None
+    return opened_by, agents
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -685,6 +744,7 @@ class TranscriptMirror:
         expect_turn: bool = False,
         unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
         subagent_log: SubagentLog | None = None,
+        resumed: bool = False,
     ) -> None:
         self.thread_id = thread_id
         # #971: the sub-agents' own transcripts, which this tail never reads.
@@ -759,6 +819,9 @@ class TranscriptMirror:
         # exactly when an interrupted turn's held text gets flushed.
         self._latest_trigger: int | None = None
         self._turn_trigger: int | None = None
+        # #1011/#1012: restored at startup — the tail starts at the end of a
+        # transcript the old process was reading, so learn where it stood.
+        self._resumed = resumed
 
     def note_turn_started(self, trigger_id: int | None = None) -> None:
         """Tell the progress line a turn just began (#539).
@@ -853,6 +916,40 @@ class TranscriptMirror:
         its next tool event re-arms the line, as it does for any turn.
         """
         await self._progress.end_turn()
+
+    async def _read_back(self) -> None:
+        """Start where the old process left off: the open turn and agents out (#1011/#1012).
+
+        Without it a person's turn that crossed the restart read as closed: a
+        notification landing in it counted as a turn Claude started by itself
+        (a second turn-end event, the person's answer unquoted), and agents it
+        had launched were not waited for. Never raises — a mirror that could
+        not read back still delivers, as before.
+        """
+        try:
+            jsonl = await asyncio.to_thread(ThreadSessionResolver(self.project_dir).resolve)
+            if jsonl is None:
+                return
+            opened_by, agents = await asyncio.to_thread(_turn_state_at_end, jsonl)
+        except Exception:
+            logger.warning(
+                "%s TranscriptMirror: could not read back the transcript (#1011)",
+                log_ctx(thread_id=self.thread_id),
+                exc_info=True,
+            )
+            return
+        self._background_agents |= agents
+        if opened_by is not None:
+            self._turn_open = True
+            self._turn_by_notification = opened_by == "notification"
+        if opened_by is not None or agents:
+            logger.info(
+                "%s TranscriptMirror: resumed mid-turn (opened by %s, %d background agent(s) "
+                "out) (#1011/#1012)",
+                log_ctx(thread_id=self.thread_id),
+                opened_by or "nobody",
+                len(agents),
+            )
 
     def _track_background_agents(self, event: dict) -> None:
         """Keep the set of background agents that have not yet reported back (#917)."""
@@ -1023,6 +1120,9 @@ class TranscriptMirror:
         # ``async for`` blocks indefinitely between events, leaving no chance to
         # flush a pending final answer when no turn-end marker is emitted.
         queue: asyncio.Queue = asyncio.Queue()
+
+        if self._resumed:
+            await self._read_back()
 
         async def _producer() -> None:
             async for event in tail_events(
