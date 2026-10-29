@@ -196,6 +196,26 @@ class TestLoopUsesTheOneSleepPath:
 
         assert cog._sleep_workspace_impl.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_a_tick_without_the_cog_does_not_retire_the_thread(self) -> None:
+        """#991: nothing was done, so nothing was decided — look again next tick.
+
+        Marking it visited (as #922 already learned for the busy path) left the
+        thread awake until a person spoke or the 7-day stop came.
+        """
+        cog = self._cog()
+        repo = MagicMock()
+        repo.list_all = AsyncMock(return_value=[_rec(1, hours_ago=9)])
+        bot = self._bot(cog)
+        bot.get_cog = MagicMock(return_value=None)  # loading / reloading
+        loop = IdleSleepLoop(bot, repo, threshold_hours=4, now_fn=lambda: NOW)
+
+        assert await loop.tick() == 0
+
+        bot.get_cog = MagicMock(return_value=cog)
+        assert await loop.tick() == 1
+        cog._sleep_workspace_impl.assert_awaited_once()
+
 
 class TestArchivedThreadsAreReachable:
     """#593 と同じ罠。``get_channel`` はキャッシュしか見ない。
