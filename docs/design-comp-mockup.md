@@ -59,7 +59,12 @@ embed: `{ "title": "🛠️ Bash(ls)", "description": "...", "color": "#FEE75C",
 - これは **Discord 風の再現画（デザインカンプ）**であって、**実クライアントの実際の見た目ではない**。
   本物のレンダリングのバグ（ボタンが実際に出るか・崩れ等）を確かめたいなら、実際の証跡が要る → **#243**。
 - 依存は既存の `c-lord[table]`（Pillow）のみ。ヘッドレスブラウザ等は使わない。
-- コードフェンス（` ``` `）内は等幅フォントで描くため **CJK はうまく出ない**（豆腐になる）。コード例は ASCII 推奨。
+- コードフェンス（` ``` `）内の日本語は等幅フォントの代わりに日本語フォントで描く（#623）。
+  同じ行で閉じるフェンス（` ```ls -la``` ` を行頭に書いたもの）は Discord と同じく1行のコードブロックとして描く（#1036）。
+  行の途中に書いた ` ``` ` はコードにせず本文のまま描く。
+- 追加パッケージ `emoji`（`uv sync --extra table`）が無い環境では、**絵文字を含む spec だけ**描かずに止まる（豆腐の絵を出さないため — #588）。
+  日本語・矢印（`→`）・罫線だけの spec はそのまま描ける（#1035）。絵文字として扱う範囲は
+  `conversation_renderer.py` の `_EMOJI_RANGES`（記号・Dingbats の `✓` `✅` `❤`、`⏳` などを含む）。
 - レンダラ本体は `c_lord/discord_ui/conversation_renderer.py`（`render_conversation_png` / `conversation_from_spec`）。
   CLI は `scripts/discord_mockup.py`（shipped パッケージの一部ではない dev ツール）。
 

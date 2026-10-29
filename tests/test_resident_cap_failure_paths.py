@@ -31,10 +31,14 @@ from c_lord.resident_cap import (
     ResidentCapLoop,
     select_lru_victims,
 )
+from c_lord.tmux import PaneTurnStates
 
 GIB = 1024**3
 NOW = datetime.datetime(2026, 8, 31, 18, 0, 0)
 LOW = (31 * GIB, int(31 * GIB * 0.05))
+#: ペインを読んで「走っているものも、読めなかったものも無い」(#1034)。
+_NO_PANE_EVIDENCE = PaneTurnStates(frozenset(), frozenset())
+
 OK = (31 * GIB, int(31 * GIB * 0.50))
 
 
@@ -185,7 +189,7 @@ class TestInFlightEvidenceSources:
             resident_fn=lambda: {1, 2, 3},
             mem_fn=lambda: OK,
         )
-        with patch("c_lord.tmux.running_thread_ids", return_value=set()):
+        with patch("c_lord.tmux.pane_turn_states", return_value=_NO_PANE_EVIDENCE):
             assert await loop.tick() == 1
         assert _slept(cog) == [3]
 
@@ -205,7 +209,7 @@ class TestInFlightEvidenceSources:
             resident_fn=lambda: {1, 2, 3},
             mem_fn=lambda: OK,
         )
-        with patch("c_lord.tmux.running_thread_ids", return_value=set()) as running:
+        with patch("c_lord.tmux.pane_turn_states", return_value=_NO_PANE_EVIDENCE) as running:
             await loop.tick()
         (asked,), _ = running.call_args
         assert asked == {2, 3}
@@ -222,7 +226,7 @@ class TestInFlightEvidenceSources:
             resident_fn=lambda: {1, 2, 3},
             mem_fn=lambda: OK,
         )
-        with patch("c_lord.tmux.running_thread_ids") as running:
+        with patch("c_lord.tmux.pane_turn_states") as running:
             assert await loop.tick() == 0
         running.assert_not_called()
         loop._repo.list_all.assert_not_awaited()  # 上限内ならDBも読まない
@@ -230,7 +234,7 @@ class TestInFlightEvidenceSources:
     @pytest.mark.asyncio
     async def test_no_candidates_means_no_pane_reads(self) -> None:
         loop = ResidentCapLoop(_bot(cog=_cog()), _repo([]), limit=2, mem_fn=lambda: OK)
-        with patch("c_lord.tmux.running_thread_ids") as running:
+        with patch("c_lord.tmux.pane_turn_states") as running:
             assert await loop._running_on_host(set()) == set()
         running.assert_not_called()
 
@@ -316,14 +320,15 @@ class TestOneBadVictimDoesNotTakeOthersDown:
             mem_fn=lambda: OK,
         )
         with caplog.at_level(logging.INFO, logger="c_lord.resident_cap"):
-            # victims = [4, 3] — 3 も 4 もキャッシュに無く API でも引けない
-            assert await loop.tick() == 0
-        cog._sleep_workspace_impl.assert_not_awaited()
+            # 4 と 3 はキャッシュに無く API でも引けない。#1033: 飛ばして次の 2 で補う
+            # （1 も引けないので、眠るのは 2 だけ）
+            assert await loop.tick() == 1
+        assert _slept(cog) == [2]
         msgs = [r.getMessage() for r in caplog.records]
         assert any("thread=4" in m and ("not reachable" in m or "could not" in m) for m in msgs)
         assert any("thread=3" in m and ("not reachable" in m or "could not" in m) for m in msgs)
-        # 「眠らせた」とは言わない
-        assert not any("slept" in m and "to stay under the limit" in m for m in msgs)
+        # 眠らせたのは実際に眠った1本だけ
+        assert any("slept 1 workspace(s) to stay under the limit" in m for m in msgs)
 
     @pytest.mark.asyncio
     async def test_a_sleep_that_raises_is_logged_and_the_rest_continue(self, caplog) -> None:
@@ -343,13 +348,14 @@ class TestOneBadVictimDoesNotTakeOthersDown:
             mem_fn=lambda: OK,
         )
         with caplog.at_level(logging.INFO, logger="c_lord.resident_cap"):
-            assert await loop.tick() == 1
-        assert _slept(cog) == [4, 3]
+            # #1033: 4 の失敗は次の 2 で補い、1回の tick で上限まで戻す
+            assert await loop.tick() == 2
+        assert _slept(cog) == [4, 3, 2]
         assert any(
             r.levelno == logging.ERROR and "failed to sleep thread=4" in r.getMessage()
             for r in caplog.records
         )
-        assert any("slept 1 workspace(s)" in r.getMessage() for r in caplog.records)
+        assert any("slept 2 workspace(s)" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_a_sleep_that_kills_nothing_is_not_counted(self, caplog) -> None:
