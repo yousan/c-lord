@@ -68,6 +68,9 @@ class UnresolvedTranscript:
 
 
 UnresolvedCb = Callable[[UnresolvedTranscript], Awaitable[None]]
+#: ``(transcript, offset)`` — where the tail starts following (#1018). ``None``
+#: when no transcript was resolvable yet.
+StartCb = Callable[[Path | None, int], Awaitable[None]]
 
 # Read the seeding baseline in bounded slices instead of one ``read(offset)``:
 # a production transcript reaches ~100 MB and the seeding of every session now
@@ -209,6 +212,9 @@ class _FollowState:
     # rather than sleeping, so falling behind is not also made slow.
     more_to_read: bool = False
     seen_uuids: set[str] = field(default_factory=set)
+    # The transcript the tail started on and where in it (#1018): everything
+    # before that offset is the caller's to read back, everything after is ours.
+    start_path: Path | None = None
     # Whether the last poll had a transcript to read at all (#773).  Starts
     # True so a tail that has not polled yet is never reported as broken.
     resolved: bool = True
@@ -241,6 +247,7 @@ def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
         # message the user sent was dropped by Discord and never redelivered.
         state.offsets[initial_path] = _whole_lines_end(initial_path)
         _seed_seen_uuids(initial_path, state.offsets[initial_path], state.seen_uuids)
+        state.start_path = initial_path
     return state
 
 
@@ -429,6 +436,7 @@ async def tail_events(
     from_start: bool = False,
     on_unresolved: UnresolvedCb | None = None,
     unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
+    on_start: StartCb | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield JSONL events as they appear under ``project_dir``.
 
@@ -450,6 +458,11 @@ async def tail_events(
         stop — and the caller decides whether anyone should hear about it.
     unresolved_after
         How long the resolver may come back empty before that call.
+    on_start
+        Awaited once, before anything is yielded, with the transcript the tail
+        starts on and the offset it starts from (#1018). A caller that reads
+        what came before reads up to exactly that offset: a line written while
+        it reads is then the tail's, never lost in between, never read twice.
     """
     # Issue #433: events already yielded (or present at start) must not be
     # re-emitted when the read offset is reset to 0 (truncation / in-place
@@ -459,6 +472,9 @@ async def tail_events(
     # they are intentionally not deduplicated (avoids collapsing two distinct
     # uuid-less records that happen to serialise identically).
     state = await _run_off_loop(_open_initial_state, project_dir, from_start)
+    if on_start is not None:
+        start = state.start_path
+        await on_start(start, state.offsets.get(start, 0) if start is not None else 0)
     # When the current run of "nothing to read" began, or None while healthy.
     unresolved_since: float | None = None
 
