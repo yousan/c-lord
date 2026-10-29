@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .retention import claude_transcript_retention_days
-from .session_dir import WorktreeStatus, worktree_status
+from .session_dir import describe_changes, worktree_status
 from .tmux import release_window_number
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
@@ -179,36 +179,6 @@ class DirOutcome(Enum):
     KEPT_FOREIGN = "kept_foreign"
     """Not this thread's own session dir — a fixed checkout, or still in use (#902)."""
     ABSENT = "absent"
-
-
-#: How many changed paths a "keeping" log line names before it abbreviates.
-_MAX_LOGGED_CHANGES = 5
-
-
-def describe_changes(status: WorktreeStatus) -> str:
-    """Why a directory is being kept, for the INFO line (#749, #903).
-
-    Names the entries, because "uncommitted work" alone read as 80 dirs of user
-    work when 60 of them held nothing but c-lord's own SKILL.md. Ignored files
-    show as ``!! name``; commits on no remote branch as a count.
-    """
-    if not status.is_repo:
-        return "not a git repo (cannot tell work from leftovers)"
-    reasons: list[str] = []
-    if status.unpushed_commits is None:
-        reasons.append("unpushed commits unknown (git rev-list failed)")
-    elif status.unpushed_commits:
-        reason = f"{status.unpushed_commits} unpushed commit(s) on no remote branch"
-        if status.remote_unchecked:
-            reason += " (ls-remote failed; pushed branches could not be checked)"
-        reasons.append(reason)
-    if status.user_changes:
-        shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
-        more = len(status.user_changes) - _MAX_LOGGED_CHANGES
-        if more > 0:
-            shown += f" (+{more} more)"
-        reasons.append(f"uncommitted user work: {shown}")
-    return "; ".join(reasons)
 
 
 #: A session dir is always ``<base>/<channel_id>/<thread_id>`` — at least three
