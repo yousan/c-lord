@@ -1142,11 +1142,13 @@ class TestReleaseSleepsLeaseWindows:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return server, asked
 
-    @pytest.mark.parametrize("status", [404, 500, 503])
+    @pytest.mark.parametrize("status", [500, 503])
     def test_an_http_error_from_the_bot_does_not_kill_the_pane(
         self, tmp_path: Path, status: int
     ) -> None:
-        """#1015 AC1. RED: 答えが ``slept`` 以外なら全部 kill-pane に進んだ。"""
+        """#1015 AC1. RED: 答えが ``slept`` 以外なら全部 kill-pane に進んだ。
+
+        bot が窓を把握していて寝かせるのに失敗した答え (500 / 503) だけ。"""
         server, asked = self._api(status)
         try:
             clone = self._clone(tmp_path, api_port=server.server_address[1])
@@ -1165,14 +1167,22 @@ class TestReleaseSleepsLeaseWindows:
         assert pane in self._panes()
         assert f"HTTP {status}" in result.stdout
 
-    def test_not_resident_from_the_bot_does_not_kill_the_pane(self, tmp_path: Path) -> None:
-        """#1015: ``not_resident`` は bot の答え — kill には進まない。"""
-        server, _ = self._api(200, {"status": "not_resident", "thread_id": "952"})
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [(200, {"status": "not_resident", "thread_id": "952"}), (404, {"error": "x"})],
+    )
+    def test_an_answer_that_the_bot_has_no_such_window_kills_the_pane(
+        self, tmp_path: Path, status: int, body: dict
+    ) -> None:
+        """#1015 (おぷー決定 2026-10-29): ``not_resident`` / 404 は bot がその窓を
+        持っていない答え。4 時間スリープ (#572) も同じ経路なので拾わない — だから
+        従来どおり pane id 指定で kill する。RED: 残していた (1 本 ~300MB が居座る)。"""
+        server, asked = self._api(status, body)
         try:
             clone = self._clone(tmp_path, api_port=server.server_address[1])
             assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
             self._row(clone, 952)
-            self._window("w1", os.path.realpath(clone), 952)
+            pane = self._window("w1", os.path.realpath(clone), 952)
             env = self._logging_tmux(tmp_path)
 
             result = self._run(["release", "--owner", "A"], clone, env)
@@ -1180,8 +1190,11 @@ class TestReleaseSleepsLeaseWindows:
             server.shutdown()
 
         assert result.returncode == 0, result.stderr
-        assert "kill-pane" not in Path(env["TMUX_LOG"]).read_text()
-        assert "not_resident" in result.stdout
+        assert asked == ["/api/threads/952/sleep"]
+        assert f"kill-pane -t {pane}" in Path(env["TMUX_LOG"]).read_text()
+        assert pane not in self._panes()
+        assert "検証窓: 1 本寝かせた" in result.stdout
+        assert "pane kill 1 本" in result.stdout
 
 
 def _free_port() -> int:

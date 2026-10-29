@@ -287,12 +287,14 @@ def tree_kb(root: int) -> int:
     return total
 
 
-def ask_api(thread_id: str) -> str | None:
+def ask_api(thread_id):
     """bot の答え (``slept`` / ``not_resident`` / ``HTTP 503`` …)。届かなければ None (#1015)。
 
-    kill に進んでよいのは「届かなかった」ときだけ。bot が答えたなら、それが
-    エラーでも bot はその窓を知っている — 横から kill すると、ミラーが止まって
-    いないので迷子の 👤 行 (#379) が出うるし、「眠った」とも記録されない。
+    kill しないのは、bot がその窓を把握していて寝かせるのに失敗した答え
+    (500 / 503 など) だけ — 横から kill すると、ミラーが止まっていないので迷子の
+    👤 行 (#379) が出うるし、「眠った」とも記録されない。``not_resident`` と 404 は
+    bot がその窓 (スレッド) を持っていない答えで、4 時間スリープ (#572) も同じ
+    経路なので拾わない。だから届かなかったときと同じく pane id 指定で kill する。
     """
     port = os.environ.get("API_PORT", "").strip()
     if not port.isdigit():
@@ -315,6 +317,9 @@ def ask_api(thread_id: str) -> str | None:
     return str(status) if status else "unreadable answer"
 
 
+#: bot がその窓 (スレッド) を持っていない答え — bot も #572 も寝かせられない (#1015)
+BOT_HAS_NO_WINDOW = {"not_resident", "HTTP 404"}
+
 targets = [p for p in panes() if p[2] == owner and p[3] in threads]
 if not targets:
     print("検証窓: 寝かせる窓は無い")
@@ -327,12 +332,13 @@ for pane, _pid, _owner, thread_id in targets:
     if answer == "slept":
         via_api += 1
         continue
-    if answer is not None:
-        # #1015: bot が答えた (not_resident / HTTP エラー) — kill はしない
+    if answer is not None and answer not in BOT_HAS_NO_WINDOW:
+        # #1015: bot は窓を知っていて、寝かせるのに失敗した — kill はしない
         refused.append(f"{thread_id}: {answer}")
         sizes.pop(pane, None)
         continue
-    # API に届かない: この pane だけを id で閉じる (窓・セッション・サーバ単位ではない)
+    # API に届かない / bot がその窓を持っていない: この pane だけを id で閉じる
+    # (窓・セッション・サーバ単位ではない)
     subprocess.run(["tmux", "kill-pane", "-t", pane], capture_output=True, timeout=10)
     via_kill += 1
 for _ in range(20):
@@ -346,7 +352,10 @@ left = len(sizes) - len(closed)
 how = f"API {via_api} 本" + (f" / pane kill {via_kill} 本" if via_kill else "")
 tail = f" — {left} 本は閉じられなかった" if left else ""
 if refused:
-    tail += f" / bot が寝かせなかった {len(refused)} 本は残した（{', '.join(refused)}）"
+    tail += (
+        f" / bot が寝かせられなかった {len(refused)} 本は残した（{', '.join(refused)}）"
+        " — 手で閉じるか bot を直してから release し直す"
+    )
 print(f"検証窓: {len(closed)} 本寝かせた / 約 {mb} MB（{how}）{tail}")
 PYEOF
 }
