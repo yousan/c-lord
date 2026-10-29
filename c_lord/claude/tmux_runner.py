@@ -3197,6 +3197,22 @@ class TmuxClaudeRunner:
         )
         return max(0, yes_idx - cursor_idx)
 
+    @classmethod
+    def _trust_ups_needed(cls, text: str) -> int:
+        """Ups needed when "Yes" sits ABOVE a cursor positively read elsewhere (#990).
+
+        :meth:`_trust_option_offset` only counts Downs, so a numbered dialog with
+        its cursor on ``❯ 2. No, exit`` came out 0 — the same answer as "already
+        on Yes" — and a bare Enter declined trust. 0 here unless the cursor line
+        was actually read.
+        """
+        block = cls._trust_option_block(text)
+        cursor_idx = next((i for i, (sel, _) in enumerate(block) if sel), None)
+        yes_idx = next((i for i, (_, label) in enumerate(block) if label.startswith("Yes")), None)
+        if cursor_idx is None or yes_idx is None:
+            return 0
+        return max(0, cursor_idx - yes_idx)
+
     @staticmethod
     def _has_permission_prompt(text: str) -> bool:
         """Check if the pane shows a permission/approval prompt.
@@ -3277,8 +3293,11 @@ class TmuxClaudeRunner:
 
         Which keys do that depends on the Claude Code version: the older dialog
         starts on "1. Yes, I trust this folder" (bare Enter), the current one
-        starts on "No, exit" (Down, then Enter).  Passing the pane text lets the
-        offset be read off the live dialog instead of assumed — confirming the
+        starts on "No, exit" (Down, then Enter). A numbered dialog found with
+        its cursor on "2. No, exit" gets Up, then Enter (#990) — and only when
+        the pane is positively running claude (#630's corpse is a shell).
+        Passing the pane text lets the offset be read off the live dialog
+        instead of assumed — confirming the
         wrong default makes Claude exit without ever starting the turn.
 
         #684: when a Down is needed, the cursor is **re-read off the pane before
@@ -3302,18 +3321,38 @@ class TmuxClaudeRunner:
         dialog that can never be steered still ends in the #630 abort).
         """
         offset = self._trust_option_offset(pane_text)
+        ups = self._trust_ups_needed(pane_text) if offset <= 0 else 0
         logger.info(
-            "Trust prompt detected, accepting (down=%d, thread=%d)", offset, self._thread_id
+            "Trust prompt detected, accepting (down=%d, up=%d, thread=%d)",
+            offset,
+            ups,
+            self._thread_id,
         )
-        if offset <= 0:
+        if offset <= 0 and ups <= 0:
             # Cursor already on "Yes" (the numbered dialog): a bare Enter, and
             # nothing to verify — there is no navigation that could be lost.
             await self._navigate_menu(0)
             return True
 
+        key = "Down"
+        if ups > 0:
+            # #990: "Yes" is above the cursor. Never lean towards ending claude —
+            # select "Yes" explicitly. But only in a pane positively running
+            # claude: on #630's corpse an Up lands in the shell and recalls its
+            # last command.
+            if not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+                logger.warning(
+                    "Trust prompt: cursor on %r with 'Yes' above it, but the pane is not "
+                    "running claude — sending nothing (#990/#630) (thread=%d)",
+                    self._trust_cursor_label(pane_text),
+                    self._thread_id,
+                )
+                return False
+            key = "Up"
+
         label: str | None = None
         for _ in range(_TRUST_NAV_MAX_DOWNS):
-            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, "Down")
+            await asyncio.to_thread(self._tmux.send_keys, self._thread_id, key)
             await asyncio.sleep(_MENU_NAV_DELAY)
             pane = _normalize_capture(
                 await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
@@ -3324,10 +3363,11 @@ class TmuxClaudeRunner:
                 return True
 
         logger.warning(
-            "Trust prompt: cursor still on %r after %d Down(s) — withholding Enter, "
-            "which would decline trust and exit claude (#684) (thread=%d)",
+            "Trust prompt: cursor still on %r after %d %s(s) — withholding Enter, "
+            "which would decline trust and exit claude (#684/#990) (thread=%d)",
             label,
             _TRUST_NAV_MAX_DOWNS,
+            key,
             self._thread_id,
         )
         return False
