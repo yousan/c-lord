@@ -195,7 +195,14 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
   push していない作業。HEAD（detached を含む）・すべてのローカルブランチ・stash から辿れて、
   `refs/remotes/*` のどれからも辿れないコミットを数える（`git rev-list --count HEAD --branches refs/stash --not --remotes`）。
   1 件でもあれば残す。remote が1つも無いリポジトリでは全コミットがこれに当たる（他にどこにも無いので）。
-  squash マージ後に remote ブランチが prune された作業ブランチもここに入る — 残す側に倒した結果として受け入れる
+  - **push 済みかは remote に聞いて確かめる。** session dir は `main` だけを取る clone なので、作業ブランチを
+    push しても手元に `origin/<branch>` ができず、手元の ref だけでは「未 push」に見える。だから
+    **ほかに残す理由が無い dir だけ**、消す直前に `git ls-remote --heads` で remote のブランチ先端を取り、
+    その先端（とそこから辿れるコミット）に含まれるものは push 済みとして数えない。照合が失敗・タイムアウト
+    （20 秒）したら**残す**（INFO に `(ls-remote failed; …)` と出る）。同じ remote への問い合わせは 60 秒
+    使い回すので、スイープ 1 回でネットワークを叩くのは remote ごとにほぼ 1 回
+  - squash マージ後に remote ブランチが消された作業ブランチは、先端がどの head とも一致しないので**残す**。
+    patch-id などで「マージ済みらしい」と推測して消す側に倒すことはしない
 - **git が無視するファイル** — `.gitignore` / `.git/info/exclude` に当たるもの。`git status --ignored=matching`
   で `!!` として拾い、次のものだけを**作業に数えない**。それ以外（`.env`、`AUDIT.md`、無視された
   `notes/` の中身など）は作業として残す:
@@ -217,6 +224,7 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 
 ```
 session cleanup: keeping /…/1559120173389062204 — 1 unpushed commit(s) on no remote branch (thread=…)
+session cleanup: keeping /…/1559120173389062204 — 1 unpushed commit(s) on no remote branch (ls-remote failed; pushed branches could not be checked) (thread=…)
 session cleanup: keeping /…/1559120173389062204 — uncommitted user work: !! AUDIT.md (thread=…)
 ```
 

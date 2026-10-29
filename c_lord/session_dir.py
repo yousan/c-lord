@@ -26,6 +26,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,10 +44,13 @@ logger = logging.getLogger(__name__)
 _THREAD_DIR_RE = re.compile(r"^\d+$")
 
 
-def _run(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: list[str], cwd: str | None = None, *, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
     return subprocess.run(
         args,
+        input=stdin,
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -158,6 +163,9 @@ class WorktreeStatus:
     #: Commits reachable from HEAD, a local branch or the stash but from no
     #: remote branch (#903); ``None`` when git could not tell. Any is work.
     unpushed_commits: int | None = 0
+    #: ``git ls-remote`` failed or timed out, so pushed branches without a
+    #: tracking ref could not be told apart from unpushed ones (#903).
+    remote_unchecked: bool = False
 
     @property
     def clean(self) -> bool:
@@ -219,26 +227,133 @@ def _ignored_dir_holds_work(path: str, rel: str) -> bool:
     return False
 
 
-def _unpushed_commits(path: str) -> int | None:
-    """How many commits exist here and on no remote branch (#903). ``None``: unknown.
+#: ``git ls-remote`` per remote URL is cached this long (#903). Every session
+#: dir of a channel shares one origin, so a sweep asks the network once, not
+#: once per candidate. Short, because a stale "this head exists" would delete.
+_LS_REMOTE_TTL_SECONDS = 60.0
+#: A remote that does not answer within this is "could not check" — keep.
+_LS_REMOTE_TIMEOUT_SECONDS = 20.0
+_ls_remote_cache: dict[str, tuple[float, frozenset[str]]] = {}
+_ls_remote_lock = threading.Lock()
 
-    Counts from HEAD (a detached commit is on no branch), every local branch,
-    and the stash. A repository with no remote at all counts every commit —
-    there is nowhere else they exist.
+
+def _remote_head_shas(path: str) -> frozenset[str] | None:
+    """Every branch head on every remote of *path*, by asking the remotes (#903).
+
+    A session dir is a single-branch clone: pushing a work branch leaves no
+    ``origin/<branch>`` behind, so ``--remotes`` alone calls it unpushed.
+    ``None`` when any remote could not be asked — the caller then keeps.
     """
-    refs = ["--branches"]
+    remotes = _run(["git", "remote"], cwd=path)
+    if remotes.returncode != 0:
+        return None
+    shas: set[str] = set()
+    for name in remotes.stdout.split():
+        url = _run(["git", "remote", "get-url", "--", name], cwd=path)
+        if url.returncode != 0:
+            return None
+        key = url.stdout.strip()
+        with _ls_remote_lock:
+            cached = _ls_remote_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
+            shas |= cached[1]
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "--heads", "--", name],
+                capture_output=True,
+                text=True,
+                cwd=path,
+                timeout=_LS_REMOTE_TIMEOUT_SECONDS,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        heads = frozenset(line.split()[0] for line in result.stdout.splitlines() if line.strip())
+        with _ls_remote_lock:
+            _ls_remote_cache[key] = (time.monotonic(), heads)
+        shas |= heads
+    return frozenset(shas)
+
+
+def _start_refs(path: str) -> dict[str, str]:
+    """HEAD, every local branch and the stash, as ref → commit."""
+    tips: dict[str, str] = {}
+    branches = _run(
+        ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], cwd=path
+    )
+    for line in branches.stdout.splitlines():
+        sha, _, ref = line.partition(" ")
+        if ref:
+            tips[ref] = sha
     # Named one by one, not ``--glob=refs/stash`` (which means ``refs/stash/*``),
     # and only when present: an unborn HEAD or no stash would fail rev-list.
     for ref in ("HEAD", "refs/stash"):
-        if _run(["git", "rev-parse", "-q", "--verify", ref], cwd=path).returncode == 0:
-            refs.append(ref)
-    result = _run(["git", "rev-list", "--count", *refs, "--not", "--remotes"], cwd=path)
+        found = _run(["git", "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"], cwd=path)
+        if found.returncode == 0:
+            tips[ref] = found.stdout.strip()
+    return tips
+
+
+def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
+    """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
+
+    *also_on* are remote heads. A head whose commit is not in this clone is
+    skipped: a branch pushed from here is present, and one that moved on since
+    no longer vouches for anything — the commits then count, and the dir stays.
+    """
+    if not tips:
+        return 0
+    present = ""
+    if also_on:
+        check = _run(
+            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            cwd=path,
+            stdin="\n".join(also_on),
+        )
+        if check.returncode != 0:
+            return None
+        present = "".join(
+            f"^{line.split()[0]}\n"
+            for line in check.stdout.splitlines()
+            if line.endswith(" commit")
+        )
+    result = _run(
+        ["git", "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
+        cwd=path,
+        stdin=present,
+    )
     if result.returncode != 0:
         return None
     try:
         return int(result.stdout.strip() or "0")
     except ValueError:
         return None
+
+
+def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
+    """How many commits exist here and on no remote branch (#903). ``None``: unknown.
+
+    Counts from HEAD (a detached commit is on no branch), every local branch,
+    and the stash. A repository with no remote at all counts every commit —
+    there is nowhere else they exist.
+
+    With *ask_remote*, a commit at or below a branch head on a remote counts
+    as pushed even without a local tracking ref (``git ls-remote``). Only exact
+    heads — no guessing at squash merges. The second value is ``True`` when
+    the remote could not be asked; the local count is returned then, so the
+    dir is kept.
+    """
+    tips = _start_refs(path)
+    local = _count_not_on(path, sorted(set(tips.values())))
+    if not ask_remote or not local:
+        return local, False
+    heads = _remote_head_shas(path)
+    if heads is None:
+        return local, True
+    return _count_not_on(path, sorted(set(tips.values())), heads), False
 
 
 def _is_clean_worktree(path: str, xy: str, rel: str, depth: int) -> bool:
@@ -297,11 +412,14 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
             continue
         else:
             user.append(line)
+    # The network is asked only when nothing else keeps the dir (#903).
+    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user)
     return WorktreeStatus(
         is_repo=True,
         user_changes=tuple(user),
         clord_files=tuple(clord),
-        unpushed_commits=_unpushed_commits(path),
+        unpushed_commits=unpushed,
+        remote_unchecked=unchecked,
     )
 
 

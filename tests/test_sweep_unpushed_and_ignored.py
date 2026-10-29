@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from c_lord import session_dir
 from c_lord.database.repository import SessionRecord
 from c_lord.orphan_dirs import remove_orphan_dir
 from c_lord.session_cleanup import DirOutcome, remove_clean_session_dir
@@ -141,6 +143,128 @@ def test_a_pushed_branch_is_removed(tmp_path: Path) -> None:
     _git(ws, "push", "-q", "origin", "feature/done")
 
     assert _sweep(ws, tmp_path) is DirOutcome.REMOVED
+
+
+def _single_branch_clone(tmp_path: Path) -> Path:
+    """本物の session dir の形: ``main`` だけを取る clone（#903 相談）。
+
+    ``remote.origin.fetch`` が ``main`` 1本なので、作業ブランチを push しても
+    手元に ``origin/<branch>`` ができない。
+    """
+    ws = _session_clone(tmp_path)
+    shutil.rmtree(ws)
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--single-branch",
+            "-b",
+            "main",
+            str(tmp_path / "origin.git"),
+            str(ws),
+        ],
+        check=True,
+        env=_GIT_ENV,
+    )
+    return ws
+
+
+def test_a_branch_pushed_without_a_tracking_ref_is_removed(tmp_path: Path) -> None:
+    """先端が remote の head と一致すれば push 済み — ``git ls-remote`` で照合する。"""
+    ws = _single_branch_clone(tmp_path)
+    _git(ws, "checkout", "-q", "-b", "feature/done")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "done")
+    _git(ws, "push", "-q", "origin", "feature/done")
+    assert "feature/done" not in _git(ws, "for-each-ref", "refs/remotes")
+
+    assert _sweep(ws, tmp_path) is DirOutcome.REMOVED
+
+
+def test_a_commit_on_top_of_a_pushed_branch_is_kept(tmp_path: Path, caplog) -> None:
+    ws = _single_branch_clone(tmp_path)
+    _git(ws, "checkout", "-q", "-b", "feature/wip")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "pushed")
+    _git(ws, "push", "-q", "origin", "feature/wip")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "not yet")
+
+    with caplog.at_level(logging.INFO, logger="c_lord.session_cleanup"):
+        assert _sweep(ws, tmp_path) is DirOutcome.KEPT_DIRTY
+    assert "1 unpushed commit" in caplog.text
+
+
+def test_a_pushed_branch_with_a_stash_is_kept(tmp_path: Path) -> None:
+    ws = _single_branch_clone(tmp_path)
+    _git(ws, "checkout", "-q", "-b", "feature/done")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "done")
+    _git(ws, "push", "-q", "origin", "feature/done")
+    (ws / "README.md").write_text("half-done\n")
+    _git(ws, "stash", "-q")
+
+    assert _sweep(ws, tmp_path) is DirOutcome.KEPT_DIRTY
+
+
+def test_an_unreachable_remote_keeps_the_dir(tmp_path: Path, caplog) -> None:
+    """照合できなければ「残す」。理由にも照合できなかったことが出る。"""
+    ws = _single_branch_clone(tmp_path)
+    _git(ws, "checkout", "-q", "-b", "feature/done")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "done")
+    _git(ws, "push", "-q", "origin", "feature/done")
+    _git(ws, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    with caplog.at_level(logging.INFO, logger="c_lord.session_cleanup"):
+        assert _sweep(ws, tmp_path) is DirOutcome.KEPT_DIRTY
+    assert "1 unpushed commit" in caplog.text
+    assert "ls-remote failed" in caplog.text
+
+
+def test_an_ls_remote_timeout_keeps_the_dir(tmp_path: Path, monkeypatch) -> None:
+    ws = _single_branch_clone(tmp_path)
+    _git(ws, "checkout", "-q", "-b", "feature/done")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "done")
+    _git(ws, "push", "-q", "origin", "feature/done")
+
+    real_run = subprocess.run
+
+    def hanging_run(args, *a, **kw):
+        if "ls-remote" in args:
+            raise subprocess.TimeoutExpired(args, kw.get("timeout") or 0)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(session_dir.subprocess, "run", hanging_run)
+
+    assert _sweep(ws, tmp_path) is DirOutcome.KEPT_DIRTY
+
+
+def test_ls_remote_runs_only_for_a_dir_that_would_otherwise_be_removed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """消す直前の候補だけ照合する。
+
+    他の理由で残る dir・未 push の無い dir ではネットワークを叩かない。
+    """
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def counting_run(args, *a, **kw):
+        if "ls-remote" in args:
+            calls.append(list(args))
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(session_dir.subprocess, "run", counting_run)
+
+    (tmp_path / "a").mkdir()
+    plain = _single_branch_clone(tmp_path / "a")
+    assert _sweep(plain, tmp_path / "a") is DirOutcome.REMOVED
+    assert calls == []
+
+    (tmp_path / "b").mkdir()
+    dirty = _single_branch_clone(tmp_path / "b")
+    _git(dirty, "checkout", "-q", "-b", "feature/wip")
+    _git(dirty, "commit", "-q", "--allow-empty", "-m", "wip")
+    (dirty / ".env").write_text("SECRET=1\n")
+    assert _sweep(dirty, tmp_path / "b") is DirOutcome.KEPT_DIRTY
+    assert calls == []
 
 
 # ── AC2: git が無視する、利用者のファイル ──────────────────────────────────────

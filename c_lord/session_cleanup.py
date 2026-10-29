@@ -198,7 +198,10 @@ def describe_changes(status: WorktreeStatus) -> str:
     if status.unpushed_commits is None:
         reasons.append("unpushed commits unknown (git rev-list failed)")
     elif status.unpushed_commits:
-        reasons.append(f"{status.unpushed_commits} unpushed commit(s) on no remote branch")
+        reason = f"{status.unpushed_commits} unpushed commit(s) on no remote branch"
+        if status.remote_unchecked:
+            reason += " (ls-remote failed; pushed branches could not be checked)"
+        reasons.append(reason)
     if status.user_changes:
         shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
         more = len(status.user_changes) - _MAX_LOGGED_CHANGES

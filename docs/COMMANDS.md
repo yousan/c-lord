@@ -347,7 +347,7 @@ Each decision is one `[thread=<id>]` INFO line: `thread already archived — swe
 | this thread's clone, but a row that was not swept still points at it | keeps it — INFO `… — still used by another session` (#902) |
 | `git` reports nothing uncommitted or untracked, apart from the files c-lord wrote there itself (#749), no commit sits on no remote branch, and nothing git ignores is left except what a tool rebuilds (#903) | **removes it** |
 | uncommitted or untracked work | keeps it, half-finished edits included |
-| commits (or a stash) on no remote branch — work Claude committed but never pushed (#903) | keeps it — INFO `… — N unpushed commit(s) on no remote branch` |
+| commits (or a stash) on no remote branch — work Claude committed but never pushed (#903). A branch pushed without a local tracking ref is checked with `git ls-remote` and counts as pushed; if the remote cannot be asked, the dir is kept | keeps it — INFO `… — N unpushed commit(s) on no remote branch` |
 | files git ignores that a tool cannot rebuild — `.env`, a runbook hidden by `.git/info/exclude`, notes in an ignored dir (#903) | keeps it — INFO `… — uncommitted user work: !! <name>`. `node_modules/`, `.venv/`, caches and build output do not count; the full list is in [workspace-vocabulary.md](specs/workspace-vocabulary.md#push-していないコミットとgit-が無視するファイル903) |
 | not a git repository, or `git` cannot tell | keeps it — cleanliness cannot be established |
 | a path too shallow to be a session dir (a corrupt row) | keeps it, with a WARNING |
