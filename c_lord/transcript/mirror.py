@@ -1088,7 +1088,15 @@ class TranscriptMirror:
                     turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
                 self._track_background_agents(event)
                 if self._subagent_log is not None:
-                    self._subagent_log.observe_parent(event)
+                    # #1021: the sub-agent log is an extra; whatever goes wrong
+                    # in it must not end this loop, the thread's only delivery.
+                    try:
+                        self._subagent_log.observe_parent(event)
+                    except Exception:
+                        logger.exception(
+                            "TranscriptMirror: sub-agent log failed on a row thread=%d",
+                            self.thread_id,
+                        )
 
                 # #232: bridge an open AskUserQuestion menu regardless of
                 # verbosity / turn-end / who triggered the turn.
