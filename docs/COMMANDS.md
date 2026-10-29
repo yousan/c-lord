@@ -606,4 +606,5 @@ changes nothing (#1081). A body that is not valid UTF-8 is `400 {"error": "Inval
 On `/api/notify` and `/api/schedule`, `channel_id` (optional) must be a positive JSON integer and
 `color` (optional) a JSON integer from `0` to `0xFFFFFF`; strings, floats, booleans, `Infinity` /
 `NaN` are a `400` naming the field, and `/api/schedule` saves nothing. `scheduled_at` must be an
-ISO 8601 string (#1083).
+ISO 8601 string, `message` a non-empty string and `title` (optional) a string (#1083). A
+`channel_id` of `0` or `null` still means the default channel.

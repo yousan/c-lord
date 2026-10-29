@@ -124,7 +124,8 @@ def _optional_channel_and_color(
     was saved as is.
     """
     channel_id: int | None = None
-    if data.get("channel_id") is not None:
+    # Falsy (absent, ``null``, ``0``) means "the default channel", as before.
+    if data.get("channel_id"):
         channel_id = _strict_int(data["channel_id"])
         if channel_id is None or channel_id <= 0:
             return (
@@ -144,6 +145,23 @@ def _optional_channel_and_color(
                 ),
             )
     return channel_id, color, None
+
+
+def _message_and_title(data: dict[str, Any]) -> tuple[str, str | None, web.Response | None]:
+    """``message`` (required) and ``title`` (optional) as text, or the 400.
+
+    Anything else reached SQLite or ``discord.Embed`` unchecked — an integer
+    past 64 bits, a list or an object was a 500 (found reviewing #1083).
+    """
+    message = data.get("message")
+    if not message:
+        return "", None, web.json_response({"error": "message is required"}, status=400)
+    if not isinstance(message, str):
+        return "", None, web.json_response({"error": "message must be a string"}, status=400)
+    title = data.get("title")
+    if title is not None and not isinstance(title, str):
+        return "", None, web.json_response({"error": "title must be a string"}, status=400)
+    return message, title, None
 
 
 # What PATCH /api/tasks/{id} can change — named in the 400 for a body with none (#1066).
@@ -437,9 +455,9 @@ class ApiServer:
         if err is not None:
             return err
 
-        message = data.get("message")
-        if not message:
-            return web.json_response({"error": "message is required"}, status=400)
+        message, title, err = _message_and_title(data)
+        if err is not None:
+            return err
 
         explicit_channel, color, err = _optional_channel_and_color(data)
         if err is not None:
@@ -458,7 +476,6 @@ class ApiServer:
         if not hasattr(raw_channel, "send"):
             return web.json_response({"error": "Channel is not messageable"}, status=400)
 
-        title = data.get("title")
         embed = self._build_embed(message=message, title=title, color=color)
         await raw_channel.send(embed=embed)  # type: ignore[union-attr]
 
@@ -470,11 +487,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        message = data.get("message")
+        message, title, err = _message_and_title(data)
+        if err is not None:
+            return err
         scheduled_at = data.get("scheduled_at")
-
-        if not message:
-            return web.json_response({"error": "message is required"}, status=400)
         if not scheduled_at:
             return web.json_response({"error": "scheduled_at is required"}, status=400)
         if not isinstance(scheduled_at, str):
@@ -499,7 +515,7 @@ class ApiServer:
         notification_id = await self.repo.create(
             message=message,
             scheduled_at=scheduled_str,
-            title=data.get("title"),
+            title=title,
             color=0x00BFFF if color is None else color,
             source="api",
             channel_id=channel_id,

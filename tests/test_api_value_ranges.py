@@ -173,3 +173,31 @@ async def test_good_schedule_and_notify_still_work(env) -> None:  # type: ignore
     resp = await client.post("/api/notify", json={"message": "x", "channel_id": 1, "color": 0})
     assert resp.status == 200
     bot.get_channel.return_value.send.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"title": 2**63}, {"title": {}}, {"message": [1]}, {"title": True}],
+    ids=["title-2^63", "title-object", "message-list", "title-bool"],
+)
+async def test_schedule_message_and_title_must_be_text(env, extra: dict) -> None:  # type: ignore[no-untyped-def]
+    """Found in review: these went into SQLite unchecked — OverflowError / InterfaceError."""
+    client, repo, *_ = env
+    resp = await client.post("/api/schedule", data=json.dumps({**SCHEDULE, **extra}), headers=H)
+    assert resp.status == 400, (resp.status, await resp.text())
+    assert await repo.get_pending() == []
+
+
+@pytest.mark.parametrize("extra", [{"title": {}}, {"message": [1]}])
+async def test_notify_message_and_title_must_be_text(env, extra: dict) -> None:  # type: ignore[no-untyped-def]
+    client, *_ = env
+    resp = await client.post("/api/notify", data=json.dumps({"message": "x", **extra}), headers=H)
+    assert resp.status == 400, (resp.status, await resp.text())
+
+
+async def test_notify_channel_id_0_still_means_the_default_channel(env) -> None:  # type: ignore[no-untyped-def]
+    """``0`` fell back to the default channel before #1083 — keep it that way."""
+    client, _, _, bot = env
+    resp = await client.post("/api/notify", json={"message": "x", "channel_id": 0})
+    assert resp.status == 200
+    bot.get_channel.assert_called_with(1)
