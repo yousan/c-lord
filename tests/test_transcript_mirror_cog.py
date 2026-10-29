@@ -1766,3 +1766,34 @@ async def test_start_for_wires_an_editable_repeat_counter(
         assert mirror._fold._edit is not None
     finally:
         await cog.cog_unload()
+
+
+async def test_start_for_follows_subagents_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#971: an upgrade alone shows a thread's sub-agents (Zero-Config)."""
+    from c_lord.transcript.subagents import SubagentLog
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLORD_SUBAGENT_LOG", raising=False)
+    (tmp_path / ".claude" / "projects" / "-cwd").mkdir(parents=True)
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+    try:
+        cog.start_for(5, "/cwd")
+        assert isinstance(cog._mirrors[5]._subagent_log, SubagentLog)
+    finally:
+        await cog.cog_unload()
+
+
+async def test_subagent_log_can_be_switched_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLORD_SUBAGENT_LOG", "0")
+    (tmp_path / ".claude" / "projects" / "-cwd").mkdir(parents=True)
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+    try:
+        cog.start_for(5, "/cwd")
+        assert cog._mirrors[5]._subagent_log is None
+    finally:
+        await cog.cog_unload()

@@ -64,6 +64,7 @@ from .formatter import (
 )
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
+from .subagents import SubagentLog
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
 logger = logging.getLogger(__name__)
@@ -682,8 +683,12 @@ class TranscriptMirror:
         fold_edit: FoldEdit | None = None,
         expect_turn: bool = False,
         unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
+        subagent_log: SubagentLog | None = None,
     ) -> None:
         self.thread_id = thread_id
+        # #971: the sub-agents' own transcripts, which this tail never reads.
+        # It hears the parent's rows from here and follows the rest itself.
+        self._subagent_log = subagent_log
         self.project_dir = project_dir
         self._sink = sink
         # #539: fills long silences with one self-updating line. Defaults to an
@@ -814,6 +819,8 @@ class TranscriptMirror:
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
         _LIVE_MIRRORS[self.thread_id] = self
+        if self._subagent_log is not None:
+            self._subagent_log.start()
 
     async def stop(self) -> None:
         """Cancel the tail task and wait for it to settle.  Safe to call repeatedly."""
@@ -826,6 +833,9 @@ class TranscriptMirror:
         self._task = None
         if _LIVE_MIRRORS.get(self.thread_id) is self:
             del _LIVE_MIRRORS[self.thread_id]
+        if self._subagent_log is not None:
+            with contextlib.suppress(Exception):
+                await self._subagent_log.stop()
         with contextlib.suppress(Exception):
             await self._progress.end_turn()
         await self._cancel_ask_bridge()
@@ -1072,6 +1082,8 @@ class TranscriptMirror:
                 ):
                     turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
                 self._track_background_agents(event)
+                if self._subagent_log is not None:
+                    self._subagent_log.observe_parent(event)
 
                 # #232: bridge an open AskUserQuestion menu regardless of
                 # verbosity / turn-end / who triggered the turn.

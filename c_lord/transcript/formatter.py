@@ -62,6 +62,9 @@ def _format_tool_use(block: dict[str, Any]) -> str:
         return f"🔧 Grep: `{inp.get('pattern', '')}`"
     if name == "Glob":
         return f"🔧 Glob: `{inp.get('pattern', '')}`"
+    if name in ("Agent", "Task") and inp.get("description"):
+        # #970: which agent this was — the receipt below no longer says.
+        return f"🔧 {name}: {inp.get('description')}"
     return f"🔧 {name}"
 
 
@@ -101,15 +104,25 @@ def _render_assistant(event: dict[str, Any]) -> RenderedEvent | None:
     return RenderedEvent(kind=kind, body="\n".join(parts), session_id=event.get("sessionId"))
 
 
+# #970: what the Agent tool returns when it starts an agent is addressed to
+# Claude — the agent's id, its output file under /tmp and "never quote this to
+# the user" — and progress.txt is read by the user. Same reasoning as #380.
+_AGENT_RECEIPT_PREFIXES = ("Async agent launched successfully", "Spawned successfully")
+AGENT_RECEIPT_BODY = "サブエージェントを起動しました"
+
+
 def _tool_result_body(block: dict[str, Any]) -> str:
     content = block.get("content")
+    text = ""
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
             b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
         )
-    return ""
+    if text.lstrip().startswith(_AGENT_RECEIPT_PREFIXES):
+        return AGENT_RECEIPT_BODY
+    return text
 
 
 # Claude Code bash-mode (``! command``) markers (#487).  A ``!``-prefixed pane
