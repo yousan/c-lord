@@ -41,6 +41,8 @@ def _init_repo(path: Path) -> Path:
         "-m",
         "i",
     )
+    # #903: the commit is on origin, as in a real clone — else it is unpushed work.
+    _git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
     return path
 
 

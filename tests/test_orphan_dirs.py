@@ -54,6 +54,8 @@ def _make_workspace(root: Path, channel: str, thread: str, *, git: bool = True) 
         _git(path, "init", "-q")
         _git(path, "add", "-A")
         _git(path, "commit", "-qm", "init")
+        # #903: the commit is on origin, as in a real clone — else it is unpushed work.
+        _git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
     return path
 
 
