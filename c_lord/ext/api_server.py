@@ -57,23 +57,6 @@ def _not_a_boolean(field: str) -> web.Response:
     return web.json_response({"error": f"{field} must be true or false"}, status=400)
 
 
-def _path_in_session_dirs(raw: str, base: str | None) -> str | None:
-    """*raw* with symlinks and ``..`` resolved, if it lies under *base* — else ``None`` (#1039).
-
-    Checked before the file is even looked at, so a path outside does not
-    learn whether it exists either. No *base* (the API was never told where the
-    session dirs are) means nothing is inside: an unknown boundary must not
-    become "anywhere".
-    """
-    if not base:
-        return None
-    root = os.path.realpath(base)
-    candidate = os.path.realpath(raw)
-    if candidate != root and not candidate.startswith(root.rstrip(os.sep) + os.sep):
-        return None
-    return candidate
-
-
 def _current_uid() -> int | None:
     """Our own UID, or ``None`` where the platform has no such notion."""
     getuid = getattr(os, "getuid", None)
@@ -963,7 +946,17 @@ class ApiServer:
         attachment = None
         progress_ignored = False
         if progress_file:
-            path = _path_in_session_dirs(str(progress_file), self.session_dir_base)
+            # #1039: only a file under the session dirs, symlinks and ``..``
+            # resolved — checked before the file is even looked at, so a path
+            # outside does not learn whether it exists either. No base (never
+            # wired) means nothing is inside: an unknown boundary must not
+            # become "anywhere".
+            path: str | None = None
+            if self.session_dir_base:
+                root = os.path.realpath(self.session_dir_base)
+                candidate = os.path.realpath(str(progress_file))
+                if candidate.startswith(root.rstrip(os.sep) + os.sep):
+                    path = candidate
             if path is None:
                 # Not an error the caller can fix by retrying, and the answer
                 # itself should still arrive — so post without it (#1039).
