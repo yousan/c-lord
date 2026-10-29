@@ -233,7 +233,7 @@ session cleanup: keeping /…/1559120173389062204 — uncommitted user work: !! 
 
 **`/workspace-cleanup` も残した理由を同じ言い方で出す**（#1016）。Discord の「⚠️ Dirty — not removed」欄の
 各行は `` `<パス>` — 2 unpushed commit(s) on no remote branch `` / `` `<パス>` — uncommitted user work: !! .env `` の形で、
-dry run の「Would skip」欄も同じ理由を出す。stash は push していないコミットとは別に `1 stash entry` と書く（#1045。以前は stash のコミットが `2 unpushed commit(s)` と数えられていた）。残すかどうかと理由は**同じ1回の `git status` から**決める（2回取ると、間で `ls-remote` の答えが変わったとき理由が空になった）。`/workspace-delete` で残したときは `ℹ️ Session directory kept — <理由>` と出す。ログは INFO 1 行
+dry run の「Would skip」欄も同じ理由を出す。stash は push していないコミットとは別に `1 stash entry` と書く（#1045。以前は stash のコミットが `2 unpushed commit(s)` と数えられていた）。`refs/stash` が在れば、reflog が空でも（`git reflog expire` の後や `update-ref` で置いた stash）最低1件と数えて残す（#1080。以前は 0 件と数えてフォルダごと stash を消していた）。残すかどうかと理由は**同じ1回の `git status` から**決める（2回取ると、間で `ls-remote` の答えが変わったとき理由が空になった）。`/workspace-delete` で残したときは `ℹ️ Session directory kept — <理由>` と出す。ログは INFO 1 行
 （`Keeping session dir <パス> (thread_id=…) — <理由> (#1016)`）。以前は一律
 「session directory has uncommitted changes」で、`git status` に何も出ないフォルダの理由が分からなかった。
 
