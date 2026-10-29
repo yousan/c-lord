@@ -599,3 +599,11 @@ exist (#1066). A numeric ID sent as `Infinity` / `NaN` (which JSON parsers in Py
 `run_immediately`（`POST`）と `enabled`（`PATCH /api/tasks/{id}`）は JSON の `true` / `false` だけを受け付ける。
 `"false"` や `0` を送ると `400 {"error": "enabled must be true or false"}` が返り、何も変わらない
 （以前は文字列の `"false"` で有効になっていた — #1038）。
+
+Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,
+`channel_id`, `thread_id` or numeric ID in the path is a `400`, and a `PATCH` that fails this way
+changes nothing (#1081). A body that is not valid UTF-8 is `400 {"error": "Invalid JSON"}` (#1082).
+On `/api/notify` and `/api/schedule`, `channel_id` (optional) must be a positive JSON integer and
+`color` (optional) a JSON integer from `0` to `0xFFFFFF`; strings, floats, booleans, `Infinity` /
+`NaN` are a `400` naming the field, and `/api/schedule` saves nothing. `scheduled_at` must be an
+ISO 8601 string (#1083).

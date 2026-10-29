@@ -15,7 +15,6 @@ Security:
 from __future__ import annotations
 
 import hmac
-import json
 import logging
 import os
 import sqlite3
@@ -74,24 +73,77 @@ async def _read_json_object(
     """
     try:
         data = await request.json()
-    except json.JSONDecodeError:
+    except ValueError:
+        # ``JSONDecodeError`` and also ``UnicodeDecodeError`` — a body that is
+        # not UTF-8 is a ``ValueError`` but not a ``JSONDecodeError`` (#1082).
         return {}, web.json_response({"error": "Invalid JSON"}, status=400)
     if not isinstance(data, dict):
         return {}, web.json_response({"error": "Body must be a JSON object"}, status=400)
     return data, None
 
 
+# SQLite's INTEGER is 64-bit signed. A larger value passed ``int()`` and then
+# failed in the INSERT with ``OverflowError`` — a 500, after any earlier write
+# of the same request had already landed (#1081).
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
 def _as_int(value: object) -> int | None:
-    """``int(value)``, or ``None`` when it is not one.
+    """``int(value)``, or ``None`` when it is not one SQLite can hold.
 
     ``json.loads`` accepts ``Infinity`` / ``NaN``, and ``int(float("inf"))``
     raises ``OverflowError`` — which no ``except (TypeError, ValueError)`` caught,
     so the caller got a 500 with no reason (#1065).
     """
     try:
-        return int(value)  # type: ignore[call-overload]
+        number = int(value)  # type: ignore[call-overload]
     except (TypeError, ValueError, OverflowError):
         return None
+    return number if _INT64_MIN <= number <= _INT64_MAX else None
+
+
+def _strict_int(value: object) -> int | None:
+    """*value* if it is a JSON integer SQLite can hold — not a bool, string or float.
+
+    For the fields that never took anything else (#1083): ``/api/schedule``
+    saved ``"1"``, ``1.5`` or ``Infinity`` as a channel id with a 200.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if _INT64_MIN <= value <= _INT64_MAX else None
+
+
+def _optional_channel_and_color(
+    data: dict[str, Any],
+) -> tuple[int | None, int | None, web.Response | None]:
+    """``channel_id`` and ``color`` of a notify / schedule body, or the 400 (#1083).
+
+    Both optional. A channel id is a positive integer; a colour is an RGB
+    integer, 0 to 0xFFFFFF — anything else reached ``discord.Embed`` (a 500) or
+    was saved as is.
+    """
+    channel_id: int | None = None
+    if data.get("channel_id") is not None:
+        channel_id = _strict_int(data["channel_id"])
+        if channel_id is None or channel_id <= 0:
+            return (
+                None,
+                None,
+                web.json_response({"error": "channel_id must be a positive integer"}, status=400),
+            )
+    color: int | None = None
+    if data.get("color") is not None:
+        color = _strict_int(data["color"])
+        if color is None or not 0 <= color <= 0xFFFFFF:
+            return (
+                None,
+                None,
+                web.json_response(
+                    {"error": "color must be an integer from 0 to 0xFFFFFF"}, status=400
+                ),
+            )
+    return channel_id, color, None
 
 
 # What PATCH /api/tasks/{id} can change — named in the 400 for a body with none (#1066).
@@ -389,7 +441,10 @@ class ApiServer:
         if not message:
             return web.json_response({"error": "message is required"}, status=400)
 
-        channel_id = data.get("channel_id") or self.default_channel_id
+        explicit_channel, color, err = _optional_channel_and_color(data)
+        if err is not None:
+            return err
+        channel_id = explicit_channel or self.default_channel_id
         if not channel_id:
             return web.json_response({"error": "No channel specified"}, status=400)
 
@@ -404,7 +459,7 @@ class ApiServer:
             return web.json_response({"error": "Channel is not messageable"}, status=400)
 
         title = data.get("title")
-        embed = self._build_embed(message=message, title=title, color=data.get("color"))
+        embed = self._build_embed(message=message, title=title, color=color)
         await raw_channel.send(embed=embed)  # type: ignore[union-attr]
 
         return web.json_response({"status": "sent"})
@@ -422,6 +477,15 @@ class ApiServer:
             return web.json_response({"error": "message is required"}, status=400)
         if not scheduled_at:
             return web.json_response({"error": "scheduled_at is required"}, status=400)
+        if not isinstance(scheduled_at, str):
+            # ``fromisoformat`` raised TypeError on a number or ``true`` — a 500 (#1083).
+            return web.json_response(
+                {"error": "scheduled_at must be ISO 8601 format"},
+                status=400,
+            )
+        channel_id, color, err = _optional_channel_and_color(data)
+        if err is not None:
+            return err
 
         try:
             dt = datetime.fromisoformat(scheduled_at)
@@ -436,9 +500,9 @@ class ApiServer:
             message=message,
             scheduled_at=scheduled_str,
             title=data.get("title"),
-            color=data.get("color", 0x00BFFF),
+            color=0x00BFFF if color is None else color,
             source="api",
-            channel_id=data.get("channel_id"),
+            channel_id=channel_id,
         )
 
         return web.json_response({"status": "scheduled", "id": notification_id})
@@ -450,9 +514,8 @@ class ApiServer:
 
     async def cancel_scheduled(self, request: web.Request) -> web.Response:
         """DELETE /api/scheduled/{id} — cancel a pending notification."""
-        try:
-            notification_id = int(request.match_info["id"])
-        except (ValueError, KeyError):
+        notification_id = _as_int(request.match_info.get("id"))
+        if notification_id is None:
             return web.json_response({"error": "Invalid ID"}, status=400)
 
         success = await self.repo.cancel(notification_id)
@@ -540,9 +603,8 @@ class ApiServer:
         """DELETE /api/tasks/{id} — remove a scheduled task."""
         if err := self._require_task_repo():
             return err
-        try:
-            task_id = int(request.match_info["id"])
-        except (ValueError, KeyError):
+        task_id = _as_int(request.match_info.get("id"))
+        if task_id is None:
             return web.json_response({"error": "Invalid ID"}, status=400)
 
         deleted = await self.task_repo.delete(task_id)  # type: ignore[union-attr]
@@ -554,9 +616,8 @@ class ApiServer:
         """PATCH /api/tasks/{id} — update a task (enable/disable, prompt, interval)."""
         if err := self._require_task_repo():
             return err
-        try:
-            task_id = int(request.match_info["id"])
-        except (ValueError, KeyError):
+        task_id = _as_int(request.match_info.get("id"))
+        if task_id is None:
             return web.json_response({"error": "Invalid ID"}, status=400)
 
         data, err = await _read_json_object(request)
@@ -861,9 +922,8 @@ class ApiServer:
         Returns (200): ``{"status": "slept" | "not_resident", "thread_id": "..."}``
         — ``not_resident`` when the thread had no window to close.
         """
-        try:
-            thread_id = int(request.match_info["thread_id"])
-        except (KeyError, ValueError):
+        thread_id = _as_int(request.match_info.get("thread_id"))
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         from ..workspace_notice import WorkspaceReason
@@ -911,9 +971,8 @@ class ApiServer:
         Returns (200):
             ``{"status": "sent"}``
         """
-        try:
-            thread_id = int(request.match_info["thread_id"])
-        except (ValueError, KeyError):
+        thread_id = _as_int(request.match_info.get("thread_id"))
+        if thread_id is None:
             return web.json_response({"error": "Invalid thread_id"}, status=400)
 
         data, err = await _read_json_object(request)
