@@ -26,6 +26,7 @@ from ..command_gate import NOT_AUTHORIZED
 from ..discord_ui.authorization import AuthorizedViewMixin, Authorizer, get_default_authorizer
 from ..protocols import DrainAware
 from ..thread_settings import resolve_auto_archive_duration
+from ..voice_webhooks import is_voice_message
 
 logger = logging.getLogger(__name__)
 
@@ -170,8 +171,8 @@ class AutoUpgradeCog(commands.Cog):
         no session into a new conversation, so the trigger never also reaches
         Claude as a request.
         """
-        if not message.webhook_id:
-            return False
+        if not message.webhook_id or is_voice_message(message):
+            return False  # #971: c-lord speaking for a sub-agent triggers nothing
         if (
             self.config.allowed_webhook_ids is not None
             and message.webhook_id not in self.config.allowed_webhook_ids
