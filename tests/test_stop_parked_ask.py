@@ -196,3 +196,26 @@ class TestTheStopRetiresEveryLiveCard:
         with patch("c_lord.cogs.session_manage.retire_menus_for_stop", side_effect=retire):
             await cog.close_workspace_text.callback(cog, helper._ctx(thread))
         assert order == ["kill", "retire", "archive"]
+
+
+async def test_a_new_message_interrupt_is_not_read_as_a_stop() -> None:
+    """A silent interrupt (the next message, #583) also sets ``stopped`` — before
+    its empty answer arrives. The card must still close as "new instruction" and
+    Esc the menu, not as a stop that leaves the menu open in the pane.
+    """
+    question = _question()
+    runner = _runner(question)
+    thread, msg = _thread()
+    task = asyncio.create_task(bridge_pane_ask(thread, question, runner))
+    await asyncio.sleep(0.05)
+
+    runner.stopped = True  # _preempt_prior_turn → interrupt(silent=True)
+    runner.preempted = True
+    await asyncio.sleep(0.05)  # tmux C-c still in flight
+    ask_bus.post_answer(THREAD, [])
+    await asyncio.wait_for(task, 1.0)
+
+    assert ask_bus.closed_reason(THREAD) == "interrupted"
+    runner.cancel_menu.assert_awaited()
+    edits = [c.kwargs.get("content") or "" for c in msg.edit.await_args_list]
+    assert not any("停止" in e for e in edits)

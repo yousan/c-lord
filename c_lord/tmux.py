@@ -115,8 +115,8 @@ WINDOW_PREFIX = "w"
 _LEGACY_WINDOW_PREFIX = "work"
 
 # #677: foreground commands that mean "this pane is an idle shell", i.e. a
-# corpse. Used only by the reaper's untagged branch, where "not claude" is too
-# weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
+# corpse. Used by both reaper branches (untagged #677, tagged #986), where "not
+# claude" is too weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
 # must survive. A login shell reports itself as ``-zsh``.
 _SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"})
 
@@ -1468,12 +1468,13 @@ class TmuxSessionManager:
         """True when **every** pane in *window* sits at a plain shell (#677).
 
         The reaper's untagged branch has no ``@thread_id`` to check against
-        ``active_thread_ids``, so this is the whole of its liveness test — it has
-        to be stricter than :meth:`_window_has_claude`'s "not claude". A window
-        whose panes are all idle shells is a corpse whatever created it; one
-        running anything else (a dev server, a build, a Claude) is somebody's
-        work. A failed probe reads as "not idle", so tmux trouble keeps windows
-        rather than killing them.
+        ``active_thread_ids``, so this is the whole of its liveness test; the
+        tagged branch uses it too (#986). It has to be stricter than
+        :meth:`_window_has_claude`'s "not claude". A window whose panes are all
+        idle shells is a corpse whatever created it; one running anything else
+        (a dev server, a build, a Claude) is somebody's work. A failed probe
+        reads as "not idle", so tmux trouble keeps windows rather than killing
+        them.
         """
         result = _run(
             [
@@ -3781,7 +3782,16 @@ class TmuxSessionManager:
                     thread_id,
                 )
                 continue
-            if self.kill_session(thread_id):
+            # Kill the window just probed, not ``kill_session``'s pick: with two
+            # windows carrying one tag (#501/#649) that is the mapped one, which
+            # may be the busy twin the probe above kept.
+            if target and self._kill_window(target):
+                if self._thread_to_window.get(thread_id) in (target, window.get("window_name")):
+                    self._thread_to_window.pop(thread_id, None)
+                    self._save_mapping()
+                self._log_reaped(window=window, reason=f"thread={thread_id} inactive, idle shell")
+                killed += 1
+            elif not target and self.kill_session(thread_id):
                 self._log_reaped(window=window, reason=f"thread={thread_id} inactive, no Claude")
                 killed += 1
 
