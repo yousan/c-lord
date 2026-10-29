@@ -18,7 +18,10 @@ lamp is adopted by a new manager:
   the transcript says it is over, or a newer turn in the thread takes over — then
   🟡, exactly as a turn that ended in this process would. Past
   :data:`MAX_SECONDS` the watch only slows down (#992): somebody keeps looking
-  at the lamp until the turn ends, so a 🟢 never outlives its turn.
+  at the lamp until the turn ends, so a 🟢 never outlives its turn. A turn
+  whose claude is **positively gone** from the pane can never end — the
+  transcript stays mid-turn for ever — so the watch lets go there, on ⚠️,
+  instead of being carried into every later restart (#870).
 
 Only lamps are touched: the bot's own 🟢/⏳/⚠️. A 🟡 or ❌ is already final.
 Failures are logged and dropped — the lamp is decoration (#632).
@@ -121,12 +124,15 @@ async def adopt_orphaned_lamp(
     max_seconds: float = MAX_SECONDS,
     slow_poll_seconds: float = SLOW_POLL_SECONDS,
     slow_recheck_seconds: float = SLOW_RECHECK_SECONDS,
+    claude_alive: Callable[[], Awaitable[bool]] | None = None,
 ) -> TurnEnd | None:
     """Bring *message*'s orphaned lamp back in line with the turn it belongs to.
 
     *turn_running* answers "is this thread's turn still going?" from the
-    transcript. Returns once the lamp is final (or the watch gave up). Run it
-    as its own task: while the turn is running it waits for the turn's end.
+    transcript. *claude_alive* answers "is there still a claude to end it?" —
+    False only on a positive reading (a pane that cannot be read is alive).
+    Returns once the lamp is final (or the watch let go). Run it as its own
+    task: while the turn is running it waits for the turn's end.
 
     Returns how the turn ended when it reached its end (#907); ``None`` when
     there was no lamp to adopt, a newer turn took over, or the watch failed.
@@ -170,6 +176,14 @@ async def adopt_orphaned_lamp(
                 if not await turn_running():
                     reason = "transcript says the turn is over"
                     break
+                if claude_alive is not None and not await claude_alive():
+                    logger.info(
+                        "%s lamp recovery: claude is gone from the pane, so the turn can "
+                        "never end — letting go of the lamp on ⚠️ (#992)",
+                        ctx,
+                    )
+                    await manager.mark_abandoned()
+                    return None
             if not slowed and now - started >= max_seconds:
                 slowed = True
                 poll_seconds = max(poll_seconds, slow_poll_seconds)

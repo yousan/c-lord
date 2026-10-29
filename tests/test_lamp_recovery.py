@@ -255,3 +255,83 @@ class TestPastTheLongWatch:
         state["running"] = False
         assert await asyncio.wait_for(task, 1) == "ended"
         assert msg.lamps == [EMOJI_WAITING]
+
+
+class TestAWatchWithNoTurnLeft:
+    """#992 review: a turn whose claude died never ends — the watch must not either.
+
+    The transcript stays "mid-turn" for ever once claude is killed mid-tool (host
+    restart, crash, the window slept or stopped). Watching without a cut-off then
+    meant watching for the life of the process, re-recording the thread on every
+    shutdown (#870) and re-adopting it — with a 🔄 line — on every start.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_claude_positively_gone_ends_the_watch_on_warning(self) -> None:
+        msg = _Message(EMOJI_RUNNING)
+
+        async def gone() -> bool:
+            return False
+
+        got = await asyncio.wait_for(
+            adopt_orphaned_lamp(
+                msg, thread_id=9923, turn_running=_running(True), claude_alive=gone, **FAST
+            ),
+            1,
+        )
+        assert got is None  # no 📊 / 🟡 summons: the turn never reached its end
+        assert msg.lamps == [EMOJI_STALL_HARD]
+
+    @pytest.mark.asyncio
+    async def test_a_live_claude_keeps_the_watch(self) -> None:
+        msg = _Message(EMOJI_RUNNING)
+
+        async def alive() -> bool:
+            return True
+
+        task = asyncio.create_task(
+            adopt_orphaned_lamp(
+                msg, thread_id=9924, turn_running=_running(True), claude_alive=alive, **FAST
+            )
+        )
+        await asyncio.sleep(0.2)
+        try:
+            assert not task.done()
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_past_the_cut_off_the_checks_slow_down() -> None:
+    """#992: "watched at the slow pace" — the transcript is re-read far less often."""
+    calls: list[float] = []
+    loop = asyncio.get_running_loop()
+
+    async def check() -> bool:
+        calls.append(loop.time())
+        return True
+
+    msg = _Message(EMOJI_RUNNING)
+    task = asyncio.create_task(
+        adopt_orphaned_lamp(
+            msg,
+            thread_id=9925,
+            turn_running=check,
+            poll_seconds=0.01,
+            recheck_seconds=0.02,
+            max_seconds=0.1,
+            slow_poll_seconds=0.3,
+            slow_recheck_seconds=0.3,
+        )
+    )
+    await asyncio.sleep(0.6)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    start = calls[0]
+    fast = [t for t in calls if t - start < 0.1]
+    slow = [t for t in calls if t - start > 0.2]
+    assert len(fast) >= 3, calls  # every 0.02s before the cut-off
+    assert len(slow) <= 2, calls  # every 0.3s after it — not every 0.02s

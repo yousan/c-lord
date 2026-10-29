@@ -121,6 +121,7 @@ from ..thread_name import thread_lamp_enabled, thread_retitle_enabled, topic_aut
 from ..thread_origin import inspect_origin
 from ..thread_owner import foreign_owner_notice_for
 from ..thread_settings import resolve_auto_archive_duration
+from ..tmux import live_claude_panes
 from ..transcript.claim import adopt_cleared_session, list_transcripts
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
@@ -2946,11 +2947,20 @@ class ClaudeChatCog(commands.Cog):
             async def turn_running() -> bool:
                 return await asyncio.to_thread(stopped_mid_turn, project_dir)
 
+            async def claude_alive() -> bool:
+                # #992: only "tmux answered and no claude is there" is dead;
+                # a tmux that cannot be asked says nothing (#510).
+                live = await asyncio.to_thread(live_claude_panes)
+                return live is None or live.covers(thread.id, working_dir)
+
             # #870: visible to the next shutdown while the watch lasts.
             self._adopted_lamps[thread.id] = message.id
             try:
                 ended = await adopt_orphaned_lamp(
-                    message, thread_id=thread.id, turn_running=turn_running
+                    message,
+                    thread_id=thread.id,
+                    turn_running=turn_running,
+                    claude_alive=claude_alive,
                 )
             finally:
                 if self._adopted_lamps.get(thread.id) == message.id:
