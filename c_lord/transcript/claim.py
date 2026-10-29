@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 #: Name of the claim file inside a project dir.
 CLAIM_FILENAME = ".clord-session"
+#: Every id c-lord has claimed here, oldest first (#994). Proof that a transcript
+#: the claim no longer names is still c-lord's — see the resolver.
+CLAIM_HISTORY_FILENAME = ".clord-session-history"
+_MAX_HISTORY = 32
 
 # The CLI refuses ``--session-id`` unless it is a valid UUID, and the transcript
 # is named after it, so this doubles as the guard that keeps a corrupted claim
@@ -95,7 +99,36 @@ def write_claim(project_dir: Path, session_id: str) -> bool:
         with contextlib.suppress(OSError):
             tmp.unlink()
         return False
+    _remember_claim(project_dir, session_id)
     return True
+
+
+def _remember_claim(project_dir: Path, session_id: str) -> None:
+    """Append *session_id* to the claim history (#994). Best effort."""
+    history = [i for i in read_claim_history(project_dir) if i != session_id]
+    history = [*history, session_id][-_MAX_HISTORY:]
+    target = project_dir / CLAIM_HISTORY_FILENAME
+    tmp = target.with_name(f"{CLAIM_HISTORY_FILENAME}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text("".join(f"{i}\n" for i in history), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        logger.warning(
+            "write_claim: could not update the claim history in %s (%s)", project_dir, exc
+        )
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def read_claim_history(project_dir: Path) -> list[str]:
+    """Every session id c-lord has claimed in ``project_dir``, oldest first (#994)."""
+    try:
+        with (project_dir / CLAIM_HISTORY_FILENAME).open("rb") as f:
+            raw = f.read((_MAX_CLAIM_BYTES // 4) * (_MAX_HISTORY + 1))
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", errors="replace").split()
+    return [line for line in lines if is_session_id(line)][-_MAX_HISTORY:]
 
 
 def read_claim(project_dir: Path) -> str | None:

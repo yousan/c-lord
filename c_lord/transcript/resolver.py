@@ -34,7 +34,9 @@ from .claim import (
     claimed_transcript,
     clear_successor,
     cleared_at,
+    is_session_id,
     read_claim,
+    read_claim_history,
     write_claim,
 )
 
@@ -45,6 +47,13 @@ logger = logging.getLogger(__name__)
 #: the folder-trust dialog is answered — seconds after the mirror starts looking
 #: on the first turn of every new workspace — and that is not a lost transcript.
 CLAIM_GRACE_SECONDS = 120.0
+
+#: How often an orphaned claim looks for the transcript c-lord is really driving
+#: (#994) — the ``/proc`` walk is cheap but not twice-a-second cheap.
+ORPHAN_RECHECK_SECONDS = 30.0
+
+#: Flags that name the session an interactive claude writes to.
+_SESSION_FLAGS = ("--resume", "-r", "--session-id")
 
 # How c-lord recognises *its own* session among the many in a project dir.
 #
@@ -109,6 +118,50 @@ def derive_project_dir(cwd: str, *, projects_root: Path | None = None) -> Path:
         cwd = os.path.realpath(cwd)
     root = projects_root if projects_root is not None else Path.home() / ".claude" / "projects"
     return root / cwd.replace("/", "-").replace(".", "-")
+
+
+def live_session_ids(project_dir: Path, *, proc_root: Path = Path("/proc")) -> set[str]:
+    """Session ids of the interactive claude processes working in ``project_dir`` (#994).
+
+    A process proves which transcript it writes by the id it was started with
+    (``--resume <id>`` / ``--session-id <id>``) and which project by its working
+    directory — the same two facts the CLI derives the jsonl path from. A
+    ``claude -p`` sub-invocation is never the thread's session (#627) and is
+    skipped. Nothing readable (no ``/proc``, another user's process) is no proof.
+    Blocking.
+    """
+    found: set[str] = set()
+    try:
+        entries = [e for e in proc_root.iterdir() if e.name.isdigit()]
+    except OSError:
+        return found
+    for entry in entries:
+        try:
+            argv = [
+                a.decode("utf-8", errors="replace")
+                for a in (entry / "cmdline").read_bytes().split(b"\0")
+                if a
+            ]
+            if not any(os.path.basename(a).startswith("claude") for a in argv[:2]):
+                continue
+            if "-p" in argv or "--print" in argv:
+                continue
+            cwd = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        if derive_project_dir(cwd, projects_root=project_dir.parent).name != project_dir.name:
+            continue
+        for i, arg in enumerate(argv):
+            if arg == "--":
+                break
+            value: str | None = None
+            if arg in _SESSION_FLAGS and i + 1 < len(argv):
+                value = argv[i + 1]
+            elif arg.startswith(("--resume=", "--session-id=")):
+                value = arg.split("=", 1)[1]
+            if value is not None and is_session_id(value):
+                found.add(value)
+    return found
 
 
 def latest_session_jsonl(project_dir: Path) -> Path | None:
@@ -225,6 +278,8 @@ class ThreadSessionResolver:
     _warned_none: bool = False
     # #926: the claimed session id we already said we are waiting for (INFO).
     _noted_waiting_for: str | None = None
+    # #994: when an orphaned claim last looked for the session really running.
+    _orphan_checked_at: float = 0.0
     # The session id c-lord claimed for this project dir, as of the last
     # resolve.  Reported to the reader when nothing resolves (#773), so the
     # message can say whether c-lord even got as far as naming a session.
@@ -320,6 +375,9 @@ class ThreadSessionResolver:
         if self._pinned is None:
             if self._awaiting_claimed_transcript():
                 return None
+            adopted = self._adopt_orphaned_claim(stats)
+            if adopted is not None:
+                return adopted
             if not self._warned_none:
                 self._warned_none = True
                 logger.warning(
@@ -363,6 +421,61 @@ class ThreadSessionResolver:
                 CLAIM_GRACE_SECONDS,
             )
         return True
+
+    def _adopt_orphaned_claim(self, stats: list[tuple[Path, float, int]]) -> Path | None:
+        """Follow the transcript c-lord is really driving when its claim names a ghost (#994).
+
+        A resume that came up a moment after the verdict called it failed left
+        the claim on a fresh start that never ran, while the resumed claude kept
+        writing its own transcript — silent from the next bot restart on. Past
+        :data:`CLAIM_GRACE_SECONDS` without the claimed file, the claim moves to
+        the **one** transcript that (a) has been written since the claim and
+        (b) is provably c-lord's: an id c-lord claimed here before, or the id a
+        live interactive claude in this working directory was started with.
+        Never "whatever is being written" — that is #627's hijack.
+        """
+        claimed_id = self._claimed_session_id
+        if claimed_id is None:
+            return None
+        now = time.time()
+        if now - self._orphan_checked_at < ORPHAN_RECHECK_SECONDS:
+            return None
+        self._orphan_checked_at = now
+        try:
+            claimed_at = claim_path(self.project_dir).stat().st_mtime
+        except OSError:
+            return None
+        fresh = {path.stem: path for path, mtime, _ in stats if mtime > claimed_at}
+        fresh.pop(claimed_id, None)
+        if not fresh:
+            return None
+        proven = set(read_claim_history(self.project_dir)) | live_session_ids(self.project_dir)
+        matches = [fresh[i] for i in fresh if i in proven]
+        if len(matches) != 1:
+            if len(matches) > 1:
+                logger.warning(
+                    "TranscriptMirror: claimed transcript %s.jsonl never appeared in %s and "
+                    "%d c-lord transcripts are being written — not guessing between them (#994)",
+                    claimed_id,
+                    self.project_dir,
+                    len(matches),
+                )
+            return None
+        (path,) = matches
+        if not write_claim(self.project_dir, path.stem):
+            return None
+        logger.warning(
+            "TranscriptMirror: claimed transcript %s.jsonl never appeared in %s, but c-lord's "
+            "session %s is being written — following it and moving the claim (#994)",
+            claimed_id,
+            self.project_dir,
+            path.stem,
+        )
+        self._claimed_session_id = path.stem
+        self._pinned = path
+        self._known_at_pin = set(self._candidates)
+        self._warned_none = False
+        return path
 
     def _awaiting_claim(self) -> bool:
         """True while a brand-new, empty project dir may still be about to get its claim.
