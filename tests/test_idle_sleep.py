@@ -327,7 +327,20 @@ class TestClaudeAtWorkIsNotIdle:
         repo.list_all = AsyncMock(return_value=[rec])
         return repo
 
-    def _transcript(self, tmp_path, *, hours_ago: float, sub: bool = False):
+    def _transcript(
+        self,
+        tmp_path,
+        *,
+        hours_ago: float,
+        sub: bool = False,
+        touched_hours_ago: float | None = None,
+    ):
+        """A transcript whose last event is *hours_ago* old.
+
+        Its mtime matches unless *touched_hours_ago* says the CLI touched the
+        file later without writing an event (#964).
+        """
+        import json
         import os
 
         from c_lord.transcript.resolver import derive_project_dir
@@ -335,8 +348,11 @@ class TestClaudeAtWorkIsNotIdle:
         project = derive_project_dir(str(tmp_path / "w"), projects_root=tmp_path / "projects")
         path = project / ("s/subagents/agent-1.jsonl" if sub else "s.jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n")
-        moment = (NOW - datetime.timedelta(hours=hours_ago)).timestamp()
+        event = NOW - datetime.timedelta(hours=hours_ago)
+        stamp = event.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")  # noqa: UP017 — 3.10
+        path.write_text(json.dumps({"type": "assistant", "timestamp": stamp}) + "\n")
+        touched = hours_ago if touched_hours_ago is None else touched_hours_ago
+        moment = (NOW - datetime.timedelta(hours=touched)).timestamp()
         os.utime(path, (moment, moment))
 
     def _loop(self, cog: _Cog, repo: MagicMock, tmp_path, now=NOW) -> IdleSleepLoop:
@@ -384,6 +400,21 @@ class TestClaudeAtWorkIsNotIdle:
     async def test_a_quiet_workspace_still_sleeps(self, tmp_path) -> None:
         """AC2: no shell, transcript last written before the threshold."""
         self._transcript(tmp_path, hours_ago=5)
+        cog = _Cog()
+        repo = self._repo(tmp_path)
+
+        assert await self._loop(cog, repo, tmp_path).tick() == 1
+        cog._sleep_workspace_impl.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_touched_but_unwritten_transcript_does_not_keep_it_awake(
+        self, tmp_path
+    ) -> None:
+        """#964: Claude Code bumps an idle transcript's mtime about once an hour
+        without writing an event. RED before #964: judged by mtime, no workspace
+        whose ``claude`` was alive ever slept (prod 2026-10-28 21:54〜: 0 sleeps,
+        452 "not slept" lines)."""
+        self._transcript(tmp_path, hours_ago=15, touched_hours_ago=0.5)
         cog = _Cog()
         repo = self._repo(tmp_path)
 
