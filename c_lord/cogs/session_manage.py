@@ -24,6 +24,7 @@ from ..command_gate import NOT_AUTHORIZED, authorize_command
 from ..database.repository import SessionRecord, SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
+from ..discord_ui.ask_handler import retire_menus_for_stop
 from ..discord_ui.authorization import Authorizer, get_default_authorizer
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
@@ -1977,6 +1978,10 @@ class SessionManageCog(commands.Cog):
                     log_ctx(thread_id=thread_id),
                     exc_info=True,
                 )
+
+        # #977: a question card left on screen must not stay pressable in the
+        # archived thread — the turn it asked for is over.
+        await retire_menus_for_stop(thread_id, ask_repo=getattr(self.bot, "ask_repo", None))
 
         # #512: record the close so a later message can tell this apart from a
         # pane that merely died — the latter still auto-resumes via --continue

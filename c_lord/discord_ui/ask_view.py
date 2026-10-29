@@ -37,6 +37,7 @@ import discord
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
+    CLOSE_STOPPED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
     AskAnswerBus,
@@ -75,6 +76,7 @@ _CLOSE_REASON_TEXT = {
     CLOSE_TERMINAL: "この質問はすでに端末（tmux ペイン）側で回答済みです",
     CLOSE_TIMEOUT: "この質問は時間切れで締め切られました",
     CLOSE_INTERRUPTED: "新しい指示が届いたため、この質問は取り消されました",
+    CLOSE_STOPPED: "停止したため、この質問は取り消されました",
 }
 _CLOSED_UNKNOWN = "この質問はすでに閉じられています"
 _CLOSED_RESTARTED = "この質問のあとに bot が再起動したため、セッションが失われました"
