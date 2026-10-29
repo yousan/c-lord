@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .retention import claude_transcript_retention_days
-from .session_dir import WorktreeStatus, worktree_status
+from .session_dir import describe_changes, worktree_status
 from .tmux import release_window_number
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
@@ -179,25 +179,6 @@ class DirOutcome(Enum):
     KEPT_FOREIGN = "kept_foreign"
     """Not this thread's own session dir — a fixed checkout, or still in use (#902)."""
     ABSENT = "absent"
-
-
-#: How many changed paths a "keeping" log line names before it abbreviates.
-_MAX_LOGGED_CHANGES = 5
-
-
-def describe_changes(status: WorktreeStatus) -> str:
-    """Why a directory is being kept, for the INFO line (#749).
-
-    Names the entries, because "uncommitted work" alone read as 80 dirs of user
-    work when 60 of them held nothing but c-lord's own SKILL.md.
-    """
-    if not status.is_repo:
-        return "not a git repo (cannot tell work from leftovers)"
-    shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
-    more = len(status.user_changes) - _MAX_LOGGED_CHANGES
-    if more > 0:
-        shown += f" (+{more} more)"
-    return f"uncommitted user work: {shown}"
 
 
 #: A session dir is always ``<base>/<channel_id>/<thread_id>`` — at least three

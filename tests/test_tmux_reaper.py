@@ -177,6 +177,67 @@ class TestReaperNeverKillsLiveClaude:
         assert fake.killed == []
 
 
+class _ProbeFailsTmux(FakeTmux):
+    """``list-panes`` exits non-zero: tmux did not answer about this window."""
+
+    def __call__(self, argv: list[str], **kwargs: object) -> MagicMock:
+        if "list-panes" in argv:
+            return MagicMock(returncode=1, stdout="", stderr="server busy")
+        return super().__call__(argv, **kwargs)
+
+
+class TestReaperKeepsBusyTaggedWindows:
+    """#986: a *tagged* window is reaped only when every pane is an idle shell.
+
+    docs/specs/tmux-window-reaping.md — 「何かが動いている窓」は消さない（開発サーバでも
+    ビルドでも）, and 「tmux が答えないときは、消さずに残します」. The untagged branch
+    (#677) already used ``_window_is_idle_shell``; the tagged one only asked "is
+    it claude?", so a dev server, or a probe that failed, read as a corpse.
+    """
+
+    def test_tagged_window_running_a_dev_server_survives(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w3"]},
+            thread_ids={"clord:w3": "111"},
+            pane_commands={"clord:w3": "node"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids=set())
+        assert killed == 0
+        assert fake.killed == []
+
+    def test_tagged_window_with_a_busy_second_pane_survives(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w3"]},
+            thread_ids={"clord:w3": "111"},
+            pane_commands={"clord:w3": "zsh\nmake"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids=set())
+        assert killed == 0
+
+    def test_tagged_window_whose_probe_fails_survives(self) -> None:
+        fake = _ProbeFailsTmux(
+            windows={"clord": ["w3"]},
+            thread_ids={"clord:w3": "111"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids=set())
+        assert killed == 0
+        assert fake.killed == []
+
+    def test_tagged_window_at_a_login_shell_is_still_reaped(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w3"]},
+            thread_ids={"clord:w3": "111"},
+            pane_commands={"clord:w3": "-bash"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids=set())
+        assert killed == 1
+        assert fake.killed == ["clord:w3"]
+
+
 class TestReaperCoversEverySession:
     def test_reaps_windows_in_per_repo_sessions(self) -> None:
         """#427: real windows live in per-repo sessions, not the default one.
@@ -633,3 +694,39 @@ class TestInstanceOwner:
         monkeypatch.setenv("CLORD_INSTANCE_ID", "prod;")
         monkeypatch.setattr(tmux_mod, "_instance_owner", None)
         assert tmux_mod.instance_owner() == "prod"
+
+
+class TestReaperKillsTheWindowItProbed:
+    """Two windows carrying one ``@thread_id`` (#501/#649): the idle one is reaped,
+    never its busy twin that the thread→window mapping happens to point at."""
+
+    def test_idle_twin_is_reaped_and_the_busy_one_survives(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w1", "w2"]},
+            thread_ids={"clord:w1": "111", "clord:w2": "111"},
+            pane_commands={"clord:w1": "node", "clord:w2": "zsh"},
+        )
+        mgr = _manager()
+        mgr._thread_to_window[111] = "@1"  # the busy w1
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert fake.killed == ["clord:w2"]
+        assert killed == 1
+        assert mgr._thread_to_window[111] == "@1"
+
+    def test_reaping_the_mapped_window_forgets_the_mapping(self) -> None:
+        fake = FakeTmux(
+            windows={"clord": ["w1"]},
+            thread_ids={"clord:w1": "111"},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        mgr = _manager()
+        mgr._thread_to_window[111] = "@1"
+
+        with patch("c_lord.tmux._run", side_effect=fake):
+            mgr.cleanup_orphaned(active_thread_ids=set())
+
+        assert fake.killed == ["clord:w1"]
+        assert 111 not in mgr._thread_to_window

@@ -549,7 +549,14 @@ class ThreadStatusDashboard:
                 # #583: a turn the user replaced summons nobody.
                 and not preempted
             )
-            known_cause = usage_limit is not None or login_required or model_unavailable is not None
+            # #967: an API error (#908) is a known cause too — its embed carries
+            # the same advice the line would.
+            known_cause = (
+                usage_limit is not None
+                or login_required
+                or model_unavailable is not None
+                or api_error is not None
+            )
             if should_mention and known_cause and already_pinged == mention_id:
                 should_mention = False
                 logger.info(

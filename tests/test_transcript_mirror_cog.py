@@ -1766,3 +1766,78 @@ async def test_start_for_wires_an_editable_repeat_counter(
         assert mirror._fold._edit is not None
     finally:
         await cog.cog_unload()
+
+
+async def test_start_for_follows_subagents_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#971: an upgrade alone shows a thread's sub-agents (Zero-Config)."""
+    from c_lord.transcript.subagents import SubagentLog
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLORD_SUBAGENT_LOG", raising=False)
+    (tmp_path / ".claude" / "projects" / "-cwd").mkdir(parents=True)
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+    try:
+        cog.start_for(5, "/cwd")
+        assert isinstance(cog._mirrors[5]._subagent_log, SubagentLog)
+    finally:
+        await cog.cog_unload()
+
+
+async def test_subagent_log_can_be_switched_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLORD_SUBAGENT_LOG", "0")
+    (tmp_path / ".claude" / "projects" / "-cwd").mkdir(parents=True)
+    cog = TranscriptMirrorCog(MagicMock(), session_repo=_make_repo([]))
+    try:
+        cog.start_for(5, "/cwd")
+        assert cog._mirrors[5]._subagent_log is None
+    finally:
+        await cog.cog_unload()
+
+
+async def test_file_sink_without_quote_attaches_but_does_not_reply(tmp_path: Path) -> None:
+    """#979: a notification-started turn's log rides, the quote-reply does not."""
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog._trigger_messages[42] = 4242
+    file_sink = cog._make_file_sink(42)
+
+    await file_sink("Lap 2", str(progress_file), quote=False)
+    kwargs = channel.send.call_args.kwargs
+    assert kwargs.get("reference") is None
+    assert [getattr(f, "filename", "") for f in kwargs.get("files", [])] == ["progress.txt"]
+
+    channel.send.reset_mock()
+    await file_sink("Lap 2", str(progress_file))
+    assert channel.send.call_args.kwargs.get("reference") is not None
+
+
+def test_the_startup_restore_asks_the_mirror_to_read_back(tmp_path, monkeypatch) -> None:
+    """Review of PR #1018: ``on_ready``'s restore (``expect_turn=False``) is what
+    picks up a turn that crossed the restart; a turn's own start is not (#1011)."""
+    from c_lord.cogs import transcript_mirror as cog_mod
+
+    made: list[dict] = []
+
+    class _Fake:
+        def __init__(self, **kwargs) -> None:
+            made.append(kwargs)
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(cog_mod, "TranscriptMirror", _Fake)
+    cog = cog_mod.TranscriptMirrorCog(MagicMock(), session_repo=MagicMock())
+    cog.start_for(1, str(tmp_path / "a"), expect_turn=False)
+    cog.start_for(2, str(tmp_path / "b"))
+    assert [m["resumed"] for m in made] == [True, False]

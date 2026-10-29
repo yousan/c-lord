@@ -345,8 +345,10 @@ Each decision is one `[thread=<id>]` INFO line: `thread already archived — swe
 |---|---|
 | not this thread's own clone — anything other than `<session dir base>/<channel>/<this thread>/`, e.g. a scheduled task's fixed checkout (#687) or another thread's clone | **never touches it** (#902). INFO `session cleanup: keeping <dir> — not a session dir (fixed checkout)`. The thread's `w{N}` is still freed |
 | this thread's clone, but a row that was not swept still points at it | keeps it — INFO `… — still used by another session` (#902) |
-| `git` reports nothing uncommitted or untracked, apart from the files c-lord wrote there itself (#749) | **removes it** |
+| `git` reports nothing uncommitted or untracked, apart from the files c-lord wrote there itself (#749), no commit sits on no remote branch, and nothing git ignores is left except what a tool rebuilds (#903) | **removes it** |
 | uncommitted or untracked work | keeps it, half-finished edits included |
+| commits (or a stash) on no remote branch — work Claude committed but never pushed (#903). A branch pushed without a local tracking ref is checked with `git ls-remote` and counts as pushed; if the remote cannot be asked, the dir is kept | keeps it — INFO `… — N unpushed commit(s) on no remote branch` |
+| files git ignores that a tool cannot rebuild — `.env`, a runbook hidden by `.git/info/exclude`, notes in an ignored dir (#903) | keeps it — INFO `… — uncommitted user work: !! <name>`. `node_modules/`, `.venv/`, caches and build output do not count; the full list is in [workspace-vocabulary.md](specs/workspace-vocabulary.md#push-していないコミットとgit-が無視するファイル903) |
 | not a git repository, or `git` cannot tell | keeps it — cleanliness cannot be established |
 | a path too shallow to be a session dir (a corrupt row) | keeps it, with a WARNING |
 
@@ -534,6 +536,7 @@ user never needs a header. Anything else gets `403`.
 | `DELETE` | `/api/tasks/{id}` | Remove a scheduled task |
 | `POST` | `/api/spawn` | Create a new thread and start Claude Code |
 | `POST` | `/api/threads/{thread_id}/messages` | Post a message to a Discord thread |
+| `POST` | `/api/threads/{thread_id}/sleep` | Put the thread's workspace to sleep — the same sleep as the 4-hour idle one (#572): the Claude window closes and the next message resumes it without a word. Returns `{"status": "slept"}` or `"not_resident"` (no window). `scripts/staging.sh release` uses it (#955) |
 | `POST` | `/api/mark-resume` | Mark a thread for resumption after restart |
 | `GET` | `/api/lounge` | List recent AI Lounge messages. Sessions are not told the lounge exists, so nothing posts here unless you set that up (#758) |
 | `POST` | `/api/lounge` | Post a message to the AI Lounge. No c-lord component calls this today — the lounge context is not delivered to sessions (#758) |
@@ -580,3 +583,7 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
     "channel_id": 123456789
   }'
 ```
+
+`interval_seconds` and `channel_id` must be integers — anything else is a `400` naming the field.
+`409` means only that a task with that `name` already exists. Every endpoint that reads a body
+answers `400 {"error": "Body must be a JSON object"}` to valid JSON that is not an object (#1037).

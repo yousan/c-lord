@@ -24,6 +24,7 @@ from ..command_gate import NOT_AUTHORIZED, authorize_command
 from ..database.repository import SessionRecord, SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
+from ..discord_ui.ask_handler import retire_menus_for_stop
 from ..discord_ui.authorization import Authorizer, get_default_authorizer
 from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
 from ..discord_ui.pane_renderer import render_pane_png
@@ -1187,7 +1188,8 @@ class SessionManageCog(commands.Cog):
                 if d.is_clean:
                     candidates.append(d)
                 else:
-                    skipped.append((d, "dirty"))
+                    # #1016: the same reason the real run would give.
+                    skipped.append((d, d.kept_reason or "dirty"))
 
             embed = discord.Embed(
                 title="📁 ワークスペースの作業ディレクトリ回収 — Dry Run",
@@ -1217,13 +1219,11 @@ class SessionManageCog(commands.Cog):
             all_results.extend(results)
 
         removed = [r for r in all_results if r.removed]
-        dirty = [r for r in all_results if not r.removed and "uncommitted changes" in r.reason]
+        dirty = [r for r in all_results if r.kept_work]
         other_skipped = [
             r
             for r in all_results
-            if not r.removed
-            and "uncommitted changes" not in r.reason
-            and r.reason != "session is still active"
+            if not r.removed and not r.kept_work and r.reason != "session is still active"
         ]
 
         color = COLOR_SUCCESS if removed else COLOR_INFO
@@ -1242,7 +1242,7 @@ class SessionManageCog(commands.Cog):
         if dirty:
             embed.add_field(
                 name=f"⚠️ Dirty — not removed ({len(dirty)})",
-                value=_fit_field_lines([f"`{r.path}`" for r in dirty]),
+                value=_fit_field_lines([f"`{r.path}` — {r.reason}" for r in dirty]),
                 inline=False,
             )
         if other_skipped:
@@ -1740,7 +1740,9 @@ class SessionManageCog(commands.Cog):
             if cleanup.removed:
                 results.append(f"✅ Session directory removed: `{cleanup.path}`")
             else:
-                results.append(f"ℹ️ Session directory: {cleanup.reason}")
+                # #1016: the reason now names the work, not "skipped" — say so.
+                sep = " kept — " if cleanup.kept_work else ": "
+                results.append(f"ℹ️ Session directory{sep}{cleanup.reason}")
 
         if not results:
             results.append(
@@ -1977,6 +1979,10 @@ class SessionManageCog(commands.Cog):
                     log_ctx(thread_id=thread_id),
                     exc_info=True,
                 )
+
+        # #977: a question card left on screen must not stay pressable in the
+        # archived thread — the turn it asked for is over.
+        await retire_menus_for_stop(thread_id, ask_repo=getattr(self.bot, "ask_repo", None))
 
         # #512: record the close so a later message can tell this apart from a
         # pane that merely died — the latter still auto-resumes via --continue

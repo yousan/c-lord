@@ -18,14 +18,16 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
 from .. import api_endpoint
 from ..log_sampler import LogSampler
+from ..utils.logger import log_ctx
 from .peer_uid import resolve_peer_uid
 
 if TYPE_CHECKING:
@@ -50,6 +52,23 @@ def _current_uid() -> int | None:
     """Our own UID, or ``None`` where the platform has no such notion."""
     getuid = getattr(os, "getuid", None)
     return getuid() if getuid is not None else None
+
+
+async def _read_json_object(
+    request: web.Request,
+) -> tuple[dict[str, Any], web.Response | None]:
+    """The request body as a JSON object, or the 400 to answer with.
+
+    Valid JSON that is not an object (``[1]``, ``"text"``) used to reach
+    ``data.get`` and come back as a 500 (#1037).
+    """
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return {}, web.json_response({"error": "Invalid JSON"}, status=400)
+    if not isinstance(data, dict):
+        return {}, web.json_response({"error": "Body must be a JSON object"}, status=400)
+    return data, None
 
 
 class ApiServer:
@@ -142,6 +161,8 @@ class ApiServer:
         self.app.router.add_post("/api/spawn", self.spawn)
         # Thread message route (CLI input forwarding)
         self.app.router.add_post("/api/threads/{thread_id}/messages", self.post_thread_message)
+        # #955: staging's release puts its verification windows to sleep
+        self.app.router.add_post("/api/threads/{thread_id}/sleep", self.sleep_thread)
         # Issue #52: Skill-based final reply (clean content, no source prefix)
         self.app.router.add_post("/api/reply", self.reply)
         # Issue #63: Skill-based interactive choice prompt
@@ -329,10 +350,9 @@ class ApiServer:
 
     async def notify(self, request: web.Request) -> web.Response:
         """POST /api/notify — send an immediate notification."""
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         message = data.get("message")
         if not message:
@@ -360,10 +380,9 @@ class ApiServer:
 
     async def schedule(self, request: web.Request) -> web.Response:
         """POST /api/schedule — schedule a notification for later."""
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         message = data.get("message")
         scheduled_at = data.get("scheduled_at")
@@ -439,26 +458,34 @@ class ApiServer:
         """
         if err := self._require_task_repo():
             return err
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         for field in ("name", "prompt", "interval_seconds", "channel_id"):
             if not data.get(field):
                 return web.json_response({"error": f"{field} is required"}, status=400)
 
+        numbers: dict[str, int] = {}
+        for field in ("interval_seconds", "channel_id"):
+            try:
+                numbers[field] = int(data[field])
+            except (TypeError, ValueError):
+                # Not a name clash: answering 409 here sent callers looking for a
+                # task that did not exist (#1037).
+                return web.json_response({"error": f"{field} must be an integer"}, status=400)
+
         try:
             task_id = await self.task_repo.create(  # type: ignore[union-attr]
                 name=str(data["name"]),
                 prompt=str(data["prompt"]),
-                interval_seconds=int(data["interval_seconds"]),
-                channel_id=int(data["channel_id"]),
+                interval_seconds=numbers["interval_seconds"],
+                channel_id=numbers["channel_id"],
                 working_dir=data.get("working_dir"),
                 run_immediately=bool(data.get("run_immediately", True)),
             )
-        except Exception as exc:
-            # Most likely a UNIQUE constraint violation on name
+        except sqlite3.IntegrityError as exc:
+            # The UNIQUE constraint on name.
             logger.warning("Failed to create task: %s", exc)
             return web.json_response({"error": "Task name already exists"}, status=409)
 
@@ -495,10 +522,9 @@ class ApiServer:
         except (ValueError, KeyError):
             return web.json_response({"error": "Invalid ID"}, status=400)
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         updated = False
         if "enabled" in data:
@@ -509,7 +535,12 @@ class ApiServer:
         if "prompt" in data:
             patch_kwargs["prompt"] = str(data["prompt"])
         if "interval_seconds" in data:
-            patch_kwargs["interval_seconds"] = int(data["interval_seconds"])
+            try:
+                patch_kwargs["interval_seconds"] = int(data["interval_seconds"])
+            except (TypeError, ValueError):
+                return web.json_response(
+                    {"error": "interval_seconds must be an integer"}, status=400
+                )
         if "working_dir" in data:
             patch_kwargs["working_dir"] = str(data["working_dir"])
 
@@ -577,10 +608,9 @@ class ApiServer:
         if err := self._require_lounge_repo():
             return err
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         message = data.get("message", "").strip()
         if not message:
@@ -627,10 +657,9 @@ class ApiServer:
         Returns (201):
             ``{"status": "spawned", "thread_id": "...", "thread_name": "..."}``
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         prompt = (data.get("prompt") or "").strip()
         if not prompt:
@@ -722,10 +751,9 @@ class ApiServer:
         if err := self._require_resume_repo():
             return err
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         raw_thread_id = data.get("thread_id")
         if not raw_thread_id:
@@ -773,6 +801,55 @@ class ApiServer:
         return web.json_response({"status": "marked", "id": row_id}, status=201)
 
     # ------------------------------------------------------------------
+    # Thread sleep endpoint (/api/threads/{thread_id}/sleep) — #955
+    # ------------------------------------------------------------------
+
+    async def sleep_thread(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/sleep — put one workspace to sleep (#955).
+
+        The same sleep as the 4-hour idle one (#572): the mirror is stopped
+        before the window is killed (#379) and the next message resumes
+        without a word. ``scripts/staging.sh release`` calls this for the
+        threads it spawned during its lease, so a finished verification stops
+        holding ~300 MB per window. Never a second implementation of sleep —
+        it goes through ``SessionManageCog._sleep_workspace_impl``.
+
+        Returns (200): ``{"status": "slept" | "not_resident", "thread_id": "..."}``
+        — ``not_resident`` when the thread had no window to close.
+        """
+        try:
+            thread_id = int(request.match_info["thread_id"])
+        except (KeyError, ValueError):
+            return web.json_response({"error": "thread_id must be an integer"}, status=400)
+
+        from ..workspace_notice import WorkspaceReason
+
+        cog = self.bot.cogs.get("SessionManageCog")
+        impl = getattr(cog, "_sleep_workspace_impl", None)
+        if impl is None:
+            return web.json_response({"error": "SessionManageCog is not loaded"}, status=503)
+
+        channel = self.bot.get_channel(thread_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(thread_id)
+            except Exception as exc:
+                logger.info(
+                    "%s sleep: thread is not reachable (%s)", log_ctx(thread_id=thread_id), exc
+                )
+                return web.json_response({"error": "thread not found"}, status=404)
+
+        try:
+            slept = bool(await impl(channel=channel, reason=WorkspaceReason.MANUAL))
+        except Exception as exc:
+            logger.exception("%s sleep: failed", log_ctx(thread_id=thread_id))
+            return web.json_response({"error": str(exc)}, status=500)
+
+        status = "slept" if slept else "not_resident"
+        logger.info("%s sleep via API: %s", log_ctx(thread_id=thread_id), status)
+        return web.json_response({"status": status, "thread_id": str(thread_id)})
+
+    # ------------------------------------------------------------------
     # Thread message endpoint (/api/threads/{thread_id}/messages)
     # ------------------------------------------------------------------
 
@@ -795,10 +872,9 @@ class ApiServer:
         except (ValueError, KeyError):
             return web.json_response({"error": "Invalid thread_id"}, status=400)
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         content = (data.get("content") or "").strip()
         if not content:
@@ -843,10 +919,9 @@ class ApiServer:
             400 on validation errors (missing / empty fields, missing file).
             404 if the thread cannot be resolved.
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
@@ -967,10 +1042,9 @@ class ApiServer:
             400 on validation errors.
             404 if the thread cannot be resolved.
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:

@@ -31,7 +31,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -58,12 +58,14 @@ from .formatter import (
     TASK_NOTIFICATION_BODY_PREFIX,
     ZWSP_MARKER,
     RenderedEvent,
+    is_harness_user_record,
     is_task_notification,
     local_command_record,
     render_event,
 )
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
+from .subagents import SubagentLog
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
 logger = logging.getLogger(__name__)
@@ -614,6 +616,12 @@ def has_pending_final(thread_id: int) -> bool:
     return mirror is not None and mirror._holding_final
 
 
+def background_agents_running(thread_id: int) -> int:
+    """How many background agents *thread_id*'s mirror knows are still out (#1012)."""
+    mirror = _LIVE_MIRRORS.get(thread_id)
+    return len(mirror._background_agents) if mirror is not None else 0
+
+
 _AGENT_LAUNCHED_RE = re.compile(r"Async agent launched successfully.*?agentId:\s*(\w+)", re.DOTALL)
 _TASK_ID_RE = re.compile(r"<task-id>\s*(\w+)\s*</task-id>")
 
@@ -644,19 +652,96 @@ def _launched_agent_ids(event: dict) -> list[str]:
     return ids
 
 
-def _reported_task_id(event: dict) -> str | None:
-    """The id of the background task a ``<task-notification>`` event reports on (#917).
+def _reported_task_ids(event: dict) -> list[str]:
+    """The ids of the background tasks a ``<task-notification>`` event reports on (#917).
 
     Claude Code queues one when an agent (or background command) stops, whatever
     its status — completed, failed, killed — so all of them release the agent.
+    On ``--resume`` it reports every agent that died with the previous process
+    in **one** notification, one ``<task-id>`` each (#1042): all of them count.
     """
     if event.get("type") != "queue-operation" or event.get("operation") != "enqueue":
-        return None
+        return []
     content = event.get("content")
     if not isinstance(content, str) or "<task-notification>" not in content:
-        return None
-    match = _TASK_ID_RE.search(content)
-    return match.group(1) if match else None
+        return []
+    return _TASK_ID_RE.findall(content)
+
+
+#: How much of the transcript a restored mirror reads back (#1011/#1012). An
+#: agent launched further back than this is not counted.
+_READ_BACK_MAX_BYTES = 16 * 1024 * 1024
+
+
+_READ_BACK_CHUNK = 1024 * 1024
+
+
+def _read_back_lines(path: Path, end: int | None) -> Iterator[bytes]:
+    """The whole lines of *path* in the last ``_READ_BACK_MAX_BYTES`` before *end*.
+
+    Chunked, so a restart that restores hundreds of mirrors at once does not
+    hold 16 MiB per mirror in memory. Raises ``OSError``.
+    """
+    with path.open("rb") as f:
+        stop = f.seek(0, os.SEEK_END) if end is None else end
+        start = max(0, stop - _READ_BACK_MAX_BYTES)
+        f.seek(start)
+        partial = b""
+        first = start > 0  # the tail of a line that began before the window
+        left = stop - start
+        while left > 0:
+            chunk = f.read(min(_READ_BACK_CHUNK, left))
+            if not chunk:
+                break
+            left -= len(chunk)
+            lines = (partial + chunk).split(b"\n")
+            partial = lines.pop()
+            if first and lines:
+                lines = lines[1:]
+                first = False
+            yield from lines
+        if partial and not first:
+            yield partial
+
+
+def _turn_state_at_end(path: Path, end: int | None = None) -> tuple[str | None, set[str]]:
+    """Who opened the turn still open at *end* of *path*, and the agents still out.
+
+    ``("person" | "notification" | None, agent ids)``. Replays the live loop's
+    own rules (#913/#979/#917) over what the old process already read, so a
+    mirror restored after a restart picks up where it left off (#1011/#1012).
+    *end* is where the tail starts (#1018); ``None`` reads to the end of file.
+    Blocking; ``(None, set())`` when the file cannot be read.
+    """
+    try:
+        lines = list(_read_back_lines(path, end))
+    except OSError:
+        return None, set()
+    opened_by: str | None = None
+    spoke = False
+    agents: set[str] = set()
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue  # blank, torn or garbage — not evidence either way
+        if not isinstance(event, dict):
+            continue
+        agents.update(_launched_agent_ids(event))
+        agents.difference_update(_reported_task_ids(event))
+        if _is_user_prompt(event):
+            kind = _prompt_kind(event)
+            if kind == "person" and is_harness_user_record(event):
+                kind = None
+            if kind == "person" or (kind == "notification" and opened_by is None):
+                opened_by = kind
+            if kind is not None:
+                spoke = False
+        if event.get("type") == "assistant" and not event.get("isSidechain"):
+            spoke = True
+        if _is_turn_end(event) or (local_command_record(event) == "output" and not spoke):
+            opened_by = None
+    return opened_by, agents
 
 
 class TranscriptMirror:
@@ -682,8 +767,13 @@ class TranscriptMirror:
         fold_edit: FoldEdit | None = None,
         expect_turn: bool = False,
         unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
+        subagent_log: SubagentLog | None = None,
+        resumed: bool = False,
     ) -> None:
         self.thread_id = thread_id
+        # #971: the sub-agents' own transcripts, which this tail never reads.
+        # It hears the parent's rows from here and follows the rest itself.
+        self._subagent_log = subagent_log
         self.project_dir = project_dir
         self._sink = sink
         # #539: fills long silences with one self-updating line. Defaults to an
@@ -743,12 +833,19 @@ class TranscriptMirror:
         # answer is not a reply to the last one.
         self._turn_open = expect_turn
         self._turn_by_notification = False
+        # #979: has Claude written anything since the prompt that opened the
+        # turn? A slash command typed in the pane opens one too, and writes no
+        # ``turn_duration`` — when it was only that, its output closes it.
+        self._model_spoke = False
         # #912: the Discord message that asked for the turn c-lord accepted last,
         # and the one that asked for the turn the transcript is in. They differ
         # from the moment a new instruction is accepted until Claude reads it —
         # exactly when an interrupted turn's held text gets flushed.
         self._latest_trigger: int | None = None
         self._turn_trigger: int | None = None
+        # #1011/#1012: restored at startup — the tail starts at the end of a
+        # transcript the old process was reading, so learn where it stood.
+        self._resumed = resumed
 
     def note_turn_started(self, trigger_id: int | None = None) -> None:
         """Tell the progress line a turn just began (#539).
@@ -814,6 +911,8 @@ class TranscriptMirror:
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
         _LIVE_MIRRORS[self.thread_id] = self
+        if self._subagent_log is not None:
+            self._subagent_log.start()
 
     async def stop(self) -> None:
         """Cancel the tail task and wait for it to settle.  Safe to call repeatedly."""
@@ -826,6 +925,9 @@ class TranscriptMirror:
         self._task = None
         if _LIVE_MIRRORS.get(self.thread_id) is self:
             del _LIVE_MIRRORS[self.thread_id]
+        if self._subagent_log is not None:
+            with contextlib.suppress(Exception):
+                await self._subagent_log.stop()
         with contextlib.suppress(Exception):
             await self._progress.end_turn()
         await self._cancel_ask_bridge()
@@ -839,12 +941,45 @@ class TranscriptMirror:
         """
         await self._progress.end_turn()
 
+    async def _read_back(self, jsonl: Path | None, end: int) -> None:
+        """Start where the old process left off: the open turn and agents out (#1011/#1012).
+
+        Without it a person's turn that crossed the restart read as closed: a
+        notification landing in it counted as a turn Claude started by itself
+        (a second turn-end event, the person's answer unquoted), and agents it
+        had launched were not waited for. Called by the tail with the transcript
+        and offset it starts from, before it yields anything (#1018): reading
+        to any other point would lose (or double) what Claude writes meanwhile.
+        Never raises — a mirror that could not read back still delivers.
+        """
+        if jsonl is None:
+            return
+        try:
+            opened_by, agents = await asyncio.to_thread(_turn_state_at_end, jsonl, end)
+        except Exception:
+            logger.warning(
+                "%s TranscriptMirror: could not read back the transcript (#1011)",
+                log_ctx(thread_id=self.thread_id),
+                exc_info=True,
+            )
+            return
+        self._background_agents |= agents
+        if opened_by is not None:
+            self._turn_open = True
+            self._turn_by_notification = opened_by == "notification"
+        if opened_by is not None or agents:
+            logger.info(
+                "%s TranscriptMirror: resumed mid-turn (opened by %s, %d background agent(s) "
+                "out) (#1011/#1012)",
+                log_ctx(thread_id=self.thread_id),
+                opened_by or "nobody",
+                len(agents),
+            )
+
     def _track_background_agents(self, event: dict) -> None:
         """Keep the set of background agents that have not yet reported back (#917)."""
         self._background_agents.update(_launched_agent_ids(event))
-        reported = _reported_task_id(event)
-        if reported is not None:
-            self._background_agents.discard(reported)
+        self._background_agents.difference_update(_reported_task_ids(event))
 
     async def _cancel_ask_bridge(self) -> None:
         t = self._ask_bridge_task
@@ -1015,6 +1150,7 @@ class TranscriptMirror:
                 poll_interval=self._poll_interval,
                 on_unresolved=self._on_unresolved,
                 unresolved_after=self._unresolved_after,
+                on_start=self._read_back if self._resumed else None,
             ):
                 await queue.put(event)
 
@@ -1072,6 +1208,16 @@ class TranscriptMirror:
                 ):
                     turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
                 self._track_background_agents(event)
+                if self._subagent_log is not None:
+                    # #1021: the sub-agent log is an extra; whatever goes wrong
+                    # in it must not end this loop, the thread's only delivery.
+                    try:
+                        self._subagent_log.observe_parent(event)
+                    except Exception:
+                        logger.exception(
+                            "TranscriptMirror: sub-agent log failed on a row thread=%d",
+                            self.thread_id,
+                        )
 
                 # #232: bridge an open AskUserQuestion menu regardless of
                 # verbosity / turn-end / who triggered the turn.
@@ -1087,12 +1233,22 @@ class TranscriptMirror:
                     # #913: a notification only *starts* a turn between turns;
                     # one that lands in a person's turn leaves it theirs.
                     started_by = _prompt_kind(event)
+                    # #979: the harness's own rows of a command typed in the pane
+                    # (``<command-name>``, its output, the compaction summary)
+                    # are nobody's request.
+                    if started_by == "person" and is_harness_user_record(event):
+                        started_by = None
                     if started_by == "person":
                         self._turn_by_notification = False
                     elif started_by == "notification" and not self._turn_open:
                         self._turn_by_notification = True
+                        # #961: no runner will announce this turn's end.
+                        turn_events.note_self_turn_started(self.thread_id, at=_event_time(event))
                     if started_by is not None:
                         self._turn_open = True
+                        self._model_spoke = False
+                if event.get("type") == "assistant" and not event.get("isSidechain"):
+                    self._model_spoke = True
 
                 if _is_turn_end(event):
                     # #773: nobody is waiting on this mirror until the next turn.
@@ -1132,7 +1288,11 @@ class TranscriptMirror:
                     if not event.get("isSidechain"):
                         # #917: after the answer is out, before the runner hears
                         # of the end — see :func:`turn_events.note_turn_end`.
-                        turn_events.note_turn_end(self.thread_id, len(self._background_agents))
+                        turn_events.note_turn_end(
+                            self.thread_id,
+                            len(self._background_agents),
+                            self_started=self._turn_by_notification,
+                        )
                         turn_end_bus.mark(self.thread_id, at=_event_time(event))
                     continue
 
@@ -1221,6 +1381,11 @@ class TranscriptMirror:
                 local_command = local_command_record(event)
                 if local_command == "output":
                     await self._progress.end_turn()
+                    # #979: …nor does anything else, so a "turn" that was only
+                    # the command ends here. Left open, the next turn a
+                    # notification starts read as the person's.
+                    if not self._model_spoke:
+                        self._turn_open = False
                 elif local_command is None and (is_tool or opened or closed):
                     self._progress.begin_turn()
                     self._progress.note_activity(
@@ -1297,7 +1462,10 @@ class TranscriptMirror:
                     if rendered.kind in _BUFFERED_KINDS:
                         # Tool event: if there's pending text, it was intermediate.
                         await _flush_pending_silently()
-                        progress_buf.append(_format_body(rendered))
+                        # #979: a command typed in the pane is not Claude's work;
+                        # buffered, it became the next answer's progress.txt.
+                        if local_command is None:
+                            progress_buf.append(_format_body(rendered))
                     elif rendered.kind == "assistant_text":
                         body = _format_body(rendered)
                         # #399 AC3: the CLI flushes the prose preceding an
@@ -1502,7 +1670,11 @@ class TranscriptMirror:
         await self._progress.end_turn()
         target = {} if reply_to is None else {"reply_to": reply_to}
         if _has_tool_lines(progress) and self._file_sink is not None:
-            await self._flush_with_progress(text, progress, **target)
+            if self._turn_by_notification:
+                # #979: still not a reply (#913) — the log rides, the quote does not.
+                await self._flush_with_progress(text, progress, quote=False)
+            else:
+                await self._flush_with_progress(text, progress, **target)
         elif self._turn_by_notification:
             # #913: nobody asked — "Still running." after a Monitor event is
             # not an answer to the last message, so it is not quoted under it.
@@ -1512,7 +1684,9 @@ class TranscriptMirror:
         else:
             await self._try_sink(text)
 
-    async def _flush_with_progress(self, body: str, progress_buf: list[str], **target: int) -> None:
+    async def _flush_with_progress(
+        self, body: str, progress_buf: list[str], **target: int | bool
+    ) -> None:
         """Write buffered tool lines to a tempfile and call file_sink."""
         await self._progress.note_output()
         assert self._file_sink is not None

@@ -15,19 +15,24 @@ Cleanup is triggered at three points:
 
 Safety invariant: a directory with uncommitted changes is NEVER auto-removed.
 Files c-lord writes into the dir itself (the injected ``discord-read`` skill)
-are not the user's changes and do not count (#749).
+are not the user's changes and do not count (#749). Commits on no remote branch
+and files git ignores are work too (#903) — ``git status`` shows neither.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .attachments import ATTACHMENT_SUBDIR
 from .coauthor import install_coauthor_hook
 from .git_exclude import add_git_exclude
 from .git_mirrors import ensure_mirror, mirrors_root_for
@@ -39,10 +44,13 @@ logger = logging.getLogger(__name__)
 _THREAD_DIR_RE = re.compile(r"^\d+$")
 
 
-def _run(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: list[str], cwd: str | None = None, *, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit)."""
     return subprocess.run(
         args,
+        input=stdin,
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -68,6 +76,55 @@ _CLORD_FILES: frozenset[str] = frozenset(
 #: (``remove_legacy_skills``, #712), so nothing placed there can outlive the
 #: next turn anyway.
 _CLORD_DIRS: tuple[str, ...] = tuple(f".claude/skills/{name}/" for name in LEGACY_SKILL_NAMES)
+
+#: Discord attachments c-lord downloads into the dir (#528). The originals stay
+#: in the thread, so they are c-lord's copy, not work.
+_CLORD_OWNED_DIRS: tuple[str, ...] = (*_CLORD_DIRS, f"{ATTACHMENT_SUBDIR}/")
+
+#: Ignored paths a tool rebuilds, which therefore are not work (#903). Every
+#: *other* ignored file is: a ``.env``, a local runbook hidden by
+#: ``info/exclude`` (#902's ``AUDIT.md``), notes in an ignored ``notes/``.
+#: The list is what keeps the sweep useful — counting ``node_modules/`` or
+#: ``.venv/`` as work would strand every checkout again (#749's 118 GB).
+#: Anything not named here resolves to *keep*.
+#:
+#: A path is regenerable when any of its directories is in
+#: :data:`_REGENERABLE_DIRS`, its file name is in :data:`_REGENERABLE_FILES` or
+#: ends with :data:`_REGENERABLE_SUFFIXES`, or it lies under one of
+#: :data:`_REGENERABLE_SUBPATHS` (framework runtime dirs, at any depth).
+_REGENERABLE_DIRS: frozenset[str] = frozenset(
+    {
+        # package managers / virtualenvs
+        "node_modules", "bower_components", ".venv", "venv", "vendor", ".eggs",
+        # caches
+        "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox", ".nox",
+        ".cache", ".gradle", ".dart_tool", ".parcel-cache", ".turbo", ".terraform",
+        # build output
+        "build", "dist", "target", ".build", ".next", ".nuxt", ".svelte-kit",
+        ".angular", ".expo", ".godot", "build_web", "coverage", "htmlcov",
+    }
+)  # fmt: skip
+_REGENERABLE_FILES: frozenset[str] = frozenset(
+    {
+        ".DS_Store",
+        ".coverage",
+        ".phpunit.result.cache",
+        # written by the build backend on install (hatch-vcs, #722)
+        "_version.py",
+        "_build_info.py",
+    }
+)
+_REGENERABLE_SUFFIXES: tuple[str, ...] = (".pyc", ".pyo", ".egg-info")
+_REGENERABLE_SUBPATHS: tuple[str, ...] = (
+    "storage/framework/",
+    "storage/logs/",
+    "bootstrap/cache/",
+)
+
+#: An ignored directory that is not regenerable is opened and its files judged
+#: one by one (git reports it as a single line). Past this many files it counts
+#: as work without looking further.
+_MAX_IGNORED_DIR_FILES = 2000
 
 #: Claude Code's own sub-agent worktrees. Not c-lord's — so never ignored
 #: outright: each one is opened and must itself be clean (see
@@ -103,10 +160,24 @@ class WorktreeStatus:
     user_changes: tuple[str, ...] = ()
     #: Changes c-lord made itself (or clean Claude Code worktrees) — not work.
     clord_files: tuple[str, ...] = ()
+    #: Commits reachable from HEAD, a local branch or the stash but from no
+    #: remote branch (#903); ``None`` when git could not tell. Any is work.
+    unpushed_commits: int | None = 0
+    #: ``git ls-remote`` failed or timed out, so pushed branches without a
+    #: tracking ref could not be told apart from unpushed ones (#903).
+    remote_unchecked: bool = False
+    #: Entries in ``git stash list`` (#1045). Any is work; counted apart from
+    #: unpushed commits so the reason says "stash", not "unpushed commit".
+    stash_entries: int = 0
 
     @property
     def clean(self) -> bool:
-        return self.is_repo and not self.user_changes
+        return (
+            self.is_repo
+            and not self.user_changes
+            and self.unpushed_commits == 0
+            and self.stash_entries == 0
+        )
 
 
 def _is_clord_change(xy: str, rel: str) -> bool:
@@ -117,10 +188,196 @@ def _is_clord_change(xy: str, rel: str) -> bool:
     SKILL.md since it slipped into a commit). A *staged* change is someone's
     decision and always counts.
     """
-    owned = rel in _CLORD_FILES or rel.startswith(_CLORD_DIRS)
-    if not owned:
+    if not _is_clord_owned(rel):
         return False
-    return xy == "??" or (xy[0] == " " and xy[1] in "MDT")
+    return xy in ("??", "!!") or (xy[0] == " " and xy[1] in "MDT")
+
+
+def _is_clord_owned(rel: str) -> bool:
+    return rel in _CLORD_FILES or rel.startswith(_CLORD_OWNED_DIRS)
+
+
+def _is_regenerable(rel: str) -> bool:
+    """Is this ignored path something a tool rebuilds? See :data:`_REGENERABLE_DIRS`."""
+    parts = rel.rstrip("/").split("/")
+    name = parts[-1]
+    if name in _REGENERABLE_FILES or name.endswith(_REGENERABLE_SUFFIXES):
+        return True
+    if any(part in _REGENERABLE_DIRS for part in parts):
+        return True
+    padded = f"/{rel.rstrip('/')}/"
+    return any(f"/{sub}" in padded for sub in _REGENERABLE_SUBPATHS)
+
+
+def _ignored_dir_holds_work(path: str, rel: str) -> bool:
+    """Does the wholly ignored directory *rel* hold anything but c-lord's and tools' files?
+
+    ``git status`` reports a matched directory as one ``!! dir/`` line, so a
+    repository that ignores ``.claude/`` would hide a user's own skill behind
+    the injected one. Walks without following symlinks; too many files, or an
+    unreadable tree, counts as work.
+    """
+    root = Path(path)
+    seen = 0
+    try:
+        for current, dirs, files in os.walk(root / rel):
+            base = Path(current).relative_to(root).as_posix()
+            dirs[:] = [d for d in dirs if not _is_regenerable(f"{base}/{d}/")]
+            for name in files:
+                seen += 1
+                if seen > _MAX_IGNORED_DIR_FILES:
+                    return True
+                file_rel = f"{base}/{name}"
+                if not (_is_clord_owned(file_rel) or _is_regenerable(file_rel)):
+                    return True
+    except OSError:
+        return True
+    return False
+
+
+#: ``git ls-remote`` per remote URL is cached this long (#903). Every session
+#: dir of a channel shares one origin, so a sweep asks the network once, not
+#: once per candidate. Short, because a stale "this head exists" would delete.
+_LS_REMOTE_TTL_SECONDS = 60.0
+#: A remote that does not answer within this is "could not check" — keep.
+_LS_REMOTE_TIMEOUT_SECONDS = 20.0
+_ls_remote_cache: dict[str, tuple[float, frozenset[str]]] = {}
+_ls_remote_lock = threading.Lock()
+
+
+def _remote_head_shas(path: str) -> frozenset[str] | None:
+    """Every branch head on every remote of *path*, by asking the remotes (#903).
+
+    A session dir is a single-branch clone: pushing a work branch leaves no
+    ``origin/<branch>`` behind, so ``--remotes`` alone calls it unpushed.
+    ``None`` when any remote could not be asked — the caller then keeps.
+    """
+    remotes = _run(["git", "remote"], cwd=path)
+    if remotes.returncode != 0:
+        return None
+    shas: set[str] = set()
+    for name in remotes.stdout.split():
+        url = _run(["git", "remote", "get-url", "--", name], cwd=path)
+        if url.returncode != 0:
+            return None
+        key = url.stdout.strip()
+        with _ls_remote_lock:
+            cached = _ls_remote_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
+            shas |= cached[1]
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "--heads", "--", name],
+                capture_output=True,
+                text=True,
+                cwd=path,
+                timeout=_LS_REMOTE_TIMEOUT_SECONDS,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        heads = frozenset(line.split()[0] for line in result.stdout.splitlines() if line.strip())
+        with _ls_remote_lock:
+            _ls_remote_cache[key] = (time.monotonic(), heads)
+        shas |= heads
+    return frozenset(shas)
+
+
+def _start_refs(path: str) -> dict[str, str]:
+    """HEAD and every local branch, as ref → commit.
+
+    Not the stash: its entries are counted on their own (:func:`_stash_entries`,
+    #1045) — a stash commit is no "unpushed commit" a user could push.
+    """
+    tips: dict[str, str] = {}
+    branches = _run(
+        ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], cwd=path
+    )
+    for line in branches.stdout.splitlines():
+        sha, _, ref = line.partition(" ")
+        if ref:
+            tips[ref] = sha
+    # Only when present: an unborn HEAD would fail rev-list.
+    found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
+    if found.returncode == 0:
+        tips["HEAD"] = found.stdout.strip()
+    return tips
+
+
+def _stash_entries(path: str) -> int | None:
+    """How many entries ``git stash list`` has (#1045). ``None``: git failed."""
+    found = _run(["git", "rev-parse", "-q", "--verify", "refs/stash"], cwd=path)
+    if found.returncode != 0:
+        return 0  # no stash at all
+    result = _run(["git", "rev-list", "--walk-reflogs", "--count", "refs/stash"], cwd=path)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
+        return None
+
+
+def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
+    """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
+
+    *also_on* are remote heads. A head whose commit is not in this clone is
+    skipped: a branch pushed from here is present, and one that moved on since
+    no longer vouches for anything — the commits then count, and the dir stays.
+    """
+    if not tips:
+        return 0
+    present = ""
+    if also_on:
+        check = _run(
+            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            cwd=path,
+            stdin="\n".join(also_on),
+        )
+        if check.returncode != 0:
+            return None
+        present = "".join(
+            f"^{line.split()[0]}\n"
+            for line in check.stdout.splitlines()
+            if line.endswith(" commit")
+        )
+    result = _run(
+        ["git", "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
+        cwd=path,
+        stdin=present,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
+        return None
+
+
+def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
+    """How many commits exist here and on no remote branch (#903). ``None``: unknown.
+
+    Counts from HEAD (a detached commit is on no branch) and every local
+    branch; the stash is counted apart (#1045). A repository with no remote at
+    all counts every commit — there is nowhere else they exist.
+
+    With *ask_remote*, a commit at or below a branch head on a remote counts
+    as pushed even without a local tracking ref (``git ls-remote``). Only exact
+    heads — no guessing at squash merges. The second value is ``True`` when
+    the remote could not be asked; the local count is returned then, so the
+    dir is kept.
+    """
+    tips = _start_refs(path)
+    local = _count_not_on(path, sorted(set(tips.values())))
+    if not ask_remote or not local:
+        return local, False
+    heads = _remote_head_shas(path)
+    if heads is None:
+        return local, True
+    return _count_not_on(path, sorted(set(tips.values())), heads), False
 
 
 def _is_clean_worktree(path: str, xy: str, rel: str, depth: int) -> bool:
@@ -144,7 +401,20 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
     # -uall: a wholly untracked ``.claude/`` must be listed file by file, or the
     # injected SKILL.md and a user's own file would hide behind one line.
     # -z: paths come back unquoted, so spaces and non-ASCII names parse as-is.
-    result = _run(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=path)
+    # --ignored=matching (#903): ignored files are listed as ``!!`` — they are
+    # work unless c-lord or a tool wrote them. ``matching`` does not descend
+    # into an ignored directory (``node_modules/`` stays one line).
+    result = _run(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        cwd=path,
+    )
     if result.returncode != 0:
         return WorktreeStatus(is_repo=False)
 
@@ -160,9 +430,57 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
         line = f"{xy} {rel}"
         if _is_clord_change(xy, rel) or _is_clean_worktree(path, xy, rel, _depth):
             clord.append(line)
+        elif xy == "!!" and (
+            _is_regenerable(rel) or (rel.endswith("/") and not _ignored_dir_holds_work(path, rel))
+        ):
+            continue
         else:
             user.append(line)
-    return WorktreeStatus(is_repo=True, user_changes=tuple(user), clord_files=tuple(clord))
+    stash = _stash_entries(path)
+    # The network is asked only when nothing else keeps the dir (#903).
+    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user and stash == 0)
+    return WorktreeStatus(
+        is_repo=True,
+        user_changes=tuple(user),
+        clord_files=tuple(clord),
+        unpushed_commits=unpushed,
+        remote_unchecked=unchecked,
+        # unknown is work too: never call a dir clean we could not read
+        stash_entries=1 if stash is None else stash,
+    )
+
+
+#: How many changed paths a "keeping" log line names before it abbreviates.
+_MAX_LOGGED_CHANGES = 5
+
+
+def describe_changes(status: WorktreeStatus) -> str:
+    """Why a directory is being kept, for the INFO line (#749, #903).
+
+    Names the entries, because "uncommitted work" alone read as 80 dirs of user
+    work when 60 of them held nothing but c-lord's own SKILL.md. Ignored files
+    show as ``!! name``; commits on no remote branch as a count.
+    """
+    if not status.is_repo:
+        return "not a git repo (cannot tell work from leftovers)"
+    reasons: list[str] = []
+    if status.unpushed_commits is None:
+        reasons.append("unpushed commits unknown (git rev-list failed)")
+    elif status.unpushed_commits:
+        reason = f"{status.unpushed_commits} unpushed commit(s) on no remote branch"
+        if status.remote_unchecked:
+            reason += " (ls-remote failed; pushed branches could not be checked)"
+        reasons.append(reason)
+    if status.stash_entries:
+        n = status.stash_entries
+        reasons.append(f"{n} stash {'entry' if n == 1 else 'entries'}")
+    if status.user_changes:
+        shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
+        more = len(status.user_changes) - _MAX_LOGGED_CHANGES
+        if more > 0:
+            shown += f" (+{more} more)"
+        reasons.append(f"uncommitted user work: {shown}")
+    return "; ".join(reasons)
 
 
 def _is_clean(path: str) -> bool:
@@ -211,6 +529,8 @@ class SessionDirInfo:
     source_repo: str
     commit: str
     is_clean: bool
+    #: why it is not clean — :func:`describe_changes` of the same snapshot (#1016)
+    kept_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -221,6 +541,8 @@ class CleanupResult:
     thread_id: int | None
     removed: bool
     reason: str
+    #: kept because it holds work (#903) — *reason* says which (#1016).
+    kept_work: bool = False
 
 
 class SessionDirManager:
@@ -381,7 +703,8 @@ class SessionDirManager:
             path = str(entry)
             thread_id = int(entry.name)
             commit = _get_commit(path)
-            clean = _is_clean(path)
+            status = worktree_status(path)
+            clean = status.clean
 
             results.append(
                 SessionDirInfo(
@@ -390,6 +713,7 @@ class SessionDirManager:
                     source_repo=self._source_repo,
                     commit=commit,
                     is_clean=clean,
+                    kept_reason="" if clean else describe_changes(status),
                 )
             )
 
@@ -438,17 +762,16 @@ class SessionDirManager:
 
     def _try_remove(self, path: str, thread_id: int | None) -> CleanupResult:
         """Check cleanliness and remove the directory if safe."""
-        if not _is_clean(path):
-            logger.warning(
-                "Skipping session dir removal (dirty): %s (thread_id=%s)",
-                path,
-                thread_id,
-            )
+        status = worktree_status(path)
+        if not status.clean:
+            # #1016: say what the work is — an unpushed commit or a ``.env``
+            # shows nothing in ``git status``, so "uncommitted changes" misled.
+            # The same snapshot decides and explains: a second ``git status``
+            # could disagree (an ``ls-remote`` that failed, then answered).
+            why = describe_changes(status)
+            logger.info("Keeping session dir %s (thread_id=%s) — %s (#1016)", path, thread_id, why)
             return CleanupResult(
-                path=path,
-                thread_id=thread_id,
-                removed=False,
-                reason="session directory has uncommitted changes — skipped to prevent data loss",
+                path=path, thread_id=thread_id, removed=False, reason=why, kept_work=True
             )
 
         try:

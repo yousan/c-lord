@@ -3176,3 +3176,73 @@ class TestOneStopPath:
         ctx = _make_thread_ctx(thread_id=12345)
         await cog.stop_text.callback(cog, ctx)
         cog._stop_thread_work.assert_not_called()
+
+
+class TestRestartCrossedTurnReadsHowItEnded:
+    """#978: the closing a restart hands on follows how the turn ended.
+
+    ``_close_recovered_turn`` always said "Claude has finished" and sent no
+    turn-end event: a turn that stopped on an API error or a plan limit was
+    summoned as finished, and a dispatcher waiting for the turn's event waited
+    forever (the old process's run ended ``cancelled``, which announces nothing).
+    """
+
+    async def _close(self, tmp_path, monkeypatch, ending):
+        import json
+        from unittest.mock import patch
+
+        from c_lord import turn_events
+
+        log = tmp_path / "events.jsonl"
+        monkeypatch.setenv("CLORD_EVENT_LOG", str(log))
+        turn_events.reset()
+        cog, thread, dashboard, order, footer = TestTurnEndAfterRestart()._setup(tmp_path)
+        thread.guild = None
+        thread.parent_id = 9000
+        trigger = thread.fetch_message.return_value
+        trigger.webhook_id = None
+        trigger.created_at = None
+        with patch("c_lord.cogs.claude_chat.recovered_turn_ending", return_value=ending, create=True):
+            await TestTurnEndAfterRestart()._run(cog, AsyncMock(return_value="ended"), footer)
+        with patch.object(turn_events, "_SETTLE_MAX_SECONDS", 0):
+            await turn_events.drain()
+        events = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        turn_events.reset()
+        return dashboard, events
+
+    @pytest.mark.asyncio
+    async def test_an_api_error_is_not_called_finished(self, tmp_path, monkeypatch) -> None:
+        """AC1. RED: ``api_error`` was never passed."""
+        from c_lord.host_restart_notice import TurnEnding
+
+        dashboard, events = await self._close(
+            tmp_path, monkeypatch, TurnEnding(api_error="API Error: 500 Internal server error")
+        )
+        kwargs = dashboard.set_state.await_args.kwargs
+        assert kwargs["api_error"]
+        assert [e["kind"] for e in events] == ["failure"]
+        assert events[0]["reason"] == "api_error"
+
+    @pytest.mark.asyncio
+    async def test_a_plan_limit_says_so(self, tmp_path, monkeypatch) -> None:
+        from c_lord.claude.types import UsageLimit
+        from c_lord.host_restart_notice import TurnEnding
+
+        limit = UsageLimit(scope="weekly limit", resets_at="3am", line="You've hit your limit")
+        dashboard, events = await self._close(tmp_path, monkeypatch, TurnEnding(usage_limit=limit))
+        kwargs = dashboard.set_state.await_args.kwargs
+        assert kwargs["usage_limit"] == limit and kwargs["no_response"] is True
+        assert [(e["kind"], e["reason"]) for e in events] == [("failure", "usage_limit")]
+
+    @pytest.mark.asyncio
+    async def test_a_plain_end_sends_one_completion(self, tmp_path, monkeypatch) -> None:
+        """AC2. RED: no event at all."""
+        from c_lord.host_restart_notice import TurnEnding
+
+        dashboard, events = await self._close(tmp_path, monkeypatch, TurnEnding())
+        kwargs = dashboard.set_state.await_args.kwargs
+        assert kwargs.get("api_error") is None and kwargs.get("usage_limit") is None
+        assert len(events) == 1
+        event = events[0]
+        assert event["kind"] == "completion" and event["reason"] == "restart_crossed"
+        assert event["started_by"] == {"type": "user", "id": "777", "name": None}

@@ -211,8 +211,10 @@ async def _run_setup(env_path: Path) -> None:
 
     token = ""
     bot_name = ""
-    for attempt in range(3):
-        token = _prompt("  Bot Token")
+    for _attempt in range(3):
+        # discord.py sends "Bot " + token at login, so a pasted "Bot xxx" must be
+        # stored without the prefix — validate_token accepts both (#1031).
+        token = _prompt("  Bot Token").removeprefix("Bot ").strip()
         if not token:
             _print("  Token cannot be empty.")
             continue
@@ -223,9 +225,11 @@ async def _run_setup(env_path: Path) -> None:
             _print(f"✅  Logged in as {bot_name}")
             break
         _print("❌  Invalid token. Please check and try again.")
-        if attempt == 2:
-            _die("Too many failed attempts. Please verify your bot token.")
         token = ""
+    if not bot_name:
+        # Empty answers use up the attempts too; going on would write an empty
+        # DISCORD_BOT_TOKEN and still print "Setup complete" (#1029).
+        _die("Too many failed attempts. Please verify your bot token.")
 
     # --- Channel ID — try API first, fallback to manual -------------------
     _print()
@@ -256,7 +260,7 @@ async def _run_setup(env_path: Path) -> None:
                     _print(f"  ✅  Channel ID: {channel_id}")
                     break
                 _print(f"  Enter a number between 1 and {len(channels)}, or paste the ID.")
-            elif len(raw) >= 17:
+            elif len(raw) >= 17 and raw.isdigit():  # a pasted URL is not an ID (#1030)
                 channel_id = raw
                 _print(f"  ✅  Channel ID: {channel_id}")
                 break

@@ -10,10 +10,16 @@ Evidence).
 from __future__ import annotations
 
 import contextlib
+import http.server
+import json
 import os
+import shutil
 import signal
+import socket
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -881,3 +887,317 @@ class TestSystemdManagedClone:
         result = self._run(["restart"], clone, env)
         assert ".venv" in result.stdout + result.stderr
         assert self._calls(env) == []
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+class TestReleaseSleepsLeaseWindows:
+    """release で、そのリース中に立った検証窓を寝かせる (#955).
+
+    窓は conftest が隔離した tmux サーバ (``TMUX_TMPDIR``) に本物を立てる。
+    ``sleep`` を抱えた窓を Claude の代わりにし、``@clord_owner`` / ``@thread_id``
+    を bot と同じ形で付ける。
+    """
+
+    SESSION = "t955"
+
+    @pytest.fixture(autouse=True)
+    def _tmux_session(self):
+        yield
+        subprocess.run(["tmux", "kill-session", "-t", self.SESSION], capture_output=True)
+
+    def _clone(self, tmp_path: Path, *, api_port: int | None = None) -> Path:
+        clone = tmp_path / "clone"
+        (clone / "data").mkdir(parents=True)
+        env = "DISCORD_BOT_TOKEN=dummy\nDISCORD_CHANNEL_ID=1\n"
+        env += f"CLORD_API_PORT={api_port if api_port is not None else _free_port()}\n"
+        (clone / ".env").write_text(env, encoding="utf-8")
+        db = sqlite3.connect(clone / "data" / "sessions.db")
+        db.execute(
+            "CREATE TABLE sessions (thread_id INTEGER PRIMARY KEY, closed_reason TEXT,"
+            " created_at TIMESTAMP)"
+        )
+        db.commit()
+        db.close()
+        return clone
+
+    def _row(self, clone: Path, thread_id: int, *, age: str = "+0 seconds") -> None:
+        db = sqlite3.connect(clone / "data" / "sessions.db")
+        db.execute(
+            "INSERT INTO sessions (thread_id, created_at)"
+            " VALUES (?, datetime('now', 'localtime', ?))",
+            (thread_id, age),
+        )
+        db.commit()
+        db.close()
+
+    def _window(self, name: str, owner: str, thread_id: int) -> str:
+        has = subprocess.run(["tmux", "has-session", "-t", self.SESSION], capture_output=True)
+        cmd = (
+            ["new-window", "-t", self.SESSION]
+            if has.returncode == 0
+            else ["new-session", "-d", "-s", self.SESSION]
+        )
+        pane = subprocess.run(
+            ["tmux", *cmd, "-n", name, "-P", "-F", "#{pane_id}", "sleep", "300"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        for opt, value in (("@clord_owner", owner), ("@thread_id", str(thread_id))):
+            subprocess.run(["tmux", "set-option", "-w", "-t", pane, opt, value], check=True)
+        return pane
+
+    def _panes(self) -> set[str]:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"], capture_output=True, text=True
+        )
+        return set(out.stdout.split())
+
+    def _logging_tmux(self, tmp_path: Path) -> dict[str, str]:
+        """A ``tmux`` on PATH that logs each call, then runs the real one."""
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        log = tmp_path / "tmux.log"
+        real = shutil.which("tmux")
+        (bindir / "tmux").write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexec "{real}" "$@"\n')
+        (bindir / "tmux").chmod(0o755)
+        return {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "TMUX_LOG": str(log)}
+
+    def _run(self, args: list[str], clone: Path, env: dict[str, str] | None = None):
+        return subprocess.run(
+            ["bash", str(SCRIPT), *args],
+            cwd=clone,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+    def test_release_closes_only_this_leases_windows(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        owner = os.path.realpath(clone)
+        self._row(clone, 900, age="-1 day")  # リース前から居たスレッド
+        before = self._window("w1", owner, 900)
+        assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+        self._row(clone, 901)
+        self._row(clone, 902)
+        spawned = [self._window("w2", owner, 901), self._window("w3", owner, 902)]
+        other = self._window("w4", "/home/someone/c-lord", 901)  # 他の台・本番の窓
+        env = self._logging_tmux(tmp_path)
+
+        result = self._run(["release", "--owner", "A"], clone, env)
+
+        assert result.returncode == 0, result.stderr
+        assert "検証窓: 2 本寝かせた / 約" in result.stdout
+        assert "MB" in result.stdout
+        alive = self._panes()
+        assert not set(spawned) & alive
+        assert before in alive
+        assert other in alive
+        calls = Path(env["TMUX_LOG"]).read_text()
+        for forbidden in ("kill-server", "kill-session", "kill-window"):
+            assert forbidden not in calls
+        assert all(f"kill-pane -t {pane}" in calls for pane in spawned)  # API 不達 → pane id
+
+    def test_release_asks_the_bot_api_first(self, tmp_path: Path) -> None:
+        """bot に届けば、bot 自身のスリープ (POST /api/threads/<id>/sleep) に任せる。"""
+        asked: list[str] = []
+        panes: dict[str, str] = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                asked.append(self.path)
+                thread_id = self.path.split("/")[3]
+                subprocess.run(["tmux", "kill-pane", "-t", panes[thread_id]])
+                body = json.dumps({"status": "slept", "thread_id": thread_id}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            clone = self._clone(tmp_path, api_port=server.server_address[1])
+            assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+            self._row(clone, 911)
+            panes["911"] = self._window("w1", os.path.realpath(clone), 911)
+            env = self._logging_tmux(tmp_path)
+
+            result = self._run(["release", "--owner", "A"], clone, env)
+        finally:
+            server.shutdown()
+
+        assert result.returncode == 0, result.stderr
+        assert asked == ["/api/threads/911/sleep"]
+        assert "検証窓: 1 本寝かせた" in result.stdout
+        assert "API 1 本" in result.stdout
+        assert "pane kill" not in result.stdout
+        assert "kill-pane" not in Path(env["TMUX_LOG"]).read_text()
+
+    def test_taking_over_an_expired_lease_sleeps_its_windows(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        args = ["borrow", "--owner", "A", "--purpose", "放置", "--ttl-hours", "0"]
+        assert self._run(args, clone).returncode == 0
+        self._row(clone, 921)
+        pane = self._window("w1", os.path.realpath(clone), 921)
+
+        result = self._run(["borrow", "--owner", "B", "--purpose", "奪取"], clone)
+
+        assert result.returncode == 0, result.stderr
+        assert "検証窓: 1 本寝かせた" in result.stdout
+        assert pane not in self._panes()
+
+    def test_nothing_to_sleep_is_one_quiet_line(self, tmp_path: Path) -> None:
+        clone = self._clone(tmp_path)
+        assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+
+        result = self._run(["release", "--owner", "A"], clone)
+
+        assert result.returncode == 0
+        assert "検証窓: このリース中に立ったスレッドは無い" in result.stdout
+        assert "released." in result.stdout
+
+    # -- #1014: 同じ owner の再 borrow でリースの始まりを動かさない -----------
+
+    def _lease(self, clone: Path) -> dict:
+        return json.loads((clone / ".staging-lease").read_text())
+
+    def _age_lease(self, clone: Path, seconds: int) -> None:
+        """リースを *seconds* 秒前に取ったことにする (時計を待たずに)。"""
+        data = self._lease(clone)
+        data["acquired_epoch"] -= seconds
+        (clone / ".staging-lease").write_text(json.dumps(data))
+
+    def test_reborrow_keeps_the_lease_start(self, tmp_path: Path) -> None:
+        """#1014 AC1. RED: 再 borrow が acquired_epoch を今の時刻に書き換えた。"""
+        clone = self._clone(tmp_path)
+        assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+        self._age_lease(clone, 3600)
+        first = self._lease(clone)
+
+        result = self._run(["borrow", "--owner", "A", "--purpose", "延長", "--ttl-hours", "2"], clone)
+
+        assert result.returncode == 0, result.stderr
+        lease = self._lease(clone)
+        assert lease["acquired_epoch"] == first["acquired_epoch"]
+        assert lease["acquired_at"] == first["acquired_at"]
+        assert lease["purpose"] == "延長"
+        # 延長は効く: 今から 2 時間 (始まりから 3 時間)
+        remaining = lease["acquired_epoch"] + lease["ttl_hours"] * 3600 - time.time()
+        assert 7100 < remaining <= 7200
+
+    def test_release_after_a_reborrow_sleeps_the_first_half_too(self, tmp_path: Path) -> None:
+        """#1014 AC2. RED: 1 回目と 2 回目の borrow の間に立てた窓が残った。"""
+        clone = self._clone(tmp_path)
+        owner = os.path.realpath(clone)
+        self._row(clone, 940, age="-1 day")
+        before = self._window("w1", owner, 940)
+        assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+        self._age_lease(clone, 600)
+        self._row(clone, 941, age="-300 seconds")  # 1 回目の borrow の後、再 borrow の前
+        first_half = self._window("w2", owner, 941)
+        assert self._run(["borrow", "--owner", "A", "--purpose", "延長"], clone).returncode == 0
+
+        result = self._run(["release", "--owner", "A"], clone)
+
+        assert result.returncode == 0, result.stderr
+        alive = self._panes()
+        assert first_half not in alive
+        assert before in alive
+
+    def test_taking_over_an_expired_lease_starts_a_new_one(self, tmp_path: Path) -> None:
+        """#1014 AC3: 別 owner の奪取は新しい始まり。"""
+        clone = self._clone(tmp_path)
+        args = ["borrow", "--owner", "A", "--purpose", "放置", "--ttl-hours", "0"]
+        assert self._run(args, clone).returncode == 0
+        self._age_lease(clone, 3600)
+        old = self._lease(clone)["acquired_epoch"]
+
+        assert self._run(["borrow", "--owner", "B", "--purpose", "奪取"], clone).returncode == 0
+
+        assert self._lease(clone)["acquired_epoch"] >= old + 3600
+
+    # -- #1015: bot が答えたら kill しない ----------------------------------
+
+    def _api(self, status: int, body: dict | None = None):
+        asked: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                asked.append(self.path)
+                payload = json.dumps(body or {"error": "x"}).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, asked
+
+    @pytest.mark.parametrize("status", [500, 503])
+    def test_an_http_error_from_the_bot_does_not_kill_the_pane(
+        self, tmp_path: Path, status: int
+    ) -> None:
+        """#1015 AC1. RED: 答えが ``slept`` 以外なら全部 kill-pane に進んだ。
+
+        bot が窓を把握していて寝かせるのに失敗した答え (500 / 503) だけ。"""
+        server, asked = self._api(status)
+        try:
+            clone = self._clone(tmp_path, api_port=server.server_address[1])
+            assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+            self._row(clone, 951)
+            pane = self._window("w1", os.path.realpath(clone), 951)
+            env = self._logging_tmux(tmp_path)
+
+            result = self._run(["release", "--owner", "A"], clone, env)
+        finally:
+            server.shutdown()
+
+        assert result.returncode == 0, result.stderr
+        assert asked == ["/api/threads/951/sleep"]
+        assert "kill-pane" not in Path(env["TMUX_LOG"]).read_text()
+        assert pane in self._panes()
+        assert f"HTTP {status}" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [(200, {"status": "not_resident", "thread_id": "952"}), (404, {"error": "x"})],
+    )
+    def test_an_answer_that_the_bot_has_no_such_window_kills_the_pane(
+        self, tmp_path: Path, status: int, body: dict
+    ) -> None:
+        """#1015 (おぷー決定 2026-10-29): ``not_resident`` / 404 は bot がその窓を
+        持っていない答え。4 時間スリープ (#572) も同じ経路なので拾わない — だから
+        従来どおり pane id 指定で kill する。RED: 残していた (1 本 ~300MB が居座る)。"""
+        server, asked = self._api(status, body)
+        try:
+            clone = self._clone(tmp_path, api_port=server.server_address[1])
+            assert self._run(["borrow", "--owner", "A", "--purpose", "t"], clone).returncode == 0
+            self._row(clone, 952)
+            pane = self._window("w1", os.path.realpath(clone), 952)
+            env = self._logging_tmux(tmp_path)
+
+            result = self._run(["release", "--owner", "A"], clone, env)
+        finally:
+            server.shutdown()
+
+        assert result.returncode == 0, result.stderr
+        assert asked == ["/api/threads/952/sleep"]
+        assert f"kill-pane -t {pane}" in Path(env["TMUX_LOG"]).read_text()
+        assert pane not in self._panes()
+        assert "検証窓: 1 本寝かせた" in result.stdout
+        assert "pane kill 1 本" in result.stdout
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]

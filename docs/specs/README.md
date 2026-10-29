@@ -24,6 +24,7 @@
 | [workspace-vocabulary.md](./workspace-vocabulary.md) | ワークスペースの用語と3操作 | スリープ ⊂ 停止 ⊂ 削除。通知は毎回「止まったもの」と「まだ残っているもの」を並べる棚卸し |
 | [workspace-sleep.md](./workspace-sleep.md) | スリープ（4時間） | 4時間 無操作で claude だけ止まる。docker は止めない。次の投稿で無言復元し、手動コマンドは無い |
 | [resident-cap.md](./resident-cap.md) | 常駐ワークスペース数の上限 | TTL のバックストップ。上限は MemTotal から自動算出し、超えたら LRU でスリープ。新規は待たせない／緊急ブレーキは上げる方向に動かない |
+| [session-plugins.md](./session-plugins.md) | セッションの claude に付けるプラグイン | Discord プラグインと、そのリポジトリに無い言語の LSP は付けない（`--settings` でその1本だけ）。ディレクトリの `.claude/settings*.json` が決めていればそちらが勝つ。`CLORD_SESSION_PLUGINS=0` で停止 |
 | [session-resume.md](./session-resume.md) | 止まったセッションの復元案内 | 「送れば復元します」と言うのは本当に復元できるときだけ。復元できないスレッドの投稿も黙って捨てず、理由と次の一手を出す |
 | [long-reply-split.md](./long-reply-split.md) | 長い返信の分割 | 2000字を超えても欠けずに複数メッセージへ分け、コードのまとまりを壊さない |
 | [commit-coauthors.md](./commit-coauthors.md) | コミットの Co-authored-by | そのターンを頼んだ Discord ユーザーと Claude が、コミット本文に共著者として残る |
@@ -38,6 +39,7 @@
 | [usage-limit.md](./usage-limit.md) | 利用上限（クォータ）に当たったとき | 上限は上限として、回復時刻つきで出す。「もう一度送ってください」とは言わない（送っても通らないため） |
 | [mirrored-events.md](./mirrored-events.md) | スレッドに流れるイベントの選別 | 👤 はその人が実際に打ったものだけ。ハーネス内部の通知は progress.txt に畳み、内部パスは出さない |
 | [repeat-fold.md](./repeat-fold.md) | 同じ発言の繰り返し | 同じ文が延々続いたら4回目からは1通にまとめ、何回ぶんかをその1通で数える。別の文・ターン最後の返事はまとめない |
+| [subagent-log.md](./subagent-log.md) | サブエージェントの作業 | 1回の走りごとに開始・終了の1行と `subagent-*.md`（報告の全文・依頼・ツール呼び出し）。走っている間は添付が差し替わる。`CLORD_SUBAGENT_VOICES=1` で、やり取りと最終報告を話した側の名前で出す |
 | [model-scopes.md](./model-scopes.md) | `/model` の範囲（セッション／チャンネル／全体） | model と effort をそれぞれ独立に設定。セッション > チャンネル > グローバル > 起動時の環境設定の順。上位の変更は `include-existing:true` を付けたときだけ既存セッションへ、次のターンから届く (#918) |
 | [scheduled-tasks.md](./scheduled-tasks.md) | スケジュール実行（定期タスク） | 時間になるとスレッドが立ち、Claude が実際に起動して応答が投稿される。失敗したら本当の理由が出てログにも残る |
 | [tmux-layout.md](./tmux-layout.md) | tmux のセッションとウィンドウの割り当て | セッションは**リポジトリ**ごと（チャンネルごとではない）。スレッドは紐づくリポジトリのセッションのウィンドウに入る |

@@ -30,6 +30,7 @@ from discord.ext import commands
 from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from .. import turn_events
+from ..api_error import advice
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
@@ -78,7 +79,7 @@ from ..gateway_backfill import (
     merge_missed_prompt,
     missed_notice,
 )
-from ..host_restart_notice import stopped_mid_turn
+from ..host_restart_notice import TurnEnding, recovered_turn_ending, stopped_mid_turn
 from ..log_sampler import LogSampler
 from ..model_scopes import TurnSettings, begin_turn_for, effort_for_launch
 from ..notify_policy import Kind, owner_notify_id
@@ -123,10 +124,11 @@ from ..thread_settings import resolve_auto_archive_duration
 from ..transcript.claim import adopt_cleared_session, list_transcripts
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
+from ..voice_webhooks import is_voice_message
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
 from ..workspace_notice import restored_devenv_notice
-from ._run_helper import _post_context_usage, run_claude_with_config
+from ._run_helper import _post_context_usage, has_other_run_in_flight, run_claude_with_config
 from .run_config import RunConfig
 
 if TYPE_CHECKING:
@@ -641,11 +643,16 @@ class ClaudeChatCog(commands.Cog):
         return await self._settings_repo.get(SETTING_CLAUDE_MODEL)
 
     async def _fix_turn_settings(
-        self, thread_id: int, channel_id: int | None
+        self, thread_id: int, channel_id: int | None, *, keep_running: bool = False
     ) -> TurnSettings | None:
         """Decide this turn's model/effort once, as a pair (#918); ``None`` ⇒ instance defaults."""
         return await begin_turn_for(
-            self.bot, self._settings_repo, self.runner, thread_id, channel_id
+            self.bot,
+            self._settings_repo,
+            self.runner,
+            thread_id,
+            channel_id,
+            keep_running=keep_running,
         )
 
     def _get_coordination(self) -> CoordinationService:
@@ -1001,6 +1008,10 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
+        # #971: c-lord's own voice for a sub-agent — never a request, and not a
+        # refused one either (the owner would be DM'd for every agent message).
+        if is_voice_message(message):
+            return
         # #745: bookkeeping for the reconnect pick-up. Before any await, so a
         # pick-up that starts after this event was dispatched always sees it.
         if not self._note_delivered(message):
@@ -3013,10 +3024,48 @@ class ClaudeChatCog(commands.Cog):
                 log_ctx(thread_id=thread.id),
                 exc_info=True,
             )
+        # #978: how it ended decides the wording, as for a turn that ended in
+        # this process (#908/#631) — an API error or a plan limit is not "done".
+        try:
+            ending = await asyncio.to_thread(recovered_turn_ending, derive_project_dir(working_dir))
+        except Exception:
+            logger.warning(
+                "%s could not read how a restart-crossed turn ended (#978)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
+            ending = TurnEnding()
+        api_error = advice(ending.api_error) if ending.api_error is not None else None
+        requester = _requester_of_turn(message, None, self.bot)
+        # #978: and the turn-end event the dead run can no longer send (#917).
+        try:
+            turn_events.announce_recovered_turn(
+                thread,
+                turn_events.started_by_from_message(
+                    message,
+                    requester=requester,
+                    bot_is_author=_is_self(getattr(message, "author", None), self.bot),
+                ),
+                started_at=(
+                    message.created_at if isinstance(message.created_at, datetime) else None
+                ),
+                failure_reason=(
+                    "usage_limit"
+                    if ending.usage_limit is not None
+                    else "api_error"
+                    if api_error is not None
+                    else None
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "%s could not announce a restart-crossed turn's end (#978)",
+                log_ctx(thread_id=thread.id),
+                exc_info=True,
+            )
         dashboard = self._get_dashboard()
         if dashboard is None:
             return
-        requester = _requester_of_turn(message, None, self.bot)
         await _safe_set_state(
             dashboard,
             thread.id,
@@ -3024,6 +3073,9 @@ class ClaudeChatCog(commands.Cog):
             (getattr(message, "content", "") or "")[:100].replace("\n", " "),
             thread=thread,
             notify_user_id=_notify_target(requester, self.bot, kind="completion"),
+            no_response=ending.usage_limit is not None,
+            usage_limit=ending.usage_limit,
+            api_error=api_error,
         )
 
     # ── #745: messages posted while the gateway was down ────────────────────
@@ -3940,8 +3992,12 @@ class ClaudeChatCog(commands.Cog):
         The workspace stop archives the thread, and Discord refuses reactions in
         an archived thread (50083). The withdrawn turn paints its final 🟡 on the
         way out, so the stop waits for that before archiving — otherwise the
-        request is left with no lamp at all. A turn that does not finish in
-        time is left to finish on its own; the stop goes ahead regardless.
+        request is left with no lamp at all.
+
+        #977: a turn that does not finish in time is cancelled, as a pre-empted
+        one is (:meth:`_drain_thread_task`) — whatever it is parked on, it must
+        not outlive its workspace. Its runner was withdrawn, so the run still
+        logs ``outcome=stopped``. The stop goes ahead regardless.
         """
         task = self._active_tasks.get(thread_id)
         if task is None or task.done() or task is asyncio.current_task():
@@ -3949,10 +4005,12 @@ class ClaudeChatCog(commands.Cog):
         _done, pending = await asyncio.wait({task}, timeout=timeout)
         if pending:
             logger.warning(
-                "%s workspace stop: the turn did not end within %.0fs; stopping anyway (#909)",
+                "%s workspace stop: the turn did not end within %.0fs; cancelling it (#909/#977)",
                 log_ctx(thread_id=thread_id),
                 timeout,
             )
+            task.cancel()
+            await asyncio.wait({task}, timeout=_PREEMPT_CANCEL_GRACE)
 
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).
@@ -4415,8 +4473,11 @@ class ClaudeChatCog(commands.Cog):
             await status.set_running()
 
             # #918: model and effort are fixed together, once, for this turn. A
-            # change made while the turn runs waits for the next one.
-            turn = await self._fix_turn_settings(thread.id, parent_channel_id)
+            # change made while the turn runs waits for the next one. #976: and a
+            # /skill run still using the pane's Claude keeps it — no restart then.
+            turn = await self._fix_turn_settings(
+                thread.id, parent_channel_id, keep_running=has_other_run_in_flight(thread.id)
+            )
             model_override = turn.model if turn else await self._get_current_model()
             if turn is not None and turn.needs_restart and tmux_manager is not None:
                 # The Claude in the pane was launched with a different pair, and
