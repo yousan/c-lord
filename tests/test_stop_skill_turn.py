@@ -107,3 +107,50 @@ async def test_nothing_running_is_nothing_ended() -> None:
 def _ledger():
     yield
     _run_helper._IN_FLIGHT.pop(THREAD, None)
+
+
+class _RealishRunner:
+    """``TmuxClaudeRunner``'s ``stopped`` / ``preempted`` / ``withdraw`` semantics."""
+
+    def __init__(self) -> None:
+        self._stopped = False
+        self._silent = False
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped
+
+    @property
+    def preempted(self) -> bool:
+        return self._stopped and self._silent
+
+    def withdraw(self, *, silent: bool = False) -> None:
+        self._stopped = True
+        self._silent = silent
+
+
+async def test_a_preempted_run_stays_preempted(monkeypatch, caplog) -> None:
+    """Review of PR #1019: a turn the next message displaced (#1007) is not the
+    user's stop. RED: the stop re-withdrew it non-silently — ``preempted`` became
+    False, the run exited ``outcome=stopped`` and announced a turn end of its own."""
+
+    async def parked(_config, _ctx):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(_run_helper, "_run_turn", parked)
+    old = _RealishRunner()
+    old.withdraw(silent=True)  # the next message's silent interrupt
+    thread = MagicMock()
+    thread.id = THREAD
+    task = asyncio.create_task(
+        _run_helper.run_claude_with_config(
+            RunConfig(thread=thread, runner=old, repo=None, prompt="a")  # type: ignore[arg-type]
+        )
+    )
+    await asyncio.sleep(0.02)
+    with caplog.at_level(logging.INFO):
+        await _stop(_chat())
+    assert old.preempted is True
+    assert task.done()
+    assert "outcome=stopped" not in caplog.text
+    assert "outcome=cancelled" in caplog.text

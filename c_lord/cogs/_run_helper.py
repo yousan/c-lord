@@ -479,11 +479,18 @@ def withdraw_in_flight(thread_id: int) -> bool:
 
     A workspace stop used to reach only the runs ``ClaudeChatCog`` started; a
     ``/skill`` run is in no table of its own, but every run is in this ledger.
+    A run the next message already displaced (``preempted``) is left as it is:
+    withdrawing it again would turn #1007's "interrupted" into a user stop and
+    give the displaced turn a turn-end event of its own. Its task is still
+    waited on and cancelled by the stop (``outcome=cancelled``).
+
     Returns whether there was one.
     """
     withdrew = False
     for run in _IN_FLIGHT.get(thread_id, ()):
         if run.task is not None and run.task.done():
+            continue
+        if getattr(run.runner, "preempted", False) is True:
             continue
         withdraw = getattr(run.runner, "withdraw", None)
         if withdraw is not None:
