@@ -857,6 +857,15 @@ def _pane_trust_dialog_downs(pane_text: str) -> int | None:
     return TmuxClaudeRunner._trust_option_offset(norm)
 
 
+def _pane_trust_dialog_ups(pane_text: str) -> int:
+    """Ups needed when a live trust dialog has "Yes" above its cursor (#990)."""
+    try:
+        from .claude.tmux_runner import TmuxClaudeRunner, _normalize_capture
+    except ImportError:  # pragma: no cover - defensive
+        return 0
+    return TmuxClaudeRunner._trust_ups_needed(_normalize_capture(pane_text))
+
+
 def pane_command_is_dead(command: object) -> bool:
     """True only when *command* positively shows the pane is NOT running claude (#510).
 
@@ -2749,6 +2758,7 @@ class TmuxSessionManager:
         downs = _pane_trust_dialog_downs(pane_text)
         if downs is None:
             return True
+        ups = _pane_trust_dialog_ups(pane_text) if downs == 0 else 0
 
         logger.warning(
             "%s send_input: the folder-trust dialog is open in this pane — approving it "
@@ -2759,10 +2769,22 @@ class TmuxSessionManager:
         )
         if downs > 0 and not self._steer_trust_cursor(target, thread_id):
             return False
+        if ups > 0:
+            # #990: a numbered dialog with its cursor on "2. No, exit" — Yes is
+            # above. Only a pane positively running claude gets the Up (#630).
+            if not self.is_claude_running(thread_id):
+                logger.error(
+                    "%s send_input: the trust dialog's cursor is on 'No, exit' and the pane "
+                    "is not running claude — withholding the message (#990)",
+                    log_ctx(thread_id=thread_id),
+                )
+                return False
+            if not self._steer_trust_cursor(target, thread_id, key="Up"):
+                return False
         _run(["tmux", "send-keys", "-t", target, "Enter"])
         return self._await_trust_dialog_closed(target, thread_id)
 
-    def _steer_trust_cursor(self, target: str, thread_id: int) -> bool:
+    def _steer_trust_cursor(self, target: str, thread_id: int, *, key: str = "Down") -> bool:
         """Move the trust dialog's cursor onto "Yes, I trust this folder" (#684/#716).
 
         Each Down is followed by a fresh read of the pane rather than an
@@ -2779,7 +2801,7 @@ class TmuxSessionManager:
 
         label: str | None = None
         for _ in range(_TRUST_NAV_MAX_DOWNS):
-            _run(["tmux", "send-keys", "-t", target, "Down"])
+            _run(["tmux", "send-keys", "-t", target, key])
             time.sleep(_TRUST_NAV_DELAY)
             capture = _run(["tmux", "capture-pane", "-p", "-t", target])
             if capture.returncode != 0:
@@ -2788,12 +2810,13 @@ class TmuxSessionManager:
             if label is None or label.startswith("Yes"):
                 return True
         logger.error(
-            "%s send_input: the trust dialog's cursor is still on %r after %d Down(s) — "
+            "%s send_input: the trust dialog's cursor is still on %r after %d %s(s) — "
             "withholding the message rather than confirming, which would decline trust "
             "and exit claude (#716)",
             log_ctx(thread_id=thread_id),
             label,
             _TRUST_NAV_MAX_DOWNS,
+            key,
         )
         return False
 
