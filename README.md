@@ -242,8 +242,8 @@ uv run c-lord setup
 
 The wizard will:
 1. Validate your bot token against the Discord API (a token pasted as `Bot xxx` is stored as `xxx`; after 3 empty or invalid answers it stops without writing `.env`)
-2. **Automatically list available channels** — just pick a number (no ID copying), or paste a numeric channel ID (a channel URL is asked again)
-3. Ask for your working directory and model preference
+2. **Automatically list available channels** — just pick a number (no ID copying), or paste a numeric channel ID (a channel URL, or digits like `²`, is asked again)
+3. Ask for your Discord user ID (optional — a username instead of the numeric ID is asked again, since `c-lord start` refuses it), your working directory and model preference
 4. Write `.env` and offer to start the bot immediately
 
 ```
