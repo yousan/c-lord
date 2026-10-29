@@ -648,7 +648,10 @@ def _launched_agent_ids(event: dict) -> list[str]:
             texts = [part.get("text") for part in result if isinstance(part, dict)]
             result = " ".join(t for t in texts if isinstance(t, str))
         if isinstance(result, str):
-            match = _AGENT_LAUNCHED_RE.search(result)
+            # #1089: the result *is* the launch — it starts with the line. A Bash
+            # output that merely shows the text (Claude reading c-lord's own
+            # tests) launched nothing.
+            match = _AGENT_LAUNCHED_RE.match(result.lstrip())
             if match:
                 ids.append(match.group(1))
     return ids
