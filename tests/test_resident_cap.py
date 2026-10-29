@@ -744,3 +744,139 @@ class TestAnAllRunningFleetIsQuiet:
 
         engaged = [r for r in caplog.records if "EMERGENCY brake ENGAGED" in r.getMessage()]
         assert len(engaged) == 2, "回復をはさんだ2回目の episode が黙ってしまった"
+
+
+class TestAnUnreachableThreadDoesNotBlockTheCap:
+    """#1033 — 引けなかった候補が LRU の先頭を塞ぎ、上限に永久に戻らない。
+
+    Discord ではスレッドが消えているが tmux の窓は生きている、という1本が一番
+    古いと、``aged[:over]`` は毎 tick それを選んで失敗し、常駐数は上限+1 のまま
+    だった。idle_sweep の #593 と同じ形。おぷー決定（2026-10-29）: 失敗した分は
+    次の候補で補い、1回の tick で上限まで戻す。
+    """
+
+    @staticmethod
+    def _unreachable_head_loop(resident: set[int], *, limit: int, gone: int) -> ResidentCapLoop:
+        import discord
+
+        cog = MagicMock()
+
+        async def _impl(*, channel, reason, idle_label):
+            resident.discard(channel.id)
+            return True
+
+        cog._sleep_workspace_impl = AsyncMock(side_effect=_impl)
+        bot = MagicMock()
+        bot.get_cog = MagicMock(return_value=cog)
+        bot.get_channel = MagicMock(side_effect=lambda t: None if t == gone else MagicMock(id=t))
+        bot.fetch_channel = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "x"))
+        repo = MagicMock()
+        repo.list_all = AsyncMock(
+            return_value=[_rec(i, hours_ago=i) for i in sorted(resident)]  # 大きいほど古い
+        )
+        loop = ResidentCapLoop(
+            bot,
+            repo,
+            limit=limit,
+            resident_fn=lambda: set(resident),
+            in_flight_fn=set,
+            mem_fn=lambda: (31 * GIB, 20 * GIB),
+        )
+        loop._cog_for_test = cog  # type: ignore[attr-defined]
+        return loop
+
+    @pytest.mark.asyncio
+    async def test_the_issue_repro_converges(self) -> None:
+        """Issue 本文の再現そのまま: 10 tick 後も上限+1 のまま、にならない。"""
+        resident = {1, 2, 3, 4}
+        loop = self._unreachable_head_loop(resident, limit=2, gone=4)
+        for _ in range(10):
+            await loop.tick()
+        assert len(resident) <= 2, f"still {sorted(resident)} resident after 10 ticks (limit 2)"
+
+    @pytest.mark.asyncio
+    async def test_one_tick_is_enough(self) -> None:
+        """失敗した分を次の候補で補うので、1 tick で上限まで戻る。"""
+        resident = {1, 2, 3, 4, 5}
+        loop = self._unreachable_head_loop(resident, limit=2, gone=5)
+
+        assert await loop.tick() == 3
+        assert resident == {1, 5}
+        assert _slept_ids(loop) == [4, 3, 2]  # 古い順のまま、5 だけ飛ばす
+
+    @pytest.mark.asyncio
+    async def test_it_never_sleeps_more_than_it_needs(self) -> None:
+        """補うのは失敗した分だけ。届いたものまで余計に眠らせない。"""
+        resident = {1, 2, 3, 4, 5}
+        loop = self._unreachable_head_loop(resident, limit=3, gone=1)  # 最新が引けない
+
+        assert await loop.tick() == 2
+        assert _slept_ids(loop) == [5, 4]
+
+    @pytest.mark.asyncio
+    async def test_a_gone_thread_is_asked_about_once(self) -> None:
+        """Discord が「無い」と答えたスレッドを毎 tick 聞き直さない (#593 と同じ)。"""
+        resident = {1, 2, 3, 4}
+        loop = self._unreachable_head_loop(resident, limit=2, gone=4)
+        await loop.tick()
+        resident.add(3)  # 誰かが 3 を起こし直した → 再び上限超過
+        await loop.tick()
+
+        assert loop._bot.fetch_channel.await_count == 1  # type: ignore[attr-defined]
+
+
+class TestAnUnreadablePaneCountsAsRunning:
+    """#1034 — 再起動直後にペインが読めないと、走っているターンを眠らせていた。
+
+    再起動直後は台帳（``_active_tasks``）が空なので、ペインだけが「走っている」の
+    根拠になる。そのペインが読めない（capture-pane のタイムアウト等）と「走って
+    いない」と同じ扱いになり、最古の走行中ターンが選ばれていた（#742 と同じ結果）。
+    おぷー決定（2026-10-29）: 読めなかった候補は「走っている」側に倒し、その tick
+    では選ばない。仕様の「走っているターンは絶対に選ばれない」に合わせる。
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_issue_repro_a_raising_pane_reader(self) -> None:
+        """Issue 本文の再現: ペインを読む関数そのものが例外を出す。"""
+        records = [_rec(1, hours_ago=99), _rec(2, hours_ago=1), _rec(3, hours_ago=2)]
+        loop = _restarted_loop(records, resident={1, 2, 3}, limit=2)
+
+        with patch("c_lord.tmux.pane_turn_states", side_effect=TimeoutError("capture-pane hung")):
+            assert await loop.tick() == 0
+
+        assert 1 not in _slept_ids(loop), (
+            "running turn evicted because pane evidence was unreadable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_capture_that_times_out_protects_only_that_pane(self) -> None:
+        """読めなかった1本だけを守る。読めて止まっているものは従来どおり選ぶ。"""
+        records = [_rec(1, hours_ago=99), _rec(2, hours_ago=1), _rec(3, hours_ago=2)]
+        loop = _restarted_loop(records, resident={1, 2, 3}, limit=2)
+        base = _fake_tmux({1: RUNNING_PANE, 2: IDLE_PANE, 3: IDLE_PANE})
+
+        def _run(args: list[str]):
+            if args[:2] == ["tmux", "capture-pane"] and args[args.index("-t") + 1] == "%100":
+                return _completed(124, "")  # 1 のペインだけ capture-pane がタイムアウト
+            return base(args)
+
+        with patch("c_lord.tmux._run", side_effect=_run):
+            assert await loop.tick() == 1
+
+        assert _slept_ids(loop) == [3]
+
+    @pytest.mark.asyncio
+    async def test_a_listing_that_fails_protects_every_candidate(self) -> None:
+        """``list-panes`` 自体が読めなければ、どの候補も選ばない。"""
+        records = [_rec(1, hours_ago=99), _rec(2, hours_ago=1), _rec(3, hours_ago=2)]
+        loop = _restarted_loop(records, resident={1, 2, 3}, limit=2)
+
+        def _run(args: list[str]):
+            if args[:2] == ["tmux", "-V"]:
+                return _completed(0, "tmux 3.4\n")
+            return _completed(124, "")  # list-panes がタイムアウト
+
+        with patch("c_lord.tmux._run", side_effect=_run):
+            assert await loop.tick() == 0
+
+        assert _slept_ids(loop) == []
