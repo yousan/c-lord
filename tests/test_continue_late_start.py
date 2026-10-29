@@ -144,3 +144,43 @@ async def test_the_fallback_does_not_type_over_a_claude_that_came_up() -> None:
     assert await _resume_failed(runner) is False, (
         "a fresh start would be typed into a running claude (#994)"
     )
+
+
+STALE = (
+    "$ claude --resume 11111111-1111-1111-1111-111111111111\n"
+    "No conversation found with session ID: 11111111-1111-1111-1111-111111111111\n"
+    "$ claude --session-id 22222222-2222-2222-2222-222222222222\n"
+    "... (that session ran, then exited) ...\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_an_old_no_conversation_in_the_scrollback_is_not_this_resumes_answer() -> None:
+    """#1002 review: ``capture_pane`` carries ~500 lines of scrollback.
+
+    A window whose earlier resume failed (#123 then typed a fresh start in the
+    same window) still shows that "No conversation found". Read as this
+    resume's answer, it failed a resume that was still booting — #994 again.
+    Only an answer that appeared after this resume was typed counts.
+    """
+    fake = _SlowResume(boot_polls=5)
+    booted = fake.up
+    fake.capture_pane = lambda _tid=None: booted if fake._booted() else STALE + "$ "  # type: ignore[method-assign]
+    runner = _runner(fake)
+    await runner._note_resume_baseline(STALE + "$ ")  # what the pane held when the resume was typed
+
+    assert await _resume_failed(runner) is False
+
+
+@pytest.mark.asyncio
+async def test_a_new_no_conversation_under_an_old_one_still_fails() -> None:
+    fake = _SlowResume(boot_polls=10**6)
+    answered = STALE + "$ claude --resume 33333333-3333-3333-3333-333333333333\n" + (
+        "No conversation found with session ID: 33333333-3333-3333-3333-333333333333\n$ "
+    )
+    fake.capture_pane = lambda _tid=None: answered  # type: ignore[method-assign]
+    runner = _runner(fake)
+    await runner._note_resume_baseline(STALE + "$ ")
+
+    assert await _resume_failed(runner) is True
+    assert fake.probes <= 3

@@ -157,7 +157,8 @@ class TestRunnerWake:
         trust = (
             "Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit"
         )
-        tmux_manager.capture_pane.side_effect = [trust, IDLE_PANE, IDLE_PANE]
+        # the first read is the screen before the resume is typed (#1002)
+        tmux_manager.capture_pane.side_effect = ["$ ", trust, IDLE_PANE, IDLE_PANE]
         runner._accept_trust_prompt = AsyncMock()
 
         assert await runner.wake(timeout=1.0) is True

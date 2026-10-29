@@ -462,6 +462,9 @@ class ThreadSessionResolver:
                 )
             return None
         (path,) = matches
+        if read_claim(self.project_dir) != claimed_id:
+            # The runner named a new session meanwhile: that one is starting now.
+            return None
         if not write_claim(self.project_dir, path.stem):
             return None
         logger.warning(

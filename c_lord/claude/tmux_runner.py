@@ -1580,6 +1580,8 @@ class TmuxClaudeRunner:
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
         self._try_continue = try_continue
+        # #1002: "No conversation found" already on screen before the resume.
+        self._resume_baseline = 0
         self._stopped = False
         self._silent_stop = False
         self._last_capture: str = ""
@@ -1864,6 +1866,7 @@ class TmuxClaudeRunner:
                 # Restart-resume path only (on_ready → pending_resumes).
                 # Try --continue first; if Claude exits immediately (no session),
                 # fall back to a fresh start (issue #123 Part 2).
+                await self._note_resume_baseline()
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,
@@ -2775,6 +2778,7 @@ class TmuxClaudeRunner:
         if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
             return True  # already awake — restarting would kill a live turn
 
+        await self._note_resume_baseline()
         started = await asyncio.to_thread(
             self._tmux.start_claude,
             self._thread_id,
@@ -3016,6 +3020,21 @@ class TmuxClaudeRunner:
     # Private helpers
     # ------------------------------------------------------------------
 
+    async def _note_resume_baseline(self, pane: str | None = None) -> None:
+        """Count the "No conversation found" already on screen before a resume (#1002).
+
+        ``capture_pane`` carries the scrollback, so an earlier resume's answer
+        in the same window is still there; only a *new* one is this resume's.
+        """
+        if pane is None:
+            try:
+                pane = _normalize_capture(
+                    await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+                )
+            except Exception:
+                pane = ""
+        self._resume_baseline = (pane or "").count(_NO_CONVERSATION)
+
     async def _resume_failed(self) -> bool:
         """Whether the resume just typed failed, so a fresh start may be typed (#994).
 
@@ -3090,7 +3109,7 @@ class TmuxClaudeRunner:
                     trust_handled = True
                 settled = 0.0
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
-                if seen_claude or _NO_CONVERSATION in pane:
+                if seen_claude or pane.count(_NO_CONVERSATION) > self._resume_baseline:
                     return False
                 # #994: not exec'd yet — nothing about the resume is decided.
                 settled = 0.0

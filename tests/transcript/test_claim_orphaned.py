@@ -185,3 +185,28 @@ class TestLiveSessionIds:
 
     def test_no_proc_is_no_proof(self, tmp_path: Path) -> None:
         assert live_session_ids(tmp_path / "p", proc_root=tmp_path / "missing") == set()
+
+
+def test_a_claim_rewritten_meanwhile_is_not_overwritten(tmp_path: Path, monkeypatch) -> None:
+    """#1002 review: the runner may write a new claim between the read and the write.
+
+    That claim names a session starting right now; replacing it would point the
+    mirror (and the next ``--resume``) at the older one.
+    """
+    project = _project(tmp_path)
+    write_claim(project, LIVE)
+    write_claim(project, ORPHAN)
+    _age_claim(project)
+    _transcript(project, LIVE)
+    fresh_start = new_session_id()
+    real_history = resolver_mod.read_claim_history
+
+    def history_then_new_claim(project_dir: Path) -> list[str]:
+        ids = real_history(project_dir)
+        claim_path(project_dir).write_text(f"{fresh_start}\n", encoding="utf-8")
+        return ids
+
+    monkeypatch.setattr(resolver_mod, "read_claim_history", history_then_new_claim)
+
+    assert ThreadSessionResolver(project).resolve() is None
+    assert read_claim(project) == fresh_start

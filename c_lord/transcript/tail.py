@@ -352,7 +352,10 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
 
     if active != state.current_path:
         if state.current_path is not None:
-            state.offsets[state.current_path] = state.offset
+            # #1043: bank the start of the half line, as _drop_current does
+            # (#1004) — the buffer is cleared below, so banking past it would
+            # resume mid-line and lose that event.
+            state.offsets[state.current_path] = state.offset - len(state.buffer.encode("utf-8"))
         state.offset = _start_offset(state, active)
         state.current_path = active
         state.buffer = ""
