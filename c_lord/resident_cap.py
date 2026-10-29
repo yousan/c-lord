@@ -588,8 +588,10 @@ class ResidentCapLoop:
                 engaged.suffix,
             )
 
+        # #1086: under pressure is exactly when a deleted thread's memory matters.
+        await self._close_known_gone(self._resident())
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
-        resident = self._resident() & {rec.thread_id for rec in records}
+        resident = (self._resident() - self._gone) & {rec.thread_id for rec in records}
         victims = select_lru_victims(
             records,
             resident=resident,
@@ -616,6 +618,8 @@ class ResidentCapLoop:
                     "%s resident-cap: slept under EMERGENCY memory pressure",
                     log_ctx(thread_id=thread_id),
                 )
+            elif thread_id in self._gone:
+                await self._close_gone(thread_id)  # found deleted just now (#1086)
             total, available = self._memory()
             if total > 0 and available >= total * EMERGENCY_LOW_FRACTION:
                 logger.warning(

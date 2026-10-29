@@ -129,3 +129,30 @@ async def test_a_deleted_thread_with_a_running_turn_is_not_closed() -> None:
         await loop.tick()
 
     closed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_emergency_brake_closes_deleted_threads_too() -> None:
+    """Found in review: under memory pressure the cap never runs, and the brake
+    only skipped a deleted thread — the window held its memory all episode."""
+    from tests.test_resident_cap_failure_paths import LOW
+
+    resident = {1, 2, 3, 4, 5}
+    cog = _sleeping_cog(resident)
+    loop = _loop(resident, cog, _not_found())
+    loop._mem_fn = lambda: LOW  # type: ignore[assignment]
+    loop._low_streak = 10  # already braking
+
+    def close(thread_id: int) -> int:
+        resident.discard(thread_id)
+        return 1
+
+    with (
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+        patch("c_lord.tmux.close_thread_windows", side_effect=close) as closed,
+    ):
+        await loop.tick()
+        await loop.tick()
+
+    assert {c.args[0] for c in closed.call_args_list} == {4, 5}
+    assert 4 not in resident and 5 not in resident
