@@ -111,3 +111,65 @@ def test_a_bot_prefixed_token_is_written_without_the_prefix(
 
     assert _values(env)["DISCORD_BOT_TOKEN"] == "abc.def"
     validate.assert_awaited_once_with("abc.def")
+
+
+def test_owner_id_username_is_asked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main.py exits on a non-numeric DISCORD_OWNER_ID (#451); setup must not write one (#1062)."""
+    env = tmp_path / ".env"
+    _setup(monkeypatch, ["abc.def", "1", "yousan", "123456789012345678", "/w", ""])
+
+    cli.cmd_setup(env)
+
+    assert _values(env)["DISCORD_OWNER_ID"] == "123456789012345678"
+    assert "numeric" in capsys.readouterr().out
+
+
+def test_owner_id_username_is_never_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Issue's probe: whatever is written, ``c-lord start`` accepts it (#1062 AC1)."""
+    env = tmp_path / ".env"
+    _setup(monkeypatch, ["abc.def", "1", "yousan", "", "/w", ""])
+
+    cli.cmd_setup(env)
+
+    owner = _values(env)["DISCORD_OWNER_ID"]
+    assert owner == "" or owner.isdigit()
+
+
+def test_empty_owner_id_is_still_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The owner is optional (#1062 AC2)."""
+    env = tmp_path / ".env"
+    _setup(monkeypatch, ["abc.def", "1", "", "/w", ""])
+
+    cli.cmd_setup(env)
+
+    assert _values(env)["DISCORD_OWNER_ID"] == ""
+
+
+@pytest.mark.parametrize("answer", ["²", "1²", "１"])
+def test_a_non_ascii_digit_on_the_list_is_asked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """``"²".isdigit()`` is True but ``int("²")`` raises — setup crashed (#1063)."""
+    env = tmp_path / ".env"
+    _setup(monkeypatch, ["abc.def", answer, "1", "", "/w", ""])
+
+    cli.cmd_setup(env)
+
+    assert _values(env)["DISCORD_CHANNEL_ID"] == CHANNEL
+
+
+def test_a_non_ascii_channel_id_is_asked_again_in_manual_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manual entry (bot in no server) takes only ASCII digits too (#1063)."""
+    env = tmp_path / ".env"
+    _setup(monkeypatch, ["abc.def", "²" * 18, CHANNEL, "", "/w", ""])
+    monkeypatch.setattr(cli, "fetch_channels", AsyncMock(return_value=[]))
+
+    cli.cmd_setup(env)
+
+    assert _values(env)["DISCORD_CHANNEL_ID"] == CHANNEL
