@@ -3852,21 +3852,7 @@ class TmuxSessionManager:
             # A name target (rows from before #649) or a tag tmux's format
             # language could misread: the two-step check is the best we have.
             return self._tag_unchanged(target, listed) and self._kill_window(target)
-        _run(
-            [
-                "tmux",
-                "if-shell",
-                "-F",
-                "-t",
-                target,
-                f"#{{==:#{{@thread_id}},{listed}}}",
-                f"kill-window -t {target}",
-            ]
-        )
-        alive = _run(["tmux", "list-windows", "-a", "-F", "#{window_id}"])
-        if alive.returncode != 0:
-            return False  # cannot tell — do not count or forget a window we may not have killed
-        if target not in alive.stdout.split():
+        if _kill_window_if_tagged(target, listed):
             return True
         logger.info(
             "cleanup_orphaned: %s was re-tagged since the listing (was %r) — keeping",
@@ -4037,6 +4023,77 @@ def live_claude_panes() -> LiveClaude | None:
         if path.strip():
             paths.add(path.strip())
     return LiveClaude(frozenset(thread_ids), frozenset(paths))
+
+
+def _kill_window_if_tagged(window_id: str, tag: str) -> bool:
+    """Kill *window_id* only if its ``@thread_id`` is still *tag*; ``True`` if it is gone.
+
+    tmux compares and kills in **one** server command, so a re-tag
+    (``/attach``, ``create_session``'s adoption) either lands first and the
+    window stays, or lands on a window that no longer exists (#1085).
+    ``if-shell`` exits 0 whether or not it ran the kill, so "gone" is read
+    back from the window list. Callers guarantee *window_id* is an ``@N`` id
+    and *tag* digits (or empty), so neither can be misread by tmux.
+    """
+    _run(
+        [
+            "tmux",
+            "if-shell",
+            "-F",
+            "-t",
+            window_id,
+            f"#{{==:#{{@thread_id}},{tag}}}",
+            f"kill-window -t {window_id}",
+        ]
+    )
+    alive = _run(["tmux", "list-windows", "-a", "-F", "#{window_id}"])
+    if alive.returncode != 0:
+        return False  # cannot tell — do not count or forget a window we may not have killed
+    return window_id not in alive.stdout.split()
+
+
+def close_thread_windows(thread_id: int) -> int:
+    """Kill this instance's windows of *thread_id*, host-wide. Returns how many (#1086).
+
+    For a thread Discord says **no longer exists**: nobody can talk to it, so its
+    Claude only holds memory — and a resident slot. The resident cap cannot
+    sleep it (sleeping goes through the Discord thread), and the #570 reaper
+    leaves it alone (its pane runs claude), so without this it held a slot for
+    good and a live workspace was slept in its place on every tick.
+
+    Only windows tagged with this thread **and** owned by this instance (or by
+    no instance — windows from before #790); another c-lord's are its own
+    business. The tag is compared and the window killed in one tmux command.
+    """
+    if not _tmux_available():
+        return 0
+    listing = _run(
+        [
+            "tmux",
+            "list-windows",
+            "-a",
+            "-F",
+            f"#{{window_id}}\t#{{@thread_id}}\t#{{{OWNER_OPTION}}}",
+        ]
+    )
+    if listing.returncode != 0:
+        return 0
+    mine = instance_owner()
+    closed = 0
+    for line in listing.stdout.splitlines():
+        window_id, tag, owner = ([*line.split("\t"), "", ""])[:3]
+        if tag.strip() != str(thread_id) or owner.strip() not in ("", mine):
+            continue
+        if not _WINDOW_ID_RE.match(window_id):
+            continue
+        if _kill_window_if_tagged(window_id, str(thread_id)):
+            closed += 1
+            logger.info(
+                "%s closed tmux window %s — the thread no longer exists in Discord",
+                log_ctx(thread_id=thread_id),
+                window_id,
+            )
+    return closed
 
 
 def resident_thread_ids() -> set[int]:

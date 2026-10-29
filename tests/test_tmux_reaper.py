@@ -920,3 +920,14 @@ def test_real_tmux_unchanged_tag_is_still_reaped(real_tmux: None) -> None:
     assert killed == 1
     assert not any(w.startswith("w1=") for w in _real_windows())
     assert "w0=999" in _real_windows()  # another instance's window is left alone
+
+
+def test_real_tmux_close_thread_windows_takes_only_our_window_of_that_thread(
+    real_tmux: None,
+) -> None:
+    """#1086: closing a deleted thread's window — ours only, by tag, on a real tmux."""
+    with patch("c_lord.tmux._run", side_effect=_isolated):
+        assert tmux_mod.close_thread_windows(999) == 0  # another instance's window
+        assert tmux_mod.close_thread_windows(111) == 1
+
+    assert _real_windows() == ["w0=999"]
