@@ -4954,6 +4954,29 @@ class TestUsageLimitChoiceMenu:
         )
         assert _usage_limit_wait_option(pane) == 1
 
+    def test_wait_option_is_found_below_a_numbered_list_in_the_answer(self) -> None:
+        """#989: capture-pane includes scrollback, so Claude's own answer above the
+        menu can hold a "1. / 2." list. That run used to be taken as the menu and
+        the real one below it was never read — press nothing, menu left open.
+
+        Both halves are real captures: the answer part of
+        ``bug_156_yn_in_conversation.txt`` and the #631 staging menu.
+        """
+        menu = _normalize_capture(_load_fixture("usage_limit_choice_menu_4options.txt"))
+        answer = _load_fixture("bug_156_yn_in_conversation.txt").split("────")[0]
+        pane = answer + "\n" + menu
+        assert _usage_limit_menu_open(pane) is True
+        assert _usage_limit_wait_option(pane) == 0
+
+    def test_numbered_list_without_the_menu_header_is_not_the_menu(self) -> None:
+        """Options are read only under "What do you want to do?" (#989)."""
+        pane = (
+            "⏺ Two ways to proceed:\n"
+            "  1. Stop and wait for the build\n"
+            "  2. Switch to usage credits\n"
+        )
+        assert _usage_limit_wait_option(pane) is None
+
     def test_pane_without_a_menu_has_no_option(self) -> None:
         pane = _load_fixture("usage_limit_weekly_hit.txt")
         assert _usage_limit_wait_option(pane) is None
