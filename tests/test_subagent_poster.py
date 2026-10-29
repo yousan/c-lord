@@ -115,3 +115,22 @@ async def test_reserved_words_are_kept_out_of_the_username() -> None:
     parent.webhooks = AsyncMock(return_value=[hook])
     await _poster(_thread(parent)).post_voice("Discord reader", "x")
     assert "discord" not in hook.send.await_args.kwargs["username"].lower()
+
+
+async def test_restore_handle_finds_a_line_again_by_id() -> None:
+    """#1027: after a restart the open start line is edited through its id."""
+    from unittest.mock import MagicMock as _MM
+
+    from c_lord.discord_ui.subagent_poster import DiscordSubagentPoster
+
+    channel = _MM()
+    channel.get_partial_message = _MM(return_value="partial-1001")
+
+    async def resolve(_tid):
+        return channel
+
+    poster = DiscordSubagentPoster(
+        bot=_MM(), thread_id=5, resolve_channel=resolve, send_chunks=_MM()
+    )
+    assert await poster.restore_handle(1001) == "partial-1001"
+    channel.get_partial_message.assert_called_once_with(1001)

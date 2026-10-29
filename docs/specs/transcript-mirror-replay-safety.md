@@ -272,6 +272,11 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
   Claude Code が1行を書いている途中だと、生のサイズはその行の途中を指す。そこから読むと
   行の後半だけを読んで JSON として捨て、その1件（返信本文のこともある）が届かなかった。
   書きかけの行は、書き終わってから丸ごと1回届く。
+- **書きかけの行はバイトのまま持ち、改行までそろってから UTF-8 として読む**（#1044）。
+  書き手は日本語の1文字の途中で止まることがある。以前は文字として読み（`errors="replace"`）、
+  途中までの1〜2バイトが `�` に置き換わったまま行の残りとつながって、`返事です` が
+  `���事です` で届いていた。読み位置もバイトで数える（文字数で数えると、覚える位置が
+  行の頭より手前や負になりえた）。テスト: `tests/transcript/test_tail_multibyte_split.py`。
 
 テスト: `tests/transcript/test_tail.py`
 (`test_tail_does_not_replay_history_on_resume_rewrite`,

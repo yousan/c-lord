@@ -68,6 +68,9 @@ class UnresolvedTranscript:
 
 
 UnresolvedCb = Callable[[UnresolvedTranscript], Awaitable[None]]
+#: ``(transcript, offset)`` — where the tail starts following (#1018). ``None``
+#: when no transcript was resolvable yet.
+StartCb = Callable[[Path | None, int], Awaitable[None]]
 
 # Read the seeding baseline in bounded slices instead of one ``read(offset)``:
 # a production transcript reaches ~100 MB and the seeding of every session now
@@ -200,7 +203,10 @@ class _FollowState:
     pre_existing: dict[Path, int] = field(default_factory=dict)
     current_path: Path | None = None
     offset: int = 0
-    buffer: str = ""
+    # Raw bytes of the line still being written.  Bytes, not text (#1044): the
+    # writer can stop inside a multi-byte character, and decoding that half
+    # turned ``返`` into U+FFFD for good.  Lines are decoded only once whole.
+    buffer: bytes = b""
     last_mtime: float = -1.0
     # Read position per file, so switching back and forth never re-reads (and
     # the consumer never re-receives) a transcript already consumed (#627 AC3).
@@ -209,6 +215,9 @@ class _FollowState:
     # rather than sleeping, so falling behind is not also made slow.
     more_to_read: bool = False
     seen_uuids: set[str] = field(default_factory=set)
+    # The transcript the tail started on and where in it (#1018): everything
+    # before that offset is the caller's to read back, everything after is ours.
+    start_path: Path | None = None
     # Whether the last poll had a transcript to read at all (#773).  Starts
     # True so a tail that has not polled yet is never reported as broken.
     resolved: bool = True
@@ -241,6 +250,7 @@ def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
         # message the user sent was dropped by Discord and never redelivered.
         state.offsets[initial_path] = _whole_lines_end(initial_path)
         _seed_seen_uuids(initial_path, state.offsets[initial_path], state.seen_uuids)
+        state.start_path = initial_path
     return state
 
 
@@ -331,7 +341,7 @@ def _drop_current(state: _FollowState) -> None:
     possibly the reply itself, was lost.
     """
     if state.current_path is not None:
-        state.offsets[state.current_path] = state.offset - len(state.buffer.encode("utf-8"))
+        state.offsets[state.current_path] = state.offset - len(state.buffer)
     state.current_path = None
 
 
@@ -358,7 +368,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             state.offsets[state.current_path] = state.offset - len(state.buffer.encode("utf-8"))
         state.offset = _start_offset(state, active)
         state.current_path = active
-        state.buffer = ""
+        state.buffer = b""
         state.last_mtime = -1.0
         state.signature = _signature(active, state.offset)
 
@@ -373,7 +383,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     if size < state.offset:
         # Truncation — reset and re-read from start.
         state.offset = 0
-        state.buffer = ""
+        state.buffer = b""
     elif (
         size == state.offset
         and mtime > state.last_mtime > 0
@@ -385,7 +395,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         # and treating that as a rewrite re-read every uuid-less event — whose
         # tool blocks then woke the progress line on a finished thread.
         state.offset = 0
-        state.buffer = ""
+        state.buffer = b""
 
     state.last_mtime = mtime
 
@@ -393,10 +403,10 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         return []
 
     try:
-        with active.open("r", encoding="utf-8", errors="replace") as f:
+        with active.open("rb") as f:
             f.seek(state.offset)
             chunk = f.read(_READ_CHUNK_BYTES)
-            state.offset = f.tell()
+            state.offset += len(chunk)
     except OSError:
         _drop_current(state)
         return []
@@ -405,7 +415,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     state.signature = _signature(active, state.offset)
 
     state.buffer += chunk
-    lines = state.buffer.split("\n")
+    lines = state.buffer.split(b"\n")
     state.buffer = lines[-1]  # last fragment may be a partial line
 
     events: list[dict[str, Any]] = []
@@ -413,7 +423,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json.loads(line.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             continue
         uid = event.get("uuid")
@@ -432,6 +442,7 @@ async def tail_events(
     from_start: bool = False,
     on_unresolved: UnresolvedCb | None = None,
     unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
+    on_start: StartCb | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield JSONL events as they appear under ``project_dir``.
 
@@ -453,6 +464,11 @@ async def tail_events(
         stop — and the caller decides whether anyone should hear about it.
     unresolved_after
         How long the resolver may come back empty before that call.
+    on_start
+        Awaited once, before anything is yielded, with the transcript the tail
+        starts on and the offset it starts from (#1018). A caller that reads
+        what came before reads up to exactly that offset: a line written while
+        it reads is then the tail's, never lost in between, never read twice.
     """
     # Issue #433: events already yielded (or present at start) must not be
     # re-emitted when the read offset is reset to 0 (truncation / in-place
@@ -462,6 +478,9 @@ async def tail_events(
     # they are intentionally not deduplicated (avoids collapsing two distinct
     # uuid-less records that happen to serialise identically).
     state = await _run_off_loop(_open_initial_state, project_dir, from_start)
+    if on_start is not None:
+        start = state.start_path
+        await on_start(start, state.offsets.get(start, 0) if start is not None else 0)
     # When the current run of "nothing to read" began, or None while healthy.
     unresolved_since: float | None = None
 

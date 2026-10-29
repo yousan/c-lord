@@ -41,7 +41,8 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +51,7 @@ from typing import Protocol
 from ..utils.logger import log_ctx
 from .claim import read_claim
 from .formatter import render_event
+from .tail import _whole_lines_end
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,13 @@ FINISHED_QUIET_SECONDS = 30.0
 #: ... and closed regardless after this long, so a dead agent does not read
 #: "作業中" forever.
 STALLED_SECONDS = 1800.0
+#: How much of an agent's progress is kept in memory, in characters (#1025). The
+#: attachment keeps the beginning and the latest part anyway, so the rest of an
+#: hours-long run's tool output only ever cost memory and CPU.
+LINES_BUDGET_CHARS = MAX_FILE_BYTES
+#: Where the start lines of the runs still open are written down (#1027), so a
+#: restart can close them instead of leaving them reading "作業中".
+OPEN_RUNS_FILE = ".clord-subagent-runs.json"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -144,6 +153,28 @@ def task_notifications(event: dict) -> list[tuple[str, str]]:
     return [(task.group(1), status.group(1) if status else "completed")]
 
 
+def foreground_results(event: dict) -> list[tuple[str, str]]:
+    """``(agent id, status)`` of a foreground ``Agent`` call that returned in *event*.
+
+    A foreground call gets no ``<task-notification>`` (CLI 2.1.312, #1027): the
+    run ends with the parent's ``tool_result`` for that call, whose
+    ``toolUseResult`` names the agent. A background launch has a
+    ``toolUseResult`` too — ``status: async_launched`` — and is not an end.
+    """
+    if event.get("type") != "user" or event.get("isSidechain"):
+        return []
+    result = event.get("toolUseResult")
+    if not isinstance(result, dict) or result.get("isAsync") is True:
+        return []
+    agent_id = result.get("agentId")
+    status = result.get("status")
+    if not isinstance(agent_id, str) or not isinstance(status, str):
+        return []
+    if status == "async_launched":
+        return []
+    return [(agent_id, status)]
+
+
 def teammate_idles(event: dict) -> list[str]:
     """Names of the in-process teammates *event* reports idle (Agent Teams)."""
     if event.get("type") != "user" or event.get("isSidechain"):
@@ -172,7 +203,9 @@ def sent_messages(event: dict) -> list[tuple[str, str]]:
             continue
         if block.get("name") != "SendMessage":
             continue
-        inp = block.get("input") or {}
+        inp = block.get("input")
+        if not isinstance(inp, dict):
+            continue
         to = inp.get("to") or inp.get("recipient")
         text = inp.get("message") or inp.get("content")
         if isinstance(to, str) and isinstance(text, str) and text.strip():
@@ -261,6 +294,50 @@ class _Run:
     handle: object | None = None
     last_upload: float = 0.0
     uploaded_len: int = -1
+    # ``stop_reason`` of the latest row (#1027): ``end_turn`` means the agent
+    # finished speaking; a ``tool_use`` / ``tool_result`` means it is mid-work.
+    last_stop: str | None = None
+
+
+class _Lines:
+    """An agent's progress lines: the beginning and the latest, within a budget (#1025).
+
+    ``agent.lines`` used to grow for as long as the agent ran, and every
+    progress upload rebuilt the whole of it. The attachment shows the first
+    fifth and the last part anyway, so that is what is kept; what is dropped
+    in between is counted and said.
+    """
+
+    def __init__(self, budget: int = LINES_BUDGET_CHARS) -> None:
+        self._budget = budget
+        self._head: list[str] = []
+        self._head_chars = 0
+        self._tail: deque[str] = deque()
+        self._tail_chars = 0
+        self.dropped = 0
+        self._total = 0
+
+    def append(self, line: str) -> None:
+        self._total += 1
+        if not self._tail and self._head_chars < self._budget // 5:
+            self._head.append(line)
+            self._head_chars += len(line)
+            return
+        self._tail.append(line)
+        self._tail_chars += len(line)
+        while len(self._tail) > 1 and self._head_chars + self._tail_chars > self._budget:
+            self._tail_chars -= len(self._tail.popleft())
+            self.dropped += 1
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._head
+        if self.dropped:
+            yield f"…（途中の {self.dropped} 行は大きすぎるため省略）…"
+        yield from self._tail
+
+    def __len__(self) -> int:
+        """How many lines ever came in — what tells a change since the last upload."""
+        return self._total
 
 
 @dataclass
@@ -273,7 +350,7 @@ class _Agent:
     read_any: bool = False
     meta: AgentMeta | None = None
     assignment: str = ""
-    lines: list[str] = field(default_factory=list)
+    lines: _Lines = field(default_factory=_Lines)
     run: _Run | None = None
     runs: int = 0
     final_status: str = ""
@@ -291,7 +368,11 @@ class StatusFile:
 
 
 class SubagentPoster(Protocol):
-    """Discord side of the log; :class:`TranscriptMirrorCog` supplies the real one."""
+    """Discord side of the log; :class:`TranscriptMirrorCog` supplies the real one.
+
+    A poster may also have ``async restore_handle(message_id) -> handle | None``:
+    with it, a start line left open by an earlier process is closed (#1027).
+    """
 
     async def post_status(self, text: str, file: StatusFile | None) -> object | None: ...
 
@@ -331,6 +412,8 @@ class SubagentLog:
         self._baselined: set[str] = set()
         self._primed = False
         self._parent: list[dict] = []
+        # agent id → the open start line, as written to :data:`OPEN_RUNS_FILE`.
+        self._open_runs: dict[str, dict] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._ctx = log_ctx(thread_id=thread_id)
@@ -375,6 +458,42 @@ class SubagentLog:
         self._primed = True
         self._session_id = await asyncio.to_thread(read_claim, self.project_dir)
         await self._baseline_session()
+        await self._close_crossed_runs()
+
+    def _open_runs_path(self) -> Path:
+        return self.project_dir / OPEN_RUNS_FILE
+
+    async def _close_crossed_runs(self) -> None:
+        """Close the start lines a previous process left open (#1027).
+
+        A run that crossed a restart was shown by the previous process; this one
+        cannot know how it went, and its handle on the line is gone. The line is
+        found again by id and closed, so it does not read "作業中" forever; if
+        the agent is still working, its next rows start a run of their own.
+        """
+        left = await asyncio.to_thread(_read_open_runs, self._open_runs_path())
+        if not left:
+            return
+        restore = getattr(self._poster, "restore_handle", None)
+        for entry in left.values():
+            message_id = entry.get("message_id")
+            if restore is None or not isinstance(message_id, int):
+                continue
+            handle = await self._safe(restore(message_id))
+            if handle is None:
+                continue
+            text = f"-# 🤖 {entry.get('label', 'サブエージェント')}{entry.get('word', '開始')}"
+            await self._safe(
+                self._poster.edit_status(
+                    handle, f"{text}（記録が途切れました — c-lord の再起動など）", None
+                )
+            )
+        logger.info("%s SubagentLog: closed %d run(s) left open", self._ctx, len(left))
+        await self._save_open_runs()
+
+    async def _save_open_runs(self) -> None:
+        snapshot = dict(self._open_runs)
+        await asyncio.to_thread(_write_open_runs, self._open_runs_path(), snapshot)
 
     async def _baseline_session(self) -> None:
         if not self._session_id or self._session_id in self._baselined:
@@ -392,7 +511,9 @@ class SubagentLog:
         if directory is None:
             return {}
         try:
-            return {p: p.stat().st_size for p in directory.glob("agent-*.jsonl") if p.is_file()}
+            # A row being written at this moment is read whole once it is
+            # finished, not from its middle (#1026, as the tail does — #988).
+            return {p: _whole_lines_end(p) for p in directory.glob("agent-*.jsonl") if p.is_file()}
         except OSError:
             return {}
 
@@ -409,7 +530,12 @@ class SubagentLog:
             if self._session_id is not None:
                 logger.info("%s SubagentLog: following session %s", self._ctx, session[:8])
             self._session_id = session
-        if task_notifications(event) or teammate_idles(event) or sent_messages(event):
+        if (
+            task_notifications(event)
+            or foreground_results(event)
+            or teammate_idles(event)
+            or sent_messages(event)
+        ):
             self._parent.append(event)
         self._wake.set()
 
@@ -428,15 +554,9 @@ class SubagentLog:
         directory = self._subagents_dir()
         if directory is None:
             return
-        try:
-            # A meta file can come first; it is what names the agent a message
-            # is addressed to.
-            ids = sorted(
-                {p.name.removesuffix(".meta.json") for p in directory.glob("agent-*.meta.json")}
-                | {p.name.removesuffix(".jsonl") for p in directory.glob("agent-*.jsonl")}
-            )
-        except OSError:
-            return
+        # A meta file can come first; it is what names the agent a message is
+        # addressed to. Off the loop (#1025): a busy session's directory is big.
+        ids = await asyncio.to_thread(_agent_stems, directory)
         # Every agent is known by name before any row is read: a message in one
         # file is addressed to an agent whose file sorts after it.
         for stem in ids:
@@ -504,10 +624,27 @@ class SubagentLog:
 
     def _scrub(self, text: str) -> str:
         """Agent ids and harness paths are Claude's bookkeeping, not the reader's."""
+        return self._scrubber()(text)
+
+    def _scrubber(self) -> Callable[[str], str]:
+        """:meth:`_scrub` as a function of the agents known now — safe to run in a worker.
+
+        One pass for all the agents (#1025), not one ``re.sub`` per agent over
+        the whole text.
+        """
+        names: dict[str, str] = {}
         for agent in self._agents.values():
-            name = agent.meta.name if agent.meta is not None else "サブエージェント"
-            text = re.sub(rf"\b{re.escape(agent.agent_id[:7])}[\w-]*", name, text)
-        return _INTERNAL_PATH_RE.sub("…", text)
+            names.setdefault(agent.agent_id[:7], self._label_name(agent))
+        pattern = (
+            re.compile(r"\b(" + "|".join(map(re.escape, names)) + r")[\w-]*") if names else None
+        )
+
+        def scrub(text: str) -> str:
+            if pattern is not None:
+                text = pattern.sub(lambda m: names[m.group(1)], text)
+            return _INTERNAL_PATH_RE.sub("…", text)
+
+        return scrub
 
     def _label(self, agent: _Agent) -> str:
         kind = (
@@ -523,6 +660,9 @@ class SubagentLog:
             await self._begin(agent, row)
         assert agent.run is not None
         agent.run.last_row_clock = self._clock()
+        message = row.get("message")
+        stop = message.get("stop_reason") if isinstance(message, dict) else None
+        agent.run.last_stop = stop if row.get("type") == "assistant" else None
         content = _content(row)
         first = not agent.read_any
         agent.read_any = True
@@ -585,11 +725,19 @@ class SubagentLog:
         agent.run.handle = await self._safe(
             self._poster.post_status(f"-# 🤖 {self._label(agent)}{word}", None)
         )
+        message_id = getattr(agent.run.handle, "id", None)
+        if isinstance(message_id, int):
+            self._open_runs[agent.agent_id] = {
+                "message_id": message_id,
+                "label": self._label(agent),
+                "word": word,
+            }
+            await self._save_open_runs()
 
     # --- parent ------------------------------------------------------------
 
     async def _on_parent(self, event: dict) -> None:
-        for agent_id, status in task_notifications(event):
+        for agent_id, status in task_notifications(event) + foreground_results(event):
             agent = self._agents.get(agent_id)
             if agent is not None:
                 await self._finish(agent, status, _timestamp(event))
@@ -641,6 +789,8 @@ class SubagentLog:
             ),
         )
         logger.info("%s SubagentLog: %s 終了 status=%s", self._ctx, self._label(agent), status)
+        if self._open_runs.pop(agent.agent_id, None) is not None:
+            await self._save_open_runs()
         if self._voices and run.report:
             await self._voice(self._label_name(agent), f"📝 **最終報告**\n{run.report}")
 
@@ -651,7 +801,10 @@ class SubagentLog:
             if run is None:
                 continue
             quiet = now - run.last_row_clock
-            if quiet >= FINISHED_QUIET_SECONDS:
+            # ``finished`` alone is not the end (#1027): it stays in the meta of
+            # a run that ended before, so a resumed agent in a long tool call
+            # read as finished. Its own rows must say it stopped speaking too.
+            if quiet >= FINISHED_QUIET_SECONDS and run.last_stop == "end_turn":
                 meta = await asyncio.to_thread(
                     _read_meta, agent.path.with_name(agent.path.stem + ".meta.json")
                 )
@@ -685,7 +838,7 @@ class SubagentLog:
 
     # --- output ------------------------------------------------------------
 
-    def _document(self, agent: _Agent, run: _Run, state: str) -> str:
+    def _document_head(self, agent: _Agent, run: _Run, state: str) -> str:
         meta = agent.meta
         parts = [f"# {self._label(agent)}", "", f"- 状態: {state}", f"- ツール: {run.tools} 件"]
         if meta is not None and meta.teammate:
@@ -695,32 +848,22 @@ class SubagentLog:
         if agent.assignment:
             parts += ["", "## 依頼（親から）", "", agent.assignment]
         parts += ["", "## 途中経過", ""]
-        body = "\n".join(parts) + "\n" + "\n".join(agent.lines) + "\n"
-        body = self._scrub(body)
-        data = body.encode("utf-8")
-        if len(data) > MAX_FILE_BYTES:
-            head = data[: MAX_FILE_BYTES // 5].decode("utf-8", "ignore")
-            tail = data[-(MAX_FILE_BYTES * 3 // 4) :].decode("utf-8", "ignore")
-            body = f"{head}\n\n…（中略 — 大きすぎるため）…\n\n{tail}"
-        return body
+        return "\n".join(parts)
 
     async def _with_file(self, agent: _Agent, run: _Run, state: str, send) -> object | None:
-        tmp: str | None = None
+        # Gathered on the loop — cheap references only — and built, scrubbed and
+        # written in a worker (#1025): for a big run that is seconds of CPU.
+        head = self._document_head(agent, run, state)
+        lines = list(agent.lines)
+        scrub = self._scrubber()
+        tmp = await asyncio.to_thread(_write_document, self.thread_id, head, lines, scrub)
+        if tmp is None:
+            return None
         try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                suffix=".md",
-                prefix=f"clord_subagent_{self.thread_id}_",
-                delete=False,
-                encoding="utf-8",
-            ) as f:
-                f.write(self._document(agent, run, state))
-                tmp = f.name
             return await self._safe(send(StatusFile(tmp, _filename(agent))))
         finally:
-            if tmp is not None:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
     async def _voice(self, speaker: str, text: str) -> None:
         await self._safe(
@@ -744,3 +887,69 @@ def _filename(agent: _Agent) -> str:
     name = agent.meta.name if agent.meta is not None else ""
     slug = _SLUG_RE.sub("-", name).strip("-.")[:40]
     return f"subagent-{agent.ordinal}-{slug}.md" if slug else f"subagent-{agent.ordinal}.md"
+
+
+def _agent_stems(directory: Path) -> list[str]:
+    """``agent-<id>`` of every agent with a file in *directory*. Blocking."""
+    try:
+        return sorted(
+            {p.name.removesuffix(".meta.json") for p in directory.glob("agent-*.meta.json")}
+            | {p.name.removesuffix(".jsonl") for p in directory.glob("agent-*.jsonl")}
+        )
+    except OSError:
+        return []
+
+
+def _write_document(
+    thread_id: int, head: str, lines: list[str], scrub: Callable[[str], str]
+) -> str | None:
+    """Build the attachment and write it to a temp file; its path. Blocking (#1025).
+
+    Cut to :data:`MAX_FILE_BYTES` first and scrubbed after, so the scrub only
+    ever sees what is sent.
+    """
+    body = head + "\n" + "\n".join(lines) + "\n"
+    data = body.encode("utf-8")
+    if len(data) > MAX_FILE_BYTES:
+        first = data[: MAX_FILE_BYTES // 5].decode("utf-8", "ignore")
+        last = data[-(MAX_FILE_BYTES * 3 // 4) :].decode("utf-8", "ignore")
+        body = f"{first}\n\n…（中略 — 大きすぎるため）…\n\n{last}"
+    body = scrub(body)
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            suffix=".md",
+            prefix=f"clord_subagent_{thread_id}_",
+            delete=False,
+            encoding="utf-8",
+        ) as f:
+            f.write(body)
+            return f.name
+    except OSError:
+        logger.warning("SubagentLog: could not write the attachment", exc_info=True)
+        return None
+
+
+def _read_open_runs(path: Path) -> dict[str, dict]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        logger.warning("SubagentLog: could not read %s", path, exc_info=True)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, dict)}
+
+
+def _write_open_runs(path: Path, runs: dict[str, dict]) -> None:
+    try:
+        if not runs:
+            path.unlink(missing_ok=True)
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(runs, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        logger.warning("SubagentLog: could not write %s", path, exc_info=True)

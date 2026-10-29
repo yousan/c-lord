@@ -730,3 +730,52 @@ class TestReaperKillsTheWindowItProbed:
 
         assert fake.killed == ["clord:w1"]
         assert 111 not in mgr._thread_to_window
+
+
+class _RetagAfterList(FakeTmux):
+    """``/attach`` or ``create_session`` re-tags a window right after the reaper listed it."""
+
+    def __init__(self, *, retag: dict[str, str], **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.retag = retag
+
+    def __call__(self, argv: list[str], **kwargs: object) -> MagicMock:
+        r = super().__call__(argv, **kwargs)
+        if "list-windows" in argv and "#{@clord_owner}" in " ".join(argv):
+            self.thread_ids.update(self.retag)
+        return r
+
+
+class TestReaperRereadsTheTagBeforeKilling:
+    """#1060: the listing is a snapshot — a window re-tagged since then is not ours to kill.
+
+    #1009 kills by window id from the listing; the old ``kill_session(thread_id)``
+    re-checked the tag on the way. ``/attach`` hands exactly this kind of window
+    (an idle shell tagged with an inactive thread) to the current thread.
+    """
+
+    def test_window_retagged_to_another_thread_is_kept(self) -> None:
+        fake = _RetagAfterList(
+            retag={"clord:w1": "222"},
+            windows={"clord": ["w1"]},
+            thread_ids={"clord:w1": "111"},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids={222})
+
+        assert fake.killed == []
+        assert killed == 0
+
+    def test_untagged_window_tagged_since_the_listing_is_kept(self) -> None:
+        fake = _RetagAfterList(
+            retag={"clord:w1": "222"},
+            windows={"clord": ["w1"]},
+            thread_ids={},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids={222})
+
+        assert fake.killed == []
+        assert killed == 0
