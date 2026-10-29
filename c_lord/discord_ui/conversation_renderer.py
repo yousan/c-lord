@@ -444,12 +444,28 @@ def _line_h(font: object, gap: int = 6) -> int:
 
 
 def _split_code_blocks(content: str) -> list[tuple[str, str]]:
-    """Split *content* into ``("text"|"code", body)`` blocks on ``` fences."""
+    """Split *content* into ``("text"|"code", body)`` blocks on ``` fences.
+
+    A line that opens a fence and closes it again (```ls -la```) is a one-line
+    code block, as Discord draws it — not a bare toggle that swallows the line
+    and turns everything after it into code (#1036).
+    """
     blocks: list[tuple[str, str]] = []
     in_code = False
     buf: list[str] = []
     for line in content.split("\n"):
-        if line.lstrip().startswith("```"):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            rest = stripped[3:]
+            close = rest.find("```")
+            if not in_code and close != -1:
+                blocks.append(("text", "\n".join(buf)))
+                blocks.append(("code", rest[:close]))
+                buf = []
+                after = rest[close + 3 :]
+                if after.strip():
+                    buf.append(after)
+                continue
             blocks.append(("code" if in_code else "text", "\n".join(buf)))
             buf = []
             in_code = not in_code
@@ -466,18 +482,42 @@ INLINE_PER_ROW = 3
 _INLINE_GAP = 10
 
 
+#: Codepoints that only an emoji face draws (#1035). Japanese, arrows (``→``)
+#: and box drawing are deliberately absent: the body / CJK fallback faces cover
+#: them, so a spec made of them renders without the ``emoji`` library (#623).
+_EMOJI_RANGES: tuple[tuple[int, int], ...] = (
+    (0x1F000, 0x1FAFF),  # mahjong … symbols & pictographs ext-A, regional indicators
+    (0x2600, 0x27BF),  # misc symbols + dingbats (☀ ✅ ❤ ✓)
+    (0x2B00, 0x2BFF),  # misc symbols and arrows (⭐ ⬛ ⭕)
+    (0x231A, 0x231B),  # ⌚ ⌛
+    (0x2328, 0x2328),  # ⌨
+    (0x23CF, 0x23CF),  # ⏏
+    (0x23E9, 0x23FA),  # ⏩ … ⏳ ⏸ — c-lord's own stall lamp is ⏳
+    (0x200D, 0x200D),  # zero-width joiner (family / profession sequences)
+    (0x20E3, 0x20E3),  # combining keycap
+    (0xFE0F, 0xFE0F),  # emoji presentation selector
+    (0xE0020, 0xE007F),  # tag sequences (subdivision flags)
+)
+
+
+def _is_emoji_codepoint(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES)
+
+
 def _messages_contain_emoji(messages: list[ConvMessage]) -> bool:
-    """True when any text in *messages* holds a character outside the BMP-text
-    range that the body font can be expected to cover.
+    """True when any text in *messages* holds a codepoint only an emoji face draws.
 
     Deliberately a cheap codepoint test rather than the ``emoji`` library: this
-    runs precisely when that library is unavailable.
+    runs precisely when that library is unavailable. It used to be
+    ``ord(ch) >= 0x2190``, which counted every Japanese character, arrow and box
+    drawing as emoji and refused nearly every Japanese spec (#1035).
     """
 
     def _has(text: str | None) -> bool:
         if not text:
             return False
-        return any(ord(ch) >= 0x2190 for ch in text)
+        return any(_is_emoji_codepoint(ch) for ch in text)
 
     for m in messages:
         if _has(m.content) or _has(m.author):
