@@ -308,15 +308,21 @@ def _start_refs(path: str) -> dict[str, str]:
 
 
 def _stash_entries(path: str) -> int | None:
-    """How many entries ``git stash list`` has (#1045). ``None``: git failed."""
+    """How many entries ``git stash list`` has (#1045). ``None``: git failed.
+
+    A ``refs/stash`` that resolves is at least one entry, whatever its reflog
+    says (#1080): ``rev-list --walk-reflogs`` counts reflog lines, and a stash
+    whose reflog was expired — or that was placed with ``update-ref`` — counted
+    0, so the dir read as clean and was removed with the stash's only copy.
+    """
     found = _run(["git", "rev-parse", "-q", "--verify", "refs/stash"], cwd=path)
-    if found.returncode != 0:
+    if found.returncode != 0 or not found.stdout.strip():
         return 0  # no stash at all
     result = _run(["git", "rev-list", "--walk-reflogs", "--count", "refs/stash"], cwd=path)
     if result.returncode != 0:
         return None
     try:
-        return int(result.stdout.strip() or "0")
+        return max(int(result.stdout.strip() or "0"), 1)
     except ValueError:
         return None
 
