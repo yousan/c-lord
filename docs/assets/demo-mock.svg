@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 470" role="img" aria-label="Mock-up of c-lord: a Discord channel with three Claude Code threads, one thread open, and a terminal attached to the same session. All names are fictional.">
+  <!-- Illustration only (#100 placeholder replacement, #963). Every name here
+       is made up: no real server, repository, user or thread. -->
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <!-- window -->
+  <rect width="880" height="470" rx="10" fill="#313338"/>
+
+  <!-- sidebar -->
+  <rect x="0" y="0" width="250" height="470" rx="10" fill="#2b2d31"/>
+  <rect x="240" y="0" width="10" height="470" fill="#2b2d31"/>
+  <text x="18" y="32" font-size="15" font-weight="700" fill="#f2f3f5">Acme Demo</text>
+  <line x1="0" y1="50" x2="250" y2="50" stroke="#1f2023"/>
+  <text x="18" y="78" font-size="11" font-weight="700" fill="#949ba4">PROJECTS</text>
+  <rect x="10" y="88" width="230" height="28" rx="4" fill="#404249"/>
+  <text x="20" y="107" font-size="14" fill="#f2f3f5"># shop-demo</text>
+
+  <!-- threads with their lamps -->
+  <g font-size="13">
+    <rect x="22" y="122" width="218" height="26" rx="4" fill="#35373c"/>
+    <circle cx="36" cy="135" r="5" fill="#23a55a"/>
+    <text x="48" y="140" fill="#f2f3f5">W1 │ Fix checkout rounding #42</text>
+    <circle cx="36" cy="163" r="5" fill="#f0b232"/>
+    <text x="48" y="168" fill="#b5bac1">W2 │ Review PR #57</text>
+    <circle cx="36" cy="191" r="5" fill="#23a55a"/>
+    <text x="48" y="196" fill="#b5bac1">W3 │ Upgrade the API to v2</text>
+    <circle cx="36" cy="219" r="5" fill="#f0b232"/>
+    <text x="48" y="224" fill="#b5bac1">W4 │ Nightly dependency audit</text>
+  </g>
+  <g font-size="11" fill="#949ba4">
+    <circle cx="26" cy="262" r="4" fill="#23a55a"/><text x="36" y="266">working</text>
+    <circle cx="100" cy="262" r="4" fill="#f0b232"/><text x="110" y="266">waiting for you</text>
+  </g>
+  <text x="18" y="300" font-size="11" fill="#80848e">1 thread = 1 Claude Code session</text>
+  <text x="18" y="316" font-size="11" fill="#80848e">= 1 tmux window = 1 git clone</text>
+
+  <!-- thread header -->
+  <text x="272" y="32" font-size="15" font-weight="700" fill="#f2f3f5">W1 │ Fix checkout rounding #42</text>
+  <line x1="250" y1="50" x2="880" y2="50" stroke="#1f2023"/>
+
+  <!-- message: request with attachment -->
+  <circle cx="290" cy="82" r="16" fill="#5865f2"/>
+  <text x="290" y="87" font-size="13" font-weight="700" fill="#fff" text-anchor="middle">A</text>
+  <text x="316" y="76" font-size="14" font-weight="600" fill="#f2f3f5">alex</text>
+  <text x="352" y="76" font-size="11" fill="#949ba4">10:02</text>
+  <text x="316" y="96" font-size="14" fill="#dbdee1">Some carts total one cent too much. Fix it and open a PR.</text>
+  <rect x="316" y="106" width="150" height="30" rx="5" fill="#2b2d31" stroke="#1f2023"/>
+  <text x="328" y="126" font-size="12" fill="#00a8fc">📎 cart-repro.png</text>
+  <rect x="476" y="110" width="38" height="22" rx="8" fill="#373a53" stroke="#5865f2"/>
+  <circle cx="495" cy="121" r="5" fill="#23a55a"/>
+
+  <!-- progress line while it works -->
+  <text x="316" y="162" font-size="12" fill="#949ba4">⚙️ working 14:20 · 🔧 Bash: npm test · 38 tools</text>
+
+  <!-- typed straight into the tmux pane, mirrored back -->
+  <text x="316" y="190" font-size="14" fill="#dbdee1">👤 also check the tax rounding while you're in there</text>
+  <text x="316" y="208" font-size="11" fill="#949ba4">typed in the terminal, shown in the thread</text>
+
+  <!-- the answer -->
+  <circle cx="290" cy="242" r="16" fill="#eb459e"/>
+  <text x="290" y="247" font-size="12" font-weight="700" fill="#fff" text-anchor="middle">CL</text>
+  <text x="316" y="236" font-size="14" font-weight="600" fill="#f2f3f5">c-lord</text>
+  <rect x="364" y="225" width="30" height="15" rx="3" fill="#5865f2"/>
+  <text x="379" y="236" font-size="9" font-weight="700" fill="#fff" text-anchor="middle">BOT</text>
+  <text x="402" y="236" font-size="11" fill="#949ba4">10:31</text>
+  <text x="316" y="258" font-size="14" fill="#dbdee1">Found it: each line was rounded before summing. Rounding once at</text>
+  <text x="316" y="278" font-size="14" fill="#dbdee1">the end fixes the total, and tax had the same bug. Tests added;</text>
+  <text x="316" y="298" font-size="14" fill="#dbdee1">opened PR #58.</text>
+  <rect x="316" y="308" width="160" height="30" rx="5" fill="#2b2d31" stroke="#1f2023"/>
+  <text x="328" y="328" font-size="12" fill="#00a8fc">📎 before-after.png</text>
+  <rect x="486" y="308" width="130" height="30" rx="5" fill="#2b2d31" stroke="#1f2023"/>
+  <text x="498" y="328" font-size="12" fill="#00a8fc">📎 progress.txt</text>
+
+  <!-- terminal attached to the same session -->
+  <rect x="520" y="354" width="344" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <circle cx="536" cy="368" r="4" fill="#ff5f56"/>
+  <circle cx="550" cy="368" r="4" fill="#ffbd2e"/>
+  <circle cx="564" cy="368" r="4" fill="#27c93f"/>
+  <text x="580" y="372" font-size="11" fill="#8b949e">your server</text>
+  <g class="mono" font-size="12">
+    <text x="534" y="396" fill="#7ee787">$ <tspan fill="#e6edf3">tmux attach -t shop-demo:w1</tspan></text>
+    <text x="534" y="418" fill="#8b949e">  the same Claude Code, live, interactive</text>
+    <text x="534" y="440" fill="#e6edf3">&gt; also check the tax rounding…</text>
+  </g>
+
+  <!-- footnote -->
+  <text x="272" y="446" font-size="10" fill="#6d6f78">Illustration — all names are fictional.</text>
+</svg>
