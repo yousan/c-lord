@@ -230,7 +230,7 @@ async def _cleanup_session_dir(config: RunConfig) -> None:
                 result.reason,
             )
             # Notify the Discord thread if there are uncommitted changes
-            if "uncommitted changes" in result.reason:
+            if result.kept_work:
                 with contextlib.suppress(Exception):
                     await config.thread.send(
                         f"⚠️ **Session directory not cleaned up** — `{result.path}` has "

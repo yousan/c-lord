@@ -10,6 +10,7 @@ import pytest
 from c_lord.session_dir import (
     SessionDirInfo,
     SessionDirManager,
+    WorktreeStatus,
     _is_clean,
     _is_local_repo,
 )
@@ -254,7 +255,7 @@ class TestFindSessionDirs:
 
         with (
             patch("c_lord.session_dir._get_commit", return_value="abc1234"),
-            patch("c_lord.session_dir._is_clean", return_value=True),
+            patch("c_lord.session_dir.worktree_status", return_value=WorktreeStatus(is_repo=True)),
         ):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             dirs = mgr.find_session_dirs()
@@ -280,7 +281,7 @@ class TestCleanupForThread:
         (session / ".git").mkdir()
         (session / "file.txt").write_text("content")
 
-        with patch("c_lord.session_dir._is_clean", return_value=True):
+        with patch("c_lord.session_dir.worktree_status", return_value=WorktreeStatus(is_repo=True)):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             result = mgr.cleanup_for_thread(999)
 
@@ -293,12 +294,16 @@ class TestCleanupForThread:
         session.mkdir()
         (session / ".git").mkdir()
 
-        with patch("c_lord.session_dir._is_clean", return_value=False):
+        with patch(
+            "c_lord.session_dir.worktree_status",
+            return_value=WorktreeStatus(is_repo=True, user_changes=(" M x.py",)),
+        ):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             result = mgr.cleanup_for_thread(999)
 
         assert result.removed is False
-        assert "uncommitted changes" in result.reason
+        assert result.kept_work is True
+        assert result.reason  # what the work is (#1016)
         assert session.exists()
 
     def test_noop_when_dir_missing(self, tmp_path: Path) -> None:
@@ -321,7 +326,7 @@ class TestCleanupOrphaned:
 
         with (
             patch("c_lord.session_dir._get_commit", return_value="abc"),
-            patch("c_lord.session_dir._is_clean", return_value=True),
+            patch("c_lord.session_dir.worktree_status", return_value=WorktreeStatus(is_repo=True)),
         ):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             results = mgr.cleanup_orphaned(active_thread_ids={555})
@@ -337,7 +342,7 @@ class TestCleanupOrphaned:
 
         with (
             patch("c_lord.session_dir._get_commit", return_value="abc"),
-            patch("c_lord.session_dir._is_clean", return_value=True),
+            patch("c_lord.session_dir.worktree_status", return_value=WorktreeStatus(is_repo=True)),
         ):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             results = mgr.cleanup_orphaned(active_thread_ids=set())
