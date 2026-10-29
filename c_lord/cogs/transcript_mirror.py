@@ -617,7 +617,9 @@ class TranscriptMirrorCog(commands.Cog):
         """
         bot = self.bot
 
-        async def file_sink(text: str, file_path: str, *, reply_to: int | None = None) -> None:
+        async def file_sink(
+            text: str, file_path: str, *, reply_to: int | None = None, quote: bool = True
+        ) -> None:
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
@@ -628,7 +630,8 @@ class TranscriptMirrorCog(commands.Cog):
             # attachment slots; _send_chunks gives that message's tables one
             # fewer — the turn log must never be the thing dropped (#683).
             files = [discord.File(file_path, filename="progress.txt")]
-            reference = await self._build_trigger_reference(thread_id, reply_to)
+            # #979: a turn a background notification started answers nobody.
+            reference = await self._build_trigger_reference(thread_id, reply_to) if quote else None
 
             from ..skills.reply_tracker import record_reply_message
 

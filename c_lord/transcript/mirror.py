@@ -58,6 +58,7 @@ from .formatter import (
     TASK_NOTIFICATION_BODY_PREFIX,
     ZWSP_MARKER,
     RenderedEvent,
+    is_harness_user_record,
     is_task_notification,
     local_command_record,
     render_event,
@@ -748,6 +749,10 @@ class TranscriptMirror:
         # answer is not a reply to the last one.
         self._turn_open = expect_turn
         self._turn_by_notification = False
+        # #979: has Claude written anything since the prompt that opened the
+        # turn? A slash command typed in the pane opens one too, and writes no
+        # ``turn_duration`` — when it was only that, its output closes it.
+        self._model_spoke = False
         # #912: the Discord message that asked for the turn c-lord accepted last,
         # and the one that asked for the turn the transcript is in. They differ
         # from the moment a new instruction is accepted until Claude reads it —
@@ -1099,6 +1104,11 @@ class TranscriptMirror:
                     # #913: a notification only *starts* a turn between turns;
                     # one that lands in a person's turn leaves it theirs.
                     started_by = _prompt_kind(event)
+                    # #979: the harness's own rows of a command typed in the pane
+                    # (``<command-name>``, its output, the compaction summary)
+                    # are nobody's request.
+                    if started_by == "person" and is_harness_user_record(event):
+                        started_by = None
                     if started_by == "person":
                         self._turn_by_notification = False
                     elif started_by == "notification" and not self._turn_open:
@@ -1107,6 +1117,9 @@ class TranscriptMirror:
                         turn_events.note_self_turn_started(self.thread_id, at=_event_time(event))
                     if started_by is not None:
                         self._turn_open = True
+                        self._model_spoke = False
+                if event.get("type") == "assistant" and not event.get("isSidechain"):
+                    self._model_spoke = True
 
                 if _is_turn_end(event):
                     # #773: nobody is waiting on this mirror until the next turn.
@@ -1239,6 +1252,11 @@ class TranscriptMirror:
                 local_command = local_command_record(event)
                 if local_command == "output":
                     await self._progress.end_turn()
+                    # #979: …nor does anything else, so a "turn" that was only
+                    # the command ends here. Left open, the next turn a
+                    # notification starts read as the person's.
+                    if not self._model_spoke:
+                        self._turn_open = False
                 elif local_command is None and (is_tool or opened or closed):
                     self._progress.begin_turn()
                     self._progress.note_activity(
@@ -1315,7 +1333,10 @@ class TranscriptMirror:
                     if rendered.kind in _BUFFERED_KINDS:
                         # Tool event: if there's pending text, it was intermediate.
                         await _flush_pending_silently()
-                        progress_buf.append(_format_body(rendered))
+                        # #979: a command typed in the pane is not Claude's work;
+                        # buffered, it became the next answer's progress.txt.
+                        if local_command is None:
+                            progress_buf.append(_format_body(rendered))
                     elif rendered.kind == "assistant_text":
                         body = _format_body(rendered)
                         # #399 AC3: the CLI flushes the prose preceding an
@@ -1520,7 +1541,11 @@ class TranscriptMirror:
         await self._progress.end_turn()
         target = {} if reply_to is None else {"reply_to": reply_to}
         if _has_tool_lines(progress) and self._file_sink is not None:
-            await self._flush_with_progress(text, progress, **target)
+            if self._turn_by_notification:
+                # #979: still not a reply (#913) — the log rides, the quote does not.
+                await self._flush_with_progress(text, progress, quote=False)
+            else:
+                await self._flush_with_progress(text, progress, **target)
         elif self._turn_by_notification:
             # #913: nobody asked — "Still running." after a Monitor event is
             # not an answer to the last message, so it is not quoted under it.
@@ -1530,7 +1555,9 @@ class TranscriptMirror:
         else:
             await self._try_sink(text)
 
-    async def _flush_with_progress(self, body: str, progress_buf: list[str], **target: int) -> None:
+    async def _flush_with_progress(
+        self, body: str, progress_buf: list[str], **target: int | bool
+    ) -> None:
         """Write buffered tool lines to a tempfile and call file_sink."""
         await self._progress.note_output()
         assert self._file_sink is not None
