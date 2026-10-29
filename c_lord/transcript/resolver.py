@@ -345,7 +345,7 @@ class ThreadSessionResolver:
         """
         claimed_id = self._claimed_session_id
         if claimed_id is None:
-            return False
+            return self._awaiting_claim()
         try:
             age = time.time() - claim_path(self.project_dir).stat().st_mtime
         except OSError:
@@ -363,6 +363,24 @@ class ThreadSessionResolver:
                 CLAIM_GRACE_SECONDS,
             )
         return True
+
+    def _awaiting_claim(self) -> bool:
+        """True while a brand-new, empty project dir may still be about to get its claim.
+
+        The mirror starts before ``start_claude``, and ``write_claim`` creates
+        the dir and only then moves the claim in — a resolve in between saw "no
+        claim, no transcript" and warned on a perfectly healthy first turn
+        (#926, prod 2026-10-29). A dir that already holds transcripts, or that
+        has sat empty past :data:`CLAIM_GRACE_SECONDS`, is the #773 case and
+        still warns at once. Silent: the claim's own INFO line follows.
+        """
+        if self._candidates:
+            return False
+        try:
+            age = time.time() - self.project_dir.stat().st_mtime
+        except OSError:
+            return False
+        return age < CLAIM_GRACE_SECONDS
 
     def _clear_successor(self, claimed_id: str) -> Path | None:
         """The transcript a ``/clear`` of the claimed session started, if any (#803).
