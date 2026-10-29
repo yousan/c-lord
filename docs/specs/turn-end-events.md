@@ -56,7 +56,7 @@ ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で
 | `kind` | `completion`（ターンが終わった）/ `blocked`（メニューで止まっている）/ `failure`（失敗した） |
 | `last_message_id` | `completion` / `failure`: そのターンで C-lord が**最後に投稿した返事**（本文）のメッセージ。無ければ `null`。`blocked`: 選択メニューのメッセージ |
 | `started_by.type` | `user` / `webhook` / `scheduler` / `api` / `self`（Claude が背景の知らせで自分から始めたターン — 後述）。`webhook` のときは webhook の id と表示名、`scheduler` のときはタスクの id と名前が入る |
-| `reason` | `failure` のとき。`completion` では、後述の保留が時間切れになったとき（`background_agents_unresolved`）と、Claude が自分から始めたターンの終わり（`self_resumed_turn`）のときだけ。短いコード。**エラー本文は入れない**（パスやペインの内容が混ざるため） |
+| `reason` | `failure` のとき。`completion` では、後述の保留が時間切れになったとき（`background_agents_unresolved`）と、Claude が自分から始めたターンの終わり（`self_resumed_turn`）と、C-lord の再起動をまたいだターンの終わり（`restart_crossed`）のときだけ。短いコード。**エラー本文は入れない**（パスやペインの内容が混ざるため） |
 
 `last_message_id` は**返事の本文**であって、その後ろに付く `📊 …context` の統計行や 🟡 のメンションではない。
 受け手が「ここから読む」ための印として使う。
@@ -72,6 +72,21 @@ ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で
   応答が無かった（`no_response`）・ユーザーが止めた（`stopped`）・その他のエラー（`error`）。
 - **出ないとき**: 次のメッセージで置き換えられたターン（`preempted`）と、キャンセルされたターンは出さない。
   そのスレッドの次のターンの終わりが出す。
+
+### C-lord の再起動をまたいだターン（#978）
+
+ターンの途中で C-lord が再起動すると（デプロイ・auto-upgrade）、そのターンを走らせていた run は古いプロセスと一緒に
+キャンセルされ、何も出さない。新しいプロセスがそのターンの終わりを transcript で見届けた時点で **1 件だけ**出す:
+
+- ふつうに終わった → `completion`、`"reason": "restart_crossed"`
+- API エラーで止まった → `failure`、`"reason": "api_error"` / プラン上限 → `failure`、`"reason": "usage_limit"`
+  （終わり方は transcript の最後の返事で決める。`restarted` という失敗理由は作らない — 再起動はターンを失敗させていない）
+- `started_by` はターンのきっかけのメッセージから決め直す（人のメッセージなら `user` とその人の id、webhook なら `webhook`）。
+  `/clord` などで C-lord が投稿した種のメッセージから始まったスレッドでは、元の依頼者が分からないので `api` になる
+- `turn_started_at` はきっかけのメッセージが投稿された時刻
+- `last_message_id` は新しいプロセスがそのスレッドに投稿した最後の返事（取りこぼしの出し直しを含む）。
+  返事が再起動前に全部出ていて、新しいプロセスが何も投稿していなければ `null`（古いプロセスの記録はもう無い）
+- 再起動後に同じスレッドで新しいターンが始まっていたときは出さない（新しいターンの終わりが出す）
 
 ### 背景のサブエージェントが残っているとき
 

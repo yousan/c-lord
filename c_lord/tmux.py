@@ -3711,12 +3711,13 @@ class TmuxSessionManager:
         is never one of them** in either case.
 
         **Tagged** — it carries an ``@thread_id``, its thread is not in
-        *active_thread_ids*, and its pane is not running Claude. The last
+        *active_thread_ids*, and every pane in it is an idle shell. The last
         condition is what makes this callable at all (#570): callers pass
         ``active_thread_ids=set()`` at startup, so membership alone would mark
         *every* window orphaned and kill live sessions. The pane's foreground
         command is read fresh from tmux rather than inferred from our own
-        bookkeeping.
+        bookkeeping. It used to be "not running Claude", which reaped a dev
+        server or a window tmux failed to describe (#986).
 
         **Untagged with a c-lord name** (#677) — it has *no* ``@thread_id``, its
         name is one only :meth:`_next_window_name` hands out (``w{N}``, or the
@@ -3770,9 +3771,12 @@ class TmuxSessionManager:
             thread_id = int(tid_str)
             if thread_id in active_thread_ids:
                 continue
-            if target and self._window_has_claude(target):
+            if target and not self._window_is_idle_shell(target):
+                # #986: "not claude" is not "idle". A dev server, a build, or a
+                # probe tmux did not answer is somebody's work, exactly as in the
+                # untagged branch below.
                 logger.debug(
-                    "cleanup_orphaned: %s still runs Claude — keeping (thread=%d)",
+                    "cleanup_orphaned: %s is not an idle shell — keeping (thread=%d)",
                     self._describe(target),
                     thread_id,
                 )
