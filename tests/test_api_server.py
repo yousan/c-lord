@@ -739,13 +739,17 @@ class TestReplyEndpoint:
         assert "file" in kwargs or "files" in kwargs
 
     @pytest.mark.asyncio
-    async def test_missing_progress_file_returns_400(self, reply_client: TestClient) -> None:
+    async def test_missing_progress_file_returns_400(
+        self, reply_client: TestClient, tmp_path
+    ) -> None:
+        # Inside the session dirs (#1039): a path outside is ignored before it is
+        # looked at, so it cannot tell whether a file exists there.
         resp = await reply_client.post(
             "/api/reply",
             json={
                 "thread_id": 555666777,
                 "content": "x",
-                "progress_file": "/no/such/path.txt",
+                "progress_file": str(tmp_path / "no-such.txt"),
             },
         )
         assert resp.status == 400

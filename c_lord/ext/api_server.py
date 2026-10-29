@@ -57,20 +57,21 @@ def _not_a_boolean(field: str) -> web.Response:
     return web.json_response({"error": f"{field} must be true or false"}, status=400)
 
 
-def _inside(path: object, base: str | None) -> bool:
-    """Whether *path*, symlinks and ``..`` resolved, lies under *base* (#1039).
+def _path_in_session_dirs(raw: str, base: str | None) -> str | None:
+    """*raw* with symlinks and ``..`` resolved, if it lies under *base* — else ``None`` (#1039).
 
-    No *base* (the API was never told where the session dirs are) means
-    nothing is inside: an unknown boundary must not become "anywhere".
+    Checked before the file is even looked at, so a path outside does not
+    learn whether it exists either. No *base* (the API was never told where the
+    session dirs are) means nothing is inside: an unknown boundary must not
+    become "anywhere".
     """
-    from pathlib import Path
-
     if not base:
-        return False
-    try:
-        return Path(str(path)).resolve().is_relative_to(Path(base).resolve())
-    except (OSError, ValueError):
-        return False
+        return None
+    root = os.path.realpath(base)
+    candidate = os.path.realpath(raw)
+    if candidate != root and not candidate.startswith(root.rstrip(os.sep) + os.sep):
+        return None
+    return candidate
 
 
 def _current_uid() -> int | None:
@@ -962,18 +963,8 @@ class ApiServer:
         attachment = None
         progress_ignored = False
         if progress_file:
-            from pathlib import Path
-
-            path = Path(str(progress_file))
-            if not path.is_file():
-                return web.json_response(
-                    {"error": f"progress_file not found: {progress_file}"},
-                    status=400,
-                )
-
-            if _inside(path, self.session_dir_base):
-                attachment = discord.File(str(path), filename=path.name)
-            else:
+            path = _path_in_session_dirs(str(progress_file), self.session_dir_base)
+            if path is None:
                 # Not an error the caller can fix by retrying, and the answer
                 # itself should still arrive — so post without it (#1039).
                 progress_ignored = True
@@ -981,9 +972,16 @@ class ApiServer:
                     "%s /api/reply: progress_file %s is outside the session dirs (%s) — "
                     "not attached (#1039)",
                     log_ctx(thread_id=thread_id),
-                    path,
+                    progress_file,
                     self.session_dir_base or "unknown",
                 )
+            elif not os.path.isfile(path):
+                return web.json_response(
+                    {"error": f"progress_file not found: {progress_file}"},
+                    status=400,
+                )
+            else:
+                attachment = discord.File(path, filename=os.path.basename(path))
 
         raw = self.bot.get_channel(thread_id)
         if raw is None:

@@ -284,3 +284,23 @@ class TestProgressFileStaysInsideSessionDirs:
         comps = BridgeComponents(session_repo=MagicMock(), session_dir_base="/x/sessions")
         comps.apply_to_api_server(api)
         assert api.session_dir_base == "/x/sessions"
+
+    @pytest.mark.asyncio
+    async def test_a_missing_file_outside_is_ignored_not_400(
+        self, repos, thread_mock: MagicMock, tmp_path: Path
+    ) -> None:
+        """外のパスは中身を見る前に捨てる — 存在するかどうかも答えない。"""
+        base = tmp_path / "sessions"
+        base.mkdir()
+        client = await _reply_client(repos, thread_mock, base)
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 555666777, "content": "x", "progress_file": "/no/such.txt"},
+            )
+            body = await resp.json()
+        finally:
+            await client.close()
+
+        assert resp.status == 200
+        assert body.get("progress_file") == "ignored"
