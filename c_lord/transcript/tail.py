@@ -324,9 +324,14 @@ def _drop_current(state: _FollowState) -> None:
     tail *started* with and re-read everything since — uuid events are deduped,
     but the uuid-less ones (whose tool blocks wake the progress line, #906)
     came out twice.
+
+    The bank is the start of the half line still in the buffer, not the end of
+    what was read (#1004): re-adoption clears the buffer, so resuming past it
+    read only the line's second half, which does not parse — and the event,
+    possibly the reply itself, was lost.
     """
     if state.current_path is not None:
-        state.offsets[state.current_path] = state.offset
+        state.offsets[state.current_path] = state.offset - len(state.buffer.encode("utf-8"))
     state.current_path = None
 
 
