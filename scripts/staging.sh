@@ -118,7 +118,7 @@ lease_guard() {
 }
 
 cmd_borrow() {
-  local owner="$1" purpose="$2" ttl="$3" holder branch
+  local owner="$1" purpose="$2" ttl="$3" holder branch keep_start=""
   [ -n "$owner" ] || die "--owner <id> (または CLORD_LEASE_OWNER) が必要"
   [ -n "$purpose" ] || die "--purpose \"<目的>\" が必要 (誰が見ても分かる形で)"
   if lease_is_valid; then
@@ -128,6 +128,8 @@ cmd_borrow() {
       die "borrow 拒否 — 他セッションの有効リース中"
     fi
     echo "re-borrow (同一 owner): 既存リースを更新"
+    # #1014: リースの始まりは動かさない — release はそこから後の検証窓を寝かせる
+    keep_start="$(lease_field acquired_epoch)"
   elif [ -f "$LEASE_FILE" ]; then
     # 失効リースの奪取: 旧内容をログに残す (奪取の監査痕跡)
     echo "takeover: 失効リースを奪取 — old: $(lease_describe)"
@@ -135,17 +137,32 @@ cmd_borrow() {
     sleep_lease_windows "$(lease_field acquired_epoch)"
   fi
   branch="$(git -C "$CLONE_DIR" branch --show-current 2>/dev/null || echo '')"
-  LEASE_PATH="$LEASE_FILE" LEASE_OWNER="$owner" LEASE_PURPOSE="$purpose" LEASE_TTL="$ttl" LEASE_BRANCH="$branch" python3 - <<'PYEOF'
+  LEASE_PATH="$LEASE_FILE" LEASE_OWNER="$owner" LEASE_PURPOSE="$purpose" LEASE_TTL="$ttl" LEASE_BRANCH="$branch" LEASE_KEEP_START="$keep_start" python3 - <<'PYEOF'
 import json, os, time
+path = os.environ.get("LEASE_PATH", ".staging-lease")
+now = int(time.time())
 data = {
     "owner": os.environ["LEASE_OWNER"],
     "purpose": os.environ["LEASE_PURPOSE"],
     "branch_before": os.environ["LEASE_BRANCH"],
     "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    "acquired_epoch": int(time.time()),
+    "acquired_epoch": now,
     "ttl_hours": float(os.environ["LEASE_TTL"]),
 }
-with open(os.environ.get("LEASE_PATH", ".staging-lease"), "w") as f:
+if os.environ.get("LEASE_KEEP_START"):
+    # #1014: 同じ owner の延長。始まり (と最初の branch) は保ち、
+    # 失効を「今から ttl 時間後」にずらす分だけ ttl_hours を伸ばす。
+    try:
+        with open(path) as f:
+            old = json.load(f)
+        start = int(old["acquired_epoch"])
+        data["acquired_epoch"] = start
+        data["acquired_at"] = old.get("acquired_at", data["acquired_at"])
+        data["branch_before"] = old.get("branch_before", data["branch_before"])
+        data["ttl_hours"] = round((now - start) / 3600 + data["ttl_hours"], 4)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass  # 読めなければ新しいリースとして書く
+with open(path, "w") as f:
     json.dump(data, f, ensure_ascii=False, indent=1)
 PYEOF
   echo "leased: $(lease_describe)"
@@ -195,7 +212,7 @@ sleep_lease_windows() {
   CLONE_DIR="$CLONE_DIR" CLONE_DIR_REAL="$CLONE_DIR_REAL" SINCE="$since" \
     API_PORT="$(env_get CLORD_API_PORT)" API_SECRET="$(env_get CLORD_API_SECRET)" \
     INSTANCE_ID="$(env_get CLORD_INSTANCE_ID)" python3 - <<'PYEOF' || true
-import json, os, sqlite3, subprocess, time, urllib.request
+import json, os, sqlite3, subprocess, time, urllib.error, urllib.request
 from pathlib import Path
 
 clone = Path(os.environ["CLONE_DIR"])
@@ -270,10 +287,16 @@ def tree_kb(root: int) -> int:
     return total
 
 
-def ask_api(thread_id: str) -> bool:
+def ask_api(thread_id: str) -> str | None:
+    """bot の答え (``slept`` / ``not_resident`` / ``HTTP 503`` …)。届かなければ None (#1015)。
+
+    kill に進んでよいのは「届かなかった」ときだけ。bot が答えたなら、それが
+    エラーでも bot はその窓を知っている — 横から kill すると、ミラーが止まって
+    いないので迷子の 👤 行 (#379) が出うるし、「眠った」とも記録されない。
+    """
     port = os.environ.get("API_PORT", "").strip()
     if not port.isdigit():
-        return False
+        return None
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/threads/{thread_id}/sleep", data=b"", method="POST"
     )
@@ -281,9 +304,15 @@ def ask_api(thread_id: str) -> bool:
         req.add_header("Authorization", f"Bearer {os.environ['API_SECRET']}")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.load(resp).get("status") == "slept"
+            body = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code}"
+    except ValueError:
+        return "unreadable answer"  # 答えはあった (JSON でないだけ)
     except Exception:
-        return False
+        return None  # 接続できない・タイムアウト
+    status = body.get("status") if isinstance(body, dict) else None
+    return str(status) if status else "unreadable answer"
 
 
 targets = [p for p in panes() if p[2] == owner and p[3] in threads]
@@ -292,9 +321,16 @@ if not targets:
     raise SystemExit(0)
 sizes = {pane: tree_kb(pid) for pane, pid, _, _ in targets}
 via_api = via_kill = 0
+refused: list[str] = []
 for pane, _pid, _owner, thread_id in targets:
-    if ask_api(thread_id):
+    answer = ask_api(thread_id)
+    if answer == "slept":
         via_api += 1
+        continue
+    if answer is not None:
+        # #1015: bot が答えた (not_resident / HTTP エラー) — kill はしない
+        refused.append(f"{thread_id}: {answer}")
+        sizes.pop(pane, None)
         continue
     # API に届かない: この pane だけを id で閉じる (窓・セッション・サーバ単位ではない)
     subprocess.run(["tmux", "kill-pane", "-t", pane], capture_output=True, timeout=10)
@@ -309,6 +345,8 @@ mb = sum(sizes[pane] for pane in closed) // 1024
 left = len(sizes) - len(closed)
 how = f"API {via_api} 本" + (f" / pane kill {via_kill} 本" if via_kill else "")
 tail = f" — {left} 本は閉じられなかった" if left else ""
+if refused:
+    tail += f" / bot が寝かせなかった {len(refused)} 本は残した（{', '.join(refused)}）"
 print(f"検証窓: {len(closed)} 本寝かせた / 約 {mb} MB（{how}）{tail}")
 PYEOF
 }
