@@ -217,3 +217,49 @@ def test_a_confirm_that_did_not_take_never_types_into_the_shell() -> None:
     assert not pane.claude_alive, "precondition: the confirm declined trust"
     assert not pane.typed, "the message must never be typed into a shell (#716)"
     assert ok is False
+
+
+class TestAnUnreadablePaneIsNoEvidence:
+    """#993: a pane that never answers says nothing about the dialog (#544's rule).
+
+    Decided 2026-10-29: the message is not held back because the screen could
+    not be read. Only a dialog actually *seen* open after the confirm withholds it.
+    """
+
+    def _await(self, captures: list[MagicMock]) -> bool:
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        replies = iter(captures)
+
+        def run(args: list[str]) -> MagicMock:
+            if "capture-pane" in args:
+                return next(replies, captures[-1])
+            return MagicMock(returncode=0, stdout="claude\n", stderr="")
+
+        with (
+            patch("c_lord.tmux._TRUST_BOOT_TIMEOUT", 0.05),
+            patch("c_lord.tmux._TRUST_SETTLE", 0.0),
+            patch("c_lord.tmux._run", side_effect=run),
+        ):
+            return mgr._await_trust_dialog_closed("t:w1", 993)
+
+    def test_a_pane_never_read_delivers(self, caplog) -> None:
+        failed = MagicMock(returncode=1, stdout="", stderr="no such pane")
+        with caplog.at_level("WARNING"):
+            assert self._await([failed]) is True
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+        assert "could not be read" in caplog.text
+
+    def test_a_dialog_seen_open_still_withholds(self) -> None:
+        open_ = MagicMock(
+            returncode=0, stdout=_fixture("trust_prompt_live_cursor_on_no"), stderr=""
+        )
+        assert self._await([open_]) is False
+
+    def test_seen_open_then_unreadable_still_withholds(self) -> None:
+        """The last thing actually seen was the dialog — that is evidence."""
+        open_ = MagicMock(
+            returncode=0, stdout=_fixture("trust_prompt_live_cursor_on_no"), stderr=""
+        )
+        failed = MagicMock(returncode=1, stdout="", stderr="x")
+        assert self._await([open_, failed]) is False

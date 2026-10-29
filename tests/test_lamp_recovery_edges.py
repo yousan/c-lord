@@ -7,9 +7,9 @@ module docstring states:
 * ``find_open_lamp`` — the fallback for a thread whose trigger id was never
   recorded: "The newest lamp of either kind decides: a 🟡/❌ above an old ⚠️
   means that ⚠️ belongs to a turn that is long over".
-* a watch that runs past ``MAX_SECONDS`` gives up and leaves the lamp to the
-  stall monitor — it must not paint 🟡 on a turn nobody knows is over, and
-  returns ``None`` so the caller posts no 📊 / 🟡 summons for it (#907);
+* a watch that runs past ``MAX_SECONDS`` slows down but keeps watching (#992)
+  — it must not paint 🟡 on a turn nobody knows is over, nor return, so the
+  caller posts no 📊 / 🟡 summons for it until the turn ends (#907);
 * production restarts several times a day (#718: usually c-lord deploying
   itself), so the watch can itself be cancelled by the next restart; and the
   transcript check can fail. "Failures are logged and dropped — the lamp is
@@ -111,10 +111,15 @@ class TestFindOpenLamp:
 
 
 @pytest.mark.asyncio
-async def test_a_watch_past_max_seconds_gives_up_without_claiming_the_turn_ended() -> None:
-    """Still "running" after MAX_SECONDS: stop watching, paint nothing final (#907)."""
+async def test_a_watch_past_max_seconds_keeps_watching_without_claiming_the_turn_ended() -> None:
+    """Still "running" after MAX_SECONDS: keep watching, slower, paint nothing final.
+
+    #992 (decided 2026-10-29): the watch no longer gives up there — somebody must
+    still be looking at the lamp so the turn's end reads 🟡. Until that end comes,
+    nothing final is painted and nothing is returned (#907).
+    """
     msg = _Message(EMOJI_STALL_HARD)
-    got = await asyncio.wait_for(
+    task = asyncio.create_task(
         adopt_orphaned_lamp(
             msg,  # type: ignore[arg-type]
             thread_id=7190,
@@ -122,12 +127,19 @@ async def test_a_watch_past_max_seconds_gives_up_without_claiming_the_turn_ended
             poll_seconds=0.01,
             recheck_seconds=10.0,
             max_seconds=0.05,
-        ),
-        2,
+            slow_poll_seconds=0.01,
+            slow_recheck_seconds=10.0,
+        )
     )
-    assert got is None  # no 📊 / 🟡 summons for a turn not known to be over
-    assert EMOJI_WAITING not in msg.lamps
-    assert msg.lamps == [EMOJI_RUNNING]  # adopted as running, left as running
+    await asyncio.sleep(0.2)
+    try:
+        assert not task.done()
+        assert EMOJI_WAITING not in msg.lamps
+        assert msg.lamps == [EMOJI_RUNNING]  # adopted as running, still running
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio

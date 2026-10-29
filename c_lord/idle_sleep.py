@@ -198,8 +198,9 @@ class IdleSleepLoop(IdleSweepLoop):
         # thread_id -> the ``last_used_at`` this loop already acted on. See
         # :meth:`_needs_action`.
         self._visited: dict[int, str] = {}
-        # #922: threads skipped this tick because Claude was still at work. They
-        # must not be marked visited, or they would never be looked at again.
+        # #922: threads skipped this tick because Claude was still at work (or,
+        # #991, the cog was not loaded). They must not be marked visited, or they
+        # would never be looked at again.
         self._busy: set[int] = set()
         # Where Claude Code keeps its transcripts. None = its real location;
         # tests point it at a tmp dir.
@@ -265,8 +266,11 @@ class IdleSleepLoop(IdleSweepLoop):
         impl = getattr(cog, "_sleep_workspace_impl", None)
         if impl is None:
             logger.warning(
-                "idle-sleep: SessionManageCog unavailable — skipping thread=%d", thread_id
+                "idle-sleep: SessionManageCog unavailable — skipping thread=%d this tick",
+                thread_id,
             )
+            # #991: nothing was decided, so the next tick looks again (as #922).
+            self._busy.add(thread_id)
             return False
 
         # #922: a background command (a render, a build) is Claude's work in

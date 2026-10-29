@@ -150,6 +150,15 @@ class StatusManager:
             await self._remove_current_locked()
             self._current_emoji = None
 
+    async def mark_abandoned(self) -> None:
+        """Nobody can end this turn any more: ⚠️, and stop watching (#992).
+
+        For an adopted lamp whose claude died mid-turn — the stall reading is
+        the honest one, and no monitor is left to take it back.
+        """
+        await self._paint_stall(EMOJI_STALL_HARD)
+        await self.cleanup_monitor()
+
     async def cleanup_monitor(self) -> None:
         """Stop watching this turn without touching the lamp (#718)."""
         await self._stop_stall_timer()
