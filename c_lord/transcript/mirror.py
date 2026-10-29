@@ -58,6 +58,7 @@ from .formatter import (
     TASK_NOTIFICATION_BODY_PREFIX,
     ZWSP_MARKER,
     RenderedEvent,
+    bash_input_command,
     is_harness_user_record,
     is_task_notification,
     local_command_record,
@@ -526,6 +527,20 @@ def _prompt_kind(event: dict) -> str | None:
     return "person"
 
 
+#: How much of a pane ``!`` command the #1052 label shows.
+_PANE_BANG_MAX = 60
+
+
+def _pane_bang_label(command: str) -> str:
+    """``-# ペインで打った `!ls` への返事`` — what an answer to a pane command is for (#1052)."""
+    lines = command.splitlines() or [""]
+    shown = lines[0]
+    if len(shown) > _PANE_BANG_MAX or len(lines) > 1:
+        shown = shown[:_PANE_BANG_MAX] + "…"
+    code = f"`` !{shown} ``" if "`" in shown else f"`!{shown}`"
+    return f"-# ペインで打った {code} への返事"
+
+
 def _unresolved_notice(report: UnresolvedTranscript) -> str:
     """What to tell the thread when its transcript cannot be found (#773).
 
@@ -842,6 +857,11 @@ class TranscriptMirror:
         # turn? A slash command typed in the pane opens one too, and writes no
         # ``turn_duration`` — when it was only that, its output closes it.
         self._model_spoke = False
+        # #1052: a ``!`` command typed in the pane between turns, and — once
+        # Claude answers its output with no turn open — the command that answer
+        # is for. Such an answer is nobody's Discord request either.
+        self._pane_bang: str | None = None
+        self._answering_bang: str | None = None
         # #912: the Discord message that asked for the turn c-lord accepted last,
         # and the one that asked for the turn the transcript is in. They differ
         # from the moment a new instruction is accepted until Claude reads it —
@@ -1256,6 +1276,11 @@ class TranscriptMirror:
                         # are nobody's request.
                         if started_by == "person" and is_harness_user_record(event):
                             started_by = None
+                        if started_by is not None:
+                            self._pane_bang = None
+                            self._answering_bang = None
+                        elif not self._turn_open and (command := bash_input_command(event)):
+                            self._pane_bang = command
                         if started_by == "person":
                             self._turn_by_notification = False
                         elif started_by == "notification" and not self._turn_open:
@@ -1268,6 +1293,11 @@ class TranscriptMirror:
                             self._turn_open = True
                             self._model_spoke = False
                     if event.get("type") == "assistant" and not event.get("isSidechain"):
+                        if not self._turn_open and self._pane_bang is not None:
+                            # #1052: the CLI handed the pane command's output to the
+                            # model, and this is its answer.
+                            self._answering_bang = self._pane_bang
+                            self._pane_bang = None
                         self._model_spoke = True
 
                     if _is_turn_end(event):
@@ -1699,6 +1729,16 @@ class TranscriptMirror:
         # only on the marker is what keeps a finished thread from carrying a line.
         await self._progress.end_turn()
         target = {} if reply_to is None else {"reply_to": reply_to}
+        if self._answering_bang is not None:
+            # #1052: answers a command typed in the pane, not the last Discord
+            # request — so no quote, and one line saying which command.
+            text = f"{_pane_bang_label(self._answering_bang)}\n{text}"
+            self._answering_bang = None
+            if _has_tool_lines(progress) and self._file_sink is not None:
+                await self._flush_with_progress(text, progress, quote=False)
+            else:
+                await self._try_sink(text)
+            return
         if _has_tool_lines(progress) and self._file_sink is not None:
             if self._turn_by_notification:
                 # #979: still not a reply (#913) — the log rides, the quote does not.
