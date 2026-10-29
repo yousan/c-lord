@@ -71,6 +71,24 @@ async def _read_json_object(
     return data, None
 
 
+def _as_int(value: object) -> int | None:
+    """``int(value)``, or ``None`` when it is not one.
+
+    ``json.loads`` accepts ``Infinity`` / ``NaN``, and ``int(float("inf"))``
+    raises ``OverflowError`` — which no ``except (TypeError, ValueError)`` caught,
+    so the caller got a 500 with no reason (#1065).
+    """
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+# What PATCH /api/tasks/{id} can change — named in the 400 for a body with none (#1066).
+_PATCHABLE_TASK_FIELDS = ("enabled", "prompt", "interval_seconds", "working_dir")
+_INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
+
+
 class ApiServer:
     """Embedded REST API server for Discord bot notifications.
 
@@ -468,12 +486,15 @@ class ApiServer:
 
         numbers: dict[str, int] = {}
         for field in ("interval_seconds", "channel_id"):
-            try:
-                numbers[field] = int(data[field])
-            except (TypeError, ValueError):
+            number = _as_int(data[field])
+            if number is None:
                 # Not a name clash: answering 409 here sent callers looking for a
                 # task that did not exist (#1037).
                 return web.json_response({"error": f"{field} must be an integer"}, status=400)
+            numbers[field] = number
+        if numbers["interval_seconds"] < 1:
+            # #1064: PATCH refuses it too — one rule for both.
+            return web.json_response({"error": _INTERVAL_ERROR}, status=400)
 
         try:
             task_id = await self.task_repo.create(  # type: ignore[union-attr]
@@ -526,31 +547,38 @@ class ApiServer:
         if err is not None:
             return err
 
-        updated = False
-        if "enabled" in data:
-            result = await self.task_repo.set_enabled(task_id, enabled=bool(data["enabled"]))  # type: ignore[union-attr]
-            updated = updated or result
-
+        # Check every value before writing any: a 400 used to arrive after
+        # ``enabled`` had already been saved (#1064).
         patch_kwargs: dict[str, object] = {}
         if "prompt" in data:
             patch_kwargs["prompt"] = str(data["prompt"])
         if "interval_seconds" in data:
-            try:
-                patch_kwargs["interval_seconds"] = int(data["interval_seconds"])
-            except (TypeError, ValueError):
-                return web.json_response(
-                    {"error": "interval_seconds must be an integer"}, status=400
-                )
+            interval = _as_int(data["interval_seconds"])
+            if interval is None or interval < 1:
+                # #1064: 0 / negative / false were saved with a 200.
+                return web.json_response({"error": _INTERVAL_ERROR}, status=400)
+            patch_kwargs["interval_seconds"] = interval
         if "working_dir" in data:
             patch_kwargs["working_dir"] = str(data["working_dir"])
 
-        if patch_kwargs:
-            result = await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
-            updated = updated or result
+        if await self.task_repo.get(task_id) is None:  # type: ignore[union-attr]
+            return web.json_response({"error": "Task not found"}, status=404)
+        if "enabled" not in data and not patch_kwargs:
+            # #1066: "nothing to update" is not "no such task" — a caller told 404
+            # for a typo (``enable``) went off to re-create a task that exists.
+            return web.json_response(
+                {
+                    "error": "No field to update. Accepted fields: "
+                    + ", ".join(_PATCHABLE_TASK_FIELDS)
+                },
+                status=400,
+            )
 
-        if updated:
-            return web.json_response({"status": "updated"})
-        return web.json_response({"error": "Task not found"}, status=404)
+        if "enabled" in data:
+            await self.task_repo.set_enabled(task_id, enabled=bool(data["enabled"]))  # type: ignore[union-attr]
+        if patch_kwargs:
+            await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
+        return web.json_response({"status": "updated"})
 
     # ------------------------------------------------------------------
     # AI Lounge endpoints (/api/lounge)
@@ -669,6 +697,10 @@ class ApiServer:
         if not raw_channel_id:
             return web.json_response({"error": "No channel specified"}, status=400)
 
+        channel_id = _as_int(raw_channel_id)
+        if channel_id is None:
+            return web.json_response({"error": "channel_id must be an integer"}, status=400)
+
         # Resolve ClaudeChatCog lazily from the bot (zero-config; no constructor change).
         from ..cogs.claude_chat import ClaudeChatCog  # avoid circular import at module level
 
@@ -678,11 +710,6 @@ class ApiServer:
                 {"error": "ClaudeChatCog is not loaded"},
                 status=503,
             )
-
-        try:
-            channel_id = int(raw_channel_id)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "channel_id must be an integer"}, status=400)
 
         import discord as _discord
 
@@ -759,9 +786,8 @@ class ApiServer:
         if not raw_thread_id:
             return web.json_response({"error": "thread_id is required"}, status=400)
 
-        try:
-            thread_id = int(raw_thread_id)
-        except (TypeError, ValueError):
+        thread_id = _as_int(raw_thread_id)
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         session_id: str | None = data.get("session_id") or None
@@ -926,9 +952,8 @@ class ApiServer:
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
             return web.json_response({"error": "thread_id is required"}, status=400)
-        try:
-            thread_id = int(thread_id_raw)
-        except (TypeError, ValueError):
+        thread_id = _as_int(thread_id_raw)
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         content = (data.get("content") or "").strip()
@@ -1049,9 +1074,8 @@ class ApiServer:
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
             return web.json_response({"error": "thread_id is required"}, status=400)
-        try:
-            thread_id = int(thread_id_raw)
-        except (TypeError, ValueError):
+        thread_id = _as_int(thread_id_raw)
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         question = (data.get("question") or "").strip()
