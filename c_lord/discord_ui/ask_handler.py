@@ -995,8 +995,16 @@ async def _bridge_claimed_menu(
         capture after that fails, which :func:`_wait_tui_resolved` rightly reads
         as "unknown", so without this the turn waited out the 24h timeout.
         ``is True``: a bare mock runner's attribute is truthy.
+
+        A pre-empted runner is not a stop: the next message's silent interrupt
+        sets ``stopped`` before its empty answer arrives, and reading it as a
+        stop closed the card as "⏹ 停止" without Esc-ing the menu in the pane.
+        That turn ends through the empty answer (``CLOSE_INTERRUPTED``).
         """
-        while getattr(runner, "stopped", False) is not True:
+        while not (
+            getattr(runner, "stopped", False) is True
+            and getattr(runner, "preempted", False) is not True
+        ):
             await asyncio.sleep(_PANE_RESOLVE_POLL)
 
     click_task: asyncio.Future = asyncio.ensure_future(answer_queue.get())
