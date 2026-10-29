@@ -396,7 +396,7 @@ uv lock --upgrade-package c-lord && uv sync
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DISCORD_BOT_TOKEN` | Your Discord bot token | (required) |
-| `DISCORD_CHANNEL_ID` | Channel ID for Claude chat | (required) |
+| `DISCORD_CHANNEL_ID` | Channel ID for Claude chat. Like every ID setting here (`DISCORD_OWNER_ID`, `COORDINATION_CHANNEL_ID`, `EXPECTED_BOT_USER_ID`), ASCII digits only — a link, a name or `²` stops `c-lord start` with the setting's name and value (#1084) | (required) |
 | `CLAUDE_COMMAND` | Path to Claude Code CLI | `claude` |
 | `CLAUDE_MODEL` | Model to use | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | Permission mode for CLI | `acceptEdits` |
