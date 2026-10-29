@@ -25,6 +25,7 @@ CLOSE_ANSWERED = "answered"  # a Discord click was delivered
 CLOSE_TERMINAL = "terminal"  # answered/cancelled directly in the tmux pane
 CLOSE_TIMEOUT = "timeout"  # nobody answered within ASK_ANSWER_TIMEOUT
 CLOSE_INTERRUPTED = "interrupted"  # a new instruction pre-empted the turn (#315)
+CLOSE_STOPPED = "stopped"  # the turn was stopped (workspace stop, ⏹ Stop) (#977)
 
 # What became of an answer the bus routed to the TUI (#804).  The bus itself
 # only ever queues an answer, so "post_answer returned True" means "someone is

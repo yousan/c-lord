@@ -44,6 +44,7 @@ from ..utils.logger import log_ctx
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
+    CLOSE_STOPPED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
     DELIVERY_DELIVERED,
@@ -171,6 +172,40 @@ async def _close(
     if ask_repo is not None:
         with contextlib.suppress(Exception):
             await ask_repo.delete(thread_id)
+
+
+# #977: written over a card whose turn was stopped (workspace stop, ⏹ Stop).
+STOPPED_NOTE = "-# ⏹ 停止したので、この質問は取り消しました。"
+
+
+async def retire_menus_for_stop(
+    thread_id: int, *, ask_repo: PendingAskRepository | None = None
+) -> None:
+    """Strip the buttons of every live card in *thread_id* — its workspace stopped (#977).
+
+    The turn-side bridge retires its own card when the runner is stopped, but a
+    card the transcript mirror bridged has a runner of its own that nobody
+    stops, and the mirror's teardown cancels it with the buttons left on — in a
+    thread that is about to be archived. Never raises.
+    """
+    try:
+        live = _ask_menus.pop_others(thread_id, None)
+        if live or _ask_bus.is_active(thread_id):
+            # Only then: the reason is what a late click on *this* card reads,
+            # and a thread with no card keeps the reason its last one closed for.
+            _ask_bus.note_closed(thread_id, CLOSE_STOPPED)
+        if ask_repo is not None:
+            with contextlib.suppress(Exception):
+                await ask_repo.delete(thread_id)
+        for message in live:
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
+                await message.edit(content=STOPPED_NOTE, embed=None, view=None)
+    except Exception:
+        logger.warning(
+            "%s could not retire the cards of a stopped workspace (#977)",
+            log_ctx(thread_id=thread_id),
+            exc_info=True,
+        )
 
 
 # #752: written over the buttons of a menu a newer question has replaced. Only
@@ -953,16 +988,28 @@ async def _bridge_claimed_menu(
             else:
                 misses = 0
 
+    async def _wait_runner_stopped() -> None:
+        """Return once the turn has been stopped (#977).
+
+        A workspace stop withdraws the runner and then kills the window. Every
+        capture after that fails, which :func:`_wait_tui_resolved` rightly reads
+        as "unknown", so without this the turn waited out the 24h timeout.
+        ``is True``: a bare mock runner's attribute is truthy.
+        """
+        while getattr(runner, "stopped", False) is not True:
+            await asyncio.sleep(_PANE_RESOLVE_POLL)
+
     click_task: asyncio.Future = asyncio.ensure_future(answer_queue.get())
     tui_task: asyncio.Future = asyncio.ensure_future(_wait_tui_resolved())
+    stop_task: asyncio.Future = asyncio.ensure_future(_wait_runner_stopped())
     try:
         done, _ = await asyncio.wait(
-            {click_task, tui_task},
+            {click_task, tui_task, stop_task},
             timeout=ASK_ANSWER_TIMEOUT,
             return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
-        for t in (click_task, tui_task):
+        for t in (click_task, tui_task, stop_task):
             t.cancel()
 
     # #536: every exit below records WHY the menu stopped accepting answers.
@@ -978,6 +1025,18 @@ async def _bridge_claimed_menu(
                 view=None,
             )
         await runner.cancel_menu()
+        return
+
+    if stop_task in done and click_task not in done:
+        # #977: the turn was stopped. No keystrokes — the window is going away
+        # (or ⏹ Stop already sent C-c); the run ends as a user stop right after.
+        await _close(thread.id, CLOSE_STOPPED, msg, ask_repo)
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
+            await msg.edit(
+                content=STOPPED_NOTE,
+                embed=None,
+                view=None,
+            )
         return
 
     if click_task not in done:
