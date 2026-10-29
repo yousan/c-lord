@@ -31,7 +31,7 @@ from .fonts import load_emoji_font, load_mono_font, load_text_font
 from .table_renderer import _emoji_tile, _segment_runs
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILImageDraw
@@ -259,17 +259,56 @@ class _MonoGrid:
     cell_w: float
     #: baseline correction so the CJK face sits on the monospace baseline.
     cjk_dy: float = 0.0
+    #: ``ch -> True`` when the monospace face has no glyph for it (#1087).
+    lacks: Callable[[str], bool] | None = None
 
 
-def _wide_runs(text: str) -> list[tuple[str, bool]]:
+def _missing_glyph_check(face: object) -> Callable[[str], bool]:
+    """``ch -> True`` when *face* would draw *ch* as its .notdef box (#1087).
+
+    PIL has no "has glyph" query, so compare the bitmap with that of a code
+    point no font draws. Cached per character: a code block asks per glyph.
+    """
+    notdef: bytes | None = None
+    seen: dict[str, bool] = {}
+
+    def lacks(ch: str) -> bool:
+        nonlocal notdef
+        if ch in seen:
+            return seen[ch]
+        try:
+            if notdef is None:
+                notdef = bytes(face.getmask("\U0010fffd"))  # type: ignore[attr-defined]
+            mask = face.getmask(ch)  # type: ignore[attr-defined]
+            missing = mask.getbbox() is not None and bytes(mask) == notdef
+        except Exception:
+            missing = False
+        seen[ch] = missing
+        return missing
+
+    return lacks
+
+
+def _code_block_grid(mono: object, cjk: object | None, cell_w: float, cjk_dy: float) -> _MonoGrid:
+    """The grid code blocks are drawn on (#623), with the missing-glyph fallback (#1087)."""
+    lacks = _missing_glyph_check(mono) if cjk is not None else None
+    return _MonoGrid(cjk=cjk, cell_w=cell_w, cjk_dy=cjk_dy, lacks=lacks)
+
+
+def _wide_runs(text: str, lacks: Callable[[str], bool] | None = None) -> list[tuple[str, bool]]:
     """Split *text* into consecutive runs of (segment, is_fullwidth).
 
     Width comes from ``unicodedata.east_asian_width`` — the same rule
     ``status_view`` pads its tables by, so the mockup matches the real message.
+    A character the monospace face cannot draw (*lacks*) — ambiguous-width ones
+    such as ``※ ① ○ △`` — goes with the wide ones to the CJK face, on the same
+    two-cell slot; left with the monospace face it was a box (#1087).
     """
     runs: list[tuple[str, bool]] = []
     for ch in text:
-        wide = unicodedata.east_asian_width(ch) in ("W", "F")
+        wide = unicodedata.east_asian_width(ch) in ("W", "F") or (
+            lacks is not None and not ch.isspace() and lacks(ch)
+        )
         if runs and runs[-1][1] == wide:
             runs[-1] = (runs[-1][0] + ch, wide)
         else:
@@ -296,7 +335,7 @@ def _measure_rich(
         if is_emoji:
             total += emoji_w
         elif grid is not None:
-            for run, wide in _wide_runs(seg):
+            for run, wide in _wide_runs(seg, grid.lacks):
                 total += len(run) * grid.cell_w * (2 if wide else 1)
         else:
             total += draw.textlength(seg, font=font)  # type: ignore[arg-type]
@@ -391,7 +430,7 @@ def _draw_rich(
                 draw.text((cx, y), seg, font=font, fill=fill, **kwargs)  # type: ignore[arg-type]
             cx += draw.textlength(seg, font=font)  # type: ignore[arg-type]
             continue
-        for run, wide in _wide_runs(seg):
+        for run, wide in _wide_runs(seg, grid.lacks):
             if not wide:
                 if not dry:
                     draw.text((cx, y), run, font=font, fill=fill, **kwargs)  # type: ignore[arg-type]
@@ -734,7 +773,7 @@ def _layout_message(
     mono_h = _line_h(fonts.mono, 4)
     # #623: one monospace cell, so code blocks can place wide glyphs on a
     # two-cell advance and keep Japanese tables aligned.
-    mono_grid = _MonoGrid(cjk=fonts.mono_cjk, cell_w=fonts.mono_cell_w, cjk_dy=fonts.mono_cjk_dy)
+    mono_grid = _code_block_grid(fonts.mono, fonts.mono_cjk, fonts.mono_cell_w, fonts.mono_cjk_dy)
     emoji_h = int(BODY_SIZE * 1.15)
     top = y
 
