@@ -603,6 +603,35 @@ class TestTmuxSessionManager:
         # #353 unsets the secrets between CLAUDECODE and the OTEL assignment.
         assert re.search(r"env -u CLAUDECODE(?: -u \w+)* OTEL_RESOURCE_ATTRIBUTES=", cmd_str)
 
+    def test_start_claude_turns_off_plugins_the_session_does_not_need(self, tmp_path) -> None:
+        """#965: the user's Discord plugin must not ride along with every session."""
+        import json
+        import shlex
+        from pathlib import Path
+
+        settings = Path.home() / ".claude/settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(
+            json.dumps({"enabledPlugins": {"discord@claude-plugins-official": True}})
+        )
+        mgr = TmuxSessionManager(mapping_path="")
+        mgr._available = True
+        mgr._thread_to_window[12345] = "work1"
+
+        def fake_run(args: list[str]) -> MagicMock:
+            if "display-message" in args:
+                return MagicMock(returncode=0, stdout=f"{tmp_path}\n")
+            return MagicMock(returncode=0, stdout="12345\n")
+
+        with patch("c_lord.tmux._run", side_effect=fake_run) as mock_run:
+            assert mgr.start_claude(12345, "hello", "sonnet") is True
+
+        words = shlex.split(_typed_command(mock_run).split("; ")[-1])
+        value = words[words.index("--settings") + 1]
+        assert json.loads(value) == {"enabledPlugins": {"discord@claude-plugins-official": False}}
+        # A flag, so it must sit before the ``--`` that starts the prompt.
+        assert words.index("--settings") < words.index("--")
+
     def test_start_claude_without_git_repo_still_starts(self) -> None:
         """A non-repo working directory must not break the launch (#NNN)."""
         mgr = TmuxSessionManager(mapping_path="")

@@ -23,9 +23,11 @@ p95 = 2.42h。4時間なら**影響を受ける復帰は 3.89%**（26回に1回�
 
 * Claude の Bash ツールのシェルがペインの下でまだ生きている
   (:func:`c_lord.tool_shells.tool_shell_groups` — ⏹ Stop が止めるのと同じもの)
-* transcript（サブエージェントのものを含む）が閾値以内に書かれている。
-  tmux の ``window_activity`` と違い、transcript は Claude が何かしたときにしか
-  書かれないので、スピナーの再描画では動かない。
+* transcript（サブエージェントのものを含む）に閾値以内のイベントがある。
+  tmux の ``window_activity`` と違い、transcript のイベントは Claude が何かした
+  ときにしか書かれないので、スピナーの再描画では動かない。ファイルの mtime では
+  なく中身の ``timestamp`` で見る — CLI は何もしていない transcript の mtime も
+  約1時間ごとに動かすので、mtime で見ると誰も眠らなくなる (#964)。
 
 あるべき動きは ``docs/specs/workspace-sleep.md``。
 """
@@ -36,6 +38,7 @@ import datetime
 import inspect
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -102,24 +105,63 @@ def idle_label_for_hours(hours: float) -> str:
     return f"{hours:g}時間"
 
 
+# How much of a transcript's end is read to find its last event (#964). One
+# record is rarely larger; a file whose tail holds no stamp falls back to an
+# older event further up, which only makes the workspace look idle sooner.
+_TAIL_BYTES = 256 * 1024
+_TIMESTAMP = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
+
+
+def _last_event_at(path: Path) -> datetime.datetime | None:
+    """The newest ``"timestamp"`` in the end of *path*, local time."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - _TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return None
+    newest: datetime.datetime | None = None
+    for raw in _TIMESTAMP.findall(tail):
+        try:
+            stamp = datetime.datetime.fromisoformat(raw.decode().replace("Z", "+00:00"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if stamp.tzinfo is None:
+            continue
+        local = stamp.astimezone().replace(tzinfo=None)
+        if newest is None or local > newest:
+            newest = local
+    return newest
+
+
 def last_transcript_write(project_dir: Path) -> datetime.datetime | None:
     """When Claude last wrote any transcript of *project_dir* (#922), local time.
 
     Every ``*.jsonl`` below it counts — the session's own and its subagents'
     (``<session>/subagents/*.jsonl``). ``None`` when there are none.
+
+    The time is the newest event *in* the file, not its mtime (#964): Claude
+    Code touches an idle transcript about once an hour without writing to it
+    (#906), so by mtime a workspace whose ``claude`` is alive was never idle.
+    The mtime only picks which files are worth opening — an event can't be
+    newer than the last write.
     """
-    newest: float | None = None
+    newest: datetime.datetime | None = None
     try:
         for path in project_dir.rglob("*.jsonl"):
             try:
-                mtime = path.stat().st_mtime
+                mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime)
             except OSError:
                 continue
-            if newest is None or mtime > newest:
-                newest = mtime
+            if newest is not None and mtime <= newest:
+                continue
+            written = _last_event_at(path)
+            if written is not None and (newest is None or written > newest):
+                newest = written
     except OSError:
         return None
-    return None if newest is None else datetime.datetime.fromtimestamp(newest)
+    return newest
 
 
 class IdleSleepLoop(IdleSweepLoop):

@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import api_endpoint
+from . import api_endpoint, session_plugins
 from .pane_running import pane_shows_running
 from .tool_shells import read_procs, terminate_tool_shells, tool_shell_groups
 from .utils.logger import log_ctx
@@ -2498,6 +2498,12 @@ class TmuxSessionManager:
                     effort,
                     ", ".join(sorted(_VALID_EFFORT_LEVELS)),
                 )
+        # #965: plugins the user enabled for their own Claude Code that this
+        # session has no use for (Discord, language servers for absent
+        # languages) — off for this process only.
+        plugin_args = session_plugins.settings_args(pane_path)
+        if plugin_args:
+            cmd_parts.extend([plugin_args[0], shlex.quote(plugin_args[1])])
 
         prelude = ""
         # #642: a wake passes ``prompt=None`` — no positional argument at all,
