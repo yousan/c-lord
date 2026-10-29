@@ -431,6 +431,17 @@ def _render_skill_invocation(text: str, session_id: str | None) -> RenderedEvent
     return RenderedEvent(kind="user_input", body=body, session_id=session_id)
 
 
+def bash_input_command(event: dict[str, Any]) -> str | None:
+    """The command of a ``!`` typed in the pane (``<bash-input>``), else ``None`` (#1052)."""
+    if event.get("type") != "user" or event.get("isMeta") or event.get("isSidechain"):
+        return None
+    content = (event.get("message") or {}).get("content")
+    if not isinstance(content, str):
+        return None
+    m = _BASH_INPUT_RE.match(content.strip())
+    return m.group(1).strip() if m is not None else None
+
+
 def _is_bash_mode_marker(text: str) -> bool:
     """True when *text* (already stripped) is a Claude Code bash-mode marker."""
     return text.startswith("<bash-input>") or text.startswith("<bash-stdout>")
