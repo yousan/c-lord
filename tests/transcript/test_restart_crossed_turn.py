@@ -249,21 +249,21 @@ async def test_without_agents_the_completion_goes_out_at_once(tmp_path: Path, lo
 def test_read_back_follows_the_live_rules(tmp_path: Path) -> None:
     path = tmp_path / "s.jsonl"
     _write(path, clord_marker_event(), _tool_use(), _launch("aaa"), _launch("bbb"), _report("aaa"))
-    assert _turn_state_at_end(path) == ("person", {"bbb"})
+    assert _turn_state_at_end(path) == ("person", None, {"bbb"})
 
     _write(path, _text("待ちます"), TURN_END)
-    assert _turn_state_at_end(path) == (None, {"bbb"})
+    assert _turn_state_at_end(path) == (None, None, {"bbb"})
 
     _write(path, _user(_NOTIFICATION))
-    assert _turn_state_at_end(path) == ("notification", {"bbb"})
+    assert _turn_state_at_end(path) == ("notification", None, {"bbb"})
 
     # a ``!`` command typed in the pane opens nobody's turn (#1013)
     _write(path, _text("x"), TURN_END, _user("<bash-input>ls</bash-input>"))
-    assert _turn_state_at_end(path) == (None, {"bbb"})
+    assert _turn_state_at_end(path) == (None, None, {"bbb"})
 
 
 def test_read_back_of_a_missing_file_knows_nothing(tmp_path: Path) -> None:
-    assert _turn_state_at_end(tmp_path / "nope.jsonl") == (None, set())
+    assert _turn_state_at_end(tmp_path / "nope.jsonl") == (None, None, set())
 
 
 # -- review of PR #1018 -------------------------------------------------------
@@ -308,13 +308,13 @@ def _stopped_together() -> dict:
 
 
 def test_agents_reported_stopped_together_are_not_out(tmp_path: Path) -> None:
-    """#1042. RED: ``(None, {'bbb222'})`` — only the first ``<task-id>`` was read."""
+    """#1042. RED: ``(None, None, {'bbb222'})`` — only the first ``<task-id>`` was read."""
     path = tmp_path / "s.jsonl"
     _write(
         path, _tool_use(), _launch("aaa111"), _launch("bbb222"), _text("x"), TURN_END,
         _stopped_together(), _user(_STOPPED_TOGETHER), _text("止まっていました"), TURN_END,
     )  # fmt: skip
-    assert _turn_state_at_end(path) == (None, set())
+    assert _turn_state_at_end(path) == (None, None, set())
 
 
 async def test_a_later_turn_is_not_held_by_agents_stopped_together(
@@ -350,3 +350,68 @@ def test_read_back_stops_at_the_tails_start_and_reads_in_chunks(
     monkeypatch.setattr(mirror_mod, "_READ_BACK_MAX_BYTES", 50)
     got = list(mirror_mod._read_back_lines(path, end))
     assert got and got == lines[30 - len(got) : 30]  # a torn first line is dropped
+
+
+# -- #1093 --------------------------------------------------------------------
+# A turn Claude opened by itself before the restart — the read-back knows that
+# now (#1011), so its end is announced like any self-started turn's (#961).
+
+
+def _notification_at(ts: str) -> dict:
+    return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": _NOTIFICATION}}
+
+
+def _wakeup_at(ts: str) -> list[dict]:
+    return [
+        {"type": "system", "subtype": "scheduled_task_fire", "timestamp": ts, "isMeta": False},
+        {
+            "type": "user",
+            "timestamp": ts,
+            "isMeta": True,
+            "message": {"role": "user", "content": "(起床予定のプロンプト)"},
+        },
+    ]
+
+
+async def test_a_notification_turn_crossing_the_restart_gets_its_end(
+    tmp_path: Path, log: Path
+) -> None:
+    """#1093 AC1/AC3. RED: no event — the restored mirror never noted a self start."""
+    before = (_text("終わりました。"), TURN_END, _notification_at("2026-10-29T19:27:32.978Z"))
+    async with _Restored(tmp_path, *before, _tool_use()) as restored:
+        await restored.feed(_text("CI が通りました。"), TURN_END)
+    events = _lines(log)
+    assert [(e["kind"], e.get("reason")) for e in events] == [("completion", "self_resumed_turn")]
+    assert events[0]["started_by"] == {"type": "self", "id": None, "name": None}
+    assert events[0]["turn_started_at"].startswith("2026-10-29T19:27:32.978")
+
+
+async def test_a_wakeup_turn_crossing_the_restart_gets_its_end(tmp_path: Path, log: Path) -> None:
+    """#1093 AC2: the same for a turn a scheduled wakeup opened (#1092)."""
+    before = (_text("終わりました。"), TURN_END, *_wakeup_at("2026-10-29T18:36:00.386Z"))
+    async with _Restored(tmp_path, *before) as restored:
+        await restored.feed(_text("やることはありません。"), TURN_END)
+    events = _lines(log)
+    assert [e.get("reason") for e in events] == ["self_resumed_turn"]
+    assert events[0]["turn_started_at"].startswith("2026-10-29T18:36:00.386")
+
+
+async def test_a_crossing_self_turn_with_agents_out_is_held(tmp_path: Path, log: Path) -> None:
+    """#1093 with #1012: agents it launched before the restart hold the event."""
+    before = (
+        _text("x"), TURN_END, _notification_at("2026-10-29T19:00:00.000Z"),
+        _tool_use(), _launch("a1b2c3"),
+    )  # fmt: skip
+    async with _Restored(tmp_path, *before) as restored:
+        await restored.feed(_text("エージェント待ち"), TURN_END)
+        assert _lines(log) == []
+        await restored.feed(
+            _report("a1b2c3"), _user(_NOTIFICATION), _text("そろいました"), TURN_END
+        )
+    assert [e.get("reason") for e in _lines(log)] == ["self_resumed_turn"]
+
+
+def test_read_back_knows_when_the_open_turn_began(tmp_path: Path) -> None:
+    path = tmp_path / "s.jsonl"
+    _write(path, _text("x"), TURN_END, _notification_at("2026-10-29T19:27:32.978Z"), _tool_use())
+    assert _turn_state_at_end(path) == ("notification", "2026-10-29T19:27:32.978Z", set())

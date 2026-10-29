@@ -319,16 +319,23 @@ class TestOneBadVictimDoesNotTakeOthersDown:
             in_flight_fn=set,
             mem_fn=lambda: OK,
         )
-        with caplog.at_level(logging.INFO, logger="c_lord.resident_cap"):
+        deleted = isinstance(exc, discord.NotFound)
+        with (
+            caplog.at_level(logging.INFO, logger="c_lord.resident_cap"),
+            patch("c_lord.tmux.close_thread_windows", return_value=1),
+        ):
             # 4 と 3 はキャッシュに無く API でも引けない。#1033: 飛ばして次の 2 で補う
-            # （1 も引けないので、眠るのは 2 だけ）
-            assert await loop.tick() == 1
-        assert _slept(cog) == [2]
+            # （1 も引けないので、眠るのは 2 だけ）。#1086: NotFound（削除済み）は
+            # 補わずに窓を閉じ、数にも入れない — 生きているのは 1 と 2 で上限ちょうど
+            assert await loop.tick() == (0 if deleted else 1)
+        assert _slept(cog) == ([] if deleted else [2])
         msgs = [r.getMessage() for r in caplog.records]
-        assert any("thread=4" in m and ("not reachable" in m or "could not" in m) for m in msgs)
-        assert any("thread=3" in m and ("not reachable" in m or "could not" in m) for m in msgs)
-        # 眠らせたのは実際に眠った1本だけ
-        assert any("slept 1 workspace(s) to stay under the limit" in m for m in msgs)
+        why = ("not reachable", "could not", "no longer exists")
+        assert any("thread=4" in m and any(w in m for w in why) for m in msgs)
+        assert any("thread=3" in m and any(w in m for w in why) for m in msgs)
+        if not deleted:
+            # 眠らせたのは実際に眠った1本だけ
+            assert any("slept 1 workspace(s) to stay under the limit" in m for m in msgs)
 
     @pytest.mark.asyncio
     async def test_a_sleep_that_raises_is_logged_and_the_rest_continue(self, caplog) -> None:

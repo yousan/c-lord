@@ -372,6 +372,10 @@ class ResidentCapLoop:
         # can outlive them, and leaving them at the head of the LRU order is what
         # kept the cap at limit+1 forever (#1033, the #593 shape).
         self._unresolvable: set[int] = set()
+        # The subset Discord answered **NotFound** for: deleted for good. Their
+        # windows are closed rather than skipped — skipped, each one held a
+        # slot forever and a live workspace was slept in its place (#1086).
+        self._gone: set[int] = set()
         self._task: object | None = None
 
     @property
@@ -584,8 +588,10 @@ class ResidentCapLoop:
                 engaged.suffix,
             )
 
+        # #1086: under pressure is exactly when a deleted thread's memory matters.
+        await self._close_known_gone(self._resident())
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
-        resident = self._resident() & {rec.thread_id for rec in records}
+        resident = (self._resident() - self._gone) & {rec.thread_id for rec in records}
         victims = select_lru_victims(
             records,
             resident=resident,
@@ -612,6 +618,8 @@ class ResidentCapLoop:
                     "%s resident-cap: slept under EMERGENCY memory pressure",
                     log_ctx(thread_id=thread_id),
                 )
+            elif thread_id in self._gone:
+                await self._close_gone(thread_id)  # found deleted just now (#1086)
             total, available = self._memory()
             if total > 0 and available >= total * EMERGENCY_LOW_FRACTION:
                 logger.warning(
@@ -626,7 +634,11 @@ class ResidentCapLoop:
         return slept
 
     async def _enforce_cap(self) -> int:
-        resident = self._resident()
+        # #1086: a thread Discord deleted holds memory nobody can use. Close it
+        # whatever the count — and never count it: the cap is about live
+        # workspaces, and counting a corpse slept a live one in its place.
+        await self._close_known_gone(self._resident())
+        resident = self._resident() - self._gone
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
@@ -693,6 +705,11 @@ class ResidentCapLoop:
                 break
             if await self._sleep_one(thread_id, WorkspaceReason.CAP, label):
                 slept += 1
+            elif thread_id in self._gone:
+                # Found deleted just now (#1086): it never counted, so it frees
+                # no slot to make up for — close it and lower the bar instead.
+                await self._close_gone(thread_id)
+                over -= 1
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
         if slept < over:
@@ -706,6 +723,18 @@ class ResidentCapLoop:
                     short.suffix,
                 )
         return slept
+
+    async def _close_known_gone(self, resident: set[int]) -> None:
+        """Close every resident window of a thread known to be deleted (#1086).
+
+        Retried each tick until it takes. A running turn is left to finish —
+        sleep never cuts one short either.
+        """
+        gone = resident & self._gone
+        if not gone:
+            return
+        for thread_id in sorted(gone - await self._turns_in_flight(gone)):
+            await self._close_gone(thread_id)
 
     async def _sleep_one(self, thread_id: int, reason: object, label: str | None) -> bool:
         """Put one workspace to sleep through the one shared implementation.
@@ -728,6 +757,28 @@ class ResidentCapLoop:
             logger.exception("resident-cap: failed to sleep thread=%d", thread_id)
             return False
 
+    async def _close_gone(self, thread_id: int) -> bool:
+        """Close the windows of a thread Discord says no longer exists (#1086)."""
+        from . import tmux
+
+        cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
+        stop_mirror = getattr(cog, "_stop_transcript_mirror", None)
+        if stop_mirror is not None:
+            # As sleep does (#379): no mirror tailing a pane that is being killed.
+            with contextlib.suppress(Exception):
+                await stop_mirror(thread_id)
+        try:
+            closed = await asyncio.to_thread(tmux.close_thread_windows, thread_id)
+        except Exception:
+            logger.exception("resident-cap: failed to close the window of thread=%d", thread_id)
+            return False
+        if closed:
+            logger.info(
+                "%s resident-cap: closed the window of a thread deleted in Discord",
+                log_ctx(thread_id=thread_id),
+            )
+        return closed > 0
+
     async def _resolve_thread(self, thread_id: int) -> object | None:
         """The thread, asking the API when the cache misses (#593)."""
         import discord
@@ -735,11 +786,18 @@ class ResidentCapLoop:
         channel = self._bot.get_channel(thread_id)  # type: ignore[attr-defined]
         if channel is not None:
             return channel
-        if thread_id in self._unresolvable:
+        if thread_id in self._unresolvable or thread_id in self._gone:
             return None
         try:
             return await self._bot.fetch_channel(thread_id)  # type: ignore[attr-defined]
-        except (discord.NotFound, discord.Forbidden):
+        except discord.NotFound:
+            # Deleted for good: remembered, and its window is closed by the
+            # caller rather than skipped (#1086).
+            self._gone.add(thread_id)
+            logger.info("resident-cap: thread=%d no longer exists in Discord", thread_id)
+            return None
+        except discord.Forbidden:
+            # Possibly a permission that comes back, so the window is left alone.
             # Remembered for the life of the process, so it neither blocks the
             # LRU order nor costs an API call every tick (#1033, as #593).
             self._unresolvable.add(thread_id)
