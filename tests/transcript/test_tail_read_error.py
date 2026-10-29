@@ -84,3 +84,32 @@ def test_vanished_file_that_returns_does_not_replay_uuidless_events(tmp_path: Pa
     assert calls["n"] == 1
 
     assert [e["type"] for e in tail._poll_once(state)] == ["assistant"]
+
+
+def test_open_error_mid_line_still_delivers_that_line_once(tmp_path: Path) -> None:
+    """#1004: the half line held in the buffer must be read again, not dropped.
+
+    The banked offset already counted the first half; resuming there with an
+    empty buffer read only the second half, which does not parse, so the event
+    — possibly the reply itself — was lost.
+    """
+    jsonl, state = _started_tail(tmp_path)
+    assert [e["type"] for e in tail._poll_once(state)] == ["assistant"]
+    line = json.dumps({"type": "assistant", "uuid": "u3", "message": {"content": "hello"}})
+    with jsonl.open("a", encoding="utf-8") as fh:
+        fh.write(line[:20])
+    assert tail._poll_once(state) == []
+    with jsonl.open("a", encoding="utf-8") as fh:
+        fh.write(line[20:] + "\n")
+    real_open = Path.open
+
+    def emfile(self: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if self == jsonl and args and args[0] == "r":
+            raise OSError(24, "Too many open files")
+        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with mock.patch.object(Path, "open", emfile):
+        assert tail._poll_once(state) == []
+
+    assert [e.get("uuid") for e in tail._poll_once(state)] == ["u3"]
+    assert tail._poll_once(state) == []

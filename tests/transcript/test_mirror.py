@@ -322,8 +322,9 @@ async def test_mirror_minimal_attaches_progress_file_when_tools_buffered(
 
 
 async def test_mirror_minimal_bash_mode_buffered_not_leaked_as_bubble(tmp_path: Path) -> None:
-    """#487: Claude Code bash-mode markers (``! command``) are buffered into the
-    progress file like tool activity — never posted raw as a 👤 thread bubble."""
+    """#487: Claude Code bash-mode markers (``! command``) are never posted raw as
+    a 👤 thread bubble. #1013: nor do they ride on the next answer's progress file
+    — a command typed in the pane is not Claude's work (as #979 for ``/compact``)."""
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
@@ -366,11 +367,10 @@ async def test_mirror_minimal_bash_mode_buffered_not_leaked_as_bubble(tmp_path: 
 
     # No raw bash-mode tag ever reached the thread bubble (plain sink).
     assert not any("<bash-input>" in c or "<bash-stdout>" in c for c in sink_calls)
-    # The bash command + output landed in the progress file (the "raw mirror" layer).
-    assert progress_contents, "progress file_sink should have been called"
-    joined = "\n".join(progress_contents)
-    assert "google-chrome --headless" in joined
-    assert "Missing X server" in joined
+    # #1013: …and it is not the next answer's progress.txt either.
+    joined = "\n".join(progress_contents + sink_calls)
+    assert "google-chrome --headless" not in joined
+    assert "Missing X server" not in joined
 
 
 async def test_mirror_minimal_no_file_sink_fallback_to_sink(tmp_path: Path) -> None:
@@ -2756,3 +2756,47 @@ async def test_a_persons_turn_with_tools_is_still_quoted(tmp_path: Path) -> None
     )
     assert [text for text, _ in file_calls] == ["Lap 2 is under way."]
     assert _run_notification_turn.file_kwargs == [{}]  # type: ignore[attr-defined]
+
+
+# -- #1013: a ``!`` command typed in the pane is not a turn either -------------
+
+
+def _pane_bang_events() -> list[dict]:
+    """What the CLI writes for ``!ls`` typed in the pane (bash mode, #487)."""
+    return [
+        _user_str("<bash-input>ls</bash-input>"),
+        _user_str("<bash-stdout>a.txt</bash-stdout><bash-stderr></bash-stderr>"),
+    ]
+
+
+async def test_a_pane_bang_commands_lines_do_not_ride_on_the_next_answer(
+    tmp_path: Path,
+) -> None:
+    """#1013 AC1. RED: ``🔧 Bash: `ls``` and ``↳ a.txt`` became the next answer's
+    progress.txt — the #979 fix only knew slash commands."""
+    sink_calls, reply_calls, file_calls = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _user_str(_MONITOR_EVENT),
+        _assistant_text("Still running."),
+    )
+    assert file_calls == [], file_calls
+    assert reply_calls == []
+    assert sink_calls[-1:] == ["Still running."]
+
+
+async def test_a_pane_bang_command_does_not_open_a_turn(tmp_path: Path) -> None:
+    """#1013 AC2: the harness's ``<bash-input>`` row is nobody's request.
+
+    Fails if the ``is_harness_user_record`` check in the mirror goes: the row
+    would open a person's turn, and a notification landing while ``!sleep``
+    still runs (no ``<bash-stdout>`` yet) would be quoted under that person.
+    """
+    sink_calls, reply_calls, _ = await _run_notification_turn(
+        tmp_path,
+        _user_str("<bash-input>sleep 100</bash-input>"),
+        _user_str(_MONITOR_EVENT),
+        _assistant_text("Still running."),
+    )
+    assert reply_calls == []
+    assert sink_calls[-1:] == ["Still running."]

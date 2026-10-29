@@ -20,7 +20,7 @@ from c_lord import turn_events
 from c_lord.transcript.mirror import (
     TranscriptMirror,
     _launched_agent_ids,
-    _reported_task_id,
+    _reported_task_ids,
     has_pending_final,
 )
 
@@ -75,18 +75,30 @@ class TestParsing:
         event = {**_launch(), "isSidechain": True}
         assert _launched_agent_ids(event) == []
 
+    def test_every_id_in_one_notification_is_released(self):
+        """#1042: ``--resume`` reports all the agents the old process lost at once."""
+        event = {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": (
+                "<task-notification>\n<task-id>aaa111</task-id>\n<task-id>bbb222</task-id>\n"
+                "<status>stopped</status>\n</task-notification>"
+            ),
+        }
+        assert _reported_task_ids(event) == ["aaa111", "bbb222"]
+
     @pytest.mark.parametrize("status", ["completed", "failed", "killed", "stopped"])
     def test_any_status_releases_the_agent(self, status):
-        assert _reported_task_id(_report("abc123", status)) == "abc123"
+        assert _reported_task_ids(_report("abc123", status)) == ["abc123"]
 
     def test_only_the_enqueue_counts(self):
-        assert _reported_task_id({**_report(), "operation": "remove"}) is None
-        assert _reported_task_id({**_report(), "operation": "dequeue"}) is None
+        assert _reported_task_ids({**_report(), "operation": "remove"}) == []
+        assert _reported_task_ids({**_report(), "operation": "dequeue"}) == []
 
     def test_odd_shapes_never_raise(self):
         for event in ({}, {"type": "user", "message": "x"}, {"type": "queue-operation"}):
             assert _launched_agent_ids(event) == []
-            assert _reported_task_id(event) is None
+            assert _reported_task_ids(event) == []
 
 
 def _write(path: Path, payload: dict) -> None:
@@ -126,6 +138,47 @@ async def test_turn_end_reports_how_many_agents_are_still_running(tmp_path, monk
 
     assert seen == [1, 0]
 
+
+async def test_one_notification_for_two_agents_releases_both_live(tmp_path, monkeypatch):
+    """#1042 AC1, on the live #917 path. RED: ``[2, 1]`` — the second id stayed out."""
+    monkeypatch.setenv(turn_events.ENV_LOG, str(tmp_path / "events.jsonl"))
+    turn_events.reset()
+    seen: list[int] = []
+    monkeypatch.setattr(
+        turn_events, "note_turn_end", lambda _tid, outstanding, **_: seen.append(outstanding)
+    )
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    os.utime(jsonl, (1, 1))
+
+    async def sink(text: str) -> None:
+        pass
+
+    both = {
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": (
+            "<task-notification>\n<task-id>aaa111</task-id>\n<task-id>bbb222</task-id>\n"
+            "<status>stopped</status>\n</task-notification>"
+        ),
+    }
+    mirror = TranscriptMirror(thread_id=79, project_dir=project, sink=sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        _write(jsonl, _launch("aaa111"))
+        _write(jsonl, _launch("bbb222"))
+        _write(jsonl, TURN_END)
+        await asyncio.sleep(0.3)
+        _write(jsonl, both)
+        _write(jsonl, TURN_END)
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+
+    assert seen == [2, 0]
 
 async def test_final_answer_counts_as_pending_until_it_is_posted(tmp_path):
     project = tmp_path / "proj"

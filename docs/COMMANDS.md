@@ -583,3 +583,7 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
     "channel_id": 123456789
   }'
 ```
+
+`interval_seconds` and `channel_id` must be integers — anything else is a `400` naming the field.
+`409` means only that a task with that `name` already exists. Every endpoint that reads a body
+answers `400 {"error": "Body must be a JSON object"}` to valid JSON that is not an object (#1037).
