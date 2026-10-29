@@ -177,7 +177,7 @@ class TestFileGoesAway:
         real_open = Path.open
 
         def _emfile(self: Path, *args, **kwargs):  # noqa: ANN002, ANN003
-            if self == path and args and args[0] == "r":
+            if self == path and args and args[0] in ("r", "rb"):
                 raise OSError(24, "Too many open files")
             return real_open(self, *args, **kwargs)
 
