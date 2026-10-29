@@ -527,6 +527,20 @@ def _prompt_kind(event: dict) -> str | None:
     return "person"
 
 
+def _is_scheduled_wakeup(event: dict) -> bool:
+    """Return True for a ``ScheduleWakeup`` / ``/loop`` prompt firing (#1092).
+
+    Claude Code writes the prompt itself as ``isMeta`` user rows, which
+    :func:`_is_user_prompt` rightly refuses (they are nobody's message), so this
+    marker row is the only sign that Claude started a turn of its own.
+    """
+    return (
+        event.get("type") == "system"
+        and event.get("subtype") == "scheduled_task_fire"
+        and not event.get("isSidechain")
+    )
+
+
 #: How much of a pane ``!`` command the #1052 label shows.
 _PANE_BANG_MAX = 60
 
@@ -727,8 +741,8 @@ def _read_back_lines(path: Path, end: int | None) -> Iterator[bytes]:
 def _turn_state_at_end(path: Path, end: int | None = None) -> tuple[str | None, set[str]]:
     """Who opened the turn still open at *end* of *path*, and the agents still out.
 
-    ``("person" | "notification" | None, agent ids)``. Replays the live loop's
-    own rules (#913/#979/#917) over what the old process already read, so a
+    ``("person" | "notification" | "wakeup" | None, agent ids)``. Replays the live
+    loop's own rules (#913/#979/#917/#1092) over what the old process already read, so a
     mirror restored after a restart picks up where it left off (#1011/#1012).
     *end* is where the tail starts (#1018); ``None`` reads to the end of file.
     Blocking; ``(None, set())`` when the file cannot be read.
@@ -749,11 +763,12 @@ def _turn_state_at_end(path: Path, end: int | None = None) -> tuple[str | None, 
             continue
         agents.update(_launched_agent_ids(event))
         agents.difference_update(_reported_task_ids(event))
-        if _is_user_prompt(event):
-            kind = _prompt_kind(event)
+        wakeup = _is_scheduled_wakeup(event)
+        if _is_user_prompt(event) or wakeup:
+            kind = "wakeup" if wakeup else _prompt_kind(event)
             if kind == "person" and is_harness_user_record(event):
                 kind = None
-            if kind == "person" or (kind == "notification" and opened_by is None):
+            if kind == "person" or (kind in ("notification", "wakeup") and opened_by is None):
                 opened_by = kind
             if kind is not None:
                 spoke = False
@@ -853,6 +868,9 @@ class TranscriptMirror:
         # answer is not a reply to the last one.
         self._turn_open = expect_turn
         self._turn_by_notification = False
+        # #961/#1092: did Claude start the open turn by itself (a notification or
+        # a scheduled wakeup)? Nobody else will announce that turn's end.
+        self._turn_self_started = False
         # #979: has Claude written anything since the prompt that opened the
         # turn? A slash command typed in the pane opens one too, and writes no
         # ``turn_duration`` — when it was only that, its output closes it.
@@ -888,6 +906,7 @@ class TranscriptMirror:
         self._unresolved_told = False
         self._turn_open = True
         self._turn_by_notification = False
+        self._turn_self_started = False
 
     async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
         """Say out loud that this thread's transcript cannot be found (#773/#585).
@@ -1264,13 +1283,15 @@ class TranscriptMirror:
                     # #583: the first half of "whose turn ended?" — Claude read an
                     # instruction. The runner's poll loop needs it to tell its own
                     # turn's ending from that of the turn its prompt displaced.
-                    if _is_user_prompt(event):
+                    wakeup = _is_scheduled_wakeup(event)
+                    if _is_user_prompt(event) or wakeup:
                         turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                         _limit_reported = False
                         usage_limit_notices.clear_thread(self.thread_id)
                         # #913: a notification only *starts* a turn between turns;
-                        # one that lands in a person's turn leaves it theirs.
-                        started_by = _prompt_kind(event)
+                        # one that lands in a person's turn leaves it theirs. A
+                        # scheduled wakeup is the same kind of start (#1092).
+                        started_by = "wakeup" if wakeup else _prompt_kind(event)
                         # #979: the harness's own rows of a command typed in the pane
                         # (``<command-name>``, its output, the compaction summary)
                         # are nobody's request.
@@ -1283,8 +1304,12 @@ class TranscriptMirror:
                             self._pane_bang = command
                         if started_by == "person":
                             self._turn_by_notification = False
-                        elif started_by == "notification" and not self._turn_open:
-                            self._turn_by_notification = True
+                            self._turn_self_started = False
+                        elif started_by in ("notification", "wakeup") and not self._turn_open:
+                            # #1092: only a notification changes how the answer is
+                            # posted (#913); a wakeup's still goes out as before.
+                            self._turn_by_notification = started_by == "notification"
+                            self._turn_self_started = True
                             # #961: no runner will announce this turn's end.
                             turn_events.note_self_turn_started(
                                 self.thread_id, at=_event_time(event)
@@ -1341,7 +1366,7 @@ class TranscriptMirror:
                             turn_events.note_turn_end(
                                 self.thread_id,
                                 len(self._background_agents),
-                                self_started=self._turn_by_notification,
+                                self_started=self._turn_self_started,
                             )
                             turn_end_bus.mark(self.thread_id, at=_event_time(event))
                         continue

@@ -55,7 +55,7 @@ ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で
 | `event_id` | イベント1件ごとの一意な ID。再送で同じ本文が2回届いたときの重複排除に使う |
 | `kind` | `completion`（ターンが終わった）/ `blocked`（メニューで止まっている）/ `failure`（失敗した） |
 | `last_message_id` | `completion` / `failure`: そのターンで C-lord が**最後に投稿した返事**（本文）のメッセージ。無ければ `null`。`blocked`: 選択メニューのメッセージ |
-| `started_by.type` | `user` / `webhook` / `scheduler` / `api` / `self`（Claude が背景の知らせで自分から始めたターン — 後述）。`webhook` のときは webhook の id と表示名、`scheduler` のときはタスクの id と名前が入る |
+| `started_by.type` | `user` / `webhook` / `scheduler` / `api` / `self`（Claude が背景の知らせや起床予定で自分から始めたターン — 後述）。`webhook` のときは webhook の id と表示名、`scheduler` のときはタスクの id と名前が入る |
 | `reason` | `failure` のとき。`completion` では、後述の保留が時間切れになったとき（`background_agents_unresolved`）と、Claude が自分から始めたターンの終わり（`self_resumed_turn`）と、C-lord の再起動をまたいだターンの終わり（`restart_crossed`）のときだけ。短いコード。**エラー本文は入れない**（パスやペインの内容が混ざるため） |
 
 `last_message_id` は**返事の本文**であって、その後ろに付く `📊 …context` の統計行や 🟡 のメンションではない。
@@ -114,7 +114,7 @@ Claude のターンが、`run_in_background` で起動した**サブエージェ
 - 保留中に同じスレッドへ新しいメッセージが来て新しいターンが始まったら、保留していた `completion` は捨てる。
   その新しいターンの終わりが、スレッドの終わりとして出る（`started_by` は新しいターンのもの）。
 
-### Claude が自分から始めたターン（背景のシェルコマンドなど、#961）
+### Claude が自分から始めたターン（背景のシェルコマンド・起床予定など、#961・#1092）
 
 背景で動かした**シェルコマンド**（CI 待ち・長い pytest など）が終わると、Claude Code は `<task-notification>` を受けて
 **誰のメッセージも無いまま次のターンを始める**。最初のターンが「裏で CI を待っています」で終わり、
@@ -126,11 +126,15 @@ Claude のターンが、`run_in_background` で起動した**サブエージェ
  "started_by": {"type": "self", "id": null, "name": null}, "...": "..."}
 ```
 
+- **起床予定**（`ScheduleWakeup` / `/loop`）で Claude が自分から始めたターンも同じく `self_resumed_turn` で 1 件出す（#1092）。
+  Claude Code はこのプロンプトを人の入力ではない行（`isMeta`）として書き、その直前に `system/scheduled_task_fire` の行を書く。
+  C-lord はこの行をターンの始まりと数える（以前は数えておらず、見回りで進めるスレッドの最後の報告が 1 件も出ていなかった）。
+  Discord への返事の出し方（直前のメッセージへの引用など）は変わらない。
 - `last_message_id` はそのターンの返事。ツールを使わない短い返事（「まだ実行中です」など）は通知なしで投稿されるので、`null` のことがある。
 - `guild_id` / `channel_id` はそのスレッドの直前のターンから引き継ぐ。C-lord の再起動後で直前のターンを知らないときは `null`。
-- `turn_started_at` は知らせを読んだ時刻。
+- `turn_started_at` は知らせ（起床予定）を読んだ時刻。
 - **出さないとき**:
-  - 知らせと同じターンに人のメッセージが入ったとき（そのターンは人のもので、終わりは普通の `completion` が出す — 二重にならない）。
+  - 知らせ・起床予定と同じターンに人のメッセージが入ったとき（そのターンは人のもので、終わりは普通の `completion` が出す — 二重にならない）。
   - サブエージェントの保留を解くターンのとき（その終わりは保留していた `completion` として出る — 重ならない）。
   - C-lord の再起動前に始まったターン（始まりを知らないので出さない）。
 - 知らせで始まったターンがさらにサブエージェントを残して終わったら、上と同じく保留し、解けたときに `self_resumed_turn` で出す。

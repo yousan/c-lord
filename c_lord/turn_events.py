@@ -274,7 +274,9 @@ def _remember(table: dict[int, Any], thread_id: int, value: object) -> None:
 
 
 def note_self_turn_started(thread_id: int, at: datetime | None = None) -> None:
-    """A ``<task-notification>`` opened a turn in *thread_id* with nobody's message (#961).
+    """Claude opened a turn in *thread_id* with nobody's message (#961/#1092).
+
+    A ``<task-notification>`` (#961) or a scheduled wakeup (#1092) started it.
 
     Records where the thread's replies stood, so the event names the reply this
     turn posts. *at* is when the transcript says the turn began.
@@ -317,8 +319,8 @@ def note_turn_end(thread_id: int, outstanding: int, *, self_started: bool = Fals
     Called by the mirror after it has posted the turn's final answer and before it
     tells the runner. Records the snapshot :func:`finish_turn` reads, and releases
     a ``completion`` held for background agents once none are left.
-    *self_started*: a ``<task-notification>`` opened the turn (#961) — with no
-    runner to announce it, its end is announced here.
+    *self_started*: a ``<task-notification>`` (#961) or a scheduled wakeup (#1092)
+    opened the turn — with no runner to announce it, its end is announced here.
     """
     if not enabled():
         return
