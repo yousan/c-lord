@@ -200,7 +200,10 @@ class _FollowState:
     pre_existing: dict[Path, int] = field(default_factory=dict)
     current_path: Path | None = None
     offset: int = 0
-    buffer: str = ""
+    # Raw bytes of the line still being written.  Bytes, not text (#1044): the
+    # writer can stop inside a multi-byte character, and decoding that half
+    # turned ``返`` into U+FFFD for good.  Lines are decoded only once whole.
+    buffer: bytes = b""
     last_mtime: float = -1.0
     # Read position per file, so switching back and forth never re-reads (and
     # the consumer never re-receives) a transcript already consumed (#627 AC3).
@@ -331,7 +334,7 @@ def _drop_current(state: _FollowState) -> None:
     possibly the reply itself, was lost.
     """
     if state.current_path is not None:
-        state.offsets[state.current_path] = state.offset - len(state.buffer.encode("utf-8"))
+        state.offsets[state.current_path] = state.offset - len(state.buffer)
     state.current_path = None
 
 
@@ -355,7 +358,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             state.offsets[state.current_path] = state.offset
         state.offset = _start_offset(state, active)
         state.current_path = active
-        state.buffer = ""
+        state.buffer = b""
         state.last_mtime = -1.0
         state.signature = _signature(active, state.offset)
 
@@ -370,7 +373,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     if size < state.offset:
         # Truncation — reset and re-read from start.
         state.offset = 0
-        state.buffer = ""
+        state.buffer = b""
     elif (
         size == state.offset
         and mtime > state.last_mtime > 0
@@ -382,7 +385,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         # and treating that as a rewrite re-read every uuid-less event — whose
         # tool blocks then woke the progress line on a finished thread.
         state.offset = 0
-        state.buffer = ""
+        state.buffer = b""
 
     state.last_mtime = mtime
 
@@ -390,10 +393,10 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         return []
 
     try:
-        with active.open("r", encoding="utf-8", errors="replace") as f:
+        with active.open("rb") as f:
             f.seek(state.offset)
             chunk = f.read(_READ_CHUNK_BYTES)
-            state.offset = f.tell()
+            state.offset += len(chunk)
     except OSError:
         _drop_current(state)
         return []
@@ -402,7 +405,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     state.signature = _signature(active, state.offset)
 
     state.buffer += chunk
-    lines = state.buffer.split("\n")
+    lines = state.buffer.split(b"\n")
     state.buffer = lines[-1]  # last fragment may be a partial line
 
     events: list[dict[str, Any]] = []
@@ -410,7 +413,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json.loads(line.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             continue
         uid = event.get("uuid")
