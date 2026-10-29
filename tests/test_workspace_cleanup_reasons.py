@@ -113,3 +113,65 @@ async def test_a_clean_clone_is_still_removed(tmp_path: Path) -> None:
 
     assert not ws.exists()
     assert not [f for f in embed.fields if f.name.startswith("⚠️ Dirty")]
+
+
+# -- review of PR #1020: one snapshot decides and explains ---------------------
+
+
+def test_the_reason_comes_from_the_status_that_kept_the_dir(tmp_path: Path, monkeypatch) -> None:
+    """RED: ``git status`` was taken twice; when ``ls-remote`` failed the first
+    time and answered the second, the dir was kept with an empty reason."""
+    from c_lord import session_dir as sd
+
+    ws = _session_clone(tmp_path)
+    real = sd.worktree_status
+    calls = {"n": 0}
+
+    def flaky(path: str, **kw: object) -> sd.WorktreeStatus:
+        calls["n"] += 1
+        if calls["n"] == 1:  # ls-remote timed out: kept, to be safe
+            return sd.WorktreeStatus(is_repo=True, unpushed_commits=1, remote_unchecked=True)
+        return real(path, **kw)  # the remote answered: nothing to say
+
+    monkeypatch.setattr(sd, "worktree_status", flaky)
+    result = SessionDirManager(base_dir=str(ws.parent), source_repo="/repo").cleanup_for_thread(
+        int(ws.name)
+    )
+
+    assert ws.exists()
+    assert result.kept_work is True
+    assert "1 unpushed commit(s)" in result.reason, result.reason
+    assert calls["n"] == 1
+
+
+# -- #1045: a stash is a stash, not unpushed commits ---------------------------
+
+
+async def test_a_stash_only_dir_says_stash(tmp_path: Path) -> None:
+    """#1045 AC1/AC2. RED: ``2 unpushed commit(s) on no remote branch``."""
+    ws = _session_clone(tmp_path)
+    (ws / "f.txt").write_text("x\n")
+    _git(ws, "add", "f.txt")
+    _git(ws, "stash", "-q")
+    assert _git(ws, "status", "--porcelain") == ""
+
+    embed = await _cleanup_embed(ws)
+
+    assert ws.exists()
+    value = _dirty_field(embed)
+    assert "1 stash entry" in value, value
+    assert "unpushed" not in value
+
+
+async def test_a_stash_on_top_of_unpushed_work_names_both(tmp_path: Path) -> None:
+    ws = _session_clone(tmp_path)
+    _git(ws, "checkout", "-q", "-b", "feature/wip")
+    _git(ws, "commit", "-q", "--allow-empty", "-m", "wip")
+    (ws / "f.txt").write_text("x\n")
+    _git(ws, "add", "f.txt")
+    _git(ws, "stash", "-q")
+
+    value = _dirty_field(await _cleanup_embed(ws))
+
+    assert "1 unpushed commit(s)" in value, value
+    assert "1 stash entry" in value

@@ -46,7 +46,7 @@ from ..session_close import (
     is_closed,
     reopen_rename_notice,
 )
-from ..session_dir import SessionDirInfo, SessionDirManager, kept_reason
+from ..session_dir import SessionDirInfo, SessionDirManager
 from ..session_resume import ThreadResume, classify, hint_for_thread, stopped_hint
 from ..status_view import StatusRow, classify_status, render_status, render_thread_status
 from ..thread_owner import foreign_owner_notice_for
@@ -1189,7 +1189,7 @@ class SessionManageCog(commands.Cog):
                     candidates.append(d)
                 else:
                     # #1016: the same reason the real run would give.
-                    skipped.append((d, await asyncio.to_thread(kept_reason, d.path)))
+                    skipped.append((d, d.kept_reason or "dirty"))
 
             embed = discord.Embed(
                 title="📁 ワークスペースの作業ディレクトリ回収 — Dry Run",
@@ -1740,7 +1740,9 @@ class SessionManageCog(commands.Cog):
             if cleanup.removed:
                 results.append(f"✅ Session directory removed: `{cleanup.path}`")
             else:
-                results.append(f"ℹ️ Session directory: {cleanup.reason}")
+                # #1016: the reason now names the work, not "skipped" — say so.
+                sep = " kept — " if cleanup.kept_work else ": "
+                results.append(f"ℹ️ Session directory{sep}{cleanup.reason}")
 
         if not results:
             results.append(

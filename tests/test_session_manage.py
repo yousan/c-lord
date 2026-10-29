@@ -5,7 +5,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
-import pytest
 
 from c_lord.database.repository import SessionRecord
 
@@ -763,11 +762,6 @@ def test_dir_size_falls_back_when_du_has_no_dash_b(tmp_path, monkeypatch) -> Non
 
 class TestWorkspaceCleanupFieldLimit:
     """候補が多くても embed field の 1024 字上限を超えない (#824)。"""
-
-    @pytest.fixture(autouse=True)
-    def _short_reason(self, monkeypatch):
-        # #1016: the dry run names the work; these paths are not checkouts.
-        monkeypatch.setattr("c_lord.cogs.session_manage.kept_reason", lambda _path: "dirty")
 
     def _cog_with_dirs(self, n: int):
         from c_lord.session_dir import SessionDirInfo
