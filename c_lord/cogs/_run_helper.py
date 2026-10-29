@@ -449,6 +449,19 @@ class _InFlightRun:
 _IN_FLIGHT: dict[int, list[_InFlightRun]] = {}
 
 
+def has_other_run_in_flight(thread_id: int) -> bool:
+    """Another run for *thread_id* is still running its turn (#976).
+
+    The calling task's own run (if it has entered) does not count. A run whose
+    task has already ended is not running anything, so it does not count either.
+    """
+    current = asyncio.current_task()
+    return any(
+        run.task is not current and not (run.task is not None and run.task.done())
+        for run in _IN_FLIGHT.get(thread_id, ())
+    )
+
+
 def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
     """Say so when *run* starts while an earlier run for its thread never exited.
 
@@ -531,7 +544,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             outcome = "ok"
         return session_id
     except asyncio.CancelledError:
-        outcome = "cancelled"
+        # #977: a stop that had to cancel the task (a turn parked on a question
+        # card) is still the user's stop. A pre-emption stays ``cancelled``.
+        runner = config.runner
+        if (
+            getattr(runner, "stopped", False) is True
+            and getattr(runner, "preempted", False) is not True
+        ):
+            outcome = "stopped"
+        else:
+            outcome = "cancelled"
         raise
     finally:
         runs = _IN_FLIGHT.get(thread_id)
