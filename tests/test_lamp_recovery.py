@@ -191,3 +191,67 @@ async def test_no_open_lamp_reports_nothing() -> None:
     assert (
         await adopt_orphaned_lamp(msg, thread_id=9073, turn_running=_running(False), **FAST) is None
     )
+
+
+class TestPastTheLongWatch:
+    """#992: past ``max_seconds`` the watch slows down but never walks away.
+
+    Decided 2026-10-29: after the cut-off somebody must still be looking at the
+    lamp — the stall monitor keeps its ⚠️ honest, and when the turn ends the
+    lamp reads 🟡. Before, the give-up stopped the very monitor its docstring
+    handed the lamp to, and a 🟢 stayed on a finished turn for good.
+    """
+
+    LONG = {**FAST, "max_seconds": 0.05, "slow_poll_seconds": 0.02, "slow_recheck_seconds": 0.05}
+
+    @pytest.mark.asyncio
+    async def test_the_stall_monitor_still_runs_after_the_cut_off(self, monkeypatch) -> None:
+        managers: list[StatusManager] = []
+        real_adopt = StatusManager.adopt
+
+        def spy(message, emoji, *, thread_id=None):
+            manager = real_adopt(message, emoji, thread_id=thread_id)
+            managers.append(manager)
+            return manager
+
+        monkeypatch.setattr(StatusManager, "adopt", staticmethod(spy))
+        msg = _Message(EMOJI_RUNNING)
+        task = asyncio.create_task(
+            adopt_orphaned_lamp(msg, thread_id=9920, turn_running=_running(True), **self.LONG)
+        )
+        await asyncio.sleep(0.2)  # well past max_seconds
+        try:
+            assert not task.done()
+            stall = managers[0]._stall_task
+            assert stall is not None and not stall.done()
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_ends_after_the_cut_off_still_reads_waiting(self) -> None:
+        msg = _Message(EMOJI_RUNNING)
+        task = asyncio.create_task(
+            adopt_orphaned_lamp(msg, thread_id=9921, turn_running=_running(True), **self.LONG)
+        )
+        await asyncio.sleep(0.2)
+        turn_end_bus.mark(9921)
+        assert await asyncio.wait_for(task, 1) == "ended"
+        assert msg.lamps == [EMOJI_WAITING]
+
+    @pytest.mark.asyncio
+    async def test_the_recheck_still_catches_an_end_without_a_marker(self) -> None:
+        state = {"running": True}
+
+        async def check() -> bool:
+            return state["running"]
+
+        msg = _Message(EMOJI_RUNNING)
+        task = asyncio.create_task(
+            adopt_orphaned_lamp(msg, thread_id=9922, turn_running=check, **self.LONG)
+        )
+        await asyncio.sleep(0.2)
+        state["running"] = False
+        assert await asyncio.wait_for(task, 1) == "ended"
+        assert msg.lamps == [EMOJI_WAITING]

@@ -2803,15 +2803,18 @@ class TmuxSessionManager:
         waits for the input prompt — but only for :data:`_TRUST_BOOT_TIMEOUT`,
         and only the *dialog still being up* blocks delivery.  A pane that simply
         cannot be read is not evidence of anything (#544's rule) and must not
-        hold the message hostage.
+        hold the message hostage (#993): the dialog blocks only when the last
+        reading actually showed it — never when there was no reading at all.
         """
         deadline = time.monotonic() + _TRUST_BOOT_TIMEOUT
-        dialog_open = True
+        dialog_open = False
+        read_once = False
         while time.monotonic() < deadline:
             time.sleep(_TRUST_SETTLE)
             capture = _run(["tmux", "capture-pane", "-p", "-t", target])
             if capture.returncode != 0:
                 continue
+            read_once = True
             dialog_open = _pane_trust_dialog_downs(capture.stdout) is not None
             if dialog_open:
                 continue
@@ -2847,6 +2850,15 @@ class TmuxSessionManager:
                 _TRUST_BOOT_TIMEOUT,
             )
             return False
+        if not read_once:
+            logger.warning(
+                "%s send_input: the pane could not be read for %.0fs after the folder-trust "
+                "dialog was confirmed; delivering the message anyway — an unreadable pane is "
+                "no evidence the dialog is still open (#544/#993)",
+                log_ctx(thread_id=thread_id),
+                _TRUST_BOOT_TIMEOUT,
+            )
+            return True
         logger.warning(
             "%s send_input: the folder-trust dialog closed but Claude's input box never "
             "appeared within %.0fs; delivering the message anyway (#716)",
