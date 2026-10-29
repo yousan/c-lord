@@ -595,3 +595,7 @@ fields it can update (`enabled`, `prompt`, `interval_seconds`, `working_dir` —
 `enable`) is a `400` naming those fields; `404 Task not found` means only that the task does not
 exist (#1066). A numeric ID sent as `Infinity` / `NaN` (which JSON parsers in Python accept) is a
 `400 "… must be an integer"` on every endpoint, not a `500` (#1065).
+
+`run_immediately`（`POST`）と `enabled`（`PATCH /api/tasks/{id}`）は JSON の `true` / `false` だけを受け付ける。
+`"false"` や `0` を送ると `400 {"error": "enabled must be true or false"}` が返り、何も変わらない
+（以前は文字列の `"false"` で有効になっていた — #1038）。

@@ -54,6 +54,16 @@ def _current_uid() -> int | None:
     return getuid() if getuid is not None else None
 
 
+def _not_a_boolean(field: str) -> web.Response:
+    """400 for a flag that is not JSON ``true``/``false`` (#1038).
+
+    ``bool("false")`` is True, so guessing at a string turned "stop this task"
+    into "start it" — with a 200. Refusing is the only reading that never
+    does the opposite of what was asked.
+    """
+    return web.json_response({"error": f"{field} must be true or false"}, status=400)
+
+
 async def _read_json_object(
     request: web.Request,
 ) -> tuple[dict[str, Any], web.Response | None]:
@@ -141,6 +151,9 @@ class ApiServer:
         self.lounge_repo = lounge_repo
         self.resume_repo = resume_repo
         self.session_repo = session_repo
+        # Where c-lord clones session dirs; ``/api/reply``'s progress_file may
+        # only point under it (#1039). Wired by ``BridgeComponents``.
+        self.session_dir_base: str | None = None
         # Fall back to COORDINATION_CHANNEL_ID so lounge shares the same channel
         if lounge_channel_id is None:
             ch_str = os.getenv("COORDINATION_CHANNEL_ID", "")
@@ -483,6 +496,9 @@ class ApiServer:
         for field in ("name", "prompt", "interval_seconds", "channel_id"):
             if not data.get(field):
                 return web.json_response({"error": f"{field} is required"}, status=400)
+        run_immediately = data.get("run_immediately", True)
+        if not isinstance(run_immediately, bool):
+            return _not_a_boolean("run_immediately")
 
         numbers: dict[str, int] = {}
         for field in ("interval_seconds", "channel_id"):
@@ -503,7 +519,7 @@ class ApiServer:
                 interval_seconds=numbers["interval_seconds"],
                 channel_id=numbers["channel_id"],
                 working_dir=data.get("working_dir"),
-                run_immediately=bool(data.get("run_immediately", True)),
+                run_immediately=run_immediately,
             )
         except sqlite3.IntegrityError as exc:
             # The UNIQUE constraint on name.
@@ -549,6 +565,8 @@ class ApiServer:
 
         # Check every value before writing any: a 400 used to arrive after
         # ``enabled`` had already been saved (#1064).
+        if "enabled" in data and not isinstance(data["enabled"], bool):
+            return _not_a_boolean("enabled")
         patch_kwargs: dict[str, object] = {}
         if "prompt" in data:
             patch_kwargs["prompt"] = str(data["prompt"])
@@ -575,7 +593,7 @@ class ApiServer:
             )
 
         if "enabled" in data:
-            await self.task_repo.set_enabled(task_id, enabled=bool(data["enabled"]))  # type: ignore[union-attr]
+            await self.task_repo.set_enabled(task_id, enabled=data["enabled"])  # type: ignore[union-attr]
         if patch_kwargs:
             await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
         return web.json_response({"status": "updated"})
@@ -939,6 +957,9 @@ class ApiServer:
             content: Message body, Discord markdown OK (required, non-empty).
             progress_file: Absolute path on the server to a file to attach
                 (optional). Used for progress.txt-style detail dumps (#38).
+                Only a file under c-lord's session dirs is attached; anything
+                else is left off with a WARNING and ``"progress_file":
+                "ignored"`` in the answer (#1039).
 
         Returns:
             200 ``{"status": "sent"}`` on success.
@@ -969,17 +990,37 @@ class ApiServer:
         # Optional attachment — resolve and validate before touching Discord.
         progress_file = data.get("progress_file")
         attachment = None
+        progress_ignored = False
         if progress_file:
-            from pathlib import Path
-
-            path = Path(str(progress_file))
-            if not path.is_file():
+            # #1039: only a file under the session dirs, symlinks and ``..``
+            # resolved — checked before the file is even looked at, so a path
+            # outside does not learn whether it exists either. No base (never
+            # wired) means nothing is inside: an unknown boundary must not
+            # become "anywhere".
+            path: str | None = None
+            if self.session_dir_base:
+                root = os.path.realpath(self.session_dir_base)
+                candidate = os.path.realpath(str(progress_file))
+                if candidate.startswith(root.rstrip(os.sep) + os.sep):
+                    path = candidate
+            if path is None:
+                # Not an error the caller can fix by retrying, and the answer
+                # itself should still arrive — so post without it (#1039).
+                progress_ignored = True
+                logger.warning(
+                    "%s /api/reply: progress_file %s is outside the session dirs (%s) — "
+                    "not attached (#1039)",
+                    log_ctx(thread_id=thread_id),
+                    progress_file,
+                    self.session_dir_base or "unknown",
+                )
+            elif not os.path.isfile(path):
                 return web.json_response(
                     {"error": f"progress_file not found: {progress_file}"},
                     status=400,
                 )
-
-            attachment = discord.File(str(path), filename=path.name)
+            else:
+                attachment = discord.File(path, filename=os.path.basename(path))
 
         raw = self.bot.get_channel(thread_id)
         if raw is None:
@@ -1048,6 +1089,8 @@ class ApiServer:
         if last_sent is not None:
             record_reply_message(thread_id, last_sent)
 
+        if progress_ignored:
+            return web.json_response({"status": "sent", "progress_file": "ignored"})
         return web.json_response({"status": "sent"})
 
     async def prompt_choice(self, request: web.Request) -> web.Response:

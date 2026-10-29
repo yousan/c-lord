@@ -666,7 +666,9 @@ class TestReplyErrors:
         monkeypatch.setattr(tr, "get_table_images", lambda content: [("table1.png", b"PNG")])
         progress = tmp_path / "progress.txt"
         progress.write_text("detail")
-        client = await make_client(ApiServer(repo=repo, bot=bot))
+        api = ApiServer(repo=repo, bot=bot)
+        api.session_dir_base = str(tmp_path)  # progress_file は session dir の下だけ (#1039)
+        client = await make_client(api)
         resp = await client.post(
             "/api/reply",
             json={"thread_id": 1, "content": "answer", "progress_file": str(progress)},
