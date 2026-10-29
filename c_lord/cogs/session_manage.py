@@ -1344,12 +1344,19 @@ class SessionManageCog(commands.Cog):
         import asyncio
 
         all_windows: list[dict] = []
+        listed: set[str] = set()
         for binding in bindings:
             # Walks channel bindings, not threads (#600 audit).
             tmux_mgr = await self._resolve_tmux_manager(binding["channel_id"], thread_id=None)
-            if tmux_mgr is not None:
-                windows = await asyncio.to_thread(tmux_mgr.list_sessions)
-                all_windows.extend(windows)
+            if tmux_mgr is None:
+                continue
+            # #1112: the session follows the repo, so channels bound to one repo
+            # share it — list its windows once, not once per channel.
+            if tmux_mgr.session_name in listed:
+                continue
+            listed.add(tmux_mgr.session_name)
+            windows = await asyncio.to_thread(tmux_mgr.list_sessions)
+            all_windows.extend(windows)
 
         if not all_windows:
             await respond(
