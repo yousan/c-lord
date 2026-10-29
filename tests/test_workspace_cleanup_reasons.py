@@ -15,6 +15,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from c_lord.session_dir import SessionDirManager
 
 from .test_session_manage import _capture_responder, _make_cog
@@ -175,3 +177,32 @@ async def test_a_stash_on_top_of_unpushed_work_names_both(tmp_path: Path) -> Non
 
     assert "1 unpushed commit(s)" in value, value
     assert "1 stash entry" in value
+
+
+# -- #1080: a stash with no reflog is still a stash ----------------------------
+
+
+def _stash_then(ws: Path, how: str) -> str:
+    (ws / "README.md").write_text("changed\n")
+    if how == "update_ref":
+        sha = _git(ws, "stash", "create").strip()
+        _git(ws, "checkout", "-q", "--", "README.md")
+        _git(ws, "update-ref", "refs/stash", sha)
+    else:
+        _git(ws, "stash", "-q")
+        if how == "expire":
+            _git(ws, "reflog", "expire", "--expire=now", "--all")
+    return _git(ws, "rev-parse", "-q", "--verify", "refs/stash").strip()
+
+
+@pytest.mark.parametrize("how", ["normal", "expire", "update_ref"])
+async def test_a_stash_without_reflog_keeps_the_dir(tmp_path: Path, how: str) -> None:
+    """#1080. RED: ``refs/stash`` resolves but its reflog is empty, so ``rev-list
+    --walk-reflogs`` counted 0 entries and the dir — the stash's only copy — was removed."""
+    ws = _session_clone(tmp_path)
+    assert _stash_then(ws, how)  # the stashed work is still in refs/stash
+
+    value = _dirty_field(await _cleanup_embed(ws))
+
+    assert ws.exists(), how
+    assert "1 stash entry" in value, value
