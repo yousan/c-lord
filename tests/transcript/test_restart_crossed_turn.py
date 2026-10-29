@@ -264,3 +264,89 @@ def test_read_back_follows_the_live_rules(tmp_path: Path) -> None:
 
 def test_read_back_of_a_missing_file_knows_nothing(tmp_path: Path) -> None:
     assert _turn_state_at_end(tmp_path / "nope.jsonl") == (None, set())
+
+
+# -- review of PR #1018 -------------------------------------------------------
+
+
+async def test_an_answer_written_while_reading_back_is_delivered(
+    tmp_path: Path, monkeypatch, log: Path
+) -> None:
+    """RED: the read-back read one end of the file, the tail started at a later
+    one, and what Claude wrote in between reached neither — the answer was lost."""
+    from c_lord.transcript import mirror as mirror_mod
+
+    original = mirror_mod._turn_state_at_end
+    holder: dict = {}
+
+    def slow_read_back(path: Path, *args: object, **kwargs: object):
+        result = original(path, *args, **kwargs)  # type: ignore[arg-type]
+        # Claude keeps writing while c-lord reads 16 MiB back.
+        _write(holder["jsonl"], _text("最終回答です。"), TURN_END)
+        return result
+
+    monkeypatch.setattr(mirror_mod, "_turn_state_at_end", slow_read_back)
+    restored = _Restored(tmp_path, _tool_use())
+    holder["jsonl"] = restored.jsonl
+    async with restored:
+        await asyncio.sleep(0.5)
+    delivered = restored.sink + restored.replies + [t for t, _ in restored.files]
+    assert "最終回答です。" in delivered, delivered
+
+
+# Claude Code's record on --resume when the previous process died with agents
+# out (real shape, a transcript of 2026-10-09): several ids in one notification.
+_STOPPED_TOGETHER = (
+    "<task-notification>\n<task-id>aaa111</task-id>\n<task-id>bbb222</task-id>\n"
+    "<status>stopped</status>\n<summary>2 background agents didn't finish before the "
+    "previous session ended</summary>\n</task-notification>"
+)
+
+
+def _stopped_together() -> dict:
+    return {"type": "queue-operation", "operation": "enqueue", "content": _STOPPED_TOGETHER}
+
+
+def test_agents_reported_stopped_together_are_not_out(tmp_path: Path) -> None:
+    """#1042. RED: ``(None, {'bbb222'})`` — only the first ``<task-id>`` was read."""
+    path = tmp_path / "s.jsonl"
+    _write(
+        path, _tool_use(), _launch("aaa111"), _launch("bbb222"), _text("x"), TURN_END,
+        _stopped_together(), _user(_STOPPED_TOGETHER), _text("止まっていました"), TURN_END,
+    )  # fmt: skip
+    assert _turn_state_at_end(path) == (None, set())
+
+
+async def test_a_later_turn_is_not_held_by_agents_stopped_together(
+    tmp_path: Path, log: Path
+) -> None:
+    """#1042 through #1018: the read-back must not carry dead agents forward."""
+    before = (
+        _tool_use(), _launch("aaa111"), _launch("bbb222"), _text("x"), TURN_END,
+        _stopped_together(), _user(_STOPPED_TOGETHER), _text("止まっていました"), TURN_END,
+        _user("次の依頼"),
+    )  # fmt: skip
+    async with _Restored(tmp_path, *before) as restored:
+        await restored.feed(_text("終わりました。"), TURN_END)
+        _announce()
+        await turn_events.drain()
+    assert [e.get("reason") for e in _lines(log)] == ["restart_crossed"]
+
+
+def test_read_back_stops_at_the_tails_start_and_reads_in_chunks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1018: only whole lines before *end*; the window and chunk edges drop nothing."""
+    from c_lord.transcript import mirror as mirror_mod
+
+    monkeypatch.setattr(mirror_mod, "_READ_BACK_CHUNK", 7)
+    path = tmp_path / "s.jsonl"
+    lines = [json.dumps({"n": i}).encode() for i in range(40)]
+    path.write_bytes(b"\n".join(lines) + b"\n")
+    end = len(b"\n".join(lines[:30])) + 1  # where line 30 starts
+
+    assert list(mirror_mod._read_back_lines(path, end)) == lines[:30]
+
+    monkeypatch.setattr(mirror_mod, "_READ_BACK_MAX_BYTES", 50)
+    got = list(mirror_mod._read_back_lines(path, end))
+    assert got and got == lines[30 - len(got) : 30]  # a torn first line is dropped

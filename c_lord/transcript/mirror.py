@@ -31,7 +31,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -65,7 +65,6 @@ from .formatter import (
 )
 from .pane_echo import pane_echo
 from .repeat_fold import RepeatFold
-from .resolver import ThreadSessionResolver
 from .subagents import SubagentLog
 from .tail import UNRESOLVED_NOTICE_SECONDS, UnresolvedTranscript, tail_events
 
@@ -653,19 +652,20 @@ def _launched_agent_ids(event: dict) -> list[str]:
     return ids
 
 
-def _reported_task_id(event: dict) -> str | None:
-    """The id of the background task a ``<task-notification>`` event reports on (#917).
+def _reported_task_ids(event: dict) -> list[str]:
+    """The ids of the background tasks a ``<task-notification>`` event reports on (#917).
 
     Claude Code queues one when an agent (or background command) stops, whatever
     its status — completed, failed, killed — so all of them release the agent.
+    On ``--resume`` it reports every agent that died with the previous process
+    in **one** notification, one ``<task-id>`` each (#1042): all of them count.
     """
     if event.get("type") != "queue-operation" or event.get("operation") != "enqueue":
-        return None
+        return []
     content = event.get("content")
     if not isinstance(content, str) or "<task-notification>" not in content:
-        return None
-    match = _TASK_ID_RE.search(content)
-    return match.group(1) if match else None
+        return []
+    return _TASK_ID_RE.findall(content)
 
 
 #: How much of the transcript a restored mirror reads back (#1011/#1012). An
@@ -673,24 +673,50 @@ def _reported_task_id(event: dict) -> str | None:
 _READ_BACK_MAX_BYTES = 16 * 1024 * 1024
 
 
-def _turn_state_at_end(path: Path) -> tuple[str | None, set[str]]:
-    """Who opened the turn still open at the end of *path*, and the agents still out.
+_READ_BACK_CHUNK = 1024 * 1024
+
+
+def _read_back_lines(path: Path, end: int | None) -> Iterator[bytes]:
+    """The whole lines of *path* in the last ``_READ_BACK_MAX_BYTES`` before *end*.
+
+    Chunked, so a restart that restores hundreds of mirrors at once does not
+    hold 16 MiB per mirror in memory. Raises ``OSError``.
+    """
+    with path.open("rb") as f:
+        stop = f.seek(0, os.SEEK_END) if end is None else end
+        start = max(0, stop - _READ_BACK_MAX_BYTES)
+        f.seek(start)
+        partial = b""
+        first = start > 0  # the tail of a line that began before the window
+        left = stop - start
+        while left > 0:
+            chunk = f.read(min(_READ_BACK_CHUNK, left))
+            if not chunk:
+                break
+            left -= len(chunk)
+            lines = (partial + chunk).split(b"\n")
+            partial = lines.pop()
+            if first and lines:
+                lines = lines[1:]
+                first = False
+            yield from lines
+        if partial and not first:
+            yield partial
+
+
+def _turn_state_at_end(path: Path, end: int | None = None) -> tuple[str | None, set[str]]:
+    """Who opened the turn still open at *end* of *path*, and the agents still out.
 
     ``("person" | "notification" | None, agent ids)``. Replays the live loop's
     own rules (#913/#979/#917) over what the old process already read, so a
     mirror restored after a restart picks up where it left off (#1011/#1012).
+    *end* is where the tail starts (#1018); ``None`` reads to the end of file.
     Blocking; ``(None, set())`` when the file cannot be read.
     """
     try:
-        with path.open("rb") as f:
-            size = f.seek(0, os.SEEK_END)
-            start = max(0, size - _READ_BACK_MAX_BYTES)
-            f.seek(start)
-            lines = f.read().split(b"\n")
+        lines = list(_read_back_lines(path, end))
     except OSError:
         return None, set()
-    if start > 0:
-        lines = lines[1:]  # the tail of a line that began before the window
     opened_by: str | None = None
     spoke = False
     agents: set[str] = set()
@@ -702,9 +728,7 @@ def _turn_state_at_end(path: Path) -> tuple[str | None, set[str]]:
         if not isinstance(event, dict):
             continue
         agents.update(_launched_agent_ids(event))
-        reported = _reported_task_id(event)
-        if reported is not None:
-            agents.discard(reported)
+        agents.difference_update(_reported_task_ids(event))
         if _is_user_prompt(event):
             kind = _prompt_kind(event)
             if kind == "person" and is_harness_user_record(event):
@@ -917,20 +941,21 @@ class TranscriptMirror:
         """
         await self._progress.end_turn()
 
-    async def _read_back(self) -> None:
+    async def _read_back(self, jsonl: Path | None, end: int) -> None:
         """Start where the old process left off: the open turn and agents out (#1011/#1012).
 
         Without it a person's turn that crossed the restart read as closed: a
         notification landing in it counted as a turn Claude started by itself
         (a second turn-end event, the person's answer unquoted), and agents it
-        had launched were not waited for. Never raises — a mirror that could
-        not read back still delivers, as before.
+        had launched were not waited for. Called by the tail with the transcript
+        and offset it starts from, before it yields anything (#1018): reading
+        to any other point would lose (or double) what Claude writes meanwhile.
+        Never raises — a mirror that could not read back still delivers.
         """
+        if jsonl is None:
+            return
         try:
-            jsonl = await asyncio.to_thread(ThreadSessionResolver(self.project_dir).resolve)
-            if jsonl is None:
-                return
-            opened_by, agents = await asyncio.to_thread(_turn_state_at_end, jsonl)
+            opened_by, agents = await asyncio.to_thread(_turn_state_at_end, jsonl, end)
         except Exception:
             logger.warning(
                 "%s TranscriptMirror: could not read back the transcript (#1011)",
@@ -954,9 +979,7 @@ class TranscriptMirror:
     def _track_background_agents(self, event: dict) -> None:
         """Keep the set of background agents that have not yet reported back (#917)."""
         self._background_agents.update(_launched_agent_ids(event))
-        reported = _reported_task_id(event)
-        if reported is not None:
-            self._background_agents.discard(reported)
+        self._background_agents.difference_update(_reported_task_ids(event))
 
     async def _cancel_ask_bridge(self) -> None:
         t = self._ask_bridge_task
@@ -1121,15 +1144,13 @@ class TranscriptMirror:
         # flush a pending final answer when no turn-end marker is emitted.
         queue: asyncio.Queue = asyncio.Queue()
 
-        if self._resumed:
-            await self._read_back()
-
         async def _producer() -> None:
             async for event in tail_events(
                 self.project_dir,
                 poll_interval=self._poll_interval,
                 on_unresolved=self._on_unresolved,
                 unresolved_after=self._unresolved_after,
+                on_start=self._read_back if self._resumed else None,
             ):
                 await queue.put(event)
 

@@ -20,7 +20,7 @@ from c_lord import turn_events
 from c_lord.transcript.mirror import (
     TranscriptMirror,
     _launched_agent_ids,
-    _reported_task_id,
+    _reported_task_ids,
     has_pending_final,
 )
 
@@ -75,18 +75,30 @@ class TestParsing:
         event = {**_launch(), "isSidechain": True}
         assert _launched_agent_ids(event) == []
 
+    def test_every_id_in_one_notification_is_released(self):
+        """#1042: ``--resume`` reports all the agents the old process lost at once."""
+        event = {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": (
+                "<task-notification>\n<task-id>aaa111</task-id>\n<task-id>bbb222</task-id>\n"
+                "<status>stopped</status>\n</task-notification>"
+            ),
+        }
+        assert _reported_task_ids(event) == ["aaa111", "bbb222"]
+
     @pytest.mark.parametrize("status", ["completed", "failed", "killed", "stopped"])
     def test_any_status_releases_the_agent(self, status):
-        assert _reported_task_id(_report("abc123", status)) == "abc123"
+        assert _reported_task_ids(_report("abc123", status)) == ["abc123"]
 
     def test_only_the_enqueue_counts(self):
-        assert _reported_task_id({**_report(), "operation": "remove"}) is None
-        assert _reported_task_id({**_report(), "operation": "dequeue"}) is None
+        assert _reported_task_ids({**_report(), "operation": "remove"}) == []
+        assert _reported_task_ids({**_report(), "operation": "dequeue"}) == []
 
     def test_odd_shapes_never_raise(self):
         for event in ({}, {"type": "user", "message": "x"}, {"type": "queue-operation"}):
             assert _launched_agent_ids(event) == []
-            assert _reported_task_id(event) is None
+            assert _reported_task_ids(event) == []
 
 
 def _write(path: Path, payload: dict) -> None:
