@@ -1820,3 +1820,24 @@ async def test_file_sink_without_quote_attaches_but_does_not_reply(tmp_path: Pat
     channel.send.reset_mock()
     await file_sink("Lap 2", str(progress_file))
     assert channel.send.call_args.kwargs.get("reference") is not None
+
+
+def test_the_startup_restore_asks_the_mirror_to_read_back(tmp_path, monkeypatch) -> None:
+    """Review of PR #1018: ``on_ready``'s restore (``expect_turn=False``) is what
+    picks up a turn that crossed the restart; a turn's own start is not (#1011)."""
+    from c_lord.cogs import transcript_mirror as cog_mod
+
+    made: list[dict] = []
+
+    class _Fake:
+        def __init__(self, **kwargs) -> None:
+            made.append(kwargs)
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(cog_mod, "TranscriptMirror", _Fake)
+    cog = cog_mod.TranscriptMirrorCog(MagicMock(), session_repo=MagicMock())
+    cog.start_for(1, str(tmp_path / "a"), expect_turn=False)
+    cog.start_for(2, str(tmp_path / "b"))
+    assert [m["resumed"] for m in made] == [True, False]

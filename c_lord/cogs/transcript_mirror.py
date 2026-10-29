@@ -315,6 +315,9 @@ class TranscriptMirrorCog(commands.Cog):
             fold_edit=fold_edit,
             expect_turn=expect_turn,
             subagent_log=self._make_subagent_log(thread_id, project_dir),
+            # #1011/#1012: the on_ready restore picks up a turn that may still
+            # be running; a mirror started for a new turn has nothing to recover.
+            resumed=not expect_turn,
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
