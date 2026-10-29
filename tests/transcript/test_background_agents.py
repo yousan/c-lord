@@ -100,7 +100,7 @@ async def test_turn_end_reports_how_many_agents_are_still_running(tmp_path, monk
     turn_events.reset()
     seen: list[int] = []
     monkeypatch.setattr(
-        turn_events, "note_turn_end", lambda _tid, outstanding: seen.append(outstanding)
+        turn_events, "note_turn_end", lambda _tid, outstanding, **_: seen.append(outstanding)
     )
     project = tmp_path / "proj"
     project.mkdir()

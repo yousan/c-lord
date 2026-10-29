@@ -55,8 +55,8 @@ ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で
 | `event_id` | イベント1件ごとの一意な ID。再送で同じ本文が2回届いたときの重複排除に使う |
 | `kind` | `completion`（ターンが終わった）/ `blocked`（メニューで止まっている）/ `failure`（失敗した） |
 | `last_message_id` | `completion` / `failure`: そのターンで C-lord が**最後に投稿した返事**（本文）のメッセージ。無ければ `null`。`blocked`: 選択メニューのメッセージ |
-| `started_by.type` | `user` / `webhook` / `scheduler` / `api`。`webhook` のときは webhook の id と表示名、`scheduler` のときはタスクの id と名前が入る |
-| `reason` | `failure` のときだけ（と、後述の `completion` の保留が時間切れになったとき）。短いコード。**エラー本文は入れない**（パスやペインの内容が混ざるため） |
+| `started_by.type` | `user` / `webhook` / `scheduler` / `api` / `self`（Claude が背景の知らせで自分から始めたターン — 後述）。`webhook` のときは webhook の id と表示名、`scheduler` のときはタスクの id と名前が入る |
+| `reason` | `failure` のとき。`completion` では、後述の保留が時間切れになったとき（`background_agents_unresolved`）と、Claude が自分から始めたターンの終わり（`self_resumed_turn`）のときだけ。短いコード。**エラー本文は入れない**（パスやペインの内容が混ざるため） |
 
 `last_message_id` は**返事の本文**であって、その後ろに付く `📊 …context` の統計行や 🟡 のメンションではない。
 受け手が「ここから読む」ための印として使う。
@@ -84,13 +84,34 @@ Claude のターンが、`run_in_background` で起動した**サブエージェ
 
 判別できないときは**待たずに出す**。限界は次のとおり:
 
-- 数えているのは Claude Code の記録（jsonl）に出る**サブエージェント**だけ。背景で動かしたシェルコマンドは数えない。
+- 数えているのは Claude Code の記録（jsonl）に出る**サブエージェント**だけ。背景で動かしたシェルコマンドは数えない（その後のターンの終わりは次の節のとおり別に出る）。
 - 数は C-lord のメモリ上にしか無い。**C-lord を再起動すると忘れる**ので、再起動をまたいだ保留は最初のターン終わりで出てしまう。
 - ターン終わりの印（`turn_duration`）を記録に書かない古い Claude Code では、残りを読めないので待たずに出す。
 - 戻ってこないエージェントのせいで永遠に出ないことを避けるため、保留は `CLORD_EVENT_DEFER_MAX_SECONDS`（既定 1 時間）で解け、
   `"reason": "background_agents_unresolved"` を付けて出す。
 - 保留中に同じスレッドへ新しいメッセージが来て新しいターンが始まったら、保留していた `completion` は捨てる。
   その新しいターンの終わりが、スレッドの終わりとして出る（`started_by` は新しいターンのもの）。
+
+### Claude が自分から始めたターン（背景のシェルコマンドなど、#961）
+
+背景で動かした**シェルコマンド**（CI 待ち・長い pytest など）が終わると、Claude Code は `<task-notification>` を受けて
+**誰のメッセージも無いまま次のターンを始める**。最初のターンが「裏で CI を待っています」で終わり、
+本当の最終報告はこの後のターンに出る、という形がよくある。上のサブエージェントと違い、こちらは保留しない
+（最初のターンの `completion` はそのまま出る）。代わりに、**知らせで始まったターンが終わるたびに `completion` を 1 件**出す:
+
+```json
+{"kind": "completion", "reason": "self_resumed_turn",
+ "started_by": {"type": "self", "id": null, "name": null}, "...": "..."}
+```
+
+- `last_message_id` はそのターンの返事。ツールを使わない短い返事（「まだ実行中です」など）は通知なしで投稿されるので、`null` のことがある。
+- `guild_id` / `channel_id` はそのスレッドの直前のターンから引き継ぐ。C-lord の再起動後で直前のターンを知らないときは `null`。
+- `turn_started_at` は知らせを読んだ時刻。
+- **出さないとき**:
+  - 知らせと同じターンに人のメッセージが入ったとき（そのターンは人のもので、終わりは普通の `completion` が出す — 二重にならない）。
+  - サブエージェントの保留を解くターンのとき（その終わりは保留していた `completion` として出る — 重ならない）。
+  - C-lord の再起動前に始まったターン（始まりを知らないので出さない）。
+- 知らせで始まったターンがさらにサブエージェントを残して終わったら、上と同じく保留し、解けたときに `self_resumed_turn` で出す。
 
 ## 受け手の例
 
