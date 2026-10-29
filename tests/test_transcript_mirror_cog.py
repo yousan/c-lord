@@ -1766,3 +1766,26 @@ async def test_start_for_wires_an_editable_repeat_counter(
         assert mirror._fold._edit is not None
     finally:
         await cog.cog_unload()
+
+
+async def test_file_sink_without_quote_attaches_but_does_not_reply(tmp_path: Path) -> None:
+    """#979: a notification-started turn's log rides, the quote-reply does not."""
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+    progress_file = tmp_path / "progress.txt"
+    progress_file.write_text("tool output")
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog._trigger_messages[42] = 4242
+    file_sink = cog._make_file_sink(42)
+
+    await file_sink("Lap 2", str(progress_file), quote=False)
+    kwargs = channel.send.call_args.kwargs
+    assert kwargs.get("reference") is None
+    assert [getattr(f, "filename", "") for f in kwargs.get("files", [])] == ["progress.txt"]
+
+    channel.send.reset_mock()
+    await file_sink("Lap 2", str(progress_file))
+    assert channel.send.call_args.kwargs.get("reference") is not None

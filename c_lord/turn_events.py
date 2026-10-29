@@ -354,6 +354,39 @@ def finish_turn(info: TurnInfo | None, *, failure_reason: str | None = None) -> 
     _spawn(_deliver("completion", info))
 
 
+def announce_recovered_turn(
+    thread: discord.Thread | Any,
+    started_by: StartedBy,
+    *,
+    started_at: datetime | None,
+    failure_reason: str | None,
+) -> None:
+    """Announce the end of a turn that crossed a bot restart (#978).
+
+    Its run died with the old process (``outcome=cancelled``, which announces
+    nothing), so this process, which saw the turn end in the transcript, sends
+    the one event: ``failure`` with *failure_reason*, or ``completion`` with
+    ``reason: "restart_crossed"``. *started_at* is when the turn's trigger was
+    posted — the old process's own record of the start is gone. Any reply this
+    process has posted in the thread is the turn's (the catch-up included), so
+    ``last_message_id`` is the latest of them.
+    """
+    if not enabled():
+        return
+    info = _info_for(thread, started_by)
+    info.baseline_reply_id = 0
+    if started_at is not None:
+        info.started_at = _as_utc(started_at)
+    if failure_reason is not None:
+        _spawn(_deliver("failure", info, reason=failure_reason))
+    else:
+        _spawn(_deliver("completion", info, reason="restart_crossed"))
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment.replace(tzinfo=_UTC) if moment.tzinfo is None else moment.astimezone(_UTC)
+
+
 def emit_blocked(thread: discord.Thread | Any, *, message_id: int | None) -> None:
     """A menu that parks the turn was posted as *message_id*."""
     if not enabled():
