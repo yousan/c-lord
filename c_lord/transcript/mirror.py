@@ -738,20 +738,24 @@ def _read_back_lines(path: Path, end: int | None) -> Iterator[bytes]:
             yield partial
 
 
-def _turn_state_at_end(path: Path, end: int | None = None) -> tuple[str | None, set[str]]:
-    """Who opened the turn still open at *end* of *path*, and the agents still out.
+def _turn_state_at_end(
+    path: Path, end: int | None = None
+) -> tuple[str | None, str | None, set[str]]:
+    """Who opened the turn still open at *end* of *path*, when, and the agents still out.
 
-    ``("person" | "notification" | "wakeup" | None, agent ids)``. Replays the live
-    loop's own rules (#913/#979/#917/#1092) over what the old process already read, so a
-    mirror restored after a restart picks up where it left off (#1011/#1012).
-    *end* is where the tail starts (#1018); ``None`` reads to the end of file.
-    Blocking; ``(None, set())`` when the file cannot be read.
+    ``("person" | "notification" | "wakeup" | None, its timestamp, agent ids)``.
+    Replays the live loop's own rules (#913/#979/#917/#1092) over what the old
+    process already read, so a mirror restored after a restart picks up where it
+    left off (#1011/#1012/#1093). *end* is where the tail starts (#1018); ``None``
+    reads to the end of file. Blocking; ``(None, None, set())`` when the file
+    cannot be read.
     """
     try:
         lines = list(_read_back_lines(path, end))
     except OSError:
-        return None, set()
+        return None, None, set()
     opened_by: str | None = None
+    opened_at: str | None = None
     spoke = False
     agents: set[str] = set()
     for raw in lines:
@@ -770,13 +774,16 @@ def _turn_state_at_end(path: Path, end: int | None = None) -> tuple[str | None, 
                 kind = None
             if kind == "person" or (kind in ("notification", "wakeup") and opened_by is None):
                 opened_by = kind
+                stamp = event.get("timestamp")
+                opened_at = stamp if isinstance(stamp, str) else None
             if kind is not None:
                 spoke = False
         if event.get("type") == "assistant" and not event.get("isSidechain"):
             spoke = True
         if _is_turn_end(event) or (local_command_record(event) == "output" and not spoke):
             opened_by = None
-    return opened_by, agents
+            opened_at = None
+    return opened_by, opened_at, agents
 
 
 class TranscriptMirror:
@@ -999,7 +1006,7 @@ class TranscriptMirror:
         if jsonl is None:
             return
         try:
-            opened_by, agents = await asyncio.to_thread(_turn_state_at_end, jsonl, end)
+            opened_by, opened_at, agents = await asyncio.to_thread(_turn_state_at_end, jsonl, end)
         except Exception:
             logger.warning(
                 "%s TranscriptMirror: could not read back the transcript (#1011)",
@@ -1011,6 +1018,13 @@ class TranscriptMirror:
         if opened_by is not None:
             self._turn_open = True
             self._turn_by_notification = opened_by == "notification"
+            self._turn_self_started = opened_by in ("notification", "wakeup")
+            if self._turn_self_started:
+                # #1093: Claude opened it before the restart; with no runner to
+                # announce its end, this mirror does, as for any such turn (#961).
+                turn_events.note_self_turn_started(
+                    self.thread_id, at=_event_time({"timestamp": opened_at})
+                )
         if opened_by is not None or agents:
             logger.info(
                 "%s TranscriptMirror: resumed mid-turn (opened by %s, %d background agent(s) "
