@@ -134,3 +134,23 @@ async def test_restore_handle_finds_a_line_again_by_id() -> None:
     )
     assert await poster.restore_handle(1001) == "partial-1001"
     channel.get_partial_message.assert_called_once_with(1001)
+
+
+async def test_edit_with_a_file_replaces_and_none_removes_the_attachment(tmp_path) -> None:
+    """#1078 AC2: the other two meanings of ``file`` are unchanged."""
+    from unittest.mock import AsyncMock as _AM
+    from unittest.mock import MagicMock as _MM
+
+    from c_lord.discord_ui.subagent_poster import DiscordSubagentPoster
+    from c_lord.transcript.subagents import StatusFile
+
+    poster = DiscordSubagentPoster(bot=_MM(), thread_id=5, resolve_channel=_AM(), send_chunks=_MM())
+    handle = _MM()
+    handle.edit = _AM()
+    path = tmp_path / "p.md"
+    path.write_text("x", encoding="utf-8")
+    await poster.edit_status(handle, "t", StatusFile(str(path), "subagent-1.md"))
+    (sent,) = handle.edit.await_args.kwargs["attachments"]
+    assert sent.filename == "subagent-1.md"
+    await poster.edit_status(handle, "t", None)
+    assert handle.edit.await_args.kwargs["attachments"] == []

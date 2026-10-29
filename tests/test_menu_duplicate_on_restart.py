@@ -124,10 +124,16 @@ async def _post_from_a_turn(thread_id: int, question, *, send=None) -> MagicMock
     repo.save = AsyncMock()
     repo.delete = AsyncMock()
 
-    task = asyncio.create_task(
-        bridge_pane_ask(thread, question, _open_pane_runner(question), ask_repo=repo)
-    )
-    await asyncio.sleep(0.05)  # let it post, then stop waiting for a click
+    runner = _open_pane_runner(question)
+    task = asyncio.create_task(bridge_pane_ask(thread, question, runner, ask_repo=repo))
+    # Let it post, then stop waiting for a click. Waited for, not slept for: a
+    # fixed 50 ms ran out before the ledger write on a loaded CI runner (#1091),
+    # and the "restart" then rightly re-posted a menu nobody had recorded. The
+    # first pane poll is the wait for an answer — everything before it is done.
+    for _ in range(500):
+        if runner.peek_menu_state.await_count or task.done():
+            break
+        await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
