@@ -1091,6 +1091,8 @@ class TranscriptMirror:
                         self._turn_by_notification = False
                     elif started_by == "notification" and not self._turn_open:
                         self._turn_by_notification = True
+                        # #961: no runner will announce this turn's end.
+                        turn_events.note_self_turn_started(self.thread_id, at=_event_time(event))
                     if started_by is not None:
                         self._turn_open = True
 
@@ -1132,7 +1134,11 @@ class TranscriptMirror:
                     if not event.get("isSidechain"):
                         # #917: after the answer is out, before the runner hears
                         # of the end — see :func:`turn_events.note_turn_end`.
-                        turn_events.note_turn_end(self.thread_id, len(self._background_agents))
+                        turn_events.note_turn_end(
+                            self.thread_id,
+                            len(self._background_agents),
+                            self_started=self._turn_by_notification,
+                        )
                         turn_end_bus.mark(self.thread_id, at=_event_time(event))
                     continue
 

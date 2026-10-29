@@ -43,6 +43,21 @@ completion goes out at once), and only agents are counted, not background shell
 commands. An agent that never reports back cannot hold the event forever:
 ``CLORD_EVENT_DEFER_MAX_SECONDS`` (default 3600) releases it with
 ``reason: "background_agents_unresolved"``.
+
+**Turns Claude starts by itself** (#961). When a background *shell command*
+(CI, a long pytest) finishes, Claude Code starts a turn on its own, just as for
+an agent — but nothing above counts those, and the runner that announces a turn
+is long gone: it ended at Claude's first turn end ("waiting for CI"). That later
+turn often carries the real final report. The mirror tells this module when a
+``<task-notification>`` opens a turn (:func:`note_self_turn_started`) and whether
+the turn that just ended was one (``note_turn_end(..., self_started=True)``);
+its end goes out as a ``completion`` with ``started_by: {"type": "self"}`` and
+``reason: "self_resumed_turn"``, one per such turn. It is not sent when a runner
+turn is open (a person's message landed in it — the runner announces that end)
+or when a held completion is released instead (the agent case above: that turn
+*is* the held turn's end). guild / channel come from the thread's last runner
+turn — ``null`` after a restart. Limit: a self-started turn that began before a
+restart has no recorded start, so its end is not announced.
 """
 
 from __future__ import annotations
@@ -126,12 +141,18 @@ class _Held:
 
     info: TurnInfo
     timer: asyncio.TimerHandle | None = None
+    #: the ``reason`` to send when the agents report back (#961).
+    reason: str | None = None
 
 
 _ACTIVE: dict[int, TurnInfo] = {}
 #: thread -> (monotonic time of the last transcript turn end, agents still running)
 _LAST_END: dict[int, tuple[float, int]] = {}
 _HELD: dict[int, _Held] = {}
+#: thread -> the last runner turn, whose guild / channel a self-started turn inherits.
+_LAST_INFO: dict[int, TurnInfo] = {}
+#: thread -> the open turn Claude started by itself on a notification (#961).
+_SELF: dict[int, TurnInfo] = {}
 _TASKS: set[asyncio.Task[None]] = set()
 
 
@@ -143,6 +164,8 @@ def reset() -> None:
     _ACTIVE.clear()
     _LAST_END.clear()
     _HELD.clear()
+    _LAST_INFO.clear()
+    _SELF.clear()
 
 
 def _log_path() -> str | None:
@@ -237,9 +260,49 @@ def begin_turn(thread: discord.Thread | Any, started_by: StartedBy) -> TurnInfo 
             "%s held completion dropped — a new turn started (#917)",
             log_ctx(thread_id=thread.id),
         )
+    _SELF.pop(thread.id, None)
     info = _info_for(thread, started_by)
     _ACTIVE[thread.id] = info
+    _remember(_LAST_INFO, thread.id, info)
     return info
+
+
+def _remember(table: dict[int, Any], thread_id: int, value: object) -> None:
+    table[thread_id] = value
+    while len(table) > _MAX_THREADS:
+        table.pop(next(iter(table)))  # oldest insertion first
+
+
+def note_self_turn_started(thread_id: int, at: datetime | None = None) -> None:
+    """A ``<task-notification>`` opened a turn in *thread_id* with nobody's message (#961).
+
+    Records where the thread's replies stood, so the event names the reply this
+    turn posts. *at* is when the transcript says the turn began.
+    """
+    if not enabled():
+        return
+    try:
+        base = _LAST_INFO.get(thread_id)
+        _remember(
+            _SELF,
+            thread_id,
+            TurnInfo(
+                thread_id=thread_id,
+                guild_id=base.guild_id if base is not None else None,
+                channel_id=base.channel_id if base is not None else None,
+                started_by=StartedBy("self"),
+                started_at=at or datetime.now(_UTC),
+                started_mono=time.monotonic(),
+                baseline_reply_id=_last_reply_id(thread_id),
+            ),
+        )
+    except Exception:
+        # Runs inside the mirror's read loop: a bug here must not stop delivery.
+        logger.warning(
+            "%s could not note the self-started turn (#961)",
+            log_ctx(thread_id=thread_id),
+            exc_info=True,
+        )
 
 
 def end_turn(info: TurnInfo | None) -> None:
@@ -248,21 +311,28 @@ def end_turn(info: TurnInfo | None) -> None:
         del _ACTIVE[info.thread_id]
 
 
-def note_turn_end(thread_id: int, outstanding: int) -> None:
+def note_turn_end(thread_id: int, outstanding: int, *, self_started: bool = False) -> None:
     """The transcript says a turn ended in *thread_id* with *outstanding* agents running.
 
     Called by the mirror after it has posted the turn's final answer and before it
     tells the runner. Records the snapshot :func:`finish_turn` reads, and releases
     a ``completion`` held for background agents once none are left.
+    *self_started*: a ``<task-notification>`` opened the turn (#961) — with no
+    runner to announce it, its end is announced here.
     """
     if not enabled():
         return
     try:
-        _LAST_END[thread_id] = (time.monotonic(), outstanding)
-        while len(_LAST_END) > _MAX_THREADS:
-            _LAST_END.pop(next(iter(_LAST_END)))  # oldest insertion first
-        if outstanding == 0:
-            _release(thread_id, reason=None)
+        _remember(_LAST_END, thread_id, (time.monotonic(), outstanding))
+        started = _SELF.pop(thread_id, None)
+        own = started if self_started else None
+        released = outstanding == 0 and _release(thread_id, reason=None)
+        if own is None or released or thread_id in _ACTIVE or thread_id in _HELD:
+            return
+        if outstanding > 0:
+            _hold(own, outstanding, reason="self_resumed_turn")
+        else:
+            _spawn(_deliver("completion", own, reason="self_resumed_turn"))
     except Exception:
         # Runs inside the mirror's read loop: a bug here must not stop delivery.
         logger.warning(
@@ -299,11 +369,11 @@ def emit_blocked(thread: discord.Thread | Any, *, message_id: int | None) -> Non
         )
 
 
-def _hold(info: TurnInfo, outstanding: int) -> None:
+def _hold(info: TurnInfo, outstanding: int, *, reason: str | None = None) -> None:
     previous = _HELD.pop(info.thread_id, None)
     if previous is not None and previous.timer is not None:
         previous.timer.cancel()
-    held = _Held(info)
+    held = _Held(info, reason=reason)
     with contextlib.suppress(RuntimeError):
         loop = asyncio.get_running_loop()
         held.timer = loop.call_later(
@@ -317,13 +387,15 @@ def _hold(info: TurnInfo, outstanding: int) -> None:
     )
 
 
-def _release(thread_id: int, reason: str | None) -> None:
+def _release(thread_id: int, reason: str | None) -> bool:
+    """Send the completion held for *thread_id*; whether there was one."""
     held = _HELD.pop(thread_id, None)
     if held is None:
-        return
+        return False
     if held.timer is not None:
         held.timer.cancel()
-    _spawn(_deliver("completion", held.info, reason=reason))
+    _spawn(_deliver("completion", held.info, reason=reason or held.reason))
+    return True
 
 
 def _spawn(coro: Coroutine[Any, Any, None]) -> None:
