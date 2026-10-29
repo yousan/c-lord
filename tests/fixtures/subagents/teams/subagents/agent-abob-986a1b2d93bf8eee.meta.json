@@ -1,0 +1,1 @@
+{"agentType":"bob","isBuiltIn":false,"description":"Bob computes 2+2","name":"bob","spawnDepth":0,"requestShape":"background","requestNonInteractive":true,"model":"haiku","taskKind":"in_process_teammate","teamName":"session-49db0b8c","color":"green","planModeRequired":false,"spawnedAgentType":"general-purpose","permissionMode":"bypassPermissions"}
