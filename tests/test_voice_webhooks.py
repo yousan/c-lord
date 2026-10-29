@@ -84,3 +84,51 @@ def test_voice_message_fires_no_webhook_trigger() -> None:
     assert cog._match(msg) is None
     msg.webhook_id = DISPATCH
     assert cog._match(msg) is not None
+
+
+# --- #1024: every instance on the host shares one file ----------------------
+
+
+def _write_as_another_instance(path: Path, ids: list[int]) -> None:
+    """What another c-lord process's ``register`` leaves on disk."""
+    path.write_text(json.dumps(ids), encoding="utf-8")
+
+
+def test_two_instances_registering_in_turn_keep_both_ids(tmp_path: Path) -> None:
+    path = tmp_path / "voice-webhooks.json"
+    assert not voice_webhooks.is_voice_webhook(DISPATCH)  # this process has read the file
+    _write_as_another_instance(path, [222])  # instance B registers 222
+    voice_webhooks.register(111)  # this one registers 111
+    assert sorted(json.loads(path.read_text())) == [111, 222]
+
+
+def test_an_id_another_instance_registered_is_ours_too(tmp_path: Path) -> None:
+    path = tmp_path / "voice-webhooks.json"
+    voice_webhooks.register(111)
+    _write_as_another_instance(path, [111, 222])
+    assert voice_webhooks.is_voice_webhook(222)
+
+
+def test_two_real_processes_registering_concurrently_lose_nothing(tmp_path: Path) -> None:
+    """Separate interpreters, each with its own in-memory set, racing on one file."""
+    import subprocess
+    import sys
+
+    path = tmp_path / "voice-webhooks.json"
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from c_lord import voice_webhooks as v\n"
+        "v.registry_path = lambda: Path(sys.argv[1])\n"
+        "v.is_voice_webhook(1)\n"
+        "base = int(sys.argv[2])\n"
+        "for i in range(40):\n"
+        "    v.register(base + i)\n"
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script, str(path), str(base)])
+        for base in (1000, 2000, 3000)
+    ]
+    assert [p.wait(timeout=60) for p in procs] == [0, 0, 0]
+    want = {b + i for b in (1000, 2000, 3000) for i in range(40)}
+    assert set(json.loads(path.read_text())) == want

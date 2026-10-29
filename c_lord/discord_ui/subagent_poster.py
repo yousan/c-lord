@@ -135,6 +135,12 @@ class DiscordSubagentPoster:
             kwargs["file"] = discord.File(file.path, filename=file.filename)
         return await channel.send(**kwargs)
 
+    async def restore_handle(self, message_id: int) -> object | None:
+        """The status line *message_id* posted by an earlier process, to edit it (#1027)."""
+        channel = await self._resolve(self._thread_id)
+        get = getattr(channel, "get_partial_message", None) if channel is not None else None
+        return get(message_id) if get is not None else None
+
     async def edit_status(self, handle: object, text: str, file: StatusFile | None) -> None:
         attachments = [] if file is None else [discord.File(file.path, filename=file.filename)]
         edit = getattr(handle, "edit", None)
