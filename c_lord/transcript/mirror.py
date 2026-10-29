@@ -644,9 +644,14 @@ def _launched_agent_ids(event: dict) -> list[str]:
             continue
         result = block.get("content")
         if isinstance(result, list):
-            result = " ".join(part.get("text", "") for part in result if isinstance(part, dict))
+            # ``text`` can be null (#1041) — joining it raised and stopped the mirror.
+            texts = [part.get("text") for part in result if isinstance(part, dict)]
+            result = " ".join(t for t in texts if isinstance(t, str))
         if isinstance(result, str):
-            match = _AGENT_LAUNCHED_RE.search(result)
+            # #1089: the result *is* the launch — it starts with the line. A Bash
+            # output that merely shows the text (Claude reading c-lord's own
+            # tests) launched nothing.
+            match = _AGENT_LAUNCHED_RE.match(result.lstrip())
             if match:
                 ids.append(match.group(1))
     return ids
@@ -1190,364 +1195,380 @@ class TranscriptMirror:
                         await _commit_cursor()
                     continue
 
-                # #769: anything Claude writes to its transcript — a tool call,
-                # its result, a thinking block — proves the session is moving.
-                # This is the stall lamp's only live feed: the runner-side
-                # producers it used to hear from are gone (#723), and without
-                # this every turn past 30s read ⚠️ however busy Claude was.
-                # #905: and a call still waiting for its result is the session
-                # working, however long it stays quiet.
-                opened, closed = _tool_call_ids(event)
-                turn_activity.note(self.thread_id, started=opened, finished=closed)
-                # #908: whether this turn's latest reply is Claude Code's own
-                # API-error message — the runner reads it when the turn ends.
-                if (
-                    event.get("type") == "assistant"
-                    and not event.get("isSidechain")
-                    and not is_rate_limit_event(event)
-                ):
-                    turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
-                self._track_background_agents(event)
-                if self._subagent_log is not None:
-                    # #1021: the sub-agent log is an extra; whatever goes wrong
-                    # in it must not end this loop, the thread's only delivery.
-                    try:
-                        self._subagent_log.observe_parent(event)
-                    except Exception:
-                        logger.exception(
-                            "TranscriptMirror: sub-agent log failed on a row thread=%d",
-                            self.thread_id,
-                        )
-
-                # #232: bridge an open AskUserQuestion menu regardless of
-                # verbosity / turn-end / who triggered the turn.
-                await self._maybe_bridge_ask(event)
-
-                # #583: the first half of "whose turn ended?" — Claude read an
-                # instruction. The runner's poll loop needs it to tell its own
-                # turn's ending from that of the turn its prompt displaced.
-                if _is_user_prompt(event):
-                    turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
-                    _limit_reported = False
-                    usage_limit_notices.clear_thread(self.thread_id)
-                    # #913: a notification only *starts* a turn between turns;
-                    # one that lands in a person's turn leaves it theirs.
-                    started_by = _prompt_kind(event)
-                    # #979: the harness's own rows of a command typed in the pane
-                    # (``<command-name>``, its output, the compaction summary)
-                    # are nobody's request.
-                    if started_by == "person" and is_harness_user_record(event):
-                        started_by = None
-                    if started_by == "person":
-                        self._turn_by_notification = False
-                    elif started_by == "notification" and not self._turn_open:
-                        self._turn_by_notification = True
-                        # #961: no runner will announce this turn's end.
-                        turn_events.note_self_turn_started(self.thread_id, at=_event_time(event))
-                    if started_by is not None:
-                        self._turn_open = True
-                        self._model_spoke = False
-                if event.get("type") == "assistant" and not event.get("isSidechain"):
-                    self._model_spoke = True
-
-                if _is_turn_end(event):
-                    # #773: nobody is waiting on this mirror until the next turn.
-                    self._turn_active = False
-                    self._turn_open = False
-                    # #631: a limit reported for the turn that just ended says
-                    # nothing about the next one — the limit may well have reset
-                    # in between, and a thread that silently stops explaining why
-                    # it is stuck is the bug this came from.  c-lord's own notice
-                    # is scoped the same way: AC8 asks whether *this* turn has
-                    # already been told, and leaving the entry standing made the
-                    # next turn silent for the rest of the TTL (staging,
-                    # 2026-09-14: announced 12:53:16, wrongly suppressed 12:54:35).
-                    _limit_reported = False
-                    usage_limit_notices.clear_thread(self.thread_id)
-                    if self._verbosity == "minimal":
-                        # #539: the turn is over — take the progress line away
-                        # before the final answer lands so it never trails
-                        # below the answer.
-                        await self._progress.end_turn()
-                        # #747: a loop never spans a turn boundary.
-                        await self._fold.reset()
-                        # Turn boundary: flush pending as the final reply.
-                        await _flush_pending_as_reply()
-                        await _commit_cursor()
-                        # #399: disarm unconsumed pane-bridge entries — the
-                        # legitimate flush always precedes its turn end, so a
-                        # surviving entry could only swallow a future real
-                        # message.
-                        bridged_context.clear_thread(self.thread_id)
-                    # #583: the pane cannot see a turn boundary, so the runner's
-                    # poll loop learns it here — this is the only place in
-                    # c-lord that reads Claude's own turn-end marker. Marked
-                    # AFTER the flush above on purpose: the runner reacts by
-                    # ending the turn (and posting the 📊 context footer), and
-                    # that must never overtake the answer the footer belongs to.
-                    if not event.get("isSidechain"):
-                        # #917: after the answer is out, before the runner hears
-                        # of the end — see :func:`turn_events.note_turn_end`.
-                        turn_events.note_turn_end(
-                            self.thread_id,
-                            len(self._background_agents),
-                            self_started=self._turn_by_notification,
-                        )
-                        turn_end_bus.mark(self.thread_id, at=_event_time(event))
-                    continue
-
-                rendered = render_event(event)
-
-                # #682/#808: the other half of the ZWSP echo test. A menu answer
-                # is typed with ``send_literal``, which leaves the marker off on
-                # purpose (#172/#650), and CLI 2.1.278+ strips it from every
-                # prompt (#808) — so the formatter cannot tell this event from
-                # human pane input. But c-lord recorded what it typed, so ask.
-                # Dropped exactly like a marked echo (no turn bookkeeping):
-                # Discord already has the sentence the user wrote.
-                if rendered is None:
-                    # A marker that survived (older CLI) already dropped the
-                    # echo; spend its record so it cannot later swallow the same
-                    # words typed by a person in the pane.
-                    _retire_marked_echo(self.thread_id, event)
-                elif rendered.kind == "user_input" and pane_echo.consume_match(
-                    self.thread_id, rendered.body
-                ):
-                    logger.info(
-                        "TranscriptMirror: suppressed c-lord pane echo (no ZWSP) thread=%d",
-                        self.thread_id,
-                    )
-                    rendered = None
-                elif rendered.kind == "user_input" and (
-                    cut := pane_echo.consume_partial(self.thread_id, rendered.body)
-                ):
-                    # #872: Claude got only part of a message c-lord typed. The
-                    # line still goes out (it is what Claude is working from),
-                    # but the log has to say a message was cut.
-                    logger.warning(
-                        "%s TranscriptMirror: Claude received only %d of the %d characters "
-                        "c-lord typed for this message — the rest never reached it (#872)",
-                        log_ctx(thread_id=self.thread_id),
-                        cut[1],
-                        cut[0],
-                    )
-
-                # #912: Claude has read a new instruction — a prompt, not a
-                # bash-mode line (those are user strings too, rendered as tool
-                # activity). A text still held is the end of the turn before:
-                # deliver it now, as that turn's answer, before this turn can
-                # claim it. (A c-lord prompt is never rendered, so the
-                # user_input branch below would not get the chance.)
-                # Only a person's prompt: a notification landing mid-turn does
-                # not end the turn (#913), and flushing there would post a
-                # mid-turn text as the answer.
-                if (
-                    _is_user_prompt(event)
-                    and _prompt_kind(event) == "person"
-                    and (rendered is None or rendered.kind == "user_input")
-                ):
-                    if self._verbosity == "minimal" and _pending_text is not None:
-                        await _flush_pending_as_reply()
-                        await _commit_cursor()
-                    # Tool lines the turn before left with no text to ride on
-                    # (it was interrupted mid-tool) are that turn's log, not
-                    # this one's: carried over, they went out as the new
-                    # answer's progress.txt (staging 2026-10-28).
-                    if progress_buf:
-                        logger.info(
-                            "%s TranscriptMirror: dropping %d progress line(s) of the turn "
-                            "before — no answer of theirs to attach to (#912)",
-                            log_ctx(thread_id=self.thread_id),
-                            len(progress_buf),
-                        )
-                        progress_buf.clear()
-                    self._turn_trigger = self._latest_trigger
-
-                # #539: record this event's activity BEFORE ticking, so the line
-                # reflects what we just read rather than the state before it —
-                # otherwise the tick that fires on a fresh tool event still
-                # renders the previous (stale) "nothing has moved" state.
-                # Tool traffic is the evidence a silent turn is alive: it keeps
-                # arriving here while nothing reaches Discord, which is exactly
-                # the gap being filled. Arming here (not only on user_input) also
-                # covers turns started outside Discord (scheduler / webhook / the
-                # tmux pane).
-                # #757: the ids tell a call that is still running (no result
-                # yet) from a turn that has genuinely gone quiet (``opened`` /
-                # ``closed`` were read above, where the lamp got them — #905).
-                is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
-                # #944: a slash command typed in the pane is not model work, and
-                # nothing but its output says it is over (no ``turn_duration``).
-                local_command = local_command_record(event)
-                if local_command == "output":
-                    await self._progress.end_turn()
-                    # #979: …nor does anything else, so a "turn" that was only
-                    # the command ends here. Left open, the next turn a
-                    # notification starts read as the person's.
-                    if not self._model_spoke:
-                        self._turn_open = False
-                elif local_command is None and (is_tool or opened or closed):
-                    self._progress.begin_turn()
-                    self._progress.note_activity(
-                        rendered.body
-                        if rendered is not None and rendered.kind == "tool_use"
-                        else None,
-                        started=opened,
-                        finished=closed,
-                    )
-                if rendered is not None and rendered.kind == "thinking":
-                    # #883: the pane's "●" sentence. It rewrites the ⚙️ line in
-                    # place (at its usual refresh interval) — never a post.
-                    self._progress.begin_turn()
-                    self._progress.note_thought(rendered.body)
-                await self._progress.tick()
-
-                if rendered is None:
-                    continue
-
-                if rendered.kind == "thinking":
-                    # #883 AC3: ~60 of these in 17 minutes — one message each
-                    # would bury the thread. Minimal mode keeps them in
-                    # progress.txt, in order with the tools; full mode, which
-                    # has no progress.txt, keeps them on the ⚙️ line only.
-                    if self._verbosity == "minimal":
-                        # Like a tool event: more work follows the held text,
-                        # so it was intermediate.
-                        await _flush_pending_silently()
-                        progress_buf.append(_format_body(rendered))
-                    continue
-
-                # #631 AC7: Claude's rate-limit refusal is written to the
-                # transcript as an ordinary assistant message, so the mirror used
-                # to post it verbatim — a bare English line with no explanation
-                # and no recovery time, six times over in the worst thread.  Fold
-                # it into one Japanese line carrying the reset time instead.
-                #
-                # Deliberately NOT held as _pending_text: the refusal is not an
-                # answer, and the CLI often retries past it (the turn then runs
-                # anyway, as it did in six of the eight threads on 2026-09-04).
-                # Letting it become the turn's final answer would ping the owner
-                # with it and, worse, take the place of the answer that follows.
-                # Any text already pending is left pending for the same reason:
-                # a refusal arriving behind it is no proof it was intermediate,
-                # and flushing it here would silently strip its ping.  The cost
-                # is that the notice can precede it in the thread, which is only
-                # an ordering wobble in a case the banner rarely takes (it is
-                # normally the turn's first assistant event).
-                if (
-                    rendered.kind == "assistant_text"
-                    and (failed := api_error_text(event)) is not None
-                ):
-                    # #908: Claude Code's synthetic API error. Not an answer —
-                    # never held as the turn's final text — and its advice
-                    # ("Double press esc…") is for someone at the terminal. One
-                    # line of what happened; the runner reports the turn as ❌
-                    # with what to do from Discord.
-                    logger.info(
-                        "TranscriptMirror: folded API error thread=%d: %s",
-                        self.thread_id,
-                        headline(failed)[:200],
-                    )
-                    await self._try_sink(f"-# ⚠️ {headline(failed)}")
-                    continue
-                if rendered.kind == "assistant_text":
-                    limit = banner_only(rendered.body)
-                    marked = is_rate_limit_event(event) and is_refusal_shaped(rendered.body)
-                    if limit is not None or marked:
-                        await self._report_usage_limit(limit, reported=_limit_reported)
-                        _limit_reported = True
-                        continue
-
-                if self._verbosity == "minimal":
-                    if rendered.kind in _BUFFERED_KINDS:
-                        # Tool event: if there's pending text, it was intermediate.
-                        await _flush_pending_silently()
-                        # #979: a command typed in the pane is not Claude's work;
-                        # buffered, it became the next answer's progress.txt.
-                        if local_command is None:
-                            progress_buf.append(_format_body(rendered))
-                    elif rendered.kind == "assistant_text":
-                        body = _format_body(rendered)
-                        # #399 AC3: the CLI flushes the prose preceding an
-                        # AskUserQuestion/plan menu only after the menu
-                        # resolves; if the pane-ask bridge already delivered
-                        # it as the menu's context message, re-posting it here
-                        # would duplicate it. Still record its uuid (#215) so
-                        # a restart does not re-post it as a missed final.
-                        bridged = bridged_context.take_match(self.thread_id, body, source="pane")
-                        if bridged is not None:
-                            await _flush_pending_silently()
-                            # #686: what the pane could deliver is the TUI
-                            # *rendering* — box-drawn tables, hard wraps, no
-                            # markdown — because while the menu was open the
-                            # jsonl held nothing to read. THIS is the readable
-                            # version of the same words, and dropping it left
-                            # the thread with only the unreadable one. Rewrite
-                            # the messages already posted instead; on any
-                            # failure they stay exactly as they are.
-                            replaced = False
-                            if bridged.messages:
-                                replaced = await replace_pane_context(bridged.messages, body)
-                            if replaced or not bridged.folded:
-                                # The pane bridge already delivered this text, so
-                                # it counts as delivered for cursor purposes
-                                # (#215).
-                                _delivered_uuid = event.get("uuid") or _delivered_uuid
-                                logger.info(
-                                    "TranscriptMirror: suppressed pane-bridged ask context "
-                                    "thread=%d (markdown replacement: %s)",
-                                    self.thread_id,
-                                    "applied" if replaced else "not applied",
-                                )
-                                # Commit immediately: the text IS delivered, and
-                                # a turn-end marker may never arrive — without
-                                # this a hard-killed bot would re-post it on
-                                # restart (#215).
-                                await _commit_cursor()
-                                continue
-                            # #686: what is in the thread is a FOLD — a pointer
-                            # saying the readable version is coming — and the
-                            # markdown would not fit into it. Suppressing here
-                            # would leave a pointer to nothing, so fall through
-                            # and post it. Not a #680 duplicate: the pointer
-                            # never held the prose.
-                            logger.info(
-                                "TranscriptMirror: pane-bridged ask context was folded and the "
-                                "markdown did not fit it — posting the markdown instead of "
-                                "suppressing it thread=%d (#686)",
+                # #1041: one row this loop cannot handle must not end it — the mirror is
+                # the thread's only delivery, and the thread used to go silent for good
+                # with nothing but an INFO line. The row is skipped, the next one is read.
+                try:
+                    # #769: anything Claude writes to its transcript — a tool call,
+                    # its result, a thinking block — proves the session is moving.
+                    # This is the stall lamp's only live feed: the runner-side
+                    # producers it used to hear from are gone (#723), and without
+                    # this every turn past 30s read ⚠️ however busy Claude was.
+                    # #905: and a call still waiting for its result is the session
+                    # working, however long it stays quiet.
+                    opened, closed = _tool_call_ids(event)
+                    turn_activity.note(self.thread_id, started=opened, finished=closed)
+                    # #908: whether this turn's latest reply is Claude Code's own
+                    # API-error message — the runner reads it when the turn ends.
+                    if (
+                        event.get("type") == "assistant"
+                        and not event.get("isSidechain")
+                        and not is_rate_limit_event(event)
+                    ):
+                        turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
+                    self._track_background_agents(event)
+                    if self._subagent_log is not None:
+                        # #1021: the sub-agent log is an extra; whatever goes wrong
+                        # in it must not end this loop, the thread's only delivery.
+                        try:
+                            self._subagent_log.observe_parent(event)
+                        except Exception:
+                            logger.exception(
+                                "TranscriptMirror: sub-agent log failed on a row thread=%d",
                                 self.thread_id,
                             )
-                        # Another text while one is pending → previous was intermediate.
-                        if _pending_text is not None:
-                            await _flush_pending_silently()
-                        _pending_text = body
-                        self._holding_final = True
-                        _pending_progress = list(progress_buf)
-                        _pending_uuid = event.get("uuid")
-                        _pending_trigger = self._turn_trigger
-                        progress_buf.clear()
-                    elif rendered.kind == "user_input":
-                        # #539: a new prompt both closes the previous turn's line
-                        # and arms the next one.
-                        await self._progress.end_turn()
-                        self._progress.begin_turn()
-                        await self._fold.reset()  # #747 (see turn_end)
-                        # Human turn: previous assistant turn is over → flush as reply.
-                        await _flush_pending_as_reply()
-                        await _commit_cursor()
-                        bridged_context.clear_thread(self.thread_id)  # #399 (see turn_end)
-                        await self._post(rendered)
-                    else:
-                        await _flush_pending_silently()
-                        await self._post(rendered)
-                else:
-                    await self._post(rendered)
 
-                # #233: after the branch above on purpose. Claude narrates
-                # ("下に貼ります") and *then* calls SendUserFile, so the prose
-                # held in _pending_text has to reach the thread first —
-                # otherwise the images land above the sentence introducing them.
-                await self._deliver_user_files(event)
+                    # #232: bridge an open AskUserQuestion menu regardless of
+                    # verbosity / turn-end / who triggered the turn.
+                    await self._maybe_bridge_ask(event)
+
+                    # #583: the first half of "whose turn ended?" — Claude read an
+                    # instruction. The runner's poll loop needs it to tell its own
+                    # turn's ending from that of the turn its prompt displaced.
+                    if _is_user_prompt(event):
+                        turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
+                        _limit_reported = False
+                        usage_limit_notices.clear_thread(self.thread_id)
+                        # #913: a notification only *starts* a turn between turns;
+                        # one that lands in a person's turn leaves it theirs.
+                        started_by = _prompt_kind(event)
+                        # #979: the harness's own rows of a command typed in the pane
+                        # (``<command-name>``, its output, the compaction summary)
+                        # are nobody's request.
+                        if started_by == "person" and is_harness_user_record(event):
+                            started_by = None
+                        if started_by == "person":
+                            self._turn_by_notification = False
+                        elif started_by == "notification" and not self._turn_open:
+                            self._turn_by_notification = True
+                            # #961: no runner will announce this turn's end.
+                            turn_events.note_self_turn_started(
+                                self.thread_id, at=_event_time(event)
+                            )
+                        if started_by is not None:
+                            self._turn_open = True
+                            self._model_spoke = False
+                    if event.get("type") == "assistant" and not event.get("isSidechain"):
+                        self._model_spoke = True
+
+                    if _is_turn_end(event):
+                        # #773: nobody is waiting on this mirror until the next turn.
+                        self._turn_active = False
+                        self._turn_open = False
+                        # #631: a limit reported for the turn that just ended says
+                        # nothing about the next one — the limit may well have reset
+                        # in between, and a thread that silently stops explaining why
+                        # it is stuck is the bug this came from.  c-lord's own notice
+                        # is scoped the same way: AC8 asks whether *this* turn has
+                        # already been told, and leaving the entry standing made the
+                        # next turn silent for the rest of the TTL (staging,
+                        # 2026-09-14: announced 12:53:16, wrongly suppressed 12:54:35).
+                        _limit_reported = False
+                        usage_limit_notices.clear_thread(self.thread_id)
+                        if self._verbosity == "minimal":
+                            # #539: the turn is over — take the progress line away
+                            # before the final answer lands so it never trails
+                            # below the answer.
+                            await self._progress.end_turn()
+                            # #747: a loop never spans a turn boundary.
+                            await self._fold.reset()
+                            # Turn boundary: flush pending as the final reply.
+                            await _flush_pending_as_reply()
+                            await _commit_cursor()
+                            # #399: disarm unconsumed pane-bridge entries — the
+                            # legitimate flush always precedes its turn end, so a
+                            # surviving entry could only swallow a future real
+                            # message.
+                            bridged_context.clear_thread(self.thread_id)
+                        # #583: the pane cannot see a turn boundary, so the runner's
+                        # poll loop learns it here — this is the only place in
+                        # c-lord that reads Claude's own turn-end marker. Marked
+                        # AFTER the flush above on purpose: the runner reacts by
+                        # ending the turn (and posting the 📊 context footer), and
+                        # that must never overtake the answer the footer belongs to.
+                        if not event.get("isSidechain"):
+                            # #917: after the answer is out, before the runner hears
+                            # of the end — see :func:`turn_events.note_turn_end`.
+                            turn_events.note_turn_end(
+                                self.thread_id,
+                                len(self._background_agents),
+                                self_started=self._turn_by_notification,
+                            )
+                            turn_end_bus.mark(self.thread_id, at=_event_time(event))
+                        continue
+
+                    rendered = render_event(event)
+
+                    # #682/#808: the other half of the ZWSP echo test. A menu answer
+                    # is typed with ``send_literal``, which leaves the marker off on
+                    # purpose (#172/#650), and CLI 2.1.278+ strips it from every
+                    # prompt (#808) — so the formatter cannot tell this event from
+                    # human pane input. But c-lord recorded what it typed, so ask.
+                    # Dropped exactly like a marked echo (no turn bookkeeping):
+                    # Discord already has the sentence the user wrote.
+                    if rendered is None:
+                        # A marker that survived (older CLI) already dropped the
+                        # echo; spend its record so it cannot later swallow the same
+                        # words typed by a person in the pane.
+                        _retire_marked_echo(self.thread_id, event)
+                    elif rendered.kind == "user_input" and pane_echo.consume_match(
+                        self.thread_id, rendered.body
+                    ):
+                        logger.info(
+                            "TranscriptMirror: suppressed c-lord pane echo (no ZWSP) thread=%d",
+                            self.thread_id,
+                        )
+                        rendered = None
+                    elif rendered.kind == "user_input" and (
+                        cut := pane_echo.consume_partial(self.thread_id, rendered.body)
+                    ):
+                        # #872: Claude got only part of a message c-lord typed. The
+                        # line still goes out (it is what Claude is working from),
+                        # but the log has to say a message was cut.
+                        logger.warning(
+                            "%s TranscriptMirror: Claude received only %d of the %d characters "
+                            "c-lord typed for this message — the rest never reached it (#872)",
+                            log_ctx(thread_id=self.thread_id),
+                            cut[1],
+                            cut[0],
+                        )
+
+                    # #912: Claude has read a new instruction — a prompt, not a
+                    # bash-mode line (those are user strings too, rendered as tool
+                    # activity). A text still held is the end of the turn before:
+                    # deliver it now, as that turn's answer, before this turn can
+                    # claim it. (A c-lord prompt is never rendered, so the
+                    # user_input branch below would not get the chance.)
+                    # Only a person's prompt: a notification landing mid-turn does
+                    # not end the turn (#913), and flushing there would post a
+                    # mid-turn text as the answer.
+                    if (
+                        _is_user_prompt(event)
+                        and _prompt_kind(event) == "person"
+                        and (rendered is None or rendered.kind == "user_input")
+                    ):
+                        if self._verbosity == "minimal" and _pending_text is not None:
+                            await _flush_pending_as_reply()
+                            await _commit_cursor()
+                        # Tool lines the turn before left with no text to ride on
+                        # (it was interrupted mid-tool) are that turn's log, not
+                        # this one's: carried over, they went out as the new
+                        # answer's progress.txt (staging 2026-10-28).
+                        if progress_buf:
+                            logger.info(
+                                "%s TranscriptMirror: dropping %d progress line(s) of the turn "
+                                "before — no answer of theirs to attach to (#912)",
+                                log_ctx(thread_id=self.thread_id),
+                                len(progress_buf),
+                            )
+                            progress_buf.clear()
+                        self._turn_trigger = self._latest_trigger
+
+                    # #539: record this event's activity BEFORE ticking, so the line
+                    # reflects what we just read rather than the state before it —
+                    # otherwise the tick that fires on a fresh tool event still
+                    # renders the previous (stale) "nothing has moved" state.
+                    # Tool traffic is the evidence a silent turn is alive: it keeps
+                    # arriving here while nothing reaches Discord, which is exactly
+                    # the gap being filled. Arming here (not only on user_input) also
+                    # covers turns started outside Discord (scheduler / webhook / the
+                    # tmux pane).
+                    # #757: the ids tell a call that is still running (no result
+                    # yet) from a turn that has genuinely gone quiet (``opened`` /
+                    # ``closed`` were read above, where the lamp got them — #905).
+                    is_tool = rendered is not None and rendered.kind in _BUFFERED_KINDS
+                    # #944: a slash command typed in the pane is not model work, and
+                    # nothing but its output says it is over (no ``turn_duration``).
+                    local_command = local_command_record(event)
+                    if local_command == "output":
+                        await self._progress.end_turn()
+                        # #979: …nor does anything else, so a "turn" that was only
+                        # the command ends here. Left open, the next turn a
+                        # notification starts read as the person's.
+                        if not self._model_spoke:
+                            self._turn_open = False
+                    elif local_command is None and (is_tool or opened or closed):
+                        self._progress.begin_turn()
+                        self._progress.note_activity(
+                            rendered.body
+                            if rendered is not None and rendered.kind == "tool_use"
+                            else None,
+                            started=opened,
+                            finished=closed,
+                        )
+                    if rendered is not None and rendered.kind == "thinking":
+                        # #883: the pane's "●" sentence. It rewrites the ⚙️ line in
+                        # place (at its usual refresh interval) — never a post.
+                        self._progress.begin_turn()
+                        self._progress.note_thought(rendered.body)
+                    await self._progress.tick()
+
+                    if rendered is None:
+                        continue
+
+                    if rendered.kind == "thinking":
+                        # #883 AC3: ~60 of these in 17 minutes — one message each
+                        # would bury the thread. Minimal mode keeps them in
+                        # progress.txt, in order with the tools; full mode, which
+                        # has no progress.txt, keeps them on the ⚙️ line only.
+                        if self._verbosity == "minimal":
+                            # Like a tool event: more work follows the held text,
+                            # so it was intermediate.
+                            await _flush_pending_silently()
+                            progress_buf.append(_format_body(rendered))
+                        continue
+
+                    # #631 AC7: Claude's rate-limit refusal is written to the
+                    # transcript as an ordinary assistant message, so the mirror used
+                    # to post it verbatim — a bare English line with no explanation
+                    # and no recovery time, six times over in the worst thread.  Fold
+                    # it into one Japanese line carrying the reset time instead.
+                    #
+                    # Deliberately NOT held as _pending_text: the refusal is not an
+                    # answer, and the CLI often retries past it (the turn then runs
+                    # anyway, as it did in six of the eight threads on 2026-09-04).
+                    # Letting it become the turn's final answer would ping the owner
+                    # with it and, worse, take the place of the answer that follows.
+                    # Any text already pending is left pending for the same reason:
+                    # a refusal arriving behind it is no proof it was intermediate,
+                    # and flushing it here would silently strip its ping.  The cost
+                    # is that the notice can precede it in the thread, which is only
+                    # an ordering wobble in a case the banner rarely takes (it is
+                    # normally the turn's first assistant event).
+                    if (
+                        rendered.kind == "assistant_text"
+                        and (failed := api_error_text(event)) is not None
+                    ):
+                        # #908: Claude Code's synthetic API error. Not an answer —
+                        # never held as the turn's final text — and its advice
+                        # ("Double press esc…") is for someone at the terminal. One
+                        # line of what happened; the runner reports the turn as ❌
+                        # with what to do from Discord.
+                        logger.info(
+                            "TranscriptMirror: folded API error thread=%d: %s",
+                            self.thread_id,
+                            headline(failed)[:200],
+                        )
+                        await self._try_sink(f"-# ⚠️ {headline(failed)}")
+                        continue
+                    if rendered.kind == "assistant_text":
+                        limit = banner_only(rendered.body)
+                        marked = is_rate_limit_event(event) and is_refusal_shaped(rendered.body)
+                        if limit is not None or marked:
+                            await self._report_usage_limit(limit, reported=_limit_reported)
+                            _limit_reported = True
+                            continue
+
+                    if self._verbosity == "minimal":
+                        if rendered.kind in _BUFFERED_KINDS:
+                            # Tool event: if there's pending text, it was intermediate.
+                            await _flush_pending_silently()
+                            # #979: a command typed in the pane is not Claude's work;
+                            # buffered, it became the next answer's progress.txt.
+                            if local_command is None:
+                                progress_buf.append(_format_body(rendered))
+                        elif rendered.kind == "assistant_text":
+                            body = _format_body(rendered)
+                            # #399 AC3: the CLI flushes the prose preceding an
+                            # AskUserQuestion/plan menu only after the menu
+                            # resolves; if the pane-ask bridge already delivered
+                            # it as the menu's context message, re-posting it here
+                            # would duplicate it. Still record its uuid (#215) so
+                            # a restart does not re-post it as a missed final.
+                            bridged = bridged_context.take_match(
+                                self.thread_id, body, source="pane"
+                            )
+                            if bridged is not None:
+                                await _flush_pending_silently()
+                                # #686: what the pane could deliver is the TUI
+                                # *rendering* — box-drawn tables, hard wraps, no
+                                # markdown — because while the menu was open the
+                                # jsonl held nothing to read. THIS is the readable
+                                # version of the same words, and dropping it left
+                                # the thread with only the unreadable one. Rewrite
+                                # the messages already posted instead; on any
+                                # failure they stay exactly as they are.
+                                replaced = False
+                                if bridged.messages:
+                                    replaced = await replace_pane_context(bridged.messages, body)
+                                if replaced or not bridged.folded:
+                                    # The pane bridge already delivered this text, so
+                                    # it counts as delivered for cursor purposes
+                                    # (#215).
+                                    _delivered_uuid = event.get("uuid") or _delivered_uuid
+                                    logger.info(
+                                        "TranscriptMirror: suppressed pane-bridged ask context "
+                                        "thread=%d (markdown replacement: %s)",
+                                        self.thread_id,
+                                        "applied" if replaced else "not applied",
+                                    )
+                                    # Commit immediately: the text IS delivered, and
+                                    # a turn-end marker may never arrive — without
+                                    # this a hard-killed bot would re-post it on
+                                    # restart (#215).
+                                    await _commit_cursor()
+                                    continue
+                                # #686: what is in the thread is a FOLD — a pointer
+                                # saying the readable version is coming — and the
+                                # markdown would not fit into it. Suppressing here
+                                # would leave a pointer to nothing, so fall through
+                                # and post it. Not a #680 duplicate: the pointer
+                                # never held the prose.
+                                logger.info(
+                                    "TranscriptMirror: pane-bridged ask context was folded and the "
+                                    "markdown did not fit it — posting the markdown instead of "
+                                    "suppressing it thread=%d (#686)",
+                                    self.thread_id,
+                                )
+                            # Another text while one is pending → previous was intermediate.
+                            if _pending_text is not None:
+                                await _flush_pending_silently()
+                            _pending_text = body
+                            self._holding_final = True
+                            _pending_progress = list(progress_buf)
+                            _pending_uuid = event.get("uuid")
+                            _pending_trigger = self._turn_trigger
+                            progress_buf.clear()
+                        elif rendered.kind == "user_input":
+                            # #539: a new prompt both closes the previous turn's line
+                            # and arms the next one.
+                            await self._progress.end_turn()
+                            self._progress.begin_turn()
+                            await self._fold.reset()  # #747 (see turn_end)
+                            # Human turn: previous assistant turn is over → flush as reply.
+                            await _flush_pending_as_reply()
+                            await _commit_cursor()
+                            bridged_context.clear_thread(self.thread_id)  # #399 (see turn_end)
+                            await self._post(rendered)
+                        else:
+                            await _flush_pending_silently()
+                            await self._post(rendered)
+                    else:
+                        await self._post(rendered)
+
+                    # #233: after the branch above on purpose. Claude narrates
+                    # ("下に貼ります") and *then* calls SendUserFile, so the prose
+                    # held in _pending_text has to reach the thread first —
+                    # otherwise the images land above the sentence introducing them.
+                    await self._deliver_user_files(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "TranscriptMirror: could not handle a row — skipped it thread=%d type=%s",
+                        self.thread_id,
+                        event.get("type") if isinstance(event, dict) else type(event).__name__,
+                    )
 
         except asyncio.CancelledError:
             pass

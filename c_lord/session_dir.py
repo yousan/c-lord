@@ -166,10 +166,18 @@ class WorktreeStatus:
     #: ``git ls-remote`` failed or timed out, so pushed branches without a
     #: tracking ref could not be told apart from unpushed ones (#903).
     remote_unchecked: bool = False
+    #: Entries in ``git stash list`` (#1045). Any is work; counted apart from
+    #: unpushed commits so the reason says "stash", not "unpushed commit".
+    stash_entries: int = 0
 
     @property
     def clean(self) -> bool:
-        return self.is_repo and not self.user_changes and self.unpushed_commits == 0
+        return (
+            self.is_repo
+            and not self.user_changes
+            and self.unpushed_commits == 0
+            and self.stash_entries == 0
+        )
 
 
 def _is_clord_change(xy: str, rel: str) -> bool:
@@ -279,7 +287,11 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
 
 
 def _start_refs(path: str) -> dict[str, str]:
-    """HEAD, every local branch and the stash, as ref → commit."""
+    """HEAD and every local branch, as ref → commit.
+
+    Not the stash: its entries are counted on their own (:func:`_stash_entries`,
+    #1045) — a stash commit is no "unpushed commit" a user could push.
+    """
     tips: dict[str, str] = {}
     branches = _run(
         ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], cwd=path
@@ -288,13 +300,25 @@ def _start_refs(path: str) -> dict[str, str]:
         sha, _, ref = line.partition(" ")
         if ref:
             tips[ref] = sha
-    # Named one by one, not ``--glob=refs/stash`` (which means ``refs/stash/*``),
-    # and only when present: an unborn HEAD or no stash would fail rev-list.
-    for ref in ("HEAD", "refs/stash"):
-        found = _run(["git", "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"], cwd=path)
-        if found.returncode == 0:
-            tips[ref] = found.stdout.strip()
+    # Only when present: an unborn HEAD would fail rev-list.
+    found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
+    if found.returncode == 0:
+        tips["HEAD"] = found.stdout.strip()
     return tips
+
+
+def _stash_entries(path: str) -> int | None:
+    """How many entries ``git stash list`` has (#1045). ``None``: git failed."""
+    found = _run(["git", "rev-parse", "-q", "--verify", "refs/stash"], cwd=path)
+    if found.returncode != 0:
+        return 0  # no stash at all
+    result = _run(["git", "rev-list", "--walk-reflogs", "--count", "refs/stash"], cwd=path)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
+        return None
 
 
 def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
@@ -336,9 +360,9 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
 def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
-    Counts from HEAD (a detached commit is on no branch), every local branch,
-    and the stash. A repository with no remote at all counts every commit —
-    there is nowhere else they exist.
+    Counts from HEAD (a detached commit is on no branch) and every local
+    branch; the stash is counted apart (#1045). A repository with no remote at
+    all counts every commit — there is nowhere else they exist.
 
     With *ask_remote*, a commit at or below a branch head on a remote counts
     as pushed even without a local tracking ref (``git ls-remote``). Only exact
@@ -412,15 +436,51 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
             continue
         else:
             user.append(line)
+    stash = _stash_entries(path)
     # The network is asked only when nothing else keeps the dir (#903).
-    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user)
+    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user and stash == 0)
     return WorktreeStatus(
         is_repo=True,
         user_changes=tuple(user),
         clord_files=tuple(clord),
         unpushed_commits=unpushed,
         remote_unchecked=unchecked,
+        # unknown is work too: never call a dir clean we could not read
+        stash_entries=1 if stash is None else stash,
     )
+
+
+#: How many changed paths a "keeping" log line names before it abbreviates.
+_MAX_LOGGED_CHANGES = 5
+
+
+def describe_changes(status: WorktreeStatus) -> str:
+    """Why a directory is being kept, for the INFO line (#749, #903).
+
+    Names the entries, because "uncommitted work" alone read as 80 dirs of user
+    work when 60 of them held nothing but c-lord's own SKILL.md. Ignored files
+    show as ``!! name``; commits on no remote branch as a count.
+    """
+    if not status.is_repo:
+        return "not a git repo (cannot tell work from leftovers)"
+    reasons: list[str] = []
+    if status.unpushed_commits is None:
+        reasons.append("unpushed commits unknown (git rev-list failed)")
+    elif status.unpushed_commits:
+        reason = f"{status.unpushed_commits} unpushed commit(s) on no remote branch"
+        if status.remote_unchecked:
+            reason += " (ls-remote failed; pushed branches could not be checked)"
+        reasons.append(reason)
+    if status.stash_entries:
+        n = status.stash_entries
+        reasons.append(f"{n} stash {'entry' if n == 1 else 'entries'}")
+    if status.user_changes:
+        shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
+        more = len(status.user_changes) - _MAX_LOGGED_CHANGES
+        if more > 0:
+            shown += f" (+{more} more)"
+        reasons.append(f"uncommitted user work: {shown}")
+    return "; ".join(reasons)
 
 
 def _is_clean(path: str) -> bool:
@@ -469,6 +529,8 @@ class SessionDirInfo:
     source_repo: str
     commit: str
     is_clean: bool
+    #: why it is not clean — :func:`describe_changes` of the same snapshot (#1016)
+    kept_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -479,6 +541,8 @@ class CleanupResult:
     thread_id: int | None
     removed: bool
     reason: str
+    #: kept because it holds work (#903) — *reason* says which (#1016).
+    kept_work: bool = False
 
 
 class SessionDirManager:
@@ -639,7 +703,8 @@ class SessionDirManager:
             path = str(entry)
             thread_id = int(entry.name)
             commit = _get_commit(path)
-            clean = _is_clean(path)
+            status = worktree_status(path)
+            clean = status.clean
 
             results.append(
                 SessionDirInfo(
@@ -648,6 +713,7 @@ class SessionDirManager:
                     source_repo=self._source_repo,
                     commit=commit,
                     is_clean=clean,
+                    kept_reason="" if clean else describe_changes(status),
                 )
             )
 
@@ -696,17 +762,16 @@ class SessionDirManager:
 
     def _try_remove(self, path: str, thread_id: int | None) -> CleanupResult:
         """Check cleanliness and remove the directory if safe."""
-        if not _is_clean(path):
-            logger.warning(
-                "Skipping session dir removal (dirty): %s (thread_id=%s)",
-                path,
-                thread_id,
-            )
+        status = worktree_status(path)
+        if not status.clean:
+            # #1016: say what the work is — an unpushed commit or a ``.env``
+            # shows nothing in ``git status``, so "uncommitted changes" misled.
+            # The same snapshot decides and explains: a second ``git status``
+            # could disagree (an ``ls-remote`` that failed, then answered).
+            why = describe_changes(status)
+            logger.info("Keeping session dir %s (thread_id=%s) — %s (#1016)", path, thread_id, why)
             return CleanupResult(
-                path=path,
-                thread_id=thread_id,
-                removed=False,
-                reason="session directory has uncommitted changes — skipped to prevent data loss",
+                path=path, thread_id=thread_id, removed=False, reason=why, kept_work=True
             )
 
         try:
