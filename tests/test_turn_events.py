@@ -275,6 +275,112 @@ class TestBackgroundAgents:
         assert len(_lines(log)) == 1
 
 
+class TestSelfResumedTurns:
+    """#961: a turn Claude started by itself on a ``<task-notification>`` has no
+    runner, so the transcript's turn end is the only place its end is known."""
+
+    async def test_its_end_is_a_completion_started_by_self(self, log):
+        first = turn_events.begin_turn(_thread(), StartedBy("webhook", "7", "Captain Hook"))
+        turn_events.note_turn_end(THREAD_ID, 0)
+        turn_events.end_turn(first)
+        turn_events.finish_turn(first)
+        reply_tracker.record_reply_message(THREAD_ID, _reply(6001))
+        await turn_events.drain()
+
+        turn_events.note_self_turn_started(THREAD_ID)
+        reply_tracker.record_reply_message(THREAD_ID, _reply(6002))
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        await turn_events.drain()
+
+        runner, own = _lines(log)
+        assert runner["started_by"]["type"] == "webhook"
+        assert own["kind"] == "completion"
+        assert own["reason"] == "self_resumed_turn"
+        assert own["started_by"] == {"type": "self", "id": None, "name": None}
+        assert (own["guild_id"], own["channel_id"]) == ("555", "777")
+        assert own["last_message_id"] == "6002"
+
+    async def test_a_runner_turn_still_open_announces_instead(self, log):
+        """A person's message landed: the runner owns the end — no second line."""
+        info = turn_events.begin_turn(_thread(), StartedBy("user", "1"))
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        turn_events.end_turn(info)
+        turn_events.finish_turn(info)
+        await turn_events.drain()
+
+        (event,) = _lines(log)
+        assert event["started_by"]["type"] == "user"
+        assert "reason" not in event
+
+    async def test_a_person_turn_end_is_not_announced_twice(self, log):
+        info = turn_events.begin_turn(_thread(), StartedBy("user", "1"))
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=False)
+        turn_events.end_turn(info)
+        turn_events.finish_turn(info)
+        await turn_events.drain()
+
+        assert [e["started_by"]["type"] for e in _lines(log)] == ["user"]
+
+    async def test_a_held_completion_is_released_instead_of_a_second_line(self, log):
+        """Background agents: the agent's report starts the turn — the held
+        completion of the runner turn is that turn's end, not a new one."""
+        info = turn_events.begin_turn(_thread(), StartedBy("webhook", "7", "Captain Hook"))
+        turn_events.note_turn_end(THREAD_ID, 1)
+        turn_events.end_turn(info)
+        turn_events.finish_turn(info)
+
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        await turn_events.drain()
+
+        (event,) = _lines(log)
+        assert event["started_by"]["type"] == "webhook"
+        assert "reason" not in event
+
+    async def test_agents_still_out_keep_the_held_one_and_add_nothing(self, log):
+        info = turn_events.begin_turn(_thread(), StartedBy("webhook", "7", "Captain Hook"))
+        turn_events.note_turn_end(THREAD_ID, 2)
+        turn_events.end_turn(info)
+        turn_events.finish_turn(info)
+
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 1, self_started=True)
+        await turn_events.drain()
+        assert _lines(log) == []
+
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        await turn_events.drain()
+        assert [e["started_by"]["type"] for e in _lines(log)] == ["webhook"]
+
+    async def test_a_self_turn_that_launches_agents_waits_for_them(self, log):
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 1, self_started=True)
+        await turn_events.drain()
+        assert _lines(log) == []
+
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        await turn_events.drain()
+
+        (event,) = _lines(log)
+        assert event["started_by"]["type"] == "self"
+        assert event["reason"] == "self_resumed_turn"
+
+    async def test_without_a_known_start_nothing_is_made_up(self, log):
+        """A self turn begun before a restart: no baseline, so no line (limit)."""
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        await turn_events.drain()
+        assert _lines(log) == []
+
+    async def test_nothing_happens_without_an_outlet(self, tmp_path):
+        turn_events.note_self_turn_started(THREAD_ID)
+        turn_events.note_turn_end(THREAD_ID, 0, self_started=True)
+        await turn_events.drain()
+        assert list(tmp_path.iterdir()) == []
+
+
 class TestHttp:
     SECRET = "s3cret"
 
