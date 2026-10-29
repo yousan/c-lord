@@ -28,6 +28,8 @@ def _repo(path: Path, *, dirty: bool = False) -> None:
     (path / "a.txt").write_text("x", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True)
+    # #903: the commit is on origin, as in a real clone — else it is unpushed work.
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=path, check=True)
     if dirty:
         (path / "uncommitted.txt").write_text("work in progress", encoding="utf-8")
 

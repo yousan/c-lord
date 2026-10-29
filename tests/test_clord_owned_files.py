@@ -54,6 +54,8 @@ def _clone(path: Path) -> Path:
     _git(path, "init", "-q")
     _git(path, "add", "-A")
     _git(path, "commit", "-qm", "init")
+    # #903: the commit is on origin, as in a real clone — else it is unpushed work.
+    _git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
     return path
 
 
@@ -159,6 +161,7 @@ def test_a_tracked_skill_overwritten_by_the_injector_is_clean(tmp_path: Path) ->
     _inject_before_779(ws, env_path="/old/.env")
     _git(ws, "add", "-A")
     _git(ws, "commit", "-qm", "oops: injected skill got committed")
+    _git(ws, "update-ref", "refs/remotes/origin/main", "HEAD")  # pushed, as in c-lord's repo
     inject_read_skill(ws, env_path="/new/.env")
 
     assert _is_clean(str(ws)) is True

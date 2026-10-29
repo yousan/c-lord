@@ -30,6 +30,8 @@ def _repo(path: Path) -> Path:
     (path / "a.txt").write_text("x", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True)
+    # #903: the commit is on origin, so only the location decides here.
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=path, check=True)
     return path
 
 
