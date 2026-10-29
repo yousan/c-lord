@@ -165,6 +165,18 @@ class TestTheStopRetiresEveryLiveCard:
         assert ask_bus.closed_reason(THREAD) == "stopped"
         repo.delete.assert_awaited_once_with(THREAD)
 
+    async def test_no_live_card_keeps_the_last_close_reason(self) -> None:
+        from c_lord.discord_ui.ask_handler import retire_menus_for_stop
+
+        ask_bus.note_closed(THREAD, "answered")
+        await retire_menus_for_stop(THREAD)
+        assert ask_bus.closed_reason(THREAD) == "answered"
+
+    def test_a_late_click_is_told_the_card_was_stopped(self) -> None:
+        from c_lord.discord_ui.ask_view import _CLOSE_REASON_TEXT
+
+        assert "停止" in _CLOSE_REASON_TEXT["stopped"]
+
     async def test_the_workspace_stop_retires_cards_before_the_archive(self) -> None:
         from unittest.mock import patch
 

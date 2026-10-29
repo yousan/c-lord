@@ -55,7 +55,6 @@ from .ask_bus import (
 )
 from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
-from .ask_menus import disable_stale_copies
 from .ask_view import AskView
 from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
@@ -190,8 +189,17 @@ async def retire_menus_for_stop(
     thread that is about to be archived. Never raises.
     """
     try:
-        await _close(thread_id, CLOSE_STOPPED, None, ask_repo)
-        await disable_stale_copies(thread_id, None, STOPPED_NOTE)
+        live = _ask_menus.pop_others(thread_id, None)
+        if live or _ask_bus.is_active(thread_id):
+            # Only then: the reason is what a late click on *this* card reads,
+            # and a thread with no card keeps the reason its last one closed for.
+            _ask_bus.note_closed(thread_id, CLOSE_STOPPED)
+        if ask_repo is not None:
+            with contextlib.suppress(Exception):
+                await ask_repo.delete(thread_id)
+        for message in live:
+            with contextlib.suppress(*DISCORD_CALL_FAILURES):
+                await message.edit(content=STOPPED_NOTE, embed=None, view=None)
     except Exception:
         logger.warning(
             "%s could not retire the cards of a stopped workspace (#977)",
