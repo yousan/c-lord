@@ -27,12 +27,12 @@
 |---|---|---|
 | c-lord 自身が送った入力のエコー（Discord の発言・スレッド最初の発言） | **捨てる**（Discord には既に原文がある）。ZWSP 印の有無に関わらない | #71 / #808 / #861 |
 | **開いている質問への文章回答のエコー（ZWSP 印なし）** | **捨てる**（同上。印が無くても c-lord 由来） | #682 |
-| `<bash-input>` / `<bash-stdout>` / `<bash-stderr>` — ペインの `!` コマンド | **ツール活動**として扱う（progress.txt に畳む） | #487 |
+| `<bash-input>` / `<bash-stdout>` / `<bash-stderr>` — ペインの `!` コマンド | **捨てる**（👤 にも progress.txt にも出さず、`<bash-input>` でターンを開かない。`<bash-stdout>` はコマンドの「ターン」を閉じる合図にだけ使う）。`CLORD_MIRROR_VERBOSITY=full` のときだけはツール活動として流す | #487 / #1013 |
 | `<task-notification>` — バックグラウンドタスクの完了・停止通知 | **ツール活動**として扱う（progress.txt に畳む） | #380 |
 | **compact の継続プロンプト** — 文脈圧縮の後にハーネスがセッションに撃ち込む要約 | **「🗜️ コンテキストを圧縮しました」の1行**に置き換え、minimal モードでもスレッドに出す | #628 / #914 |
-| `<command-name>` / `<command-message>` / `<command-args>` — ペインで打った `/compact` などの記録 | **ツール活動**として扱う（`🔧 /compact`） | #628 |
+| `<command-name>` / `<command-message>` / `<command-args>` — ペインで打った `/compact` などの記録 | **捨てる**（progress.txt に入れず、人の依頼と数えずターンを開かない）。`CLORD_MIRROR_VERBOSITY=full` のときだけはツール活動 `🔧 /compact` として流す | #628 / #979 |
 | `<command-message>` で**始まる**記録 — スキルの起動（`/skill`、ペインで打った `/copywriting …`） | 打った形の **`/名前 引数`** に戻し、c-lord が打ったもの（控えと一致）は**捨てる**。人がペインで打ったものは `👤 /名前 引数` で流す（生のタグは出さない） | #834 |
-| `<local-command-stdout>` — そのスラッシュコマンドの出力 | **ツール活動**として扱う（ANSI を剥がす。空なら捨てる） | #628 |
+| `<local-command-stdout>` — そのスラッシュコマンドの出力 | **捨てる**（progress.txt に入れない）。コマンドの「ターン」を閉じる合図にだけ使う。`CLORD_MIRROR_VERBOSITY=full` のときだけはツール活動として流す（ANSI を剥がす。空なら出さない） | #628 / #979 |
 
 ### Claude の進み具合の文章（`thinking` ブロック、#883）
 
