@@ -385,3 +385,71 @@ class TestHostWidePaneReaders:
             assert running_thread_ids([222]) == {222}
 
         assert captured == ["%6"]
+
+
+class TestPaneTurnStates:
+    """#1034: 読めなかったペインを「走っていない」と区別して返す。"""
+
+    def test_a_failed_capture_is_unreadable_not_idle(self) -> None:
+        from c_lord.tmux import pane_turn_states
+
+        def run(argv: list[str]) -> MagicMock:
+            if "list-panes" in argv:
+                return _ok("111\tclaude\t%5\n222\tclaude\t%6\n")
+            if argv[argv.index("-t") + 1] == "%5":
+                return MagicMock(returncode=124, stdout="", stderr="timed out")
+            return _ok("")
+
+        with (
+            patch("c_lord.tmux._tmux_available", return_value=True),
+            patch("c_lord.tmux._run", side_effect=run),
+            patch("c_lord.tmux.pane_shows_running", return_value=False),
+        ):
+            states = pane_turn_states([111, 222])
+
+        assert states.running == frozenset()
+        assert states.unreadable == frozenset({111})
+
+    def test_a_failed_listing_makes_every_candidate_unreadable(self) -> None:
+        from c_lord.tmux import pane_turn_states
+
+        with (
+            patch("c_lord.tmux._tmux_available", return_value=True),
+            patch(
+                "c_lord.tmux._run",
+                return_value=MagicMock(returncode=124, stdout="", stderr="timed out"),
+            ),
+        ):
+            states = pane_turn_states([111, 222])
+
+        assert states.unreadable == frozenset({111, 222})
+
+    def test_no_server_is_an_answer_not_unreadable(self) -> None:
+        """サーバが無い = 誰も走っていない。読めなかったのではない (#807 と同じ)。"""
+        from c_lord.tmux import pane_turn_states
+
+        with (
+            patch("c_lord.tmux._tmux_available", return_value=True),
+            patch(
+                "c_lord.tmux._run",
+                return_value=MagicMock(returncode=1, stdout="", stderr="no server running on x"),
+            ),
+        ):
+            states = pane_turn_states([111])
+
+        assert states.running == frozenset()
+        assert states.unreadable == frozenset()
+
+    def test_running_thread_ids_keeps_its_answer(self) -> None:
+        """既存の呼び出し口は「確かに走っているもの」だけを返し続ける。"""
+
+        def run(argv: list[str]) -> MagicMock:
+            if "list-panes" in argv:
+                return _ok("111\tclaude\t%5\n")
+            return MagicMock(returncode=124, stdout="", stderr="timed out")
+
+        with (
+            patch("c_lord.tmux._tmux_available", return_value=True),
+            patch("c_lord.tmux._run", side_effect=run),
+        ):
+            assert running_thread_ids([111]) == set()
