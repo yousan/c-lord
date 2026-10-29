@@ -3799,10 +3799,8 @@ class TmuxSessionManager:
                 continue
 
             if not tid_str.isdigit():
-                if (
-                    self._is_reapable_untagged(window, target)
-                    and self._tag_unchanged(target, tid_str)
-                    and self._kill_window(target)
+                if self._is_reapable_untagged(window, target) and self._kill_if_still_tagged(
+                    target, tid_str
                 ):
                     self._log_reaped(window=window, reason="no @thread_id, idle c-lord window")
                     killed += 1
@@ -3821,12 +3819,10 @@ class TmuxSessionManager:
                     thread_id,
                 )
                 continue
-            if target and not self._tag_unchanged(target, tid_str):
-                continue
             # Kill the window just probed, not ``kill_session``'s pick: with two
             # windows carrying one tag (#501/#649) that is the mapped one, which
             # may be the busy twin the probe above kept.
-            if target and self._kill_window(target):
+            if target and self._kill_if_still_tagged(target, tid_str):
                 if self._thread_to_window.get(thread_id) in (target, window.get("window_name")):
                     self._thread_to_window.pop(thread_id, None)
                     self._save_mapping()
@@ -3837,6 +3833,47 @@ class TmuxSessionManager:
                 killed += 1
 
         return killed
+
+    def _kill_if_still_tagged(self, target: str, listed: str) -> bool:
+        """Kill *target* only if it still carries the ``@thread_id`` the listing showed.
+
+        Returns whether the window is gone. tmux compares and kills in **one**
+        server command (``if-shell -F``), so ``/attach`` (``remap_window``) or
+        ``create_session``'s adoption either lands before it — the tag differs
+        and the window stays — or after it, on a window that no longer exists,
+        and says so. #1060 re-read the tag and then killed in a second command;
+        a re-tag between the two still lost the window ``/attach`` had just
+        reported attached (#1085).
+
+        ``if-shell`` exits 0 whether or not it ran the kill (and for a missing
+        window), so "gone" is read back from the window list.
+        """
+        if not _WINDOW_ID_RE.match(target) or not re.fullmatch(r"\d*", listed):
+            # A name target (rows from before #649) or a tag tmux's format
+            # language could misread: the two-step check is the best we have.
+            return self._tag_unchanged(target, listed) and self._kill_window(target)
+        _run(
+            [
+                "tmux",
+                "if-shell",
+                "-F",
+                "-t",
+                target,
+                f"#{{==:#{{@thread_id}},{listed}}}",
+                f"kill-window -t {target}",
+            ]
+        )
+        alive = _run(["tmux", "list-windows", "-a", "-F", "#{window_id}"])
+        if alive.returncode != 0:
+            return False  # cannot tell — do not count or forget a window we may not have killed
+        if target not in alive.stdout.split():
+            return True
+        logger.info(
+            "cleanup_orphaned: %s was re-tagged since the listing (was %r) — keeping",
+            self._describe(target),
+            listed,
+        )
+        return False
 
     def _tag_unchanged(self, target: str, listed: str) -> bool:
         """Does ``target`` still carry the ``@thread_id`` the listing showed? (#1060)

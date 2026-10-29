@@ -13,10 +13,16 @@ called, and had two structural gaps that made it unsafe to simply wire up:
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
+import subprocess
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import c_lord.tmux as tmux_mod
 from c_lord.tmux import TmuxSessionManager
 
 
@@ -67,6 +73,23 @@ class FakeTmux:
     def __call__(self, argv: list[str], **kwargs: object) -> MagicMock:
         if "list-sessions" in argv:
             return MagicMock(returncode=0, stdout="\n".join(self.sessions) + "\n")
+
+        if "list-windows" in argv and "-a" in argv:
+            # #1085: "is it gone?" after a conditional kill — every live window id.
+            alive = [i for i, k in self._ids.items() if k not in self.killed]
+            return MagicMock(returncode=0, stdout="".join(f"{i}\n" for i in alive))
+
+        if "if-shell" in argv:
+            # #1085: ``if-shell -F -t T '#{==:#{@thread_id},X}' 'kill-window -t T'`` —
+            # tmux compares and kills in one server command.
+            target = argv[argv.index("-t") + 1]
+            cond, command = argv[-2], argv[-1]
+            m = re.fullmatch(r"#\{==:#\{@thread_id\},(.*)\}", cond)
+            assert m is not None, cond
+            if self.thread_ids.get(self._key(target), "") == m.group(1):
+                assert command == f"kill-window -t {target}", command
+                self.killed.append(self._key(target))
+            return MagicMock(returncode=0, stdout="")
 
         if "list-windows" in argv:
             session = argv[argv.index("-t") + 1]
@@ -779,3 +802,121 @@ class TestReaperRereadsTheTagBeforeKilling:
 
         assert fake.killed == []
         assert killed == 0
+
+
+class _RetagRightBeforeKill(FakeTmux):
+    """``/attach`` lands after every probe, just before the kill is sent (#1085)."""
+
+    def __call__(self, argv: list[str], **kwargs: object) -> MagicMock:
+        if "if-shell" in argv or ("kill-window" in argv and "if-shell" not in argv):
+            self.thread_ids["clord:w1"] = "222"
+        return super().__call__(argv, **kwargs)
+
+
+class TestReaperComparesAndKillsInOneCommand:
+    """#1085: the re-read (#1060) and the kill were two tmux commands — /attach
+    landing between them still lost the window it had just reported attached."""
+
+    def test_retag_just_before_the_kill_keeps_the_window(self) -> None:
+        fake = _RetagRightBeforeKill(
+            windows={"clord": ["w1"]},
+            thread_ids={"clord:w1": "111"},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids={222})
+
+        assert fake.killed == []
+        assert killed == 0
+
+    def test_untagged_window_tagged_just_before_the_kill_is_kept(self) -> None:
+        fake = _RetagRightBeforeKill(
+            windows={"clord": ["w1"]},
+            thread_ids={},
+            pane_commands={"clord:w1": "zsh"},
+        )
+        with patch("c_lord.tmux._run", side_effect=fake):
+            killed = _manager().cleanup_orphaned(active_thread_ids={222})
+
+        assert fake.killed == []
+        assert killed == 0
+
+
+_SOCK = f"clord-1085-{uuid.uuid4().hex[:8]}"
+
+
+def _isolated_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    return env
+
+
+def _isolated(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Every tmux call on its own ``-L`` socket — never the fleet's server (#701)."""
+    assert argv[0] == "tmux", argv
+    return subprocess.run(
+        ["tmux", "-L", _SOCK, "-f", "/dev/null", *argv[1:]],
+        capture_output=True,
+        text=True,
+        env=_isolated_env(),
+        timeout=10,
+    )
+
+
+@pytest.fixture
+def real_tmux():  # type: ignore[no-untyped-def]
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not installed")
+    _isolated(["tmux", "new-session", "-d", "-s", "clord", "-n", "w0", "sh"])
+    _isolated(["tmux", "new-window", "-d", "-t", "clord:", "-n", "w1", "sh"])
+    _isolated(["tmux", "set-option", "-w", "-t", "clord:w1", "@thread_id", "111"])
+    _isolated(
+        [
+            "tmux",
+            "set-option",
+            "-w",
+            "-t",
+            "clord:w1",
+            tmux_mod.OWNER_OPTION,
+            tmux_mod.instance_owner(),
+        ]
+    )
+    _isolated(["tmux", "set-option", "-w", "-t", "clord:w0", "@thread_id", "999"])
+    _isolated(["tmux", "set-option", "-w", "-t", "clord:w0", tmux_mod.OWNER_OPTION, "someone-else"])
+    yield
+    _isolated(["tmux", "kill-server"])
+
+
+def _real_windows() -> list[str]:
+    out = _isolated(["tmux", "list-windows", "-t", "clord", "-F", "#{window_name}=#{@thread_id}"])
+    return out.stdout.split()
+
+
+def test_real_tmux_attach_just_before_the_kill_keeps_the_window(real_tmux: None) -> None:
+    """#1085 AC1 on a real tmux: ``remap_window`` (``/attach``) lands after the
+    reaper's probes, right before its kill — the window stays, attached."""
+    mgr = _manager()
+    done = {"attached": False}
+
+    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if not done["attached"] and ("if-shell" in argv or "kill-window" in argv):
+            done["attached"] = True
+            assert mgr.remap_window(222, "w1")  # /attach reports success
+        return _isolated(argv)
+
+    with patch("c_lord.tmux._run", side_effect=run):
+        killed = mgr.cleanup_orphaned({222})
+
+    assert done["attached"]
+    assert "w1=222" in _real_windows()
+    assert killed == 0
+
+
+def test_real_tmux_unchanged_tag_is_still_reaped(real_tmux: None) -> None:
+    with patch("c_lord.tmux._run", side_effect=_isolated):
+        killed = _manager().cleanup_orphaned(set())
+
+    assert killed == 1
+    assert not any(w.startswith("w1=") for w in _real_windows())
+    assert "w0=999" in _real_windows()  # another instance's window is left alone
