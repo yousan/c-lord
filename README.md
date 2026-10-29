@@ -6,14 +6,21 @@
 
 **Run multiple Claude Code sessions in parallel from Discord — each thread in its own git clone, so sessions never share a working tree.**
 
-<!-- TODO(#100): replace this placeholder with a ~30s demo GIF showing parent → parallel child sessions → consolidated reply. -->
+c-lord turns a Discord server into the control room for the Claude Code sessions running on your own machine. Give each task its own thread, walk away, and check on all of them from your phone, laptop, or terminal — nothing gets cut off, and everything that happened stays in the thread.
+
 <p align="center">
-  <a href="https://github.com/yousan/c-lord/issues/100">
-    <img src="docs/assets/demo-placeholder.svg" alt="c-lord demo (coming soon)" width="720">
-  </a>
+  <img src="docs/assets/demo-mock.svg" alt="Mock-up: a Discord channel with four Claude Code threads, one open showing a request, a message typed in the terminal, the reply with files, and a terminal attached to the same session (all names fictional)" width="760">
 </p>
 
-Each Discord thread becomes a fully isolated Claude Code session. Work on a feature in one thread, review a PR in another, and run a background task in a third — simultaneously, from your phone, tablet, or desktop. Each thread works in its own clone of the repository, so sessions never edit the same working tree.
+## Why c-lord
+
+- 🎛️ **Discord becomes the control room for many Claude Code sessions.** One thread is one real, interactive Claude Code running in tmux on your machine — the same thing you'd use in a terminal. Drop files into the thread and Claude gets them; files Claude makes come back as attachments. Want the keyboard? `tmux attach` to that very session.
+- ⏳ **No time limit.** A long job is never stopped for taking long. c-lord only gives up on a turn when Claude's screen has been frozen for 5 minutes, and even then it doesn't kill Claude.
+- 🧪 **A whole separate workspace per thread.** Each thread works in its own clone of your repo, so it can run its own backend and frontend together, and its own `docker compose` stack, without touching another thread's. c-lord knows which containers belong to which thread and stops them with it. (Turn it on by binding the channel to a repo with `/clord-init`; host ports are still shared, so give each stack its own.)
+- 📜 **Everything is kept in Discord.** Replies, tool activity, files — even what you type straight into the tmux pane — land in the thread. Your team can follow along, and another AI agent can read the history to pick up the work.
+- 🔒 **You choose who can drive it.** Out of the box only the owner of the Discord app can use it (talking to c-lord runs commands on your machine). Open it to a role or a list of people when you want.
+
+**Get started:** [Quick Start — 5 minutes](#quick-start--claude-in-discord-in-5-minutes) · [How it works](#the-big-idea-parallel-sessions-each-in-its-own-clone) · [Commands](docs/COMMANDS.md) · [Configuration](#configuration) · [Architecture](#architecture)
 
 **[日本語](docs/ja/README.md)** | **[简体中文](docs/zh-CN/README.md)** | **[한국어](docs/ko/README.md)** | **[Español](docs/es/README.md)** | **[Português](docs/pt-BR/README.md)** | **[Français](docs/fr/README.md)**
 
@@ -22,6 +29,8 @@ Each Discord thread becomes a fully isolated Claude Code session. Work on a feat
 > **Disclaimer:** This project is not affiliated with, endorsed by, or officially connected to Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC. This is an independent open-source tool that interfaces with the Claude Code CLI.
 
 > **Built entirely by Claude Code.** This entire codebase — architecture, implementation, tests, documentation — was written by Claude Code itself. The human author provided requirements and direction via natural language. See [How This Project Was Built](#how-this-project-was-built).
+
+**Contents:** [How it works](#the-big-idea-parallel-sessions-each-in-its-own-clone) · [What you can do](#what-you-can-do) · [Features](#features) · [Quick Start](#quick-start--claude-in-discord-in-5-minutes) · [Configuration](#configuration) · [Discord Bot Setup](#discord-bot-setup) · [GitHub automation](#github--claude-code-automation) · [Scheduled Tasks](#scheduled-tasks-1) · [Auto-Upgrade](#auto-upgrade) · [REST API](#rest-api) · [Architecture](#architecture) · [Testing](#testing) · [How this was built](#how-this-project-was-built)
 
 ---
 
