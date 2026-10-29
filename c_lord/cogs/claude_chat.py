@@ -124,6 +124,7 @@ from ..thread_settings import resolve_auto_archive_duration
 from ..transcript.claim import adopt_cleared_session, list_transcripts
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
+from ..voice_webhooks import is_voice_message
 from ..workspace_dir import external_workspace
 from ..workspace_failure import describe_workspace_failure
 from ..workspace_notice import restored_devenv_notice
@@ -1007,6 +1008,10 @@ class ClaudeChatCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
+        # #971: c-lord's own voice for a sub-agent — never a request, and not a
+        # refused one either (the owner would be DM'd for every agent message).
+        if is_voice_message(message):
+            return
         # #745: bookkeeping for the reconnect pick-up. Before any await, so a
         # pick-up that starts after this event was dispatched always sees it.
         if not self._note_delivered(message):

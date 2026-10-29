@@ -89,6 +89,9 @@ _READ_CHUNK_BYTES = 8 << 20
 # from a real same-size rewrite without re-reading a 100 MB file to find out.
 _SIGNATURE_BYTES = 4096
 
+# Step size when backing up to the start of a half-written line (#988).
+_LINE_SEEK_BYTES = 64 * 1024
+
 # Worker pool for the follow loops.  Deliberately **not** ``asyncio.to_thread``,
 # which shares one bounded pool with the rest of c-lord (git checkouts, the #215
 # recovery scans, ``_transcript_has_ask_result``): 250 mirrors polling twice a
@@ -152,9 +155,9 @@ def _seed_seen_uuids(path: Path, upto_offset: int, seen: set[str]) -> None:
 
     Reads exactly ``upto_offset`` bytes (the same baseline the follow loop skips
     past) so events that existed when the tail started are marked already-seen
-    and are never re-emitted on a later offset-0 reset.  A partial trailing line
-    (offset cutting mid-line) fails to parse and is ignored — it is read afresh
-    by the follow loop from ``upto_offset``.
+    and are never re-emitted on a later offset-0 reset.  Callers pass an offset
+    that ends a whole line (:func:`_whole_lines_end`, #988), so a record being
+    appended at that moment lies past it and is read whole by the follow loop.
 
     Blocking: parses every pre-existing line.  Callers on the event loop must
     hand it to a worker thread (Issue #537) — :func:`tail_events` does.
@@ -224,7 +227,9 @@ def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
     resolver = ThreadSessionResolver(project_dir)
     state = _FollowState(project_dir=project_dir, resolver=resolver, from_start=from_start)
     try:
-        state.pre_existing = {p: _size_of(p) for p in project_dir.glob("*.jsonl") if p.is_file()}
+        state.pre_existing = {
+            p: _whole_lines_end(p) for p in project_dir.glob("*.jsonl") if p.is_file()
+        }
     except OSError:
         state.pre_existing = {}
 
@@ -234,7 +239,7 @@ def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
         # bot startup. Parsing that on the event loop stalled the Discord
         # gateway heartbeat long enough to force a reconnect, during which every
         # message the user sent was dropped by Discord and never redelivered.
-        state.offsets[initial_path] = _size_of(initial_path)
+        state.offsets[initial_path] = _whole_lines_end(initial_path)
         _seed_seen_uuids(initial_path, state.offsets[initial_path], state.seen_uuids)
     return state
 
@@ -244,6 +249,39 @@ def _size_of(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _whole_lines_end(path: Path) -> int:
+    """Where the last *complete* line of ``path`` ends — the size, unless a line is half-written.
+
+    The tail skips what was on disk when it started by starting there (#988).
+    Starting at the raw size put that point inside a line Claude Code was still
+    appending: the follow loop then read only the line's second half, failed to
+    parse it and dropped the record. Backing up to the last newline lets the
+    line be read whole once it is finished.
+    """
+    size = _size_of(path)
+    if size == 0:
+        return 0
+    end = size
+    try:
+        with path.open("rb") as f:
+            # The common case — nothing being written — costs one byte, not a
+            # chunk: this runs for every transcript of every mirror at startup.
+            f.seek(size - 1)
+            if f.read(1) == b"\n":
+                return size
+            while end > 0:
+                start = max(0, end - _LINE_SEEK_BYTES)
+                f.seek(start)
+                chunk = f.read(end - start)
+                newline = chunk.rfind(b"\n")
+                if newline >= 0:
+                    return start + newline + 1
+                end = start
+    except OSError:
+        return size
+    return 0
 
 
 def _signature(path: Path, offset: int) -> bytes:
@@ -278,6 +316,25 @@ def _start_offset(state: _FollowState, path: Path) -> int:
     return 0
 
 
+def _drop_current(state: _FollowState) -> None:
+    """Let go of the current file after a failed read, keeping our place in it.
+
+    The next poll re-resolves and, for the same file, resumes from the banked
+    offset. Without banking it (#987), re-adoption fell back to the offset the
+    tail *started* with and re-read everything since — uuid events are deduped,
+    but the uuid-less ones (whose tool blocks wake the progress line, #906)
+    came out twice.
+
+    The bank is the start of the half line still in the buffer, not the end of
+    what was read (#1004): re-adoption clears the buffer, so resuming past it
+    read only the line's second half, which does not parse — and the event,
+    possibly the reply itself, was lost.
+    """
+    if state.current_path is not None:
+        state.offsets[state.current_path] = state.offset - len(state.buffer.encode("utf-8"))
+    state.current_path = None
+
+
 def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     """One follow-loop cycle: resolve, stat, read, parse.  Returns new events.
 
@@ -305,7 +362,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     try:
         stat = active.stat()
     except FileNotFoundError:
-        state.current_path = None
+        _drop_current(state)
         return []
     size = stat.st_size
     mtime = stat.st_mtime
@@ -338,7 +395,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             chunk = f.read(_READ_CHUNK_BYTES)
             state.offset = f.tell()
     except OSError:
-        state.current_path = None
+        _drop_current(state)
         return []
 
     state.more_to_read = state.offset < size
