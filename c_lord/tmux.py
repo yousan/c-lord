@@ -115,8 +115,8 @@ WINDOW_PREFIX = "w"
 _LEGACY_WINDOW_PREFIX = "work"
 
 # #677: foreground commands that mean "this pane is an idle shell", i.e. a
-# corpse. Used only by the reaper's untagged branch, where "not claude" is too
-# weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
+# corpse. Used by both reaper branches (untagged #677, tagged #986), where "not
+# claude" is too weak a guard: a hand-made ``work3`` running a dev server reports ``node``, and
 # must survive. A login shell reports itself as ``-zsh``.
 _SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"})
 
@@ -1477,12 +1477,13 @@ class TmuxSessionManager:
         """True when **every** pane in *window* sits at a plain shell (#677).
 
         The reaper's untagged branch has no ``@thread_id`` to check against
-        ``active_thread_ids``, so this is the whole of its liveness test — it has
-        to be stricter than :meth:`_window_has_claude`'s "not claude". A window
-        whose panes are all idle shells is a corpse whatever created it; one
-        running anything else (a dev server, a build, a Claude) is somebody's
-        work. A failed probe reads as "not idle", so tmux trouble keeps windows
-        rather than killing them.
+        ``active_thread_ids``, so this is the whole of its liveness test; the
+        tagged branch uses it too (#986). It has to be stricter than
+        :meth:`_window_has_claude`'s "not claude". A window whose panes are all
+        idle shells is a corpse whatever created it; one running anything else
+        (a dev server, a build, a Claude) is somebody's work. A failed probe
+        reads as "not idle", so tmux trouble keeps windows rather than killing
+        them.
         """
         result = _run(
             [
@@ -2826,15 +2827,18 @@ class TmuxSessionManager:
         waits for the input prompt — but only for :data:`_TRUST_BOOT_TIMEOUT`,
         and only the *dialog still being up* blocks delivery.  A pane that simply
         cannot be read is not evidence of anything (#544's rule) and must not
-        hold the message hostage.
+        hold the message hostage (#993): the dialog blocks only when the last
+        reading actually showed it — never when there was no reading at all.
         """
         deadline = time.monotonic() + _TRUST_BOOT_TIMEOUT
-        dialog_open = True
+        dialog_open = False
+        read_once = False
         while time.monotonic() < deadline:
             time.sleep(_TRUST_SETTLE)
             capture = _run(["tmux", "capture-pane", "-p", "-t", target])
             if capture.returncode != 0:
                 continue
+            read_once = True
             dialog_open = _pane_trust_dialog_downs(capture.stdout) is not None
             if dialog_open:
                 continue
@@ -2870,6 +2874,15 @@ class TmuxSessionManager:
                 _TRUST_BOOT_TIMEOUT,
             )
             return False
+        if not read_once:
+            logger.warning(
+                "%s send_input: the pane could not be read for %.0fs after the folder-trust "
+                "dialog was confirmed; delivering the message anyway — an unreadable pane is "
+                "no evidence the dialog is still open (#544/#993)",
+                log_ctx(thread_id=thread_id),
+                _TRUST_BOOT_TIMEOUT,
+            )
+            return True
         logger.warning(
             "%s send_input: the folder-trust dialog closed but Claude's input box never "
             "appeared within %.0fs; delivering the message anyway (#716)",
@@ -3734,12 +3747,13 @@ class TmuxSessionManager:
         is never one of them** in either case.
 
         **Tagged** — it carries an ``@thread_id``, its thread is not in
-        *active_thread_ids*, and its pane is not running Claude. The last
+        *active_thread_ids*, and every pane in it is an idle shell. The last
         condition is what makes this callable at all (#570): callers pass
         ``active_thread_ids=set()`` at startup, so membership alone would mark
         *every* window orphaned and kill live sessions. The pane's foreground
         command is read fresh from tmux rather than inferred from our own
-        bookkeeping.
+        bookkeeping. It used to be "not running Claude", which reaped a dev
+        server or a window tmux failed to describe (#986).
 
         **Untagged with a c-lord name** (#677) — it has *no* ``@thread_id``, its
         name is one only :meth:`_next_window_name` hands out (``w{N}``, or the
@@ -3785,7 +3799,11 @@ class TmuxSessionManager:
                 continue
 
             if not tid_str.isdigit():
-                if self._is_reapable_untagged(window, target) and self._kill_window(target):
+                if (
+                    self._is_reapable_untagged(window, target)
+                    and self._tag_unchanged(target, tid_str)
+                    and self._kill_window(target)
+                ):
                     self._log_reaped(window=window, reason="no @thread_id, idle c-lord window")
                     killed += 1
                 continue
@@ -3793,18 +3811,59 @@ class TmuxSessionManager:
             thread_id = int(tid_str)
             if thread_id in active_thread_ids:
                 continue
-            if target and self._window_has_claude(target):
+            if target and not self._window_is_idle_shell(target):
+                # #986: "not claude" is not "idle". A dev server, a build, or a
+                # probe tmux did not answer is somebody's work, exactly as in the
+                # untagged branch below.
                 logger.debug(
-                    "cleanup_orphaned: %s still runs Claude — keeping (thread=%d)",
+                    "cleanup_orphaned: %s is not an idle shell — keeping (thread=%d)",
                     self._describe(target),
                     thread_id,
                 )
                 continue
-            if self.kill_session(thread_id):
+            if target and not self._tag_unchanged(target, tid_str):
+                continue
+            # Kill the window just probed, not ``kill_session``'s pick: with two
+            # windows carrying one tag (#501/#649) that is the mapped one, which
+            # may be the busy twin the probe above kept.
+            if target and self._kill_window(target):
+                if self._thread_to_window.get(thread_id) in (target, window.get("window_name")):
+                    self._thread_to_window.pop(thread_id, None)
+                    self._save_mapping()
+                self._log_reaped(window=window, reason=f"thread={thread_id} inactive, idle shell")
+                killed += 1
+            elif not target and self.kill_session(thread_id):
                 self._log_reaped(window=window, reason=f"thread={thread_id} inactive, no Claude")
                 killed += 1
 
         return killed
+
+    def _tag_unchanged(self, target: str, listed: str) -> bool:
+        """Does ``target`` still carry the ``@thread_id`` the listing showed? (#1060)
+
+        The reaper decides from one listing and then probes every pane, which
+        takes a while at startup — long enough for ``/attach`` (``remap_window``)
+        or ``create_session``'s adoption to hand that very window, an idle shell
+        tagged with an inactive thread, to *another* thread. Killing by window id
+        (#1009) dropped the re-check ``kill_session`` used to make, so the window
+        a user had just been told was attached vanished. tmux answers rc=1 both
+        for "no such window" and "option unset", so both read as untagged.
+
+        A window handed back to the *same* thread keeps its tag and is not
+        caught here — that race predates #1009 (``kill_session`` checked the
+        same tag) and is not what this guards.
+        """
+        result = _run(["tmux", "show-option", "-w", "-v", "-t", self._target(target), "@thread_id"])
+        current = result.stdout.strip() if result.returncode == 0 else ""
+        if current == listed:
+            return True
+        logger.info(
+            "cleanup_orphaned: %s was re-tagged %r → %r since the listing — keeping",
+            self._describe(target),
+            listed,
+            current,
+        )
+        return False
 
     def _is_reapable_untagged(self, window: dict[str, str], target: str) -> bool:
         """Does this ``@thread_id``-less row belong to c-lord and hold nothing? (#677)"""
@@ -3844,6 +3903,18 @@ def _claude_panes_by_thread() -> dict[int, str]:
     process is a shell holds a window, not the ~400 MB the cap is about, so
     counting it would evict a live workspace to make room for a corpse. Windows
     without an ``@thread_id`` were made by hand and are none of our business.
+
+    An unreadable listing reads as ``{}`` here; callers that must tell "none"
+    from "could not ask" use :func:`_claude_panes_listing` (#1034).
+    """
+    return _claude_panes_listing() or {}
+
+
+def _claude_panes_listing() -> dict[int, str] | None:
+    """:func:`_claude_panes_by_thread`, but ``None`` when tmux could not be asked (#1034).
+
+    No tmux at all, or no server, is an answer — nothing can be running claude.
+    A ``list-panes`` that fails otherwise (a timeout, #699) is not.
     """
     if not _tmux_available():
         return {}
@@ -3858,7 +3929,7 @@ def _claude_panes_by_thread() -> dict[int, str]:
         ]
     )
     if result.returncode != 0:
-        return {}
+        return {} if _NO_SERVER_RE.search(result.stderr or "") else None
 
     panes: dict[int, str] = {}
     for line in result.stdout.splitlines():
@@ -3936,8 +4007,20 @@ def resident_thread_ids() -> set[int]:
     return set(_claude_panes_by_thread())
 
 
-def running_thread_ids(candidates: Iterable[int] | None = None) -> set[int]:
-    """Of *candidates*, the ones whose pane is **mid-turn right now** (#742).
+@dataclass(frozen=True)
+class PaneTurnStates:
+    """What the panes of some candidates say about their turns (#742 / #1034).
+
+    ``unreadable`` is kept apart from "not running" on purpose: a pane that could
+    not be read is not evidence that nobody is working in it.
+    """
+
+    running: frozenset[int]
+    unreadable: frozenset[int]
+
+
+def pane_turn_states(candidates: Iterable[int] | None = None) -> PaneTurnStates:
+    """Of *candidates*, whose pane is **mid-turn right now**, and whose could not be read.
 
     Read from the pane, because **that is the evidence a bot restart cannot
     erase.** c-lord's own ledger of running turns
@@ -3952,29 +4035,44 @@ def running_thread_ids(candidates: Iterable[int] | None = None) -> set[int]:
     only on the paths that are about to evict something. ``candidates=None``
     means "every resident", which on a busy host is ~30 captures.
 
-    Answers ``set()`` for anything it cannot read: an unreadable pane is not
-    evidence that nobody is working, but it is also not evidence that someone
-    is, and the caller's other guards (``_active_tasks``, the TTL) still apply.
+    **A pane that could not be read is reported as unreadable, not as idle**
+    (#1034). Right after a restart the ledger is empty, so the pane is the only
+    guard left; folding "could not read" into "not running" handed the eviction
+    guard the oldest running turn — the #742 outcome by another road. A failed
+    ``list-panes`` makes every candidate unreadable.
     """
-    panes = _claude_panes_by_thread()
-    if candidates is not None:
-        wanted = {int(tid) for tid in candidates}
+    wanted = None if candidates is None else {int(tid) for tid in candidates}
+    panes = _claude_panes_listing()
+    if panes is None:
+        return PaneTurnStates(frozenset(), frozenset(wanted or ()))
+    if wanted is not None:
         panes = {tid: pane_id for tid, pane_id in panes.items() if tid in wanted}
-    if not panes:
-        return set()
 
     running: set[int] = set()
+    unreadable: set[int] = set()
     for thread_id, pane_id in panes.items():
         if not _PANE_ID_RE.match(pane_id):
             # tmux minted it, but the eviction guard is not the place to trust
             # an unvalidated token into an argv.
+            unreadable.add(thread_id)
             continue
         result = _run(
             ["tmux", "capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{_RUNNING_CAPTURE_LINES}"]
         )
-        if result.returncode == 0 and pane_shows_running(result.stdout):
+        if result.returncode != 0:
+            unreadable.add(thread_id)
+        elif pane_shows_running(result.stdout):
             running.add(thread_id)
-    return running
+    return PaneTurnStates(frozenset(running), frozenset(unreadable))
+
+
+def running_thread_ids(candidates: Iterable[int] | None = None) -> set[int]:
+    """Of *candidates*, the ones whose pane **positively** shows a running turn (#742).
+
+    Anything unreadable is left out; a caller that must not mistake "could not
+    read" for "idle" uses :func:`pane_turn_states` (#1034).
+    """
+    return set(pane_turn_states(candidates).running)
 
 
 def cleanup_orphaned_all_sessions(active_thread_ids: set[int]) -> int:

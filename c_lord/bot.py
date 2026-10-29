@@ -18,6 +18,7 @@ from .coordination.service import CoordinationService
 from .discord_ui.authorization import Authorizer
 from .discord_ui.permission_help import command_error_help
 from .discord_ui.slash_io import followup_ephemeral
+from .voice_webhooks import is_voice_message
 
 if TYPE_CHECKING:
     from .database.ask_repo import PendingAskRepository
@@ -104,6 +105,8 @@ class ClaudeDiscordBot(commands.Bot):
         """
         if message.author.bot and not message.webhook_id:
             return
+        if is_voice_message(message):
+            return  # #971: c-lord speaking for a sub-agent is not a command
         ctx = await self.get_context(message)
         if ctx.command is not None and not await owns_channel(self, message.channel):
             # DEBUG: in a shared guild every bystander logs this for every

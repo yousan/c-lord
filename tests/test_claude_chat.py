@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import discord
 import pytest
@@ -2863,6 +2863,11 @@ class TestDiscordLinkEnrichmentWireIn:
 class TestOnReadyLampRecovery:
     """#718: a turn in flight at shutdown gets its lamp taken back on startup."""
 
+    @pytest.fixture(autouse=True)
+    def _tmux_cannot_be_asked(self, monkeypatch):
+        """Never read the host's real tmux: "could not tell" keeps the watch (#992)."""
+        monkeypatch.setattr("c_lord.cogs.claude_chat.live_claude_panes", lambda: None)
+
     def _cog(self, record, thread):
         from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
@@ -2962,7 +2967,7 @@ class TestOnReadyLampRecovery:
 
         seen: dict = {}
 
-        async def adopt(message, *, thread_id, turn_running):
+        async def adopt(message, *, thread_id, turn_running, **_):
             seen.update(cog._adopted_lamps)
 
         with patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", adopt):
@@ -3096,7 +3101,7 @@ class TestTurnEndAfterRestart:
         """The startup pick-up (#776) may already have started the next turn."""
         cog, thread, dashboard, order, footer = self._setup(tmp_path)
 
-        async def adopt(message, *, thread_id, turn_running):
+        async def adopt(message, *, thread_id, turn_running, **_):
             cog._active_tasks[thread_id] = MagicMock()
             return "over"
 
@@ -3246,3 +3251,61 @@ class TestRestartCrossedTurnReadsHowItEnded:
         event = events[0]
         assert event["kind"] == "completion" and event["reason"] == "restart_crossed"
         assert event["started_by"] == {"type": "user", "id": "777", "name": None}
+
+
+class TestAdoptedLampOfADeadTurn(TestOnReadyLampRecovery):
+    """#992 review: on_ready's adopted watch lets go once claude is gone from the pane.
+
+    Otherwise the thread stays in ``_adopted_lamps``, is recorded again at every
+    shutdown (#870) and re-adopted — with a 🔄 line — at every start, for good.
+    """
+
+    async def _adopt(self, tmp_path, live) -> dict:
+        import inspect
+
+        from c_lord.discord_ui import lamp_recovery
+        from c_lord.discord_ui.status import EMOJI_RUNNING
+        from tests.test_lamp_recovery import _Message
+
+        real = lamp_recovery.adopt_orphaned_lamp
+
+        async def fast_adopt(message, *, thread_id, turn_running, **kwargs):
+            kw = dict(poll_seconds=0.01, recheck_seconds=0.02, max_seconds=0.05)
+            if "slow_poll_seconds" in inspect.signature(real).parameters:
+                kw.update(slow_poll_seconds=0.01, slow_recheck_seconds=0.02)
+            return await real(
+                message, thread_id=thread_id, turn_running=turn_running, **kwargs, **kw
+            )
+
+        thread = self._thread(9920)
+        trigger = _Message(EMOJI_RUNNING)
+        trigger.id = 4242
+        thread.fetch_message = AsyncMock(return_value=trigger)
+        record = MagicMock(trigger_message_id=4242, working_dir=str(tmp_path))
+        cog = self._cog(record, thread)
+        with (
+            patch("c_lord.cogs.claude_chat.adopt_orphaned_lamp", fast_adopt),
+            # the transcript ends on a tool_use: claude was killed mid-turn
+            patch("c_lord.cogs.claude_chat.stopped_mid_turn", return_value=True),
+            patch("c_lord.cogs.claude_chat.live_claude_panes", return_value=live),
+        ):
+            await cog.on_ready()
+            await asyncio.sleep(0.5)  # 10x max_seconds
+            still = dict(cog._adopted_lamps)
+            for t in list(cog._lamp_recovery_tasks):
+                t.cancel()
+            await asyncio.gather(*cog._lamp_recovery_tasks, return_exceptions=True)
+        return still
+
+    @pytest.mark.asyncio
+    async def test_a_dead_mid_turn_thread_is_not_carried_into_the_next_restart(
+        self, tmp_path
+    ) -> None:
+        from c_lord.tmux import LiveClaude
+
+        assert await self._adopt(tmp_path, LiveClaude(frozenset(), frozenset())) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_pane_that_cannot_be_read_keeps_the_watch(self, tmp_path) -> None:
+        """#510's asymmetry: "could not tell" is never read as "it died"."""
+        assert await self._adopt(tmp_path, None) == {9920: 4242}

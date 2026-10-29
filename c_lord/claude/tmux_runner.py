@@ -229,6 +229,10 @@ _CONTINUE_SETTLE = 5.0
 # gave, and the turn loop's own timeouts take it from there.
 _CONTINUE_VERDICT_TIMEOUT = 15.0
 
+#: What the CLI prints when ``--continue`` / ``--resume`` has nothing to open —
+#: the one positive reading of a failed resume before claude was ever seen (#994).
+_NO_CONVERSATION = "No conversation found"
+
 #: How long :meth:`TmuxClaudeRunner.wake` waits for a restored pane to reach its
 #: input box. Generous on purpose: a cold ``claude --continue`` re-renders the
 #: whole conversation on a host that may already be running a dozen of them, and
@@ -698,8 +702,14 @@ def _usage_limit_wait_option(pane: str) -> int | None:
     """
     if not pane:
         return None
+    # #989: read only what is under the (last) menu header. capture-pane
+    # includes scrollback, and a "1. / 2." list in Claude's answer above the
+    # menu used to be taken for it — the real menu was never read.
+    header = pane.rfind(_LIMIT_MENU_HEADER)
+    if header < 0:
+        return None
     options: list[str] = []
-    for line in pane.splitlines():
+    for line in pane[header:].splitlines():
         match = _LIMIT_MENU_OPTION_RE.match(line)
         if match is None:
             if options:
@@ -1570,6 +1580,8 @@ class TmuxClaudeRunner:
         # /clear and normal new threads must remain False to prevent --continue
         # from recovering cleared conversation history (issue #123 Part 2 fix).
         self._try_continue = try_continue
+        # #1002: "No conversation found" already on screen before the resume.
+        self._resume_baseline = 0
         self._stopped = False
         self._silent_stop = False
         self._last_capture: str = ""
@@ -1854,6 +1866,7 @@ class TmuxClaudeRunner:
                 # Restart-resume path only (on_ready → pending_resumes).
                 # Try --continue first; if Claude exits immediately (no session),
                 # fall back to a fresh start (issue #123 Part 2).
+                await self._note_resume_baseline()
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,
@@ -1877,7 +1890,7 @@ class TmuxClaudeRunner:
                     )
                     return
 
-                if not await self._continue_came_up():
+                if await self._resume_failed():
                     logger.info(
                         "start_claude --continue found no session for thread %d; "
                         "falling back to fresh start",
@@ -2765,6 +2778,7 @@ class TmuxClaudeRunner:
         if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
             return True  # already awake — restarting would kill a live turn
 
+        await self._note_resume_baseline()
         started = await asyncio.to_thread(
             self._tmux.start_claude,
             self._thread_id,
@@ -2779,7 +2793,7 @@ class TmuxClaudeRunner:
             logger.warning("wake: start_claude --continue failed (thread=%d)", self._thread_id)
             return False
 
-        if not await self._continue_came_up():
+        if await self._resume_failed():
             logger.info(
                 "wake: --continue found no conversation for thread %d; starting fresh",
                 self._thread_id,
@@ -3006,6 +3020,42 @@ class TmuxClaudeRunner:
     # Private helpers
     # ------------------------------------------------------------------
 
+    async def _note_resume_baseline(self, pane: str | None = None) -> None:
+        """Count the "No conversation found" already on screen before a resume (#1002).
+
+        ``capture_pane`` carries the scrollback, so an earlier resume's answer
+        in the same window is still there; only a *new* one is this resume's.
+        """
+        if pane is None:
+            try:
+                pane = _normalize_capture(
+                    await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+                )
+            except Exception:
+                pane = ""
+        self._resume_baseline = (pane or "").count(_NO_CONVERSATION)
+
+    async def _resume_failed(self) -> bool:
+        """Whether the resume just typed failed, so a fresh start may be typed (#994).
+
+        A wrong "failed" is the expensive mistake: the fresh start writes a new
+        claim before its command runs, so if the resume was in fact coming up the
+        claim names a session that never starts and the mirror goes silent. So
+        the verdict of :meth:`_continue_came_up` is checked once more against the
+        pane right before the fallback — a claude running by now is the resume,
+        and typing a command line at it would only make it a message.
+        """
+        if await self._continue_came_up():
+            return False
+        if await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
+            logger.warning(
+                "%s the resume was judged failed but claude is running in the pane now — "
+                "keeping it instead of typing a fresh start over it (#994)",
+                log_ctx(thread_id=self._thread_id),
+            )
+            return False
+        return True
+
     async def _continue_came_up(self) -> bool:
         """Decide whether ``claude --continue`` actually came up (#657).
 
@@ -3024,7 +3074,11 @@ class TmuxClaudeRunner:
         answered here, which is what lets the real outcome happen at all), then
         settled on something that separates the two outcomes:
 
-        * claude is gone                    → nothing to continue → False
+        * claude was seen and is gone, or the CLI printed "No conversation
+          found"                            → nothing to continue → False
+        * claude has not appeared yet       → undecided (#994): a cold window
+          can still be loading zsh at the grace, and reading that as an exit
+          typed a fresh start over a resume that came up a second later
         * claude is up at its input box     → the conversation loaded → True
         * claude simply outlives the window in which a failed ``--continue``
           exits → it started
@@ -3038,6 +3092,7 @@ class TmuxClaudeRunner:
         elapsed = 0.0
         settled = 0.0
         trust_handled = False
+        seen_claude = False
         while elapsed < _CONTINUE_VERDICT_TIMEOUT and not self._stopped:
             # ``capture_pane`` keeps the escape sequences (``-e``), so the input
             # box arrives as ``\x1b[39m❯\xa0`` and would never be recognised
@@ -3048,34 +3103,48 @@ class TmuxClaudeRunner:
             if self._has_trust_prompt(pane):
                 # Not a verdict: answer it, and hold the settle clock at zero —
                 # nothing about ``--continue`` is decided while this is up.
+                seen_claude = True  # only a live claude draws the dialog
                 if not trust_handled:
                     await self._accept_trust_prompt(pane)
                     trust_handled = True
                 settled = 0.0
             elif not await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id):
-                return False
-            elif self._has_input_prompt(pane) or self._is_generating(pane):
-                # Liveness is checked first on purpose: a zsh theme renders the
-                # very same ``❯``, so a claude that just exited must not read as
-                # a ready input box.
-                return True
-            elif settled >= _CONTINUE_SETTLE:
-                # Still alive, dialog gone, but the TUI has painted nothing we
-                # recognise. It outlived the window in which a failed
-                # ``--continue`` exits, so it started.
-                return True
+                if seen_claude or pane.count(_NO_CONVERSATION) > self._resume_baseline:
+                    return False
+                # #994: not exec'd yet — nothing about the resume is decided.
+                settled = 0.0
             else:
+                seen_claude = True
+                if self._has_input_prompt(pane) or self._is_generating(pane):
+                    # Liveness is checked first on purpose: a zsh theme renders
+                    # the very same ``❯``, so a claude that just exited must not
+                    # read as a ready input box.
+                    return True
+                if settled >= _CONTINUE_SETTLE:
+                    # Still alive, dialog gone, but the TUI has painted nothing we
+                    # recognise. It outlived the window in which a failed
+                    # ``--continue`` exits, so it started.
+                    return True
                 settled += _POLL_INTERVAL
             await asyncio.sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
 
-        if not self._stopped:
+        if self._stopped:
+            return True
+        if not seen_claude:
             logger.warning(
-                "--continue neither reached its input box nor exited within %.0fs "
-                "(thread=%d); treating it as started",
+                "--continue: claude never appeared in the pane within %.0fs (thread=%d); "
+                "treating the resume as failed (#994)",
                 _CONTINUE_VERDICT_TIMEOUT,
                 self._thread_id,
             )
+            return False
+        logger.warning(
+            "--continue neither reached its input box nor exited within %.0fs "
+            "(thread=%d); treating it as started",
+            _CONTINUE_VERDICT_TIMEOUT,
+            self._thread_id,
+        )
         return True
 
     async def _handle_startup_prompts(self) -> None:

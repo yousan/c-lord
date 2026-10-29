@@ -322,8 +322,9 @@ async def test_mirror_minimal_attaches_progress_file_when_tools_buffered(
 
 
 async def test_mirror_minimal_bash_mode_buffered_not_leaked_as_bubble(tmp_path: Path) -> None:
-    """#487: Claude Code bash-mode markers (``! command``) are buffered into the
-    progress file like tool activity — never posted raw as a 👤 thread bubble."""
+    """#487: Claude Code bash-mode markers (``! command``) are never posted raw as
+    a 👤 thread bubble. #1013: nor do they ride on the next answer's progress file
+    — a command typed in the pane is not Claude's work (as #979 for ``/compact``)."""
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
@@ -366,11 +367,12 @@ async def test_mirror_minimal_bash_mode_buffered_not_leaked_as_bubble(tmp_path: 
 
     # No raw bash-mode tag ever reached the thread bubble (plain sink).
     assert not any("<bash-input>" in c or "<bash-stdout>" in c for c in sink_calls)
-    # The bash command + output landed in the progress file (the "raw mirror" layer).
-    assert progress_contents, "progress file_sink should have been called"
-    joined = "\n".join(progress_contents)
-    assert "google-chrome --headless" in joined
-    assert "Missing X server" in joined
+    # #1013: …and it is not the next answer's progress.txt either. #1052: the
+    # one place the command may appear is the label naming what "done" answers.
+    assert sink_calls[-1] == "-# ペインで打った `!google-chrome --headless` への返事\ndone"
+    joined = "\n".join(progress_contents + sink_calls[:-1])
+    assert "google-chrome --headless" not in joined
+    assert "Missing X server" not in joined
 
 
 async def test_mirror_minimal_no_file_sink_fallback_to_sink(tmp_path: Path) -> None:
@@ -2692,7 +2694,11 @@ async def test_local_command_with_empty_output_also_ends_it(tmp_path: Path) -> N
 
 async def test_a_real_request_after_a_local_command_still_gets_its_line(tmp_path: Path) -> None:
     """AC2's neighbour: the next human prompt arms the line as usual."""
-    events = [*_local_compact_events(), _user_str("続きを調べて"), _assistant_tool_use("Bash", "ls")]
+    events = [
+        *_local_compact_events(),
+        _user_str("続きを調べて"),
+        _assistant_tool_use("Bash", "ls"),
+    ]
     spy = await _run_progress(tmp_path, 9443, events)
     assert spy.posts, "the next real request lost its progress line"
 
@@ -2756,3 +2762,108 @@ async def test_a_persons_turn_with_tools_is_still_quoted(tmp_path: Path) -> None
     )
     assert [text for text, _ in file_calls] == ["Lap 2 is under way."]
     assert _run_notification_turn.file_kwargs == [{}]  # type: ignore[attr-defined]
+
+
+# -- #1013: a ``!`` command typed in the pane is not a turn either -------------
+
+
+def _pane_bang_events() -> list[dict]:
+    """What the CLI writes for ``!ls`` typed in the pane (bash mode, #487)."""
+    return [
+        _user_str("<bash-input>ls</bash-input>"),
+        _user_str("<bash-stdout>a.txt</bash-stdout><bash-stderr></bash-stderr>"),
+    ]
+
+
+async def test_a_pane_bang_commands_lines_do_not_ride_on_the_next_answer(
+    tmp_path: Path,
+) -> None:
+    """#1013 AC1. RED: ``🔧 Bash: `ls``` and ``↳ a.txt`` became the next answer's
+    progress.txt — the #979 fix only knew slash commands."""
+    sink_calls, reply_calls, file_calls = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _user_str(_MONITOR_EVENT),
+        _assistant_text("Still running."),
+    )
+    assert file_calls == [], file_calls
+    assert reply_calls == []
+    assert sink_calls[-1:] == ["Still running."]
+
+
+async def test_a_pane_bang_command_does_not_open_a_turn(tmp_path: Path) -> None:
+    """#1013 AC2: the harness's ``<bash-input>`` row is nobody's request.
+
+    Fails if the ``is_harness_user_record`` check in the mirror goes: the row
+    would open a person's turn, and a notification landing while ``!sleep``
+    still runs (no ``<bash-stdout>`` yet) would be quoted under that person.
+    """
+    sink_calls, reply_calls, _ = await _run_notification_turn(
+        tmp_path,
+        _user_str("<bash-input>sleep 100</bash-input>"),
+        _user_str(_MONITOR_EVENT),
+        _assistant_text("Still running."),
+    )
+    assert reply_calls == []
+    assert sink_calls[-1:] == ["Still running."]
+
+
+# -- #1052: Claude answering a ``!`` command typed in the pane -----------------
+
+_BANG_LABEL = "-# ペインで打った `!ls` への返事"
+
+
+async def test_an_answer_to_a_pane_bang_command_says_what_it_answers(tmp_path: Path) -> None:
+    """#1052: the CLI hands ``!ls``'s output to the model, which may answer it.
+
+    RED: that answer went out quoted under the last Discord request — it read as
+    the answer to that person. おぷー決定（2026-10-29）: not a quote-reply, and
+    one leading line naming the pane command it answers.
+    """
+    sink_calls, reply_calls, file_calls = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _assistant_text("No response requested."),
+    )
+    assert reply_calls == [], "the answer was quoted under the last Discord request"
+    assert file_calls == []
+    assert sink_calls[-1:] == [f"{_BANG_LABEL}\nNo response requested."]
+
+
+async def test_a_pane_bang_answer_with_tools_keeps_progress_but_no_quote(
+    tmp_path: Path,
+) -> None:
+    """Claude may look into a failed ``!`` command with tools: the log rides, unquoted."""
+    _, reply_calls, file_calls = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _assistant_tool_use("Bash", "cat a.txt"),
+        _assistant_text("a.txt is empty."),
+    )
+    assert reply_calls == []
+    assert [text for text, _ in file_calls] == [f"{_BANG_LABEL}\na.txt is empty."]
+    assert _run_notification_turn.file_kwargs == [{"quote": False}]  # type: ignore[attr-defined]
+
+
+async def test_a_person_turn_after_a_pane_bang_is_not_labelled(tmp_path: Path) -> None:
+    """The label belongs to the answer to the command, not to the next request's."""
+    sink_calls, reply_calls, _ = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _user_str("what is in this directory?"),
+        _assistant_text("Just a.txt."),
+    )
+    assert not any("ペインで打った" in c for c in sink_calls + reply_calls)
+
+
+async def test_a_long_or_backticked_command_is_shown_safely(tmp_path: Path) -> None:
+    sink_calls, _, _ = await _run_notification_turn(
+        tmp_path,
+        _user_str("<bash-input>echo `date` && " + "x" * 200 + "</bash-input>"),
+        _user_str("<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>"),
+        _assistant_text("Noted."),
+    )
+    label = sink_calls[-1].split("\n", 1)[0]
+    assert label.startswith("-# ペインで打った `` !echo `date`")
+    assert label.endswith("… `` への返事")
+    assert len(label) < 160

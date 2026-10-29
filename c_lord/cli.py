@@ -151,6 +151,15 @@ def _die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def _is_id(raw: str) -> bool:
+    """ASCII digits only — what Discord IDs are, and what ``int()`` / main.py accept.
+
+    ``str.isdigit()`` alone is True for ``²``, which ``int()`` rejects with a
+    traceback (#1063); full-width digits would be written to ``.env`` as typed.
+    """
+    return raw.isascii() and raw.isdigit()
+
+
 def _prompt(prompt: str, default: str = "") -> str:
     """Prompt user for input with an optional default."""
     suffix = f" [{default}]" if default else ""
@@ -211,8 +220,10 @@ async def _run_setup(env_path: Path) -> None:
 
     token = ""
     bot_name = ""
-    for attempt in range(3):
-        token = _prompt("  Bot Token")
+    for _attempt in range(3):
+        # discord.py sends "Bot " + token at login, so a pasted "Bot xxx" must be
+        # stored without the prefix — validate_token accepts both (#1031).
+        token = _prompt("  Bot Token").removeprefix("Bot ").strip()
         if not token:
             _print("  Token cannot be empty.")
             continue
@@ -223,9 +234,11 @@ async def _run_setup(env_path: Path) -> None:
             _print(f"✅  Logged in as {bot_name}")
             break
         _print("❌  Invalid token. Please check and try again.")
-        if attempt == 2:
-            _die("Too many failed attempts. Please verify your bot token.")
         token = ""
+    if not bot_name:
+        # Empty answers use up the attempts too; going on would write an empty
+        # DISCORD_BOT_TOKEN and still print "Setup complete" (#1029).
+        _die("Too many failed attempts. Please verify your bot token.")
 
     # --- Channel ID — try API first, fallback to manual -------------------
     _print()
@@ -244,7 +257,7 @@ async def _run_setup(env_path: Path) -> None:
 
         while True:
             raw = _prompt(f"  Select channel [1-{len(channels)}] or paste ID directly")
-            if raw.isdigit():
+            if _is_id(raw):
                 idx = int(raw)
                 if 1 <= idx <= len(channels):
                     channel_id = channels[idx - 1][0]
@@ -256,7 +269,7 @@ async def _run_setup(env_path: Path) -> None:
                     _print(f"  ✅  Channel ID: {channel_id}")
                     break
                 _print(f"  Enter a number between 1 and {len(channels)}, or paste the ID.")
-            elif len(raw) >= 17:
+            elif len(raw) >= 17 and _is_id(raw):  # a pasted URL is not an ID (#1030)
                 channel_id = raw
                 _print(f"  ✅  Channel ID: {channel_id}")
                 break
@@ -268,7 +281,7 @@ async def _run_setup(env_path: Path) -> None:
         _print("       then right-click the channel → Copy Channel ID.")
         while True:
             raw = _prompt("  Channel ID")
-            if len(raw) >= 17 and raw.isdigit():
+            if len(raw) >= 17 and _is_id(raw):
                 channel_id = raw
                 break
             _print("  Channel IDs are 17-19 digit numbers. Please try again.")
@@ -277,7 +290,13 @@ async def _run_setup(env_path: Path) -> None:
     _print()
     _print("Step 4 — Your Discord User ID  (optional — used for @-mentions)")
     _print("  Tip: Right-click your username → Copy User ID  (Developer Mode required)")
-    owner_id = _prompt("  Your User ID", default="")
+    while True:
+        owner_id = _prompt("  Your User ID", default="")
+        # main.py refuses a non-numeric DISCORD_OWNER_ID (#451) — a username
+        # here used to be written anyway and fail only at ``c-lord start`` (#1062).
+        if not owner_id or _is_id(owner_id):
+            break
+        _print("  User IDs are numeric (not your username). Leave empty to skip.")
 
     # --- Working directory -------------------------------------------------
     _print()

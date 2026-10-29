@@ -18,9 +18,10 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
@@ -51,6 +52,41 @@ def _current_uid() -> int | None:
     """Our own UID, or ``None`` where the platform has no such notion."""
     getuid = getattr(os, "getuid", None)
     return getuid() if getuid is not None else None
+
+
+async def _read_json_object(
+    request: web.Request,
+) -> tuple[dict[str, Any], web.Response | None]:
+    """The request body as a JSON object, or the 400 to answer with.
+
+    Valid JSON that is not an object (``[1]``, ``"text"``) used to reach
+    ``data.get`` and come back as a 500 (#1037).
+    """
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return {}, web.json_response({"error": "Invalid JSON"}, status=400)
+    if not isinstance(data, dict):
+        return {}, web.json_response({"error": "Body must be a JSON object"}, status=400)
+    return data, None
+
+
+def _as_int(value: object) -> int | None:
+    """``int(value)``, or ``None`` when it is not one.
+
+    ``json.loads`` accepts ``Infinity`` / ``NaN``, and ``int(float("inf"))``
+    raises ``OverflowError`` — which no ``except (TypeError, ValueError)`` caught,
+    so the caller got a 500 with no reason (#1065).
+    """
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+# What PATCH /api/tasks/{id} can change — named in the 400 for a body with none (#1066).
+_PATCHABLE_TASK_FIELDS = ("enabled", "prompt", "interval_seconds", "working_dir")
+_INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
 
 
 class ApiServer:
@@ -332,10 +368,9 @@ class ApiServer:
 
     async def notify(self, request: web.Request) -> web.Response:
         """POST /api/notify — send an immediate notification."""
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         message = data.get("message")
         if not message:
@@ -363,10 +398,9 @@ class ApiServer:
 
     async def schedule(self, request: web.Request) -> web.Response:
         """POST /api/schedule — schedule a notification for later."""
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         message = data.get("message")
         scheduled_at = data.get("scheduled_at")
@@ -442,26 +476,37 @@ class ApiServer:
         """
         if err := self._require_task_repo():
             return err
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         for field in ("name", "prompt", "interval_seconds", "channel_id"):
             if not data.get(field):
                 return web.json_response({"error": f"{field} is required"}, status=400)
 
+        numbers: dict[str, int] = {}
+        for field in ("interval_seconds", "channel_id"):
+            number = _as_int(data[field])
+            if number is None:
+                # Not a name clash: answering 409 here sent callers looking for a
+                # task that did not exist (#1037).
+                return web.json_response({"error": f"{field} must be an integer"}, status=400)
+            numbers[field] = number
+        if numbers["interval_seconds"] < 1:
+            # #1064: PATCH refuses it too — one rule for both.
+            return web.json_response({"error": _INTERVAL_ERROR}, status=400)
+
         try:
             task_id = await self.task_repo.create(  # type: ignore[union-attr]
                 name=str(data["name"]),
                 prompt=str(data["prompt"]),
-                interval_seconds=int(data["interval_seconds"]),
-                channel_id=int(data["channel_id"]),
+                interval_seconds=numbers["interval_seconds"],
+                channel_id=numbers["channel_id"],
                 working_dir=data.get("working_dir"),
                 run_immediately=bool(data.get("run_immediately", True)),
             )
-        except Exception as exc:
-            # Most likely a UNIQUE constraint violation on name
+        except sqlite3.IntegrityError as exc:
+            # The UNIQUE constraint on name.
             logger.warning("Failed to create task: %s", exc)
             return web.json_response({"error": "Task name already exists"}, status=409)
 
@@ -498,31 +543,42 @@ class ApiServer:
         except (ValueError, KeyError):
             return web.json_response({"error": "Invalid ID"}, status=400)
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
-        updated = False
-        if "enabled" in data:
-            result = await self.task_repo.set_enabled(task_id, enabled=bool(data["enabled"]))  # type: ignore[union-attr]
-            updated = updated or result
-
+        # Check every value before writing any: a 400 used to arrive after
+        # ``enabled`` had already been saved (#1064).
         patch_kwargs: dict[str, object] = {}
         if "prompt" in data:
             patch_kwargs["prompt"] = str(data["prompt"])
         if "interval_seconds" in data:
-            patch_kwargs["interval_seconds"] = int(data["interval_seconds"])
+            interval = _as_int(data["interval_seconds"])
+            if interval is None or interval < 1:
+                # #1064: 0 / negative / false were saved with a 200.
+                return web.json_response({"error": _INTERVAL_ERROR}, status=400)
+            patch_kwargs["interval_seconds"] = interval
         if "working_dir" in data:
             patch_kwargs["working_dir"] = str(data["working_dir"])
 
-        if patch_kwargs:
-            result = await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
-            updated = updated or result
+        if await self.task_repo.get(task_id) is None:  # type: ignore[union-attr]
+            return web.json_response({"error": "Task not found"}, status=404)
+        if "enabled" not in data and not patch_kwargs:
+            # #1066: "nothing to update" is not "no such task" — a caller told 404
+            # for a typo (``enable``) went off to re-create a task that exists.
+            return web.json_response(
+                {
+                    "error": "No field to update. Accepted fields: "
+                    + ", ".join(_PATCHABLE_TASK_FIELDS)
+                },
+                status=400,
+            )
 
-        if updated:
-            return web.json_response({"status": "updated"})
-        return web.json_response({"error": "Task not found"}, status=404)
+        if "enabled" in data:
+            await self.task_repo.set_enabled(task_id, enabled=bool(data["enabled"]))  # type: ignore[union-attr]
+        if patch_kwargs:
+            await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
+        return web.json_response({"status": "updated"})
 
     # ------------------------------------------------------------------
     # AI Lounge endpoints (/api/lounge)
@@ -580,10 +636,9 @@ class ApiServer:
         if err := self._require_lounge_repo():
             return err
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         message = data.get("message", "").strip()
         if not message:
@@ -630,10 +685,9 @@ class ApiServer:
         Returns (201):
             ``{"status": "spawned", "thread_id": "...", "thread_name": "..."}``
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         prompt = (data.get("prompt") or "").strip()
         if not prompt:
@@ -642,6 +696,10 @@ class ApiServer:
         raw_channel_id = data.get("channel_id") or self.default_channel_id
         if not raw_channel_id:
             return web.json_response({"error": "No channel specified"}, status=400)
+
+        channel_id = _as_int(raw_channel_id)
+        if channel_id is None:
+            return web.json_response({"error": "channel_id must be an integer"}, status=400)
 
         # Resolve ClaudeChatCog lazily from the bot (zero-config; no constructor change).
         from ..cogs.claude_chat import ClaudeChatCog  # avoid circular import at module level
@@ -652,11 +710,6 @@ class ApiServer:
                 {"error": "ClaudeChatCog is not loaded"},
                 status=503,
             )
-
-        try:
-            channel_id = int(raw_channel_id)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "channel_id must be an integer"}, status=400)
 
         import discord as _discord
 
@@ -725,18 +778,16 @@ class ApiServer:
         if err := self._require_resume_repo():
             return err
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         raw_thread_id = data.get("thread_id")
         if not raw_thread_id:
             return web.json_response({"error": "thread_id is required"}, status=400)
 
-        try:
-            thread_id = int(raw_thread_id)
-        except (TypeError, ValueError):
+        thread_id = _as_int(raw_thread_id)
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         session_id: str | None = data.get("session_id") or None
@@ -847,10 +898,9 @@ class ApiServer:
         except (ValueError, KeyError):
             return web.json_response({"error": "Invalid thread_id"}, status=400)
 
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         content = (data.get("content") or "").strip()
         if not content:
@@ -895,17 +945,15 @@ class ApiServer:
             400 on validation errors (missing / empty fields, missing file).
             404 if the thread cannot be resolved.
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
             return web.json_response({"error": "thread_id is required"}, status=400)
-        try:
-            thread_id = int(thread_id_raw)
-        except (TypeError, ValueError):
+        thread_id = _as_int(thread_id_raw)
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         content = (data.get("content") or "").strip()
@@ -1019,17 +1067,15 @@ class ApiServer:
             400 on validation errors.
             404 if the thread cannot be resolved.
         """
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        data, err = await _read_json_object(request)
+        if err is not None:
+            return err
 
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
             return web.json_response({"error": "thread_id is required"}, status=400)
-        try:
-            thread_id = int(thread_id_raw)
-        except (TypeError, ValueError):
+        thread_id = _as_int(thread_id_raw)
+        if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
         question = (data.get("question") or "").strip()

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from ..discord_ui.subagent_poster import DiscordSubagentPoster
 from ..discord_ui.turn_progress import TurnProgress
 from ..host_restart_notice import notify_host_restart_stops
 from ..notify_policy import owner_notify_id
@@ -43,6 +44,12 @@ from ..transcript.mirror import (
 )
 from ..transcript.recovery import final_answer_needs_recovery_async
 from ..transcript.resolver import derive_project_dir
+from ..transcript.subagents import (
+    SubagentLog,
+    subagent_log_enabled,
+    subagent_progress_seconds,
+    subagent_voices_enabled,
+)
 
 if TYPE_CHECKING:
     from ..database.repository import SessionRepository
@@ -307,6 +314,10 @@ class TranscriptMirrorCog(commands.Cog):
             fold_post=fold_post,
             fold_edit=fold_edit,
             expect_turn=expect_turn,
+            subagent_log=self._make_subagent_log(thread_id, project_dir),
+            # #1011/#1012: the on_ready restore picks up a turn that may still
+            # be running; a mirror started for a new turn has nothing to recover.
+            resumed=not expect_turn,
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -410,6 +421,29 @@ class TranscriptMirrorCog(commands.Cog):
             edit=edit,
             delete=delete,
             quiet_seconds=turn_progress_quiet_seconds(),
+        )
+
+    def _make_subagent_log(self, thread_id: int, project_dir: Path) -> SubagentLog | None:
+        """Build the #971 sub-agent log for *thread_id*, or None when disabled.
+
+        Wired here so an upgrade alone turns it on (Zero-Config Principle).
+        ``CLORD_SUBAGENT_LOG=0`` opts out; ``CLORD_SUBAGENT_VOICES=1`` adds the
+        agents' named messages and reports.
+        """
+        if not subagent_log_enabled():
+            return None
+        poster = DiscordSubagentPoster(
+            bot=self.bot,
+            thread_id=thread_id,
+            resolve_channel=lambda tid: self._resolve_channel(self.bot, tid),
+            send_chunks=self._send_chunks,
+        )
+        return SubagentLog(
+            thread_id=thread_id,
+            project_dir=project_dir,
+            poster=poster,
+            voices=subagent_voices_enabled(),
+            progress_seconds=subagent_progress_seconds(),
         )
 
     def _make_fold(self, thread_id: int):

@@ -16,7 +16,12 @@ lamp is adopted by a new manager:
 - it is **still running** → 🟢, with the ordinary stall monitor fed by the
   transcript (#769), until the mirror reads the turn's end marker, a re-read of
   the transcript says it is over, or a newer turn in the thread takes over — then
-  🟡, exactly as a turn that ended in this process would.
+  🟡, exactly as a turn that ended in this process would. Past
+  :data:`MAX_SECONDS` the watch only slows down (#992): somebody keeps looking
+  at the lamp until the turn ends, so a 🟢 never outlives its turn. A turn
+  whose claude is **positively gone** from the pane can never end — the
+  transcript stays mid-turn for ever — so the watch lets go there, on ⚠️,
+  instead of being carried into every later restart (#870).
 
 Only lamps are touched: the bot's own 🟢/⏳/⚠️. A 🟡 or ❌ is already final.
 Failures are logged and dropped — the lamp is decoration (#632).
@@ -68,9 +73,16 @@ POLL_SECONDS = 2.0
 #: did not see (it tails from EOF, so an end written before it started is only
 #: visible in the file).
 RECHECK_SECONDS = 15.0
-#: A turn still "running" after this long is left to the stall monitor's ⚠️;
-#: the watcher stops so it cannot live for ever.
+#: A turn still "running" after this long is watched at the slow pace below —
+#: never dropped (#992, decided 2026-10-29). The stall monitor keeps running, so
+#: a turn that went quiet reads ⚠️, and a turn that ends still reads 🟡. Before,
+#: the watcher gave up here and stopped that monitor too, leaving a 🟢 on a
+#: finished turn for good. The slow watch is two cheap checks a few minutes
+#: apart; it ends with the turn, with a newer turn, or with the process.
 MAX_SECONDS = 6 * 3600.0
+#: The pace past :data:`MAX_SECONDS`.
+SLOW_POLL_SECONDS = 60.0
+SLOW_RECHECK_SECONDS = 300.0
 
 #: How an adopted lamp's turn ended (#907). ``"over"``: it had already ended
 #: when the new process looked; ``"ended"``: it ended while being watched.
@@ -110,15 +122,20 @@ async def adopt_orphaned_lamp(
     poll_seconds: float = POLL_SECONDS,
     recheck_seconds: float = RECHECK_SECONDS,
     max_seconds: float = MAX_SECONDS,
+    slow_poll_seconds: float = SLOW_POLL_SECONDS,
+    slow_recheck_seconds: float = SLOW_RECHECK_SECONDS,
+    claude_alive: Callable[[], Awaitable[bool]] | None = None,
 ) -> TurnEnd | None:
     """Bring *message*'s orphaned lamp back in line with the turn it belongs to.
 
     *turn_running* answers "is this thread's turn still going?" from the
-    transcript. Returns once the lamp is final (or the watch gave up). Run it
-    as its own task: while the turn is running it waits for the turn's end.
+    transcript. *claude_alive* answers "is there still a claude to end it?" —
+    False only on a positive reading (a pane that cannot be read is alive).
+    Returns once the lamp is final (or the watch let go). Run it as its own
+    task: while the turn is running it waits for the turn's end.
 
     Returns how the turn ended when it reached its end (#907); ``None`` when
-    there was no lamp to adopt, a newer turn took over, or the watch gave up.
+    there was no lamp to adopt, a newer turn took over, or the watch failed.
     """
     ctx = log_ctx(thread_id=thread_id)
     try:
@@ -140,6 +157,7 @@ async def adopt_orphaned_lamp(
         since = datetime.now(_UTC)
         loop = asyncio.get_running_loop()
         started = last_check = loop.time()
+        slowed = False
         # Makes this task the turn's task, so the monitor behaves as it would
         # for a turn started in this process.
         await manager.set_running()
@@ -158,12 +176,25 @@ async def adopt_orphaned_lamp(
                 if not await turn_running():
                     reason = "transcript says the turn is over"
                     break
-            if now - started >= max_seconds:
+                if claude_alive is not None and not await claude_alive():
+                    logger.info(
+                        "%s lamp recovery: claude is gone from the pane, so the turn can "
+                        "never end — letting go of the lamp on ⚠️ (#992)",
+                        ctx,
+                    )
+                    await manager.mark_abandoned()
+                    return None
+            if not slowed and now - started >= max_seconds:
+                slowed = True
+                poll_seconds = max(poll_seconds, slow_poll_seconds)
+                recheck_seconds = max(recheck_seconds, slow_recheck_seconds)
                 logger.info(
-                    "%s lamp recovery: still running after %.0fs, giving up", ctx, now - started
+                    "%s lamp recovery: still running after %.0fs — watching every %.0fs "
+                    "from now on (#992)",
+                    ctx,
+                    now - started,
+                    poll_seconds,
                 )
-                await manager.cleanup_monitor()
-                return None
         logger.info("%s lamp recovery: %s → 🟡", ctx, reason)
         await manager.set_waiting()
         return None if reason == "a newer turn took over" else "ended"

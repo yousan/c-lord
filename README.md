@@ -6,14 +6,21 @@
 
 **Run multiple Claude Code sessions in parallel from Discord — each thread in its own git clone, so sessions never share a working tree.**
 
-<!-- TODO(#100): replace this placeholder with a ~30s demo GIF showing parent → parallel child sessions → consolidated reply. -->
+c-lord turns a Discord server into the control room for the Claude Code sessions running on your own machine. Give each task its own thread, walk away, and check on all of them from your phone, laptop, or terminal — nothing gets cut off, and everything that happened stays in the thread.
+
 <p align="center">
-  <a href="https://github.com/yousan/c-lord/issues/100">
-    <img src="docs/assets/demo-placeholder.svg" alt="c-lord demo (coming soon)" width="720">
-  </a>
+  <img src="docs/assets/demo-mock.svg" alt="Mock-up: a Discord channel with four Claude Code threads, one open showing a request, a message typed in the terminal, the reply with files, and a terminal attached to the same session (all names fictional)" width="760">
 </p>
 
-Each Discord thread becomes a fully isolated Claude Code session. Work on a feature in one thread, review a PR in another, and run a background task in a third — simultaneously, from your phone, tablet, or desktop. Each thread works in its own clone of the repository, so sessions never edit the same working tree.
+## Why c-lord
+
+- 🎛️ **Discord becomes the control room for many Claude Code sessions.** One thread is one real, interactive Claude Code running in tmux on your machine — the same thing you'd use in a terminal. Drop files into the thread and Claude gets them; files Claude makes come back as attachments. Want the keyboard? `tmux attach` to that very session.
+- ⏳ **No time limit.** A long job is never stopped for taking long. c-lord only gives up on a turn when Claude's screen has been frozen for 5 minutes, and even then it doesn't kill Claude.
+- 🧪 **A whole separate workspace per thread.** Each thread works in its own clone of your repo, so it can run its own backend and frontend together, and its own `docker compose` stack, without touching another thread's. c-lord knows which containers belong to which thread and stops them with it. (Turn it on by binding the channel to a repo with `/clord-init`; host ports are still shared, so give each stack its own.)
+- 📜 **Everything is kept in Discord.** Replies, tool activity, files — even what you type straight into the tmux pane — land in the thread. Your team can follow along, and another AI agent can read the history to pick up the work.
+- 🔒 **You choose who can drive it.** Out of the box only the owner of the Discord app can use it (talking to c-lord runs commands on your machine). Open it to a role or a list of people when you want.
+
+**Get started:** [Quick Start — 5 minutes](#quick-start--claude-in-discord-in-5-minutes) · [How it works](#the-big-idea-parallel-sessions-each-in-its-own-clone) · [Commands](docs/COMMANDS.md) · [Configuration](#configuration) · [Architecture](#architecture)
 
 **[日本語](docs/ja/README.md)** | **[简体中文](docs/zh-CN/README.md)** | **[한국어](docs/ko/README.md)** | **[Español](docs/es/README.md)** | **[Português](docs/pt-BR/README.md)** | **[Français](docs/fr/README.md)**
 
@@ -22,6 +29,8 @@ Each Discord thread becomes a fully isolated Claude Code session. Work on a feat
 > **Disclaimer:** This project is not affiliated with, endorsed by, or officially connected to Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC. This is an independent open-source tool that interfaces with the Claude Code CLI.
 
 > **Built entirely by Claude Code.** This entire codebase — architecture, implementation, tests, documentation — was written by Claude Code itself. The human author provided requirements and direction via natural language. See [How This Project Was Built](#how-this-project-was-built).
+
+**Contents:** [How it works](#the-big-idea-parallel-sessions-each-in-its-own-clone) · [What you can do](#what-you-can-do) · [Features](#features) · [Quick Start](#quick-start--claude-in-discord-in-5-minutes) · [Configuration](#configuration) · [Discord Bot Setup](#discord-bot-setup) · [GitHub automation](#github--claude-code-automation) · [Scheduled Tasks](#scheduled-tasks-1) · [Auto-Upgrade](#auto-upgrade) · [REST API](#rest-api) · [Architecture](#architecture) · [Testing](#testing) · [How this was built](#how-this-project-was-built)
 
 ---
 
@@ -63,6 +72,8 @@ Open multiple threads simultaneously. Each is an independent Claude Code session
 - **Feature + review in parallel**: Start a feature in one thread while Claude reviews a PR in another.
 - **Multiple contributors**: Different team members each get their own thread — and their own clone — so their sessions never edit the same files on disk.
 - **Experiment safely**: Try an approach in thread A while keeping thread B on stable code.
+
+**When to open a new thread, and when to split work inside one** (#969): open a new thread only when the work needs its own branch, its own dev server, or its own conversation with you. To split one piece of work — research, reviews, sorting — ask Claude to use sub-agents inside the thread: no extra `claude` process (≈285 MB each) is started, and each sub-agent's start, end and full report still land in the thread ([sub-agent log](docs/specs/subagent-log.md)). Agent Teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) is experimental and its teammates do not come back when c-lord restarts or resumes the session; do not use its split-pane display (`--teammate-mode tmux`), which adds panes to the window c-lord drives.
 
 ### Scheduled Tasks (SchedulerCog)
 
@@ -157,6 +168,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
 - **Compact notice** — When Claude Code compacts the context, the thread gets a one-line `🗜️ コンテキストを圧縮しました` instead of the raw continuation summary (#628)
 - **Hard stall lamp** — After 30 s of no activity the reaction on your message turns ⚠️ (extended thinking or context compression can be this quiet too); no message is posted to the thread (#473)
+- **Sub-agent log** — Work split across sub-agents inside one thread stays on Discord: a `🤖 サブエージェント「…」開始` / `終了 · 6:12 · ツール 48 件` line per run, the end line carrying `subagent-*.md` (full report, assignment, tool calls), the start line's copy refreshed while it runs. `CLORD_SUBAGENT_VOICES=1` adds each agent's messages and report under its own name (#971, `docs/specs/subagent-log.md`)
 - **Turn progress line** — When a turn goes quiet for 90 s, one subtext line appears (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), refreshes in place every 15 s, and disappears the moment real output returns; says `⏳ 待機中` when even tool activity has stopped. When Claude writes a progress sentence (the pane's "●" line), the line shows the newest one instead of the tool (#883) — those sentences also land in `progress.txt`, never as messages of their own. Never posted outside a turn. Opt out with `CLORD_TURN_PROGRESS=0` (#539)
 - **📊 Session Status board** — Off by default (#761). Set `CLORD_SESSION_STATUS_BOARD=1` to keep one live board in `DISCORD_CHANNEL_ID` listing each session as 🟢 Auto-processing / 🟡 Waiting for input. While it is off, a starting bot posts nothing to the channel and retires any board earlier starts left behind; the turn-end `🟡 Claude has finished … @you` ping in the thread is unaffected. See `docs/specs/session-status-board.md`
 - **Timeout notifications** — Embed with elapsed time and resume guidance, raised only when Claude is genuinely wedged (pane frozen for the whole window *and* not idle at its prompt); a normally-finished turn never triggers it (#541), and neither does a question/plan menu left waiting for your answer (#751)
@@ -191,7 +203,7 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 - **Startup resume** — Interrupted sessions restart automatically after any bot reboot; `AutoUpgradeCog` (upgrade restarts) and `ClaudeChatCog.cog_unload()` (all other shutdowns) mark them automatically, or use `POST /api/mark-resume` manually
 - **Programmatic spawn** — `POST /api/spawn` creates a new Discord thread + Claude session from any script or Claude subprocess; returns non-blocking 201 immediately after thread creation
 - **Thread ID injection** — `DISCORD_THREAD_ID` env var is passed to every Claude subprocess, enabling sessions to spawn child sessions via `$CLORD_API_URL/api/spawn`
-- **Workspace cleanup** — `/workspace-cleanup` reclaims clone directories that no running session is using (`dry_run` to preview); a directory with uncommitted changes is never removed
+- **Workspace cleanup** — `/workspace-cleanup` reclaims clone directories that no running session is using (`dry_run` to preview); a directory holding work (uncommitted changes, unpushed commits, ignored files such as `.env`) is never removed, and the reply says which (#1016)
 - **Runtime model switching** — `/model` shows and changes the model and effort at session, channel or global scope (`include-existing` also moves open sessions from their next turn)
 - **30-day cleanup, announced** — on every startup, session records untouched for **30 days** are deleted; each thread that is still open gets a 🧹 notice saying so and what survived on disk (#554), and is then archived; threads already closed are tidied without a post, so they stay closed (#857). This is what makes an old thread say "no session" — before the notice it happened in silence, so nobody could tell a cleanup from a bug. **The git clone is not deleted**, only the record linking the thread to its Claude session. Note Claude Code separately expires its own transcripts on the same 30-day default (`cleanupPeriodDays`), so a swept thread has usually lost its conversation history too — the notice checks the disk and says which of the two you still have.
 
@@ -229,9 +241,9 @@ uv run c-lord setup
 ```
 
 The wizard will:
-1. Validate your bot token against the Discord API
-2. **Automatically list available channels** — just pick a number (no ID copying)
-3. Ask for your working directory and model preference
+1. Validate your bot token against the Discord API (a token pasted as `Bot xxx` is stored as `xxx`; after 3 empty or invalid answers it stops without writing `.env`)
+2. **Automatically list available channels** — just pick a number (no ID copying), or paste a numeric channel ID (a channel URL, or digits like `²`, is asked again)
+3. Ask for your Discord user ID (optional — a username instead of the numeric ID is asked again, since `c-lord start` refuses it), your working directory and model preference
 4. Write `.env` and offer to start the bot immediately
 
 ```
@@ -400,6 +412,9 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_EVENT_LOG` | Append one JSON line per turn end (`completion` / `blocked` / `failure`) to this file, after the last reply is posted — for a dispatching agent or CI to `tail -F` instead of polling the thread. Server-side only; see [docs/specs/turn-end-events.md](docs/specs/turn-end-events.md) (#917) | (off) |
 | `CLORD_EVENT_WEBHOOK_URL` / `CLORD_EVENT_WEBHOOK_SECRET` | POST the same event as JSON to this URL, with `X-Clord-Signature: sha256=<HMAC-SHA256 of the body>`. Nothing is sent without the secret. Failures are retried a few times and never block the turn (#917) | (off) |
 | `CLORD_EVENT_DEFER_MAX_SECONDS` | How long a `completion` is held while background sub-agents are still running before it is sent anyway | `3600` |
+| `CLORD_SUBAGENT_LOG` | `0` stops the sub-agent log: one `🤖 … 開始` / `終了` line per run of a sub-agent, the end line carrying `subagent-*.md` (the full report, the assignment and every tool call), the start line's copy of it replaced while the agent works. See [docs/specs/subagent-log.md](docs/specs/subagent-log.md) (#971) | `true` |
+| `CLORD_SUBAGENT_VOICES` | `1` also posts, **under the speaker's name**, the parent's assignments, every `SendMessage` between the parent and its agents, and each final report — so who told whom what can be followed in the thread. Uses a webhook when the bot has Manage Webhooks (not required: without it the name goes in front of the text). Tool calls stay in the attachment (#971) | `false` |
+| `CLORD_SUBAGENT_PROGRESS_SECONDS` | How often a running sub-agent's attached progress file is replaced (only when it changed; minimum 10) | `60` |
 | `COORDINATION_CHANNEL_ID` | Channel that gets a one-line notice when a session's turn ends; also the default AI Lounge channel | (optional) |
 | `CLORD_RENDER_TABLE_IMAGES` | Set to `1`, `true`, or `yes` to render GFM pipe tables as PNG images attached to Discord messages | (optional) |
 | `CLORD_SHOW_URL_EMBEDS` | Set to `1`/`true`/`yes`/`on` to let Discord expand OGP/link-preview cards for URLs in Claude's replies. Off by default — replies stay compact (no preview card). | `false` |
