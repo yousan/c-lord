@@ -63,6 +63,7 @@ class BridgeComponents:
         if self.resume_repo is not None:
             api_server.resume_repo = self.resume_repo
         api_server.session_repo = self.session_repo
+        api_server.session_dir_base = self.session_dir_base
 
 
 async def setup_bridge(

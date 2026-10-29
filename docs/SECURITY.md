@@ -314,6 +314,12 @@ Notes and limits:
 - It binds `CLORD_API_HOST`, **default `127.0.0.1`** — loopback only. Do not
   bind `0.0.0.0` unless something else (firewall, reverse proxy with auth) is in
   front of it; a remote peer cannot be UID-verified and will need the secret.
+- **`/api/reply`'s `progress_file` attaches only files under c-lord's session
+  dirs** (`SESSION_DIR_BASE`, symlinks and `..` resolved). Anything else is
+  posted without the attachment and logged at WARNING (#1039). Without this, a
+  caller let in with `CLORD_API_SECRET` could have the bot attach its own `.env`
+  to a thread. This narrows one direct read path; it is not a sandbox — the same
+  caller can still start a session with `POST /api/spawn` (see above).
 - One bot per port. A port collision is logged as a WARNING and the bot runs
   without the API — it does not silently attach to another bot's listener. (A
   listener belonging to *another user* cannot serve your callers either: they

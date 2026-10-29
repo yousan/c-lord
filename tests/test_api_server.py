@@ -599,9 +599,12 @@ class TestReplyEndpoint:
 
     @pytest.fixture
     async def reply_client(
-        self, repo: NotificationRepository, bot_with_thread: MagicMock
+        self, repo: NotificationRepository, bot_with_thread: MagicMock, tmp_path
     ) -> TestClient:
         api = ApiServer(repo=repo, bot=bot_with_thread, default_channel_id=12345)
+        # progress_file is attached only from under the session dirs (#1039);
+        # the tests below write theirs into tmp_path.
+        api.session_dir_base = str(tmp_path)
         server = TestServer(api.app)
         client = TestClient(server)
         await client.start_server()

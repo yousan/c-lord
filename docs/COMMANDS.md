@@ -583,3 +583,7 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
     "channel_id": 123456789
   }'
 ```
+
+`run_immediately`（`POST`）と `enabled`（`PATCH /api/tasks/{id}`）は JSON の `true` / `false` だけを受け付ける。
+`"false"` や `0` を送ると `400 {"error": "enabled must be true or false"}` が返り、何も変わらない
+（以前は文字列の `"false"` で有効になっていた — #1038）。
