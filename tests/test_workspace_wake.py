@@ -90,8 +90,19 @@ class TestRunnerWake:
         """``claude --continue`` exits immediately when the transcript is gone.
         Mirrors the #123 Part 2 fallback on the turn path."""
         _fast(monkeypatch)
-        # dead → still dead after --continue → alive after the fresh start
-        tmux_manager.is_claude_running.side_effect = [False, False, True, True]
+        # dead → still dead after --continue (verdict, then #994's re-check right
+        # before the fallback) → alive after the fresh start
+        tmux_manager.is_claude_running.side_effect = [False, False, False] + [True] * 20
+        # #994: "not running yet" alone is no verdict — the CLI's own answer is.
+        exited = (_FIXTURES_DIR / "continue_no_conversation_exited.txt").read_text()
+
+        def start(*_args, **kwargs):
+            tmux_manager.capture_pane.return_value = (
+                exited if kwargs.get("try_continue") else IDLE_PANE
+            )
+            return True
+
+        tmux_manager.start_claude.side_effect = start
 
         assert await runner.wake() is True
 
@@ -146,7 +157,8 @@ class TestRunnerWake:
         trust = (
             "Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit"
         )
-        tmux_manager.capture_pane.side_effect = [trust, IDLE_PANE, IDLE_PANE]
+        # the first read is the screen before the resume is typed (#1002)
+        tmux_manager.capture_pane.side_effect = ["$ ", trust, IDLE_PANE, IDLE_PANE]
         runner._accept_trust_prompt = AsyncMock()
 
         assert await runner.wake(timeout=1.0) is True
