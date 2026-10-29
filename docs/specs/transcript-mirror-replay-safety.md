@@ -224,6 +224,10 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
   transcript が、c-lord が次のターンを回して初めて資格を得る場合）は、
   **開始時点のサイズから**読む。開始前からディスクにあった履歴は、そもそも
   こちらが配信すべきものではなかった。
+- **「開始時点のサイズ」は、最後に書き終わった行の終わりに揃える**（#988）。開始の瞬間に
+  Claude Code が1行を書いている途中だと、生のサイズはその行の途中を指す。そこから読むと
+  行の後半だけを読んで JSON として捨て、その1件（返信本文のこともある）が届かなかった。
+  書きかけの行は、書き終わってから丸ごと1回届く。
 
 テスト: `tests/transcript/test_tail.py`
 (`test_tail_does_not_replay_history_on_resume_rewrite`,
