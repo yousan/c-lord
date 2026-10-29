@@ -531,7 +531,16 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
             outcome = "ok"
         return session_id
     except asyncio.CancelledError:
-        outcome = "cancelled"
+        # #977: a stop that had to cancel the task (a turn parked on a question
+        # card) is still the user's stop. A pre-emption stays ``cancelled``.
+        runner = config.runner
+        if (
+            getattr(runner, "stopped", False) is True
+            and getattr(runner, "preempted", False) is not True
+        ):
+            outcome = "stopped"
+        else:
+            outcome = "cancelled"
         raise
     finally:
         runs = _IN_FLIGHT.get(thread_id)

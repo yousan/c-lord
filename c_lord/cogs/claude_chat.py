@@ -3940,8 +3940,12 @@ class ClaudeChatCog(commands.Cog):
         The workspace stop archives the thread, and Discord refuses reactions in
         an archived thread (50083). The withdrawn turn paints its final 🟡 on the
         way out, so the stop waits for that before archiving — otherwise the
-        request is left with no lamp at all. A turn that does not finish in
-        time is left to finish on its own; the stop goes ahead regardless.
+        request is left with no lamp at all.
+
+        #977: a turn that does not finish in time is cancelled, as a pre-empted
+        one is (:meth:`_drain_thread_task`) — whatever it is parked on, it must
+        not outlive its workspace. Its runner was withdrawn, so the run still
+        logs ``outcome=stopped``. The stop goes ahead regardless.
         """
         task = self._active_tasks.get(thread_id)
         if task is None or task.done() or task is asyncio.current_task():
@@ -3949,10 +3953,12 @@ class ClaudeChatCog(commands.Cog):
         _done, pending = await asyncio.wait({task}, timeout=timeout)
         if pending:
             logger.warning(
-                "%s workspace stop: the turn did not end within %.0fs; stopping anyway (#909)",
+                "%s workspace stop: the turn did not end within %.0fs; cancelling it (#909/#977)",
                 log_ctx(thread_id=thread_id),
                 timeout,
             )
+            task.cancel()
+            await asyncio.wait({task}, timeout=_PREEMPT_CANCEL_GRACE)
 
     def mark_reopened(self, thread_id: int) -> None:
         """Note that ``thread_id`` was just reopened from 終了 (#512).

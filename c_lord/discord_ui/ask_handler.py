@@ -44,6 +44,7 @@ from ..utils.logger import log_ctx
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
+    CLOSE_STOPPED,
     CLOSE_TERMINAL,
     CLOSE_TIMEOUT,
     DELIVERY_DELIVERED,
@@ -953,16 +954,28 @@ async def _bridge_claimed_menu(
             else:
                 misses = 0
 
+    async def _wait_runner_stopped() -> None:
+        """Return once the turn has been stopped (#977).
+
+        A workspace stop withdraws the runner and then kills the window. Every
+        capture after that fails, which :func:`_wait_tui_resolved` rightly reads
+        as "unknown", so without this the turn waited out the 24h timeout.
+        ``is True``: a bare mock runner's attribute is truthy.
+        """
+        while getattr(runner, "stopped", False) is not True:
+            await asyncio.sleep(_PANE_RESOLVE_POLL)
+
     click_task: asyncio.Future = asyncio.ensure_future(answer_queue.get())
     tui_task: asyncio.Future = asyncio.ensure_future(_wait_tui_resolved())
+    stop_task: asyncio.Future = asyncio.ensure_future(_wait_runner_stopped())
     try:
         done, _ = await asyncio.wait(
-            {click_task, tui_task},
+            {click_task, tui_task, stop_task},
             timeout=ASK_ANSWER_TIMEOUT,
             return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
-        for t in (click_task, tui_task):
+        for t in (click_task, tui_task, stop_task):
             t.cancel()
 
     # #536: every exit below records WHY the menu stopped accepting answers.
@@ -978,6 +991,18 @@ async def _bridge_claimed_menu(
                 view=None,
             )
         await runner.cancel_menu()
+        return
+
+    if stop_task in done and click_task not in done:
+        # #977: the turn was stopped. No keystrokes — the window is going away
+        # (or ⏹ Stop already sent C-c); the run ends as a user stop right after.
+        await _close(thread.id, CLOSE_STOPPED, msg, ask_repo)
+        with contextlib.suppress(*DISCORD_CALL_FAILURES):
+            await msg.edit(
+                content="-# ⏹ 停止したので、この質問は取り消しました。",
+                embed=None,
+                view=None,
+            )
         return
 
     if click_task not in done:
