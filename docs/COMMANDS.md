@@ -588,6 +588,14 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
 `409` means only that a task with that `name` already exists. Every endpoint that reads a body
 answers `400 {"error": "Body must be a JSON object"}` to valid JSON that is not an object (#1037).
 
+`interval_seconds` must be an integer of 1 or more, on create and on `PATCH` alike — `0`, negative
+values and `false` are a `400` and nothing is saved (#1064). A `PATCH` checks every value before
+writing any, so a `400` means the task is unchanged. A `PATCH` on an existing task with none of the
+fields it can update (`enabled`, `prompt`, `interval_seconds`, `working_dir` — e.g. a typo such as
+`enable`) is a `400` naming those fields; `404 Task not found` means only that the task does not
+exist (#1066). A numeric ID sent as `Infinity` / `NaN` (which JSON parsers in Python accept) is a
+`400 "… must be an integer"` on every endpoint, not a `500` (#1065).
+
 `run_immediately`（`POST`）と `enabled`（`PATCH /api/tasks/{id}`）は JSON の `true` / `false` だけを受け付ける。
 `"false"` や `0` を送ると `400 {"error": "enabled must be true or false"}` が返り、何も変わらない
 （以前は文字列の `"false"` で有効になっていた — #1038）。

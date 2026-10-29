@@ -55,7 +55,7 @@ def test_open_error_does_not_replay_uuidless_events(tmp_path: Path) -> None:
     real_open = Path.open
 
     def emfile(self: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
-        if self == jsonl and args and args[0] == "r":
+        if self == jsonl and args and args[0] in ("r", "rb"):
             raise OSError(24, "Too many open files")
         return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -104,7 +104,7 @@ def test_open_error_mid_line_still_delivers_that_line_once(tmp_path: Path) -> No
     real_open = Path.open
 
     def emfile(self: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
-        if self == jsonl and args and args[0] == "r":
+        if self == jsonl and args and args[0] in ("r", "rb"):
             raise OSError(24, "Too many open files")
         return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
 
