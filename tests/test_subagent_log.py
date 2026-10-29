@@ -415,3 +415,17 @@ async def test_run_that_goes_silent_is_closed_eventually(tmp_path: Path) -> None
     await log.step()
     ends = [p.text for p in poster.statuses if "終了" in p.text]
     assert len(ends) == 1 and "記録が止まりました" in ends[0]
+
+
+async def test_each_agent_gets_its_own_attachment_name(tmp_path: Path) -> None:
+    """Japanese names have no ASCII slug; two agents must not share one name."""
+    _, poster = await _plain_run(tmp_path, voices=False)
+    # The fixture names are ASCII; check the numbering with a non-ASCII one too.
+    from c_lord.transcript.subagents import AgentMeta, _Agent, _filename
+
+    a = _Agent(agent_id="a1", path=tmp_path / "a", meta=AgentMeta(name="計算係"), ordinal=1)
+    b = _Agent(agent_id="a2", path=tmp_path / "b", meta=AgentMeta(name="質問係"), ordinal=2)
+    assert _filename(a) != _filename(b)
+    assert _filename(a) == "subagent-1.md"
+    names = {p.file and p.text.split("「")[1].split("」")[0] for p in poster.statuses if p.file}
+    assert names == {"probe child A (calc)", "probe child B (asks A)"}

@@ -277,6 +277,9 @@ class _Agent:
     run: _Run | None = None
     runs: int = 0
     final_status: str = ""
+    # 1, 2, … in the order this log met the agents: tells attachments apart
+    # when the name has no ASCII to put in the filename.
+    ordinal: int = 0
 
 
 @dataclass(frozen=True)
@@ -442,7 +445,13 @@ class SubagentLog:
             if agent is None:
                 path = directory / f"{stem}.jsonl"
                 start = self._baseline.get(path, 0)
-                agent = _Agent(agent_id=agent_id, path=path, offset=start, read_any=start > 0)
+                agent = _Agent(
+                    agent_id=agent_id,
+                    path=path,
+                    offset=start,
+                    read_any=start > 0,
+                    ordinal=len(self._agents) + 1,
+                )
                 self._agents[agent_id] = agent
             if agent.meta is None:
                 agent.meta = await asyncio.to_thread(_read_meta, directory / f"{stem}.meta.json")
@@ -734,4 +743,4 @@ _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 def _filename(agent: _Agent) -> str:
     name = agent.meta.name if agent.meta is not None else ""
     slug = _SLUG_RE.sub("-", name).strip("-.")[:40]
-    return f"subagent-{slug or agent.runs}.md"
+    return f"subagent-{agent.ordinal}-{slug}.md" if slug else f"subagent-{agent.ordinal}.md"
