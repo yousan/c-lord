@@ -588,14 +588,15 @@ class TranscriptMirrorCog(commands.Cog):
         """
         bot = self.bot
 
-        async def reply_sink(text: str, *, reply_to: int | None = None) -> None:
+        async def reply_sink(text: str, *, reply_to: int | None = None, quote: bool = True) -> None:
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
                 return
             send = getattr(channel, "send", None)
             if send is None:
                 return
-            reference = await self._build_trigger_reference(thread_id, reply_to)
+            # #1138: a turn a scheduled wakeup started answers nobody's message.
+            reference = await self._build_trigger_reference(thread_id, reply_to) if quote else None
             try:
                 last_msg = await self._send_chunks(send, text, reference=reference, tables=True)
             except discord.HTTPException as exc:
