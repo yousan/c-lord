@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import discord
 from discord.ext import commands
 
+from .. import turn_events
+from ..api_error import advice
 from ..discord_ui.subagent_poster import DiscordSubagentPoster
 from ..discord_ui.turn_progress import TurnProgress
 from ..host_restart_notice import notify_host_restart_stops
@@ -318,6 +320,7 @@ class TranscriptMirrorCog(commands.Cog):
             # #1011/#1012: the on_ready restore picks up a turn that may still
             # be running; a mirror started for a new turn has nothing to recover.
             resumed=not expect_turn,
+            api_error_sink=self._make_api_error_sink(thread_id),
         )
         mirror.start()
         self._mirrors[thread_id] = mirror
@@ -576,6 +579,40 @@ class TranscriptMirrorCog(commands.Cog):
                 )
 
         return sink
+
+    def _make_api_error_sink(self, thread_id: int):
+        """The ❌ notice for a self-started turn that stopped on an API error (#1131).
+
+        Same words as the runner's for a turn c-lord started (#908 — the
+        dashboard's ERROR line): what happened, what to do from Discord, and one
+        ping for whoever the thread is working for — the last turn's requester,
+        or for a webhook / bot / unknown requester the owner fallback (#520/#525).
+        """
+        bot = self.bot
+
+        async def api_error_sink(error_text: str) -> None:
+            channel = await self._resolve_channel(bot, thread_id)
+            send = getattr(channel, "send", None) if channel is not None else None
+            if send is None:
+                return
+            started_by = turn_events.last_started_by(thread_id)
+            mention_id: int | None = None
+            if started_by is not None and started_by.type == "user" and started_by.id:
+                with contextlib.suppress(ValueError):
+                    mention_id = int(started_by.id)
+            if mention_id is None:
+                mention_id = owner_notify_id(bot, kind="failure")
+            body = f"❌ Claude Code が API エラーで止まりました。{advice(error_text)}"
+            if mention_id is not None:
+                body += f" <@{mention_id}>"
+            await send(
+                body,
+                allowed_mentions=discord.AllowedMentions(
+                    users=True, roles=False, everyone=False, replied_user=False
+                ),
+            )
+
+        return api_error_sink
 
     def _make_reply_sink(self, thread_id: int):
         """Return an awaitable callable for final assistant text (no progress.txt).

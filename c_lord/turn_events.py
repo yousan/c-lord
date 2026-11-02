@@ -307,13 +307,33 @@ def note_self_turn_started(thread_id: int, at: datetime | None = None) -> None:
         )
 
 
+def is_active(thread_id: int) -> bool:
+    """Whether a run c-lord started is still going in *thread_id* (#1131)."""
+    return thread_id in _ACTIVE
+
+
+def last_started_by(thread_id: int) -> StartedBy | None:
+    """Who started the last turn c-lord ran in *thread_id* (#1131), or ``None``.
+
+    A turn Claude starts by itself names nobody; this is who it is working for.
+    """
+    info = _LAST_INFO.get(thread_id)
+    return info.started_by if info is not None else None
+
+
 def end_turn(info: TurnInfo | None) -> None:
     """The run for *info* is over (whatever the outcome)."""
     if info is not None and _ACTIVE.get(info.thread_id) is info:
         del _ACTIVE[info.thread_id]
 
 
-def note_turn_end(thread_id: int, outstanding: int, *, self_started: bool = False) -> None:
+def note_turn_end(
+    thread_id: int,
+    outstanding: int,
+    *,
+    self_started: bool = False,
+    failure_reason: str | None = None,
+) -> None:
     """The transcript says a turn ended in *thread_id* with *outstanding* agents running.
 
     Called by the mirror after it has posted the turn's final answer and before it
@@ -321,6 +341,10 @@ def note_turn_end(thread_id: int, outstanding: int, *, self_started: bool = Fals
     a ``completion`` held for background agents once none are left.
     *self_started*: a ``<task-notification>`` (#961) or a scheduled wakeup (#1092)
     opened the turn — with no runner to announce it, its end is announced here.
+    *failure_reason*: the self-started turn stopped on an error (``api_error``,
+    #1131). Then nothing is ``completion``: a completion held for the request
+    whose work this turn was continuing goes out as ``failure`` instead, and so
+    does the turn's own event — at once, whatever agents are still out.
     """
     if not enabled():
         return
@@ -328,6 +352,16 @@ def note_turn_end(thread_id: int, outstanding: int, *, self_started: bool = Fals
         _remember(_LAST_END, thread_id, (time.monotonic(), outstanding))
         started = _SELF.pop(thread_id, None)
         own = started if self_started else None
+        if own is not None and failure_reason is not None and thread_id not in _ACTIVE:
+            # #1131: one failure — the held request's if there is one, it is the
+            # request whose work just stopped; else this turn's own.
+            held = _HELD.pop(thread_id, None)
+            if held is not None and held.timer is not None:
+                held.timer.cancel()
+            _spawn(
+                _deliver("failure", held.info if held is not None else own, reason=failure_reason)
+            )
+            return
         released = outstanding == 0 and _release(thread_id, reason=None)
         if own is None or released or thread_id in _ACTIVE or thread_id in _HELD:
             return
