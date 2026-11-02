@@ -74,6 +74,13 @@ MAX_LINE_CHARS = 4000
 #: new agent always comes with a row of the parent's (which wakes the loop), and
 #: every thread on the host has one of these loops, so the fallback is slow.
 IDLE_WAKE_SECONDS = 300.0
+#: How often the idle loop looks at the ``subagents/`` directory itself (#1144).
+#: A new agent does *not* always come with a parent row in time: Claude Code
+#: writes the parent's ``Agent`` rows when the whole API message is done, so 9
+#: launches in one message reached the parent's file 80 s after the first child
+#: started writing its own. Creating ``agent-*.jsonl`` changes the directory's
+#: mtime, and one ``stat`` of it is all this costs.
+DIR_POLL_SECONDS = 2.0
 #: A run whose file has been quiet this long is closed if its meta says finished
 #: (the notice can be missing — a foreground call, a parent that died).
 FINISHED_QUIET_SECONDS = 30.0
@@ -459,6 +466,10 @@ class SubagentLog:
     async def _loop(self) -> None:
         await self.prime()
         while True:
+            # Cleared before the step, not after (#1144): a parent row that
+            # arrives while the step runs must wake the next one.
+            self._wake.clear()
+            stamp = self._dir_stamp()
             try:
                 await self.step()
             except asyncio.CancelledError:
@@ -468,9 +479,30 @@ class SubagentLog:
             if self._running():
                 await asyncio.sleep(self._poll_interval)
                 continue
-            self._wake.clear()
+            await self._idle_wait(stamp)
+
+    async def _idle_wait(self, stamp: int | None) -> None:
+        """Wait for a parent row, a change in ``subagents/``, or the slow fallback."""
+        deadline = time.monotonic() + IDLE_WAKE_SECONDS
+        while True:
+            timeout = min(DIR_POLL_SECONDS, deadline - time.monotonic())
+            if timeout <= 0:
+                return
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=IDLE_WAKE_SECONDS)
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+                return
+            if self._dir_stamp() != stamp:
+                return
+
+    def _dir_stamp(self) -> int | None:
+        """The ``subagents/`` directory's mtime — what a new agent's file changes (#1144)."""
+        directory = self._subagents_dir()
+        if directory is None:
+            return None
+        try:
+            return directory.stat().st_mtime_ns
+        except OSError:
+            return None
 
     def _running(self) -> bool:
         return any(a.run is not None for a in self._agents.values())
