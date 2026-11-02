@@ -30,6 +30,23 @@
    モジュールのあらゆる失敗は ``None`` を返して終わる
 2. **ミラーのパスが置き場の外に出ない。** origin URL は ``/clord repo:`` で
    利用者入力から届く (#514)
+
+**更新 (fetch) が時間切れになるミラー** (#1133/#1134 — 本番の ``yousan/openclaw``
+は 10/27〜10/29 の6回すべてで 300 秒の時間切れだった):
+
+- 時間切れのときは git をプロセスグループごと止め、受信途中の
+  ``objects/pack/tmp_*`` (1回約3GB) をその場で消す。殺された fetch の書きかけは
+  git 自身には消せない
+- ミラーに印 (``clord-fetch-timed-out``) を置き、**次からはクローンを待たせない**。
+  印が1時間以上古ければ、長い上限 (1時間) で**裏で**取り直し、成功したら印を
+  消して元の「更新してから使う」に戻る。直後は裏でも取り直さない (1回3GB を
+  スレッドごとに繰り返さない)
+- 誰かが同じミラーを更新中 (``clord-fetch.lock``) なら、その終わりも待たない
+- 以前に殺された fetch の書きかけ (2時間以上更新の無い ``tmp_*``) は、更新中で
+  ないときに消す。書きかけが残っていた = 前に fetch が殺された、なので印も置く
+
+ミラーが古いままでも正しさは変わらない。クローンは ``--reference-if-able`` で
+足りないオブジェクトを origin から取る。
 """
 
 from __future__ import annotations
@@ -39,19 +56,25 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
+import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "FETCH_TIMED_OUT_MARK",
     "MIRRORS_DIR_NAME",
     "ensure_mirror",
     "mirror_name",
     "mirrors_enabled",
     "mirrors_root_for",
     "normalise_origin",
+    "wait_for_background_fetches",
 ]
 
 #: 置き場の名前。ワークスペースは ``<root>/<channel>/<thread>`` という
@@ -70,6 +93,26 @@ _CLONE_TIMEOUT = 900.0
 #: 既存ミラーの更新を待つ上限。失敗しても困らない — クローン側が
 #: 足りないオブジェクトを origin から取るだけで、正しさは変わらない。
 _FETCH_TIMEOUT = 300.0
+
+#: 更新が時間切れになったミラーに置く印 (#1133)。あれば次の更新を待たない。
+FETCH_TIMED_OUT_MARK = "clord-fetch-timed-out"
+
+#: 印が付いたミラーを裏で取り直すまでの間隔。印の mtime = 最後に失敗した時刻。
+_BACKGROUND_RETRY_AFTER = 3600.0
+
+#: 裏で取り直すときの上限。誰も待っていないので長くてよい。
+_BACKGROUND_FETCH_TIMEOUT = 3600.0
+
+#: 同じミラーの更新を1本にする flock のファイル (ミラーの中に置く)。
+_FETCH_LOCK = "clord-fetch.lock"
+
+#: これより長く更新の無い ``objects/pack/tmp_*`` は、殺された fetch の書きかけ
+#: とみなして消す (#1134)。走っている fetch は書きかけを書き続けるので mtime が
+#: 新しい。c-lord の fetch は最長 ``_BACKGROUND_FETCH_TIMEOUT`` で止まる。
+_STALE_GARBAGE_AGE = 2 * 3600.0
+
+_background: dict[str, threading.Thread] = {}
+_background_lock = threading.Lock()
 
 _README = """# c-lord git object mirrors
 
@@ -154,12 +197,196 @@ def mirrors_root_for(base_dir: str | Path) -> Path:
 
 
 def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
-    """Never raises. タイムアウトも失敗も ``None`` / 非ゼロで返る。"""
+    """Never raises. 失敗は非ゼロ、OS エラーは ``None``、時間切れは ``returncode=-9``.
+
+    git は自分の新しいプロセスグループで走らせ、時間切れのときは**グループごと**
+    止める (#1134)。``subprocess.run(timeout=)`` は親の git しか殺さず、受信を
+    担う子 (index-pack / ssh) が書きかけの pack を育て続けていた。
+    """
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError) as exc:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
         logger.warning("git mirror: %s failed: %s", " ".join(args[:3]), exc)
         return None
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=10)
+        logger.warning("git mirror: %s timed out after %.0f seconds", " ".join(args[:4]), timeout)
+        return subprocess.CompletedProcess(args, _TIMED_OUT, "", "timed out")
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+_TIMED_OUT = -9
+
+
+def _garbage_files(target: Path) -> list[Path]:
+    """殺された git が残しうる受信途中のファイル (``objects/pack/tmp_*``)。"""
+    try:
+        return [p for p in (target / "objects" / "pack").glob("tmp_*") if p.is_file()]
+    except OSError:
+        return []
+
+
+def _remove(paths: list[Path]) -> int:
+    import contextlib
+
+    freed = 0
+    for path in paths:
+        with contextlib.suppress(OSError):
+            size = path.stat().st_size
+            path.unlink()
+            freed += size
+    return freed
+
+
+class _FetchLock:
+    """ミラー1個につき更新を1本に絞る flock。取れなければ ``held`` は False (待たない)。"""
+
+    def __init__(self, target: Path) -> None:
+        self._path = target / _FETCH_LOCK
+        self._fh: Any = None
+        self.held = False
+
+    def __enter__(self) -> _FetchLock:
+        import fcntl
+
+        try:
+            self._fh = open(self._path, "a")  # noqa: SIM115 — closed in __exit__
+            fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.held = True
+        except OSError:
+            self.held = False
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        import contextlib
+
+        if self._fh is not None:
+            with contextlib.suppress(OSError):
+                self._fh.close()
+
+
+def _mark_timed_out(target: Path, when: float | None = None) -> None:
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        mark = target / FETCH_TIMED_OUT_MARK
+        mark.touch()
+        if when is not None:
+            os.utime(mark, (when, when))
+
+
+def _sweep_stale_garbage(target: Path) -> None:
+    """以前に殺された fetch の書きかけを消す (#1134)。更新中なら触らない。"""
+    with _FetchLock(target) as lock:
+        if not lock.held:
+            return
+        now = time.time()
+        stale: list[Path] = []
+        newest = 0.0
+        for path in _garbage_files(target):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if now - mtime > _STALE_GARBAGE_AGE:
+                stale.append(path)
+                newest = max(newest, mtime)
+        if not stale:
+            return
+        freed = _remove(stale)
+        logger.info(
+            "git mirror: removed %d half-written pack(s) (%.1f GiB) left by killed fetches in %s",
+            len(stale),
+            freed / 2**30,
+            target.name,
+        )
+        # 書きかけが残っていた = その時刻に fetch が殺された。次からは待たない。
+        if not (target / FETCH_TIMED_OUT_MARK).exists():
+            _mark_timed_out(target, newest)
+
+
+def _fetch(target: Path, *, timeout: float) -> None:
+    """ミラーを更新する。**誰かが更新中なら待たずに戻る。** Never raises."""
+    with _FetchLock(target) as lock:
+        if not lock.held:
+            logger.info("git mirror: %s is being updated elsewhere — not waiting", target.name)
+            return
+        before = set(_garbage_files(target))
+        result = _run(["git", "-C", str(target), "fetch", "--quiet"], timeout=timeout)
+        if result is not None and result.returncode == _TIMED_OUT:
+            # ロックを持っているので、新しくできた書きかけは止めた git のもの。
+            ours = [p for p in _garbage_files(target) if p not in before]
+            freed = _remove(ours)
+            _mark_timed_out(target)
+            logger.warning(
+                "git mirror: fetch of %s timed out; removed %d half-written pack(s) "
+                "(%.1f GiB); later clones use it as-is and it is refetched in the background",
+                target.name,
+                len(ours),
+                freed / 2**30,
+            )
+        elif result is not None and result.returncode == 0:
+            import contextlib
+
+            with contextlib.suppress(OSError):
+                (target / FETCH_TIMED_OUT_MARK).unlink()
+
+
+def _start_background_fetch(target: Path) -> None:
+    key = str(target)
+    with _background_lock:
+        running = _background.get(key)
+        if running is not None and running.is_alive():
+            return
+        # 印を新しくしておく — 裏の fetch が失敗しても次の1時間は取り直さない。
+        _mark_timed_out(target)
+        thread = threading.Thread(
+            target=_fetch,
+            args=(target,),
+            kwargs={"timeout": _BACKGROUND_FETCH_TIMEOUT},
+            name=f"git-mirror-fetch-{target.name}",
+            daemon=True,
+        )
+        _background[key] = thread
+        thread.start()
+    logger.info("git mirror: refetching %s in the background", target.name)
+
+
+def wait_for_background_fetches(timeout: float | None = None) -> None:
+    """裏の更新が終わるまで待つ (試験用)。"""
+    with _background_lock:
+        threads = list(_background.values())
+    for thread in threads:
+        thread.join(timeout)
+
+
+def _refresh(target: Path) -> None:
+    """既存ミラーの更新。**時間切れの前歴があればクローンを待たせない** (#1133)。"""
+    _sweep_stale_garbage(target)
+    mark = target / FETCH_TIMED_OUT_MARK
+    try:
+        age = time.time() - mark.stat().st_mtime
+    except OSError:
+        age = None
+    if age is None:
+        _fetch(target, timeout=_FETCH_TIMEOUT)
+    elif age >= _BACKGROUND_RETRY_AFTER:
+        _start_background_fetch(target)
+    else:
+        logger.info("git mirror: %s timed out %.0f min ago — using it as-is", target.name, age / 60)
 
 
 def _write_readme(root: Path) -> None:
@@ -197,7 +424,7 @@ def ensure_mirror(mirrors_root: Path | str, origin: str) -> Path | None:
     if target.is_dir():
         # 足すだけ。``--prune`` は付けない — upstream で消えたブランチの
         # オブジェクトを参照しているクローンが在りうる。
-        _run(["git", "-C", str(target), "fetch", "--quiet"], timeout=_FETCH_TIMEOUT)
+        _refresh(target)
         return target
 
     return _create_mirror(root, target, origin)
