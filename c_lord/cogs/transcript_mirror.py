@@ -546,10 +546,10 @@ class TranscriptMirrorCog(commands.Cog):
         """
         bot = self.bot
 
-        async def sink(text: str) -> None:
+        async def sink(text: str) -> discord.Message | None:
             channel = await self._resolve_channel(bot, thread_id)
             if channel is None:
-                return
+                return None
             send = getattr(channel, "send", None)
             if send is None:
                 logger.warning(
@@ -557,9 +557,11 @@ class TranscriptMirrorCog(commands.Cog):
                     thread_id,
                     type(channel).__name__,
                 )
-                return
+                return None
             try:
-                await self._send_chunks(
+                # #1125: the mirror keeps the message — a text that went out here
+                # can turn out to be the turn's answer once the turn ends.
+                return await self._send_chunks(
                     send,
                     text,
                     silent=silent_posts_enabled(),
@@ -574,6 +576,7 @@ class TranscriptMirrorCog(commands.Cog):
                     exc,
                     exc_info=True,
                 )
+                return None
 
         return sink
 
