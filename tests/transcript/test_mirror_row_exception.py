@@ -159,4 +159,8 @@ async def test_idle_flush_failure_does_not_stop_the_mirror(
             await m.stop()
     assert alive, "mirror task ended"
     assert "二つ目の答え" in posted, posted
-    assert any("idle" in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    # #1103: the first reply is no longer lost — it goes out without progress.txt.
+    assert "一つ目の答え" in posted, posted
+    assert any(
+        "progress.txt" in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR
+    )

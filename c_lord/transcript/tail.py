@@ -38,9 +38,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..log_sampler import LogSampler
 from .resolver import ThreadSessionResolver
 
 logger = logging.getLogger(__name__)
+
+#: #1102: a read that keeps failing (a permission flipped, a dying disk) is on
+#: record in full once per transcript directory an hour, not once per poll.
+_POLL_FAILURE_LOG = LogSampler(3600.0)
 
 # How long the resolver may come back empty before the reader is told (#773).
 #
@@ -148,6 +153,8 @@ def _record_uuid(line: bytes, seen: set[str]) -> None:
         event = json.loads(line.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
         return
+    if not isinstance(event, dict):
+        return  # #1102: valid JSON, but not a record (``null``, a number, a list)
     uid = event.get("uuid")
     if isinstance(uid, str) and uid:
         seen.add(uid)
@@ -374,7 +381,9 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
 
     try:
         stat = active.stat()
-    except FileNotFoundError:
+    except OSError:
+        # #1102: not only a vanished file — PermissionError / EIO too. Dropped
+        # like a missing file; the next poll stats it again.
         _drop_current(state)
         return []
     size = stat.st_size
@@ -426,6 +435,8 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             event = json.loads(line.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue  # #1102: ``null`` / a number / a list is no record
         uid = event.get("uuid")
         if isinstance(uid, str) and uid:
             if uid in state.seen_uuids:
@@ -487,7 +498,26 @@ async def tail_events(
     while True:
         # The whole cycle — glob, stat, read, parse — in one worker-thread hop.
         # Splitting it would put the loop back in the middle of the syscalls.
-        for event in await _run_off_loop(_poll_once, state):
+        # #1102: one poll that raises must not end the tail. The mirror reads
+        # through this generator, and a tail that died left it waiting on an
+        # empty queue forever — no reply, no #773 notice, no ERROR. Logged and
+        # retried on the next poll; a fault that persists says so once an hour.
+        try:
+            events = await _run_off_loop(_poll_once, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            sample = _POLL_FAILURE_LOG.sample(str(project_dir))
+            if sample.emit:
+                logger.exception(
+                    "tail_events: reading the transcript failed — retrying on the next poll "
+                    "(%s)%s",
+                    project_dir,
+                    sample.suffix,
+                )
+            events = []
+            state.more_to_read = False
+        for event in events:
             yield event
 
         if not state.resolved:
