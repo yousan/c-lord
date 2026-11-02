@@ -1857,3 +1857,32 @@ def test_the_startup_restore_asks_the_mirror_to_read_back(tmp_path, monkeypatch)
     cog.start_for(1, str(tmp_path / "a"), expect_turn=False)
     cog.start_for(2, str(tmp_path / "b"))
     assert [m["resumed"] for m in made] == [True, False]
+
+
+async def test_api_error_sink_pings_the_last_requester_1131() -> None:
+    """#1131: the self-started turn's ❌ notice names the thread's last requester."""
+    from types import SimpleNamespace
+
+    from c_lord import turn_events
+    from c_lord.turn_events import StartedBy
+
+    bot = MagicMock()
+    bot.owner_id = 1
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+    turn_events.reset()
+    thread = SimpleNamespace(id=42, parent_id=1, guild=None)
+    turn_events._LAST_INFO[42] = turn_events._info_for(thread, StartedBy("user", "777"))
+    try:
+        cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+        await cog._make_api_error_sink(42)(
+            "API Error: The response stopped arriving. The response above may be incomplete."
+        )
+    finally:
+        turn_events.reset()
+
+    body = channel.send.call_args.args[0]
+    assert body.startswith("❌ Claude Code が API エラーで止まりました。")
+    assert "『続けて』" in body
+    assert body.endswith("<@777>")

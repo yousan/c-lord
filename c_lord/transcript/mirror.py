@@ -107,6 +107,9 @@ class UserFileRequest:
 
 
 UserFileSink = Callable[[UserFileRequest], Awaitable[None]]
+#: Posts the "stopped on an API error" notice for a turn no runner owns (#1131):
+#: called with the CLI's error text.
+ApiErrorSink = Callable[[str], Awaitable[None]]
 # #747: posts the repeat counter and returns a handle to edit it with later.
 FoldPost = Callable[[str], Awaitable[object | None]]
 FoldEdit = Callable[[object, str], Awaitable[None]]
@@ -827,6 +830,7 @@ class TranscriptMirror:
         unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
         subagent_log: SubagentLog | None = None,
         resumed: bool = False,
+        api_error_sink: ApiErrorSink | None = None,
     ) -> None:
         self.thread_id = thread_id
         # #971: the sub-agents' own transcripts, which this tail never reads.
@@ -851,6 +855,12 @@ class TranscriptMirror:
         # #233: delivers the files of a SendUserFile call. Optional so a mirror
         # built without one (older consumers, tests) keeps working unchanged.
         self._user_file_sink = user_file_sink
+        # #1131: a turn Claude started by itself has no runner to say ❌ when it
+        # stops on an API error; the mirror says it through this.
+        self._api_error_sink = api_error_sink
+        # #908/#1131: the CLI's API-error text when the open turn's latest reply
+        # is one (None once Claude answers past it).
+        self._turn_api_error: str | None = None
         # tool_use ids already delivered — a transcript line re-read after a
         # rewrite (#433) must not attach the same files a second time.
         self._delivered_user_files: set[str] = set()
@@ -1316,7 +1326,8 @@ class TranscriptMirror:
                         and not event.get("isSidechain")
                         and not is_rate_limit_event(event)
                     ):
-                        turn_end_bus.note_reply(self.thread_id, api_error=api_error_text(event))
+                        self._turn_api_error = api_error_text(event)
+                        turn_end_bus.note_reply(self.thread_id, api_error=self._turn_api_error)
                     self._track_background_agents(event)
                     if self._subagent_log is not None:
                         # #1021: the sub-agent log is an extra; whatever goes wrong
@@ -1421,13 +1432,16 @@ class TranscriptMirror:
                         # ending the turn (and posting the 📊 context footer), and
                         # that must never overtake the answer the footer belongs to.
                         if not event.get("isSidechain"):
+                            failure = await self._report_self_turn_api_error()
                             # #917: after the answer is out, before the runner hears
                             # of the end — see :func:`turn_events.note_turn_end`.
                             turn_events.note_turn_end(
                                 self.thread_id,
                                 len(self._background_agents),
                                 self_started=self._turn_self_started,
+                                failure_reason=failure,
                             )
+                            self._turn_api_error = None
                             turn_end_bus.mark(self.thread_id, at=_event_time(event))
                         continue
 
@@ -1899,6 +1913,35 @@ class TranscriptMirror:
                 exc_info=True,
             )
             return None
+
+    async def _report_self_turn_api_error(self) -> str | None:
+        """Say ❌ for a self-started turn that stopped on an API error (#1131).
+
+        A turn c-lord started is reported by its runner (#908). One Claude
+        started by itself — a background notification, a scheduled wakeup — has
+        none, so only the one folded English line reached the thread and the
+        turn-end event said ``completion``. Returns the failure reason for the
+        event, or ``None`` when this turn is not such a case.
+        """
+        failed = self._turn_api_error
+        if failed is None or not self._turn_self_started or turn_events.is_active(self.thread_id):
+            return None
+        logger.info(
+            "%s TranscriptMirror: self-started turn stopped on an API error (#1131)",
+            log_ctx(thread_id=self.thread_id),
+        )
+        if self._api_error_sink is not None:
+            try:
+                await self._api_error_sink(failed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "%s could not post the API-error notice (#1131)",
+                    log_ctx(thread_id=self.thread_id),
+                    exc_info=True,
+                )
+        return "api_error"
 
     async def _try_reply_sink(self, body: str, **target: int | bool) -> None:
         await self._progress.note_output()
