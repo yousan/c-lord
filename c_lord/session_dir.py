@@ -169,6 +169,10 @@ class WorktreeStatus:
     #: Entries in ``git stash list`` (#1045). Any is work; counted apart from
     #: unpushed commits so the reason says "stash", not "unpushed commit".
     stash_entries: int = 0
+    #: Stashes inside submodules, as ``"<path>: N stash entries"`` (#1121). They
+    #: live in ``<ws>/.git/modules/<name>`` — deleting the dir deletes them —
+    #: and the parent's status and ``refs/stash`` never show them.
+    submodule_stashes: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
@@ -177,6 +181,7 @@ class WorktreeStatus:
             and not self.user_changes
             and self.unpushed_commits == 0
             and self.stash_entries == 0
+            and not self.submodule_stashes
         )
 
 
@@ -327,6 +332,39 @@ def _stash_entries(path: str) -> int | None:
         return None
 
 
+#: How deep submodules of submodules are searched for stashes (#1121).
+_MAX_SUBMODULE_DEPTH = 3
+
+
+def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[str]:
+    """``"<path>: N stash entries"`` for every checked-out submodule with a stash (#1121).
+
+    Only repos with a ``.gitmodules`` are asked, so a plain checkout costs one
+    ``stat``. A submodule whose stash cannot be read is reported as having one —
+    unknown is work too, as for the parent.
+    """
+    if depth >= _MAX_SUBMODULE_DEPTH or not (Path(path) / ".gitmodules").is_file():
+        return []
+    listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
+    if listed.returncode != 0:
+        return []
+    found: list[str] = []
+    for entry in listed.stdout.split("\0"):
+        meta, _, rel = entry.partition("\t")
+        if not meta.startswith("160000 ") or not rel:
+            continue
+        sub = Path(path) / rel
+        if not (sub / ".git").exists():
+            continue  # not checked out — nothing of the user's lives there
+        n = _stash_entries(str(sub))
+        n = 1 if n is None else n
+        name = f"{prefix}{rel}"
+        if n:
+            found.append(f"{name}: {n} stash {'entry' if n == 1 else 'entries'}")
+        found += _submodule_stashes(str(sub), prefix=f"{name}/", depth=depth + 1)
+    return found
+
+
 def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
     """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
 
@@ -453,6 +491,7 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
         remote_unchecked=unchecked,
         # unknown is work too: never call a dir clean we could not read
         stash_entries=1 if stash is None else stash,
+        submodule_stashes=tuple(_submodule_stashes(path)),
     )
 
 
@@ -480,6 +519,7 @@ def describe_changes(status: WorktreeStatus) -> str:
     if status.stash_entries:
         n = status.stash_entries
         reasons.append(f"{n} stash {'entry' if n == 1 else 'entries'}")
+    reasons.extend(status.submodule_stashes)
     if status.user_changes:
         shown = ", ".join(status.user_changes[:_MAX_LOGGED_CHANGES])
         more = len(status.user_changes) - _MAX_LOGGED_CHANGES
