@@ -42,6 +42,9 @@ _lock = threading.Lock()
 _ids: set[int] | None = None
 # What the file looked like when ``_ids`` was read from it: ``(mtime_ns, size)``.
 _seen_stamp: tuple[int, int] | None = None
+# The version of the file the last failed read was logged for (#1108): retried
+# on every unknown webhook (#1075), but logged once per version, not per message.
+_failed_stamp: tuple[int, int] | None = None
 
 
 def registry_path() -> Path:
@@ -56,14 +59,23 @@ def _stamp(path: Path) -> tuple[int, int] | None:
     return (st.st_mtime_ns, st.st_size)
 
 
-def _read_file(path: Path) -> set[int] | None:
-    """The ids in *path*; ``None`` when it could not be read (not the same as empty)."""
+def _read_file(path: Path, *, quiet: bool = False) -> set[int] | None:
+    """The ids in *path*; ``None`` when it could not be read (not the same as empty).
+
+    *quiet*: this version of the file has already been reported (#1108).
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return set()
     except (OSError, ValueError):
-        logger.warning("voice webhooks: could not read %s", path, exc_info=True)
+        if not quiet:
+            logger.warning(
+                "voice webhooks: could not read %s (retried on each unknown webhook; "
+                "logged again only when the file changes — #1108)",
+                path,
+                exc_info=True,
+            )
         return None
     if not isinstance(raw, list):
         return set()
@@ -77,7 +89,7 @@ def _load(*, refresh: bool = False) -> set[int]:
     may have added to it since we last looked. Merged, never replaced: an id
     this process registered but could not write must not be forgotten.
     """
-    global _ids, _seen_stamp
+    global _ids, _seen_stamp, _failed_stamp
     if _ids is None:
         _ids = set()
         refresh = True
@@ -85,12 +97,16 @@ def _load(*, refresh: bool = False) -> set[int]:
         path = registry_path()
         stamp = _stamp(path)
         if stamp is not None and stamp != _seen_stamp:
-            read = _read_file(path)
+            read = _read_file(path, quiet=stamp == _failed_stamp)
             if read is None:
                 # Not read, so not seen (#1075): remembering the stamp would skip
                 # the file until it changes, and another instance's voice would
-                # pass as an order until then.
+                # pass as an order until then. Only the *log* is once per
+                # version (#1108) — a file that stays broken is otherwise one
+                # WARNING with a traceback per webhook message, forever.
+                _failed_stamp = stamp
                 return _ids
+            _failed_stamp = None
             _ids |= read
         _seen_stamp = stamp
     return _ids
@@ -125,7 +141,13 @@ def register(webhook_id: int) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with _file_lock(path):
-                on_disk = _read_file(path) or set()
+                on_disk = _read_file(path)
+                if on_disk is None:
+                    # Unreadable is not empty (#1109): writing back now would
+                    # erase every id another instance put there. Ours stays in
+                    # memory and goes to the file with the next register that
+                    # can read it.
+                    return
                 ids |= on_disk
                 if webhook_id in on_disk:
                     _seen_stamp = _stamp(path)
@@ -156,7 +178,8 @@ def is_voice_message(message: object) -> bool:
 
 
 def _reset_for_tests() -> None:
-    global _ids, _seen_stamp
+    global _ids, _seen_stamp, _failed_stamp
     with _lock:
         _ids = None
         _seen_stamp = None
+        _failed_stamp = None

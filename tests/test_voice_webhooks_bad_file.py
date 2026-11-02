@@ -1,0 +1,106 @@
+"""#1108 / #1109 — a voice-webhook registry that cannot be read (review 4 of #1091).
+
+#1108: since #1075 a failed read is retried on every unknown webhook message —
+right, but each retry logged a WARNING with a traceback, so a file that stays
+broken (nothing rewrites it unless voices are in use) produced one per webhook
+message, up to five per message. Now: retried every time, logged once per
+version of the file.
+
+#1109: ``register`` treated a failed read as an empty file and wrote back only
+its own ids, erasing every other instance's (#1024's whole point).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from c_lord import voice_webhooks as v
+
+
+@pytest.fixture
+def registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    p = tmp_path / "voice-webhooks.json"
+    monkeypatch.setattr(v, "registry_path", lambda: p)
+    v._reset_for_tests()
+    yield p
+    v._reset_for_tests()
+
+
+def _could_not_read(caplog: pytest.LogCaptureFixture) -> int:
+    return sum("could not read" in r.getMessage() for r in caplog.records)
+
+
+def test_corrupt_file_logs_once_per_change_not_per_message(
+    registry: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry.write_text("[777, 8")  # half-written / garbage that stays
+    with caplog.at_level(logging.WARNING, logger="c_lord.voice_webhooks"):
+        for _ in range(100):  # 100 webhook messages, e.g. from a dispatch webhook
+            v.is_voice_webhook(12345)
+    assert _could_not_read(caplog) <= 1
+
+
+def test_a_new_version_of_a_still_broken_file_is_logged_again(
+    registry: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once per *change*: a different broken file is news, so it is logged."""
+    registry.write_text("[777, 8")
+    with caplog.at_level(logging.WARNING, logger="c_lord.voice_webhooks"):
+        v.is_voice_webhook(12345)
+        registry.write_text("[777, 88")  # size changes -> a new stamp
+        v.is_voice_webhook(12345)
+    assert _could_not_read(caplog) == 2
+
+
+def test_a_quiet_retry_still_reads_the_file_once_it_is_fixed(registry: Path) -> None:
+    """#1075 is kept: not logging the retry must not mean not retrying it."""
+    registry.write_text("[777, 8")
+    for _ in range(3):
+        assert not v.is_voice_webhook(777)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores chmod")
+def test_register_after_failed_read_keeps_other_instances_ids(registry: Path) -> None:
+    registry.write_text("[777]")  # another instance's id
+    registry.chmod(0)
+    try:
+        v.register(888)
+    finally:
+        if registry.exists():
+            registry.chmod(0o600)
+    on_disk = json.loads(registry.read_text())
+    assert 777 in on_disk, on_disk
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores chmod")
+def test_an_id_not_written_after_a_failed_read_is_written_by_the_next_register(
+    registry: Path,
+) -> None:
+    """Kept in memory, then sent to the file the next time the file can be read."""
+    registry.write_text("[777]")
+    registry.chmod(0)
+    try:
+        v.register(888)
+        assert v.is_voice_webhook(888)  # still ours in this process
+    finally:
+        registry.chmod(0o600)
+    v.register(999)
+    assert set(json.loads(registry.read_text())) == {777, 888, 999}
+
+
+def test_deleted_file_then_recreated_is_read(registry: Path) -> None:
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    registry.unlink()
+    assert v.is_voice_webhook(777)  # remembered in memory
+    time.sleep(0.05)
+    registry.write_text("[999]")
+    assert v.is_voice_webhook(999)
