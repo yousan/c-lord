@@ -883,8 +883,22 @@ def pane_command_is_dead(command: object) -> bool:
 
 def _tmux_available() -> bool:
     """Return True if tmux is installed and accessible."""
+    return _tmux_installed() is True
+
+
+def _tmux_installed() -> bool | None:
+    """``True``: tmux answered. ``False``: not installed. ``None``: could not tell (#1095).
+
+    ``tmux -V`` timing out means the host is stalled, not that tmux is missing —
+    and a stalled host is exactly when the emergency brake runs. Reading that
+    as "no tmux, so nobody is running" let it sleep a running turn.
+    """
     result = _run(["tmux", "-V"])
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    if result.returncode == 127:  # not installed (see ``_run``)
+        return False
+    return None
 
 
 def server_fingerprint(socket_name: str | None = None) -> str | None:
@@ -3940,7 +3954,8 @@ def _claude_panes_listing() -> dict[int, str] | None:
     A ``list-panes`` that fails otherwise (a timeout, #699) is not.
     """
     if not _tmux_available():
-        return {}
+        # Not installed is an answer; tmux not answering is not (#1095).
+        return {} if _tmux_installed() is False else None
 
     result = _run(
         [
@@ -3966,8 +3981,14 @@ def _claude_panes_listing() -> dict[int, str] | None:
 
 
 # What tmux says when there is no server to ask — a host reboot's normal state,
-# not a failure to read one (#807).
-_NO_SERVER_RE = re.compile(r"no server running|error connecting to", re.IGNORECASE)
+# not a failure to read one (#807). Only "no server running" and a socket that
+# is not there (ENOENT) or that nobody listens on (ECONNREFUSED): a server that
+# exists but refuses the connection (EAGAIN — a stalled host) is "could not
+# read", never "nobody is running" (#1095).
+_NO_SERVER_RE = re.compile(
+    r"no server running|error connecting to .*\((No such file or directory|Connection refused)\)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
