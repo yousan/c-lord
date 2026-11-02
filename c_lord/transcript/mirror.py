@@ -557,7 +557,13 @@ def _pane_bang_label(command: str) -> str:
     shown = lines[0]
     if len(shown) > _PANE_BANG_MAX or len(lines) > 1:
         shown = shown[:_PANE_BANG_MAX] + "…"
-    code = f"`` !{shown} ``" if "`" in shown else f"`!{shown}`"
+    if "`" not in shown:
+        return f"-# ペインで打った `!{shown}` への返事"
+    # #1100: an inline code span closes at the next run of exactly as many
+    # backticks as opened it, so the fence must be longer than any run inside.
+    longest = max(len(run) for run in re.findall(r"`+", shown))
+    fence = "`" * (longest + 1)
+    code = f"{fence} !{shown} {fence}"
     return f"-# ペインで打った {code} への返事"
 
 
@@ -1309,6 +1315,7 @@ class TranscriptMirror:
                 # #1041: one row this loop cannot handle must not end it — the mirror is
                 # the thread's only delivery, and the thread used to go silent for good
                 # with nothing but an INFO line. The row is skipped, the next one is read.
+                _forget_bang_answer = False
                 try:
                     # #769: anything Claude writes to its transcript — a tool call,
                     # its result, a thinking block — proves the session is moving.
@@ -1363,7 +1370,9 @@ class TranscriptMirror:
                             started_by = None
                         if started_by is not None:
                             self._pane_bang = None
-                            self._answering_bang = None
+                            # #1099: ``_answering_bang`` waits until the #912
+                            # pre-flush below has delivered a held answer with it.
+                            _forget_bang_answer = True
                         elif not self._turn_open and (command := bash_input_command(event)):
                             self._pane_bang = command
                         if started_by == "person":
@@ -1511,6 +1520,10 @@ class TranscriptMirror:
                             )
                             progress_buf.clear()
                         self._turn_trigger = self._latest_trigger
+                    if _forget_bang_answer:
+                        # #1099: a new request's answer is not the pane command's.
+                        self._answering_bang = None
+                        _forget_bang_answer = False
 
                     # #539: record this event's activity BEFORE ticking, so the line
                     # reflects what we just read rather than the state before it —
