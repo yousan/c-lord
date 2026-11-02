@@ -15,9 +15,11 @@ Security:
 from __future__ import annotations
 
 import hmac
+import io
 import logging
 import os
 import sqlite3
+import stat
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -87,6 +89,72 @@ async def _read_json_object(
 # of the same request had already landed (#1081).
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+
+#: ``_open_inside`` results that are not an open file.
+_OUTSIDE = "outside"
+_UNOPENABLE = "unopenable"
+
+
+def _open_inside(base: str | None, requested: object) -> io.BufferedReader | str:
+    """Open ``requested`` only if the file it names is under ``base`` (#1039/#1106).
+
+    Returns an open binary file, :data:`_OUTSIDE` (not under ``base``, not a
+    usable path, or no ``base`` known) or :data:`_UNOPENABLE` (under ``base``
+    but missing / not a regular file).
+
+    The check and the open must be the same act (#1106): checking the
+    ``realpath`` string and then opening by name again let a component be
+    swapped for an outward symlink in between. So the resolved path is only
+    used to decide *which* components to walk; the walk itself starts from a
+    descriptor of ``base`` and opens each component relative to the previous
+    one with ``O_NOFOLLOW``. A component that became a symlink after the
+    check fails to open instead of being followed. ``openat`` + ``O_NOFOLLOW``
+    is POSIX, so this holds on macOS too, not only where ``/proc`` exists.
+    """
+    if not base:
+        return _OUTSIDE
+    try:
+        root = os.path.realpath(base)
+        candidate = os.path.realpath(str(requested))
+    except (ValueError, OSError):  # e.g. a NUL in the value (#1105)
+        return _OUTSIDE
+    prefix = root.rstrip(os.sep) + os.sep
+    if not candidate.startswith(prefix):
+        return _OUTSIDE
+    parts = [p for p in candidate[len(prefix) :].split(os.sep) if p]
+    if not parts:
+        return _UNOPENABLE
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(root, os.O_RDONLY | directory | cloexec)
+    except OSError:
+        return _UNOPENABLE
+    try:
+        for name in parts[:-1]:
+            nxt = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+        # O_NONBLOCK: a FIFO planted here must not hang the request.
+        fd = os.open(
+            parts[-1],
+            os.O_RDONLY | nofollow | cloexec | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        return _UNOPENABLE
+    finally:
+        os.close(dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return _UNOPENABLE
+        return os.fdopen(fd, "rb")
+    except OSError:
+        os.close(fd)
+        return _UNOPENABLE
 
 
 def _as_int(value: object) -> int | None:
@@ -1056,46 +1124,70 @@ class ApiServer:
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
-        # Issue #201: import unconditionally — `discord` is referenced later for
-        # MessageReference / table images even when progress_file is absent. A
-        # conditional import made the name a function-local that was unbound on
-        # the no-attachment path, raising UnboundLocalError -> 500.
-        import discord
-
         # Optional attachment — resolve and validate before touching Discord.
         progress_file = data.get("progress_file")
-        attachment = None
+        progress_fp: io.BufferedReader | None = None
         progress_ignored = False
         if progress_file:
             # #1039: only a file under the session dirs, symlinks and ``..``
             # resolved — checked before the file is even looked at, so a path
             # outside does not learn whether it exists either. No base (never
             # wired) means nothing is inside: an unknown boundary must not
-            # become "anywhere".
-            path: str | None = None
-            if self.session_dir_base:
-                root = os.path.realpath(self.session_dir_base)
-                candidate = os.path.realpath(str(progress_file))
-                if candidate.startswith(root.rstrip(os.sep) + os.sep):
-                    path = candidate
-            if path is None:
+            # become "anywhere". #1106: checked and opened in one walk.
+            opened = _open_inside(self.session_dir_base, progress_file)
+            if opened == _OUTSIDE:
                 # Not an error the caller can fix by retrying, and the answer
                 # itself should still arrive — so post without it (#1039).
+                # A value that is not a path at all (NUL, #1105) lands here too.
                 progress_ignored = True
                 logger.warning(
-                    "%s /api/reply: progress_file %s is outside the session dirs (%s) — "
+                    # %r: the value comes from the caller; a newline in it must
+                    # not start a fake log line (#1107).
+                    "%s /api/reply: progress_file %r is outside the session dirs (%s) — "
                     "not attached (#1039)",
                     log_ctx(thread_id=thread_id),
                     progress_file,
                     self.session_dir_base or "unknown",
                 )
-            elif not os.path.isfile(path):
+            elif isinstance(opened, str):
                 return web.json_response(
                     {"error": f"progress_file not found: {progress_file}"},
                     status=400,
                 )
             else:
-                attachment = discord.File(path, filename=os.path.basename(path))
+                progress_fp = opened
+        attachment = None
+        try:
+            if progress_fp is not None:
+                import discord
+
+                attachment = discord.File(
+                    progress_fp, filename=os.path.basename(str(progress_file))
+                )
+            return await self._send_reply(thread_id, content, attachment, progress_ignored)
+        finally:
+            # discord.File neither owns nor closes a file object it was handed
+            # (it stubs out ``close`` until its own ``close``), so give the real
+            # ``close`` back and close it on every path — 404 / 400 included
+            # (#1106).
+            if attachment is not None:
+                attachment.close()
+            if progress_fp is not None:
+                progress_fp.close()
+
+    async def _send_reply(
+        self,
+        thread_id: int,
+        content: str,
+        attachment: discord.File | None,
+        progress_ignored: bool,
+    ) -> web.Response:
+        """The Discord half of :meth:`reply`, after the attachment is open."""
+        # Issue #201: import unconditionally — `discord` is referenced later for
+        # MessageReference / table images even when progress_file is absent. A
+        # conditional import made the name a function-local that was unbound on
+        # the no-attachment path, raising UnboundLocalError -> 500.
+        import discord
 
         raw = self.bot.get_channel(thread_id)
         if raw is None:

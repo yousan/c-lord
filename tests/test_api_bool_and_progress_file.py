@@ -321,3 +321,199 @@ class TestProgressFileStaysInsideSessionDirs:
 
         assert resp.status == 200
         assert body.get("progress_file") == "ignored"
+
+
+class TestProgressFileOpenedOnceInsideTheBoundary:
+    """#1105 / #1106 / #1107 — #1058 の事後レビュー第4弾で見つかった穴。
+
+    #1106: 範囲を ``realpath`` の文字列で確かめた後に名前でもう一度開いていたため、
+    その間に途中のディレクトリを外向きの symlink に替えると外のファイルが添付された
+    (TOCTOU)。開いた後に 404/400 で返すとファイルも開きっぱなしだった。
+    #1105: NUL 入りの値で ``realpath`` が ``ValueError`` を出し 500 になっていた。
+    #1107: 捨てたときの WARNING が値を ``%s`` で書き、改行で偽のログ行を作れた。
+    """
+
+    @pytest.mark.asyncio
+    async def test_swapping_a_dir_for_an_outward_symlink_after_the_check_leaks_nothing(
+        self, repos, thread_mock: MagicMock, tmp_path: Path, monkeypatch
+    ) -> None:
+        """確かめた直後（realpath の直後）に途中のディレクトリを外向き symlink に替える。
+
+        決定的に再現するため、``realpath`` が対象のパスを解決した直後に差し替える。
+        """
+        import os
+
+        base = tmp_path / "sessions"
+        sub = base / "1" / "2" / "sub"
+        sub.mkdir(parents=True)
+        (sub / ".env").write_text("harmless\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / ".env").write_text("SECRET\n")
+        real_realpath = os.path.realpath
+
+        def racing_realpath(p, *a, **k):
+            out = real_realpath(p, *a, **k)
+            if str(p).endswith(os.path.join("sub", ".env")) and not sub.is_symlink():
+                (sub / ".env").unlink()
+                sub.rmdir()
+                sub.symlink_to(outside)
+            return out
+
+        sent: list[bytes] = []
+
+        async def send(*_a, **k):
+            for f in [k.get("file"), *(k.get("files") or [])]:
+                if f is not None:
+                    sent.append(f.fp.read())
+            return MagicMock(id=1)
+
+        thread_mock.send = AsyncMock(side_effect=send)
+        client = await _reply_client(repos, thread_mock, base)
+        try:
+            monkeypatch.setattr(os.path, "realpath", racing_realpath)
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 555666777, "content": "x", "progress_file": str(sub / ".env")},
+            )
+        finally:
+            monkeypatch.undo()
+            await client.close()
+
+        assert b"SECRET\n" not in sent, "確かめた後に差し替えた外のファイルが添付された"
+        assert resp.status in (200, 400)
+
+    @pytest.mark.asyncio
+    async def test_a_symlinked_dir_inside_the_session_still_attaches(
+        self, repos, thread_mock: MagicMock, tmp_path: Path
+    ) -> None:
+        """中を指す symlink（例: 置き場所自体が symlink 経由）は従来どおり添付する。"""
+        base = tmp_path / "sessions"
+        (base / "1" / "2").mkdir(parents=True)
+        (base / "1" / "2" / "progress.txt").write_text("ok\n")
+        link_base = tmp_path / "linkbase"
+        link_base.symlink_to(base)
+        client = await _reply_client(repos, thread_mock, link_base)
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={
+                    "thread_id": 555666777,
+                    "content": "x",
+                    "progress_file": str(link_base / "1" / "2" / "progress.txt"),
+                },
+            )
+        finally:
+            await client.close()
+
+        assert resp.status == 200
+        assert len(_sent_files(thread_mock)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_directory_inside_is_400(
+        self, repos, thread_mock: MagicMock, tmp_path: Path
+    ) -> None:
+        base = tmp_path / "sessions"
+        (base / "1" / "2").mkdir(parents=True)
+        client = await _reply_client(repos, thread_mock, base)
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 555666777, "content": "x", "progress_file": str(base / "1")},
+            )
+        finally:
+            await client.close()
+
+        assert resp.status == 400
+        assert _sent_files(thread_mock) == []
+
+    @pytest.mark.skipif(
+        not Path("/proc/self/fd").is_dir(), reason="needs /proc to list open descriptors"
+    )
+    @pytest.mark.asyncio
+    async def test_a_404_does_not_leave_the_file_open(self, repos, tmp_path: Path) -> None:
+        import gc
+        import os
+
+        base = tmp_path / "sessions"
+        f = base / "1" / "2" / "progress.txt"
+        f.parent.mkdir(parents=True)
+        f.write_text("x")
+        repo, _ = repos
+        bot = MagicMock()
+        bot.get_channel.return_value = None
+        bot.fetch_channel = AsyncMock(side_effect=Exception("gone"))
+        api = ApiServer(repo=repo, bot=bot, default_channel_id=1)
+        api.session_dir_base = str(base)
+        client = TestClient(TestServer(api.app))
+        await client.start_server()
+        try:
+            for _ in range(5):
+                resp = await client.post(
+                    "/api/reply",
+                    json={"thread_id": 7, "content": "x", "progress_file": str(f)},
+                )
+                assert resp.status == 404
+        finally:
+            await client.close()
+        gc.collect()
+
+        def _open_to(path: str) -> int:
+            n = 0
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    if os.readlink(f"/proc/self/fd/{fd}") == path:
+                        n += 1
+                except OSError:
+                    pass
+            return n
+
+        assert _open_to(os.path.realpath(f)) == 0, "404 で返したのに添付のファイルが開いたまま"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("where", ["inside", "outside"])
+    async def test_a_nul_in_the_path_is_not_a_500(
+        self, repos, thread_mock: MagicMock, tmp_path: Path, where: str
+    ) -> None:
+        """#1105: 外の場所と同じく添付を捨てて本文は届ける（200 + ignored）。"""
+        base = tmp_path / "sessions"
+        (base / "1" / "2").mkdir(parents=True)
+        value = str(base / "1" / "2" / "a\x00b") if where == "inside" else "/etc/pass\x00wd"
+        client = await _reply_client(repos, thread_mock, base)
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={"thread_id": 555666777, "content": "x", "progress_file": value},
+            )
+            body = await resp.json()
+        finally:
+            await client.close()
+
+        assert resp.status == 200
+        assert body.get("progress_file") == "ignored"
+        assert _sent_files(thread_mock) == []
+
+    @pytest.mark.asyncio
+    async def test_the_warning_stays_on_one_line(
+        self, repos, thread_mock: MagicMock, tmp_path: Path, caplog
+    ) -> None:
+        """#1107: 呼び出し元の改行でログに偽の行を作らせない。"""
+        base = tmp_path / "sessions"
+        base.mkdir()
+        client = await _reply_client(repos, thread_mock, base)
+        try:
+            with caplog.at_level(logging.WARNING):
+                await client.post(
+                    "/api/reply",
+                    json={
+                        "thread_id": 555666777,
+                        "content": "x",
+                        "progress_file": "/x\n2026-10-29 00:00:00 [INFO] fake: thread=999 exit",
+                    },
+                )
+        finally:
+            await client.close()
+
+        msgs = [r.getMessage() for r in caplog.records if "progress_file" in r.getMessage()]
+        assert msgs, "WARNING が出ていない"
+        assert not any("\n" in m for m in msgs), "呼び出し元の改行がそのままログに書かれた"
