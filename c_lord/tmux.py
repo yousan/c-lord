@@ -883,8 +883,22 @@ def pane_command_is_dead(command: object) -> bool:
 
 def _tmux_available() -> bool:
     """Return True if tmux is installed and accessible."""
+    return _tmux_installed() is True
+
+
+def _tmux_installed() -> bool | None:
+    """``True``: tmux answered. ``False``: not installed. ``None``: could not tell (#1095).
+
+    ``tmux -V`` timing out means the host is stalled, not that tmux is missing —
+    and a stalled host is exactly when the emergency brake runs. Reading that
+    as "no tmux, so nobody is running" let it sleep a running turn.
+    """
     result = _run(["tmux", "-V"])
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    if result.returncode == 127:  # not installed (see ``_run``)
+        return False
+    return None
 
 
 def server_fingerprint(socket_name: str | None = None) -> str | None:
@@ -1023,7 +1037,18 @@ class TmuxSessionManager:
         sibling sharing its name. Plain names still arrive from the operator-facing
         :meth:`remap_window`, and those stay session-qualified.
         """
-        return window if _WINDOW_ID_RE.match(window) else f"{self.session_name}:{window}"
+        return window if _WINDOW_ID_RE.match(window) else f"={self.session_name}:{window}"
+
+    @property
+    def _session_target(self) -> str:
+        """This session as a tmux ``-t`` target, matched **exactly** (#1120).
+
+        ``-t foo`` is a prefix match: with no ``foo`` session yet but a
+        ``foobar``, it resolved to ``foobar`` — the thread's window was made in
+        another repo's session and /tmux-list showed it twice. ``=foo`` matches
+        ``foo`` only. A window target is ``=foo:<window>`` for the same reason.
+        """
+        return f"={self.session_name}"
 
     def _check_available(self) -> bool:
         """Check and cache tmux availability."""
@@ -1055,7 +1080,7 @@ class TmuxSessionManager:
         """
         if not self._check_available():
             return
-        _run(["tmux", "set-option", "-t", self.session_name, "window-size", "manual"])
+        _run(["tmux", "set-option", "-t", self._session_target, "window-size", "manual"])
 
     def _current_client_size(self) -> tuple[int, int] | None:
         """Return ``(width, height)`` of an attached client, or ``None``.
@@ -1069,7 +1094,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-clients",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{client_width} #{client_height}",
             ]
@@ -1114,7 +1139,7 @@ class TmuxSessionManager:
         Returns True if the session is available (already existed or was
         created), False on failure.
         """
-        result = _run(["tmux", "has-session", "-t", self.session_name])
+        result = _run(["tmux", "has-session", "-t", self._session_target])
         if result.returncode == 0:
             self._ensure_window_size_manual()  # #403
             self._strip_sensitive_env()  # #353
@@ -1152,7 +1177,7 @@ class TmuxSessionManager:
         if self._env_stripped:
             return
         for key in SENSITIVE_ENV_KEYS:
-            _run(["tmux", "set-environment", "-t", self.session_name, "-r", key])
+            _run(["tmux", "set-environment", "-t", self._session_target, "-r", key])
         self._env_stripped = True
         logger.info(
             "Marked %d secret(s) for removal in tmux session %s — new windows "
@@ -1216,7 +1241,7 @@ class TmuxSessionManager:
         if result.returncode == 0:
             deadline = time.monotonic() + _SERVER_START_TIMEOUT
             while time.monotonic() < deadline:
-                if _run(["tmux", "has-session", "-t", self.session_name]).returncode == 0:
+                if _run(["tmux", "has-session", "-t", self._session_target]).returncode == 0:
                     logger.info(
                         "Started tmux server in its own systemd unit — a c-lord "
                         "restart will no longer kill tmux sessions (#503)"
@@ -1289,7 +1314,7 @@ class TmuxSessionManager:
         Falls back to the instance counter only when ``list-windows`` fails,
         where the alternative is not creating the window at all.
         """
-        result = _run(["tmux", "list-windows", "-t", self.session_name, "-F", "#{window_name}"])
+        result = _run(["tmux", "list-windows", "-t", self._session_target, "-F", "#{window_name}"])
         if result.returncode != 0:
             name = f"{WINDOW_PREFIX}{self._next_work_id}"
             self._next_work_id += 1
@@ -1358,7 +1383,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_id}\t#{window_name}\t#{@thread_id}\t#{pane_current_path}",
             ]
@@ -1598,7 +1623,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_id}\t#{window_name}",
             ]
@@ -1748,7 +1773,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_id}\t#{pane_current_path}",
             ]
@@ -1856,7 +1881,7 @@ class TmuxSessionManager:
                 "-s",
                 window_id,
                 "-t",
-                f"{self.session_name}:",
+                f"={self.session_name}:",
             ]
         )
         if result.returncode != 0:
@@ -1964,7 +1989,7 @@ class TmuxSessionManager:
                     "-F",
                     "#{window_id}",
                     "-t",
-                    self.session_name,
+                    self._session_target,
                     "-n",
                     window_name,
                     "-c",
@@ -2053,7 +2078,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_id}\t#{window_name}\t#{window_active}",
             ]
@@ -2092,10 +2117,10 @@ class TmuxSessionManager:
                     "-s",
                     window_id,
                     "-t",
-                    f"{self.session_name}:{_SORT_TMP_BASE + offset}",
+                    f"={self.session_name}:{_SORT_TMP_BASE + offset}",
                 ]
             )
-        _run(["tmux", "move-window", "-r", "-t", self.session_name])
+        _run(["tmux", "move-window", "-r", "-t", self._session_target])
 
         # Restore the active window: parking/renumbering resets the session's
         # current window to the base index, which would yank an attached user's
@@ -2253,7 +2278,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_name}\t#{window_id}\t#{window_index}\t#{@thread_id}",
             ]
@@ -2328,7 +2353,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_name}\t#{@thread_id}\t#{window_id}\t#{@clord_owner}"
                 "\t#{pane_current_path}",
@@ -3264,7 +3289,7 @@ class TmuxSessionManager:
         window = self._find_window_for_thread(thread_id)
         if window is None:
             return None
-        return self._pane_path(f"{self.session_name}:{window}")
+        return self._pane_path(f"={self.session_name}:{window}")
 
     def send_keys(self, thread_id: int, *keys: str) -> bool:
         """Send raw tmux key names to the window (e.g. ``"Down"``, ``"Enter"``).
@@ -3548,7 +3573,7 @@ class TmuxSessionManager:
                 "tmux",
                 "list-windows",
                 "-t",
-                self.session_name,
+                self._session_target,
                 "-F",
                 "#{window_index}\t#{window_name}\t#{window_active}",
             ]
@@ -3940,7 +3965,8 @@ def _claude_panes_listing() -> dict[int, str] | None:
     A ``list-panes`` that fails otherwise (a timeout, #699) is not.
     """
     if not _tmux_available():
-        return {}
+        # Not installed is an answer; tmux not answering is not (#1095).
+        return {} if _tmux_installed() is False else None
 
     result = _run(
         [
@@ -3966,8 +3992,14 @@ def _claude_panes_listing() -> dict[int, str] | None:
 
 
 # What tmux says when there is no server to ask — a host reboot's normal state,
-# not a failure to read one (#807).
-_NO_SERVER_RE = re.compile(r"no server running|error connecting to", re.IGNORECASE)
+# not a failure to read one (#807). Only "no server running" and a socket that
+# is not there (ENOENT) or that nobody listens on (ECONNREFUSED): a server that
+# exists but refuses the connection (EAGAIN — a stalled host) is "could not
+# read", never "nobody is running" (#1095).
+_NO_SERVER_RE = re.compile(
+    r"no server running|error connecting to .*\((No such file or directory|Connection refused)\)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
