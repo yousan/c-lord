@@ -86,6 +86,25 @@ def _as_final_answer(event: dict) -> FinalAnswer | None:
     return FinalAnswer(uuid=uuid, text=rendered.body)
 
 
+def _ends_in_api_error(event: dict, ended_in_error: bool) -> bool:
+    """Track whether the turn so far ends in an API error / limit refusal (#1143).
+
+    Fed every event in order; returns the new state. A main-thread assistant
+    row sets it to whether that row is Claude Code's ``isApiErrorMessage`` —
+    the usage-limit refusal (#631) and an API error (#908) alike. Everything
+    else leaves it as it was, so at the turn-end marker it says whether the
+    **last** assistant row of the turn was such an error.
+
+    A turn that ends like that has no answer to re-deliver: the live path
+    already said ❌ / ⏳ in Japanese, and the last text that *looks* like an
+    answer is either the raw English error or a progress line posted earlier
+    in the turn ("The rebuild succeeded. Repacking …").
+    """
+    if event.get("type") != "assistant" or event.get("isSidechain"):
+        return ended_in_error
+    return bool(event.get("isApiErrorMessage"))
+
+
 def last_completed_final_answer(project_dir: Path) -> FinalAnswer | None:
     """Return the final answer of the last completed turn, or ``None``.
 
@@ -107,6 +126,7 @@ def last_completed_final_answer(project_dir: Path) -> FinalAnswer | None:
     # which is exactly "the last answer at or before the last turn-end marker".
     candidate: FinalAnswer | None = None
     answer: FinalAnswer | None = None
+    ended_in_error = False
     try:
         with jsonl.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -118,8 +138,12 @@ def last_completed_final_answer(project_dir: Path) -> FinalAnswer | None:
                 except json.JSONDecodeError:
                     continue
                 if _is_turn_end(event):
+                    if ended_in_error:  # #1143: nothing to re-deliver
+                        candidate = None
                     answer = candidate
+                    ended_in_error = False
                     continue
+                ended_in_error = _ends_in_api_error(event, ended_in_error)
                 found = _as_final_answer(event)
                 if found is not None:
                     candidate = found
@@ -181,6 +205,7 @@ def final_answer_needs_recovery(project_dir: Path, cursor_uuid: str | None) -> F
     answer: FinalAnswer | None = None
     answer_idx = -1
     cursor_idx = -1
+    ended_in_error = False
     try:
         with jsonl.open("r", encoding="utf-8", errors="replace") as f:
             for idx, line in enumerate(f):
@@ -194,8 +219,12 @@ def final_answer_needs_recovery(project_dir: Path, cursor_uuid: str | None) -> F
                 if cursor_uuid is not None and cursor_idx < 0 and event.get("uuid") == cursor_uuid:
                     cursor_idx = idx
                 if _is_turn_end(event):
+                    if ended_in_error:  # #1143: nothing to re-deliver
+                        candidate, candidate_idx = None, -1
                     answer, answer_idx = candidate, candidate_idx
+                    ended_in_error = False
                     continue
+                ended_in_error = _ends_in_api_error(event, ended_in_error)
                 found = _as_final_answer(event)
                 if found is not None:
                     candidate, candidate_idx = found, idx
