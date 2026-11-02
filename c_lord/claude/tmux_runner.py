@@ -72,6 +72,13 @@ _STARTUP_TIMEOUT = 30.0
 # ``timeout_seconds`` backstop still bounds the wait.
 _TURN_START_GRACE = 120.0
 
+# #1132: how long the pane may look finished while Claude's transcript says the
+# turn is still going before the pane is believed anyway. A long prompt Claude
+# Code takes as a paste shows no spinner and nothing new for the 15–40 s before
+# the first output, and the pane exit used to close such turns 14 s in. The cap
+# only keeps a build that writes no turn-end marker from waiting forever.
+_IN_FLIGHT_PANE_GRACE = 120.0
+
 # Prefix of the RESULT error for "this turn never produced anything" (#562).
 # Exported so callers can recognise the outcome without string-sniffing.
 NO_RESPONSE_ERROR_PREFIX = "No response —"
@@ -2071,6 +2078,8 @@ class TmuxClaudeRunner:
         # of polling. The baseline is empty on a fresh start, so the first real
         # response trivially differs and cold starts are unaffected.
         saw_generation = False
+        # #1132: whether "the transcript holds this turn open" was logged yet.
+        held_logged = False
         baseline_response: str | None = None
         # #562: the #365 gate, hoisted out of the loop body. The idle exit and
         # the final verdict both need it, and it must be defined even if the
@@ -2515,13 +2524,27 @@ class TmuxClaudeRunner:
                 )
                 break
 
-            if (
+            # #1132: the pane may only say "done" when the transcript does not
+            # say otherwise — see :meth:`_transcript_holds_turn`.
+            pane_done = bool(
                 last_response
                 and stable_seconds >= _RESPONSE_STABLE_TIMEOUT
                 and not is_gen
                 and new_turn_started
                 and (has_prompt or stable_seconds >= _RESPONSE_STABLE_FALLBACK)
+            )
+            pane_idle = bool(
+                not last_response
+                and stable_seconds >= _IDLE_TIMEOUT
+                and raw_static_seconds >= _IDLE_TIMEOUT
+            )
+            if (pane_done or pane_idle) and self._transcript_holds_turn(
+                turn_started_at, elapsed, stable_seconds, held_logged
             ):
+                held_logged = True
+                continue
+
+            if pane_done:
                 break
 
             # Idle timeout: no response and the pane has been completely frozen
@@ -2530,11 +2553,7 @@ class TmuxClaudeRunner:
             # AskUserQuestion menu — where the spinner/elapsed counter keeps the
             # pane changing — does not trip the timeout and stop polling before
             # the menu appears (#166).  ``timeout_seconds`` (300s) is the backstop.
-            if (
-                not last_response
-                and stable_seconds >= _IDLE_TIMEOUT
-                and raw_static_seconds >= _IDLE_TIMEOUT
-            ):
+            if pane_idle:
                 # #562: a turn that never started is not a turn that finished.
                 # #365 gates the *completion* detector on the new turn actually
                 # having begun; this exit ignored that gate, so a warm session
@@ -3669,6 +3688,59 @@ class TmuxClaudeRunner:
         if not _delivered:
             await self._explain_undelivered()
         return _delivered
+
+    def _transcript_holds_turn(
+        self,
+        turn_started_at: datetime,
+        elapsed: float,
+        stable_seconds: float,
+        logged: bool,
+    ) -> bool:
+        """Whether Claude's transcript forbids the pane from ending this turn now (#1132).
+
+        The pane is a poor witness (see :mod:`c_lord.turn_end_bus`). It says
+        "done" when the response area is stable with the input box showing and
+        no spinner — and a long prompt Claude Code takes as a paste looks exactly
+        like that for the 15–40 s before Claude's first output. Production closed
+        four such turns 14–19 s in (2026-10-29), posting 📊 / 🟡 / ``completion``
+        while the work went on for up to 50 minutes. So:
+
+        - the transcript has this turn's instruction and no ending after it →
+          hold, until the pane has looked finished for ``_IN_FLIGHT_PANE_GRACE``
+          (a build that writes no turn-end marker must not wait forever);
+        - a mirror is tailing the transcript but the instruction is not in it
+          yet (a paste reaches it only when Claude Code sends it on) → hold for
+          the turn-start grace;
+        - no transcript to ask → the pane decides, as before.
+        """
+        thread_id = self._thread_id
+        reason: str | None = None
+        if turn_end_bus.in_flight_after(thread_id, turn_started_at):
+            if stable_seconds < _IN_FLIGHT_PANE_GRACE:
+                reason = "the transcript has this turn's instruction and no turn end yet"
+            else:
+                logger.warning(
+                    "%s pane has looked finished for %.0fs but the transcript never ended "
+                    "the turn — ending it on the pane (#1132)",
+                    log_ctx(thread_id=thread_id),
+                    stable_seconds,
+                )
+        elif (
+            turn_end_bus.is_tailing(thread_id)
+            and not turn_end_bus.prompt_since(thread_id, turn_started_at)
+            and elapsed < _TURN_START_GRACE
+        ):
+            reason = "the instruction has not reached the transcript yet"
+        if reason is None:
+            return False
+        if not logged:
+            logger.info(
+                "%s pane looks finished after %.1fs, but %s — waiting (#1132)",
+                log_ctx(thread_id=thread_id),
+                elapsed,
+                reason,
+            )
+        return True
 
     async def transcript_project_dir(self) -> Path | None:
         """Where Claude Code writes this pane's transcript, or None (#651).

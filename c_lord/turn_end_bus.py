@@ -89,6 +89,7 @@ class TurnEndBus:
 
     def __init__(self) -> None:
         self._threads: dict[int, _ThreadTurns] = {}
+        self._tailing: set[int] = set()
 
     def _record(self, thread_id: int) -> _ThreadTurns:
         record = self._threads.get(thread_id)
@@ -152,6 +153,50 @@ class TurnEndBus:
             return False
         return record.prompt_at > _as_utc(started_at) and record.ended_at >= record.prompt_at
 
+    def in_flight_after(self, thread_id: int, started_at: datetime) -> bool:
+        """Has Claude read an instruction after *started_at* and not yet ended that turn? (#1132)
+
+        The transcript's own "this turn is still going". While it holds, the
+        pane is not allowed to declare the turn over: a long prompt that Claude
+        Code takes as a paste shows neither a spinner nor anything new on the
+        pane for the 15–40 s before Claude's first output, and the pane exit
+        closed such turns 14 s in while the work went on for up to an hour.
+
+        ``False`` without a record — no transcript, no evidence — so a thread
+        whose transcript c-lord cannot read keeps the pane detection.
+        """
+        record = self._threads.get(thread_id)
+        if record is None or record.prompt_at is None:
+            return False
+        if record.prompt_at <= _as_utc(started_at):
+            return False
+        return record.ended_at is None or record.ended_at < record.prompt_at
+
+    def prompt_since(self, thread_id: int, started_at: datetime) -> bool:
+        """Has the transcript recorded an instruction after *started_at*? (#1132)"""
+        record = self._threads.get(thread_id)
+        return (
+            record is not None
+            and record.prompt_at is not None
+            and record.prompt_at > _as_utc(started_at)
+        )
+
+    def note_tailing(self, thread_id: int, live: bool) -> None:
+        """A mirror started (*live*) or stopped tailing *thread_id*'s transcript (#1132).
+
+        While one is, an instruction c-lord typed will show up here as
+        :meth:`note_prompt` — a pasted one only once Claude Code sends it on,
+        which can be many seconds after the keystrokes.
+        """
+        if live:
+            self._tailing.add(thread_id)
+        else:
+            self._tailing.discard(thread_id)
+
+    def is_tailing(self, thread_id: int) -> bool:
+        """Whether a mirror is tailing *thread_id*'s transcript (#1132)."""
+        return thread_id in self._tailing
+
     def ended_at(self, thread_id: int) -> datetime | None:
         """When the transcript last said a turn in *thread_id* ended, if ever.
 
@@ -165,6 +210,7 @@ class TurnEndBus:
     def forget(self, thread_id: int) -> None:
         """Drop *thread_id*'s record (workspace teardown, tests)."""
         self._threads.pop(thread_id, None)
+        self._tailing.discard(thread_id)
 
     def size(self) -> int:
         """How many threads are on record — for the bound's own test."""
