@@ -129,7 +129,7 @@ class TestTmuxSessionManager:
 
         # Verify new-window was called correctly
         args = call_with("new-window")
-        assert SESSION_NAME in args
+        assert f"={SESSION_NAME}" in args  # exact match (#1120)
         assert "w1" in args
         assert "/work/dir" in args
         # #374: created detached so a new thread doesn't steal the attached
@@ -255,7 +255,7 @@ class TestTmuxSessionManager:
         kill_call = mock_run.call_args_list[1]
         args = kill_call[0][0]
         assert "kill-window" in args
-        assert f"{SESSION_NAME}:work1" in args
+        assert f"={SESSION_NAME}:work1" in args
 
     def test_kill_session_not_found(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
@@ -564,7 +564,7 @@ class TestTmuxSessionManager:
         # Verify the claude command was sent, and the prompt handed over
         send_keys = [c[0][0] for c in mock_run.call_args_list if "send-keys" in c[0][0]]
         assert send_keys, "start_claude must send keys to the pane"
-        assert all(f"{SESSION_NAME}:work1" in args for args in send_keys)
+        assert all(f"={SESSION_NAME}:work1" in args for args in send_keys)
         cmd_str = _typed_command(mock_run)
         # #773: c-lord names the session it starts, between `claude` and --model.
         assert re.search(r"claude --session-id [0-9a-f-]{36} --model sonnet", cmd_str), cmd_str
@@ -1028,7 +1028,7 @@ class TestTmuxSessionManager:
         args = cap_call[0][0]
         assert "capture-pane" in args
         assert "-p" in args
-        assert f"{SESSION_NAME}:work1" in args
+        assert f"={SESSION_NAME}:work1" in args
         assert "-S" in args
 
     def test_capture_pane_custom_history(self) -> None:
@@ -1216,7 +1216,7 @@ class TestTmuxSessionManager:
         # Verify the custom session name is used in the target
         cmd_call = mock_run.call_args_list[0]
         args = cmd_call[0][0]
-        assert "mybot:work1" in args
+        assert "=mybot:work1" in args
 
     def test_custom_session_name_in_ensure_session(self) -> None:
         """Custom session name is used when creating the tmux session."""
@@ -1236,7 +1236,7 @@ class TestTmuxSessionManager:
 
         # Verify has-session used custom name
         has_call = mock_run.call_args_list[0]
-        assert "custom" in has_call[0][0]
+        assert "=custom" in has_call[0][0]
 
         # Verify new-session used custom name
         new_call = mock_run.call_args_list[2]

@@ -95,7 +95,7 @@ class TestTmuxHelpers:
         ) as run:
             assert _capture_pane_text("qiita-article", "w1", 120) == "❯\n"
         argv = run.call_args.args[0]
-        assert argv[argv.index("-t") + 1] == "qiita-article:w1"
+        assert argv[argv.index("-t") + 1] == "=qiita-article:w1"
         assert argv[argv.index("-S") + 1] == "-120"
 
     def test_foreground_command_unknown_is_none_not_dead(self) -> None:

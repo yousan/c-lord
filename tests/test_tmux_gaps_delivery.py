@@ -338,7 +338,7 @@ class TestUnknownIsNone:
     def test_pane_working_dir(self) -> None:
         with patch("c_lord.tmux._run", return_value=_ok("/sessions/ch/thr\n")) as mock_run:
             assert _mgr().pane_working_dir(1) == "/sessions/ch/thr"
-        assert "t:w1" in _argvs(mock_run)[0]
+        assert "=t:w1" in _argvs(mock_run)[0]
         assert _mgr(window=None).pane_working_dir(1) is None
         mgr = _mgr()
         mgr._available = False

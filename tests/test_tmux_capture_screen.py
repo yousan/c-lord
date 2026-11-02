@@ -58,7 +58,7 @@ class TestCaptureScreen:
         cap_args = [c.args[0] for c in mock_run.call_args_list if "capture-pane" in c.args[0]][0]
         assert "-e" in cap_args  # preserve ANSI colors/hyperlinks
         assert "-p" in cap_args
-        assert f"{SESSION_NAME}:work1" in cap_args
+        assert f"={SESSION_NAME}:work1" in cap_args
         assert "-S" not in cap_args  # exact visible screen, not a scrollback dump
         assert "-J" not in cap_args  # no wrapped-line joining
 
@@ -164,7 +164,7 @@ class TestListWindowTabs:
         assert tabs == [(1, "zsh", False), (5, "work4", False), (7, "work6", True)]
         args = mock_run.call_args[0][0]
         assert "list-windows" in args
-        assert SESSION_NAME in args
+        assert f"={SESSION_NAME}" in args
 
     def test_unavailable_returns_empty(self) -> None:
         mgr = TmuxSessionManager(mapping_path="")
