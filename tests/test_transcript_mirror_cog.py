@@ -613,6 +613,22 @@ async def test_reply_sink_no_reference_when_disabled(monkeypatch: pytest.MonkeyP
     assert "reference" not in call_kwargs
 
 
+async def test_reply_sink_without_quote_sends_no_reference_1138() -> None:
+    """#1138: a wakeup turn's answer is posted (and notifies) but quotes nothing."""
+    bot = MagicMock()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    bot.get_channel.return_value = channel
+
+    cog = TranscriptMirrorCog(bot, session_repo=_make_repo([]))
+    cog.set_trigger_message(42, 9999)
+    reply_sink = cog._make_reply_sink(42)
+    await reply_sink("いま: CI 待ちです", quote=False)
+
+    call_kwargs = channel.send.call_args.kwargs
+    assert "reference" not in call_kwargs
+
+
 async def test_reply_sink_no_reference_when_no_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
     """reply_sink works without reference if trigger message is unknown."""
     monkeypatch.delenv("CLORD_REPLY_TO_TRIGGER", raising=False)
