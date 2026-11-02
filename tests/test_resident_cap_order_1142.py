@@ -170,3 +170,32 @@ async def test_a_sleep_that_really_failed_is_still_made_up_for_1094() -> None:
     with patch("c_lord.tmux.pane_turn_states", return_value=_NO_PANE_EVIDENCE):
         await loop.tick()
     assert live == {1, 4}
+
+
+@pytest.mark.asyncio
+async def test_window_already_gone_is_made_up_and_goes_below_limit() -> None:
+    """Issue #1094 の再現試験そのまま: 常駐一覧は古いまま {1,2,3,4} を返し続ける。
+
+    眠らせる処理が「殺す窓が無かった」と答えたら、その分は補わない。
+    """
+    resident = {1, 2, 3, 4}
+
+    async def impl(*, channel: object, reason: object, idle_label: object) -> bool:
+        if channel.id == 4:  # type: ignore[attr-defined]  # claude exited
+            return False
+        resident.discard(channel.id)  # type: ignore[attr-defined]
+        return True
+
+    resident.discard(4)  # it really is gone now
+    cog = _cog(AsyncMock(side_effect=impl))
+    loop = ResidentCapLoop(
+        _bot(cog=cog),
+        _repo([_rec(i, hours_ago=i) for i in range(1, 5)]),
+        limit=2,
+        resident_fn=lambda: {1, 2, 3, 4},
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+    )
+    with patch("c_lord.tmux.pane_turn_states", return_value=_NO_PANE_EVIDENCE):
+        await loop.tick()
+    assert len(resident) >= 2, f"slept below the limit: {sorted(resident)} left (limit 2)"

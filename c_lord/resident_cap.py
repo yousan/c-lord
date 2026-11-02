@@ -765,17 +765,19 @@ class ResidentCapLoop:
         for thread_id in victims:
             if slept >= over:
                 break
-            if await self._sleep_one(thread_id, WorkspaceReason.CAP, label):
+            outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
+            if outcome:
                 slept += 1
+            elif outcome is None:
+                # Nothing to sleep — its claude ended on its own between the
+                # count and the kill (#1094). It left the residents by itself,
+                # so it is one fewer over, not a failure to make up for with a
+                # live workspace (that slept the cap below its limit).
+                over -= 1
             elif thread_id in self._gone:
                 # Found deleted just now (#1086): it never counted, so it frees
                 # no slot to make up for — close it and lower the bar instead.
                 await self._close_gone(thread_id)
-                over -= 1
-            elif thread_id not in self._resident():
-                # Its claude ended on its own between the count and the kill
-                # (#1094): it left the residents by itself, so it is one fewer
-                # over — not a failure to make up for with a live workspace.
                 over -= 1
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
@@ -803,11 +805,15 @@ class ResidentCapLoop:
         for thread_id in sorted(gone - await self._turns_in_flight(gone)):
             await self._close_gone(thread_id)
 
-    async def _sleep_one(self, thread_id: int, reason: object, label: str | None) -> bool:
+    async def _sleep_one(self, thread_id: int, reason: object, label: str | None) -> bool | None:
         """Put one workspace to sleep through the one shared implementation.
 
         Never a second copy of "sleep a workspace" — #572 owns that, and two
         implementations of one outcome always drift (#538).
+
+        ``True``: slept. ``False``: could not (the thread could not be resolved,
+        the sleep raised) — the window is still there. ``None``: the sleep found
+        nothing to kill (#1094) — the window was already gone.
         """
         cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
         impl = getattr(cog, "_sleep_workspace_impl", None)
@@ -819,7 +825,7 @@ class ResidentCapLoop:
         if channel is None:
             return False
         try:
-            return bool(await impl(channel=channel, reason=reason, idle_label=label))
+            return True if await impl(channel=channel, reason=reason, idle_label=label) else None
         except Exception:
             logger.exception("resident-cap: failed to sleep thread=%d", thread_id)
             return False
