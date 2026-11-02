@@ -962,6 +962,7 @@ class TranscriptMirror:
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
         _LIVE_MIRRORS[self.thread_id] = self
+        turn_end_bus.note_tailing(self.thread_id, True)
         if self._subagent_log is not None:
             self._subagent_log.start()
 
@@ -976,6 +977,7 @@ class TranscriptMirror:
         self._task = None
         if _LIVE_MIRRORS.get(self.thread_id) is self:
             del _LIVE_MIRRORS[self.thread_id]
+            turn_end_bus.note_tailing(self.thread_id, False)
         if self._subagent_log is not None:
             with contextlib.suppress(Exception):
                 await self._subagent_log.stop()
