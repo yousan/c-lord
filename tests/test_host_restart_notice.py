@@ -194,6 +194,62 @@ def test_compact_summary_last_is_not_mid_turn_895() -> None:
     assert transcript_stopped_mid_turn(fixture) is False
 
 
+def test_a_manual_compact_last_is_not_mid_turn_1137() -> None:
+    """A thread whose last act was a typed ``/compact`` is finished and waiting.
+
+    The CLI writes the command itself as a plain ``'/compact'`` user row before
+    the compaction rows, and that row read as "a prompt Claude never answered"
+    (staging-2 1564774924718047444, 2026-10-28; summary redacted).
+    """
+    fixture = _FIXTURES / "i1137_manual_compact.jsonl"
+    assert transcript_stopped_mid_turn(fixture) is False
+
+
+@pytest.mark.parametrize(
+    "command_rows",
+    [
+        # /compact as the CLI writes it: the command, then its records.
+        [
+            _user("/compact"),
+            COMPACT_BOUNDARY,
+            COMPACT_SUMMARY,
+            _user("<local-command-caveat>…</local-command-caveat>", isMeta=True),
+            _user("<command-name>/compact</command-name>"),
+            _user("<local-command-stdout>Compacted</local-command-stdout>"),
+        ],
+        # Any other local command typed after a finished turn (/model, /cost …).
+        [
+            _user("<command-name>/model</command-name>"),
+            _user("<local-command-stdout>Set model to opus</local-command-stdout>"),
+        ],
+        [
+            _user("/cost"),
+            _user("<command-name>/cost</command-name>"),
+            _user("<local-command-stderr>no cost</local-command-stderr>"),
+        ],
+    ],
+)
+def test_a_local_command_last_is_not_mid_turn_1137(
+    tmp_path: Path, command_rows: list[dict]
+) -> None:
+    events = [_user("hi"), _assistant("end_turn", TEXT), TURN_END, *command_rows]
+    assert transcript_stopped_mid_turn(_write(tmp_path / "t.jsonl", events)) is False
+
+
+def test_a_prompt_after_a_local_command_is_still_mid_turn_1137(tmp_path: Path) -> None:
+    """The command only settles what came before it; a prompt after it is unanswered."""
+    events = [
+        _user("hi"),
+        _assistant("end_turn", TEXT),
+        TURN_END,
+        _user("/compact"),
+        _user("<command-name>/compact</command-name>"),
+        _user("<local-command-stdout>Compacted</local-command-stdout>"),
+        _user("続きをお願いします"),
+    ]
+    assert transcript_stopped_mid_turn(_write(tmp_path / "t.jsonl", events)) is True
+
+
 @pytest.mark.skipif(not _KOPUU.exists(), reason="the production transcript lives on the bot host")
 def test_the_real_kopuu_transcript_is_not_mid_turn_895() -> None:
     assert transcript_stopped_mid_turn(_KOPUU) is False

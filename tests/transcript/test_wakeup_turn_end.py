@@ -105,6 +105,8 @@ class _Run:
     def __init__(self) -> None:
         self.posted: list[str] = []
         self.replies: list[str] = []
+        self.reply_kwargs: list[dict] = []
+        self.file_kwargs: list[dict] = []
 
     async def sink(self, text: str) -> None:
         self.posted.append(text)
@@ -114,11 +116,13 @@ class _Run:
         reply_tracker.record_reply_message(THREAD_ID, SimpleNamespace(id=10_000 + len(self.posted)))
         self.posted.append(text)
 
-    async def reply_sink(self, text: str, **_: int) -> None:
+    async def reply_sink(self, text: str, **kwargs: int | bool) -> None:
         self.replies.append(text)
+        self.reply_kwargs.append(kwargs)
         self._record(text)
 
-    async def file_sink(self, text: str, _path: str, **_: int) -> None:
+    async def file_sink(self, text: str, _path: str, **kwargs: int | bool) -> None:
+        self.file_kwargs.append(kwargs)
         self._record(text)
 
 
@@ -212,3 +216,80 @@ def test_read_back_sees_a_wakeup_turn_still_open(tmp_path):
     with path.open("a") as f:
         f.write(json.dumps(_end("2026-10-29T18:00:06.000Z")) + "\n")
     assert _turn_state_at_end(path) == (None, None, set())
+
+
+# --- #1138: a wakeup's answer is not a quote-reply to an old request ----------
+
+
+def _tool_use(ts: str) -> dict:
+    return {
+        "type": "assistant",
+        "timestamp": ts,
+        "isSidechain": False,
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_w",
+                    "name": "Bash",
+                    "input": {"command": "gh pr view"},
+                }
+            ],
+        },
+    }
+
+
+def _tool_result(ts: str) -> dict:
+    return {
+        "type": "user",
+        "timestamp": ts,
+        "isSidechain": False,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_w", "content": "OPEN"}],
+        },
+    }
+
+
+async def test_a_wakeup_answer_is_not_quoted_1138(tmp_path, log):
+    """AC1: scheduled_task_fire → isMeta prompt → reply → turn end: no quote."""
+    events = [*_wakeup("2026-10-29T18:00:00.000Z"), _reply("2026-10-29T18:00:05.000Z")]
+    events.append(_end("2026-10-29T18:00:06.000Z"))
+    run = await _replay(tmp_path, events)
+
+    assert run.replies == ["返信 2026-10-29T18:00:05.000Z"]
+    assert run.reply_kwargs == [{"quote": False}]
+
+
+async def test_a_wakeup_answer_after_tools_keeps_progress_without_quote_1138(tmp_path, log):
+    """AC2: the same with a tool call — progress.txt rides, the quote does not."""
+    events = [
+        *_wakeup("2026-10-29T18:00:00.000Z"),
+        _tool_use("2026-10-29T18:00:01.000Z"),
+        _tool_result("2026-10-29T18:00:02.000Z"),
+        _reply("2026-10-29T18:00:05.000Z"),
+        _end("2026-10-29T18:00:06.000Z"),
+    ]
+    run = await _replay(tmp_path, events)
+
+    assert run.file_kwargs == [{"quote": False}]
+    assert run.replies == []
+
+
+async def test_a_persons_answer_is_still_quoted_1138(tmp_path, log):
+    """AC3: a turn a person started still answers them as a quote-reply."""
+    events = [
+        {
+            "type": "user",
+            "timestamp": "2026-10-29T18:00:00.000Z",
+            "isSidechain": False,
+            "message": {"role": "user", "content": "PR を見て"},
+        },
+        _reply("2026-10-29T18:00:05.000Z"),
+        _end("2026-10-29T18:00:06.000Z"),
+    ]
+    run = await _replay(tmp_path, events, person_turn=True)
+
+    assert run.replies == ["返信 2026-10-29T18:00:05.000Z"]
+    assert run.reply_kwargs and all("quote" not in kw for kw in run.reply_kwargs)
