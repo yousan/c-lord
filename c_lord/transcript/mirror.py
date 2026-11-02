@@ -547,6 +547,11 @@ def _is_scheduled_wakeup(event: dict) -> bool:
     )
 
 
+#: #1103: failures that repeat while the cause lasts (a full /tmp) are logged in
+#: full once per thread an hour; the next line carries how many were held back.
+_IDLE_FLUSH_FAILURE_LOG = LogSampler(3600.0)
+_PROGRESS_FILE_FAILURE_LOG = LogSampler(3600.0)
+
 #: How much of a pane ``!`` command the #1052 label shows.
 _PANE_BANG_MAX = 60
 
@@ -1258,14 +1263,26 @@ class TranscriptMirror:
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _producer() -> None:
-            async for event in tail_events(
-                self.project_dir,
-                poll_interval=self._poll_interval,
-                on_unresolved=self._on_unresolved,
-                unresolved_after=self._unresolved_after,
-                on_start=self._read_back if self._resumed else None,
-            ):
-                await queue.put(event)
+            try:
+                async for event in tail_events(
+                    self.project_dir,
+                    poll_interval=self._poll_interval,
+                    on_unresolved=self._on_unresolved,
+                    unresolved_after=self._unresolved_after,
+                    on_start=self._read_back if self._resumed else None,
+                ):
+                    await queue.put(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # #1102: the reading task ending is the thread going silent; its
+                # exception used to be dropped unread when the mirror stopped.
+                logger.exception(
+                    "%s TranscriptMirror: the transcript reader stopped — this thread "
+                    "gets no more replies until the mirror is restarted",
+                    log_ctx(thread_id=self.thread_id),
+                )
+                raise
 
         producer = asyncio.create_task(_producer(), name=f"transcript-tail-{self.thread_id}")
         idle_timeout = (
@@ -1306,10 +1323,15 @@ class TranscriptMirror:
                             # re-post this idle-flushed final answer.
                             await _commit_cursor()
                     except Exception:
-                        logger.exception(
-                            "TranscriptMirror: idle flush failed — mirror goes on thread=%d",
-                            self.thread_id,
-                        )
+                        # #1103: once per thread an hour (#810: a failure that
+                        # repeats every idle window buried the real ERRORs).
+                        sample = _IDLE_FLUSH_FAILURE_LOG.sample(self.thread_id)
+                        if sample.emit:
+                            logger.exception(
+                                "TranscriptMirror: idle flush failed — mirror goes on thread=%d%s",
+                                self.thread_id,
+                                sample.suffix,
+                            )
                     continue
 
                 # #1041: one row this loop cannot handle must not end it — the mirror is
@@ -1881,15 +1903,34 @@ class TranscriptMirror:
         assert self._file_sink is not None
         tmp_path: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".txt",
-                prefix=f"clord_progress_{self.thread_id}_",
-                delete=False,
-                encoding="utf-8",
-            ) as f:
-                f.write(_truncate_progress("\n".join(progress_buf)))
-                tmp_path = f.name
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".txt",
+                    prefix=f"clord_progress_{self.thread_id}_",
+                    delete=False,
+                    encoding="utf-8",
+                ) as f:
+                    tmp_path = f.name
+                    f.write(_truncate_progress("\n".join(progress_buf)))
+            except OSError:
+                # #1103: a full /tmp cost the reply itself, not just its log —
+                # and the held text failed again in every idle window. The reply
+                # goes out without progress.txt.
+                sample = _PROGRESS_FILE_FAILURE_LOG.sample(self.thread_id)
+                if sample.emit:
+                    logger.exception(
+                        "%s TranscriptMirror: could not write progress.txt — posting the "
+                        "reply without it%s",
+                        log_ctx(thread_id=self.thread_id),
+                        sample.suffix,
+                    )
+                if self._reply_sink is not None:
+                    # The same target (quote / no quote / reply_to) as the file had.
+                    await self._try_reply_sink(body, **target)
+                else:
+                    await self._try_sink(body)
+                return
             try:
                 await self._file_sink(body, tmp_path, **target)
             except asyncio.CancelledError:
