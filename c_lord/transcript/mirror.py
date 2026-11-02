@@ -662,10 +662,23 @@ def _launched_agent_ids(event: dict) -> list[str]:
     """Ids of the background agents *event* reports as launched (#917).
 
     The launch is the ``tool_result`` of the ``Agent`` / ``Task`` call that had
-    ``run_in_background``; its text carries the agent's id.
+    ``run_in_background``: ``toolUseResult.status`` is ``async_launched`` and
+    carries the agent's id (#1104); older rows only have the text.
     """
     if event.get("type") != "user" or event.get("isSidechain"):
         return []
+    # #1104: the row says what the tool returned. A real receipt carries
+    # ``toolUseResult.status == "async_launched"``; any other ``toolUseResult``
+    # (a Bash call's stdout/stderr, a Read's file) launched nothing, whatever its
+    # text begins with. Only rows written before ``toolUseResult`` existed fall
+    # back to the wording.
+    tool_use_result = event.get("toolUseResult")
+    if isinstance(tool_use_result, dict):
+        if tool_use_result.get("status") != "async_launched":
+            return []
+        agent_id = tool_use_result.get("agentId")
+        if isinstance(agent_id, str) and agent_id:
+            return [agent_id]
     message = event.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
