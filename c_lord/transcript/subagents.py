@@ -87,6 +87,9 @@ LINES_BUDGET_CHARS = MAX_FILE_BYTES
 #: Where the start lines of the runs still open are written down (#1027), so a
 #: restart can close them instead of leaving them reading "作業中".
 OPEN_RUNS_FILE = ".clord-subagent-runs.json"
+#: Each agent's number in its attachment's name (#1139), kept across restarts:
+#: ``{agent id: number}``.
+ORDINALS_FILE = ".clord-subagent-numbers.json"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -307,6 +310,9 @@ class _Run:
     # ``stop_reason`` of the latest row (#1027): ``end_turn`` means the agent
     # finished speaking; a ``tool_use`` / ``tool_result`` means it is mid-work.
     last_stop: str | None = None
+    # #1136: a finished agent woken only by its own background task's notice.
+    # Nothing is posted for the run unless it goes on to call a tool.
+    quiet: bool = False
 
 
 class _Lines:
@@ -364,8 +370,9 @@ class _Agent:
     run: _Run | None = None
     runs: int = 0
     final_status: str = ""
-    # 1, 2, … in the order this log met the agents: tells attachments apart
-    # when the name has no ASCII to put in the filename.
+    # 1, 2, … in the order the agents appeared in the thread (#1139): tells
+    # attachments apart when the name has no ASCII to put in the filename. Kept
+    # in :data:`ORDINALS_FILE`, so a restart does not hand it to another agent.
     ordinal: int = 0
 
 
@@ -429,6 +436,8 @@ class SubagentLog:
         self._parent: list[dict] = []
         # agent id → the open start line, as written to :data:`OPEN_RUNS_FILE`.
         self._open_runs: dict[str, dict] = {}
+        # agent id → its number (#1139), as written to :data:`ORDINALS_FILE`.
+        self._ordinals: dict[str, int] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._ctx = log_ctx(thread_id=thread_id)
@@ -472,6 +481,7 @@ class SubagentLog:
             return
         self._primed = True
         self._session_id = await asyncio.to_thread(read_claim, self.project_dir)
+        self._ordinals = await asyncio.to_thread(_read_ordinals, self.project_dir / ORDINALS_FILE)
         await self._baseline_session()
         await self._close_crossed_runs()
 
@@ -574,6 +584,9 @@ class SubagentLog:
         # A meta file can come first; it is what names the agent a message is
         # addressed to. Off the loop (#1025): a busy session's directory is big.
         ids = await asyncio.to_thread(_agent_stems, directory)
+        new = [s for s in ids if s.removeprefix("agent-") not in self._agents]
+        if new:
+            await self._number(directory, new)
         # Every agent is known by name before any row is read: a message in one
         # file is addressed to an agent whose file sorts after it.
         for stem in ids:
@@ -587,7 +600,7 @@ class SubagentLog:
                     path=path,
                     offset=start,
                     read_any=start > 0,
-                    ordinal=len(self._agents) + 1,
+                    ordinal=self._ordinals[agent_id],
                 )
                 self._agents[agent_id] = agent
             if agent.meta is None:
@@ -598,7 +611,44 @@ class SubagentLog:
             for row in await asyncio.to_thread(self._read_rows, agent):
                 batch.append((_timestamp(row) or 0.0, len(batch), agent, row))
         for _, _, agent, row in sorted(batch, key=lambda item: (item[0], item[1])):
+            await self._on_agent_row_guarded(agent, row)
+
+    async def _number(self, directory: Path, stems: list[str]) -> None:
+        """Give each agent in *stems* without a number the next one (#1139).
+
+        In the order they appeared — the time of their file's first row — not
+        the id order of the directory listing, and written down so the next
+        process gives every agent the number it had.
+        """
+        unnumbered = [s for s in stems if s.removeprefix("agent-") not in self._ordinals]
+        if not unnumbered:
+            return
+        firsts = await asyncio.to_thread(_first_timestamps, directory, unnumbered)
+        order = sorted(unnumbered, key=lambda s: (firsts.get(s) is None, firsts.get(s) or 0.0, s))
+        last = max(self._ordinals.values(), default=0)
+        for stem in order:
+            last += 1
+            self._ordinals[stem.removeprefix("agent-")] = last
+        snapshot = dict(self._ordinals)
+        await asyncio.to_thread(_write_json, self.project_dir / ORDINALS_FILE, snapshot)
+
+    async def _on_agent_row_guarded(self, agent: _Agent, row: dict) -> None:
+        """:meth:`_on_agent_row`, with whatever one row raises kept to that row (#1110).
+
+        The mirror got this guard in #1041; here an odd row ended the whole poll,
+        and the rows read after it in the same poll — a final report — were lost.
+        """
+        try:
             await self._on_agent_row(agent, row)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "%s SubagentLog: skipped a row of %s it could not handle (uuid=%s)",
+                self._ctx,
+                self._label(agent),
+                row.get("uuid"),
+            )
 
     @staticmethod
     def _read_rows(agent: _Agent) -> list[dict]:
@@ -707,6 +757,10 @@ class SubagentLog:
             if self._voices:
                 await self._voice(self._label_name(agent), f"→ **{self._name(to)}**\n{text}")
         agent.run.tools += _tool_uses(row)
+        if agent.run.quiet and agent.run.tools:
+            # #1136: woken by its own notice, but this is work — shown as before.
+            agent.run.quiet = False
+            await self._announce(agent, agent.run)
         said = _assistant_text(row)
         if said:
             agent.run.report = said
@@ -735,14 +789,31 @@ class SubagentLog:
             last_row_clock=now,
         )
         agent.runs += 1
-        word = "再開" if resumed else "開始"
+        if resumed and _is_own_task_notice(row):
+            # #1136: nobody spoke to it — its own background task (a crawl it was
+            # waiting on) finished. Usually it says "nothing changes" and stops:
+            # no line for that, unless it calls a tool (:meth:`_on_agent_row`).
+            agent.run.quiet = True
+            logger.info(
+                "%s SubagentLog: %s woken by its own background-task notice (run %d) — "
+                "not shown unless it calls a tool (#1136)",
+                self._ctx,
+                self._label(agent),
+                agent.runs,
+            )
+            return
+        await self._announce(agent, agent.run)
+
+    async def _announce(self, agent: _Agent, run: _Run) -> None:
+        """Post the run's start line (``開始`` / ``再開``)."""
+        word = "再開" if run.resumed else "開始"
         logger.info(
             "%s SubagentLog: %s %s (run %d)", self._ctx, self._label(agent), word, agent.runs
         )
-        agent.run.handle = await self._safe(
+        run.handle = await self._safe(
             self._poster.post_status(f"-# 🤖 {self._label(agent)}{word}", None)
         )
-        message_id = getattr(agent.run.handle, "id", None)
+        message_id = getattr(run.handle, "id", None)
         if isinstance(message_id, int):
             self._open_runs[agent.agent_id] = {
                 "message_id": message_id,
@@ -775,9 +846,18 @@ class SubagentLog:
             return
         # The notice can overtake the last rows of the agent's own file.
         for row in await asyncio.to_thread(self._read_rows, agent):
-            await self._on_agent_row(agent, row)
+            await self._on_agent_row_guarded(agent, row)
         agent.run = None
         agent.final_status = status
+        if run.quiet:
+            logger.info(
+                "%s SubagentLog: %s ended a run its own background-task notice started, "
+                "with no tool call — nothing posted (#1136) status=%s",
+                self._ctx,
+                self._label(agent),
+                status,
+            )
+            return
         if at is not None and run.started_at is not None:
             elapsed = at - run.started_at
         else:
@@ -945,6 +1025,62 @@ def _write_document(
     except OSError:
         logger.warning("SubagentLog: could not write the attachment", exc_info=True)
         return None
+
+
+def _is_own_task_notice(row: dict) -> bool:
+    """Whether *row* is the harness waking an agent for its own background task (#1136).
+
+    The CLI writes it into the agent's file as an ``isMeta`` user row
+    (``[SYSTEM NOTIFICATION - NOT USER INPUT] … background-task event``). A
+    message from the parent or another agent is not one: that is ``SendMessage``,
+    a ``peer`` row or a plain prompt — a real ``再開``.
+    """
+    if row.get("type") != "user" or not row.get("isMeta"):
+        return False
+    origin = row.get("origin")
+    return not (isinstance(origin, dict) and origin.get("kind") == "peer")
+
+
+def _first_timestamps(directory: Path, stems: list[str]) -> dict[str, float]:
+    """When each agent's file got its first row — the order they appeared. Blocking."""
+    out: dict[str, float] = {}
+    for stem in stems:
+        try:
+            with (directory / f"{stem}.jsonl").open("rb") as f:
+                line = f.readline()
+            row = json.loads(line)
+        except (OSError, ValueError):
+            continue
+        at = _timestamp(row) if isinstance(row, dict) else None
+        if at is not None:
+            out[stem] = at
+    return out
+
+
+def _read_ordinals(path: Path) -> dict[str, int]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        logger.warning("SubagentLog: could not read %s", path, exc_info=True)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: v
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v > 0
+    }
+
+
+def _write_json(path: Path, data: dict) -> None:
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        logger.warning("SubagentLog: could not write %s", path, exc_info=True)
 
 
 def _read_open_runs(path: Path) -> dict[str, dict]:
