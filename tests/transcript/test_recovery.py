@@ -292,10 +292,69 @@ def test_a_real_answer_before_a_banner_turn_is_still_not_re_delivered(tmp_path: 
             _turn_end(),
         ],
     )
-    # The newest completed turn carries no answer, so the rescue falls back to
-    # the previous one — which the cursor has already passed, so
-    # final_answer_needs_recovery declines it (see test below).
-    assert last_completed_final_answer(tmp_path) == FinalAnswer("u1", "前のターンの本物の回答")
+    # The newest completed turn ended in a refusal, so it has no answer — and
+    # it does not fall back to the previous turn's either (#1143).
+    assert last_completed_final_answer(tmp_path) is None
     from c_lord.transcript.recovery import final_answer_needs_recovery
 
     assert final_answer_needs_recovery(tmp_path, "u1") is None
+
+
+# --- #1143: a turn that ends in an API error / usage-limit refusal ------------
+
+_FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "transcripts"
+
+
+def _i1143_rows() -> list[dict]:
+    """Production rows (openclaw:W4, 2026-10-27; bodies redacted).
+
+    previous answer A (1b05c98d) → turn end → prompt → progress line B
+    (fd1d88c2, ``stop_reason: tool_use``) → Bash → tool_result → monthly
+    spend-limit refusal (``isApiErrorMessage``) → turn end.
+    """
+    text = (_FIXTURES / "i1143_limit_after_progress.jsonl").read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+_PREVIOUS_ANSWER = "1b05c98d-7dee-4234-abbd-22ff2d125c7d"
+
+
+def test_a_turn_ending_in_a_usage_limit_has_nothing_to_recover(tmp_path: Path) -> None:
+    """The progress line before the refusal is not the turn's answer (#1143 AC1).
+
+    In production the restart re-posted "The rebuild succeeded. Repacking …"
+    — a line already shown mid-turn — as if it were the answer.
+    """
+    from c_lord.transcript.recovery import final_answer_needs_recovery
+
+    _write_jsonl(tmp_path / "s.jsonl", _i1143_rows())
+    assert final_answer_needs_recovery(tmp_path, _PREVIOUS_ANSWER) is None
+    assert last_completed_final_answer(tmp_path) is None
+
+
+def test_a_turn_ending_in_an_api_error_has_nothing_to_recover(tmp_path: Path) -> None:
+    """The raw English API error is not an answer either (#1143 AC2)."""
+    from c_lord.transcript.recovery import final_answer_needs_recovery
+
+    rows = _i1143_rows()
+    api_error = json.loads((_FIXTURES / "i1143_api_error_row.json").read_text(encoding="utf-8"))
+    rows[-2] = api_error  # the refusal → "API Error: The response stopped arriving. …"
+    _write_jsonl(tmp_path / "s.jsonl", rows)
+    assert final_answer_needs_recovery(tmp_path, _PREVIOUS_ANSWER) is None
+    assert last_completed_final_answer(tmp_path) is None
+
+
+def test_a_turn_after_an_api_error_turn_is_recovered_as_usual(tmp_path: Path) -> None:
+    """Only the errored turn is skipped; the next normal turn's answer still counts."""
+    from c_lord.transcript.recovery import final_answer_needs_recovery
+
+    rows = _i1143_rows()
+    rows += [
+        {"type": "user", "uuid": "p2", "message": {"role": "user", "content": "続けて"}},
+        _assistant("u-next", "続きの本物の答え"),
+        _turn_end(),
+    ]
+    _write_jsonl(tmp_path / "s.jsonl", rows)
+    assert final_answer_needs_recovery(tmp_path, _PREVIOUS_ANSWER) == FinalAnswer(
+        "u-next", "続きの本物の答え"
+    )

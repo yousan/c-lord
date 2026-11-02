@@ -35,6 +35,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 from .. import turn_events
 from ..api_error import api_error_text, headline
@@ -79,7 +80,9 @@ logger = logging.getLogger(__name__)
 # thread, carrying the count of the reports it stands for.
 _idle_unresolved_log = LogSampler(3600.0)
 
-Sink = Callable[[str], Awaitable[None]]
+#: Posts one message. The cog's returns the ``discord.Message`` it sent (#1125);
+#: anything else may return ``None``.
+Sink = Callable[[str], Awaitable[object]]
 # The final-answer sinks: ``(text)`` / ``(text, progress_path)``, plus a keyword
 # ``reply_to=<message id>`` passed only when the answer belongs to an earlier
 # request than the current one (#912).
@@ -662,10 +665,23 @@ def _launched_agent_ids(event: dict) -> list[str]:
     """Ids of the background agents *event* reports as launched (#917).
 
     The launch is the ``tool_result`` of the ``Agent`` / ``Task`` call that had
-    ``run_in_background``; its text carries the agent's id.
+    ``run_in_background``: ``toolUseResult.status`` is ``async_launched`` and
+    carries the agent's id (#1104); older rows only have the text.
     """
     if event.get("type") != "user" or event.get("isSidechain"):
         return []
+    # #1104: the row says what the tool returned. A real receipt carries
+    # ``toolUseResult.status == "async_launched"``; any other ``toolUseResult``
+    # (a Bash call's stdout/stderr, a Read's file) launched nothing, whatever its
+    # text begins with. Only rows written before ``toolUseResult`` existed fall
+    # back to the wording.
+    tool_use_result = event.get("toolUseResult")
+    if isinstance(tool_use_result, dict):
+        if tool_use_result.get("status") != "async_launched":
+            return []
+        agent_id = tool_use_result.get("agentId")
+        if isinstance(agent_id, str) and agent_id:
+            return [agent_id]
     message = event.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
@@ -972,6 +988,7 @@ class TranscriptMirror:
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
         _LIVE_MIRRORS[self.thread_id] = self
+        turn_end_bus.note_tailing(self.thread_id, True)
         if self._subagent_log is not None:
             self._subagent_log.start()
 
@@ -986,6 +1003,7 @@ class TranscriptMirror:
         self._task = None
         if _LIVE_MIRRORS.get(self.thread_id) is self:
             del _LIVE_MIRRORS[self.thread_id]
+            turn_end_bus.note_tailing(self.thread_id, False)
         if self._subagent_log is not None:
             with contextlib.suppress(Exception):
                 await self._subagent_log.stop()
@@ -1134,11 +1152,29 @@ class TranscriptMirror:
         # mistook that answer for a dropped one and re-posted it. The cursor must
         # only ever advance on a real final-answer delivery.
         _delivered_uuid: str | None = None
+        # #1125: the turn's latest text that went out silently because a tool
+        # call followed it — (uuid, the message the sink returned). When the
+        # turn ends with no text held, that text *was* its last word: the answer
+        # (the same one the #215 rescue would pick), so it takes the answer's
+        # place instead of being re-posted by the next restart.
+        _last_silent: tuple[str, object] | None = None
         # #631 AC9: has this turn already reported the plan limit?  The CLI
         # retries internally and writes the same refusal again on each attempt —
         # six times in one turn on 2026-09-04 — and every copy says exactly the
         # same thing, so only the first is worth a message.
         _limit_reported = False
+
+        def _adopt_last_silent_as_answer() -> None:
+            """#1125: a turn whose last text preceded its last tool call answered with it."""
+            nonlocal _delivered_uuid, _last_silent
+            silent, _last_silent = _last_silent, None
+            if silent is None or _delivered_uuid is not None:
+                return
+            _delivered_uuid = silent[0]
+            if silent[1] is not None:
+                from ..skills import reply_tracker
+
+                reply_tracker.record_reply_message(self.thread_id, cast(Any, silent[1]))
 
         async def _commit_cursor() -> None:
             nonlocal _delivered_uuid
@@ -1156,12 +1192,15 @@ class TranscriptMirror:
             _delivered_uuid = None
 
         async def _flush_pending_silently() -> None:
-            nonlocal _pending_text, _pending_progress, _pending_uuid
+            nonlocal _pending_text, _pending_progress, _pending_uuid, _last_silent
             if _pending_text is None:
                 return
             # #747: a loop's copy is counted in one message instead of posted.
             if not await self._fold.offer(_pending_text):
-                await self._try_sink(_pending_text)
+                sent = await self._try_sink(_pending_text)
+                _last_silent = (_pending_uuid, sent) if _pending_uuid else None
+            else:
+                _last_silent = None
             # #399: an intermediate text posted silently may be the prose above
             # a not-yet-bridged menu (the plan path flushes it BEFORE the menu).
             # Register it as source="mirror" so the later pane-bridge skips its
@@ -1331,14 +1370,20 @@ class TranscriptMirror:
                             self._turn_by_notification = False
                             self._turn_self_started = False
                         elif started_by in ("notification", "wakeup") and not self._turn_open:
-                            # #1092: only a notification changes how the answer is
-                            # posted (#913); a wakeup's still goes out as before.
+                            # #1092: only a notification is posted silently (#913);
+                            # neither is quoted under the last request (#1138).
                             self._turn_by_notification = started_by == "notification"
                             self._turn_self_started = True
                             # #961: no runner will announce this turn's end.
                             turn_events.note_self_turn_started(
                                 self.thread_id, at=_event_time(event)
                             )
+                        if started_by == "person" or (
+                            started_by is not None and not self._turn_open
+                        ):
+                            # #1125: a new turn's answer is its own (a notice
+                            # inside a turn leaves the turn — and its text — as is).
+                            _last_silent = None
                         if started_by is not None:
                             self._turn_open = True
                             self._model_spoke = False
@@ -1373,6 +1418,7 @@ class TranscriptMirror:
                             await self._fold.reset()
                             # Turn boundary: flush pending as the final reply.
                             await _flush_pending_as_reply()
+                            _adopt_last_silent_as_answer()
                             await _commit_cursor()
                             # #399: disarm unconsumed pane-bridge entries — the
                             # legitimate flush always precedes its turn end, so a
@@ -1793,8 +1839,9 @@ class TranscriptMirror:
                 await self._try_sink(text)
             return
         if _has_tool_lines(progress) and self._file_sink is not None:
-            if self._turn_by_notification:
-                # #979: still not a reply (#913) — the log rides, the quote does not.
+            if self._turn_self_started:
+                # #979/#1138: still not a reply (#913) — the log rides, the quote
+                # does not. Same for a turn a scheduled wakeup started.
                 await self._flush_with_progress(text, progress, quote=False)
             else:
                 await self._flush_with_progress(text, progress, **target)
@@ -1803,7 +1850,13 @@ class TranscriptMirror:
             # not an answer to the last message, so it is not quoted under it.
             await self._try_sink(text)
         elif self._reply_sink is not None:
-            await self._try_reply_sink(text, **target)
+            if self._turn_self_started:
+                # #1138: a scheduled wakeup (ScheduleWakeup / /loop) read no
+                # one's message either: posted as before, minus the quote of a
+                # request hours old.
+                await self._try_reply_sink(text, quote=False)
+            else:
+                await self._try_reply_sink(text, **target)
         else:
             await self._try_sink(text)
 
@@ -1843,13 +1896,14 @@ class TranscriptMirror:
         """Format and send a rendered event via plain sink."""
         await self._try_sink(_format_body(rendered))
 
-    async def _try_sink(self, body: str) -> None:
+    async def _try_sink(self, body: str) -> object:
+        """Post *body*; the sink's result (the message, from the cog) or ``None``."""
         # #539: something a reader can see is reaching the thread, so the filler
         # must step aside — otherwise it would sit *below* the output it stood in
         # for. Done before the send so the ordering holds even if the send is slow.
         await self._progress.note_output()
         try:
-            await self._sink(body)
+            return await self._sink(body)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1858,6 +1912,7 @@ class TranscriptMirror:
                 self.thread_id,
                 exc_info=True,
             )
+            return None
 
     async def _report_self_turn_api_error(self) -> str | None:
         """Say ❌ for a self-started turn that stopped on an API error (#1131).
@@ -1888,7 +1943,7 @@ class TranscriptMirror:
                 )
         return "api_error"
 
-    async def _try_reply_sink(self, body: str, **target: int) -> None:
+    async def _try_reply_sink(self, body: str, **target: int | bool) -> None:
         await self._progress.note_output()
         assert self._reply_sink is not None
         try:
