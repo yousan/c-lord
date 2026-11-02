@@ -2867,3 +2867,32 @@ async def test_a_long_or_backticked_command_is_shown_safely(tmp_path: Path) -> N
     assert label.startswith("-# ペインで打った `` !echo `date`")
     assert label.endswith("… `` への返事")
     assert len(label) < 160
+
+
+async def test_a_pane_bang_answer_held_when_a_person_prompt_arrives_keeps_its_label(
+    tmp_path: Path,
+) -> None:
+    """#1099: no ``turn_duration`` between the answer and a person's prompt (#218,
+    Esc, a queued Discord message). RED: the prompt row cleared the command before
+    the #912 pre-flush delivered the held answer — quoted under the last request."""
+    sink_calls, reply_calls, _ = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _assistant_text("No response requested."),
+        _user_str("次の依頼です"),
+        _assistant_text("次の答え"),
+    )
+    assert "No response requested." not in reply_calls, "the bang answer was quoted"
+    assert f"{_BANG_LABEL}\nNo response requested." in sink_calls
+    assert not any("ペインで打った" in c for c in sink_calls if "次の答え" in c)
+
+
+def test_a_backtick_run_in_the_command_cannot_close_the_label_early() -> None:
+    """#1100: the fence is one backtick longer than the longest run in the command."""
+    from c_lord.transcript.mirror import _pane_bang_label
+
+    label = _pane_bang_label("echo ``a``")
+    assert label == "-# ペインで打った ``` !echo ``a`` ``` への返事"
+    assert _pane_bang_label("echo `x`") == "-# ペインで打った `` !echo `x` `` への返事"
+    # AC2: no backtick, no change.
+    assert _pane_bang_label("ls") == "-# ペインで打った `!ls` への返事"
