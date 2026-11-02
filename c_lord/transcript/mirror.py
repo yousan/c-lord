@@ -1322,8 +1322,7 @@ class TranscriptMirror:
                         sample = _IDLE_FLUSH_FAILURE_LOG.sample(self.thread_id)
                         if sample.emit:
                             logger.exception(
-                                "TranscriptMirror: idle flush failed — mirror goes on "
-                                "thread=%d%s",
+                                "TranscriptMirror: idle flush failed — mirror goes on thread=%d%s",
                                 self.thread_id,
                                 sample.suffix,
                             )

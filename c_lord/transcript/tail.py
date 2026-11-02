@@ -510,8 +510,7 @@ async def tail_events(
             sample = _POLL_FAILURE_LOG.sample(str(project_dir))
             if sample.emit:
                 logger.exception(
-                    "tail_events: reading the transcript failed — retrying on the next poll "
-                    "(%s)%s",
+                    "tail_events: reading the transcript failed — retrying on the next poll (%s)%s",
                     project_dir,
                     sample.suffix,
                 )
