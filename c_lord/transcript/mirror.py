@@ -1320,8 +1320,8 @@ class TranscriptMirror:
                             self._turn_by_notification = False
                             self._turn_self_started = False
                         elif started_by in ("notification", "wakeup") and not self._turn_open:
-                            # #1092: only a notification changes how the answer is
-                            # posted (#913); a wakeup's still goes out as before.
+                            # #1092: only a notification is posted silently (#913);
+                            # neither is quoted under the last request (#1138).
                             self._turn_by_notification = started_by == "notification"
                             self._turn_self_started = True
                             # #961: no runner will announce this turn's end.
@@ -1779,8 +1779,9 @@ class TranscriptMirror:
                 await self._try_sink(text)
             return
         if _has_tool_lines(progress) and self._file_sink is not None:
-            if self._turn_by_notification:
-                # #979: still not a reply (#913) — the log rides, the quote does not.
+            if self._turn_self_started:
+                # #979/#1138: still not a reply (#913) — the log rides, the quote
+                # does not. Same for a turn a scheduled wakeup started.
                 await self._flush_with_progress(text, progress, quote=False)
             else:
                 await self._flush_with_progress(text, progress, **target)
@@ -1789,7 +1790,13 @@ class TranscriptMirror:
             # not an answer to the last message, so it is not quoted under it.
             await self._try_sink(text)
         elif self._reply_sink is not None:
-            await self._try_reply_sink(text, **target)
+            if self._turn_self_started:
+                # #1138: a scheduled wakeup (ScheduleWakeup / /loop) read no
+                # one's message either: posted as before, minus the quote of a
+                # request hours old.
+                await self._try_reply_sink(text, quote=False)
+            else:
+                await self._try_reply_sink(text, **target)
         else:
             await self._try_sink(text)
 
@@ -1845,7 +1852,7 @@ class TranscriptMirror:
                 exc_info=True,
             )
 
-    async def _try_reply_sink(self, body: str, **target: int) -> None:
+    async def _try_reply_sink(self, body: str, **target: int | bool) -> None:
         await self._progress.note_output()
         assert self._reply_sink is not None
         try:
