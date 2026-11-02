@@ -394,3 +394,200 @@ def test_the_orphan_sweep_never_sees_the_mirror_dir(tmp_path: Path) -> None:
     paths = {str(c.path) for c in found}
     assert str(root / "111" / "222") in paths
     assert not any(MIRRORS_DIR_NAME in p for p in paths)
+
+
+# --------------------------------------------------------------------------
+# 時間切れの fetch — #1133 (スレッドの開始を止めない) / #1134 (書きかけを残さない)
+# --------------------------------------------------------------------------
+
+
+def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``fetch`` だけ「受信し続けて終わらない」git を PATH の先頭に置く。
+
+    本物の時間切れと同じく、受信中の pack を ``objects/pack/tmp_pack_*`` に
+    書き続ける。書いているのは子プロセス (本物では index-pack / ssh) なので、
+    親の git だけを殺しても書きかけは育ち続ける。
+    """
+    real = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    log = tmp_path / "fetch-calls.log"
+    script = bindir / "git"
+    script.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-C" ] && [ "$3" = "fetch" ]; then\n'
+        f'  echo call >> "{log}"\n'
+        '  pack="$2/objects/pack/tmp_pack_fake$$"\n'
+        '  ( while true; do echo x >> "$pack"; sleep 0.05; done ) &\n'
+        "  sleep 30\n"
+        "  exit 0\n"
+        "fi\n"
+        f'exec "{real}" "$@"\n'
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    return log
+
+
+def _garbage(mirror: Path) -> list[str]:
+    return sorted(p.name for p in (mirror / "objects" / "pack").glob("tmp_*"))
+
+
+def test_a_timed_out_fetch_leaves_no_half_written_pack_1134(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """時間切れで止めた fetch の書きかけ (本番で1回約3GB) を c-lord が片付ける。"""
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, str(upstream))
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch)
+    monkeypatch.setattr(gm, "_FETCH_TIMEOUT", 1.0)
+
+    assert ensure_mirror(root, str(upstream)) == mirror
+    time.sleep(0.3)  # 止め損ねた子が居れば、ここで書きかけを作り直す
+    assert _garbage(mirror) == []
+
+
+def test_after_a_timed_out_fetch_the_next_clone_does_not_wait_1133(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """前回の更新が時間切れだったミラーは、次は待たずにそのまま使う。"""
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, str(upstream))
+    _fake_slow_git(tmp_path, monkeypatch)
+    monkeypatch.setattr(gm, "_FETCH_TIMEOUT", 2.0)
+
+    ensure_mirror(root, str(upstream))  # 1回目: 時間切れまで待つ (2秒)
+    started = time.monotonic()
+    assert ensure_mirror(root, str(upstream)) == mirror
+    assert time.monotonic() - started < 1.0, "2回目も fetch の時間切れを待った"
+
+
+def test_a_failing_mirror_is_refetched_in_the_background_and_recovers_1133(
+    tmp_path: Path, upstream: Path
+) -> None:
+    """時間切れの印が古くなったら、待たずに裏で取り直す。成功したら印を消して元に戻る。"""
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, str(upstream))
+    assert mirror is not None
+    mark = mirror / gm.FETCH_TIMED_OUT_MARK
+    mark.write_text("")
+    old = mark.stat().st_mtime - gm._BACKGROUND_RETRY_AFTER - 60
+    os.utime(mark, (old, old))
+
+    (upstream / "NEW.md").write_text("new\n")
+    _git(upstream, "add", "-A")
+    _git(upstream, "commit", "-qm", "second")
+    head = _git(upstream, "rev-parse", "HEAD").stdout.strip()
+
+    assert ensure_mirror(root, str(upstream)) == mirror
+    gm.wait_for_background_fetches(timeout=30)
+    got = subprocess.run(["git", "-C", str(mirror), "cat-file", "-e", head])
+    assert got.returncode == 0, "裏の fetch が走っていない"
+    assert not mark.exists(), "成功したのに印が残っている"
+
+
+def test_a_recent_timeout_mark_skips_the_fetch_entirely_1133(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """時間切れの直後は裏でも取り直さない (1回3GB をスレッドごとに繰り返さない)。"""
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, str(upstream))
+    assert mirror is not None
+    (mirror / gm.FETCH_TIMED_OUT_MARK).write_text("")
+    log = _fake_slow_git(tmp_path, monkeypatch)
+    assert ensure_mirror(root, str(upstream)) == mirror
+    gm.wait_for_background_fetches(timeout=5)
+    assert not log.exists(), "印が新しいのに fetch した"
+
+
+def test_leftover_half_written_packs_are_swept_when_no_fetch_runs_1134(
+    tmp_path: Path, upstream: Path
+) -> None:
+    """既に残っている書きかけ (本番 openclaw の7個) も次の ensure_mirror で消える。
+
+    今まさに誰かが書いている (新しい) ものには触らない。
+    """
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, str(upstream))
+    assert mirror is not None
+    pack_dir = mirror / "objects" / "pack"
+    stale = pack_dir / "tmp_pack_k7BymR"
+    stale.write_bytes(b"x" * 1024)
+    old = stale.stat().st_mtime - 3 * 86400
+    os.utime(stale, (old, old))
+    fresh = pack_dir / "tmp_pack_live01"
+    fresh.write_bytes(b"x")
+
+    ensure_mirror(root, str(upstream))
+    gm.wait_for_background_fetches(timeout=30)
+    assert _garbage(mirror) == ["tmp_pack_live01"]
+    # 書きかけが残っていた = 前に fetch が殺された。待たずに裏で取り直している
+    assert str(mirror) in gm._background
+
+
+def test_a_fetch_already_running_is_not_waited_for_1133(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """別のスレッドが同じミラーを更新中なら、終わるのを待たずにそのまま使う。"""
+    import fcntl
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, str(upstream))
+    assert mirror is not None
+    log = _fake_slow_git(tmp_path, monkeypatch)
+    with open(mirror / gm._FETCH_LOCK, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        started = time.monotonic()
+        assert ensure_mirror(root, str(upstream)) == mirror
+        assert time.monotonic() - started < 1.0
+    assert not log.exists()
+
+
+def test_a_timed_out_mirror_clone_leaves_nothing_behind_1134(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``clone --mirror`` が時間切れでも、書きかけの一時ディレクトリは残らない。"""
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    real = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    script = bindir / "git"
+    script.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "clone" ]; then\n'
+        '  for a; do dest="$a"; done\n'
+        '  mkdir -p "$dest/objects/pack"\n'
+        '  ( while true; do echo x >> "$dest/objects/pack/tmp_pack_c"; sleep 0.05; done ) &\n'
+        "  sleep 30\n"
+        "fi\n"
+        f'exec "{real}" "$@"\n'
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(gm, "_CLONE_TIMEOUT", 1.0)
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    assert ensure_mirror(root, str(upstream)) is None
+    time.sleep(0.3)
+    assert [p.name for p in root.iterdir() if p.name != "README.md"] == []

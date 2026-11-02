@@ -62,6 +62,30 @@ c-lord-sessions/                      ← セッション root
    ブランチのオブジェクトを参照しているクローンが在りうる）
 3. どちらも**失敗してよい**。失敗したらミラー無しでクローンする
 
+### 更新が時間切れになるミラー (#1133 / #1134)
+
+本番の `yousan/openclaw` では、ミラーの更新が 10/27〜10/29 の6回すべてで 300 秒の時間切れに
+なり、そのたびにスレッドの開始が 6〜7 分遅れ（ランプも返事も無い）、殺された fetch の
+受信途中の pack（1回約 3 GB）が `objects/pack/tmp_pack_*` に 7 個・20 GB 残っていた。
+
+- **時間切れの fetch は c-lord が片付ける。** git を自分のプロセスグループで走らせ、時間切れの
+  ときはグループごと止め（受信を担う子の index-pack / ssh まで）、その fetch が作った
+  `objects/pack/tmp_*` をその場で消す
+- **一度時間切れになったミラーは、次からクローンを待たせない。** ミラーに印
+  `clord-fetch-timed-out` を置き、印があるあいだは更新せずにそのまま使う
+  （古くても正しさは変わらない — クローンは `--reference-if-able` で足りない分を origin から取る）
+- **印が 1 時間以上古ければ裏で取り直す。** 上限 1 時間でバックグラウンドの fetch を走らせ、
+  成功したら印を消して「更新してから使う」に戻る。失敗すれば印が新しくなり、次の 1 時間は
+  取り直さない（1 回 3 GB をスレッドごとに繰り返さない）
+- **同じミラーの更新は 1 本だけ**（`clord-fetch.lock` の flock）。誰かが更新中なら、その終わりも待たない
+- **前に殺された fetch の書きかけも消す。** 更新中でないときに、2 時間以上更新の無い
+  `objects/pack/tmp_*` を消す（走っている fetch は書き続けるので新しい）。書きかけが残っていた
+  = 前に fetch が殺されたので、印も置く（その書きかけの時刻で）
+
+ログ: `git mirror: fetch of … timed out; removed N half-written pack(s)` /
+`… timed out N min ago — using it as-is` / `refetching … in the background` /
+`removed N half-written pack(s) (X GiB) left by killed fetches`。
+
 **ローカルリポジトリ (`git clone --local`) はミラーを使わない。** 既に hardlink で
 共有しており、意味が無い（実測: `/home/yousan/c-lord` の300クローンで合計 0.5 GB）。
 
