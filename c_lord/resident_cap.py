@@ -66,6 +66,8 @@ from .log_sampler import LogSampler
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     from .database.repository import SessionRecord
 
 logger = logging.getLogger(__name__)
@@ -284,8 +286,17 @@ def select_lru_victims(
     resident: set[int],
     target: int,
     in_flight: set[int],
+    activity: Mapping[int, datetime.datetime] | None = None,
 ) -> list[int]:
     """Thread ids to sleep so at most *target* stay resident, longest-idle first.
+
+    "Idle since" is the **later** of the last request (``last_used_at``) and
+    *activity* — when Claude last wrote any transcript of that workspace,
+    subagents included (#1142, the clock idle-sleep uses since #922/#964). By
+    ``last_used_at`` alone a thread that kept working for hours after its
+    request (background waits, wakeups, subagents) looked the *most* idle, and
+    on 2026-10-29 the brake slept one 17 seconds after its last write. A thread
+    missing from *activity* (no transcript, unreadable) orders by its request.
 
     Only workspaces that are **actually resident** can be chosen — sleeping one
     that is already asleep would make the count never converge.
@@ -322,6 +333,9 @@ def select_lru_victims(
         last = parse_timestamp(rec.last_used_at)
         if last is None:
             continue
+        written = (activity or {}).get(rec.thread_id)
+        if written is not None and written > last:
+            last = written
         aged.append((last, rec.thread_id))
 
     aged.sort(key=lambda pair: pair[0])
@@ -352,6 +366,8 @@ class ResidentCapLoop:
         resident_fn: object | None = None,
         in_flight_fn: object | None = None,
         mem_fn: object | None = None,
+        activity_fn: Callable[[SessionRecord], datetime.datetime | None] | None = None,
+        projects_root: Path | None = None,
     ) -> None:
         self._bot = bot
         self._repo = session_repo
@@ -361,6 +377,8 @@ class ResidentCapLoop:
         self._resident_fn = resident_fn
         self._in_flight_fn = in_flight_fn
         self._mem_fn = mem_fn or memory_snapshot
+        self._activity_fn = activity_fn
+        self._projects_root = projects_root
         self._low_streak = 0
         self._braking = False
         # One "episode" = one stretch of braking, from engaged to released. The
@@ -464,6 +482,46 @@ class ResidentCapLoop:
             if isinstance(active, dict):
                 return {int(t) for t in active}
         return set()
+
+    def _last_write(self, record: SessionRecord) -> datetime.datetime | None:
+        """When Claude last wrote this workspace's transcript (#1142), local time."""
+        if self._activity_fn is not None:
+            return self._activity_fn(record)
+        if not record.working_dir:
+            return None
+        from .idle_sleep import last_transcript_write
+        from .transcript.resolver import derive_project_dir
+
+        project_dir = derive_project_dir(record.working_dir, projects_root=self._projects_root)
+        return last_transcript_write(project_dir)
+
+    async def _activity(
+        self, records: Iterable[SessionRecord], candidates: set[int]
+    ) -> dict[int, datetime.datetime]:
+        """``thread_id → last transcript write`` for *candidates* (#1142).
+
+        A transcript that cannot be read is simply absent: that workspace then
+        orders by its last request, as before. Never raises.
+        """
+        wanted = [rec for rec in records if rec.thread_id in candidates]
+
+        def _read() -> dict[int, datetime.datetime]:
+            found: dict[int, datetime.datetime] = {}
+            for rec in wanted:
+                try:
+                    written = self._last_write(rec)
+                except Exception:
+                    logger.debug("resident-cap: transcript of thread=%d unreadable", rec.thread_id)
+                    continue
+                if written is not None:
+                    found[rec.thread_id] = written
+            return found
+
+        try:
+            return await asyncio.to_thread(_read)
+        except Exception:
+            logger.warning("resident-cap: could not read transcripts", exc_info=True)
+            return {}
 
     async def _running_on_host(self, candidates: set[int]) -> set[int]:
         """Of *candidates*, whose pane is mid-turn — the restart-proof half.
@@ -592,11 +650,13 @@ class ResidentCapLoop:
         await self._close_known_gone(self._resident())
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
         resident = (self._resident() - self._gone) & {rec.thread_id for rec in records}
+        in_flight = await self._turns_in_flight(resident)
         victims = select_lru_victims(
             records,
             resident=resident,
             target=0,  # ordering only — the loop below stops as soon as it recovers
-            in_flight=await self._turns_in_flight(resident),
+            in_flight=in_flight,
+            activity=await self._activity(records, resident - in_flight),
         )
         if not victims:
             stuck = self._quiet.sample(("nothing", self._episode))
@@ -663,13 +723,15 @@ class ResidentCapLoop:
         # is made up for by the next one, so one tick gets back under the limit
         # (#1033 — slicing first let one dead thread hold the cap at limit+1
         # forever, the #593 shape).
+        in_flight = await self._turns_in_flight(resident)
         victims = [
             tid
             for tid in select_lru_victims(
                 records,
                 resident=resident,
                 target=0,
-                in_flight=await self._turns_in_flight(resident),
+                in_flight=in_flight,
+                activity=await self._activity(records, resident - in_flight),
             )
             if tid not in self._unresolvable
         ]
@@ -703,8 +765,15 @@ class ResidentCapLoop:
         for thread_id in victims:
             if slept >= over:
                 break
-            if await self._sleep_one(thread_id, WorkspaceReason.CAP, label):
+            outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
+            if outcome:
                 slept += 1
+            elif outcome is None:
+                # Nothing to sleep — its claude ended on its own between the
+                # count and the kill (#1094). It left the residents by itself,
+                # so it is one fewer over, not a failure to make up for with a
+                # live workspace (that slept the cap below its limit).
+                over -= 1
             elif thread_id in self._gone:
                 # Found deleted just now (#1086): it never counted, so it frees
                 # no slot to make up for — close it and lower the bar instead.
@@ -736,11 +805,15 @@ class ResidentCapLoop:
         for thread_id in sorted(gone - await self._turns_in_flight(gone)):
             await self._close_gone(thread_id)
 
-    async def _sleep_one(self, thread_id: int, reason: object, label: str | None) -> bool:
+    async def _sleep_one(self, thread_id: int, reason: object, label: str | None) -> bool | None:
         """Put one workspace to sleep through the one shared implementation.
 
         Never a second copy of "sleep a workspace" — #572 owns that, and two
         implementations of one outcome always drift (#538).
+
+        ``True``: slept. ``False``: could not (the thread could not be resolved,
+        the sleep raised) — the window is still there. ``None``: the sleep found
+        nothing to kill (#1094) — the window was already gone.
         """
         cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
         impl = getattr(cog, "_sleep_workspace_impl", None)
@@ -752,7 +825,7 @@ class ResidentCapLoop:
         if channel is None:
             return False
         try:
-            return bool(await impl(channel=channel, reason=reason, idle_label=label))
+            return True if await impl(channel=channel, reason=reason, idle_label=label) else None
         except Exception:
             logger.exception("resident-cap: failed to sleep thread=%d", thread_id)
             return False

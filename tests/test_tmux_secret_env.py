@@ -109,7 +109,7 @@ class TestSessionEnvRemovalMark:
         for call in run.call_args_list:
             argv = call[0][0]
             if "set-environment" in argv:
-                assert argv[argv.index("-t") + 1] == "project-x"
+                assert argv[argv.index("-t") + 1] == "=project-x"
 
     def test_mark_is_applied_to_a_session_that_already_existed(self) -> None:
         """The dirty server is usually one that predates the fix — mark it anyway."""

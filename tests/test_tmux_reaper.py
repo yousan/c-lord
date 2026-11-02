@@ -68,6 +68,7 @@ class FakeTmux:
 
     def _key(self, target: str) -> str:
         """``@3`` or ``session:name`` → the ``session:name`` key of the test data."""
+        target = target.removeprefix("=")  # exact-match target (#1120)
         return self._ids.get(target, target)
 
     def __call__(self, argv: list[str], **kwargs: object) -> MagicMock:
@@ -92,7 +93,7 @@ class FakeTmux:
             return MagicMock(returncode=0, stdout="")
 
         if "list-windows" in argv:
-            session = argv[argv.index("-t") + 1]
+            session = argv[argv.index("-t") + 1].removeprefix("=")  # #1120
             fmt = argv[argv.index("-F") + 1] if "-F" in argv else "#{window_name}"
             body = ""
             for name in self.windows.get(session, []):

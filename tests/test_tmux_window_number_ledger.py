@@ -67,7 +67,10 @@ class FakeTmux:
 
     @staticmethod
     def _opt(args: list[str], flag: str) -> str | None:
-        return args[args.index(flag) + 1] if flag in args else None
+        if flag not in args:
+            return None
+        value = args[args.index(flag) + 1]
+        return value.removeprefix("=") if flag == "-t" else value  # exact match (#1120)
 
     def _render(self, fmt: str, w: dict[str, str]) -> str:
         return re.sub(r"#\{([^}]+)\}", lambda m: w.get(m.group(1), ""), fmt)

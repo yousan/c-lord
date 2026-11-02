@@ -63,7 +63,7 @@ class TestAdoptWindowFromOtherSession:
         # Addressed by window_id: "games:w5" is ambiguous the moment another
         # window shares the name — that is how this failed on staging.
         assert "@42" in move
-        assert f"{mgr.session_name}:" in move
+        assert f"={mgr.session_name}:" in move
         assert "games:w5" not in move
 
     def test_tags_the_adopted_window_with_thread_id(self) -> None:
