@@ -121,6 +121,25 @@ def _is_bookkeeping(event: dict[str, Any]) -> bool:
     return text is not None and text.lstrip().startswith(_BOOKKEEPING_PREFIXES)
 
 
+def _is_local_command_output(event: object) -> bool:
+    """The output record of a local slash command (``/compact``, ``/model`` …) (#1137).
+
+    The CLI runs those itself, at the prompt, with Claude idle — so one after
+    the last message settles it like a turn-end marker: nothing was asked of
+    Claude. It matters because the CLI also writes the typed command as a plain
+    ``'/compact'`` user row, which otherwise read as a prompt never answered.
+    """
+    if not isinstance(event, dict) or event.get("type") != "user" or event.get("isSidechain"):
+        return False
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return False
+    text = _user_text(message.get("content"))
+    return text is not None and text.lstrip().startswith(
+        ("<local-command-stdout>", "<local-command-stderr>")
+    )
+
+
 def _is_turn_end(event: object) -> bool:
     """Claude Code's own "this turn is over" marker (same rule as #215 recovery)."""
     if not isinstance(event, dict):
@@ -153,7 +172,9 @@ def _last_message(path: Path, *, through_turn_end: bool = False) -> dict[str, An
                 partial = lines.pop(0) if pos > 0 else b""
                 for raw in reversed(lines):
                     event = _parse(raw)
-                    if _is_turn_end(event) and not through_turn_end:
+                    if not through_turn_end and (
+                        _is_turn_end(event) or _is_local_command_output(event)
+                    ):
                         return None
                     if _is_message(event):
                         return event
@@ -199,7 +220,9 @@ def transcript_stopped_mid_turn(path: Path) -> bool:
     - a user prompt → mid-turn (Claude never answered it);
     - ``[Request interrupted by user…]`` → the user stopped it, not a stop;
     - rows nobody typed (compaction summary, slash command, task notification)
-      → looked past; the row before them decides (#895).
+      → looked past; the row before them decides (#895);
+    - a local command's output (a typed ``/compact``, ``/model`` …) after the
+      last message → finished, waiting (#1137).
 
     Blocking.
     """
