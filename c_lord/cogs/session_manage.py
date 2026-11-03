@@ -1713,7 +1713,13 @@ class SessionManageCog(commands.Cog):
                 exc_info=True,
             )
 
-    async def _stop_teardown(self, thread_id: int, parent_channel_id: int) -> _StopTeardown:
+    async def _stop_teardown(
+        self,
+        thread_id: int,
+        parent_channel_id: int,
+        *,
+        close_reason: WorkspaceReason | None = None,
+    ) -> _StopTeardown:
         """Everything 停止 does to a workspace, in order (#1113).
 
         Shared by ``/workspace-stop`` and ``/workspace-delete`` so "削除 ⊃ 停止"
@@ -1727,6 +1733,11 @@ class SessionManageCog(commands.Cog):
         for the turn to paint its end → retire question cards → find, record and
         stop the dev containers. What each caller *says* about it stays with the
         caller.
+
+        ``close_reason`` (stop only) records the close right after the window
+        goes and before the docker calls, which can take seconds — a message
+        landing in that gap must see a *closed* thread, not a dead pane to
+        auto-resume (#512 / #270).
         """
         import asyncio
 
@@ -1771,6 +1782,13 @@ class SessionManageCog(commands.Cog):
         # #977: a question card left on screen must not stay pressable in the
         # archived thread — the turn it asked for is over.
         await retire_menus_for_stop(thread_id, ask_repo=getattr(self.bot, "ask_repo", None))
+
+        # #512: record the close so a later message can tell this apart from a
+        # pane that merely died — the latter still auto-resumes via --continue
+        # (#270), this one holds the message and offers the reopen button.
+        if close_reason is not None:
+            with contextlib.suppress(Exception):
+                await self.repo.set_closed(thread_id, True, reason=close_reason.value)
 
         # #574: stop the dev environment too. Leaving it running is how 12
         # supabase containers ended up on the production host holding ports
@@ -2052,19 +2070,13 @@ class SessionManageCog(commands.Cog):
         parent_channel_id = channel.parent_id or thread_id
         await ack()
 
-        teardown = await self._stop_teardown(thread_id, parent_channel_id)
+        teardown = await self._stop_teardown(thread_id, parent_channel_id, close_reason=reason)
         results: list[str] = []
         if teardown.tmux_mgr is None:
             results.append(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
                 " `/clord-init` で設定してください。"
             )
-
-        # #512: record the close so a later message can tell this apart from a
-        # pane that merely died — the latter still auto-resumes via --continue
-        # (#270), this one holds the message and offers the reopen button.
-        with contextlib.suppress(Exception):
-            await self.repo.set_closed(thread_id, True, reason=reason.value)
 
         # Rename to "[終了] …" **and** archive (#271) in a single PATCH. They must
         # not be two calls: Discord refuses to rename an archived thread (code

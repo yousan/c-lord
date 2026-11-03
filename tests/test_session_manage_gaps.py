@@ -1038,3 +1038,38 @@ class TestWorkspaceStartGaps:
         await cog.workspace_start_text.callback(cog, _ctx(thread))
         await cog.reopen_workspace.callback(cog, _interaction(thread))
         assert cog._reopen_workspace_impl.await_count == 3
+
+
+class TestStopTeardownOrder:
+    """#1113 refactor: stop still records the close before the (slow) docker calls."""
+
+    async def test_close_is_recorded_before_docker_is_asked(self, monkeypatch):
+        order: list[str] = []
+        cog = _cog()
+        mgr = _tmux()
+        mgr.kill_session = MagicMock(side_effect=lambda _t: order.append("kill") or True)
+        sdm = MagicMock()
+        sdm.base_dir = "/s"
+        cog._resolve_tmux_manager = AsyncMock(return_value=mgr)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
+        cog.repo.set_closed = AsyncMock(side_effect=lambda *a, **k: order.append("closed"))
+
+        async def found(_d):
+            order.append("docker")
+            return []
+
+        monkeypatch.setattr(sm, "containers_for_session_dir", found)
+
+        await cog._stop_teardown(555, 1, close_reason=sm.WorkspaceReason.MANUAL)
+
+        assert order == ["kill", "closed", "docker"]
+
+    async def test_delete_does_not_mark_the_thread_closed(self, monkeypatch):
+        cog = _cog()
+        cog._resolve_tmux_manager = AsyncMock(return_value=_tmux())
+        cog._resolve_session_dir_manager = AsyncMock(return_value=None)
+        cog.repo.set_closed = AsyncMock()
+
+        await cog._stop_teardown(555, 1)
+
+        cog.repo.set_closed.assert_not_called()
