@@ -12,6 +12,7 @@ import contextlib
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,6 +64,7 @@ from ..workspace_notice import (
     DockerOutcome,
     WorkspaceAction,
     WorkspaceReason,
+    docker_value,
     restored_devenv_notice,
     workspace_notice_embed,
 )
@@ -80,6 +82,16 @@ _Acknowledger = Callable[..., Awaitable[None]]
 
 # Discord rejects an embed whose field value exceeds this (400, code 50035 — #824).
 _EMBED_FIELD_LIMIT = 1024
+
+
+@dataclass(frozen=True)
+class _StopTeardown:
+    """What :meth:`SessionManageCog._stop_teardown` did, for the caller to report."""
+
+    tmux_mgr: TmuxSessionManager | None
+    killed: bool
+    containers: list[DevContainer]
+    docker: DockerOutcome
 
 
 def _fit_field_lines(lines: list[str], limit: int = _EMBED_FIELD_LIMIT) -> str:
@@ -1701,6 +1713,104 @@ class SessionManageCog(commands.Cog):
                 exc_info=True,
             )
 
+    async def _stop_teardown(self, thread_id: int, parent_channel_id: int) -> _StopTeardown:
+        """Everything 停止 does to a workspace, in order (#1113).
+
+        Shared by ``/workspace-stop`` and ``/workspace-delete`` so "削除 ⊃ 停止"
+        (``docs/specs/workspace-vocabulary.md``) holds in the code's shape too:
+        delete used to kill the window under a running turn (the #909 crash) and
+        never looked for the workspace's docker containers (the #574 orphans),
+        because each of those was added to stop alone. Anything stop gains from
+        now on, delete gains with it.
+
+        Order: end the running turn → stop the mirror → kill the window → wait
+        for the turn to paint its end → retire question cards → find, record and
+        stop the dev containers. What each caller *says* about it stays with the
+        caller.
+        """
+        import asyncio
+
+        # #909: end the turn that is running here first. Killing the window
+        # under it left the run polling a pane that no longer exists until the
+        # 5-minute backstop, which then reported a crash (❌ + failure ping) for
+        # a stop the user asked for. Loose-coupled through bot.get_cog (#512).
+        end_turn = getattr(self.bot.get_cog("ClaudeChatCog"), "end_turn_for_workspace_stop", None)
+        if end_turn is not None:
+            try:
+                end_turn(thread_id)
+            except Exception:
+                logger.warning(
+                    "%s workspace stop: could not end the running turn (#909)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+
+        # Stop the mirror BEFORE kill/archive so the kill's task-notification can't
+        # be echoed (👤) into the thread after we archive it and un-archive it (#379).
+        await self._stop_transcript_mirror(thread_id)
+
+        # Kill the tmux window to free the w<N> slot.
+        killed = False
+        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
+        if tmux_mgr is not None:
+            killed = bool(await asyncio.to_thread(tmux_mgr.kill_session, thread_id))
+
+        # #909: let the turn ended above paint its final 🟡 before the archive
+        # below — Discord refuses reactions in an archived thread.
+        wait_for_turn_end = getattr(self.bot.get_cog("ClaudeChatCog"), "wait_for_turn_end", None)
+        if wait_for_turn_end is not None:
+            try:
+                await wait_for_turn_end(thread_id)
+            except Exception:
+                logger.warning(
+                    "%s workspace stop: could not wait for the turn to end (#909)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+
+        # #977: a question card left on screen must not stay pressable in the
+        # archived thread — the turn it asked for is over.
+        await retire_menus_for_stop(thread_id, ask_repo=getattr(self.bot, "ask_repo", None))
+
+        # #574: stop the dev environment too. Leaving it running is how 12
+        # supabase containers ended up on the production host holding ports
+        # 55321-55327 with no owner: the workspace was gone, so nothing was left
+        # that knew they existed. Stopping frees the ports; the volumes (the
+        # actual data) are untouched — see docs/specs/workspace-vocabulary.md.
+        containers: list[DevContainer] = []
+        # Only a discovery that actually completed may be written down. An empty
+        # list from a *failed* docker call is indistinguishable from "nothing is
+        # running" at the call site, and recording it would mark live containers
+        # as gone — losing the very ownership record #612 exists to keep.
+        discovered_dir: str | None = None
+        with contextlib.suppress(Exception):
+            sdm = await self._resolve_session_dir_manager(parent_channel_id)
+            if sdm is not None:
+                session_dir = str(Path(sdm.base_dir) / str(thread_id))
+                containers = await containers_for_session_dir(session_dir)
+                discovered_dir = session_dir
+
+        # #612: write the link down *before* stopping. This is the last moment
+        # anything knows these containers belong to this thread — after the
+        # workspace goes, only this row can answer "who is holding port 55322?".
+        if self._devenv_repo is not None and discovered_dir is not None:
+            with contextlib.suppress(Exception):
+                await self._devenv_repo.record(  # type: ignore[attr-defined]
+                    thread_id, discovered_dir, containers
+                )
+
+        docker_outcome = DockerOutcome.NONE
+        if containers:
+            stopped = await stop_containers(containers)
+            # Report what actually happened, not what was attempted: a docker
+            # that refused leaves the ports held, and the notice must say so
+            # rather than announcing a release that did not occur (#571).
+            docker_outcome = DockerOutcome.STOPPED if stopped else DockerOutcome.LEFT_RUNNING
+
+        return _StopTeardown(
+            tmux_mgr=tmux_mgr, killed=killed, containers=containers, docker=docker_outcome
+        )
+
     async def _workspace_delete_impl(
         self, *, channel: object, respond: _Responder, ack: _Acknowledger
     ) -> None:
@@ -1721,20 +1831,21 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        # Stop the mirror before tearing down so it doesn't keep tailing a JSONL
-        # whose session dir we're about to remove (and can't echo post-teardown) (#379).
-        await self._stop_transcript_mirror(thread_id)
+        # #1113: 削除 ⊃ 停止 — the same teardown as /workspace-stop (end the
+        # turn, stop the mirror, kill the window, retire menus, stop docker),
+        # then the one thing only delete does: remove the directory.
+        teardown = await self._stop_teardown(thread_id, parent_channel_id)
 
         results: list[str] = []
-
-        # Kill tmux window
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
-        if tmux_mgr is not None:
-            killed = await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
-            if killed:
+        if teardown.tmux_mgr is not None:
+            if teardown.killed:
                 results.append("✅ Tmux window deleted")
             else:
                 results.append("ℹ️ No tmux window found")
+        if teardown.containers:
+            results.append(
+                "🐳 開発環境 (docker): " + docker_value(teardown.docker, teardown.containers)
+            )
 
         # #595: deletion is the one operation that frees the thread's ``w{N}``;
         # sleep and stop keep it so the thread returns under the same number.
@@ -1941,55 +2052,13 @@ class SessionManageCog(commands.Cog):
         parent_channel_id = channel.parent_id or thread_id
         await ack()
 
-        import asyncio
-
-        # #909: end the turn that is running here first. Killing the window
-        # under it left the run polling a pane that no longer exists until the
-        # 5-minute backstop, which then reported a crash (❌ + failure ping) for
-        # a stop the user asked for. Loose-coupled through bot.get_cog (#512).
-        end_turn = getattr(self.bot.get_cog("ClaudeChatCog"), "end_turn_for_workspace_stop", None)
-        if end_turn is not None:
-            try:
-                end_turn(thread_id)
-            except Exception:
-                logger.warning(
-                    "%s workspace stop: could not end the running turn (#909)",
-                    log_ctx(thread_id=thread_id),
-                    exc_info=True,
-                )
-
-        # Stop the mirror BEFORE kill/archive so the kill's task-notification can't
-        # be echoed (👤) into the thread after we archive it and un-archive it (#379).
-        await self._stop_transcript_mirror(thread_id)
-
+        teardown = await self._stop_teardown(thread_id, parent_channel_id)
         results: list[str] = []
-
-        # Kill the tmux window to free the w<N> slot.
-        tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
-        if tmux_mgr is not None:
-            await asyncio.to_thread(tmux_mgr.kill_session, thread_id)
-        else:
+        if teardown.tmux_mgr is None:
             results.append(
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
                 " `/clord-init` で設定してください。"
             )
-
-        # #909: let the turn ended above paint its final 🟡 before the archive
-        # below — Discord refuses reactions in an archived thread.
-        wait_for_turn_end = getattr(self.bot.get_cog("ClaudeChatCog"), "wait_for_turn_end", None)
-        if wait_for_turn_end is not None:
-            try:
-                await wait_for_turn_end(thread_id)
-            except Exception:
-                logger.warning(
-                    "%s workspace stop: could not wait for the turn to end (#909)",
-                    log_ctx(thread_id=thread_id),
-                    exc_info=True,
-                )
-
-        # #977: a question card left on screen must not stay pressable in the
-        # archived thread — the turn it asked for is over.
-        await retire_menus_for_stop(thread_id, ask_repo=getattr(self.bot, "ask_repo", None))
 
         # #512: record the close so a later message can tell this apart from a
         # pane that merely died — the latter still auto-resumes via --continue
@@ -2004,41 +2073,8 @@ class SessionManageCog(commands.Cog):
         # likely. apply_closed_name falls back to archive-only if the rename half
         # fails, so a missing Manage Threads permission still leaves the thread
         # archived (#512).
-
-        # #574: stop the dev environment too. Leaving it running is how 12
-        # supabase containers ended up on the production host holding ports
-        # 55321-55327 with no owner: the workspace was gone, so nothing was left
-        # that knew they existed. Stopping frees the ports; the volumes (the
-        # actual data) are untouched — see docs/specs/workspace-vocabulary.md.
-        containers: list[DevContainer] = []
-        # Only a discovery that actually completed may be written down. An empty
-        # list from a *failed* docker call is indistinguishable from "nothing is
-        # running" at the call site, and recording it would mark live containers
-        # as gone — losing the very ownership record #612 exists to keep.
-        discovered_dir: str | None = None
-        with contextlib.suppress(Exception):
-            sdm = await self._resolve_session_dir_manager(parent_channel_id)
-            if sdm is not None:
-                session_dir = str(Path(sdm.base_dir) / str(thread_id))
-                containers = await containers_for_session_dir(session_dir)
-                discovered_dir = session_dir
-
-        # #612: write the link down *before* stopping. This is the last moment
-        # anything knows these containers belong to this thread — after the
-        # workspace goes, only this row can answer "who is holding port 55322?".
-        if self._devenv_repo is not None and discovered_dir is not None:
-            with contextlib.suppress(Exception):
-                await self._devenv_repo.record(  # type: ignore[attr-defined]
-                    thread_id, discovered_dir, containers
-                )
-
-        docker_outcome = DockerOutcome.NONE
-        if containers:
-            stopped = await stop_containers(containers)
-            # Report what actually happened, not what was attempted: a docker
-            # that refused leaves the ports held, and the notice must say so
-            # rather than announcing a release that did not occur (#571).
-            docker_outcome = DockerOutcome.STOPPED if stopped else DockerOutcome.LEFT_RUNNING
+        containers = teardown.containers
+        docker_outcome = teardown.docker
 
         # #571: the notice is an inventory, not a label — it says what stopped
         # *and* what survived, because that is the question the reader has.

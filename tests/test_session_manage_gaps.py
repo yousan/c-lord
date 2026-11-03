@@ -789,12 +789,6 @@ class TestWorkspaceDeleteGaps:
         await cog.workspace_delete.callback(cog, _interaction(_thread()))
         cog._workspace_delete_impl.assert_awaited_once()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="#1113: docs: 削除 ⊃ 停止 (workspace-vocabulary.md, COMMANDS.md), but "
-        "/workspace-delete never discovers or stops the workspace's docker containers "
-        "(only /workspace-stop does, #574) — they keep holding ports with no owner.",
-    )
     async def test_delete_stops_dev_containers_like_stop_does(self, monkeypatch):
         from c_lord.session_dir import CleanupResult
 
@@ -813,12 +807,6 @@ class TestWorkspaceDeleteGaps:
 
         stop.assert_awaited_once_with([container])
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="#1113: #909 ended the running turn before /workspace-stop kills the window, so the "
-        "run does not poll a dead pane until the 5-min backstop and report a crash. "
-        "/workspace-delete kills the same window without ending the turn.",
-    )
     async def test_delete_ends_the_running_turn_first(self, monkeypatch):
         from c_lord.session_dir import CleanupResult
 
@@ -835,6 +823,43 @@ class TestWorkspaceDeleteGaps:
         await cog._workspace_delete_impl(channel=_thread(), respond=respond, ack=ack)
 
         chat.end_turn_for_workspace_stop.assert_called_once_with(555)
+
+    async def test_delete_ends_the_turn_before_killing_the_window(self, monkeypatch):
+        # #1113/#909: the order is the point — killing first is the 5-minute ❌.
+        from c_lord.session_dir import CleanupResult
+
+        monkeypatch.setattr(sm, "release_window_number", MagicMock())
+        cog, mgr, _sdm = self._cog(
+            killed=True, cleanup=CleanupResult("/s/555", 555, True, "removed")
+        )
+        order: list[str] = []
+        chat = MagicMock()
+        chat.end_turn_for_workspace_stop = MagicMock(side_effect=lambda _t: order.append("end"))
+        chat.wait_for_turn_end = AsyncMock()
+        mgr.kill_session = MagicMock(side_effect=lambda _t: order.append("kill") or True)
+        cog.bot.get_cog = MagicMock(side_effect=lambda n: chat if n == "ClaudeChatCog" else None)
+        respond, ack, _sent, _ = _capture()
+
+        await cog._workspace_delete_impl(channel=_thread(), respond=respond, ack=ack)
+
+        assert order == ["end", "kill"]
+
+    async def test_delete_reports_the_stopped_containers(self, monkeypatch):
+        # #1113: the notice says what happened to docker, like stop's inventory does.
+        from c_lord.session_dir import CleanupResult
+
+        monkeypatch.setattr(sm, "release_window_number", MagicMock())
+        container = sm.DevContainer("id1", "db", "running", (55322,), "p", "mount")
+        monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[container]))
+        monkeypatch.setattr(sm, "stop_containers", AsyncMock(return_value=["db"]))
+        cog, _mgr, _sdm = self._cog(
+            killed=True, cleanup=CleanupResult("/s/555", 555, True, "removed")
+        )
+        respond, ack, sent, _ = _capture()
+
+        await cog._workspace_delete_impl(channel=_thread(), respond=respond, ack=ack)
+
+        assert "🐳 開発環境 (docker): ⏹ 停止（:55322 を解放）" in sent[-1]["embed"].description
 
 
 # ── tool-shell count / sleep ────────────────────────────────────────────────
