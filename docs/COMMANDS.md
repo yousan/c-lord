@@ -131,7 +131,7 @@ Before this, `/clord` checked only whether *a repository* was reachable from the
 /clord repo:git@github.com:yousan/dotclaude.git prompt:Claude 5 系に対応する
 ```
 
-The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476), and `git@github.com/owner/repo` gets its `:` back (#1135). The thread's tmux session follows the chosen repository too (#427).
+The option autocompletes with the channel's default (shown first) and every repository the bot already knows. A repository URL longer than 100 characters is not offered (Discord caps a choice's value at 100, and a cut URL would bind a different repository) — type it by hand instead (#1116). Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476), and `git@github.com/owner/repo` gets its `:` back (#1135). The thread's tmux session follows the chosen repository too (#427).
 
 In the text twin `!clord repo:<URL> <prompt>`, the URL ends at the first whitespace — a space, a tab **or a newline** (#923). Writing the request on the line after `repo:<URL>` therefore works the same as writing it after a space. A repository value that still contains a line break or tab (e.g. from a hand-built `/clord repo:`) is refused before anything is cloned, with a one-line reason.
 
@@ -237,7 +237,7 @@ first message). See [specs/thread-name.md](specs/thread-name.md).
 | Command | Description | Where |
 |---------|-------------|-------|
 | `/workspace-cleanup [dry_run]` | Reclaim the working directories of workspaces nothing is using. Long lists show what fits and end with `…他 N 件` (#824) | Anywhere |
-| `/tmux-list` | List all active tmux windows (each window once, even when several channels share a repo — and so its tmux session, #1112) | Anywhere |
+| `/tmux-list` | List all active tmux windows (each window once, even when several channels share a repo — and so its tmux session, #1112). At most 24 windows are listed; the rest are counted in a last `…ほか N 件` row pointing at `/clord-status` (#1114) | Anywhere |
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane — a stopped workspace is restored first (debug) | Thread only |
 | `/workspace-stop` | **停止**: close the tmux window, keep the session (see below) | Thread only |
 | `/workspace-start` | Reopen a 停止 thread so messages run again | Thread only |

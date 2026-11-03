@@ -224,6 +224,25 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
             )
             sys.exit(1)
 
+    # #1119: the two numeric limits must be whole numbers of at least 1. ``0``
+    # used to start a bot on which every turn waited forever behind a
+    # Semaphore(0) — no error, no log line; ``-1`` and ``three`` died with a
+    # traceback that named no setting. Fail with the key, like the IDs above.
+    max_concurrent = os.getenv("MAX_CONCURRENT_SESSIONS", "3")
+    timeout = os.getenv("SESSION_TIMEOUT_SECONDS", "300")
+    for key, value in (
+        ("MAX_CONCURRENT_SESSIONS", max_concurrent),
+        ("SESSION_TIMEOUT_SECONDS", timeout),
+    ):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit() and int(text) >= 1):
+            logger.error(
+                "%s must be a whole number of at least 1, got %r.",
+                key,
+                value,
+            )
+            sys.exit(1)
+
     return {
         "token": token,
         "channel_id": channel_id,
@@ -236,8 +255,8 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "claude_effort_source": _env_source("CLAUDE_EFFORT", resolved_env_path, "未設定"),
         "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
         "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
-        "max_concurrent": os.getenv("MAX_CONCURRENT_SESSIONS", "3"),
-        "timeout": os.getenv("SESSION_TIMEOUT_SECONDS", "300"),
+        "max_concurrent": max_concurrent.strip(),
+        "timeout": timeout.strip(),
         "owner_id": owner_id_raw,
         "coordination_channel_id": coordination_raw,
     }

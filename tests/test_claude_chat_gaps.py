@@ -448,17 +448,27 @@ class TestRepoAutocomplete:
         channel_cog.known_repos = AsyncMock(side_effect=RuntimeError("db"))
         assert await cog._repo_autocomplete(self._interaction(), "") == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="#1116: repo URLs over 100 chars are offered with a truncated value — picking "
-        "one sends a different (non-existent) URL as repo:",
-    )
     async def test_a_long_repo_url_is_never_offered_truncated(self) -> None:
         long_repo = "https://github.com/some-organisation/" + "x" * 90
         assert len(long_repo) > 100
         cog, _ = self._cog(default=None, known=[long_repo])
         choices = await cog._repo_autocomplete(self._interaction(), "")
         assert all(ch.value == long_repo for ch in choices)
+
+    async def test_a_long_repo_url_is_not_offered_at_all(self) -> None:
+        # #1116 案A: over 100 characters → no choice; the short one is still offered.
+        long_repo = "https://github.com/some-organisation/" + "x" * 90
+        short = "https://github.com/o/r.git"
+        cog, _ = self._cog(default=long_repo, known=[long_repo, short])
+        choices = await cog._repo_autocomplete(self._interaction(), "")
+        assert [c.value for c in choices] == [short]
+
+    async def test_a_100_character_repo_is_still_offered_whole(self) -> None:
+        repo = "https://github.com/o/" + "x" * (100 - len("https://github.com/o/"))
+        assert len(repo) == 100
+        cog, _ = self._cog(default=None, known=[repo])
+        choices = await cog._repo_autocomplete(self._interaction(), "")
+        assert [c.value for c in choices] == [repo]
 
 
 # ── /clord-reattach ───────────────────────────────────────────────────────
