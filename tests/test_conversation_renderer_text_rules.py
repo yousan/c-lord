@@ -117,3 +117,64 @@ class TestSingleLineCodeFence:
             ("code", "print(1)"),
             ("text", ""),
         ]
+
+
+B = "`" * 3
+
+
+class TestFenceReopenedOnTheSameLine:
+    """#1096 — 1行で閉じたフェンスの後ろで同じ行に次のフェンスを開くと反転した（#1057 の回帰）。"""
+
+    def test_issue_repro_matches_discord(self) -> None:
+        # Discord: code "a", text " then ", code "more", text "after"
+        blocks = _split_code_blocks(f"{B}a{B} then {B}\nmore\n{B}\nafter")
+        assert ("text", "after") in blocks
+        assert ("code", "more") in blocks
+        assert [b for b in blocks if b[1].strip()] == [
+            ("code", "a"),
+            ("text", " then "),
+            ("code", "more"),
+            ("text", "after"),
+        ]
+
+    def test_two_one_line_blocks_on_one_line(self) -> None:
+        blocks = _split_code_blocks(f"{B}a{B} and {B}b{B} done\nnext")
+        assert [b for b in blocks if b[1].strip()] == [
+            ("code", "a"),
+            ("text", " and "),
+            ("code", "b"),
+            ("text", " done\nnext"),
+        ]
+
+    def test_the_reopened_fence_keeps_its_language_tag_out(self) -> None:
+        blocks = _split_code_blocks(f"{B}a{B} {B}py\nprint(1)\n{B}\nend")
+        assert [b for b in blocks if b[1].strip()] == [
+            ("code", "a"),
+            ("code", "print(1)"),
+            ("text", "end"),
+        ]
+
+
+class TestTofuSymbolsAreEmoji:
+    """#1097 — #1057 で外れた ◻ ◼ ◽ ◾ ⤴ ⤵ と、もとから素通りの ℹ を断る側に戻す。"""
+
+    @pytest.mark.parametrize("ch", ["◻", "◼", "◽", "◾", "⤴", "⤵", "ℹ"])
+    def test_counted_as_emoji(self, ch: str) -> None:
+        assert _messages_contain_emoji([ConvMessage(author="a", content=f"{ch} 状態")])
+
+    @pytest.mark.parametrize("ch", ["◻", "◼", "◽", "◾", "⤴"])
+    def test_refused_without_the_library(self, monkeypatch, ch: str) -> None:
+        # #588: without the `emoji` lib a spec holding emoji must not render as tofu.
+        f = load_text_font(20)
+        if f is None:
+            pytest.skip("needs a CJK font")
+        assert f.getbbox(ch) == f.getbbox("\U000fffff"), "body font draws it after all"
+        monkeypatch.setattr(
+            "c_lord.discord_ui.conversation_renderer.emoji_support_available", lambda: False
+        )
+        assert render_conversation_png([ConvMessage(author="a", content=f"{ch} 状態")]) is None
+
+    @pytest.mark.parametrize("text", ["□ 未完了", "■ 完了", "◯ ok"])
+    def test_neighbouring_geometric_shapes_are_not(self, text: str) -> None:
+        # The body face draws these; only the four emoji-presentation squares were added.
+        assert not _messages_contain_emoji([ConvMessage(author="a", content=text)])

@@ -496,14 +496,31 @@ def _split_code_blocks(content: str) -> list[tuple[str, str]]:
         stripped = line.lstrip()
         if stripped.startswith("```"):
             rest = stripped[3:]
-            close = rest.find("```")
-            if not in_code and close != -1:
-                blocks.append(("text", "\n".join(buf)))
-                blocks.append(("code", rest[:close]))
-                buf = []
-                after = rest[close + 3 :]
-                if after.strip():
-                    buf.append(after)
+            if not in_code and rest.find("```") != -1:
+                # One or more one-line blocks on this line. Whatever follows the
+                # last one is text — unless it opens another fence, in which
+                # case the block runs on from the next line (#1096: that
+                # trailing opener was not counted and inverted code and text
+                # for the rest of the message).
+                while True:
+                    close = rest.find("```")
+                    blocks.append(("text", "\n".join(buf)))
+                    blocks.append(("code", rest[:close]))
+                    buf = []
+                    after = rest[close + 3 :]
+                    reopen = after.find("```")
+                    if reopen == -1:
+                        if after.strip():
+                            buf.append(after)
+                        break
+                    buf.append(after[:reopen])
+                    rest = after[reopen + 3 :]
+                    if rest.find("```") == -1:
+                        # An opener: the rest of the line is its language tag.
+                        blocks.append(("text", "\n".join(buf)))
+                        buf = []
+                        in_code = True
+                        break
                 continue
             blocks.append(("code" if in_code else "text", "\n".join(buf)))
             buf = []
@@ -528,6 +545,9 @@ _EMOJI_RANGES: tuple[tuple[int, int], ...] = (
     (0x1F000, 0x1FAFF),  # mahjong … symbols & pictographs ext-A, regional indicators
     (0x2600, 0x27BF),  # misc symbols + dingbats (☀ ✅ ❤ ✓)
     (0x2B00, 0x2BFF),  # misc symbols and arrows (⭐ ⬛ ⭕)
+    (0x25FB, 0x25FE),  # ◻ ◼ ◽ ◾ — dropped by #1057, tofu in the body face (#1097)
+    (0x2934, 0x2935),  # ⤴ ⤵ — likewise (#1097)
+    (0x2139, 0x2139),  # ℹ (#1097)
     (0x2194, 0x2199),  # ↔ ↕ ↖ … — emoji-capable arrows the body face lacks
     (0x21A9, 0x21AA),  # ↩ ↪
     (0x231A, 0x231B),  # ⌚ ⌛
