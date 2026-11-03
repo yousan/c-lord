@@ -469,7 +469,12 @@ automatically (see `tests/e2e/test_text_command_twins.py`).
 >
 > - a **webhook** message is allowed — holding the webhook URL is the grant, and
 >   it is what keeps the E2E harness working with `DISCORD_OWNER_ID` set;
-> - a bot listed in `CLORD_TRUSTED_BOT_IDS` is allowed; any other bot is denied;
+> - a message posted **as a bot account** never runs a text command — not even a
+>   bot listed in `CLORD_TRUSTED_BOT_IDS`. `process_commands` drops non-webhook
+>   bot messages before authorization (#740); a trusted bot may only **reply in an
+>   existing thread**. To start a thread with `!clord`, post through a channel
+>   **webhook**. The drop leaves one INFO line per channel and window
+>   (`text command !clord from bot … ignored … (#740/#1140)`);
 > - a **human** must pass the same allowlist as the slash command
 >   ([Access Control](#access-control)).
 >
