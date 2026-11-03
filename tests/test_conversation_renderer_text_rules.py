@@ -165,10 +165,8 @@ class TestTofuSymbolsAreEmoji:
     @pytest.mark.parametrize("ch", ["◻", "◼", "◽", "◾", "⤴"])
     def test_refused_without_the_library(self, monkeypatch, ch: str) -> None:
         # #588: without the `emoji` lib a spec holding emoji must not render as tofu.
-        f = load_text_font(20)
-        if f is None:
-            pytest.skip("needs a CJK font")
-        assert f.getbbox(ch) == f.getbbox("\U000fffff"), "body font draws it after all"
+        # (Noto Sans JP — the Linux body face — has no glyph for these; some
+        # macOS faces do, so whether it *would* be tofu is not asserted here.)
         monkeypatch.setattr(
             "c_lord.discord_ui.conversation_renderer.emoji_support_available", lambda: False
         )
