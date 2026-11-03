@@ -179,6 +179,11 @@ def _docker_value(outcome: DockerOutcome, containers: list[DevContainer]) -> str
     return f"⏹ 停止{freed}"
 
 
+def docker_value(outcome: DockerOutcome, containers: list[DevContainer]) -> str:
+    """The docker row's wording, for notices that are not this embed (#1113)."""
+    return _docker_value(outcome, containers)
+
+
 def _workdir_value(action: WorkspaceAction, freed_mb: int | None) -> str:
     if action is not WorkspaceAction.DELETE:
         return _KEPT
