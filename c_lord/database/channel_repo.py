@@ -48,16 +48,33 @@ def normalize_repo_url(url: str) -> str:
         'git@github.com:owner/repo.git'               → 'git@github.com:owner/repo.git'
         'https://gitlab.com/owner/repo/-/merge_requests/3' → 'https://gitlab.com/owner/repo.git'
         'github.com/owner/repo'                       → 'https://github.com/owner/repo.git'
+        'git@github.com/owner/repo'                   → 'git@github.com:owner/repo.git'
 
     A scheme-less URL on a known forge (github.com / gitlab.com / bitbucket.org)
     gets ``https://`` prepended, since that is what a browser address bar hands
-    over (#476). Other non-HTTP(S) inputs that are not ``git@host:`` SSH URLs
+    over (#476). ``git@<known forge>/owner/repo`` (``/`` typed for ``:``) becomes
+    ``git@<forge>:owner/repo.git`` (#1135); ``git@<other host>/…`` is left alone.
+    Other non-HTTP(S) inputs that are not ``git@host:`` SSH URLs
     (e.g. local paths) are returned unchanged apart from whitespace stripping,
     since their structure is unknown. Empty input is returned unchanged.
     """
     url = url.strip()
     if not url:
         return url
+
+    # #1135: ``git@github.com/owner/repo`` — the SSH form with ``/`` where the
+    # ``:`` belongs (a browser URL bleeding into the SSH one). git reads it as a
+    # local path, so the binding "succeeds" and every clone then fails. On a
+    # known forge the intent is unambiguous: put the ``:`` back.
+    if url.startswith("git@"):
+        host, sep, path = url[len("git@") :].partition("/")
+        if sep and ":" not in host and host.lower() in _SCHEMELESS_FORGE_HOSTS:
+            parts = path.strip("/").split("/")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                owner, repo = parts[0], parts[1]
+                if repo.endswith(".git"):
+                    repo = repo[:-4]
+                return f"git@{host}:{owner}/{repo}.git"
 
     # SSH shorthand: git@host:owner/repo[.git] — only ensure a .git suffix.
     if url.startswith("git@") and ":" in url:
