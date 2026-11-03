@@ -44,7 +44,9 @@ GitHub のアカウントとは結び付かないので GitHub 上でアバタ�
 
 - **コミットが失敗することは絶対にない。** 何らかの理由で Co-authored-by を付けられなくても、コミットはそのまま成功する（署名は履歴の付加情報であって、作業を止める理由にはならない）。
 - 対象リポジトリに **C-lord 以外の `prepare-commit-msg` の仕掛けがすでにある**場合は、**それを壊さない**。この場合 Co-authored-by は付かず、ログに警告が出る。
-- リポジトリ側が `core.hooksPath` で仕掛けの置き場所を変えていても、**その置き場所に対して正しく効く**。
+- リポジトリ側が `core.hooksPath` で仕掛けの置き場所を変えている場合、効くのは**その置き場所がそのセッションの `.git` の中**を指しているときだけ。
+  **作業コピーの中**（`git-hooks/` や `.husky/` など）や**作業コピーの外**（全体設定の共通フォルダなど）を指していると、C-lord はそこに仕掛けを**置かず**、そのセッションのコミットには **Co-authored-by が付かない**。ログに `coauthor: core.hooksPath points outside … refusing to write there; Co-authored-by trailers are off for this session` の WARNING が出る（#1141）。
+  置かないのは、作業コピーの中に置くと `git add -A` でリポジトリに混ざり、外に置くとほかのリポジトリのコミットまで署名してしまうため。たとえば `core.hooksPath=git-hooks` の `yousan/openclaw` では、スレッドで作ったコミットに依頼者は残らない（2026-10-23〜30 に 26 件）。
 
 ### 止め方
 
@@ -60,6 +62,7 @@ GitHub のアカウントとは結び付かないので GitHub 上でアバタ�
 - 表示名に改行を入れた利用者が頼むと、**身に覚えのない第三者の Co-authored-by** がコミットに現れる。
 - Co-authored-by を付けられなかったせいで **`git commit` 自体が失敗する**。
 - 利用者のリポジトリにあった husky などの `prepare-commit-msg` が **勝手に上書きされて消える**。
+- `core.hooksPath` が作業コピーの中（`.husky/` や `git-hooks/` など）を指すリポジトリで、C-lord の仕掛けが**リポジトリの中に置かれ**、`git add -A` で**利用者のコミットに混ざる**（いまはそこに置かずに WARNING を出す — #1141）。
 
 ## 根拠
 
