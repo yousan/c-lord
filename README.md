@@ -401,9 +401,9 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLAUDE_MODEL` | Model to use | `sonnet` |
 | `CLAUDE_PERMISSION_MODE` | Permission mode for CLI | `acceptEdits` |
 | `CLAUDE_WORKING_DIR` | Working directory for Claude | current dir |
-| `MAX_CONCURRENT_SESSIONS` | Max **turns running at once**. Not a cap on resident `claude` processes — the semaphore wraps turn execution only and is released when the turn ends, while the tmux pane lives on. For the resident cap see `CLORD_MAX_RESIDENT_WORKSPACES` (#576). | `3` |
+| `MAX_CONCURRENT_SESSIONS` | Max **turns running at once**. Not a cap on resident `claude` processes — the semaphore wraps turn execution only and is released when the turn ends, while the tmux pane lives on. For the resident cap see `CLORD_MAX_RESIDENT_WORKSPACES` (#576). Must be a whole number **≥ 1** — `0`, negatives and non-numbers stop startup with the key named (#1119). | `3` |
 | `CLORD_MAX_RESIDENT_WORKSPACES` | Max workspaces holding a live `claude` at once. Over the cap, the longest-idle ones are put to sleep; creating a new workspace is never blocked. Unlike the idle TTLs this default **is** host-dependent, so it is computed from `MemTotal` (cgroup limit first) rather than shipped as a constant. `0` disables. See `docs/specs/resident-cap.md`. | auto (`max(2, MemTotal_GiB × 0.4 / 0.45)`) |
-| `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout | `300` |
+| `SESSION_TIMEOUT_SECONDS` | Session inactivity timeout. Whole number **≥ 1**, otherwise startup stops with the key named (#1119) | `300` |
 | `DISCORD_OWNER_ID` | User ID allowed to drive the bot, and @-mentioned when Claude needs input. Unset, the bot allows only the Discord application's owner (#713) | (optional) |
 | `CLORD_ALLOWED_ROLE` | Discord role name whose members may drive the bot (OR with `DISCORD_OWNER_ID`) | (optional) |
 | `CLORD_ALLOW_ANYONE` | `1` lets **every** member of the server drive the bot — which means running shell commands on the host. Warned about at startup | `false` |

@@ -149,6 +149,9 @@ logger = logging.getLogger(__name__)
 # any kind — a newline included (#923).
 _REPO_PREFIX_RE = re.compile(r"repo:(?P<repo>\S+)\s+(?P<rest>.*)", re.DOTALL)
 
+# Discord caps an autocomplete choice's name *and* value at 100 characters (#1116).
+_CHOICE_MAX = 100
+
 # Longest sentence still treated as an answer to an open menu (#536 AC7).
 # Matches AskModal's free-text limit: the two are the same affordance reached
 # two ways, and past this length the message reads as a new request rather than
@@ -1776,18 +1779,22 @@ class ClaudeChatCog(commands.Cog):
         if parent_id is not None:
             with contextlib.suppress(Exception):
                 default = await channel_cog.channel_repo(parent_id)
-        if default is not None and needle in default.lower():
+        # #1116: a choice's *value* is capped at 100 characters by Discord too.
+        # Cutting it sent a different (non-existent) URL as ``repo:`` — so a repo
+        # longer than that is not offered at all; typing it by hand still works.
+        if default is not None and needle in default.lower() and len(default) <= _CHOICE_MAX:
             choices.append(
                 app_commands.Choice(
-                    name=f"未指定ならこれ（このチャンネル）: {default}"[:100], value=default[:100]
+                    name=f"未指定ならこれ（このチャンネル）: {default}"[:_CHOICE_MAX],
+                    value=default,
                 )
             )
 
         with contextlib.suppress(Exception):
             for repo in await channel_cog.known_repos():
-                if repo == default or needle not in repo.lower():
+                if repo == default or needle not in repo.lower() or len(repo) > _CHOICE_MAX:
                     continue
-                choices.append(app_commands.Choice(name=repo[:100], value=repo[:100]))
+                choices.append(app_commands.Choice(name=repo, value=repo))
                 if len(choices) >= 25:
                     break
         return choices
