@@ -240,3 +240,54 @@ class TestDotenvOverride:
         config = load_config()
         assert config["token"] == "cwd-file-tok"
         assert config["channel_id"] == "333"
+
+
+class TestNumericLimits:
+    """Issue #1119: MAX_CONCURRENT_SESSIONS / SESSION_TIMEOUT_SECONDS must be >= 1."""
+
+    def _base_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setenv("DISCORD_CHANNEL_ID", "999")
+        monkeypatch.delenv("MAX_CONCURRENT_SESSIONS", raising=False)
+        monkeypatch.delenv("SESSION_TIMEOUT_SECONDS", raising=False)
+
+    @pytest.mark.parametrize("key", ["MAX_CONCURRENT_SESSIONS", "SESSION_TIMEOUT_SECONDS"])
+    @pytest.mark.parametrize("value", ["0", "-1", "three", "5m", "", "1.5", "３"])
+    def test_bad_value_stops_startup_naming_the_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        key: str,
+        value: str,
+    ) -> None:
+        import logging
+        import sys
+        from unittest.mock import patch
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv(key, value)
+        with (
+            caplog.at_level(logging.ERROR, logger="c_lord.main"),
+            patch.object(sys, "exit") as mock_exit,
+        ):
+            load_config()
+        mock_exit.assert_called_with(1)
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert key in joined
+        assert repr(value) in joined
+
+    def test_zero_never_reaches_the_semaphore(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The silent failure: Semaphore(0) is locked from the start, every turn waits.
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("MAX_CONCURRENT_SESSIONS", "0")
+        with pytest.raises(SystemExit):
+            load_config()
+
+    def test_defaults_and_valid_values_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base_env(monkeypatch)
+        config = load_config()
+        assert (config["max_concurrent"], config["timeout"]) == ("3", "300")
+        monkeypatch.setenv("MAX_CONCURRENT_SESSIONS", "1")
+        monkeypatch.setenv("SESSION_TIMEOUT_SECONDS", " 600 ")
+        config = load_config()
+        assert (config["max_concurrent"], config["timeout"]) == ("1", "600")
