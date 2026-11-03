@@ -80,6 +80,13 @@ _Acknowledger = Callable[..., Awaitable[None]]
 
 # Discord rejects an embed whose field value exceeds this (400, code 50035 — #824).
 _EMBED_FIELD_LIMIT = 1024
+# ... and a field name over 256 characters.
+_EMBED_FIELD_NAME_LIMIT = 256
+# /tmux-list (#1114): Discord allows 25 fields per embed and 6000 characters in
+# total. 24 windows leave the 25th field for "…ほか N 件"; the character budget
+# keeps that last field's room too.
+_TMUX_LIST_MAX_WINDOWS = 24
+_TMUX_LIST_MAX_CHARS = 5800
 
 
 def _fit_field_lines(lines: list[str], limit: int = _EMBED_FIELD_LIMIT) -> str:
@@ -1372,12 +1379,27 @@ class SessionManageCog(commands.Cog):
             title=f"🖥️ Tmux Windows ({len(all_windows)})",
             color=COLOR_INFO,
         )
+        # #1114: Discord refuses an embed with more than 25 fields (or 6000
+        # characters) with a 400, so a busy host got an error instead of a list.
+        # Show what fits and name the rest in the last field.
+        shown = 0
         for w in all_windows:
+            if shown >= _TMUX_LIST_MAX_WINDOWS:
+                break
             tid = w.get("thread_id", "")
             tid_display = f"Thread: `{tid}`" if tid else "Thread: —"
+            name = f"`{w['window_name']}`"[:_EMBED_FIELD_NAME_LIMIT]
+            value = f"Dir: `{w['working_dir'] or 'unknown'}`\n{tid_display}"
+            value = value[:_EMBED_FIELD_LIMIT]
+            if len(embed) + len(name) + len(value) > _TMUX_LIST_MAX_CHARS:
+                break
+            embed.add_field(name=name, value=value, inline=False)
+            shown += 1
+        rest = len(all_windows) - shown
+        if rest:
             embed.add_field(
-                name=f"`{w['window_name']}`",
-                value=f"Dir: `{w['working_dir'] or 'unknown'}`\n{tid_display}",
+                name=f"…ほか {rest} 件",
+                value="全部は `/clord-status` で見られます。",
                 inline=False,
             )
 

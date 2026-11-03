@@ -589,12 +589,6 @@ class TestTmuxList:
         await cog.tmux_list.callback(cog, _interaction())
         cog._tmux_list_impl.assert_awaited_once()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="#1114: /tmux-list adds one embed field per window with no cap; Discord rejects "
-        "an embed with more than 25 fields (400/50035), so a busy host gets an error "
-        "instead of a list — the crash /clord-status was built to avoid (#363, #824).",
-    )
     async def test_more_than_25_windows_still_fits_one_embed(self):
         cog = _cog()
         cog._get_all_bindings = AsyncMock(return_value=[{"channel_id": 1}])
@@ -610,6 +604,57 @@ class TestTmuxList:
         embed = sent[-1]["embed"]
         assert len(embed.fields) <= 25
         assert len(embed) <= 6000
+
+    async def test_the_last_field_names_the_windows_left_out(self):
+        # #1114 案A: 24 windows, then "…ほか N 件" pointing at /clord-status.
+        cog = _cog()
+        cog._get_all_bindings = AsyncMock(return_value=[{"channel_id": 1}])
+        windows = [
+            {"window_name": f"w{i}", "working_dir": f"/s/{i}", "thread_id": str(i)}
+            for i in range(30)
+        ]
+        cog._resolve_tmux_manager = AsyncMock(return_value=_tmux(windows=windows))
+        respond, ack, sent, _ = _capture()
+
+        await cog._tmux_list_impl(respond=respond, ack=ack)
+
+        embed = sent[-1]["embed"]
+        assert embed.title == "🖥️ Tmux Windows (30)"
+        assert [f.name for f in embed.fields[:24]] == [f"`w{i}`" for i in range(24)]
+        assert embed.fields[24].name == "…ほか 6 件"
+        assert "/clord-status" in embed.fields[24].value
+
+    async def test_long_dirs_stay_under_the_embed_total(self):
+        # #1114: 6000 characters is the other limit — long paths hit it first.
+        cog = _cog()
+        cog._get_all_bindings = AsyncMock(return_value=[{"channel_id": 1}])
+        windows = [
+            {"window_name": f"w{i}", "working_dir": "/s/" + "d" * 600, "thread_id": str(i)}
+            for i in range(24)
+        ]
+        cog._resolve_tmux_manager = AsyncMock(return_value=_tmux(windows=windows))
+        respond, ack, sent, _ = _capture()
+
+        await cog._tmux_list_impl(respond=respond, ack=ack)
+
+        embed = sent[-1]["embed"]
+        assert len(embed) <= 6000
+        assert len(embed.fields) <= 25
+        assert embed.fields[-1].name.startswith("…ほか ")
+
+    async def test_25_or_fewer_windows_are_all_listed(self):
+        cog = _cog()
+        cog._get_all_bindings = AsyncMock(return_value=[{"channel_id": 1}])
+        windows = [
+            {"window_name": f"w{i}", "working_dir": f"/s/{i}", "thread_id": str(i)}
+            for i in range(24)
+        ]
+        cog._resolve_tmux_manager = AsyncMock(return_value=_tmux(windows=windows))
+        respond, ack, sent, _ = _capture()
+
+        await cog._tmux_list_impl(respond=respond, ack=ack)
+
+        assert len(sent[-1]["embed"].fields) == 24
 
 
 # ── /tmux-screenshot edges ──────────────────────────────────────────────────
