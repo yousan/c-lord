@@ -3996,6 +3996,14 @@ class ClaudeChatCog(commands.Cog):
         like :meth:`mark_reopened`. Returns whether a turn was running.
         """
         runner = self._active_runners.get(thread_id)
+        if runner is not None and getattr(runner, "preempted", False) is True:
+            # #1101: the next message already displaced this turn and
+            # ``_preempt_prior_turn`` is draining it. Withdrawing it again would
+            # turn #1007's "interrupted" into a user stop (``outcome=stopped``
+            # and a turn-end event of its own) — the same guard the ledger side
+            # has in ``withdraw_in_flight``. Its task is still waited on and
+            # cancelled by :meth:`wait_for_turn_end` (``outcome=cancelled``).
+            runner = None
         if runner is not None:
             runner.withdraw(silent=False)
         others = withdraw_in_flight(thread_id)
