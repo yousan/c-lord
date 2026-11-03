@@ -18,6 +18,8 @@ from .coordination.service import CoordinationService
 from .discord_ui.authorization import Authorizer
 from .discord_ui.permission_help import command_error_help
 from .discord_ui.slash_io import followup_ephemeral
+from .log_sampler import LogSampler
+from .utils.logger import log_ctx
 from .voice_webhooks import is_voice_message
 
 if TYPE_CHECKING:
@@ -58,6 +60,8 @@ class ClaudeDiscordBot(commands.Bot):
         )
         self.channel_id = channel_id
         self.owner_id = owner_id
+        # #1140: another bot's dropped ``!command`` — one INFO per channel per window.
+        self._dropped_bot_command_log = LogSampler()
         self.session_registry = SessionRegistry()
         # Optional repo for AskUserQuestion restart recovery
         self.ask_repo: PendingAskRepository | None = ask_repo
@@ -104,6 +108,7 @@ class ClaudeDiscordBot(commands.Bot):
         does own the thread (#522).
         """
         if message.author.bot and not message.webhook_id:
+            self._log_dropped_bot_command(message)
             return
         if is_voice_message(message):
             return  # #971: c-lord speaking for a sub-agent is not a command
@@ -117,6 +122,44 @@ class ClaudeDiscordBot(commands.Bot):
             )
             return
         await self.invoke(ctx)
+
+    def _log_dropped_bot_command(self, message: discord.Message) -> None:
+        """Leave an INFO line when another bot's ``!command`` is dropped (#1140).
+
+        Text commands are for people and webhooks only — a bot account,
+        trusted (``CLORD_TRUSTED_BOT_IDS``) or not, may reply in an existing
+        thread but cannot start one with ``!clord`` (#740). That drop used to be
+        silent, so an OpenClaw persona that sent ``!clord`` as itself saw
+        nothing happen and found nothing in the log (#678). Only messages that
+        read as one of our commands are logged; c-lord's own messages and a
+        bot's ordinary chatter are not. Sampled per channel.
+        """
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or not content.startswith("!"):
+            return
+        me = getattr(self, "user", None)
+        author = message.author
+        if me is not None and getattr(author, "id", None) == getattr(me, "id", object()):
+            return
+        words = content[1:].split(maxsplit=1)
+        if not words or self.get_command(words[0]) is None:
+            return
+        channel_id = getattr(message.channel, "id", None)
+        sampler = getattr(self, "_dropped_bot_command_log", None)
+        if sampler is None:  # built without __init__ (test stubs)
+            sampler = self._dropped_bot_command_log = LogSampler()
+        sample = sampler.sample(channel_id)
+        if not sample.emit:
+            return
+        logger.info(
+            "%s text command !%s from bot %s (id=%s) ignored — a bot account cannot run "
+            "text commands; post it through a channel webhook instead (#740/#1140)%s",
+            log_ctx(channel_id=channel_id if isinstance(channel_id, int) else None),
+            words[0],
+            getattr(author, "name", "?"),
+            getattr(author, "id", "?"),
+            sample.suffix,
+        )
 
     async def on_error(self, event_method: str, /, *args: object, **kwargs: object) -> None:
         """Handle uncaught exceptions in event handlers.

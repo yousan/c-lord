@@ -415,3 +415,100 @@ class TestSlashCommandSync:
 
         # Global sync still happened so commands are registered everywhere
         assert call() in bot.tree.sync.call_args_list
+
+
+class TestDroppedBotCommandLog:
+    """#1140: a non-webhook bot's ``!command`` is still dropped (#740), but logged."""
+
+    @staticmethod
+    def _bot() -> ClaudeDiscordBot:
+        from discord.ext import commands
+
+        bot = ClaudeDiscordBot(channel_id=123)
+
+        @commands.command(name="clord")
+        async def _clord(ctx: commands.Context) -> None:  # pragma: no cover - never run
+            raise AssertionError("must not run")
+
+        bot.add_command(_clord)
+        bot.get_context = AsyncMock()
+        bot.invoke = AsyncMock()
+        return bot
+
+    @staticmethod
+    def _msg(content: str, *, author_id: int = 111, channel_id: int = 123) -> MagicMock:
+        msg = MagicMock(spec=discord.Message)
+        msg.author = MagicMock()
+        msg.author.bot = True
+        msg.author.id = author_id
+        msg.author.name = "opu"
+        msg.webhook_id = None
+        msg.content = content
+        msg.channel = MagicMock(spec=discord.TextChannel)
+        msg.channel.id = channel_id
+        return msg
+
+    @staticmethod
+    def _dropped(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "c_lord.bot" and r.levelno == logging.INFO and "#1140" in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_bot_clord_is_dropped_with_an_info_line(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bot = self._bot()
+        caplog.set_level(logging.INFO, logger="c_lord.bot")
+
+        await bot.process_commands(self._msg("!clord ok とだけ返して"))
+
+        bot.get_context.assert_not_called()
+        bot.invoke.assert_not_called()  # #740: still not run
+        lines = self._dropped(caplog)
+        assert len(lines) == 1
+        assert "!clord" in lines[0] and "id=111" in lines[0] and "channel=123" in lines[0]
+        assert "webhook" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_chatter_and_unknown_commands_are_not_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bot = self._bot()
+        caplog.set_level(logging.INFO, logger="c_lord.bot")
+
+        for text in ("おはようございます", "!nosuchcommand x", "!", "clord ok", ""):
+            await bot.process_commands(self._msg(text))
+
+        assert self._dropped(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_own_messages_are_not_logged(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bot = self._bot()
+        me = MagicMock()
+        me.id = 555
+        monkeypatch.setattr(type(bot), "user", property(lambda _self: me))
+        caplog.set_level(logging.INFO, logger="c_lord.bot")
+
+        await bot.process_commands(self._msg("!clord ok", author_id=555))
+
+        assert self._dropped(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_repeats_in_one_channel_are_sampled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bot = self._bot()
+        caplog.set_level(logging.INFO, logger="c_lord.bot")
+
+        for _ in range(5):
+            await bot.process_commands(self._msg("!clord again"))
+        await bot.process_commands(self._msg("!clord other channel", channel_id=456))
+
+        lines = self._dropped(caplog)
+        assert len(lines) == 2  # one for 123, one for 456
+        assert "channel=456" in lines[1]

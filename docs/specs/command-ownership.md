@@ -59,12 +59,13 @@ c-lord のスラッシュコマンドには、`!` 始まり（と `@bot` メン�
 ### 認可 — webhook は人間用 allowlist を通らない
 
 - **webhook から送ったテキストコマンドは、`DISCORD_OWNER_ID` を設定していても通る。** webhook URL を持っていること自体が認可だからです。
-- **`CLORD_TRUSTED_BOT_IDS` に登録した bot も通る。** 人間と同じ扱い。
-- **それ以外の bot は拒否される。**
+- **bot アカウントの投稿は、`CLORD_TRUSTED_BOT_IDS` に登録した bot でもテキストコマンドとしては動かない。** `bot.py::process_commands` が、webhook でない bot の投稿を認可より前に捨てるためです（#740 で「コードは変えず、こう書く」と決めた — [STAGING.md の「他エージェントからのトリガー」](../STAGING.md)）。信頼済み bot が使えるのは**既存スレッドへの返信**（会話の続き）だけで、`!clord` で新しいスレッドを立てるには **webhook** から送る。
+  - 捨てたときは c-lord のログに INFO が1行残る（`text command !clord from bot <名前> (id=<id>) ignored — … post it through a channel webhook instead (#740/#1140)`、チャンネルごとに間引き）。c-lord 自身の発言や、コマンドとして読めない bot の発言では出ない（#1140。以前は1行も残らず、送った側が原因を探せなかった）。
+- **それ以外の bot も同じく動かない。**
 - **人間は従来どおり allowlist（owner / role）で判定される。**
 - **スラッシュコマンドは常に人間用 allowlist のまま。** メッセージが無く、webhook から来ようがないからです。
 
-この規則は `!clord` / `!attach` / `!skill` / `!clord-init` / `!clord-thread-init` で同一です。
+この規則はテキストコマンド（`!clord` / `!attach` / `!skill` / `!clord-init` / `!clord-thread-init` ほか）すべてで同一です。
 
 ## なぜこうなっているか
 

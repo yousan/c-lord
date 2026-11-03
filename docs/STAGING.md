@@ -469,7 +469,7 @@ bash scripts/staging.sh restart main && bash scripts/staging.sh release
 |---|---|---|
 | `IDENTITY MISMATCH` で起動失敗 | per-run ログ | 意図と違う token(.env の token と EXPECTED_BOT_USER_ID の組を確認)。**ガードが正しく働いている** |
 | webhook を投げても無反応 | `E2E_TEST_THREAD_ID` の sessions レコード有無 / フリート表の webhook 列 | スレッドにセッションが無い / thread_id 空(前提節を参照) / その台の webhook が `...PENDING` プレースホルダ |
-| prod token でチャンネルに投稿してもスレッドが立たない | — | 仕様。信頼bot方式は既存スレッドへの返信専用 — 新スレッドは `POST /api/spawn`(「トリガー」節) |
+| prod token でチャンネルに投稿してもスレッドが立たない | per-run ログの `text command !clord from bot … ignored`(#1140) | 仕様。信頼bot方式は既存スレッドへの返信専用 — 新スレッドは `POST /api/spawn`(「トリガー」節) |
 | `instances: 2+` | `staging.sh status` | 二重起動 — `stop` → `restart`。手動 kill 禁止事項を守ったか確認 |
 | 起動直後に死ぬ | per-run ログ末尾 | LoginFailure(token 不正)/ DB スキーマ不整合(古いブランチ — idle は main) |
 | `API server not listening` | per-run ログの `REST API could not bind` | ポート衝突。その clone の `CLORD_API_PORT` を空き番号に(#712 以降 API は常時起動する) |
