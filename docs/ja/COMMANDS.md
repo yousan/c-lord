@@ -117,7 +117,7 @@ tmux セッションはチャンネルではなく**リポジトリ**に従い�
 | `/tmux-list` | アクティブな tmux ウィンドウを一覧表示 | どこでも |
 | `/workspace-stop` | **停止**: tmux ウィンドウを閉じ、セッションは残す | スレッドのみ |
 | `/workspace-start` | 停止したスレッドを再開し、メッセージがまた動くようにする | スレッドのみ |
-| `/workspace-delete` | このスレッドの tmux ウィンドウと作業ディレクトリを削除 | スレッドのみ |
+| `/workspace-delete` | `/workspace-stop` と同じこと（走っているターンを終える・tmux ウィンドウを消す・開発環境の docker を止める）**＋** 作業ディレクトリを削除（#1113） | スレッドのみ |
 
 旧名 `/session-cleanup` / `/close-workspace` / `/reopen-workspace` も**同じ実装**を呼び続けます。
 
