@@ -56,7 +56,7 @@ tmux セッションはチャンネルではなく**リポジトリ**に従い�
 | コマンド | 説明 | 使用場所 |
 |---------|------|---------|
 | `/clord-init` | チャンネルとリポジトリの紐づけを一覧表示 | 任意のチャンネル |
-| `/clord-init repo:<url>` | このチャンネルを git リポジトリに紐づけ | 任意のチャンネル |
+| `/clord-init repo:<url>` | このチャンネルを git リポジトリに紐づけ（`git@github.com/owner/repo` のように `:` を `/` と打った SSH の形は `git@github.com:owner/repo.git` に直して保存 — github.com / gitlab.com / bitbucket.org のみ、#1135） | 任意のチャンネル |
 | `/clord-init remove:True` | このチャンネルの紐づけを解除 | 任意のチャンネル |
 | `/clord-thread-init` | このスレッドのスレッドレベル紐づけを表示 | スレッドのみ |
 | `/clord-thread-init repo:<url>` | このスレッドを git リポジトリに紐づけ（チャンネル設定を上書き） | スレッドのみ |

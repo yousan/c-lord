@@ -131,7 +131,7 @@ Before this, `/clord` checked only whether *a repository* was reachable from the
 /clord repo:git@github.com:yousan/dotclaude.git prompt:Claude 5 系に対応する
 ```
 
-The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476). The thread's tmux session follows the chosen repository too (#427).
+The option autocompletes with the channel's default (shown first) and every repository the bot already knows. Derived URLs are accepted — a PR or issue link is normalized to the repository root, and a scheme-less `github.com/owner/repo` gets `https://` (#476), and `git@github.com/owner/repo` gets its `:` back (#1135). The thread's tmux session follows the chosen repository too (#427).
 
 In the text twin `!clord repo:<URL> <prompt>`, the URL ends at the first whitespace — a space, a tab **or a newline** (#923). Writing the request on the line after `repo:<URL>` therefore works the same as writing it after a space. A repository value that still contains a line break or tab (e.g. from a hand-built `/clord repo:`) is refused before anything is cloned, with a one-line reason.
 
@@ -176,7 +176,7 @@ In a channel, `/skill` opens a new thread and runs there; inside a c-lord thread
 
 Requires **Manage Server** permission. When a channel is bound to a repo, all sessions started in that channel automatically use that repo as their working directory. A thread-level binding set via `/clord-thread-init` takes precedence over the channel binding.
 
-The `repo` value is stored in clonable form. A PR / issue / file link is shrunk to the repository root (#88), and a URL pasted without its scheme — `github.com/owner/repo`, as a browser address bar shows it — gets `https://` put back for `github.com`, `gitlab.com` and `bitbucket.org` (#476); the reply shows the value that was actually stored (`https://github.com/owner/repo.git`). Any other scheme-less string is taken as a local path and stored as-is.
+The `repo` value is stored in clonable form. A PR / issue / file link is shrunk to the repository root (#88), and a URL pasted without its scheme — `github.com/owner/repo`, as a browser address bar shows it — gets `https://` put back for `github.com`, `gitlab.com` and `bitbucket.org` (#476); the reply shows the value that was actually stored (`https://github.com/owner/repo.git`). The SSH form typed with `/` where the `:` belongs — `git@github.com/owner/repo` (git would read it as a local folder) — is stored as `git@github.com:owner/repo.git` on the same three hosts (#1135); `git@<any other host>/…` is left as typed. Any other scheme-less string is taken as a local path and stored as-is.
 
 `/clord-thread-init repo:<url>` **changes the repository of a thread that is already c-lord's** — it does not turn a thread into one (#551). Binding an ordinary conversation thread used to be step one of the takeover described under `/clord` above, so it is refused on the same test. To start on a different repository, use `/clord repo:<url> prompt:<...>` in the channel, which opens a new thread already bound to it. Showing the binding (no arguments) and `remove:True` still work anywhere — neither can turn a thread into a session.
 
