@@ -314,6 +314,39 @@ class TestNormalizeRepoUrl:
         # Anything that is not a known forge host keeps the pre-#476 behavior.
         assert normalize_repo_url(url) == url
 
+    # --- #1135: git@host/owner/repo — "/" typed where the SSH ":" belongs ---
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("git@github.com/owner/repo", "git@github.com:owner/repo.git"),
+            ("git@github.com/owner/repo.git", "git@github.com:owner/repo.git"),
+            ("git@github.com/yousan/mogul-rec-intro", "git@github.com:yousan/mogul-rec-intro.git"),
+            ("git@github.com/yousan/openclaw/", "git@github.com:yousan/openclaw.git"),
+            ("git@GitHub.com/owner/repo", "git@GitHub.com:owner/repo.git"),
+            ("git@gitlab.com/owner/repo", "git@gitlab.com:owner/repo.git"),
+            ("git@bitbucket.org/owner/repo", "git@bitbucket.org:owner/repo.git"),
+            ("  git@github.com/owner/repo  ", "git@github.com:owner/repo.git"),
+        ],
+    )
+    def test_ssh_slash_typo_on_known_forge_gets_its_colon(self, url: str, expected: str) -> None:
+        assert normalize_repo_url(url) == expected
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@example.com/owner/repo",
+            "git@git.internal/team/repo",
+            "git@github.com/onlyowner",
+        ],
+    )
+    def test_ssh_slash_form_elsewhere_is_unchanged(self, url: str) -> None:
+        # AC3: only the known forges are rewritten; anything else keeps pre-#1135 behavior.
+        assert normalize_repo_url(url) == url
+
+    def test_proper_ssh_form_is_unchanged(self) -> None:
+        assert normalize_repo_url("git@github.com:owner/repo") == "git@github.com:owner/repo.git"
+
 
 # ===========================================================================
 # Bind handlers normalize the URL before persisting (#88)
@@ -378,6 +411,47 @@ class TestBindNormalizesUrl:
         binding = await thread_repo.get(300)
         assert binding is not None
         assert binding["source_repo"] == "https://gitlab.com/owner/repo.git"
+
+    async def test_clord_init_ssh_slash_typo_is_clonable(
+        self, cog: ChannelRepoCog, repo: ChannelRepository
+    ) -> None:
+        # #1135: stored as-is in production twice; every clone then failed.
+        await cog._clord_init_impl(
+            channel_id=100,
+            user=MagicMock(),
+            repo="git@github.com/yousan/openclaw",
+            remove=False,
+            respond=AsyncMock(),
+        )
+        binding = await repo.get(100)
+        assert binding is not None
+        assert binding["source_repo"] == "git@github.com:yousan/openclaw.git"
+
+    async def test_clord_thread_init_ssh_slash_typo_is_clonable(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        await cog._clord_thread_init_impl(
+            thread_id=200,
+            channel=MagicMock(),
+            client=MagicMock(),
+            user=MagicMock(),
+            repo="git@gitlab.com/owner/repo",
+            remove=False,
+            respond=AsyncMock(),
+        )
+        binding = await thread_repo.get(200)
+        assert binding is not None
+        assert binding["source_repo"] == "git@gitlab.com:owner/repo.git"
+
+    async def test_bind_thread_ssh_slash_typo_is_clonable(
+        self, cog: ChannelRepoCog, thread_repo: ThreadRepository
+    ) -> None:
+        # `/clord repo:` and `!clord repo:` (#514) both bind through bind_thread.
+        bound = await cog.bind_thread(300, "git@bitbucket.org/owner/repo", channel_id=100)
+        assert bound == "git@bitbucket.org:owner/repo.git"
+        binding = await thread_repo.get(300)
+        assert binding is not None
+        assert binding["source_repo"] == "git@bitbucket.org:owner/repo.git"
 
 
 # ===========================================================================
