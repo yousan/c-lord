@@ -176,3 +176,34 @@ def test_a_non_ascii_digit_coordination_id_does_not_raise(tmp_path, monkeypatch,
     """For callers of ApiServer / setup_bridge that skip load_config's #1084 check."""
     monkeypatch.setenv("COORDINATION_CHANNEL_ID", value)
     assert _api(tmp_path).lounge_channel_id is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(" 1505747831447883806 ", 1505747831447883806), ("²", None), ("１２３", None), ("", None)],
+)
+def test_setup_bridge_lounge_reads_the_coordination_id_the_same_way(
+    monkeypatch, value, expected
+) -> None:  # noqa: ANN001
+    """setup.py, api_server.py and claude_chat.py share one reading (review of #1194)."""
+    import inspect
+
+    from c_lord import setup as setup_mod
+    from c_lord.coordination.env import coordination_channel_id_from_env
+
+    monkeypatch.setenv("COORDINATION_CHANNEL_ID", value)
+    assert coordination_channel_id_from_env() == expected
+    assert "coordination_channel_id_from_env()" in inspect.getsource(setup_mod.setup_bridge)
+
+
+def test_claude_chat_coordination_ignores_a_superscript_id(monkeypatch) -> None:  # noqa: ANN001
+    from unittest.mock import MagicMock
+
+    from c_lord.cogs.claude_chat import ClaudeChatCog
+
+    monkeypatch.setenv("COORDINATION_CHANNEL_ID", "²")
+    cog = ClaudeChatCog.__new__(ClaudeChatCog)
+    cog._coordination = None
+    cog.bot = MagicMock(spec=[])
+    svc = cog._get_coordination()
+    assert getattr(svc, "channel_id", getattr(svc, "_channel_id", None)) is None

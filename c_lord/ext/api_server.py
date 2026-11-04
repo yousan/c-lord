@@ -328,8 +328,9 @@ class ApiServer:
         self.session_dir_base: str | None = None
         # Fall back to COORDINATION_CHANNEL_ID so lounge shares the same channel
         if lounge_channel_id is None:
-            ch_str = os.getenv("COORDINATION_CHANNEL_ID", "").strip()  # #1194
-            lounge_channel_id = int(ch_str) if ch_str.isascii() and ch_str.isdigit() else None
+            from ..coordination.env import coordination_channel_id_from_env
+
+            lounge_channel_id = coordination_channel_id_from_env()  # #1194
         self.lounge_channel_id = lounge_channel_id
 
         # #457: the UID this bot runs as. Only that user (and root, which can

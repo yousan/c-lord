@@ -194,8 +194,9 @@ async def setup_bridge(
 
     # Lounge shares the coordination channel unless explicitly overridden
     if lounge_channel_id is None:
-        ch_str = os.getenv("COORDINATION_CHANNEL_ID", "").strip()  # #1194
-        lounge_channel_id = int(ch_str) if ch_str.isascii() and ch_str.isdigit() else None
+        from .coordination.env import coordination_channel_id_from_env
+
+        lounge_channel_id = coordination_channel_id_from_env()  # #1194
 
     # Global SessionDirManager and TmuxSessionManager are no longer created here.
     # Per-channel managers are resolved dynamically via ChannelRepoCog.
