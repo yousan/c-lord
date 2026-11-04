@@ -230,6 +230,9 @@ class _FollowState:
     resolved: bool = True
     # The bytes just before ``offset`` as they were when we got there (#906).
     signature: bytes = b""
+    # #1188: why the last poll could not stat / read the transcript, when it was
+    # not simply gone. Logged by the caller on the event loop, sampled.
+    read_error: OSError | None = None
 
 
 def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
@@ -361,6 +364,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     while this is running.
     """
     state.more_to_read = False
+    state.read_error = None
 
     active = state.resolver.resolve()
     state.resolved = active is not None
@@ -381,9 +385,13 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
 
     try:
         stat = active.stat()
-    except OSError:
+    except OSError as exc:
         # #1102: not only a vanished file — PermissionError / EIO too. Dropped
-        # like a missing file; the next poll stats it again.
+        # like a missing file; the next poll stats it again. #1188: but those
+        # are reported — a vanished file is routine, a refused one is a silent
+        # thread with no other trace.
+        if not isinstance(exc, FileNotFoundError):
+            state.read_error = exc
         _drop_current(state)
         return []
     size = stat.st_size
@@ -416,7 +424,9 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             f.seek(state.offset)
             chunk = f.read(_READ_CHUNK_BYTES)
             state.offset += len(chunk)
-    except OSError:
+    except OSError as exc:
+        if not isinstance(exc, FileNotFoundError):
+            state.read_error = exc  # #1188
         _drop_current(state)
         return []
 
@@ -516,6 +526,19 @@ async def tail_events(
                 )
             events = []
             state.more_to_read = False
+        if state.read_error is not None:
+            # #1188: _poll_once kept going, but the thread hears nothing while
+            # this lasts. Same sampler as above: once per directory an hour.
+            sample = _POLL_FAILURE_LOG.sample(str(project_dir))
+            if sample.emit:
+                logger.error(
+                    "tail_events: cannot read the transcript (%s: %s) — this thread gets no "
+                    "replies while it lasts; retrying on the next poll (%s)%s",
+                    type(state.read_error).__name__,
+                    state.read_error,
+                    project_dir,
+                    sample.suffix,
+                )
         for event in events:
             yield event
 
