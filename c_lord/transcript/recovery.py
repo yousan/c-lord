@@ -219,8 +219,11 @@ def final_answer_needs_recovery(project_dir: Path, cursor_uuid: str | None) -> F
                 if cursor_uuid is not None and cursor_idx < 0 and event.get("uuid") == cursor_uuid:
                     cursor_idx = idx
                 if _is_turn_end(event):
-                    if ended_in_error:  # #1143: nothing to re-deliver
-                        candidate, candidate_idx = None, -1
+                    if ended_in_error:
+                        # #1143: this turn has nothing to re-deliver. #1191: but the
+                        # turn before may — keep its answer and let the cursor decide
+                        # (in #1143's own shape it was delivered: the cursor is on it).
+                        candidate, candidate_idx = answer, answer_idx
                     answer, answer_idx = candidate, candidate_idx
                     ended_in_error = False
                     continue

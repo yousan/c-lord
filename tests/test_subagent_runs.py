@@ -1,4 +1,4 @@
-"""#1110 / #1136 / #1139: one odd row, a self-woken finished agent, and stable numbers."""
+"""#1110 / #1136 / #1139 / #1177: one odd row, a self-woken finished agent, and stable numbers."""
 
 from __future__ import annotations
 
@@ -44,7 +44,9 @@ def _end_turn(uid: str, ts: str, text: str) -> dict:
 
 
 def _log(project: Path, poster: FakePoster, *, voices: bool = False) -> SubagentLog:
-    return SubagentLog(thread_id=1, project_dir=project, poster=poster, clock=Clock(), voices=voices)
+    return SubagentLog(
+        thread_id=1, project_dir=project, poster=poster, clock=Clock(), voices=voices
+    )
 
 
 # --- #1110: one row of an unexpected shape --------------------------------
@@ -92,7 +94,12 @@ async def test_an_odd_row_does_not_drop_the_rows_after_it(
                 [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}],
             ),
             odd,
-            _row("a2", "2026-10-29T00:00:03Z", "assistant", [{"type": "text", "text": "最後の報告です"}]),
+            _row(
+                "a2",
+                "2026-10-29T00:00:03Z",
+                "assistant",
+                [{"type": "text", "text": "最後の報告です"}],
+            ),
         ],
     )
     caplog.set_level(logging.INFO)
@@ -281,3 +288,89 @@ async def test_agents_from_before_the_numbers_were_kept_get_them_in_order(tmp_pa
     await log.step()
     assert log._agents[B_EARLY].ordinal == 1
     assert log._agents[A_LATE].ordinal == 2
+
+
+# --- #1177: the coordinator speaking to a finished agent is a real 再開 -------
+#
+# #1158 silenced every ``isMeta`` row that was not ``peer`` as the agent's own
+# background-task notice. CLI 2.1.305 / 2.1.312 write the parent's message to a
+# finished agent as ``isMeta`` with ``origin.kind == "coordinator"``, so when the
+# parent asked a finished agent something, the thread showed nothing of it.
+
+
+def _coordinator_row(uid: str, ts: str, text: str) -> dict:
+    return _row(
+        uid,
+        ts,
+        "user",
+        f"The coordinator sent a message while you were working:\n{text}",
+        isMeta=True,
+        origin={"kind": "coordinator"},
+    )
+
+
+async def test_parent_message_to_finished_agent_coordinator_origin_is_a_resume(
+    tmp_path: Path,
+) -> None:
+    """The agent answers in text (no tool). #1136 AC3: a resume shows 再開 / 終了."""
+    log, poster, path = await _finished_agent(tmp_path)
+    before = len(poster.statuses)
+    _append(
+        path,
+        [
+            _coordinator_row("u1", "2026-10-29T06:00:00Z", "見つけた3件の URL を教えて"),
+            _end_turn("a2", "2026-10-29T06:00:05Z", "URL は A, B, C です"),
+        ],
+    )
+    await log.step()
+    log.observe_parent(_notice(AID, "2026-10-29T06:00:06Z"))
+    await log.step()
+    new = [p.text for p in poster.statuses[before:]]
+    assert len(new) == 2 and new[0].endswith("再開"), new
+    assert any("URL は A, B, C です" in t for _, t in poster.voices)
+
+
+async def test_resume_with_coordinator_origin_is_shown_before_its_first_tool(
+    tmp_path: Path,
+) -> None:
+    """Same row, the agent then works: 再開 is posted at the resume, not at the 1st tool."""
+    log, poster, path = await _finished_agent(tmp_path)
+    before = len(poster.statuses)
+    _append(
+        path,
+        [
+            _coordinator_row("u1", "2026-10-29T06:00:00Z", "第2弾"),
+            _row(
+                "a2",
+                "2026-10-29T06:00:01Z",
+                "assistant",
+                [{"type": "thinking", "thinking": "考え中"}],
+            ),
+        ],
+    )
+    await log.step()
+    assert len(poster.statuses) == before + 1, [p.text for p in poster.statuses[before:]]
+
+
+async def test_own_notice_with_its_real_origin_is_still_quiet(tmp_path: Path) -> None:
+    """#1136 kept with what the CLI really writes: ``origin.kind == "task-notification"``."""
+    log, poster, path = await _finished_agent(tmp_path)
+    before = (len(poster.statuses), len(poster.edits), len(poster.voices))
+    _append(
+        path,
+        [
+            _row(
+                "u1",
+                "2026-10-29T06:00:00Z",
+                "user",
+                _SYSTEM_NOTICE,
+                isMeta=True,
+                origin={"kind": "task-notification"},
+            ),
+            _end_turn("a2", "2026-10-29T06:00:05Z", "Nothing changes from this."),
+        ],
+    )
+    await log.step()
+    log.observe_parent(_notice(AID, "2026-10-29T06:00:06Z"))
+    await log.step()
+    assert (len(poster.statuses), len(poster.edits), len(poster.voices)) == before

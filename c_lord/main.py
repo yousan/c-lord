@@ -17,6 +17,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
+from .git_mirrors import stop_running_git
 from .session_cleanup import DirOutcome, retire_swept_workspace, sweep_days
 from .setup import setup_bridge
 from .shutdown_watchdog import arm_shutdown_watchdog, shutdown_timeout_from_env
@@ -393,6 +394,9 @@ def install_shutdown_signal_handlers(
             return
         started = True
         arm_shutdown_watchdog(shutdown_timeout_from_env())
+        # ミラー更新の git は別のプロセスグループで走るので停止シグナルが届かない。
+        # ここで止めないと bot が終わったあとも受信を続ける (#1174)。
+        stop_running_git()
         loop.create_task(shutdown())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
