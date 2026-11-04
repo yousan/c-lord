@@ -370,7 +370,11 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
     ``.git/modules`` that no checkout claimed is asked too (#1181): after
     ``git submodule deinit`` or ``git rm`` the checkout is gone but the stash
     is still there — and deleting the workspace deletes it. Those are named by
-    their module name. A plain checkout costs two ``stat``. A submodule whose
+    their module name. Every ``160000`` gitlink in the index is asked,
+    ``.gitmodules`` or not (#1207): a nested repo that was only ``git add``-ed
+    has no ``.gitmodules`` entry, and requiring one let its stash be deleted
+    with the workspace. So a plain checkout costs one ``git ls-files`` and a
+    ``stat``. A submodule whose
     stash cannot be read is reported as having one — unknown is work too, as
     for the parent.
     """
@@ -386,7 +390,7 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
 def _checked_out_submodule_stashes(
     path: str, *, prefix: str, depth: int, seen: set[Path]
 ) -> list[str]:
-    if depth >= _MAX_SUBMODULE_DEPTH or not (Path(path) / ".gitmodules").is_file():
+    if depth >= _MAX_SUBMODULE_DEPTH:
         return []
     listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
     if listed.returncode != 0:
