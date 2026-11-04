@@ -53,7 +53,7 @@ async def test_only_exited_containers_are_not_called_running(monkeypatch) -> Non
     assert "動いたまま" not in d, d
 
 
-async def test_shared_teardown_calls_exited_only_left_running(monkeypatch) -> None:
+async def test_shared_teardown_does_not_call_exited_only_left_running(monkeypatch) -> None:
     """The root is in the shared teardown, so /workspace-stop said the same."""
     monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[_exited()]))
     cog = _setup(monkeypatch)

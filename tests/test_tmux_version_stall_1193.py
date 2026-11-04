@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import c_lord.tmux as T
 
 
-def test_manager_caches_version_timeout_as_not_installed() -> None:
+def test_a_version_timeout_is_not_cached_as_not_installed() -> None:
     calls = {"n": 0}
 
     def run(argv: list[str]) -> MagicMock:
@@ -50,7 +50,7 @@ def test_tmux_not_installed_is_still_remembered_as_absent() -> None:
     assert seen.count(["tmux", "-V"]) == 2  # once for the manager, once for the listing
 
 
-def test_listing_asks_version_twice_on_stall() -> None:
+def test_listing_asks_version_once_on_stall() -> None:
     seen: list[list[str]] = []
 
     def run(argv: list[str]) -> MagicMock:
