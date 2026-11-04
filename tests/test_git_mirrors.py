@@ -708,3 +708,58 @@ def test_background_fetch_git_dies_with_the_bot_1174(
     finally:
         _kill_procs_mentioning(str(tmp_path / "fakebin"))
     assert sizes1 == sizes2, f"bot が終わったあとも git の受信が続いている: {sizes1} -> {sizes2}"
+
+
+@pytest.fixture(autouse=True)
+def _not_stopping():  # noqa: ANN202
+    import c_lord.git_mirrors as gm
+
+    stopping = getattr(gm, "_stopping", None)
+    if stopping is not None:
+        stopping.clear()
+    yield
+    if stopping is not None:
+        stopping.clear()
+
+
+def test_an_open_pack_is_seen_under_a_relative_or_symlinked_root_1173(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """独立レビュー: /proc は実体の絶対パスを返す。相対・シンボリックリンク経由の
+    ミラーの置き場所でも「誰かが開いている」と分かる（旧既定の data/sessions は相対）。"""
+    import c_lord.git_mirrors as gm
+
+    real = tmp_path / "real"
+    (real / "pack").mkdir(parents=True)
+    pack = real / "pack" / "tmp_pack_held"
+    pack.write_text("x")
+    (tmp_path / "link").symlink_to(real)
+    monkeypatch.chdir(tmp_path)
+    via_link = Path("link") / "pack" / "tmp_pack_held"
+    with open(pack):
+        assert gm._open_by_someone([via_link]) == {via_link}
+        assert gm._abandoned([via_link]) == []
+
+
+def test_a_fetch_stopped_with_the_bot_is_not_marked_timed_out_1174(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """独立レビュー: 停止で SIGKILL した git も -9 で終わる。時間切れの印を付けると、
+    デプロイのたびに1時間ミラーを更新しなくなる。"""
+    import threading
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, f"file://{upstream}")
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch)
+    t = threading.Thread(target=ensure_mirror, args=(root, f"file://{upstream}"))
+    t.start()
+    deadline = time.monotonic() + 10
+    while not gm._running_groups and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert gm.stop_running_git() == 1
+    t.join(timeout=15)
+    assert not (mirror / gm.FETCH_TIMED_OUT_MARK).exists()

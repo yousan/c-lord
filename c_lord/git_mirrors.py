@@ -203,6 +203,8 @@ def mirrors_root_for(base_dir: str | Path) -> Path:
 #: いま走っている git のプロセスグループ (#1174)。bot が終わるときにまとめて止める。
 _running_groups: set[int] = set()
 _running_lock = threading.Lock()
+#: ``stop_running_git`` ran: a git killed from here on did not time out.
+_stopping = threading.Event()
 
 
 def stop_running_git() -> int:
@@ -213,6 +215,7 @@ def stop_running_git() -> int:
     flock も外れるので次の bot が同じミラーにもう1本 fetch を出す (#1174)。
     プロセスの終了時 (``atexit``) と、停止シグナルを受けたとき (``main``) に呼ぶ。
     """
+    _stopping.set()
     with _running_lock:
         groups = list(_running_groups)
     stopped = 0
@@ -270,6 +273,9 @@ def _wait(
             os.killpg(proc.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             proc.communicate(timeout=10)
+        with _running_lock:
+            # Reaped: the number may be reused — never kill it again (#1174).
+            _running_groups.discard(proc.pid)
         _wait_for_group_gone(proc.pid)
         logger.warning("git mirror: %s timed out after %.0f seconds", " ".join(args[:4]), timeout)
         return subprocess.CompletedProcess(args, _TIMED_OUT, "", "timed out")
@@ -303,7 +309,9 @@ def _open_by_someone(paths: list[Path]) -> set[Path]:
 
     ``/proc`` が無い OS では空を返す — そのときは書き続けているかどうかだけで見る。
     """
-    wanted = {str(p): p for p in paths}
+    # /proc gives the real, absolute path; a relative or symlinked mirrors root
+    # would otherwise never match and the check would be silently off.
+    wanted = {os.path.realpath(p): p for p in paths}
     found: set[Path] = set()
     try:
         procs = list(Path("/proc").glob("[0-9]*/fd"))
@@ -444,7 +452,11 @@ def _fetch(target: Path, *, timeout: float) -> None:
             return
         before = set(_garbage_files(target))
         result = _run(["git", "-C", str(target), "fetch", "--quiet"], timeout=timeout)
-        if result is not None and result.returncode == _TIMED_OUT:
+        if result is not None and result.returncode == _TIMED_OUT and _stopping.is_set():
+            # bot の停止で止めた (#1174)。時間切れではないので印は付けない。書きかけは
+            # 次の起動の古いゴミ掃除 (2時間) が拾う — 停止を1秒でも延ばさない。
+            logger.info("git mirror: fetch of %s stopped with the bot", target.name)
+        elif result is not None and result.returncode == _TIMED_OUT:
             # 新しくできた書きかけのうち、止めた git のものだけを消す。flock は
             # c-lord 同士の約束でしかなく、手で打った fetch も同じ場所に書く (#1173)。
             ours = _abandoned([p for p in _garbage_files(target) if p not in before])
