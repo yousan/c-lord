@@ -888,6 +888,12 @@ def pane_command_is_dead(command: object) -> bool:
     return isinstance(command, str) and bool(command.strip()) and "claude" not in command.lower()
 
 
+#: What the latest ``tmux -V`` said (:func:`_tmux_installed`), so a caller that
+#: went through :func:`_tmux_available` can tell "not installed" from "did not
+#: answer" without asking twice (#1193).
+_last_tmux_answer: bool | None = None
+
+
 def _tmux_available() -> bool:
     """Return True if tmux is installed and accessible."""
     return _tmux_installed() is True
@@ -900,12 +906,15 @@ def _tmux_installed() -> bool | None:
     and a stalled host is exactly when the emergency brake runs. Reading that
     as "no tmux, so nobody is running" let it sleep a running turn.
     """
+    global _last_tmux_answer
     result = _run(["tmux", "-V"])
     if result.returncode == 0:
-        return True
-    if result.returncode == 127:  # not installed (see ``_run``)
-        return False
-    return None
+        _last_tmux_answer = True
+    elif result.returncode == 127:  # not installed (see ``_run``)
+        _last_tmux_answer = False
+    else:
+        _last_tmux_answer = None
+    return _last_tmux_answer
 
 
 def server_fingerprint(socket_name: str | None = None) -> str | None:
@@ -1058,9 +1067,19 @@ class TmuxSessionManager:
         return f"={self.session_name}"
 
     def _check_available(self) -> bool:
-        """Check and cache tmux availability."""
+        """Check and cache tmux availability.
+
+        Only an answer is cached (#1193): a ``tmux -V`` that timed out means
+        the host stalled, not that tmux is missing (#1095). Caching that as
+        "not installed" left the channel unable to make a window until the
+        bot was restarted, so it is asked again next time.
+        """
         if self._available is None:
-            self._available = _tmux_available()
+            installed = _tmux_installed()
+            if installed is None:
+                logger.warning("tmux did not answer `tmux -V` — will ask again next time")
+                return False
+            self._available = installed
             if not self._available:
                 logger.warning("tmux is not installed — tmux features disabled")
         return self._available
@@ -4035,9 +4054,13 @@ def _claude_panes_listing() -> dict[int, str] | None:
     No tmux at all, or no server, is an answer — nothing can be running claude.
     A ``list-panes`` that fails otherwise (a timeout, #699) is not.
     """
+    global _last_tmux_answer
+    _last_tmux_answer = None
     if not _tmux_available():
-        # Not installed is an answer; tmux not answering is not (#1095).
-        return {} if _tmux_installed() is False else None
+        # Not installed is an answer; tmux not answering is not (#1095). The
+        # answer the check just got is reused — asking ``tmux -V`` again made a
+        # stall wait twice (#1193).
+        return {} if _last_tmux_answer is False else None
 
     result = _run(
         [

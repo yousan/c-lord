@@ -274,3 +274,103 @@ async def test_the_answers_end_after_the_bridged_menu_completes(log) -> None:
     turn_events.note_turn_end(THREAD_ID, 0)  # answered; the turn ends now
     await turn_events.drain()
     assert _kinds(log) == ["blocked", "completion"]
+
+
+def _ago(seconds: float):  # noqa: ANN202
+    from datetime import datetime, timedelta, timezone
+
+    return datetime.now(timezone.utc) - timedelta(seconds=seconds)
+
+
+async def test_a_late_end_after_the_hold_does_not_release_it(log) -> None:
+    """#1202: menu → run ended (held) → the previous turn's end, dated before the menu."""
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    turn_events.note_turn_end(THREAD_ID, 0, at=_ago(5))
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked"]
+    turn_events.note_turn_end(THREAD_ID, 0)  # the answer's end still sends it
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked", "completion"]
+
+
+async def test_a_late_end_with_agents_after_the_hold_does_not_time_out(log, monkeypatch) -> None:
+    """#1202: nor does it put the menu's wait on #917's clock."""
+    import asyncio
+
+    monkeypatch.setenv(turn_events.ENV_DEFER_MAX, "0.01")
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    turn_events.note_turn_end(THREAD_ID, 1, at=_ago(5))
+    await asyncio.sleep(0.05)
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked"]
+
+
+async def test_the_mirror_dates_the_end_by_the_transcript(log, tmp_path) -> None:
+    """#1202 AC3: the mirror passes the row's own time — a stale end it reads late,
+    dated before the menu, leaves the menu's hold alone."""
+    import asyncio
+    import json as _json
+
+    from c_lord.transcript.mirror import TranscriptMirror
+
+    from .transcript.helpers import clord_transcript
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    mirror = TranscriptMirror(
+        thread_id=THREAD_ID, project_dir=project, sink=AsyncMock(), poll_interval=0.02
+    )
+    mirror.start()
+    try:
+        await asyncio.sleep(0.1)
+        row = {
+            "type": "system",
+            "subtype": "turn_duration",
+            "isSidechain": False,
+            "uuid": "end-old",
+            "timestamp": _ago(5).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        }
+        with jsonl.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(row) + "\n")
+        await asyncio.sleep(0.3)
+    finally:
+        await mirror.stop()
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked"]
+
+
+async def test_a_late_failed_self_turn_end_does_not_fail_the_waiting_request(log) -> None:
+    """#1202 (review): a self-started turn that failed before the menu, reported late,
+    is its own failure — not the waiting request's."""
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    turn_events.note_self_turn_started(THREAD_ID, at=_ago(10))
+    turn_events.note_turn_end(
+        THREAD_ID, 0, self_started=True, failure_reason="api_error", at=_ago(5)
+    )
+    await turn_events.drain()
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sorted(e["kind"] for e in events) == ["blocked", "failure"]
+    (failure,) = [e for e in events if e["kind"] == "failure"]
+    assert failure["started_by"]["type"] != "webhook"  # the self-started turn's, not B's
+    turn_events.note_turn_end(THREAD_ID, 0)  # the answer's end: B completes
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked", "completion", "failure"]

@@ -235,7 +235,7 @@ once it is over. At the end of a turn they are folded into a single
 | `/tmux-list` | List all active tmux windows | Available |
 | `/close-workspace` | 終了: close the tmux window, keep the session (thread renamed `[終了] …`; a later message is held and offers a 再開 button) | Available |
 | `/reopen-workspace` | Reopen a 終了 thread so messages run again | Available |
-| `/workspace-delete` | Delete the tmux window and session directory for this thread | Available |
+| `/workspace-delete` | Stop this thread (turn, tmux window, docker) and delete its session directory | Available |
 | `/upgrade` | Trigger bot upgrade (if enabled) | Available |
 
 ### Text Commands

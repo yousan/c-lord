@@ -312,18 +312,26 @@ def _start_refs(path: str) -> dict[str, str]:
     return tips
 
 
-def _stash_entries(path: str) -> int | None:
+def _stash_entries(path: str, *, git_dir: bool = False) -> int | None:
     """How many entries ``git stash list`` has (#1045). ``None``: git failed.
 
     A ``refs/stash`` that resolves is at least one entry, whatever its reflog
     says (#1080): ``rev-list --walk-reflogs`` counts reflog lines, and a stash
     whose reflog was expired — or that was placed with ``update-ref`` — counted
     0, so the dir read as clean and was removed with the stash's only copy.
+
+    With *git_dir*, *path* is a git directory whose checkout may be gone
+    (#1181). Its ``core.worktree`` then names a missing folder and every git
+    command dies on it, so the git dir itself stands in as the work tree; and
+    a failure other than "no such ref" is unknown, not "no stash".
     """
-    found = _run(["git", "rev-parse", "-q", "--verify", "refs/stash"], cwd=path)
+    pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
+    found = _run([*pre, "rev-parse", "-q", "--verify", "refs/stash"], cwd=path)
+    if git_dir and found.returncode not in (0, 1):
+        return None
     if found.returncode != 0 or not found.stdout.strip():
         return 0  # no stash at all
-    result = _run(["git", "rev-list", "--walk-reflogs", "--count", "refs/stash"], cwd=path)
+    result = _run([*pre, "rev-list", "--walk-reflogs", "--count", "refs/stash"], cwd=path)
     if result.returncode != 0:
         return None
     try:
@@ -336,18 +344,53 @@ def _stash_entries(path: str) -> int | None:
 _MAX_SUBMODULE_DEPTH = 3
 
 
-def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[str]:
-    """``"<path>: N stash entries"`` for every checked-out submodule with a stash (#1121).
+def _stash_note(name: str, n: int | None) -> str | None:
+    """``"<name>: N stash entries"``, or ``None`` with no stash. Unknown counts as one."""
+    n = 1 if n is None else n
+    if not n:
+        return None
+    return f"{name}: {n} stash {'entry' if n == 1 else 'entries'}"
 
-    Only repos with a ``.gitmodules`` are asked, so a plain checkout costs one
-    ``stat``. A submodule whose stash cannot be read is reported as having one —
-    unknown is work too, as for the parent.
+
+def _linked_git_dir(checkout: Path) -> Path | None:
+    """The git dir a submodule's ``.git`` *file* points at (``gitdir: …``), resolved."""
+    try:
+        line = (checkout / ".git").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None  # a directory (old-style submodule) or unreadable
+    if not line.startswith("gitdir:"):
+        return None
+    return (checkout / line[len("gitdir:") :].strip()).resolve()
+
+
+def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[str]:
+    """``"<path>: N stash entries"`` for every submodule with a stash (#1121, #1181).
+
+    Checked-out submodules are named by their path. Then every git dir under
+    ``.git/modules`` that no checkout claimed is asked too (#1181): after
+    ``git submodule deinit`` or ``git rm`` the checkout is gone but the stash
+    is still there — and deleting the workspace deletes it. Those are named by
+    their module name. A plain checkout costs two ``stat``. A submodule whose
+    stash cannot be read is reported as having one — unknown is work too, as
+    for the parent.
     """
+    found: list[str] = []
+    seen: set[Path] = set()
+    found += _checked_out_submodule_stashes(path, prefix=prefix, depth=depth, seen=seen)
+    modules = Path(path) / ".git" / "modules"
+    if depth == 0 and modules.is_dir():
+        found += _module_dir_stashes(modules, prefix="", depth=0, seen=seen)
+    return found
+
+
+def _checked_out_submodule_stashes(
+    path: str, *, prefix: str, depth: int, seen: set[Path]
+) -> list[str]:
     if depth >= _MAX_SUBMODULE_DEPTH or not (Path(path) / ".gitmodules").is_file():
         return []
     listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
     if listed.returncode != 0:
-        return []
+        return []  # .git/modules is still walked (#1181)
     found: list[str] = []
     for entry in listed.stdout.split("\0"):
         meta, _, rel = entry.partition("\t")
@@ -355,13 +398,47 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
             continue
         sub = Path(path) / rel
         if not (sub / ".git").exists():
-            continue  # not checked out — nothing of the user's lives there
-        n = _stash_entries(str(sub))
-        n = 1 if n is None else n
+            continue  # not checked out — its git dir, if any, is walked below (#1181)
+        linked = _linked_git_dir(sub)
+        if linked is not None:
+            seen.add(linked)
         name = f"{prefix}{rel}"
-        if n:
-            found.append(f"{name}: {n} stash {'entry' if n == 1 else 'entries'}")
-        found += _submodule_stashes(str(sub), prefix=f"{name}/", depth=depth + 1)
+        note = _stash_note(name, _stash_entries(str(sub)))
+        if note:
+            found.append(note)
+        found += _checked_out_submodule_stashes(
+            str(sub), prefix=f"{name}/", depth=depth + 1, seen=seen
+        )
+    return found
+
+
+def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Path]) -> list[str]:
+    """Stashes in the git dirs under a ``modules`` dir that no checkout claimed (#1181).
+
+    A module name may hold ``/`` (``libs/foo`` → ``modules/libs/foo``), so a
+    dir that is no git dir is descended into; a git dir's own ``modules`` holds
+    its nested submodules.
+    """
+    if depth >= _MAX_SUBMODULE_DEPTH * 4:
+        return []
+    found: list[str] = []
+    try:
+        children = sorted(p for p in modules.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    for child in children:
+        name = f"{prefix}{child.name}"
+        if not ((child / "HEAD").is_file() and (child / "objects").is_dir()):
+            found += _module_dir_stashes(child, prefix=f"{name}/", depth=depth + 1, seen=seen)
+            continue
+        if child.resolve() not in seen:
+            note = _stash_note(name, _stash_entries(str(child), git_dir=True))
+            if note:
+                found.append(note)
+        if (child / "modules").is_dir():
+            found += _module_dir_stashes(
+                child / "modules", prefix=f"{name}/", depth=depth + 1, seen=seen
+            )
     return found
 
 

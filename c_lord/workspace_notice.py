@@ -154,10 +154,10 @@ _IDLE_PREFIX = {
 
 
 def _running_ports(containers: list[DevContainer]) -> list[int]:
-    """Host ports still held. Only running containers hold one."""
+    """Host ports still held — by running, paused or restarting containers (#1182)."""
     ports: set[int] = set()
     for c in containers:
-        if c.running:
+        if c.holds_ports:
             ports.update(c.ports)
     return sorted(ports)
 
@@ -257,7 +257,7 @@ def workspace_notice_embed(
         ports = _running_ports(containers)
         if ports:
             detail = " / ".join(
-                f"`{c.name}` :{p}" for c in containers if c.running for p in c.ports
+                f"`{c.name}` :{p}" for c in containers if c.holds_ports for p in c.ports
             )
             embed.add_field(
                 name="⚠️ 掴んだままのポート",
