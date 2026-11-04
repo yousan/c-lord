@@ -2011,6 +2011,16 @@ class SessionManageCog(commands.Cog):
         tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is None:
             return False
+        # #1206: a stalled tmux (``tmux -V`` / ``show-option`` / ``list-windows``
+        # timing out) makes ``session_exists`` below answer "no window", which
+        # the resident cap counted as gone and never made up for. Could not tell
+        # is "still there".
+        if await asyncio.to_thread(tmux_mgr.window_present, thread_id) is None:
+            logger.warning(
+                "%s sleep: tmux did not answer — counted as still there",
+                log_ctx(thread_id=thread_id),
+            )
+            return False
 
         # Already asleep (or never resident): there is nothing to reclaim, and
         # going further would re-post the docker line on every tick — which is

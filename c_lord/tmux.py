@@ -1295,17 +1295,7 @@ class TmuxSessionManager:
         cached = self._thread_to_window.get(thread_id)
         if cached is not None:
             # Verify the window still exists
-            result = _run(
-                [
-                    "tmux",
-                    "show-option",
-                    "-w",
-                    "-v",
-                    "-t",
-                    self._target(cached),
-                    "@thread_id",
-                ]
-            )
+            result = self._show_thread_tag(cached)
             if result.returncode == 0 and result.stdout.strip() == str(thread_id):
                 return cached
             # Stale cache entry. Use pop(): capture_pane runs in a thread executor
@@ -1316,6 +1306,10 @@ class TmuxSessionManager:
         # Fallback: scan all windows
         self._rebuild_mapping()
         return self._thread_to_window.get(thread_id)
+
+    def _show_thread_tag(self, window: str) -> subprocess.CompletedProcess[str]:
+        """``show-option @thread_id`` of *window* — the cheap "is it still mine?" check."""
+        return _run(["tmux", "show-option", "-w", "-v", "-t", self._target(window), "@thread_id"])
 
     def _next_window_name(self, thread_id: int | None = None, preferred: int | None = None) -> str:
         """The ``w{N}`` name for *thread_id*'s next window, read from live tmux state (#649).
@@ -1371,8 +1365,12 @@ class TmuxSessionManager:
         self._next_work_id = max_id + 2  # fallback value should the next call fail
         return f"{WINDOW_PREFIX}{max_id + 1}"
 
-    def _rebuild_mapping(self) -> None:
+    def _rebuild_mapping(self) -> bool:
         """Rebuild ``_thread_to_window`` from live tmux state.
+
+        Returns ``False`` only when ``list-windows`` timed out — tmux did not
+        answer, so the mapping says nothing about which windows exist (#1206).
+        Any other failure (no server, no such session) is an answer.
 
         Primary key is the ``@thread_id`` window option. When that option
         is missing — which happens after a tmux server restart, because
@@ -1416,7 +1414,7 @@ class TmuxSessionManager:
         )
         if result.returncode != 0:
             # Keep the current (complete) mapping rather than wiping it to empty.
-            return
+            return result.returncode != _RUN_TIMEOUT_RETURNCODE
 
         # Pass 0: restore from persistent mapping file for windows whose
         # @thread_id was cleared and whose pane has cd'd away (issue #113 Fix-B).
@@ -1507,6 +1505,7 @@ class TmuxSessionManager:
         # partially-built map. dict assignment is atomic under CPython's GIL.
         self._thread_to_window = new_map
         self._next_work_id = max_id + 1
+        return True
 
     def _window_has_claude(self, window: str) -> bool:
         """True when *window*'s pane runs ``claude`` in the foreground."""
@@ -2332,6 +2331,34 @@ class TmuxSessionManager:
             return False
 
         return self._find_window_for_thread(thread_id) is not None
+
+    def window_present(self, thread_id: int) -> bool | None:
+        """Like :meth:`session_exists`, but ``None`` when tmux did not answer (#1206).
+
+        :meth:`session_exists` reads a timed-out ``tmux -V``, ``show-option`` or
+        ``list-windows`` as "no window". A caller that counts a missing window
+        as gone — the resident cap — must not: on a stalled host the window is
+        still there. Only a timeout is "could not tell"; tmux saying "no server"
+        or "no such session" is an answer.
+        """
+        if self._available is None:
+            installed = _tmux_installed()
+            if installed is None:
+                return None  # `tmux -V` timed out: stalled, not missing (#1095)
+            self._available = installed
+        if not self._available:
+            return False
+        cached = self._thread_to_window.get(thread_id)
+        if cached is not None:
+            shown = self._show_thread_tag(cached)
+            if shown.returncode == _RUN_TIMEOUT_RETURNCODE:
+                return None
+            if shown.returncode == 0 and shown.stdout.strip() == str(thread_id):
+                return True
+            self._thread_to_window.pop(thread_id, None)
+        if not self._rebuild_mapping():
+            return None
+        return thread_id in self._thread_to_window
 
     def kill_session(self, thread_id: int) -> bool:
         """Kill the tmux window for a thread. Returns True if killed."""
