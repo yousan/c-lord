@@ -816,6 +816,37 @@ def _turn_state_at_end(
     return opened_by, opened_at, agents
 
 
+def _api_error_at_end(path: Path, end: int | None = None) -> str | None:
+    """The open turn's API-error text at *end* of *path*, as the live loop would hold it.
+
+    #1179: the live loop keeps the latest main-chain reply's API-error text
+    (#908/#1131) and drops it at the turn end. A restart between that row and the
+    ``turn_duration`` lost it, so a self-started turn that failed was recorded as
+    a completion with no ❌. Blocking; ``None`` when the file cannot be read.
+    """
+    try:
+        lines = list(_read_back_lines(path, end))
+    except OSError:
+        return None
+    failed: str | None = None
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if (
+            event.get("type") == "assistant"
+            and not event.get("isSidechain")
+            and not is_rate_limit_event(event)
+        ):
+            failed = api_error_text(event)
+        if _is_turn_end(event) and not event.get("isSidechain"):
+            failed = None
+    return failed
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -1055,6 +1086,16 @@ class TranscriptMirror:
             return
         self._background_agents |= agents
         if opened_by is not None:
+            # #1179: a turn still open may already have stopped on an API error.
+            # Read only then — a turn closed before the restart carries none over.
+            try:
+                self._turn_api_error = await asyncio.to_thread(_api_error_at_end, jsonl, end)
+            except Exception:
+                logger.warning(
+                    "%s TranscriptMirror: could not read back the open turn's API error (#1179)",
+                    log_ctx(thread_id=self.thread_id),
+                    exc_info=True,
+                )
             self._turn_open = True
             self._turn_by_notification = opened_by == "notification"
             self._turn_self_started = opened_by in ("notification", "wakeup")
