@@ -507,6 +507,8 @@ class TestProgressFileOpenedOnceInsideTheBoundary:
 
         if os.geteuid() == 0:
             pytest.skip("root ignores directory permissions")
+        if not (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)):
+            pytest.skip("no O_PATH / O_SEARCH: a directory can only be opened to read it")
         base = tmp_path / "sessions"
         xonly = base / "1" / "2" / "xonly"
         xonly.mkdir(parents=True)
