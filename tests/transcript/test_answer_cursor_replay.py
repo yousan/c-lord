@@ -219,12 +219,13 @@ async def test_tool_only_turn_after_a_text_turn_adopts_nothing(tmp_path, log):
     assert run.cursor == ["a1"]
 
 
-async def test_restart_between_silent_text_and_turn_end(tmp_path, log):
-    """Bot restarts after 'text A → tool_use' was mirrored; the turn ends after the
-    restore. A was posted (silently) by the old process; the cursor should still
-    land on A so the next restart does not re-post it."""
+async def _restart_mid_turn(tmp_path: Path, *, old_process_posted: bool) -> _Run:
     project = tmp_path / "proj"
     project.mkdir()
+    if old_process_posted:
+        from c_lord.transcript.mirror import LAST_SILENT_FILENAME
+
+        (project / LAST_SILENT_FILENAME).write_text("a1")
     jsonl = project / "s.jsonl"
     clord_transcript(jsonl)
     with jsonl.open("a", encoding="utf-8") as f:
@@ -252,12 +253,37 @@ async def test_restart_between_silent_text_and_turn_end(tmp_path, log):
         await asyncio.sleep(0.3)
     finally:
         await m.stop()
-    print(
-        run.posted,
-        run.cursor,
-        final_answer_needs_recovery(project, run.cursor[-1] if run.cursor else None),
-    )
+    run.project = project  # type: ignore[attr-defined]
+    return run
+
+
+async def test_restart_between_silent_text_and_turn_end(tmp_path, log):
+    """Bot restarts after 'text A → tool_use' was mirrored; the turn ends after the
+    restore. A was posted (silently) by the old process; the cursor should still
+    land on A so the next restart does not re-post it."""
+    run = await _restart_mid_turn(tmp_path, old_process_posted=True)
     assert run.cursor == ["a1"]
+
+
+async def test_text_written_while_no_process_read_is_not_taken_as_posted(tmp_path, log):
+    """Review of #1187: the tail resumes at the end, so A may have been written while
+    the bot was down and posted by nobody. Then the cursor stays put and the next
+    restart's rescue delivers it — late, not lost."""
+    run = await _restart_mid_turn(tmp_path, old_process_posted=False)
+    assert "a1" not in run.cursor
+    rescue = final_answer_needs_recovery(run.project, run.cursor[-1] if run.cursor else None)
+    assert rescue is not None and rescue.uuid == "a1"
+
+
+async def test_a_silent_text_is_recorded_as_posted(tmp_path, log):
+    """#1187: the live mirror leaves the proof the next process needs."""
+    from c_lord.transcript.mirror import LAST_SILENT_FILENAME
+
+    project = tmp_path / "p"
+    await _replay(
+        project, [(_user("依頼", "u0"), 0.05), (_text("A", "a1"), 0.05), (_tool("t1", "a2"), 0.1)]
+    )
+    assert (project / LAST_SILENT_FILENAME).read_text() == "a1"
 
 
 def _write_rows(path: Path, *rows: dict) -> None:

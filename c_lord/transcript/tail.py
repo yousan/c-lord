@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import Any
 
 from ..log_sampler import LogSampler
-from .resolver import ThreadSessionResolver
+from .claim import claim_path
+from .resolver import CLAIM_GRACE_SECONDS, ThreadSessionResolver
 
 logger = logging.getLogger(__name__)
 
@@ -459,6 +460,24 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     return events
 
 
+def _claim_still_young(resolver: ThreadSessionResolver, project_dir: Path) -> bool:
+    """A transcript c-lord named that may still be about to appear (#1190).
+
+    A new session's file appears only with its first prompt, so a fresh claim
+    counts as "reading" (else a pasted first prompt closes early — #1132). One
+    older than :data:`CLAIM_GRACE_SECONDS` with no file is the #773 state the
+    resolver already warns about: nothing is being read, and the pane's exit
+    must not wait on it (review of #1190).
+    """
+    if resolver.claimed_session_id is None:
+        return False
+    try:
+        age = time.time() - claim_path(project_dir).stat().st_mtime
+    except OSError:
+        return False
+    return age < CLAIM_GRACE_SECONDS
+
+
 async def tail_events(
     project_dir: Path,
     *,
@@ -550,7 +569,7 @@ async def tail_events(
                     project_dir,
                     sample.suffix,
                 )
-        found = state.resolved or state.resolver.claimed_session_id is not None
+        found = state.resolved or _claim_still_young(state.resolver, project_dir)
         if on_resolved is not None and found != reported_found:
             reported_found = found
             try:

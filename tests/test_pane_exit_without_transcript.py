@@ -134,3 +134,27 @@ async def test_a_transcript_that_appears_later_turns_tailing_on(tmp_path: Path) 
     finally:
         await mirror.stop()
     assert not turn_end_bus.is_tailing(THREAD)
+
+
+async def test_an_old_name_whose_transcript_never_came_does_not_hold(tmp_path: Path) -> None:
+    """Review of #1190: in production the threads with no transcript mostly do have a
+    claim — one whose file never appeared. Past the resolver's grace it is not
+    "reading", so the pane's exit does not wait on it every turn."""
+    import os
+    import time
+
+    from c_lord.transcript.claim import claim_path
+    from c_lord.transcript.resolver import CLAIM_GRACE_SECONDS
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    write_claim(project, SESSION_ID)
+    old = time.time() - CLAIM_GRACE_SECONDS - 60
+    os.utime(claim_path(project), (old, old))
+    mirror = TranscriptMirror(thread_id=THREAD, project_dir=project, sink=_sink, poll_interval=0.02)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        assert not turn_end_bus.is_tailing(THREAD)
+    finally:
+        await mirror.stop()

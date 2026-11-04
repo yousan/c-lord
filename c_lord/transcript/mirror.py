@@ -816,6 +816,27 @@ def _turn_state_at_end(
     return opened_by, opened_at, agents
 
 
+#: The uuid of the last text this process posted silently (#1187), so the next
+#: process can tell "the old process posted it" from "Claude wrote it while no
+#: process was reading" — read-back alone cannot (the tail resumes at the end).
+LAST_SILENT_FILENAME = ".clord-last-silent"
+
+
+def _write_last_silent(project_dir: Path, uuid: str) -> None:
+    """Record *uuid* as posted (#1187). Blocking; never raises."""
+    try:
+        (project_dir / LAST_SILENT_FILENAME).write_text(uuid, encoding="utf-8")
+    except OSError:
+        logger.debug("could not record the last silent text in %s", project_dir, exc_info=True)
+
+
+def _read_last_silent(project_dir: Path) -> str | None:
+    try:
+        return (project_dir / LAST_SILENT_FILENAME).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
     """The uuid of the open turn's last text that went out silently, at *end* (#1187).
 
@@ -1167,7 +1188,12 @@ class TranscriptMirror:
             # #1187: the text before the turn's last tool call is its answer at
             # the turn end (#1125) — the old process's memory of it is gone.
             try:
-                self._read_back_silent = await asyncio.to_thread(_silent_text_at_end, jsonl, end)
+                silent = await asyncio.to_thread(_silent_text_at_end, jsonl, end)
+                posted = await asyncio.to_thread(_read_last_silent, Path(self.project_dir))
+                # Only a text the old process says it posted: one Claude wrote
+                # while no process was reading was posted by nobody, and taking
+                # it as delivered would lose it for good (review of #1187).
+                self._read_back_silent = silent if silent is not None and silent == posted else None
             except Exception:
                 logger.warning(
                     "%s TranscriptMirror: could not read back the turn's last text (#1187)",
@@ -1320,6 +1346,11 @@ class TranscriptMirror:
             if not await self._fold.offer(_pending_text):
                 sent = await self._try_sink(_pending_text)
                 _last_silent = (_pending_uuid, sent) if _pending_uuid else None
+                if _pending_uuid and sent is not None:
+                    # #1187: proof for the next process that this one posted it.
+                    await asyncio.to_thread(
+                        _write_last_silent, Path(self.project_dir), _pending_uuid
+                    )
             else:
                 _last_silent = None
             # #399: an intermediate text posted silently may be the prose above
