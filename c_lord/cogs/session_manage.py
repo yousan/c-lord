@@ -12,7 +12,7 @@ import contextlib
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1852,6 +1852,12 @@ class SessionManageCog(commands.Cog):
             # rather than announcing a release that did not occur (#571).
             all_stopped = all(c.name in stopped for c in holding)
             docker_outcome = DockerOutcome.STOPPED if all_stopped else DockerOutcome.LEFT_RUNNING
+            # The notice names what still holds a port *after* the stop (review of
+            # #1182): the ones just stopped no longer do.
+            containers = [
+                replace(c, status="exited") if c.running and c.name in stopped else c
+                for c in containers
+            ]
 
         return _StopTeardown(
             tmux_mgr=tmux_mgr, killed=killed, containers=containers, docker=docker_outcome

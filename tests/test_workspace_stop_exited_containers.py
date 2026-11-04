@@ -103,3 +103,38 @@ async def test_running_stopped_but_paused_left_is_left_running(monkeypatch) -> N
     cog = _setup(monkeypatch)
     t = await cog._stop_teardown(555, 999, close_reason=sm.WorkspaceReason.MANUAL)
     assert t.docker is sm.DockerOutcome.LEFT_RUNNING
+
+
+def _port_field(sent: list) -> str:  # noqa: ANN001
+    for msg in reversed(sent):
+        embed = msg.get("embed") if isinstance(msg, dict) else None
+        if embed is None:
+            continue
+        for f in embed.fields:
+            if "掴んだままのポート" in f.name:
+                return f.value
+        return ""
+    return ""
+
+
+async def test_the_stop_notice_names_the_port_still_held_not_the_one_freed(monkeypatch) -> None:  # noqa: ANN001
+    """Review: running `web` stopped, paused `db` left — the warning names db :55322."""
+    run = sm.DevContainer("id1", "web", "running", (8080,), "p", "mount")
+    paused = sm.DevContainer("id2", "db", "paused", (55322,), "p", "mount")
+    monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[run, paused]))
+    monkeypatch.setattr(sm, "stop_containers", AsyncMock(return_value=["web"]))
+    cog = _setup(monkeypatch)
+    respond, ack, sent, _ = _capture()
+    await cog._close_workspace_impl(channel=_thread(), respond=respond, ack=ack)
+    field = _port_field(sent)
+    assert "`db` :55322" in field and "8080" not in field, field
+
+
+@pytest.mark.parametrize("status", ["paused", "restarting"])
+async def test_the_stop_notice_names_a_paused_containers_port(monkeypatch, status: str) -> None:  # noqa: ANN001
+    c = sm.DevContainer("id1", "db", status, (55322,), "p", "mount")
+    monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[c]))
+    cog = _setup(monkeypatch)
+    respond, ack, sent, _ = _capture()
+    await cog._close_workspace_impl(channel=_thread(), respond=respond, ack=ack)
+    assert "`db` :55322" in _port_field(sent)
