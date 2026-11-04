@@ -123,12 +123,12 @@ async def test_a_window_that_vanished_on_its_own_is_not_made_up_for_1094() -> No
     live = {1, 2, 3, 4}
     listed = {"stale": True}
 
-    async def impl(*, channel: object, reason: object, idle_label: object) -> bool:
+    async def impl(*, channel: object, reason: object, idle_label: object) -> bool | None:
         tid = channel.id  # type: ignore[attr-defined]
         if tid == 4:  # claude exited between list-panes and kill
             live.discard(4)
             listed["stale"] = False
-            return False
+            return None  # the sleep's "nothing to kill" (a bare False is a failure — #1192)
         live.discard(tid)
         return True
 
@@ -180,9 +180,9 @@ async def test_window_already_gone_is_made_up_and_goes_below_limit() -> None:
     """
     resident = {1, 2, 3, 4}
 
-    async def impl(*, channel: object, reason: object, idle_label: object) -> bool:
+    async def impl(*, channel: object, reason: object, idle_label: object) -> bool | None:
         if channel.id == 4:  # type: ignore[attr-defined]  # claude exited
-            return False
+            return None  # nothing to kill (#1192: False now means the kill failed)
         resident.discard(channel.id)  # type: ignore[attr-defined]
         return True
 

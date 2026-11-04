@@ -812,8 +812,11 @@ class ResidentCapLoop:
         implementations of one outcome always drift (#538).
 
         ``True``: slept. ``False``: could not (the thread could not be resolved,
-        the sleep raised) — the window is still there. ``None``: the sleep found
-        nothing to kill (#1094) — the window was already gone.
+        the sleep raised, or it answered ``False``: the kill failed with the
+        window still there) — made up for by the next candidate. ``None``: the
+        sleep found nothing to kill (#1094) — the window was already gone.
+        Only the sleep's own ``None`` means gone (#1192): reading every falsy
+        answer as gone left the cap above its limit whenever a kill failed.
         """
         cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
         impl = getattr(cog, "_sleep_workspace_impl", None)
@@ -825,10 +828,13 @@ class ResidentCapLoop:
         if channel is None:
             return False
         try:
-            return True if await impl(channel=channel, reason=reason, idle_label=label) else None
+            slept = await impl(channel=channel, reason=reason, idle_label=label)
         except Exception:
             logger.exception("resident-cap: failed to sleep thread=%d", thread_id)
             return False
+        if slept:
+            return True
+        return None if slept is None else False
 
     async def _close_gone(self, thread_id: int) -> bool:
         """Close the windows of a thread Discord says no longer exists (#1086)."""

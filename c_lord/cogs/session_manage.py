@@ -12,7 +12,7 @@ import contextlib
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1840,12 +1840,24 @@ class SessionManageCog(commands.Cog):
                 )
 
         docker_outcome = DockerOutcome.NONE
-        if containers:
-            stopped = await stop_containers(containers)
+        # #1182: only a container that still holds its ports can be left running.
+        # ``docker ps -a`` also finds exited ones (the usual "stop, then delete"),
+        # which hold nothing — they read as なし, not "▶️ 動いたまま". Paused and
+        # restarting ones do hold them, though ``stop_containers`` leaves them be.
+        holding = [c for c in containers if c.holds_ports]
+        if holding:
+            stopped = set(await stop_containers(containers))
             # Report what actually happened, not what was attempted: a docker
             # that refused leaves the ports held, and the notice must say so
             # rather than announcing a release that did not occur (#571).
-            docker_outcome = DockerOutcome.STOPPED if stopped else DockerOutcome.LEFT_RUNNING
+            all_stopped = all(c.name in stopped for c in holding)
+            docker_outcome = DockerOutcome.STOPPED if all_stopped else DockerOutcome.LEFT_RUNNING
+            # The notice names what still holds a port *after* the stop (review of
+            # #1182): the ones just stopped no longer do.
+            containers = [
+                replace(c, status="exited") if c.running and c.name in stopped else c
+                for c in containers
+            ]
 
         return _StopTeardown(
             tmux_mgr=tmux_mgr, killed=killed, containers=containers, docker=docker_outcome
@@ -1917,7 +1929,7 @@ class SessionManageCog(commands.Cog):
 
     @app_commands.command(
         name="workspace-delete",
-        description="Delete the tmux window and session directory for this thread",
+        description="Stop this thread (turn, tmux window, docker) and delete its session directory",
     )
     async def workspace_delete(self, interaction: discord.Interaction) -> None:
         """Delete the tmux window and session directory for the current thread."""
@@ -1958,7 +1970,7 @@ class SessionManageCog(commands.Cog):
         channel: object,
         reason: WorkspaceReason = WorkspaceReason.IDLE,
         idle_label: str | None = None,
-    ) -> bool:
+    ) -> bool | None:
         """スリープ — stop this workspace's Claude and nothing else (#572).
 
         The innermost of the three lifecycle operations (スリープ ⊂ 停止 ⊂ 削除).
@@ -1977,7 +1989,12 @@ class SessionManageCog(commands.Cog):
         Returns ``True`` only when a window was actually killed. The callers —
         :class:`c_lord.idle_sleep.IdleSleepLoop`, and #576's resident cap — count
         that, not the number of calls: a sweep that counts attempts reports
-        progress it never made (#604).
+        progress it never made (#604). The two falsy answers differ (#1192):
+        ``None`` — there was no window to kill (already asleep, or its claude
+        ended on its own); ``False`` — the window may still be there and could
+        not be killed (no manager, ``kill-window`` failed — a stalled tmux also
+        fails it, so a failed kill is never read as gone). The resident cap makes
+        up for ``False`` with the next candidate and only for that (#1094).
 
         There is no slash command on purpose. Being invisible is the feature; a
         手動 twin would add a concept ("how is this different from 停止?") that
@@ -1999,7 +2016,7 @@ class SessionManageCog(commands.Cog):
         # going further would re-post the docker line on every tick — which is
         # how an invisible feature turns into a nuisance.
         if not await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
-            return False
+            return None
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the
         # harness write a final ``<task-notification>`` row into the transcript,
@@ -2008,7 +2025,15 @@ class SessionManageCog(commands.Cog):
         await self._stop_transcript_mirror(thread_id)
 
         if not await asyncio.to_thread(tmux_mgr.kill_session, thread_id):
-            logger.info("%s sleep: no tmux window to kill", log_ctx(thread_id=thread_id))
+            # #1192: the window was there a moment ago and the kill failed. Not
+            # "gone": asking tmux again cannot tell "vanished in between" from
+            # "tmux stalled" (the kill's own likely cause — a stalled lookup also
+            # answers "no window"), and reading a stall as gone left the cap
+            # above its limit. At worst the cap sleeps one more thread than needed.
+            logger.warning(
+                "%s sleep: could not kill the tmux window — counted as still there",
+                log_ctx(thread_id=thread_id),
+            )
             return False
 
         # Remember it, so the next message resumes without a word even across a
