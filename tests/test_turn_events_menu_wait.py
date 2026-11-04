@@ -245,3 +245,32 @@ async def test_the_previous_turns_late_end_with_agents_does_not_time_out(log, mo
     await asyncio.sleep(0.05)
     await turn_events.drain()
     assert _kinds(log) == ["blocked"]
+
+
+async def test_a_late_end_noted_after_the_bridged_menu_is_not_the_answer(log) -> None:
+    """#1195 (review): the pane bridge posts the menu while the mirror is still
+    delivering the previous answer, so the previous turn's end is *noted* after
+    the menu. It was *written* before the request was taken — that decides."""
+    from datetime import datetime, timedelta, timezone
+
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    written = datetime.now(timezone.utc) - timedelta(seconds=5)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)  # the pane bridge first
+    turn_events.note_turn_end(THREAD_ID, 0, at=written)  # the previous turn's end, late
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked"]
+
+
+async def test_the_answers_end_after_the_bridged_menu_completes(log) -> None:
+    """#1195: an end written after the menu is the answer's — one completion."""
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    turn_events.note_turn_end(THREAD_ID, 0)  # answered; the turn ends now
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked", "completion"]

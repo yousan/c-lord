@@ -1471,6 +1471,7 @@ class TranscriptMirror:
                                 len(self._background_agents),
                                 self_started=self._turn_self_started,
                                 failure_reason=failure,
+                                at=_event_time(event),
                             )
                             self._turn_api_error = None
                             turn_end_bus.mark(self.thread_id, at=_event_time(event))

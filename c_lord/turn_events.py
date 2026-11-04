@@ -148,10 +148,11 @@ class _Held:
 
 
 _ACTIVE: dict[int, TurnInfo] = {}
-#: thread -> (monotonic time of the last transcript turn end, agents still running)
-_LAST_END: dict[int, tuple[float, int]] = {}
+#: thread -> (monotonic time the mirror noted the last transcript turn end, agents
+#: still running, wall-clock time the transcript says that turn ended — #1195)
+_LAST_END: dict[int, tuple[float, int, float]] = {}
 _HELD: dict[int, _Held] = {}
-#: thread -> monotonic time the mirror posted the last menu that parks a turn (#1195).
+#: thread -> wall-clock time the last menu that parks a turn was posted (#1195).
 _BLOCKED_AT: dict[int, float] = {}
 #: thread -> the last runner turn, whose guild / channel a self-started turn inherits.
 _LAST_INFO: dict[int, TurnInfo] = {}
@@ -341,6 +342,7 @@ def note_turn_end(
     *,
     self_started: bool = False,
     failure_reason: str | None = None,
+    at: datetime | None = None,
 ) -> None:
     """The transcript says a turn ended in *thread_id* with *outstanding* agents running.
 
@@ -353,11 +355,14 @@ def note_turn_end(
     #1131). Then nothing is ``completion``: a completion held for the request
     whose work this turn was continuing goes out as ``failure`` instead, and so
     does the turn's own event — at once, whatever agents are still out.
+    *at*: when the transcript says the turn ended (the row's own timestamp);
+    ``None`` reads as now.
     """
     if not enabled():
         return
     try:
-        _remember(_LAST_END, thread_id, (time.monotonic(), outstanding))
+        ended = at.timestamp() if at is not None else time.time()
+        _remember(_LAST_END, thread_id, (time.monotonic(), outstanding, ended))
         started = _SELF.pop(thread_id, None)
         own = started if self_started else None
         if own is not None and failure_reason is not None and thread_id not in _ACTIVE:
@@ -417,18 +422,20 @@ def finish_turn(
     _spawn(_deliver("completion", info))
 
 
-def _ended_after_menu(info: TurnInfo, snapshot: tuple[float, int] | None) -> bool:
-    """Did the transcript say the turn ended after its menu was posted? (#1170/#1195)
+def _ended_after_menu(info: TurnInfo, snapshot: tuple[float, int, float] | None) -> bool:
+    """Did the turn end, by the transcript's clock, after its menu was posted? (#1170/#1195)
 
-    Only such an end can follow the answer. The mirror reads the transcript in
-    order, so the interrupted previous turn's end — which may reach it after
-    this run began — always comes before this turn's menu. No menu seen in this
-    run: no end can be told to be the answer's, so none is.
+    Only such an end can follow the answer. The interrupted previous turn's end
+    can reach c-lord after this run began — and even after the menu, which the
+    runner's pane bridge posts on its own while the mirror is still delivering
+    the previous answer — so when it was *noted* says nothing. When it was
+    *written* does: before the new request was taken, so before its menu. No
+    menu posted in this run: no end can be told to be the answer's, so none is.
     """
     blocked_at = _BLOCKED_AT.get(info.thread_id)
-    if snapshot is None or blocked_at is None or blocked_at < info.started_mono:
+    if snapshot is None or blocked_at is None or blocked_at < info.started_at.timestamp():
         return False
-    return snapshot[0] >= blocked_at
+    return snapshot[2] >= blocked_at
 
 
 def announce_recovered_turn(
@@ -479,7 +486,7 @@ def emit_blocked(thread: discord.Thread | Any, *, message_id: int | None) -> Non
         return
     try:
         info = _ACTIVE.get(thread.id) or _info_for(thread, StartedBy("user"))
-        _remember(_BLOCKED_AT, thread.id, time.monotonic())
+        _remember(_BLOCKED_AT, thread.id, time.time())
         _spawn(_deliver("blocked", info, message_id=message_id))
     except Exception:
         logger.warning(
