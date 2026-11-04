@@ -1840,7 +1840,10 @@ class SessionManageCog(commands.Cog):
                 )
 
         docker_outcome = DockerOutcome.NONE
-        if containers:
+        # #1182: only a *running* container can be left running. ``docker ps -a``
+        # also finds exited ones (the usual "stop, then delete"), which hold no
+        # port and need nothing done — they read as なし, not "▶️ 動いたまま".
+        if any(c.running for c in containers):
             stopped = await stop_containers(containers)
             # Report what actually happened, not what was attempted: a docker
             # that refused leaves the ports held, and the notice must say so
@@ -1917,7 +1920,7 @@ class SessionManageCog(commands.Cog):
 
     @app_commands.command(
         name="workspace-delete",
-        description="Delete the tmux window and session directory for this thread",
+        description="Stop this thread (turn, tmux window, docker) and delete its session directory",
     )
     async def workspace_delete(self, interaction: discord.Interaction) -> None:
         """Delete the tmux window and session directory for the current thread."""

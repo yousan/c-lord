@@ -241,7 +241,7 @@ first message). See [specs/thread-name.md](specs/thread-name.md).
 | `/tmux-screenshot` | Post a PNG screenshot of this thread's tmux pane — a stopped workspace is restored first (debug) | Thread only |
 | `/workspace-stop` | **停止**: close the tmux window, keep the session (see below) | Thread only |
 | `/workspace-start` | Reopen a 停止 thread so messages run again | Thread only |
-| `/workspace-delete` | Everything `/workspace-stop` does (ends the running turn, kills the tmux window, stops the dev containers) **plus** deletes the session directory (#1113) | Thread only |
+| `/workspace-delete` | What `/workspace-stop` does to the running pieces (ends the running turn, kills the tmux window, stops the dev containers) **plus** deletes the session directory (#1113). Unlike `/workspace-stop` it neither marks the thread closed nor archives it | Thread only |
 
 **`/workspace-stop` = 終了 (#271, #512).** It kills the tmux window and archives
 the thread but **keeps** the session directory, transcript, and DB row, so the
