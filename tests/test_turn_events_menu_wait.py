@@ -352,3 +352,25 @@ async def test_the_mirror_dates_the_end_by_the_transcript(log, tmp_path) -> None
         await mirror.stop()
     await turn_events.drain()
     assert _kinds(log) == ["blocked"]
+
+
+async def test_a_late_failed_self_turn_end_does_not_fail_the_waiting_request(log) -> None:
+    """#1202 (review): a self-started turn that failed before the menu, reported late,
+    is its own failure — not the waiting request's."""
+    thread = _thread()
+    info = turn_events.begin_turn(thread, DISPATCHER)
+    turn_events.emit_blocked(thread, message_id=BLOCKED_MESSAGE_ID)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    turn_events.note_self_turn_started(THREAD_ID, at=_ago(10))
+    turn_events.note_turn_end(
+        THREAD_ID, 0, self_started=True, failure_reason="api_error", at=_ago(5)
+    )
+    await turn_events.drain()
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sorted(e["kind"] for e in events) == ["blocked", "failure"]
+    (failure,) = [e for e in events if e["kind"] == "failure"]
+    assert failure["started_by"]["type"] != "webhook"  # the self-started turn's, not B's
+    turn_events.note_turn_end(THREAD_ID, 0)  # the answer's end: B completes
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked", "completion", "failure"]

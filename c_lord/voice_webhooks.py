@@ -109,7 +109,7 @@ def _load(*, refresh: bool = False) -> set[int]:
     if refresh:
         path = registry_path()
         stamp = _stamp(path)
-        if stamp is None and _ours:
+        if stamp is None and _ours and time.monotonic() >= _next_retry:
             # #1204: the file is gone. Ours must be on it — recreate it (another
             # instance's ids are lost with the file either way; they re-add theirs).
             _flush_ours(path, quiet=_unwritten)
@@ -225,8 +225,13 @@ def is_voice_webhook(webhook_id: int | None) -> bool:
     if not webhook_id:
         return False
     with _lock:
-        if _unwritten and time.monotonic() >= _next_retry:
-            # #1176: ours is not on disk yet — try again, quietly.
+        if (
+            _ours
+            and time.monotonic() >= _next_retry
+            and (_unwritten or _stamp(registry_path()) is None)
+        ):
+            # #1176: ours is not on disk yet — try again, quietly. #1204: nor
+            # if the file was removed — our own voices may be all that posts.
             _flush_ours(registry_path(), quiet=True)
         if webhook_id in _load():
             return True

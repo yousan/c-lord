@@ -388,7 +388,9 @@ async def test_the_parents_question_is_in_the_md_1203(tmp_path: Path) -> None:
                 "u1",
                 "2026-10-29T06:00:00Z",
                 "user",
-                "The coordinator sent a message:\nQUESTION-XYZ",
+                # The CLI's real wording (2.1.305–2.1.318, measured).
+                "The coordinator sent a message while you were working:\nQUESTION-XYZ\n\n"
+                "Address this before completing your current task.",
                 isMeta=True,
                 origin={"kind": "coordinator"},
             ),
@@ -401,3 +403,4 @@ async def test_the_parents_question_is_in_the_md_1203(tmp_path: Path) -> None:
     files = "\n".join((p.file or "") for p in poster.statuses + [e for _, e in poster.edits])
     assert "ANSWER-XYZ" in files
     assert "📨 ← 親: QUESTION-XYZ" in files
+    assert "Address this" not in files and "coordinator sent" not in files

@@ -230,3 +230,12 @@ def test_a_deleted_file_is_recreated_with_our_id(tmp_path, monkeypatch) -> None:
     registry.unlink()
     v.is_voice_webhook(999)  # an unknown webhook makes it look at the file
     assert 111 in json.loads(registry.read_text())
+
+
+def test_a_deleted_file_is_recreated_when_only_our_voices_post(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """#1204 (review): no unknown webhook ever comes — our own voice is enough."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    v.register(111)
+    registry.unlink()
+    assert v.is_voice_webhook(111)
+    assert 111 in json.loads(registry.read_text())
