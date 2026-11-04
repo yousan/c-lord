@@ -50,3 +50,18 @@ async def test_string_and_fraction_are_accepted_as_documented(
     assert r.status == 201
     (task,) = await tr.get_all()
     assert task["interval_seconds"] == saved
+
+
+@pytest.mark.parametrize("value", ["１２０", "٣٠٠", "1_000", "+60", " 60 "])
+@pytest.mark.parametrize("field", ["interval_seconds", "channel_id"])
+async def test_only_ascii_digit_strings_are_integers(
+    env: tuple[TestClient, TaskRepository],  # noqa: F811
+    field: str,
+    value: str,
+) -> None:
+    """#1184 (review): "a string of decimal digits" means exactly that — not every
+    string ``int()`` reads. Same rule as the .env ids (#1084)."""
+    c, tr = env
+    r = await c.post("/api/tasks", json={**TASK, "name": f"n{field}{value!r}", field: value})
+    assert r.status == 400, (field, value, r.status)
+    assert await tr.get_all() == []

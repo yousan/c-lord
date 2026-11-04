@@ -134,3 +134,45 @@ def test_counts_in_the_same_file_accept_the_same_spaces(
     env = tmp_path / ".env"
     env.write_text('DISCORD_BOT_TOKEN=x\nDISCORD_CHANNEL_ID=1\nMAX_CONCURRENT_SESSIONS=" 4 "\n')
     assert load_config(env)["max_concurrent"] == "4"
+
+
+# --- #1194 (review): the three places that read COORDINATION_CHANNEL_ID themselves ---
+
+
+def _api(tmp_path):  # noqa: ANN001, ANN202
+    from unittest.mock import MagicMock
+
+    from c_lord.database.notification_repo import NotificationRepository
+    from c_lord.ext.api_server import ApiServer
+
+    return ApiServer(
+        repo=NotificationRepository(str(tmp_path / "n.db")),
+        bot=MagicMock(),
+        default_channel_id=1,
+        port=0,
+    )
+
+
+def test_api_server_lounge_uses_a_coordination_id_with_spaces(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setenv("COORDINATION_CHANNEL_ID", " 1505747831447883806 ")
+    assert _api(tmp_path).lounge_channel_id == 1505747831447883806
+
+
+def test_claude_chat_coordination_uses_an_id_with_spaces(monkeypatch) -> None:  # noqa: ANN001
+    from unittest.mock import MagicMock
+
+    from c_lord.cogs.claude_chat import ClaudeChatCog
+
+    monkeypatch.setenv("COORDINATION_CHANNEL_ID", " 1505747831447883806 ")
+    cog = ClaudeChatCog.__new__(ClaudeChatCog)
+    cog._coordination = None
+    cog.bot = MagicMock(spec=[])
+    svc = cog._get_coordination()
+    assert getattr(svc, "channel_id", getattr(svc, "_channel_id", None)) == 1505747831447883806
+
+
+@pytest.mark.parametrize("value", ["²", "１２３"])
+def test_a_non_ascii_digit_coordination_id_does_not_raise(tmp_path, monkeypatch, value) -> None:  # noqa: ANN001
+    """For callers of ApiServer / setup_bridge that skip load_config's #1084 check."""
+    monkeypatch.setenv("COORDINATION_CHANNEL_ID", value)
+    assert _api(tmp_path).lounge_channel_id is None

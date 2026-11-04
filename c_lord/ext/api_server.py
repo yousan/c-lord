@@ -183,7 +183,14 @@ def _task_int(value: object) -> int | None:
     takes no ``true`` / ``false``. A decimal string and a fraction stay
     accepted (#1126 — Discord ids often travel as strings).
     """
-    return None if isinstance(value, bool) else _as_int(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not (value.isascii() and value.isdigit()):
+        # #1184 (review): "a string of decimal digits", as the docs say — not
+        # what ``int()`` also reads (``"１２０"``, ``"1_000"``, ``"+60"``, ``" 60 "``).
+        # The same rule as the .env ids (#1084).
+        return None
+    return _as_int(value)
 
 
 def _strict_int(value: object) -> int | None:
@@ -322,7 +329,7 @@ class ApiServer:
         # Fall back to COORDINATION_CHANNEL_ID so lounge shares the same channel
         if lounge_channel_id is None:
             ch_str = os.getenv("COORDINATION_CHANNEL_ID", "").strip()  # #1194
-            lounge_channel_id = int(ch_str) if ch_str.isdigit() else None
+            lounge_channel_id = int(ch_str) if ch_str.isascii() and ch_str.isdigit() else None
         self.lounge_channel_id = lounge_channel_id
 
         # #457: the UID this bot runs as. Only that user (and root, which can

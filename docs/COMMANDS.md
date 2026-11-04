@@ -590,8 +590,8 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
 ```
 
 `interval_seconds` and `channel_id` must be integers — anything else is a `400` naming the field.
-"Integer" here means a JSON integer, a string of decimal digits (`"86400"` — Discord ids often travel
-as strings) or a JSON number with a fraction, which is cut toward zero (`90.7` is saved as `90`).
+"Integer" here means a JSON integer, a string of ASCII decimal digits only (`"86400"` — Discord ids
+often travel as strings; `"１２０"`, `"1_000"`, `"+60"` and `" 60 "` are a `400`, as for the `.env` ids) or a JSON number with a fraction, which is cut toward zero (`90.7` is saved as `90`).
 `true` / `false` are not integers: they are a `400` on create and on `PATCH`, and nothing is saved
 (before #1184, `true` was saved as an interval of 1 second).
 `409` means only that a task with that `name` already exists. Every endpoint that reads a body
