@@ -151,6 +151,8 @@ _ACTIVE: dict[int, TurnInfo] = {}
 #: thread -> (monotonic time of the last transcript turn end, agents still running)
 _LAST_END: dict[int, tuple[float, int]] = {}
 _HELD: dict[int, _Held] = {}
+#: thread -> monotonic time the mirror posted the last menu that parks a turn (#1195).
+_BLOCKED_AT: dict[int, float] = {}
 #: thread -> the last runner turn, whose guild / channel a self-started turn inherits.
 _LAST_INFO: dict[int, TurnInfo] = {}
 #: thread -> the open turn Claude started by itself on a notification (#961).
@@ -165,6 +167,7 @@ def reset() -> None:
             held.timer.cancel()
     _ACTIVE.clear()
     _LAST_END.clear()
+    _BLOCKED_AT.clear()
     _HELD.clear()
     _LAST_INFO.clear()
     _SELF.clear()
@@ -400,7 +403,7 @@ def finish_turn(
         _spawn(_deliver("failure", info, reason=failure_reason))
         return
     snapshot = _LAST_END.get(info.thread_id)
-    if awaiting_answer and not (snapshot is not None and snapshot[0] >= info.started_mono):
+    if awaiting_answer and not _ended_after_menu(info, snapshot):
         _hold(info, 0, expires=False)
         return
     # #1170: answered and ended already (the mirror's turn end beat this run's
@@ -409,6 +412,20 @@ def finish_turn(
         _hold(info, snapshot[1])
         return
     _spawn(_deliver("completion", info))
+
+
+def _ended_after_menu(info: TurnInfo, snapshot: tuple[float, int] | None) -> bool:
+    """Did the transcript say the turn ended after its menu was posted? (#1170/#1195)
+
+    Only such an end can follow the answer. The mirror reads the transcript in
+    order, so the interrupted previous turn's end — which may reach it after
+    this run began — always comes before this turn's menu. No menu seen in this
+    run: no end can be told to be the answer's, so none is.
+    """
+    blocked_at = _BLOCKED_AT.get(info.thread_id)
+    if snapshot is None or blocked_at is None or blocked_at < info.started_mono:
+        return False
+    return snapshot[0] >= blocked_at
 
 
 def announce_recovered_turn(
@@ -459,6 +476,7 @@ def emit_blocked(thread: discord.Thread | Any, *, message_id: int | None) -> Non
         return
     try:
         info = _ACTIVE.get(thread.id) or _info_for(thread, StartedBy("user"))
+        _remember(_BLOCKED_AT, thread.id, time.monotonic())
         _spawn(_deliver("blocked", info, message_id=message_id))
     except Exception:
         logger.warning(

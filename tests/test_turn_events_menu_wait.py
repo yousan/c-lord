@@ -203,3 +203,45 @@ async def test_answered_with_agents_out_gets_the_agent_time_limit(log, monkeypat
     await asyncio.sleep(0.05)
     await turn_events.drain()
     assert _kinds(log) == ["blocked", "completion"]
+
+
+def _with_stale_end(config, outstanding: int):  # noqa: ANN001, ANN202
+    """The interrupted previous turn's end reaches the mirror after this run began (#1195)."""
+    original = config.runner.run
+
+    async def run(prompt, session_id=None):  # noqa: ANN001, ANN202
+        first = True
+        async for event in original(prompt, session_id=session_id):
+            if first:
+                turn_events.note_turn_end(THREAD_ID, outstanding)
+                first = False
+            yield event
+
+    config.runner.run = run
+    return config
+
+
+async def test_the_previous_turns_late_end_is_not_the_answer(log, monkeypatch) -> None:
+    """#1195: an end from before the menu was posted cannot be the answer's end."""
+    from c_lord.cogs import _run_helper
+
+    monkeypatch.setattr(_run_helper, "_post_context_usage", AsyncMock())
+    config = _with_stale_end(_config(_thread(), awaiting_answer=True), 0)
+    await _run_helper.run_claude_with_config(config)
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked"]
+
+
+async def test_the_previous_turns_late_end_with_agents_does_not_time_out(log, monkeypatch) -> None:
+    """#1195: nor does its agents' wait put the menu's hold on #917's clock."""
+    import asyncio
+
+    from c_lord.cogs import _run_helper
+
+    monkeypatch.setenv(turn_events.ENV_DEFER_MAX, "0.01")
+    monkeypatch.setattr(_run_helper, "_post_context_usage", AsyncMock())
+    config = _with_stale_end(_config(_thread(), awaiting_answer=True), 1)
+    await _run_helper.run_claude_with_config(config)
+    await asyncio.sleep(0.05)
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked"]
