@@ -1584,6 +1584,17 @@ class TranscriptMirror:
                             progress_buf.clear()
                         self._turn_trigger = self._latest_trigger
                     if _forget_bang_answer:
+                        if (
+                            self._answering_bang is not None
+                            and self._verbosity == "minimal"
+                            and _pending_text is not None
+                        ):
+                            # #1189: a notification / wakeup opening a turn gets no
+                            # #912 pre-flush above (only a person's prompt does), yet
+                            # the held text is the pane command's answer — deliver it
+                            # with its label before the label goes.
+                            await _flush_pending_as_reply()
+                            await _commit_cursor()
                         # #1099: a new request's answer is not the pane command's.
                         self._answering_bang = None
                         _forget_bang_answer = False
