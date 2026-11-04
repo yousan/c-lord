@@ -171,3 +171,35 @@ async def test_an_ordinary_end_is_unchanged(log, monkeypatch) -> None:
     await turn_events.drain()
 
     assert _kinds(log) == ["blocked", "completion"]
+
+
+async def test_an_answer_whose_end_beats_the_run_end_still_completes(log, monkeypatch) -> None:
+    """W57 review 1: answered and ended before ``finish_turn`` — completion goes out."""
+    from c_lord.cogs import _run_helper
+
+    monkeypatch.setattr(_run_helper, "_post_context_usage", AsyncMock())
+    config = _config(_thread(), awaiting_answer=True)
+    original = config.runner.run
+
+    async def run(prompt, session_id=None):
+        async for event in original(prompt, session_id=session_id):
+            if event.is_complete:
+                turn_events.note_turn_end(THREAD_ID, 0)  # the answer's turn end lands first
+            yield event
+
+    config.runner.run = run
+    await _run_helper.run_claude_with_config(config)
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked", "completion"]
+
+
+async def test_answered_with_agents_out_gets_the_agent_time_limit(log, monkeypatch) -> None:
+    """W57 review 2: once answered, a wait on agents is #917's — it expires."""
+    import asyncio
+
+    monkeypatch.setenv(turn_events.ENV_DEFER_MAX, "0.01")
+    await _run_production_turn(monkeypatch, _thread())
+    turn_events.note_turn_end(THREAD_ID, 1)  # answered; one agent never reports
+    await asyncio.sleep(0.05)
+    await turn_events.drain()
+    assert _kinds(log) == ["blocked", "completion"]

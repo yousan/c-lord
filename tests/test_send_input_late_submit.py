@@ -156,3 +156,9 @@ def test_the_late_delivery_is_logged(caplog) -> None:  # noqa: ANN001
     assert len(late) == 1
     assert f"thread={THREAD}" in late[0]
     assert not any("never left" in r.getMessage() for r in caplog.records)
+
+
+def test_a_pane_with_no_input_box_counts_as_sent() -> None:
+    """W57 review: the accepted message opened a menu, which hides the box (#560's rule)."""
+    pane = _ClockPane(accept_at=ACCEPT_DELAY, box_after="menu without any rules\n")
+    assert _confirm(pane) is True

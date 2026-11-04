@@ -3268,7 +3268,8 @@ class TmuxSessionManager:
         only ever submit something twice. Two kinds of evidence end the wait —
         the box no longer holds the message, or the transcript has it (the
         mirror consumed the ``pane_echo`` entry ``send_input`` registered). A
-        frame that cannot be read is not evidence either way; keep looking.
+        pane with no input box on it (a menu took it over) counts as sent, as
+        in the #560 looks; a capture that fails is no evidence; keep looking.
         """
         from .transcript.pane_echo import pane_echo
 
@@ -3281,12 +3282,15 @@ class TmuxSessionManager:
                 how = "the transcript has it"
             else:
                 capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
-                if (
-                    capture.returncode != 0
-                    or _input_box_retains(capture.stdout, payload) is not False
-                ):
+                if capture.returncode != 0:
                     continue
-                how = "the box is empty"
+                retained = _input_box_retains(capture.stdout, payload)
+                if retained is True:
+                    continue
+                # No box at all is #560's "cannot tell" — counted as sent there
+                # too: a menu (AskUserQuestion / permission) that the accepted
+                # message opened hides the box (#1169 review).
+                how = "the box is empty" if retained is False else "the input box is gone"
             logger.warning(
                 "send_input: message left the input box %.1fs after the last Enter "
                 "(thread=%d) — %s; Claude Code was still busy, not a failed send (#1169)",

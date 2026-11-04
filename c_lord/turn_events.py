@@ -143,6 +143,8 @@ class _Held:
     timer: asyncio.TimerHandle | None = None
     #: the ``reason`` to send when the agents report back (#961).
     reason: str | None = None
+    #: False while the turn waits on a menu answer (#1170): no time limit.
+    expires: bool = True
 
 
 _ACTIVE: dict[int, TurnInfo] = {}
@@ -363,6 +365,11 @@ def note_turn_end(
             )
             return
         released = outstanding == 0 and _release(thread_id, reason=None)
+        parked = _HELD.get(thread_id)
+        if outstanding > 0 and parked is not None and not parked.expires:
+            # #1170: the menu was answered and the turn ended with agents still
+            # out — from here it is #917's wait, with #917's time limit.
+            _hold(parked.info, outstanding, reason=parked.reason)
         if own is None or released or thread_id in _ACTIVE or thread_id in _HELD:
             return
         if outstanding > 0:
@@ -392,10 +399,12 @@ def finish_turn(
     if failure_reason is not None:
         _spawn(_deliver("failure", info, reason=failure_reason))
         return
-    if awaiting_answer:
+    snapshot = _LAST_END.get(info.thread_id)
+    if awaiting_answer and not (snapshot is not None and snapshot[0] >= info.started_mono):
         _hold(info, 0, expires=False)
         return
-    snapshot = _LAST_END.get(info.thread_id)
+    # #1170: answered and ended already (the mirror's turn end beat this run's
+    # end) — that end is the one to announce, as for any turn.
     if snapshot is not None and snapshot[0] >= info.started_mono and snapshot[1] > 0:
         _hold(info, snapshot[1])
         return
@@ -471,7 +480,7 @@ def _hold(
     previous = _HELD.pop(info.thread_id, None)
     if previous is not None and previous.timer is not None:
         previous.timer.cancel()
-    held = _Held(info, reason=reason)
+    held = _Held(info, reason=reason, expires=expires)
     if expires:
         with contextlib.suppress(RuntimeError):
             loop = asyncio.get_running_loop()
