@@ -1562,6 +1562,15 @@ class TestMenuWaitDoesNotFalseTimeout:
         assert runner.ended_awaiting_answer is True
 
     @pytest.mark.asyncio
+    async def test_the_parked_mark_is_per_run(self, runner, tmux_manager) -> None:
+        """#1170: a later run of the same runner (the menu-answer resume) starts unmarked."""
+        await self._run_until_backstop(runner, tmux_manager, _load_fixture(self._MENU_FIXTURE))
+        assert runner.ended_awaiting_answer is True
+        idle = _load_fixture("i742_idle_after_turn_v2_1_271.txt")
+        await self._run_until_backstop(runner, tmux_manager, idle)
+        assert runner.ended_awaiting_answer is False
+
+    @pytest.mark.asyncio
     async def test_frozen_mid_turn_real_pane_still_times_out(self, runner, tmux_manager) -> None:
         """A real mid-turn pane that stops redrawing is a hang — no menu, no pass."""
         frozen = _load_fixture("i742_running_mid_turn_v2_1_271.txt")

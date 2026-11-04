@@ -1762,6 +1762,9 @@ class TmuxClaudeRunner:
         # reset that used to sit here erased that interrupt, and the cancelled
         # request was typed into the pane anyway. A runner is built per turn,
         # so the constructor's ``False`` is the only reset it needs.
+        # #1170: this one IS per run — the AskUserQuestion resume runs the same
+        # runner again, and only the last run's ending may hold the completion.
+        self.ended_awaiting_answer = False
         if (stopped := self._stopped_before_delivery()) is not None:
             yield stopped
             return
