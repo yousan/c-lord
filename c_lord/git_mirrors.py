@@ -36,7 +36,9 @@
 
 - 時間切れのときは git をプロセスグループごと止め、受信途中の
   ``objects/pack/tmp_*`` (1回約3GB) をその場で消す。殺された fetch の書きかけは
-  git 自身には消せない
+  git 自身には消せない。**別の git がいま書いているものは消さない** (#1173)
+- bot が終わるとき (停止シグナル・``atexit``) は走っている git もグループごと止める
+  (#1174)。別グループなので、止めないと Ctrl-C / SIGTERM の後も受信を続ける
 - ミラーに印 (``clord-fetch-timed-out``) を置き、**次からはクローンを待たせない**。
   印が1時間以上古ければ、長い上限 (1時間) で**裏で**取り直し、成功したら印を
   消して元の「更新してから使う」に戻る。直後は裏でも取り直さない (1回3GB を
@@ -51,6 +53,8 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import hashlib
 import logging
 import os
@@ -74,6 +78,7 @@ __all__ = [
     "mirrors_enabled",
     "mirrors_root_for",
     "normalise_origin",
+    "stop_running_git",
     "wait_for_background_fetches",
 ]
 
@@ -196,13 +201,50 @@ def mirrors_root_for(base_dir: str | Path) -> Path:
     return Path(base_dir).parent / MIRRORS_DIR_NAME
 
 
+#: いま走っている git のプロセスグループ (#1174)。bot が終わるときにまとめて止める。
+_running_groups: set[int] = set()
+_running_lock = threading.Lock()
+#: ``stop_running_git`` ran: a git killed from here on did not time out.
+_stopping = threading.Event()
+
+
+def stop_running_git() -> int:
+    """走っているミラー用の git をグループごと止める。止めた数を返す。Never raises.
+
+    git は自分のプロセスグループで走るので (#1134)、端末の Ctrl-C や bot への
+    SIGTERM が届かない。何もしないと bot が終わったあとも git が受信を続け、
+    flock も外れるので次の bot が同じミラーにもう1本 fetch を出す (#1174)。
+    プロセスの終了時 (``atexit``) と、停止シグナルを受けたとき (``main``) に呼ぶ。
+    """
+    _stopping.set()
+    with _running_lock:
+        groups = list(_running_groups)
+    stopped = 0
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            stopped += 1
+        except OSError:
+            continue
+    if stopped:
+        logger.info("git mirror: stopped %d running git process group(s) on shutdown", stopped)
+    return stopped
+
+
+atexit.register(stop_running_git)
+
+
 def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
     """Never raises. 失敗は非ゼロ、OS エラーは ``None``、時間切れは ``returncode=-9``.
 
     git は自分の新しいプロセスグループで走らせ、時間切れのときは**グループごと**
     止める (#1134)。``subprocess.run(timeout=)`` は親の git しか殺さず、受信を
     担う子 (index-pack / ssh) が書きかけの pack を育て続けていた。
+    別グループなので bot の停止は届かない — ``stop_running_git`` が代わりに止める (#1174)。
     """
+    if _stopping.is_set():
+        # The bot is stopping (#1174): start no new git it could not stop.
+        return None
     try:
         proc = subprocess.Popen(
             args,
@@ -214,6 +256,23 @@ def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
     except OSError as exc:
         logger.warning("git mirror: %s failed: %s", " ".join(args[:3]), exc)
         return None
+    with _running_lock:
+        _running_groups.add(proc.pid)
+    if _stopping.is_set():
+        # Started as the bot stops: ``stop_running_git`` set the flag before it
+        # read the groups, so it either saw this one or this sees the flag (#1174).
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    try:
+        return _wait(proc, args, timeout=timeout)
+    finally:
+        with _running_lock:
+            _running_groups.discard(proc.pid)
+
+
+def _wait(
+    proc: subprocess.Popen[str], args: list[str], *, timeout: float
+) -> subprocess.CompletedProcess[str]:
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -223,12 +282,88 @@ def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
             os.killpg(proc.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             proc.communicate(timeout=10)
+        with _running_lock:
+            # Reaped: the number may be reused — never kill it again (#1174).
+            _running_groups.discard(proc.pid)
+        _wait_for_group_gone(proc.pid)
         logger.warning("git mirror: %s timed out after %.0f seconds", " ".join(args[:4]), timeout)
         return subprocess.CompletedProcess(args, _TIMED_OUT, "", "timed out")
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
 _TIMED_OUT = -9
+
+
+def _wait_for_group_gone(pgid: int, limit: float = 2.0) -> None:
+    """SIGKILL したグループの子 (index-pack 等) が本当に居なくなるまで少し待つ。
+
+    ``communicate`` が待つのは親の git だけ。子が最後の1回を書き終える前に
+    「書き続けているか」を測ると、自分の書きかけを他人のものと見誤る (#1173)。
+    """
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+        time.sleep(0.05)
+
+
+#: 時間切れの片付けで「まだ誰かが書いているか」を見る間隔 (#1173)。
+_SETTLE_SECONDS = 1.0
+
+
+def _open_by_someone(paths: list[Path]) -> set[Path]:
+    """*paths* のうち、いま生きているプロセスが開いているもの (Linux の ``/proc``)。
+
+    ``/proc`` が無い OS では空を返す — そのときは書き続けているかどうかだけで見る。
+    """
+    # /proc gives the real, absolute path; a relative or symlinked mirrors root
+    # would otherwise never match and the check would be silently off.
+    wanted = {os.path.realpath(p): p for p in paths}
+    found: set[Path] = set()
+    try:
+        procs = list(Path("/proc").glob("[0-9]*/fd"))
+    except OSError:
+        return found
+    for fd_dir in procs:
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link in wanted:
+                found.add(wanted[link])
+    return found
+
+
+def _abandoned(paths: list[Path]) -> list[Path]:
+    """止めた git の書きかけだけを選ぶ — **誰かが書いているものは外す** (#1173)。
+
+    自分の git はグループごと止めた後なので、もう書かない・開いていない。
+    同じミラーで別の git (手で打った fetch など。c-lord の flock は持たない) が
+    受信中の pack は、開かれているか、少し待つあいだに育つ。消すとその fetch が
+    失敗するので残す (古くなれば ``_sweep_stale_garbage`` が拾う)。
+    """
+    if not paths:
+        return []
+
+    def _stamp(path: Path) -> tuple[int, int] | None:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
+    first = {p: _stamp(p) for p in paths}
+    time.sleep(_SETTLE_SECONDS)
+    still = [p for p in paths if first[p] is not None and _stamp(p) == first[p]]
+    busy = _open_by_someone(still)
+    return [p for p in still if p not in busy]
 
 
 def _garbage_files(target: Path) -> list[Path]:
@@ -326,9 +461,14 @@ def _fetch(target: Path, *, timeout: float) -> None:
             return
         before = set(_garbage_files(target))
         result = _run(["git", "-C", str(target), "fetch", "--quiet"], timeout=timeout)
-        if result is not None and result.returncode == _TIMED_OUT:
-            # ロックを持っているので、新しくできた書きかけは止めた git のもの。
-            ours = [p for p in _garbage_files(target) if p not in before]
+        if result is not None and result.returncode == _TIMED_OUT and _stopping.is_set():
+            # bot の停止で止めた (#1174)。時間切れではないので印は付けない。書きかけは
+            # 次の起動の古いゴミ掃除 (2時間) が拾う — 停止を1秒でも延ばさない。
+            logger.info("git mirror: fetch of %s stopped with the bot", target.name)
+        elif result is not None and result.returncode == _TIMED_OUT:
+            # 新しくできた書きかけのうち、止めた git のものだけを消す。flock は
+            # c-lord 同士の約束でしかなく、手で打った fetch も同じ場所に書く (#1173)。
+            ours = _abandoned([p for p in _garbage_files(target) if p not in before])
             freed = _remove(ours)
             _mark_timed_out(target)
             logger.warning(
