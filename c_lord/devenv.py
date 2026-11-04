@@ -63,6 +63,15 @@ class DevContainer:
     def running(self) -> bool:
         return self.status == "running"
 
+    @property
+    def holds_ports(self) -> bool:
+        """Still bound to its host ports: anything but exited / created / dead.
+
+        ``paused`` and ``restarting`` are not ``running`` but keep their ports —
+        a notice must not call them gone (#1182 review).
+        """
+        return self.status not in ("exited", "created", "dead")
+
 
 async def _docker(argv: list[str]) -> tuple[int, str]:
     """Run a docker command. Returns ``(returncode, stdout)``; never raises.

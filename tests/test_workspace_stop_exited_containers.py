@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from c_lord.cogs import session_manage as sm
 from c_lord.session_dir import CleanupResult
 
@@ -65,6 +67,39 @@ async def test_running_container_that_refuses_to_stop_is_still_left_running(monk
     c = sm.DevContainer("id1", "db", "running", (55322,), "p", "mount")
     monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[c, _exited()]))
     monkeypatch.setattr(sm, "stop_containers", AsyncMock(return_value=[]))
+    cog = _setup(monkeypatch)
+    t = await cog._stop_teardown(555, 999, close_reason=sm.WorkspaceReason.MANUAL)
+    assert t.docker is sm.DockerOutcome.LEFT_RUNNING
+
+
+# --- review of #1182: paused / restarting containers still hold their ports ---------
+
+
+@pytest.mark.parametrize("status", ["paused", "restarting"])
+async def test_a_port_holding_container_is_not_called_none(monkeypatch, status: str) -> None:  # noqa: ANN001
+    c = sm.DevContainer("id1", "db", status, (55322,), "p", "mount")
+    monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[c]))
+    cog = _setup(monkeypatch)
+    t = await cog._stop_teardown(555, 999, close_reason=sm.WorkspaceReason.MANUAL)
+    assert t.docker is sm.DockerOutcome.LEFT_RUNNING, status
+
+
+@pytest.mark.parametrize("status", ["paused", "restarting"])
+async def test_the_delete_notice_says_left_running(monkeypatch, status: str) -> None:  # noqa: ANN001
+    c = sm.DevContainer("id1", "db", status, (55322,), "p", "mount")
+    monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[c]))
+    cog = _setup(monkeypatch)
+    respond, ack, sent, _ = _capture()
+    await cog._workspace_delete_impl(channel=_thread(), respond=respond, ack=ack)
+    assert "動いたまま" in sent[-1]["embed"].description
+
+
+async def test_running_stopped_but_paused_left_is_left_running(monkeypatch) -> None:  # noqa: ANN001
+    """One running (stopped now) and one paused (left): the ports are not all free."""
+    run = sm.DevContainer("id1", "web", "running", (8080,), "p", "mount")
+    paused = sm.DevContainer("id2", "db", "paused", (55322,), "p", "mount")
+    monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[run, paused]))
+    monkeypatch.setattr(sm, "stop_containers", AsyncMock(return_value=["web"]))
     cog = _setup(monkeypatch)
     t = await cog._stop_teardown(555, 999, close_reason=sm.WorkspaceReason.MANUAL)
     assert t.docker is sm.DockerOutcome.LEFT_RUNNING

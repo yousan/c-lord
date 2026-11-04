@@ -1840,15 +1840,18 @@ class SessionManageCog(commands.Cog):
                 )
 
         docker_outcome = DockerOutcome.NONE
-        # #1182: only a *running* container can be left running. ``docker ps -a``
-        # also finds exited ones (the usual "stop, then delete"), which hold no
-        # port and need nothing done — they read as なし, not "▶️ 動いたまま".
-        if any(c.running for c in containers):
-            stopped = await stop_containers(containers)
+        # #1182: only a container that still holds its ports can be left running.
+        # ``docker ps -a`` also finds exited ones (the usual "stop, then delete"),
+        # which hold nothing — they read as なし, not "▶️ 動いたまま". Paused and
+        # restarting ones do hold them, though ``stop_containers`` leaves them be.
+        holding = [c for c in containers if c.holds_ports]
+        if holding:
+            stopped = set(await stop_containers(containers))
             # Report what actually happened, not what was attempted: a docker
             # that refused leaves the ports held, and the notice must say so
             # rather than announcing a release that did not occur (#571).
-            docker_outcome = DockerOutcome.STOPPED if stopped else DockerOutcome.LEFT_RUNNING
+            all_stopped = all(c.name in stopped for c in holding)
+            docker_outcome = DockerOutcome.STOPPED if all_stopped else DockerOutcome.LEFT_RUNNING
 
         return _StopTeardown(
             tmux_mgr=tmux_mgr, killed=killed, containers=containers, docker=docker_outcome
