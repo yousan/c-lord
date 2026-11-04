@@ -613,3 +613,10 @@ On `/api/notify` and `/api/schedule`, `channel_id` (optional) must be a positive
 `NaN` are a `400` naming the field, and `/api/schedule` saves nothing. `scheduled_at` must be an
 ISO 8601 string, `message` a non-empty string and `title` (optional) a string (#1083). A
 `channel_id` of `0` or `null` still means the default channel.
+
+A text field sent as anything other than a JSON string — a number, `true`, a list, an object —
+is a `400 {"error": "<field> must be a string"}`, not a `500` (#1183): `content` on `/api/reply`
+and `/api/threads/{id}/messages`, `question` on `/api/prompt-choice`, `prompt` on `/api/spawn`,
+`message` on `/api/lounge`, `session_id` / `resume_prompt` on `/api/mark-resume`, and
+`working_dir` on `POST` / `PATCH /api/tasks` (a `PATCH` that fails this way changes nothing).
+Absent or `null` is the same as leaving the field out.

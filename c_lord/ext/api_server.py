@@ -215,6 +215,18 @@ def _optional_channel_and_color(
     return channel_id, color, None
 
 
+def _text(data: dict[str, Any], field: str) -> tuple[str | None, web.Response | None]:
+    """``data[field]`` as text — ``None`` when absent or ``null`` — or the 400 naming it.
+
+    A number, list or object in a text field reached ``.strip()`` or SQLite and
+    came back as a 500 with no reason (#1183).
+    """
+    value = data.get(field)
+    if value is None or isinstance(value, str):
+        return value, None
+    return None, web.json_response({"error": f"{field} must be a string"}, status=400)
+
+
 def _message_and_title(data: dict[str, Any]) -> tuple[str, str | None, web.Response | None]:
     """``message`` (required) and ``title`` (optional) as text, or the 400.
 
@@ -647,6 +659,10 @@ class ApiServer:
         if not isinstance(run_immediately, bool):
             return _not_a_boolean("run_immediately")
 
+        working_dir, err = _text(data, "working_dir")
+        if err is not None:
+            return err
+
         numbers: dict[str, int] = {}
         for field in ("interval_seconds", "channel_id"):
             number = _as_int(data[field])
@@ -665,7 +681,7 @@ class ApiServer:
                 prompt=str(data["prompt"]),
                 interval_seconds=numbers["interval_seconds"],
                 channel_id=numbers["channel_id"],
-                working_dir=data.get("working_dir"),
+                working_dir=working_dir,
                 run_immediately=run_immediately,
             )
         except sqlite3.IntegrityError as exc:
@@ -722,7 +738,10 @@ class ApiServer:
                 return web.json_response({"error": _INTERVAL_ERROR}, status=400)
             patch_kwargs["interval_seconds"] = interval
         if "working_dir" in data:
-            patch_kwargs["working_dir"] = str(data["working_dir"])
+            # #1183: a list was saved as the text "['x']" — same rule as on create.
+            if not isinstance(data["working_dir"], str):
+                return web.json_response({"error": "working_dir must be a string"}, status=400)
+            patch_kwargs["working_dir"] = data["working_dir"]
 
         if await self.task_repo.get(task_id) is None:  # type: ignore[union-attr]
             return web.json_response({"error": "Task not found"}, status=404)
@@ -803,7 +822,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        message = data.get("message", "").strip()
+        raw_message, err = _text(data, "message")
+        if err is not None:
+            return err
+        message = (raw_message or "").strip()
         if not message:
             return web.json_response({"error": "message is required"}, status=400)
 
@@ -852,7 +874,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        prompt = (data.get("prompt") or "").strip()
+        raw_prompt, err = _text(data, "prompt")
+        if err is not None:
+            return err
+        prompt = (raw_prompt or "").strip()
         if not prompt:
             return web.json_response({"error": "prompt is required"}, status=400)
 
@@ -953,9 +978,15 @@ class ApiServer:
         if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
-        session_id: str | None = data.get("session_id") or None
+        raw_session_id, err = _text(data, "session_id")
+        if err is not None:
+            return err
+        raw_resume_prompt, err = _text(data, "resume_prompt")
+        if err is not None:
+            return err
+        session_id: str | None = raw_session_id or None
         reason: str = str(data.get("reason") or "self_restart")
-        resume_prompt: str | None = data.get("resume_prompt") or None
+        resume_prompt: str | None = raw_resume_prompt or None
 
         # Auto-resolve session_id from the sessions table if not provided.
         if session_id is None and self.session_repo is not None:
@@ -1063,7 +1094,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        content = (data.get("content") or "").strip()
+        raw_content, err = _text(data, "content")
+        if err is not None:
+            return err
+        content = (raw_content or "").strip()
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
@@ -1120,7 +1154,10 @@ class ApiServer:
         if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
-        content = (data.get("content") or "").strip()
+        raw_content, err = _text(data, "content")
+        if err is not None:
+            return err
+        content = (raw_content or "").strip()
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
@@ -1288,7 +1325,10 @@ class ApiServer:
         if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
-        question = (data.get("question") or "").strip()
+        raw_question, err = _text(data, "question")
+        if err is not None:
+            return err
+        question = (raw_question or "").strip()
         if not question:
             return web.json_response({"error": "question is required"}, status=400)
 
