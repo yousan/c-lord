@@ -731,6 +731,7 @@ def _not_stopping():  # noqa: ANN202
         stopping.clear()
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="no /proc (macOS): growth only")
 def test_an_open_pack_is_seen_under_a_relative_or_symlinked_root_1173(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
