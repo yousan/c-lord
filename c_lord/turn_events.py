@@ -365,6 +365,21 @@ def note_turn_end(
         _remember(_LAST_END, thread_id, (time.monotonic(), outstanding, ended))
         started = _SELF.pop(thread_id, None)
         own = started if self_started else None
+        parked = _HELD.get(thread_id)
+        # #1202: a menu-wait hold is the answer's to release (#1195) — an end the
+        # transcript dates before the menu is a previous turn's, however late it
+        # reached the mirror. It speaks only for its own turn, if it has one.
+        stale = (
+            parked is not None
+            and not parked.expires
+            and ended < _BLOCKED_AT.get(thread_id, float("-inf"))
+        )
+        if stale:
+            if own is not None and thread_id not in _ACTIVE:
+                kind = "failure" if failure_reason is not None else "completion"
+                reason = failure_reason if failure_reason is not None else "self_resumed_turn"
+                _spawn(_deliver(kind, own, reason=reason))
+            return
         if own is not None and failure_reason is not None and thread_id not in _ACTIVE:
             # #1131: one failure — the held request's if there is one, it is the
             # request whose work just stopped; else this turn's own.
@@ -376,7 +391,6 @@ def note_turn_end(
             )
             return
         released = outstanding == 0 and _release(thread_id, reason=None)
-        parked = _HELD.get(thread_id)
         if outstanding > 0 and parked is not None and not parked.expires:
             # #1170: the menu was answered and the turn ended with agents still
             # out — from here it is #917's wait, with #917's time limit.

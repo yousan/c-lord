@@ -374,3 +374,33 @@ async def test_own_notice_with_its_real_origin_is_still_quiet(tmp_path: Path) ->
     log.observe_parent(_notice(AID, "2026-10-29T06:00:06Z"))
     await log.step()
     assert (len(poster.statuses), len(poster.edits), len(poster.voices)) == before
+
+
+async def test_the_parents_question_is_in_the_md_1203(tmp_path: Path) -> None:
+    """#1203: the coordinator's message that resumed a finished child is in its md."""
+    from .test_subagent_log import _append
+
+    log, poster, path = await _finished_agent(tmp_path)
+    _append(
+        path,
+        [
+            _row(
+                "u1",
+                "2026-10-29T06:00:00Z",
+                "user",
+                # The CLI's real wording (2.1.305–2.1.318, measured).
+                "The coordinator sent a message while you were working:\nQUESTION-XYZ\n\n"
+                "Address this before completing your current task.",
+                isMeta=True,
+                origin={"kind": "coordinator"},
+            ),
+            _end_turn("a2", "2026-10-29T06:00:05Z", "ANSWER-XYZ"),
+        ],
+    )
+    await log.step()
+    log.observe_parent(_notice(AID, "2026-10-29T06:00:06Z"))
+    await log.step()
+    files = "\n".join((p.file or "") for p in poster.statuses + [e for _, e in poster.edits])
+    assert "ANSWER-XYZ" in files
+    assert "📨 ← 親: QUESTION-XYZ" in files
+    assert "Address this" not in files and "coordinator sent" not in files
