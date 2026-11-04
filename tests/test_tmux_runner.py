@@ -1558,6 +1558,17 @@ class TestMenuWaitDoesNotFalseTimeout:
         assert results[0].error is None, f"menu wait reported as: {results[0].error!r}"
         # #678: the decision not to report is itself logged at INFO.
         assert any("#751" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+        # #1170: and it says the turn is parked, so no completion goes out yet.
+        assert runner.ended_awaiting_answer is True
+
+    @pytest.mark.asyncio
+    async def test_the_parked_mark_is_per_run(self, runner, tmux_manager) -> None:
+        """#1170: a later run of the same runner (the menu-answer resume) starts unmarked."""
+        await self._run_until_backstop(runner, tmux_manager, _load_fixture(self._MENU_FIXTURE))
+        assert runner.ended_awaiting_answer is True
+        idle = _load_fixture("i742_idle_after_turn_v2_1_271.txt")
+        await self._run_until_backstop(runner, tmux_manager, idle)
+        assert runner.ended_awaiting_answer is False
 
     @pytest.mark.asyncio
     async def test_frozen_mid_turn_real_pane_still_times_out(self, runner, tmux_manager) -> None:
@@ -1577,6 +1588,7 @@ class TestMenuWaitDoesNotFalseTimeout:
 
         assert len(results) == 1
         assert results[0].error is None
+        assert runner.ended_awaiting_answer is False  # #1170: a finished turn
 
 
 class TestTurnThatNeverStarted:

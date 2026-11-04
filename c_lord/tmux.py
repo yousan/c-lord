@@ -226,6 +226,13 @@ _SUBMIT_RETRY_DELAY = 0.5
 # How many times to look for the message leaving the box (each failed look after
 # the first re-presses Enter). Three looks ≈ 1.35s worst case before giving up.
 _SUBMIT_ATTEMPTS = 3
+# #1169: after those, keep looking — without pressing Enter again — before
+# calling the message lost. Right after an interrupt Claude Code is still
+# winding the old turn down (and runs its UserPromptSubmit hook) and holds the
+# accepted message in the box for seconds: production 2026-11-02 had it reach
+# the transcript 10s after the Enter, after c-lord had already reported ❌.
+_SUBMIT_LATE_POLL = 0.5
+_SUBMIT_LATE_LOOKS = 40  # 20s
 # A horizontal rule drawn by the TUI. The input box sits between the last two.
 _BOX_RULE_RE = re.compile(r"^\s*[─━]{10,}\s*$")
 # The placeholder a folded paste leaves in the input box. Compared against
@@ -2416,15 +2423,36 @@ class TmuxSessionManager:
             )
             return ["--continue"] if try_continue else []
 
-        from .transcript.claim import new_session_id, read_claim, write_claim
+        from .transcript.claim import (
+            new_session_id,
+            newest_transcript_id,
+            read_claim,
+            write_claim,
+        )
         from .transcript.resolver import derive_project_dir
 
         project_dir = derive_project_dir(pane_path)
         if try_continue:
             claimed = read_claim(project_dir)
-            if claimed is not None:
-                return ["--resume", claimed]
-            return ["--continue"]
+            if claimed is None:
+                return ["--continue"]
+            # #1171: a claimed session whose transcript was never written cannot
+            # be resumed — the CLI says "No conversation found", the run falls
+            # back to a fresh start (#123), and the thread's real conversation
+            # beside it is forgotten. Resume that one instead, and claim it.
+            if not (project_dir / f"{claimed}.jsonl").is_file():
+                newest = newest_transcript_id(project_dir)
+                if newest is not None and newest != claimed and write_claim(project_dir, newest):
+                    logger.warning(
+                        "start_claude: claimed session %s has no transcript in %s — "
+                        "resuming %s, the newest conversation there, and claiming it "
+                        "instead of starting over (#1171)",
+                        claimed,
+                        project_dir,
+                        newest,
+                    )
+                    return ["--resume", newest]
+            return ["--resume", claimed]
 
         session_id = new_session_id()
         if not write_claim(project_dir, session_id):
@@ -3220,6 +3248,8 @@ class TmuxSessionManager:
                     thread_id,
                 )
                 _run(["tmux", "send-keys", "-t", target, "Enter"])
+        if self._accepted_late(target, payload, thread_id):
+            return True
         logger.error(
             "send_input: message never left the input box after %d Enter presses "
             "(thread=%d, %d chars); reporting a delivery failure instead of a "
@@ -3228,6 +3258,47 @@ class TmuxSessionManager:
             thread_id,
             len(payload),
         )
+        return False
+
+    def _accepted_late(self, target: str, payload: str, thread_id: int) -> bool:
+        """Did Claude Code take *payload* after all, just slowly? (#1169)
+
+        Watches for up to ``_SUBMIT_LATE_POLL * _SUBMIT_LATE_LOOKS`` seconds,
+        pressing nothing: an extra Enter on a box the TUI is about to empty could
+        only ever submit something twice. Two kinds of evidence end the wait —
+        the box no longer holds the message, or the transcript has it (the
+        mirror consumed the ``pane_echo`` entry ``send_input`` registered). A
+        pane with no input box on it (a menu took it over) counts as sent, as
+        in the #560 looks; a capture that fails is no evidence; keep looking.
+        """
+        from .transcript.pane_echo import pane_echo
+
+        registered = pane_echo.holds(thread_id, payload)
+        waited = 0.0
+        for _ in range(_SUBMIT_LATE_LOOKS):
+            time.sleep(_SUBMIT_LATE_POLL)
+            waited += _SUBMIT_LATE_POLL
+            if registered and not pane_echo.holds(thread_id, payload):
+                how = "the transcript has it"
+            else:
+                capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+                if capture.returncode != 0:
+                    continue
+                retained = _input_box_retains(capture.stdout, payload)
+                if retained is True:
+                    continue
+                # No box at all is #560's "cannot tell" — counted as sent there
+                # too: a menu (AskUserQuestion / permission) that the accepted
+                # message opened hides the box (#1169 review).
+                how = "the box is empty" if retained is False else "the input box is gone"
+            logger.warning(
+                "send_input: message left the input box %.1fs after the last Enter "
+                "(thread=%d) — %s; Claude Code was still busy, not a failed send (#1169)",
+                waited,
+                thread_id,
+                how,
+            )
+            return True
         return False
 
     def send_literal(self, thread_id: int, text: str) -> bool:

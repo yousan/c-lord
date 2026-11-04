@@ -1,0 +1,10 @@
+# #1171 — production thread 1564444583767703562 (JST journal of c-lord.service).
+# The claim names a session whose transcript was never written; the thread's
+# real conversation is the other file. Listing taken 2026-11-04.
+ls .claude/projects/-home-yousan-c-lord-sessions-1504670029923352597-1564444583767703562/
+  .clord-session  93b54394-6ded-40bc-96b3-b979349d8f83
+  a07fc39e-f689-4d38-8b24-acdc9150539a.jsonl  7282270 bytes  2026-10-29 14:07
+2026-10-29 09:29:09 [INFO] c_lord.cogs.claude_chat: [thread=1564444583767703562] silently restoring a slept workspace (#572)
+2026-10-29 09:29:14 [INFO] c_lord.tmux: start_claude: session 93b54394-6ded-40bc-96b3-b979349d8f83 claims transcript 93b54394-6ded-40bc-96b3-b979349d8f83.jsonl in /home/yousan/.claude/projects/-home-yousan-c-lord-sessions-1504670029923352597-1564444583767703562 (#773)
+2026-10-30 00:29:55 [WARNING] c_lord.transcript.resolver: TranscriptMirror: no c-lord-driven transcript in /home/yousan/.claude/projects/-home-yousan-c-lord-sessions-1504670029923352597-1564444583767703562 (1 jsonl file(s) present, claimed session id 93b54394-6ded-40bc-96b3-b979349d8f83) — posting nothing rather than mirroring another session's conversation (#627/#773)
+2026-10-30 01:32:00 [WARNING] c_lord.transcript.mirror: TranscriptMirror: nothing to read for thread=1564444583767703562 in /home/yousan/.claude/projects/-home-yousan-c-lord-sessions-1504670029923352597-1564444583767703562 after 120s (1 jsonl file(s) present, claimed session id 93b54394-6ded-40bc-96b3-b979349d8f83) while idle — a turn started here would not reach Discord (#773/#810) (+29 suppressed in the last 3600s)

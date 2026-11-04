@@ -1591,6 +1591,9 @@ class TmuxClaudeRunner:
         self._resume_baseline = 0
         self._stopped = False
         self._silent_stop = False
+        # #1170: the run ended because its pane is a menu waiting for an answer
+        # (the #751 backstop), not because the turn finished.
+        self.ended_awaiting_answer = False
         self._last_capture: str = ""
         # #809: why the last menu answer did not reach the TUI, in words the
         # thread can be shown. Empty until an answer fails.
@@ -1759,6 +1762,9 @@ class TmuxClaudeRunner:
         # reset that used to sit here erased that interrupt, and the cancelled
         # request was typed into the pane anyway. A runner is built per turn,
         # so the constructor's ``False`` is the only reset it needs.
+        # #1170: this one IS per run — the AskUserQuestion resume runs the same
+        # runner again, and only the last run's ending may hold the completion.
+        self.ended_awaiting_answer = False
         if (stopped := self._stopped_before_delivery()) is not None:
             yield stopped
             return
@@ -2759,6 +2765,9 @@ class TmuxClaudeRunner:
                         waiting_on.header or waiting_on.question[:80],
                     )
                     error = None
+                    # #1170: the turn is parked, not over — its completion
+                    # waits for the answer (turn_events.finish_turn).
+                    self.ended_awaiting_answer = True
                 else:
                     error = f"Timed out after {self.timeout_seconds} seconds"
             else:

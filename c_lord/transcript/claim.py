@@ -167,6 +167,29 @@ def claimed_transcript(project_dir: Path) -> Path | None:
     return None
 
 
+def newest_transcript_id(project_dir: Path) -> str | None:
+    """The session id of the most recently written ``<id>.jsonl`` there, if any (#1171).
+
+    The one ``claude --continue`` would reopen. Used only when the claimed
+    session has no transcript at all, so resuming it could only fail. Blocking.
+    """
+    best: tuple[float, str] | None = None
+    try:
+        candidates = list(project_dir.glob("*.jsonl"))
+    except OSError:
+        return None
+    for path in candidates:
+        if not is_session_id(path.stem):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, path.stem)
+    return best[1] if best is not None else None
+
+
 # ── /clear moves the claim to its successor (#803) ─────────────────────────
 #
 # ``/clear`` is typed into the TUI (#803), and Claude Code answers it with a new

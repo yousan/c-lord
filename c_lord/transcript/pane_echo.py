@@ -155,6 +155,19 @@ class PaneEchoRegistry:
             self._entries.pop(thread_id, None)
         return False
 
+    def holds(self, thread_id: int, text: str) -> bool:
+        """Is *text* still a live, unconsumed entry for *thread_id*? (#1169)
+
+        Read-only. Once the mirror has matched the transcript's ``user`` row to
+        it (:meth:`consume_match` / :meth:`consume_partial`), the entry is gone:
+        the transcript has the message, so Claude Code accepted it.
+        """
+        norm = _normalize(text)
+        now = time.monotonic()
+        return any(
+            now < expires and cand == norm for expires, cand in self._entries.get(thread_id, ())
+        )
+
     def consume_partial(self, thread_id: int, text: str) -> tuple[int, int] | None:
         """``(typed, recorded)`` sizes if *text* is a strict part of a live entry (#872).
 
