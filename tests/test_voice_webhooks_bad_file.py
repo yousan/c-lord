@@ -8,6 +8,9 @@ version of the file.
 
 #1109: ``register`` treated a failed read as an empty file and wrote back only
 its own ids, erasing every other instance's (#1024's whole point).
+
+#1176: the id #1109 kept in memory never reached the file once it could be read
+again, so a restart or another instance obeyed this process's voices.
 """
 
 from __future__ import annotations
@@ -104,3 +107,116 @@ def test_deleted_file_then_recreated_is_read(registry: Path) -> None:
     time.sleep(0.05)
     registry.write_text("[999]")
     assert v.is_voice_webhook(999)
+
+
+# --- #1176: the id kept in memory must actually reach the file ---------------
+#
+# #1161 stopped writing while the file was unreadable (#1109) and promised the
+# id would go to the file "with the next register that can read it". But the
+# voice webhook is cached per parent channel per process, so there is usually
+# no next register; and a register of an id already on disk returned early.
+# Until the id is on disk, a restart or another instance obeys this process's
+# sub-agent voices as orders (decision 12).
+
+
+def _other_process_sees(wid: int) -> bool:
+    """A fresh process (or another instance) reading the file."""
+    saved = (v._ids, v._seen_stamp, v._failed_stamp)
+    v._ids, v._seen_stamp, v._failed_stamp = None, None, None
+    try:
+        return v.is_voice_webhook(wid)
+    finally:
+        v._ids, v._seen_stamp, v._failed_stamp = saved
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores chmod")
+def test_permission_restored_our_id_reaches_file_without_another_register(
+    registry: Path,
+) -> None:
+    registry.write_text("[777]")
+    registry.chmod(0)
+    try:
+        v.register(888)  # our voice webhook (subagent_poster._acquire, once)
+    finally:
+        registry.chmod(0o644)  # permission restored
+    for _ in range(5):  # our process keeps working: webhook messages arrive
+        v.is_voice_webhook(888)
+        v.is_voice_webhook(4242)
+    assert 888 in json.loads(registry.read_text())
+    assert _other_process_sees(888)
+
+
+def test_deleted_then_recreated_by_other_instance_our_id_reaches_file(registry: Path) -> None:
+    registry.write_text("[777")  # broken
+    v.register(888)  # not written (#1109)
+    registry.unlink()
+    registry.write_text("[777]")  # another instance recreates it
+    for _ in range(5):
+        v.is_voice_webhook(4242)
+    assert 888 in json.loads(registry.read_text())
+
+
+def test_register_of_an_id_already_on_disk_flushes_pending_ids(registry: Path) -> None:
+    """888 registered while unreadable; another instance later wrote 999 (a shared
+    channel webhook); this one registers 999 too -> 888 must not stay off disk."""
+    registry.write_text("[777")
+    v.register(888)
+    registry.write_text("[777, 999]")
+    v.register(999)
+    assert 888 in json.loads(registry.read_text())
+
+
+# --- #1176, independent review: the stamp a failure leaves behind ---------------
+
+
+def _fresh(tmp_path, monkeypatch):  # noqa: ANN001, ANN202
+    from c_lord import voice_webhooks as v
+
+    monkeypatch.setattr(v, "registry_path", lambda: tmp_path / "voice-webhooks.json")
+    monkeypatch.setattr(v, "_RETRY_SECONDS", 0.0)
+    v._reset_for_tests()
+    return v, tmp_path / "voice-webhooks.json"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_id_reaches_the_file_after_a_permission_flip_on_a_file_read_before(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    """chmod 0 → register → chmod 644 changes neither mtime nor size."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    registry.chmod(0)
+    v.register(888)
+    registry.chmod(0o644)
+    for _ in range(3):
+        v.is_voice_webhook(4242)
+    assert 888 in json.loads(registry.read_text())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_a_failed_write_is_tried_again(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The directory was read-only during register; it is writable again later."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    tmp_path.chmod(0o555)
+    try:
+        v.register(888)
+    finally:
+        tmp_path.chmod(0o755)
+    v.is_voice_webhook(4242)
+    assert 888 in json.loads(registry.read_text())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_our_own_voice_is_enough_to_write_it(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A quiet instance sees no unknown webhook; its own voices still get it written."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    registry.chmod(0)
+    v.register(888)
+    registry.chmod(0o644)
+    assert v.is_voice_webhook(888)  # our own voice, known in memory
+    assert 888 in json.loads(registry.read_text())
