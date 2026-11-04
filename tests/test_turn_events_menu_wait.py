@@ -136,7 +136,7 @@ async def test_the_turn_end_after_the_answer_sends_it(log, monkeypatch) -> None:
         e for e in map(json.loads, log.read_text().splitlines()) if e["kind"] == "completion"
     ]
     assert event["started_by"]["name"] == "clord-dispatch"
-    assert event["reason"] is None
+    assert event.get("reason") is None
 
 
 async def test_a_new_request_drops_it(log, monkeypatch) -> None:
