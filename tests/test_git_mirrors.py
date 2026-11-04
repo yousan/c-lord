@@ -763,3 +763,25 @@ def test_a_fetch_stopped_with_the_bot_is_not_marked_timed_out_1174(
     assert gm.stop_running_git() == 1
     t.join(timeout=15)
     assert not (mirror / gm.FETCH_TIMED_OUT_MARK).exists()
+
+
+def test_a_git_started_after_the_stop_is_stopped_too_1174(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A background fetch that starts git right after ``stop_running_git`` (atexit runs
+    while daemon threads still live) must not escape it."""
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, f"file://{upstream}")
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch, secs=20)
+    gm.stop_running_git()
+    started = time.monotonic()
+    try:
+        gm._run(["git", "-C", str(mirror), "fetch", "--quiet"], timeout=15)
+    finally:
+        _kill_procs_mentioning(str(tmp_path / "fakebin"))
+    assert time.monotonic() - started < 5

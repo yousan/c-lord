@@ -54,6 +54,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
 import logging
 import os
@@ -254,6 +255,11 @@ def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
         return None
     with _running_lock:
         _running_groups.add(proc.pid)
+    if _stopping.is_set():
+        # Started as the bot stops: ``stop_running_git`` set the flag before it
+        # read the groups, so it either saw this one or this sees the flag (#1174).
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
     try:
         return _wait(proc, args, timeout=timeout)
     finally:
