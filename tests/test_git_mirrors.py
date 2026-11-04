@@ -767,11 +767,15 @@ def test_a_fetch_stopped_with_the_bot_is_not_marked_timed_out_1174(
     _fake_slow_git(tmp_path, monkeypatch)
     t = threading.Thread(target=ensure_mirror, args=(root, f"file://{upstream}"))
     t.start()
-    deadline = time.monotonic() + 10
-    while not gm._running_groups and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert gm.stop_running_git() == 1
-    t.join(timeout=15)
+    try:
+        deadline = time.monotonic() + 10
+        while not gm._running_groups and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gm.stop_running_git() == 1
+        t.join(timeout=15)
+    finally:
+        # A failure above must not leave the fake git's writer running.
+        _kill_procs_mentioning(str(tmp_path / "fakebin"))
     assert not (mirror / gm.FETCH_TIMED_OUT_MARK).exists()
 
 
