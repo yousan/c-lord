@@ -401,7 +401,7 @@ def test_the_orphan_sweep_never_sees_the_mirror_dir(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, secs: int = 30) -> Path:
     """``fetch`` だけ「受信し続けて終わらない」git を PATH の先頭に置く。
 
     本物の時間切れと同じく、受信中の pack を ``objects/pack/tmp_pack_*`` に
@@ -419,7 +419,7 @@ def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         f'  echo call >> "{log}"\n'
         '  pack="$2/objects/pack/tmp_pack_fake$$"\n'
         '  ( while true; do echo x >> "$pack"; sleep 0.05; done ) &\n'
-        "  sleep 30\n"
+        f"  sleep {secs}\n"
         "  exit 0\n"
         "fi\n"
         f'exec "{real}" "$@"\n'
@@ -591,3 +591,51 @@ def test_a_timed_out_mirror_clone_leaves_nothing_behind_1134(
     assert ensure_mirror(root, str(upstream)) is None
     time.sleep(0.3)
     assert [p.name for p in root.iterdir() if p.name != "README.md"] == []
+
+
+# --------------------------------------------------------------------------
+# #1152 の回帰 — #1173 (別の fetch の書きかけを消さない) / #1174 (bot と一緒に止まる)
+# --------------------------------------------------------------------------
+
+
+def test_timeout_cleanup_spares_a_pack_another_fetch_is_writing_1173(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """時間切れの片付けが、同じミラーで別の git がいま受信中の pack を消さない。
+
+    消すと、手で打った fetch や別の更新がその場で失敗する。c-lord が消してよいのは
+    自分が止めた git の書きかけだけ。
+    """
+    import threading
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, f"file://{upstream}")
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch)
+    monkeypatch.setattr(gm, "_FETCH_TIMEOUT", 1.5)
+
+    foreign = mirror / "objects" / "pack" / "tmp_pack_foreign"
+    stop = threading.Event()
+
+    def other_writer() -> None:  # c-lord の flock を持たない別の fetch
+        time.sleep(0.5)  # c-lord の fetch が before を撮ったあとに受信を始める
+        while not stop.is_set():
+            with open(foreign, "a") as fh:
+                fh.write("y")
+            time.sleep(0.05)
+
+    t = threading.Thread(target=other_writer)
+    t.start()
+    try:
+        ensure_mirror(root, f"file://{upstream}")  # 1.5 秒で時間切れ
+        alive_and_written = foreign.exists()
+    finally:
+        stop.set()
+        t.join()
+    assert alive_and_written, "別のプロセスがいま書いている tmp_pack を消した"
+    assert [p for p in _garbage(mirror) if p != "tmp_pack_foreign"] == [], (
+        "止めた自分の fetch の書きかけが残った"
+    )

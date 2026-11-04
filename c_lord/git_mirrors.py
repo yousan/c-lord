@@ -36,7 +36,7 @@
 
 - 時間切れのときは git をプロセスグループごと止め、受信途中の
   ``objects/pack/tmp_*`` (1回約3GB) をその場で消す。殺された fetch の書きかけは
-  git 自身には消せない
+  git 自身には消せない。**別の git がいま書いているものは消さない** (#1173)
 - ミラーに印 (``clord-fetch-timed-out``) を置き、**次からはクローンを待たせない**。
   印が1時間以上古ければ、長い上限 (1時間) で**裏で**取り直し、成功したら印を
   消して元の「更新してから使う」に戻る。直後は裏でも取り直さない (1回3GB を
@@ -223,12 +223,83 @@ def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
             os.killpg(proc.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             proc.communicate(timeout=10)
+        _wait_for_group_gone(proc.pid)
         logger.warning("git mirror: %s timed out after %.0f seconds", " ".join(args[:4]), timeout)
         return subprocess.CompletedProcess(args, _TIMED_OUT, "", "timed out")
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
 _TIMED_OUT = -9
+
+
+def _wait_for_group_gone(pgid: int, limit: float = 2.0) -> None:
+    """SIGKILL したグループの子 (index-pack 等) が本当に居なくなるまで少し待つ。
+
+    ``communicate`` が待つのは親の git だけ。子が最後の1回を書き終える前に
+    「書き続けているか」を測ると、自分の書きかけを他人のものと見誤る (#1173)。
+    """
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+        time.sleep(0.05)
+
+
+#: 時間切れの片付けで「まだ誰かが書いているか」を見る間隔 (#1173)。
+_SETTLE_SECONDS = 1.0
+
+
+def _open_by_someone(paths: list[Path]) -> set[Path]:
+    """*paths* のうち、いま生きているプロセスが開いているもの (Linux の ``/proc``)。
+
+    ``/proc`` が無い OS では空を返す — そのときは書き続けているかどうかだけで見る。
+    """
+    wanted = {str(p): p for p in paths}
+    found: set[Path] = set()
+    try:
+        procs = list(Path("/proc").glob("[0-9]*/fd"))
+    except OSError:
+        return found
+    for fd_dir in procs:
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link in wanted:
+                found.add(wanted[link])
+    return found
+
+
+def _abandoned(paths: list[Path]) -> list[Path]:
+    """止めた git の書きかけだけを選ぶ — **誰かが書いているものは外す** (#1173)。
+
+    自分の git はグループごと止めた後なので、もう書かない・開いていない。
+    同じミラーで別の git (手で打った fetch など。c-lord の flock は持たない) が
+    受信中の pack は、開かれているか、少し待つあいだに育つ。消すとその fetch が
+    失敗するので残す (古くなれば ``_sweep_stale_garbage`` が拾う)。
+    """
+    if not paths:
+        return []
+
+    def _stamp(path: Path) -> tuple[int, int] | None:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
+    first = {p: _stamp(p) for p in paths}
+    time.sleep(_SETTLE_SECONDS)
+    still = [p for p in paths if first[p] is not None and _stamp(p) == first[p]]
+    busy = _open_by_someone(still)
+    return [p for p in still if p not in busy]
 
 
 def _garbage_files(target: Path) -> list[Path]:
@@ -327,8 +398,9 @@ def _fetch(target: Path, *, timeout: float) -> None:
         before = set(_garbage_files(target))
         result = _run(["git", "-C", str(target), "fetch", "--quiet"], timeout=timeout)
         if result is not None and result.returncode == _TIMED_OUT:
-            # ロックを持っているので、新しくできた書きかけは止めた git のもの。
-            ours = [p for p in _garbage_files(target) if p not in before]
+            # 新しくできた書きかけのうち、止めた git のものだけを消す。flock は
+            # c-lord 同士の約束でしかなく、手で打った fetch も同じ場所に書く (#1173)。
+            ours = _abandoned([p for p in _garbage_files(target) if p not in before])
             freed = _remove(ours)
             _mark_timed_out(target)
             logger.warning(
