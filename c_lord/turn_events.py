@@ -148,9 +148,12 @@ class _Held:
 
 
 _ACTIVE: dict[int, TurnInfo] = {}
-#: thread -> (monotonic time of the last transcript turn end, agents still running)
-_LAST_END: dict[int, tuple[float, int]] = {}
+#: thread -> (monotonic time the mirror noted the last transcript turn end, agents
+#: still running, wall-clock time the transcript says that turn ended — #1195)
+_LAST_END: dict[int, tuple[float, int, float]] = {}
 _HELD: dict[int, _Held] = {}
+#: thread -> wall-clock time the last menu that parks a turn was posted (#1195).
+_BLOCKED_AT: dict[int, float] = {}
 #: thread -> the last runner turn, whose guild / channel a self-started turn inherits.
 _LAST_INFO: dict[int, TurnInfo] = {}
 #: thread -> the open turn Claude started by itself on a notification (#961).
@@ -165,6 +168,7 @@ def reset() -> None:
             held.timer.cancel()
     _ACTIVE.clear()
     _LAST_END.clear()
+    _BLOCKED_AT.clear()
     _HELD.clear()
     _LAST_INFO.clear()
     _SELF.clear()
@@ -252,6 +256,9 @@ def _info_for(thread: discord.Thread | Any, started_by: StartedBy) -> TurnInfo:
 def begin_turn(thread: discord.Thread | Any, started_by: StartedBy) -> TurnInfo | None:
     """Note that a turn starts in *thread*; ``None`` when no outlet is configured."""
     if not enabled():
+        # #1178: who the thread works for (:func:`last_started_by` — the API
+        # error ❌'s ping, #1149) does not depend on an event outlet.
+        _remember(_LAST_INFO, thread.id, _info_for(thread, started_by))
         return None
     held = _HELD.pop(thread.id, None)
     if held is not None:
@@ -335,6 +342,7 @@ def note_turn_end(
     *,
     self_started: bool = False,
     failure_reason: str | None = None,
+    at: datetime | None = None,
 ) -> None:
     """The transcript says a turn ended in *thread_id* with *outstanding* agents running.
 
@@ -347,11 +355,14 @@ def note_turn_end(
     #1131). Then nothing is ``completion``: a completion held for the request
     whose work this turn was continuing goes out as ``failure`` instead, and so
     does the turn's own event — at once, whatever agents are still out.
+    *at*: when the transcript says the turn ended (the row's own timestamp);
+    ``None`` reads as now.
     """
     if not enabled():
         return
     try:
-        _remember(_LAST_END, thread_id, (time.monotonic(), outstanding))
+        ended = at.timestamp() if at is not None else time.time()
+        _remember(_LAST_END, thread_id, (time.monotonic(), outstanding, ended))
         started = _SELF.pop(thread_id, None)
         own = started if self_started else None
         if own is not None and failure_reason is not None and thread_id not in _ACTIVE:
@@ -400,7 +411,7 @@ def finish_turn(
         _spawn(_deliver("failure", info, reason=failure_reason))
         return
     snapshot = _LAST_END.get(info.thread_id)
-    if awaiting_answer and not (snapshot is not None and snapshot[0] >= info.started_mono):
+    if awaiting_answer and not _ended_after_menu(info, snapshot):
         _hold(info, 0, expires=False)
         return
     # #1170: answered and ended already (the mirror's turn end beat this run's
@@ -409,6 +420,22 @@ def finish_turn(
         _hold(info, snapshot[1])
         return
     _spawn(_deliver("completion", info))
+
+
+def _ended_after_menu(info: TurnInfo, snapshot: tuple[float, int, float] | None) -> bool:
+    """Did the turn end, by the transcript's clock, after its menu was posted? (#1170/#1195)
+
+    Only such an end can follow the answer. The interrupted previous turn's end
+    can reach c-lord after this run began — and even after the menu, which the
+    runner's pane bridge posts on its own while the mirror is still delivering
+    the previous answer — so when it was *noted* says nothing. When it was
+    *written* does: before the new request was taken, so before its menu. No
+    menu posted in this run: no end can be told to be the answer's, so none is.
+    """
+    blocked_at = _BLOCKED_AT.get(info.thread_id)
+    if snapshot is None or blocked_at is None or blocked_at < info.started_at.timestamp():
+        return False
+    return snapshot[2] >= blocked_at
 
 
 def announce_recovered_turn(
@@ -459,6 +486,7 @@ def emit_blocked(thread: discord.Thread | Any, *, message_id: int | None) -> Non
         return
     try:
         info = _ACTIVE.get(thread.id) or _info_for(thread, StartedBy("user"))
+        _remember(_BLOCKED_AT, thread.id, time.time())
         _spawn(_deliver("blocked", info, message_id=message_id))
     except Exception:
         logger.warning(

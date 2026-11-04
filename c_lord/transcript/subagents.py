@@ -1059,18 +1059,28 @@ def _write_document(
         return None
 
 
+#: How the CLI opens an agent's own background-task notice (#1136).
+_SYSTEM_NOTICE_PREFIX = "[SYSTEM NOTIFICATION - NOT USER INPUT]"
+
+
 def _is_own_task_notice(row: dict) -> bool:
     """Whether *row* is the harness waking an agent for its own background task (#1136).
 
-    The CLI writes it into the agent's file as an ``isMeta`` user row
-    (``[SYSTEM NOTIFICATION - NOT USER INPUT] … background-task event``). A
-    message from the parent or another agent is not one: that is ``SendMessage``,
-    a ``peer`` row or a plain prompt — a real ``再開``.
+    The CLI writes it into the agent's file as an ``isMeta`` user row with
+    ``origin.kind == "task-notification"`` (``[SYSTEM NOTIFICATION - NOT USER
+    INPUT] … background-task event``). Only that is silenced. A message from the
+    parent (``coordinator``, CLI 2.1.305 / 2.1.312) or another agent (``peer``)
+    is also ``isMeta``, and is a real ``再開`` (#1177 — it was taken for a notice
+    and the parent's question to a finished agent showed nothing). A row with no
+    origin counts only when its text is the system notice itself.
     """
     if row.get("type") != "user" or not row.get("isMeta"):
         return False
     origin = row.get("origin")
-    return not (isinstance(origin, dict) and origin.get("kind") == "peer")
+    if isinstance(origin, dict):
+        return origin.get("kind") == "task-notification"
+    content = _content(row)
+    return isinstance(content, str) and content.lstrip().startswith(_SYSTEM_NOTICE_PREFIX)
 
 
 def _first_timestamps(directory: Path, stems: list[str]) -> dict[str, float]:

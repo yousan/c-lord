@@ -155,6 +155,32 @@ class TestFenceReopenedOnTheSameLine:
         ]
 
 
+class TestInlineCodeAfterAOneLineBlock:
+    """#1175 — 1行のコードブロックの後ろのインラインコード `` ``` `` を開きフェンスと数えた。
+
+    #1168（#1096 の修正）で、1行ブロックの後ろの ``` を開きフェンスとして数える
+    ようになったが、インラインコードの中の ``` まで数えたので、以降の本文と
+    コードが入れ替わって描かれた。Discord ではインラインコードの中身は
+    フェンスにならない。
+    """
+
+    def test_inline_code_holding_a_fence_after_a_one_line_block(self) -> None:
+        content = f"{B}a{B} see `` {B} `` here\nbody\n{B}\ncode\n{B}"
+        blocks = _split_code_blocks(content)
+        assert ("code", "code") in blocks
+        assert not any(k == "code" and "body" in v for k, v in blocks), blocks
+
+    def test_single_backtick_span_holding_a_fence(self) -> None:
+        blocks = _split_code_blocks(f"{B}a{B} see `x {B} y` here\nbody\n{B}\ncode\n{B}")
+        assert ("code", "code") in blocks
+        assert not any(k == "code" and "body" in v for k, v in blocks), blocks
+
+    def test_unclosed_backtick_does_not_hide_a_real_opener(self) -> None:
+        blocks = _split_code_blocks(f"{B}a{B} it`s {B}\nmore\n{B}\nafter")
+        assert ("code", "more") in blocks
+        assert ("text", "after") in blocks
+
+
 class TestTofuSymbolsAreEmoji:
     """#1097 — #1057 で外れた ◻ ◼ ◽ ◾ ⤴ ⤵ と、もとから素通りの ℹ を断る側に戻す。"""
 
