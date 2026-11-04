@@ -1982,8 +1982,9 @@ class SessionManageCog(commands.Cog):
         that, not the number of calls: a sweep that counts attempts reports
         progress it never made (#604). The two falsy answers differ (#1192):
         ``None`` — there was no window to kill (already asleep, or its claude
-        ended on its own); ``False`` — the window is still there and could not
-        be killed (no manager, ``kill-window`` failed). The resident cap makes
+        ended on its own); ``False`` — the window may still be there and could
+        not be killed (no manager, ``kill-window`` failed — a stalled tmux also
+        fails it, so a failed kill is never read as gone). The resident cap makes
         up for ``False`` with the next candidate and only for that (#1094).
 
         There is no slash command on purpose. Being invisible is the feature; a
@@ -2015,17 +2016,16 @@ class SessionManageCog(commands.Cog):
         await self._stop_transcript_mirror(thread_id)
 
         if not await asyncio.to_thread(tmux_mgr.kill_session, thread_id):
-            # #1192: "nothing to kill" and "the kill failed" both come back as
-            # False from tmux. Only a window that is really gone may be read as
-            # gone — a failed kill leaves a resident the cap must make up for.
-            if await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
-                logger.warning(
-                    "%s sleep: could not kill the tmux window — it is still there",
-                    log_ctx(thread_id=thread_id),
-                )
-                return False
-            logger.info("%s sleep: no tmux window to kill", log_ctx(thread_id=thread_id))
-            return None
+            # #1192: the window was there a moment ago and the kill failed. Not
+            # "gone": asking tmux again cannot tell "vanished in between" from
+            # "tmux stalled" (the kill's own likely cause — a stalled lookup also
+            # answers "no window"), and reading a stall as gone left the cap
+            # above its limit. At worst the cap sleeps one more thread than needed.
+            logger.warning(
+                "%s sleep: could not kill the tmux window — counted as still there",
+                log_ctx(thread_id=thread_id),
+            )
+            return False
 
         # Remember it, so the next message resumes without a word even across a
         # bot restart. Wording only — see ``SessionRepository.set_slept``.

@@ -96,8 +96,10 @@ async def test_real_sleep_impl_no_window_reads_as_gone() -> None:
     assert await loop._sleep_one(3, MagicMock(), "1本") is None
 
 
-async def test_real_sleep_impl_window_vanished_during_kill_reads_as_gone() -> None:
-    """The kill found nothing because claude ended between the check and the kill."""
+async def test_real_sleep_impl_failed_kill_is_not_gone_even_if_the_recheck_says_so() -> None:
+    """Review of #1192: the kill failed and a second look says "no window" — but a
+    stalled tmux answers every lookup that way. Counted as still there; the cost
+    of the rare "it really vanished in between" is one extra thread asleep."""
     mgr = MagicMock()
     mgr.session_exists = MagicMock(side_effect=[True, False])
     mgr.kill_session = MagicMock(return_value=False)
@@ -110,4 +112,4 @@ async def test_real_sleep_impl_window_vanished_during_kill_reads_as_gone() -> No
         in_flight_fn=set,
         mem_fn=lambda: OK,
     )
-    assert await loop._sleep_one(3, MagicMock(), "1本") is None
+    assert await loop._sleep_one(3, MagicMock(), "1本") is False
