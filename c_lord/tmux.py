@@ -2423,15 +2423,36 @@ class TmuxSessionManager:
             )
             return ["--continue"] if try_continue else []
 
-        from .transcript.claim import new_session_id, read_claim, write_claim
+        from .transcript.claim import (
+            new_session_id,
+            newest_transcript_id,
+            read_claim,
+            write_claim,
+        )
         from .transcript.resolver import derive_project_dir
 
         project_dir = derive_project_dir(pane_path)
         if try_continue:
             claimed = read_claim(project_dir)
-            if claimed is not None:
-                return ["--resume", claimed]
-            return ["--continue"]
+            if claimed is None:
+                return ["--continue"]
+            # #1171: a claimed session whose transcript was never written cannot
+            # be resumed — the CLI says "No conversation found", the run falls
+            # back to a fresh start (#123), and the thread's real conversation
+            # beside it is forgotten. Resume that one instead, and claim it.
+            if not (project_dir / f"{claimed}.jsonl").is_file():
+                newest = newest_transcript_id(project_dir)
+                if newest is not None and newest != claimed and write_claim(project_dir, newest):
+                    logger.warning(
+                        "start_claude: claimed session %s has no transcript in %s — "
+                        "resuming %s, the newest conversation there, and claiming it "
+                        "instead of starting over (#1171)",
+                        claimed,
+                        project_dir,
+                        newest,
+                    )
+                    return ["--resume", newest]
+            return ["--resume", claimed]
 
         session_id = new_session_id()
         if not write_claim(project_dir, session_id):
