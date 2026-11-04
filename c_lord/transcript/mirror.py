@@ -1030,9 +1030,16 @@ class TranscriptMirror:
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
         _LIVE_MIRRORS[self.thread_id] = self
-        turn_end_bus.note_tailing(self.thread_id, True)
+        # #1190: "tailing" (which makes the pane wait for the instruction to
+        # reach the transcript, #1132) is said by the tail once it has one —
+        # see _note_resolved. A thread with none keeps the pane's own exit.
         if self._subagent_log is not None:
             self._subagent_log.start()
+
+    def _note_resolved(self, found: bool) -> None:
+        """The tail found a transcript to read, or lost it (#1190)."""
+        if _LIVE_MIRRORS.get(self.thread_id) is self:
+            turn_end_bus.note_tailing(self.thread_id, found)
 
     async def stop(self) -> None:
         """Cancel the tail task and wait for it to settle.  Safe to call repeatedly."""
@@ -1311,6 +1318,7 @@ class TranscriptMirror:
                     on_unresolved=self._on_unresolved,
                     unresolved_after=self._unresolved_after,
                     on_start=self._read_back if self._resumed else None,
+                    on_resolved=self._note_resolved,
                 ):
                     await queue.put(event)
             except asyncio.CancelledError:
