@@ -30,7 +30,9 @@ SAFEGUARDS_ADVICE = (
     "このセッションは Claude の安全機能で止められました。"
     "`/model` で別のモデルにするか、新しいスレッドで始めてください。"
 )
-GENERIC_ADVICE = "Claude Code が API エラーで止まりました。『続けて』と送ると再開を試みます。"
+# #1180: every place that shows it already opens with "Claude Code が API エラーで
+# 止まりました" (the ❌ line, the embed's title), so it does not say so again.
+GENERIC_ADVICE = "『続けて』と送ると再開を試みます。"
 
 # The first sentence: up to the first ". " / "." at a line end, or the first line.
 _FIRST_SENTENCE = re.compile(r"^(.+?[.。])(?=\s|$)")

@@ -255,6 +255,9 @@ def _info_for(thread: discord.Thread | Any, started_by: StartedBy) -> TurnInfo:
 def begin_turn(thread: discord.Thread | Any, started_by: StartedBy) -> TurnInfo | None:
     """Note that a turn starts in *thread*; ``None`` when no outlet is configured."""
     if not enabled():
+        # #1178: who the thread works for (:func:`last_started_by` — the API
+        # error ❌'s ping, #1149) does not depend on an event outlet.
+        _remember(_LAST_INFO, thread.id, _info_for(thread, started_by))
         return None
     held = _HELD.pop(thread.id, None)
     if held is not None:
