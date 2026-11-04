@@ -321,7 +321,7 @@ class ApiServer:
         self.session_dir_base: str | None = None
         # Fall back to COORDINATION_CHANNEL_ID so lounge shares the same channel
         if lounge_channel_id is None:
-            ch_str = os.getenv("COORDINATION_CHANNEL_ID", "")
+            ch_str = os.getenv("COORDINATION_CHANNEL_ID", "").strip()  # #1194
             lounge_channel_id = int(ch_str) if ch_str.isdigit() else None
         self.lounge_channel_id = lounge_channel_id
 

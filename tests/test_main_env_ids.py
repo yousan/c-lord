@@ -88,3 +88,49 @@ def test_c_lord_start_with_that_env_prints_the_reason_not_a_traceback(
     assert result.returncode == 1, output
     assert "Traceback" not in output, output
     assert "must be a numeric" in output, output
+
+
+_COUNT_KEYS = ("MAX_CONCURRENT_SESSIONS", "SESSION_TIMEOUT_SECONDS")
+
+
+@pytest.mark.parametrize("key", ["DISCORD_CHANNEL_ID", "COORDINATION_CHANNEL_ID"])
+def test_id_with_surrounding_space_in_quoted_env_still_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """#1194: ``KEY="1505… "`` started before #1084 (``int()`` ignores the spaces)
+    and stopped with exit 1 after it — an update alone broke a working .env. The
+    counts in the same file (#1119) already allow the spaces; the IDs do now too."""
+    for k in (*_ID_KEYS, *_COUNT_KEYS):
+        monkeypatch.delenv(k, raising=False)
+    env = tmp_path / ".env"
+    lines = ["DISCORD_BOT_TOKEN=x", "DISCORD_CHANNEL_ID=1"]
+    lines.append(f'{key}="1505747831447883806 "')
+    env.write_text("\n".join(lines) + "\n")
+    config = load_config(env)  # was: SystemExit(1)
+    int(config["channel_id"])  # what main() does next
+    if config["coordination_channel_id"]:
+        int(config["coordination_channel_id"])
+
+
+@pytest.mark.parametrize("key", _ID_KEYS)
+def test_every_id_is_used_without_its_spaces(base_env: pytest.MonkeyPatch, key: str) -> None:
+    base_env.setenv(key, " 1505747831447883806\t")
+    config = load_config()
+    loaded = {
+        "DISCORD_CHANNEL_ID": config["channel_id"],
+        "DISCORD_OWNER_ID": config["owner_id"],
+        "COORDINATION_CHANNEL_ID": config["coordination_channel_id"],
+        "EXPECTED_BOT_USER_ID": config["expected_bot_user_id"],
+    }[key]
+    assert loaded == "1505747831447883806"
+
+
+def test_counts_in_the_same_file_accept_the_same_spaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The contrast in #1194: #1119 strips spaces for counts."""
+    for k in (*_ID_KEYS, *_COUNT_KEYS):
+        monkeypatch.delenv(k, raising=False)
+    env = tmp_path / ".env"
+    env.write_text('DISCORD_BOT_TOKEN=x\nDISCORD_CHANNEL_ID=1\nMAX_CONCURRENT_SESSIONS=" 4 "\n')
+    assert load_config(env)["max_concurrent"] == "4"

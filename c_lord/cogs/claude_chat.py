@@ -678,7 +678,7 @@ class ClaudeChatCog(commands.Cog):
             if existing is not None:
                 self._coordination = existing
             else:
-                channel_id_str = os.getenv("COORDINATION_CHANNEL_ID", "")
+                channel_id_str = os.getenv("COORDINATION_CHANNEL_ID", "").strip()  # #1194
                 channel_id = int(channel_id_str) if channel_id_str.isdigit() else None
                 self._coordination = CoordinationService(self.bot, channel_id)
         return self._coordination
