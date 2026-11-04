@@ -609,6 +609,14 @@ exist (#1066). A numeric ID sent as `Infinity` / `NaN` (which JSON parsers in Py
 `"false"` や `0` を送ると `400 {"error": "enabled must be true or false"}` が返り、何も変わらない
 （以前は文字列の `"false"` で有効になっていた — #1038）。
 
+`name` / `prompt` on `POST /api/tasks`, `prompt` on `PATCH /api/tasks/{id}`, `label` on
+`/api/lounge`, `source` on `/api/threads/{id}/messages` and `reason` on `/api/mark-resume` must be
+JSON strings. A number, `true`, a list or an object is a `400 {"error": "<field> must be a string"}`
+and nothing is saved or posted (#1208 — before, it was accepted and saved through `str()`, so a
+task's `prompt: ["x"]` ran as the instruction `['x']`). Absent or `null` is the same as leaving the
+field out (`label` falls back to `AI`, `source` to `cli`, `reason` to `self_restart`; a `PATCH` with
+`"prompt": null` does not touch the prompt).
+
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,
 `channel_id`, `thread_id` or numeric ID in the path is a `400`, and a `PATCH` that fails this way
 changes nothing (#1081). A body that is not valid UTF-8 is `400 {"error": "Invalid JSON"}` (#1082).
