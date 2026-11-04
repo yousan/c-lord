@@ -639,3 +639,72 @@ def test_timeout_cleanup_spares_a_pack_another_fetch_is_writing_1173(
     assert [p for p in _garbage(mirror) if p != "tmp_pack_foreign"] == [], (
         "止めた自分の fetch の書きかけが残った"
     )
+
+
+def _kill_procs_mentioning(text: str) -> None:
+    """コマンドラインに *text* を含むプロセスだけを止める (試験の後始末。pkill は使わない)。"""
+    import contextlib
+    import signal
+
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+        except OSError:
+            continue
+        if text in cmdline:
+            with contextlib.suppress(OSError):
+                os.kill(int(proc.name), signal.SIGKILL)
+
+
+def test_background_fetch_git_dies_with_the_bot_1174(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bot を Ctrl-C で止めたら、裏で走っていたミラー更新の git も一緒に止まる。
+
+    git は時間切れでグループごと止めるために自分のプロセスグループで走る (#1134)。
+    そのせいで端末の Ctrl-C が git に届かず、systemd の外で動かす利用者では bot が
+    終わったあとも git がミラーに書き続け、次の bot がもう1本 fetch を出していた。
+    """
+    import signal
+    import sys
+    import textwrap
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    origin = f"file://{upstream}"
+    mirror = ensure_mirror(root, origin)
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch, secs=20)
+    mark = mirror / gm.FETCH_TIMED_OUT_MARK
+    mark.touch()
+    old = time.time() - 7200
+    os.utime(mark, (old, old))
+    code = textwrap.dedent(f"""
+        import time, c_lord.git_mirrors as gm
+        gm.ensure_mirror({str(root)!r}, {origin!r})
+        time.sleep(0.5)
+        print("started", flush=True)
+    """)
+    # 端末で Ctrl-C したときと同じく、bot のプロセスグループに SIGINT を送る
+    p = subprocess.Popen(
+        [sys.executable, "-c", code + "time.sleep(30)"],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert p.stdout is not None
+        p.stdout.readline()
+        os.killpg(p.pid, signal.SIGINT)
+        p.wait(timeout=10)
+        time.sleep(0.5)
+        packs = list((mirror / "objects" / "pack").glob("tmp_pack_fake*"))
+        sizes1 = [x.stat().st_size for x in packs if x.exists()]
+        time.sleep(0.5)
+        sizes2 = [x.stat().st_size for x in packs if x.exists()]
+    finally:
+        _kill_procs_mentioning(str(tmp_path / "fakebin"))
+    assert sizes1 == sizes2, f"bot が終わったあとも git の受信が続いている: {sizes1} -> {sizes2}"

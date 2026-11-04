@@ -37,6 +37,8 @@
 - 時間切れのときは git をプロセスグループごと止め、受信途中の
   ``objects/pack/tmp_*`` (1回約3GB) をその場で消す。殺された fetch の書きかけは
   git 自身には消せない。**別の git がいま書いているものは消さない** (#1173)
+- bot が終わるとき (停止シグナル・``atexit``) は走っている git もグループごと止める
+  (#1174)。別グループなので、止めないと Ctrl-C / SIGTERM の後も受信を続ける
 - ミラーに印 (``clord-fetch-timed-out``) を置き、**次からはクローンを待たせない**。
   印が1時間以上古ければ、長い上限 (1時間) で**裏で**取り直し、成功したら印を
   消して元の「更新してから使う」に戻る。直後は裏でも取り直さない (1回3GB を
@@ -51,6 +53,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import logging
 import os
@@ -74,6 +77,7 @@ __all__ = [
     "mirrors_enabled",
     "mirrors_root_for",
     "normalise_origin",
+    "stop_running_git",
     "wait_for_background_fetches",
 ]
 
@@ -196,12 +200,43 @@ def mirrors_root_for(base_dir: str | Path) -> Path:
     return Path(base_dir).parent / MIRRORS_DIR_NAME
 
 
+#: いま走っている git のプロセスグループ (#1174)。bot が終わるときにまとめて止める。
+_running_groups: set[int] = set()
+_running_lock = threading.Lock()
+
+
+def stop_running_git() -> int:
+    """走っているミラー用の git をグループごと止める。止めた数を返す。Never raises.
+
+    git は自分のプロセスグループで走るので (#1134)、端末の Ctrl-C や bot への
+    SIGTERM が届かない。何もしないと bot が終わったあとも git が受信を続け、
+    flock も外れるので次の bot が同じミラーにもう1本 fetch を出す (#1174)。
+    プロセスの終了時 (``atexit``) と、停止シグナルを受けたとき (``main``) に呼ぶ。
+    """
+    with _running_lock:
+        groups = list(_running_groups)
+    stopped = 0
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            stopped += 1
+        except OSError:
+            continue
+    if stopped:
+        logger.info("git mirror: stopped %d running git process group(s) on shutdown", stopped)
+    return stopped
+
+
+atexit.register(stop_running_git)
+
+
 def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
     """Never raises. 失敗は非ゼロ、OS エラーは ``None``、時間切れは ``returncode=-9``.
 
     git は自分の新しいプロセスグループで走らせ、時間切れのときは**グループごと**
     止める (#1134)。``subprocess.run(timeout=)`` は親の git しか殺さず、受信を
     担う子 (index-pack / ssh) が書きかけの pack を育て続けていた。
+    別グループなので bot の停止は届かない — ``stop_running_git`` が代わりに止める (#1174)。
     """
     try:
         proc = subprocess.Popen(
@@ -214,6 +249,18 @@ def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
     except OSError as exc:
         logger.warning("git mirror: %s failed: %s", " ".join(args[:3]), exc)
         return None
+    with _running_lock:
+        _running_groups.add(proc.pid)
+    try:
+        return _wait(proc, args, timeout=timeout)
+    finally:
+        with _running_lock:
+            _running_groups.discard(proc.pid)
+
+
+def _wait(
+    proc: subprocess.Popen[str], args: list[str], *, timeout: float
+) -> subprocess.CompletedProcess[str]:
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
