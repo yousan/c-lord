@@ -217,3 +217,82 @@ async def test_tool_only_turn_after_a_text_turn_adopts_nothing(tmp_path, log):
     run = await _replay(project, steps)
     print(run.posted, run.cursor)
     assert run.cursor == ["a1"]
+
+
+async def test_restart_between_silent_text_and_turn_end(tmp_path, log):
+    """Bot restarts after 'text A → tool_use' was mirrored; the turn ends after the
+    restore. A was posted (silently) by the old process; the cursor should still
+    land on A so the next restart does not re-post it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = project / "s.jsonl"
+    clord_transcript(jsonl)
+    with jsonl.open("a", encoding="utf-8") as f:
+        for r in (_user("依頼", "u0"), _text("予約しました", "a1"), _tool("t1", "a2")):
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.utime(jsonl, (1, 1))
+    run = _Run()
+    m = TranscriptMirror(
+        thread_id=THREAD_ID,
+        project_dir=project,
+        sink=run.sink,
+        reply_sink=run.reply_sink,
+        file_sink=run.file_sink,
+        reply_cursor_sink=run.cursor_sink,
+        poll_interval=0.02,
+        idle_flush_seconds=0,
+        resumed=True,
+    )
+    m.start()
+    try:
+        await asyncio.sleep(0.15)
+        with jsonl.open("a", encoding="utf-8") as f:
+            for r in (_result("t1", "u1"), END):
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        await asyncio.sleep(0.3)
+    finally:
+        await m.stop()
+    print(
+        run.posted,
+        run.cursor,
+        final_answer_needs_recovery(project, run.cursor[-1] if run.cursor else None),
+    )
+    assert run.cursor == ["a1"]
+
+
+def _write_rows(path: Path, *rows: dict) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def test_read_back_finds_the_text_before_the_last_tool_call(tmp_path):
+    """#1187: what the restored mirror takes as the turn's silent text."""
+    from c_lord.transcript.mirror import _silent_text_at_end
+
+    path = tmp_path / "s.jsonl"
+    _write_rows(path, _user("依頼", "u0"), _text("A", "a1"), _tool("t1", "a2"))
+    assert _silent_text_at_end(path) == "a1"
+
+
+def test_read_back_leaves_a_held_text_to_the_old_process(tmp_path):
+    """The old process flushed a still-held text as the reply when it stopped."""
+    from c_lord.transcript.mirror import _silent_text_at_end
+
+    path = tmp_path / "s.jsonl"
+    _write_rows(
+        path, _user("依頼", "u0"), _text("A", "a1"), _tool("t1", "a2"), _result("t1", "u1"),
+        _text("B", "a3"),
+    )  # fmt: skip
+    assert _silent_text_at_end(path) is None
+
+
+def test_read_back_does_not_carry_a_text_across_a_new_request(tmp_path):
+    from c_lord.transcript.mirror import _silent_text_at_end
+
+    path = tmp_path / "s.jsonl"
+    _write_rows(
+        path, _user("依頼1", "u0"), _text("A", "a1"), _tool("t1", "a2"), _result("t1", "u1"),
+        END, _user("依頼2", "u5"), _tool("t2", "a4"),
+    )  # fmt: skip
+    assert _silent_text_at_end(path) is None

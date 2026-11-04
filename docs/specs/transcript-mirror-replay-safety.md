@@ -321,6 +321,11 @@ Discord へ転送する。`c_lord/transcript/tail.py` は通常 **EOF から** �
     「返事A → ツール → 返事B → ツール → ターンの終わり」で B がアイドル flush（次のツール呼び出しが
     書かれるまでに間が空いた）で答えとして先に出たとき、ターンの終わりに A を採用してカーソルを B より前に
     戻していたため、次の再起動で B がもう一度投稿されていた。
+  - **再起動をまたいでも同じ** (#1187)。「返事 → 最後のツール呼び出し」の最中に bot が再起動し、ターンの終わりを
+    新しいプロセスが読んだときも、その返事を答えにしてカーソルを進める。新しいプロセスは起動時の読み戻し
+    (`_silent_text_at_end`) で、開いているターンの「ツール呼び出しの前に通知なしで出た返事」の uuid を拾う
+    （メッセージ自体は前のプロセスが投稿したので、`last_message_id` は付かない）。以前はこの記憶がプロセスと一緒に
+    消え、そのターンのカーソルが進まず、次の再起動で同じ返事がもう一度投稿されていた。
 - 救出の判定は、カーソルとの**等価比較ではなく順序**で行う:
   カーソルが最後の完了ターンの最終回答**以降**にあれば配信済み → 何もしない。
   カーソルがそれより**前**にあれば、そのターンは mirror が止まっている間に
@@ -361,6 +366,7 @@ uuid を返す。判定が等価比較だったので「不一致 → 落ちた�
 | カーソルを進めるのは最終回答の配信時だけ | `transcript/mirror.py` の `_delivered_uuid` / `_flush_pending_as_reply` |
 | 中間メッセージではカーソルを進めない | `transcript/mirror.py::_flush_pending_silently` |
 | 最後のツール呼び出しの前の返事を、ターンの終わりで答えにする (#1125) | `transcript/mirror.py::_adopt_last_silent_as_answer` |
+| 再起動をまたいだターンでも同じ返事を答えにする (#1187) | `transcript/mirror.py::_silent_text_at_end` / `_read_back` |
 | 順序による救出判定 | `transcript/recovery.py::final_answer_needs_recovery` |
 | 呼び出し側 | `cogs/transcript_mirror.py::_recover_final_answer` |
 

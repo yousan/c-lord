@@ -816,6 +816,54 @@ def _turn_state_at_end(
     return opened_by, opened_at, agents
 
 
+def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
+    """The uuid of the open turn's last text that went out silently, at *end* (#1187).
+
+    The live loop's ``_last_silent`` (#1125) replayed over what the old process
+    read: a text followed by a tool call or a thinking block was posted silently
+    as an intermediate. ``None`` when the turn's last text is still held (the old
+    process flushed that as the reply when it stopped), when it was followed by
+    nothing, or when the file cannot be read. Blocking.
+    """
+    try:
+        lines = list(_read_back_lines(path, end))
+    except OSError:
+        return None
+    silent: str | None = None
+    held: str | None = None
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if _is_turn_end(event) or (
+            _is_user_prompt(event)
+            and _prompt_kind(event) == "person"
+            and not is_harness_user_record(event)
+        ):
+            silent = held = None  # a new turn's answer is its own
+            continue
+        if event.get("isSidechain"):
+            continue
+        rendered = render_event(event)
+        if rendered is None:
+            continue
+        if rendered.kind in _BUFFERED_KINDS or rendered.kind == "thinking":
+            if held is not None:
+                silent, held = held, None
+        elif rendered.kind == "assistant_text" and event.get("type") == "assistant":
+            if api_error_text(event) is not None or banner_only(rendered.body) is not None:
+                continue
+            if is_rate_limit_event(event) and is_refusal_shaped(rendered.body):
+                continue
+            if held is not None:
+                silent = held
+            held = event.get("uuid") or None
+    return None if held is not None else silent
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -933,6 +981,9 @@ class TranscriptMirror:
         # #1011/#1012: restored at startup — the tail starts at the end of a
         # transcript the old process was reading, so learn where it stood.
         self._resumed = resumed
+        # #1187: the restored turn's text the old process posted silently, for
+        # ``_run`` to take as its ``_last_silent`` (set by ``_read_back``).
+        self._read_back_silent: str | None = None
 
     def note_turn_started(self, trigger_id: int | None = None) -> None:
         """Tell the progress line a turn just began (#539).
@@ -1063,6 +1114,17 @@ class TranscriptMirror:
                 # announce its end, this mirror does, as for any such turn (#961).
                 turn_events.note_self_turn_started(
                     self.thread_id, at=_event_time({"timestamp": opened_at})
+                )
+        if opened_by is not None:
+            # #1187: the text before the turn's last tool call is its answer at
+            # the turn end (#1125) — the old process's memory of it is gone.
+            try:
+                self._read_back_silent = await asyncio.to_thread(_silent_text_at_end, jsonl, end)
+            except Exception:
+                logger.warning(
+                    "%s TranscriptMirror: could not read back the turn's last text (#1187)",
+                    log_ctx(thread_id=self.thread_id),
+                    exc_info=True,
                 )
         if opened_by is not None or agents:
             logger.info(
@@ -1337,6 +1399,11 @@ class TranscriptMirror:
                                 sample.suffix,
                             )
                     continue
+
+                if self._read_back_silent is not None:
+                    # #1187: the read-back runs before the first row is queued.
+                    _last_silent = (self._read_back_silent, None)
+                    self._read_back_silent = None
 
                 # #1041: one row this loop cannot handle must not end it — the mirror is
                 # the thread's only delivery, and the thread used to go silent for good
