@@ -2845,6 +2845,23 @@ async def test_a_pane_bang_answer_with_tools_keeps_progress_but_no_quote(
     assert _run_notification_turn.file_kwargs == [{"quote": False}]  # type: ignore[attr-defined]
 
 
+async def test_notification_while_bang_answer_held_keeps_label(tmp_path: Path) -> None:
+    """#1189: a notification (Monitor etc.) read while the answer to a pane ``!``
+    command is still held. RED: the notification dropped the label, but only a
+    person's prompt delivered the held text first — so the answer went out
+    with no line saying it answered ``!ls``."""
+    sink_calls, reply_calls, _ = await _run_notification_turn(
+        tmp_path,
+        *_pane_bang_events(),
+        _assistant_text("No response requested."),
+        _user_str(_MONITOR_EVENT),
+        _assistant_tool_use("Bash", "x"),
+        _assistant_text("Still running."),
+    )
+    assert "No response requested." not in reply_calls
+    assert f"{_BANG_LABEL}\nNo response requested." in sink_calls
+
+
 async def test_a_person_turn_after_a_pane_bang_is_not_labelled(tmp_path: Path) -> None:
     """The label belongs to the answer to the command, not to the next request's."""
     sink_calls, reply_calls, _ = await _run_notification_turn(

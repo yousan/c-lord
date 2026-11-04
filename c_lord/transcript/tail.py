@@ -76,6 +76,9 @@ UnresolvedCb = Callable[[UnresolvedTranscript], Awaitable[None]]
 #: ``(transcript, offset)`` — where the tail starts following (#1018). ``None``
 #: when no transcript was resolvable yet.
 StartCb = Callable[[Path | None, int], Awaitable[None]]
+#: ``True`` once there is a transcript to read (or one c-lord named and Claude is
+#: about to write), ``False`` while there is none (#1190). Called on each change.
+ResolvedCb = Callable[[bool], None]
 
 # Read the seeding baseline in bounded slices instead of one ``read(offset)``:
 # a production transcript reaches ~100 MB and the seeding of every session now
@@ -230,6 +233,9 @@ class _FollowState:
     resolved: bool = True
     # The bytes just before ``offset`` as they were when we got there (#906).
     signature: bytes = b""
+    # #1188: why the last poll could not stat / read the transcript, when it was
+    # not simply gone. Logged by the caller on the event loop, sampled.
+    read_error: OSError | None = None
 
 
 def _open_initial_state(project_dir: Path, from_start: bool) -> _FollowState:
@@ -361,6 +367,7 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     while this is running.
     """
     state.more_to_read = False
+    state.read_error = None
 
     active = state.resolver.resolve()
     state.resolved = active is not None
@@ -381,9 +388,13 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
 
     try:
         stat = active.stat()
-    except OSError:
+    except OSError as exc:
         # #1102: not only a vanished file — PermissionError / EIO too. Dropped
-        # like a missing file; the next poll stats it again.
+        # like a missing file; the next poll stats it again. #1188: but those
+        # are reported — a vanished file is routine, a refused one is a silent
+        # thread with no other trace.
+        if not isinstance(exc, FileNotFoundError):
+            state.read_error = exc
         _drop_current(state)
         return []
     size = stat.st_size
@@ -416,7 +427,9 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
             f.seek(state.offset)
             chunk = f.read(_READ_CHUNK_BYTES)
             state.offset += len(chunk)
-    except OSError:
+    except OSError as exc:
+        if not isinstance(exc, FileNotFoundError):
+            state.read_error = exc  # #1188
         _drop_current(state)
         return []
 
@@ -454,6 +467,7 @@ async def tail_events(
     on_unresolved: UnresolvedCb | None = None,
     unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
     on_start: StartCb | None = None,
+    on_resolved: ResolvedCb | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield JSONL events as they appear under ``project_dir``.
 
@@ -480,6 +494,11 @@ async def tail_events(
         starts on and the offset it starts from (#1018). A caller that reads
         what came before reads up to exactly that offset: a line written while
         it reads is then the tail's, never lost in between, never read twice.
+    on_resolved
+        Called after the first poll and whenever it changes, with whether this
+        tail has a transcript to follow (#1190): one it resolved, or the one
+        c-lord named in ``.clord-session`` that Claude writes with its first
+        prompt. Synchronous; an exception is logged, never raised.
     """
     # Issue #433: events already yielded (or present at start) must not be
     # re-emitted when the read offset is reset to 0 (truncation / in-place
@@ -494,6 +513,8 @@ async def tail_events(
         await on_start(start, state.offsets.get(start, 0) if start is not None else 0)
     # When the current run of "nothing to read" began, or None while healthy.
     unresolved_since: float | None = None
+    # What on_resolved last heard (#1190); None until the first poll.
+    reported_found: bool | None = None
 
     while True:
         # The whole cycle — glob, stat, read, parse — in one worker-thread hop.
@@ -516,6 +537,29 @@ async def tail_events(
                 )
             events = []
             state.more_to_read = False
+        if state.read_error is not None:
+            # #1188: _poll_once kept going, but the thread hears nothing while
+            # this lasts. Same sampler as above: once per directory an hour.
+            sample = _POLL_FAILURE_LOG.sample(str(project_dir))
+            if sample.emit:
+                logger.error(
+                    "tail_events: cannot read the transcript (%s: %s) — this thread gets no "
+                    "replies while it lasts; retrying on the next poll (%s)%s",
+                    type(state.read_error).__name__,
+                    state.read_error,
+                    project_dir,
+                    sample.suffix,
+                )
+        found = state.resolved or state.resolver.claimed_session_id is not None
+        if on_resolved is not None and found != reported_found:
+            reported_found = found
+            try:
+                on_resolved(found)
+            except Exception:
+                logger.warning(
+                    "tail_events: resolved callback failed for %s", project_dir, exc_info=True
+                )
+
         for event in events:
             yield event
 

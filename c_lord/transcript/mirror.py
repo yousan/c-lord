@@ -864,6 +864,37 @@ def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
     return None if held is not None else silent
 
 
+def _api_error_at_end(path: Path, end: int | None = None) -> str | None:
+    """The open turn's API-error text at *end* of *path*, as the live loop would hold it.
+
+    #1179: the live loop keeps the latest main-chain reply's API-error text
+    (#908/#1131) and drops it at the turn end. A restart between that row and the
+    ``turn_duration`` lost it, so a self-started turn that failed was recorded as
+    a completion with no ❌. Blocking; ``None`` when the file cannot be read.
+    """
+    try:
+        lines = list(_read_back_lines(path, end))
+    except OSError:
+        return None
+    failed: str | None = None
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if (
+            event.get("type") == "assistant"
+            and not event.get("isSidechain")
+            and not is_rate_limit_event(event)
+        ):
+            failed = api_error_text(event)
+        if _is_turn_end(event) and not event.get("isSidechain"):
+            failed = None
+    return failed
+
+
 class TranscriptMirror:
     """Tail one project's jsonl and forward rendered events to ``sink``."""
 
@@ -1050,9 +1081,16 @@ class TranscriptMirror:
             return
         self._task = asyncio.create_task(self._run(), name=f"transcript-mirror-{self.thread_id}")
         _LIVE_MIRRORS[self.thread_id] = self
-        turn_end_bus.note_tailing(self.thread_id, True)
+        # #1190: "tailing" (which makes the pane wait for the instruction to
+        # reach the transcript, #1132) is said by the tail once it has one —
+        # see _note_resolved. A thread with none keeps the pane's own exit.
         if self._subagent_log is not None:
             self._subagent_log.start()
+
+    def _note_resolved(self, found: bool) -> None:
+        """The tail found a transcript to read, or lost it (#1190)."""
+        if _LIVE_MIRRORS.get(self.thread_id) is self:
+            turn_end_bus.note_tailing(self.thread_id, found)
 
     async def stop(self) -> None:
         """Cancel the tail task and wait for it to settle.  Safe to call repeatedly."""
@@ -1106,6 +1144,16 @@ class TranscriptMirror:
             return
         self._background_agents |= agents
         if opened_by is not None:
+            # #1179: a turn still open may already have stopped on an API error.
+            # Read only then — a turn closed before the restart carries none over.
+            try:
+                self._turn_api_error = await asyncio.to_thread(_api_error_at_end, jsonl, end)
+            except Exception:
+                logger.warning(
+                    "%s TranscriptMirror: could not read back the open turn's API error (#1179)",
+                    log_ctx(thread_id=self.thread_id),
+                    exc_info=True,
+                )
             self._turn_open = True
             self._turn_by_notification = opened_by == "notification"
             self._turn_self_started = opened_by in ("notification", "wakeup")
@@ -1336,6 +1384,7 @@ class TranscriptMirror:
                     on_unresolved=self._on_unresolved,
                     unresolved_after=self._unresolved_after,
                     on_start=self._read_back if self._resumed else None,
+                    on_resolved=self._note_resolved,
                 ):
                     await queue.put(event)
             except asyncio.CancelledError:
@@ -1614,6 +1663,17 @@ class TranscriptMirror:
                             progress_buf.clear()
                         self._turn_trigger = self._latest_trigger
                     if _forget_bang_answer:
+                        if (
+                            self._answering_bang is not None
+                            and self._verbosity == "minimal"
+                            and _pending_text is not None
+                        ):
+                            # #1189: a notification / wakeup opening a turn gets no
+                            # #912 pre-flush above (only a person's prompt does), yet
+                            # the held text is the pane command's answer — deliver it
+                            # with its label before the label goes.
+                            await _flush_pending_as_reply()
+                            await _commit_cursor()
                         # #1099: a new request's answer is not the pane command's.
                         self._answering_bang = None
                         _forget_bang_answer = False
