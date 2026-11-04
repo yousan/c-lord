@@ -321,7 +321,9 @@ Notes and limits:
   and the open are one act: the file is opened by walking from the session-dir
   base one component at a time with `openat` + `O_NOFOLLOW`, so swapping a
   directory for an outward symlink after the check fails the open instead of
-  attaching the outside file (#1106). The logged value is `repr`'d so a newline
+  attaching the outside file (#1106). The directories on the way are opened for search
+  only (`O_PATH` on Linux, `O_SEARCH` where Python offers it), so a directory one may pass
+  through but not list (mode `0311`) does not hide the file under it (#1185). The logged value is `repr`'d so a newline
   in it cannot forge a log line (#1107). Without this, a
   caller let in with `CLORD_API_SECRET` could have the bot attach its own `.env`
   to a thread. This narrows one direct read path; it is not a sandbox — the same

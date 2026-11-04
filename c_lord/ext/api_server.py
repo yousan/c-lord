@@ -128,13 +128,17 @@ def _open_inside(base: str | None, requested: object) -> io.BufferedReader | str
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
+    # #1185: a directory is only walked through, never listed — so open it for
+    # search (O_PATH on Linux, O_SEARCH elsewhere), not for reading. O_RDONLY
+    # needed read permission and turned a file under a 0311 dir into a 400.
+    walk = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY
     try:
-        dir_fd = os.open(root, os.O_RDONLY | directory | cloexec)
+        dir_fd = os.open(root, walk | directory | cloexec)
     except OSError:
         return _UNOPENABLE
     try:
         for name in parts[:-1]:
-            nxt = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=dir_fd)
+            nxt = os.open(name, walk | directory | nofollow | cloexec, dir_fd=dir_fd)
             os.close(dir_fd)
             dir_fd = nxt
         # O_NONBLOCK: a FIFO planted here must not hang the request.
