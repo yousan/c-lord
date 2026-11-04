@@ -242,6 +242,9 @@ def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
     担う子 (index-pack / ssh) が書きかけの pack を育て続けていた。
     別グループなので bot の停止は届かない — ``stop_running_git`` が代わりに止める (#1174)。
     """
+    if _stopping.is_set():
+        # The bot is stopping (#1174): start no new git it could not stop.
+        return None
     try:
         proc = subprocess.Popen(
             args,

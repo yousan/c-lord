@@ -681,8 +681,11 @@ def test_background_fetch_git_dies_with_the_bot_1174(
     mark.touch()
     old = time.time() - 7200
     os.utime(mark, (old, old))
+    # A terminal's Ctrl-C reaches a process whose SIGINT is not ignored; a test run
+    # launched as a background job inherits it ignored, so restore the default.
     code = textwrap.dedent(f"""
-        import time, c_lord.git_mirrors as gm
+        import signal, time, c_lord.git_mirrors as gm
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         gm.ensure_mirror({str(root)!r}, {origin!r})
         time.sleep(0.5)
         print("started", flush=True)
@@ -698,6 +701,12 @@ def test_background_fetch_git_dies_with_the_bot_1174(
     try:
         assert p.stdout is not None
         p.stdout.readline()
+        # Stop it while git is receiving — what the Issue is about. Under load the
+        # background fetch may not have started yet at "started".
+        pack_dir = mirror / "objects" / "pack"
+        deadline = time.monotonic() + 15
+        while not list(pack_dir.glob("tmp_pack_fake*")) and time.monotonic() < deadline:
+            time.sleep(0.05)
         os.killpg(p.pid, signal.SIGINT)
         p.wait(timeout=10)
         time.sleep(0.5)
