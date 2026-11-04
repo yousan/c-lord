@@ -109,6 +109,11 @@ def _load(*, refresh: bool = False) -> set[int]:
     if refresh:
         path = registry_path()
         stamp = _stamp(path)
+        if stamp is None and _ours:
+            # #1204: the file is gone. Ours must be on it — recreate it (another
+            # instance's ids are lost with the file either way; they re-add theirs).
+            _flush_ours(path, quiet=_unwritten)
+            return _ids
         if stamp is not None and stamp != _seen_stamp:
             read = _read_file(path, quiet=stamp == _failed_stamp)
             if read is None:

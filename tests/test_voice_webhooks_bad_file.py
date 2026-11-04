@@ -220,3 +220,13 @@ def test_our_own_voice_is_enough_to_write_it(tmp_path, monkeypatch) -> None:  # 
     registry.chmod(0o644)
     assert v.is_voice_webhook(888)  # our own voice, known in memory
     assert 888 in json.loads(registry.read_text())
+
+
+def test_a_deleted_file_is_recreated_with_our_id(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """#1204: someone removed the file and nobody recreates it — ours goes back."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    v.register(111)
+    assert 111 in json.loads(registry.read_text())
+    registry.unlink()
+    v.is_voice_webhook(999)  # an unknown webhook makes it look at the file
+    assert 111 in json.loads(registry.read_text())

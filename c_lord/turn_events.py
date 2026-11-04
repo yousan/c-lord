@@ -375,9 +375,17 @@ def note_turn_end(
                 _deliver("failure", held.info if held is not None else own, reason=failure_reason)
             )
             return
-        released = outstanding == 0 and _release(thread_id, reason=None)
         parked = _HELD.get(thread_id)
-        if outstanding > 0 and parked is not None and not parked.expires:
+        # #1202: a menu-wait hold is the answer's to release (#1195) — an end the
+        # transcript dates before the menu is a previous turn's, however late it
+        # reached the mirror.
+        stale = (
+            parked is not None
+            and not parked.expires
+            and ended < _BLOCKED_AT.get(thread_id, float("-inf"))
+        )
+        released = outstanding == 0 and not stale and _release(thread_id, reason=None)
+        if outstanding > 0 and parked is not None and not parked.expires and not stale:
             # #1170: the menu was answered and the turn ended with agents still
             # out — from here it is #917's wait, with #917's time limit.
             _hold(parked.info, outstanding, reason=parked.reason)
