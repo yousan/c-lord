@@ -228,6 +228,24 @@ class TestTheOneExceptionIsRunningDocker:
     """唯一の例外 — ポートを掴んだままなので、知らないと次に衝突する。"""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["paused", "restarting"])
+    async def test_a_paused_container_still_gets_the_notice(self, monkeypatch, status) -> None:
+        """Review of #1182: paused / restarting keep their ports, so the reader is told."""
+        import c_lord.cogs.session_manage as sm
+
+        c = DevContainer("id1", "supabase_db_555", status, (55322,), "p", "mount")
+        monkeypatch.setattr(sm, "containers_for_session_dir", AsyncMock(return_value=[c]))
+        monkeypatch.setattr(sm, "stop_containers", AsyncMock(return_value=[]))
+
+        ws = _cog()
+        thread = _thread()
+        await ws.cog._sleep_workspace_impl(channel=thread, idle_label="4時間")
+
+        thread.send.assert_awaited_once()
+        embed = thread.send.await_args.kwargs["embed"]
+        assert "55322" in "".join(f.value for f in embed.fields)
+
+    @pytest.mark.asyncio
     async def test_a_notice_names_the_ports_that_stay_held(self, monkeypatch) -> None:
         import c_lord.cogs.session_manage as sm
 

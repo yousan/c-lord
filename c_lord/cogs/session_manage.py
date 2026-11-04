@@ -2071,7 +2071,8 @@ class SessionManageCog(commands.Cog):
                 session_dir = str(Path(sdm.base_dir) / str(thread_id))
                 containers = await containers_for_session_dir(session_dir)
 
-        if any(c.running for c in containers):
+        # Paused / restarting ones hold their ports too (review of #1182).
+        if any(c.holds_ports for c in containers):
             # Built by the shared inventory builder, not a bespoke line: a notice
             # says what stopped *and what survived*, because "did I just lose
             # something?" is the reader's actual question (#571). Two functions

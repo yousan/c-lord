@@ -193,7 +193,10 @@ def test_setup_bridge_lounge_reads_the_coordination_id_the_same_way(
 
     monkeypatch.setenv("COORDINATION_CHANNEL_ID", value)
     assert coordination_channel_id_from_env() == expected
-    assert "coordination_channel_id_from_env()" in inspect.getsource(setup_mod.setup_bridge)
+    # setup_bridge hands that value on as the lounge channel (not just calls it).
+    assert "lounge_channel_id = coordination_channel_id_from_env()" in inspect.getsource(
+        setup_mod.setup_bridge
+    )
 
 
 def test_claude_chat_coordination_ignores_a_superscript_id(monkeypatch) -> None:  # noqa: ANN001
