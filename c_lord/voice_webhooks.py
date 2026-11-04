@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -51,6 +52,12 @@ _failed_stamp: tuple[int, int] | None = None
 # there is usually no second ``register``: the voice webhook is cached per
 # parent channel for the life of the process.
 _ours: set[int] = set()
+# Some of ``_ours`` is not known to be on disk yet (#1176). While so, any lookup
+# — our own voices included — tries the file again, at most every
+# ``_RETRY_SECONDS``: a quiet instance may see no unknown webhook for days.
+_unwritten = False
+_next_retry = 0.0
+_RETRY_SECONDS = 60.0
 
 
 def registry_path() -> Path:
@@ -116,13 +123,10 @@ def _load(*, refresh: bool = False) -> set[int]:
             _ids |= read
             if not _ours <= read:
                 # Ours is not on disk: until it is, a restart or another
-                # instance obeys our sub-agents' voices (#1176).
-                try:
-                    _write_merged(path)
-                except OSError:
-                    logger.warning("voice webhooks: could not write %s", path, exc_info=True)
-                else:
-                    return _ids
+                # instance obeys our sub-agents' voices (#1176). Reported once:
+                # a write that keeps failing is not one WARNING per message.
+                _flush_ours(path, quiet=_unwritten)
+                return _ids
         _seen_stamp = stamp
     return _ids
 
@@ -141,29 +145,60 @@ def _file_lock(path: Path) -> Iterator[None]:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def _write_merged(path: Path) -> None:
+def _write_merged(path: Path, *, quiet: bool = False) -> bool:
     """Send what this process knows to *path*, merged with it, under the host lock.
 
     Call with ``_lock`` held and the file lock *not* held (``flock`` is per open
     file, so taking it twice in one process deadlocks). Unreadable is not empty
     (#1109): nothing is written then, and ours stays in memory for the next read.
+    ``True`` when all of ours is on disk afterwards. Raises ``OSError`` when the
+    write fails.
     """
     global _ids, _seen_stamp
     ids = _ids if _ids is not None else set()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _file_lock(path):
-        on_disk = _read_file(path)
+        on_disk = _read_file(path, quiet=quiet)
         if on_disk is None:
-            return
+            return False
         ids |= on_disk
         _ids = ids
         if _ours <= on_disk:
             _seen_stamp = _stamp(path)
-            return
+            return True
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(sorted(ids)), encoding="utf-8")
         tmp.replace(path)
         _seen_stamp = _stamp(path)
+        return True
+
+
+def _flush_ours(path: Path, *, quiet: bool) -> None:
+    """Try to get all of ``_ours`` onto disk; on failure, look at the file again later.
+
+    Call with ``_lock`` held. A failed read or write forgets the file's stamp:
+    a permission put back, or a directory made writable again, changes neither
+    its mtime nor its size, and a remembered stamp would skip it for good (#1176).
+    """
+    global _unwritten, _next_retry, _seen_stamp
+    _next_retry = time.monotonic() + _RETRY_SECONDS
+    try:
+        written = _write_merged(path, quiet=quiet)
+    except OSError:
+        _unwritten = True
+        _seen_stamp = None
+        if not quiet:
+            # Still known for this process; only a restart would forget it.
+            logger.warning(
+                "voice webhooks: could not write %s (tried again at most every %.0fs)",
+                path,
+                _RETRY_SECONDS,
+                exc_info=True,
+            )
+        return
+    _unwritten = not written
+    if not written:
+        _seen_stamp = None
 
 
 def register(webhook_id: int) -> None:
@@ -176,20 +211,18 @@ def register(webhook_id: int) -> None:
     with _lock:
         _load().add(webhook_id)
         _ours.add(webhook_id)
-        path = registry_path()
-        try:
-            # Not written while the file is unreadable (#1109); then it goes to
-            # the file the next time any read of it succeeds (#1176).
-            _write_merged(path)
-        except OSError:
-            # Still known for this process; only a restart would forget it.
-            logger.warning("voice webhooks: could not write %s", path, exc_info=True)
+        # Not written while the file is unreadable (#1109); then it goes to the
+        # file the next time a read of it succeeds (#1176).
+        _flush_ours(registry_path(), quiet=False)
 
 
 def is_voice_webhook(webhook_id: int | None) -> bool:
     if not webhook_id:
         return False
     with _lock:
+        if _unwritten and time.monotonic() >= _next_retry:
+            # #1176: ours is not on disk yet — try again, quietly.
+            _flush_ours(registry_path(), quiet=True)
         if webhook_id in _load():
             return True
         # Unknown here — another instance may have registered it since (#1024).
@@ -203,9 +236,11 @@ def is_voice_message(message: object) -> bool:
 
 
 def _reset_for_tests() -> None:
-    global _ids, _seen_stamp, _failed_stamp
+    global _ids, _seen_stamp, _failed_stamp, _unwritten, _next_retry
     with _lock:
         _ids = None
         _seen_stamp = None
         _failed_stamp = None
+        _unwritten = False
+        _next_retry = 0.0
         _ours.clear()

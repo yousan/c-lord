@@ -164,3 +164,59 @@ def test_register_of_an_id_already_on_disk_flushes_pending_ids(registry: Path) -
     registry.write_text("[777, 999]")
     v.register(999)
     assert 888 in json.loads(registry.read_text())
+
+
+# --- #1176, independent review: the stamp a failure leaves behind ---------------
+
+
+def _fresh(tmp_path, monkeypatch):  # noqa: ANN001, ANN202
+    from c_lord import voice_webhooks as v
+
+    monkeypatch.setattr(v, "registry_path", lambda: tmp_path / "voice-webhooks.json")
+    monkeypatch.setattr(v, "_RETRY_SECONDS", 0.0)
+    v._reset_for_tests()
+    return v, tmp_path / "voice-webhooks.json"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_id_reaches_the_file_after_a_permission_flip_on_a_file_read_before(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    """chmod 0 → register → chmod 644 changes neither mtime nor size."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    registry.chmod(0)
+    v.register(888)
+    registry.chmod(0o644)
+    for _ in range(3):
+        v.is_voice_webhook(4242)
+    assert 888 in json.loads(registry.read_text())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_a_failed_write_is_tried_again(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The directory was read-only during register; it is writable again later."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    tmp_path.chmod(0o555)
+    try:
+        v.register(888)
+    finally:
+        tmp_path.chmod(0o755)
+    v.is_voice_webhook(4242)
+    assert 888 in json.loads(registry.read_text())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_our_own_voice_is_enough_to_write_it(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A quiet instance sees no unknown webhook; its own voices still get it written."""
+    v, registry = _fresh(tmp_path, monkeypatch)
+    registry.write_text("[777]")
+    assert v.is_voice_webhook(777)
+    registry.chmod(0)
+    v.register(888)
+    registry.chmod(0o644)
+    assert v.is_voice_webhook(888)  # our own voice, known in memory
+    assert 888 in json.loads(registry.read_text())
