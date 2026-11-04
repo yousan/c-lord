@@ -358,3 +358,57 @@ def test_a_turn_after_an_api_error_turn_is_recovered_as_usual(tmp_path: Path) ->
     assert final_answer_needs_recovery(tmp_path, _PREVIOUS_ANSWER) == FinalAnswer(
         "u-next", "続きの本物の答え"
     )
+
+
+# --- #1191: an undelivered answer before a turn that ended in an error ---------
+#
+# The mirror was down while two turns ended: the first with a real answer, the
+# second (a task notification, a "続けて") refused at once by the usage limit or
+# ended by an API error. #1143 made the errored turn have no answer, and that
+# also hid the first one — it was never posted, before the restart or after.
+
+
+def _prompt(uuid: str, text: str) -> dict:
+    return {"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}}
+
+
+def test_dropped_answer_then_limit_only_turn_is_still_recovered(tmp_path: Path) -> None:
+    """c0 delivered → turn 1 answers A while the mirror is down (not delivered)
+    → turn 2 (e.g. a task-notification turn) is refused by the usage limit at once.
+    A is the last real answer nobody posted; the cursor is before it."""
+    from c_lord.transcript.recovery import final_answer_needs_recovery
+
+    _write_jsonl(
+        tmp_path / "s.jsonl",
+        [
+            _assistant("c0", "配達済みの答え"),
+            _turn_end(),
+            _prompt("p1", "依頼1"),
+            _assistant("A", "取りこぼした本物の答え"),
+            _turn_end(),
+            _prompt("p2", "<task-notification>done</task-notification>"),
+            _rate_limit_banner("L", "You've hit your session limit · resets 3pm (Asia/Tokyo)"),
+            _turn_end(),
+        ],
+    )
+    assert final_answer_needs_recovery(tmp_path, "c0") == FinalAnswer("A", "取りこぼした本物の答え")
+
+
+def test_dropped_answer_then_api_error_only_turn_is_still_recovered(tmp_path: Path) -> None:
+    from c_lord.transcript.recovery import final_answer_needs_recovery
+
+    api_error = json.loads((_FIXTURES / "i1143_api_error_row.json").read_text(encoding="utf-8"))
+    _write_jsonl(
+        tmp_path / "s.jsonl",
+        [
+            _assistant("c0", "配達済みの答え"),
+            _turn_end(),
+            _prompt("p1", "依頼1"),
+            _assistant("A", "取りこぼした本物の答え"),
+            _turn_end(),
+            _prompt("p2", "続けて"),
+            api_error,
+            _turn_end(),
+        ],
+    )
+    assert final_answer_needs_recovery(tmp_path, "c0") == FinalAnswer("A", "取りこぼした本物の答え")
