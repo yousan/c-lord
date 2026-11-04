@@ -772,6 +772,12 @@ class SubagentLog:
                     sender = self._name(str(origin.get("from") or origin.get("name") or "?"))
                     body = str(origin.get("body") or _unwrap(content))
                     agent.lines.append(f"📨 ← {sender}: {body}")
+                elif isinstance(origin, dict) and origin.get("kind") == "coordinator":
+                    # #1203: the parent's question that resumed it (#1177) — without
+                    # it the md holds an answer to nothing anyone can read.
+                    body = _COORDINATOR_PREFIX.sub("", _unwrap(content), count=1)
+                    body = _COORDINATOR_SUFFIX.sub("", body, count=1)
+                    agent.lines.append(f"📨 ← {PARENT_NAME}: {body}")
                 return
             if isinstance(content, str):
                 text = _unwrap(content)
@@ -1058,6 +1064,14 @@ def _write_document(
         logger.warning("SubagentLog: could not write the attachment", exc_info=True)
         return None
 
+
+#: How the CLI opens a message from the parent in the agent's file (#1203).
+#: CLI 2.1.305–2.1.318 (measured): "The coordinator sent a message while you were
+#: working:\n<text>\n\nAddress this before completing your current task."
+_COORDINATOR_PREFIX = re.compile(
+    r"\AThe coordinator sent a message(?: while you were working)?:\s*"
+)
+_COORDINATOR_SUFFIX = re.compile(r"\s*Address this before completing your current task\.\s*\Z")
 
 #: How the CLI opens an agent's own background-task notice (#1136).
 _SYSTEM_NOTICE_PREFIX = "[SYSTEM NOTIFICATION - NOT USER INPUT]"

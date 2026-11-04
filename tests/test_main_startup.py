@@ -314,6 +314,22 @@ class TestShutdownSignals:
         assert len(loop.created) == 1
         assert any("repeated signal" in r.getMessage() for r in caplog.records)
 
+    def test_the_stop_signal_also_stops_the_mirror_git_1174(self) -> None:
+        """ミラー更新の git は別のプロセスグループなので、停止シグナルで明示的に止める。
+
+        止めないと SIGTERM / Ctrl-C で bot が終わったあとも git がミラーに書き続ける。
+        """
+        loop = _FakeLoop()
+        install_shutdown_signal_handlers(loop, AsyncMock())  # type: ignore[arg-type]
+
+        with (
+            patch.object(main_mod, "arm_shutdown_watchdog"),
+            patch.object(main_mod, "stop_running_git") as stop,
+        ):
+            loop.handlers[signal.SIGTERM]()  # type: ignore[operator]
+
+        stop.assert_called_once_with()
+
 
 class TestLoadConfigRequiredKeys:
     @pytest.mark.parametrize("missing", ["DISCORD_BOT_TOKEN", "DISCORD_CHANNEL_ID"])
