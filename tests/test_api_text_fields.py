@@ -67,6 +67,7 @@ TASK = {"name": "n", "prompt": "p", "interval_seconds": 60, "channel_id": 1}
             "question",
         ),
         ("/api/spawn", {"prompt": 1.5}, "prompt"),
+        ("/api/spawn", {"prompt": "p", "thread_name": 5}, "thread_name"),  # review
         ("/api/threads/5/messages", {"content": {"a": 1}}, "content"),
         ("/api/lounge", {"message": None}, "message"),
         ("/api/lounge", {"message": 1}, "message"),
@@ -95,3 +96,15 @@ async def test_patch_task_working_dir_of_wrong_type_is_400(
     assert r.status == 400
     task = await tr.get(tid)
     assert task is not None and task["working_dir"] is None
+
+
+async def test_patch_task_working_dir_null_is_not_given(
+    env: tuple[TestClient, TaskRepository],
+) -> None:
+    """Review: ``null`` reads as "not given" everywhere (it was saved as "None")."""
+    c, tr = env
+    tid = (await (await c.post("/api/tasks", json={**TASK, "working_dir": "/w"})).json())["id"]
+    r = await c.patch(f"/api/tasks/{tid}", json={"working_dir": None, "prompt": "q"})
+    assert r.status == 200, await r.text()
+    task = await tr.get(tid)
+    assert task is not None and task["working_dir"] == "/w"

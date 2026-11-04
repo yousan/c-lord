@@ -752,8 +752,9 @@ class ApiServer:
                 # #1064: 0 / negative / false were saved with a 200.
                 return web.json_response({"error": _INTERVAL_ERROR}, status=400)
             patch_kwargs["interval_seconds"] = interval
-        if "working_dir" in data:
+        if data.get("working_dir") is not None:
             # #1183: a list was saved as the text "['x']" — same rule as on create.
+            # ``null`` is "not given", as everywhere (it was saved as "None").
             if not isinstance(data["working_dir"], str):
                 return web.json_response({"error": "working_dir must be a string"}, status=400)
             patch_kwargs["working_dir"] = data["working_dir"]
@@ -904,6 +905,10 @@ class ApiServer:
         if channel_id is None:
             return web.json_response({"error": "channel_id must be an integer"}, status=400)
 
+        raw_thread_name, err = _text(data, "thread_name")  # #1183 (review)
+        if err is not None:
+            return err
+
         # Resolve ClaudeChatCog lazily from the bot (zero-config; no constructor change).
         from ..cogs.claude_chat import ClaudeChatCog  # avoid circular import at module level
 
@@ -929,7 +934,7 @@ class ApiServer:
                 status=400,
             )
 
-        thread_name: str | None = data.get("thread_name") or None
+        thread_name: str | None = raw_thread_name or None
 
         try:
             thread = await cog.spawn_session(raw, prompt, thread_name=thread_name)

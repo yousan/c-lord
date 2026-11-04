@@ -620,7 +620,7 @@ ISO 8601 string, `message` a non-empty string and `title` (optional) a string (#
 
 A text field sent as anything other than a JSON string — a number, `true`, a list, an object —
 is a `400 {"error": "<field> must be a string"}`, not a `500` (#1183): `content` on `/api/reply`
-and `/api/threads/{id}/messages`, `question` on `/api/prompt-choice`, `prompt` on `/api/spawn`,
-`message` on `/api/lounge`, `session_id` / `resume_prompt` on `/api/mark-resume`, and
+and `/api/threads/{id}/messages`, `question` on `/api/prompt-choice`, `prompt` / `thread_name` on
+`/api/spawn`, `message` on `/api/lounge`, `session_id` / `resume_prompt` on `/api/mark-resume`, and
 `working_dir` on `POST` / `PATCH /api/tasks` (a `PATCH` that fails this way changes nothing).
 Absent or `null` is the same as leaving the field out.
