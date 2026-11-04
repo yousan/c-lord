@@ -226,6 +226,13 @@ _SUBMIT_RETRY_DELAY = 0.5
 # How many times to look for the message leaving the box (each failed look after
 # the first re-presses Enter). Three looks ≈ 1.35s worst case before giving up.
 _SUBMIT_ATTEMPTS = 3
+# #1169: after those, keep looking — without pressing Enter again — before
+# calling the message lost. Right after an interrupt Claude Code is still
+# winding the old turn down (and runs its UserPromptSubmit hook) and holds the
+# accepted message in the box for seconds: production 2026-11-02 had it reach
+# the transcript 10s after the Enter, after c-lord had already reported ❌.
+_SUBMIT_LATE_POLL = 0.5
+_SUBMIT_LATE_LOOKS = 40  # 20s
 # A horizontal rule drawn by the TUI. The input box sits between the last two.
 _BOX_RULE_RE = re.compile(r"^\s*[─━]{10,}\s*$")
 # The placeholder a folded paste leaves in the input box. Compared against
@@ -3220,6 +3227,8 @@ class TmuxSessionManager:
                     thread_id,
                 )
                 _run(["tmux", "send-keys", "-t", target, "Enter"])
+        if self._accepted_late(target, payload, thread_id):
+            return True
         logger.error(
             "send_input: message never left the input box after %d Enter presses "
             "(thread=%d, %d chars); reporting a delivery failure instead of a "
@@ -3228,6 +3237,43 @@ class TmuxSessionManager:
             thread_id,
             len(payload),
         )
+        return False
+
+    def _accepted_late(self, target: str, payload: str, thread_id: int) -> bool:
+        """Did Claude Code take *payload* after all, just slowly? (#1169)
+
+        Watches for up to ``_SUBMIT_LATE_POLL * _SUBMIT_LATE_LOOKS`` seconds,
+        pressing nothing: an extra Enter on a box the TUI is about to empty could
+        only ever submit something twice. Two kinds of evidence end the wait —
+        the box no longer holds the message, or the transcript has it (the
+        mirror consumed the ``pane_echo`` entry ``send_input`` registered). A
+        frame that cannot be read is not evidence either way; keep looking.
+        """
+        from .transcript.pane_echo import pane_echo
+
+        registered = pane_echo.holds(thread_id, payload)
+        waited = 0.0
+        for _ in range(_SUBMIT_LATE_LOOKS):
+            time.sleep(_SUBMIT_LATE_POLL)
+            waited += _SUBMIT_LATE_POLL
+            if registered and not pane_echo.holds(thread_id, payload):
+                how = "the transcript has it"
+            else:
+                capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+                if (
+                    capture.returncode != 0
+                    or _input_box_retains(capture.stdout, payload) is not False
+                ):
+                    continue
+                how = "the box is empty"
+            logger.warning(
+                "send_input: message left the input box %.1fs after the last Enter "
+                "(thread=%d) — %s; Claude Code was still busy, not a failed send (#1169)",
+                waited,
+                thread_id,
+                how,
+            )
+            return True
         return False
 
     def send_literal(self, thread_id: int, text: str) -> bool:
