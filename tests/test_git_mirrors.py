@@ -401,7 +401,7 @@ def test_the_orphan_sweep_never_sees_the_mirror_dir(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, secs: int = 30) -> Path:
     """``fetch`` だけ「受信し続けて終わらない」git を PATH の先頭に置く。
 
     本物の時間切れと同じく、受信中の pack を ``objects/pack/tmp_pack_*`` に
@@ -419,7 +419,7 @@ def _fake_slow_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         f'  echo call >> "{log}"\n'
         '  pack="$2/objects/pack/tmp_pack_fake$$"\n'
         '  ( while true; do echo x >> "$pack"; sleep 0.05; done ) &\n'
-        "  sleep 30\n"
+        f"  sleep {secs}\n"
         "  exit 0\n"
         "fi\n"
         f'exec "{real}" "$@"\n'
@@ -591,3 +591,211 @@ def test_a_timed_out_mirror_clone_leaves_nothing_behind_1134(
     assert ensure_mirror(root, str(upstream)) is None
     time.sleep(0.3)
     assert [p.name for p in root.iterdir() if p.name != "README.md"] == []
+
+
+# --------------------------------------------------------------------------
+# #1152 の回帰 — #1173 (別の fetch の書きかけを消さない) / #1174 (bot と一緒に止まる)
+# --------------------------------------------------------------------------
+
+
+def test_timeout_cleanup_spares_a_pack_another_fetch_is_writing_1173(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """時間切れの片付けが、同じミラーで別の git がいま受信中の pack を消さない。
+
+    消すと、手で打った fetch や別の更新がその場で失敗する。c-lord が消してよいのは
+    自分が止めた git の書きかけだけ。
+    """
+    import threading
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, f"file://{upstream}")
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch)
+    monkeypatch.setattr(gm, "_FETCH_TIMEOUT", 1.5)
+
+    foreign = mirror / "objects" / "pack" / "tmp_pack_foreign"
+    stop = threading.Event()
+
+    def other_writer() -> None:  # c-lord の flock を持たない別の fetch
+        time.sleep(0.5)  # c-lord の fetch が before を撮ったあとに受信を始める
+        while not stop.is_set():
+            with open(foreign, "a") as fh:
+                fh.write("y")
+            time.sleep(0.05)
+
+    t = threading.Thread(target=other_writer)
+    t.start()
+    try:
+        ensure_mirror(root, f"file://{upstream}")  # 1.5 秒で時間切れ
+        alive_and_written = foreign.exists()
+    finally:
+        stop.set()
+        t.join()
+    assert alive_and_written, "別のプロセスがいま書いている tmp_pack を消した"
+    assert [p for p in _garbage(mirror) if p != "tmp_pack_foreign"] == [], (
+        "止めた自分の fetch の書きかけが残った"
+    )
+
+
+def _kill_procs_mentioning(text: str) -> None:
+    """コマンドラインに *text* を含むプロセスだけを止める (試験の後始末。pkill は使わない)。"""
+    import contextlib
+    import signal
+
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+        except OSError:
+            continue
+        if text in cmdline:
+            with contextlib.suppress(OSError):
+                os.kill(int(proc.name), signal.SIGKILL)
+
+
+def test_background_fetch_git_dies_with_the_bot_1174(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bot を Ctrl-C で止めたら、裏で走っていたミラー更新の git も一緒に止まる。
+
+    git は時間切れでグループごと止めるために自分のプロセスグループで走る (#1134)。
+    そのせいで端末の Ctrl-C が git に届かず、systemd の外で動かす利用者では bot が
+    終わったあとも git がミラーに書き続け、次の bot がもう1本 fetch を出していた。
+    """
+    import signal
+    import sys
+    import textwrap
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    origin = f"file://{upstream}"
+    mirror = ensure_mirror(root, origin)
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch, secs=20)
+    mark = mirror / gm.FETCH_TIMED_OUT_MARK
+    mark.touch()
+    old = time.time() - 7200
+    os.utime(mark, (old, old))
+    # A terminal's Ctrl-C reaches a process whose SIGINT is not ignored; a test run
+    # launched as a background job inherits it ignored, so restore the default.
+    code = textwrap.dedent(f"""
+        import signal, time, c_lord.git_mirrors as gm
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        gm.ensure_mirror({str(root)!r}, {origin!r})
+        time.sleep(0.5)
+        print("started", flush=True)
+    """)
+    # 端末で Ctrl-C したときと同じく、bot のプロセスグループに SIGINT を送る
+    p = subprocess.Popen(
+        [sys.executable, "-c", code + "time.sleep(30)"],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert p.stdout is not None
+        p.stdout.readline()
+        # Stop it while git is receiving — what the Issue is about. Under load the
+        # background fetch may not have started yet at "started".
+        pack_dir = mirror / "objects" / "pack"
+        deadline = time.monotonic() + 15
+        while not list(pack_dir.glob("tmp_pack_fake*")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.killpg(p.pid, signal.SIGINT)
+        p.wait(timeout=10)
+        time.sleep(0.5)
+        packs = list((mirror / "objects" / "pack").glob("tmp_pack_fake*"))
+        sizes1 = [x.stat().st_size for x in packs if x.exists()]
+        time.sleep(0.5)
+        sizes2 = [x.stat().st_size for x in packs if x.exists()]
+    finally:
+        _kill_procs_mentioning(str(tmp_path / "fakebin"))
+    assert sizes1 == sizes2, f"bot が終わったあとも git の受信が続いている: {sizes1} -> {sizes2}"
+
+
+@pytest.fixture(autouse=True)
+def _not_stopping():  # noqa: ANN202
+    import c_lord.git_mirrors as gm
+
+    stopping = getattr(gm, "_stopping", None)
+    if stopping is not None:
+        stopping.clear()
+    yield
+    if stopping is not None:
+        stopping.clear()
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="no /proc (macOS): growth only")
+def test_an_open_pack_is_seen_under_a_relative_or_symlinked_root_1173(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """独立レビュー: /proc は実体の絶対パスを返す。相対・シンボリックリンク経由の
+    ミラーの置き場所でも「誰かが開いている」と分かる（旧既定の data/sessions は相対）。"""
+    import c_lord.git_mirrors as gm
+
+    real = tmp_path / "real"
+    (real / "pack").mkdir(parents=True)
+    pack = real / "pack" / "tmp_pack_held"
+    pack.write_text("x")
+    (tmp_path / "link").symlink_to(real)
+    monkeypatch.chdir(tmp_path)
+    via_link = Path("link") / "pack" / "tmp_pack_held"
+    with open(pack):
+        assert gm._open_by_someone([via_link]) == {via_link}
+        assert gm._abandoned([via_link]) == []
+
+
+def test_a_fetch_stopped_with_the_bot_is_not_marked_timed_out_1174(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """独立レビュー: 停止で SIGKILL した git も -9 で終わる。時間切れの印を付けると、
+    デプロイのたびに1時間ミラーを更新しなくなる。"""
+    import threading
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, f"file://{upstream}")
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch)
+    t = threading.Thread(target=ensure_mirror, args=(root, f"file://{upstream}"))
+    t.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not gm._running_groups and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gm.stop_running_git() == 1
+        t.join(timeout=15)
+    finally:
+        # A failure above must not leave the fake git's writer running.
+        _kill_procs_mentioning(str(tmp_path / "fakebin"))
+    assert not (mirror / gm.FETCH_TIMED_OUT_MARK).exists()
+
+
+def test_a_git_started_after_the_stop_is_stopped_too_1174(
+    tmp_path: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A background fetch that starts git right after ``stop_running_git`` (atexit runs
+    while daemon threads still live) must not escape it."""
+    import time
+
+    import c_lord.git_mirrors as gm
+
+    root = tmp_path / MIRRORS_DIR_NAME
+    mirror = ensure_mirror(root, f"file://{upstream}")
+    assert mirror is not None
+    _fake_slow_git(tmp_path, monkeypatch, secs=20)
+    gm.stop_running_git()
+    started = time.monotonic()
+    try:
+        gm._run(["git", "-C", str(mirror), "fetch", "--quiet"], timeout=15)
+    finally:
+        _kill_procs_mentioning(str(tmp_path / "fakebin"))
+    assert time.monotonic() - started < 5
