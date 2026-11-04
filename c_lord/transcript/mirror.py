@@ -1227,7 +1227,7 @@ class TranscriptMirror:
             _pending_uuid = None
 
         async def _flush_pending_as_reply() -> None:
-            nonlocal _pending_text, _pending_progress, _pending_uuid, _delivered_uuid
+            nonlocal _pending_text, _pending_progress, _pending_uuid, _delivered_uuid, _last_silent
             if _pending_text is None:
                 return
             # #747: the answer is never folded, and it ends any loop before it.
@@ -1251,6 +1251,10 @@ class TranscriptMirror:
             # advance the cursor (#553).
             if _pending_uuid:
                 _delivered_uuid = _pending_uuid
+            # #1186: a text before this one is no longer the turn's last word —
+            # adopting it at the turn end would move the cursor back before this
+            # answer (an idle flush commits it early), and a restart re-posts it.
+            _last_silent = None
             _pending_text = None
             self._holding_final = False
             _pending_progress = []
@@ -1679,6 +1683,7 @@ class TranscriptMirror:
                                     # it counts as delivered for cursor purposes
                                     # (#215).
                                     _delivered_uuid = event.get("uuid") or _delivered_uuid
+                                    _last_silent = None  # #1186 (see _flush_pending_as_reply)
                                     logger.info(
                                         "TranscriptMirror: suppressed pane-bridged ask context "
                                         "thread=%d (markdown replacement: %s)",
