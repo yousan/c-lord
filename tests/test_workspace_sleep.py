@@ -306,7 +306,7 @@ class TestAlreadyAsleep:
         thread = _thread()
         result = await ws.cog._sleep_workspace_impl(channel=thread, idle_label="4時間")
 
-        assert result is False
+        assert result is None  # nothing to kill — not a failed kill (#1192)
         ws.tmux.kill_session.assert_not_called()
         thread.send.assert_not_awaited()
 

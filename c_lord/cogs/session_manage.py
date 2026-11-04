@@ -1961,7 +1961,7 @@ class SessionManageCog(commands.Cog):
         channel: object,
         reason: WorkspaceReason = WorkspaceReason.IDLE,
         idle_label: str | None = None,
-    ) -> bool:
+    ) -> bool | None:
         """スリープ — stop this workspace's Claude and nothing else (#572).
 
         The innermost of the three lifecycle operations (スリープ ⊂ 停止 ⊂ 削除).
@@ -1980,7 +1980,11 @@ class SessionManageCog(commands.Cog):
         Returns ``True`` only when a window was actually killed. The callers —
         :class:`c_lord.idle_sleep.IdleSleepLoop`, and #576's resident cap — count
         that, not the number of calls: a sweep that counts attempts reports
-        progress it never made (#604).
+        progress it never made (#604). The two falsy answers differ (#1192):
+        ``None`` — there was no window to kill (already asleep, or its claude
+        ended on its own); ``False`` — the window is still there and could not
+        be killed (no manager, ``kill-window`` failed). The resident cap makes
+        up for ``False`` with the next candidate and only for that (#1094).
 
         There is no slash command on purpose. Being invisible is the feature; a
         手動 twin would add a concept ("how is this different from 停止?") that
@@ -2002,7 +2006,7 @@ class SessionManageCog(commands.Cog):
         # going further would re-post the docker line on every tick — which is
         # how an invisible feature turns into a nuisance.
         if not await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
-            return False
+            return None
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the
         # harness write a final ``<task-notification>`` row into the transcript,
@@ -2011,8 +2015,17 @@ class SessionManageCog(commands.Cog):
         await self._stop_transcript_mirror(thread_id)
 
         if not await asyncio.to_thread(tmux_mgr.kill_session, thread_id):
+            # #1192: "nothing to kill" and "the kill failed" both come back as
+            # False from tmux. Only a window that is really gone may be read as
+            # gone — a failed kill leaves a resident the cap must make up for.
+            if await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
+                logger.warning(
+                    "%s sleep: could not kill the tmux window — it is still there",
+                    log_ctx(thread_id=thread_id),
+                )
+                return False
             logger.info("%s sleep: no tmux window to kill", log_ctx(thread_id=thread_id))
-            return False
+            return None
 
         # Remember it, so the next message resumes without a word even across a
         # bot restart. Wording only — see ``SessionRepository.set_slept``.
