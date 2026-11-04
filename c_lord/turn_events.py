@@ -376,12 +376,24 @@ def note_turn_end(
         )
 
 
-def finish_turn(info: TurnInfo | None, *, failure_reason: str | None = None) -> None:
-    """The turn *info* ended: announce ``failure``, or ``completion`` unless held."""
+def finish_turn(
+    info: TurnInfo | None, *, failure_reason: str | None = None, awaiting_answer: bool = False
+) -> None:
+    """The turn *info* ended: announce ``failure``, or ``completion`` unless held.
+
+    *awaiting_answer*: the run ended because the turn is parked on a menu
+    waiting for an answer (#751) — ``blocked`` already went out. The turn is
+    not over, so its ``completion`` is held until the transcript says the
+    turn ended (the answer came and Claude finished, :func:`note_turn_end`),
+    with no time limit; a new request drops it (#1170).
+    """
     if info is None:
         return
     if failure_reason is not None:
         _spawn(_deliver("failure", info, reason=failure_reason))
+        return
+    if awaiting_answer:
+        _hold(info, 0, expires=False)
         return
     snapshot = _LAST_END.get(info.thread_id)
     if snapshot is not None and snapshot[0] >= info.started_mono and snapshot[1] > 0:
@@ -447,22 +459,38 @@ def emit_blocked(thread: discord.Thread | Any, *, message_id: int | None) -> Non
         )
 
 
-def _hold(info: TurnInfo, outstanding: int, *, reason: str | None = None) -> None:
+def _hold(
+    info: TurnInfo, outstanding: int, *, reason: str | None = None, expires: bool = True
+) -> None:
+    """Hold *info*'s ``completion``.
+
+    *expires*: release it after ``CLORD_EVENT_DEFER_MAX_SECONDS`` as
+    ``background_agents_unresolved``. Off for a turn waiting on a menu answer
+    (#1170) — that wait is the user's, and blocked already said so.
+    """
     previous = _HELD.pop(info.thread_id, None)
     if previous is not None and previous.timer is not None:
         previous.timer.cancel()
     held = _Held(info, reason=reason)
-    with contextlib.suppress(RuntimeError):
-        loop = asyncio.get_running_loop()
-        held.timer = loop.call_later(
-            _defer_max_seconds(), _release, info.thread_id, "background_agents_unresolved"
-        )
+    if expires:
+        with contextlib.suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            held.timer = loop.call_later(
+                _defer_max_seconds(), _release, info.thread_id, "background_agents_unresolved"
+            )
     _HELD[info.thread_id] = held
-    logger.info(
-        "%s completion held — %d background agent(s) still running (#917)",
-        log_ctx(thread_id=info.thread_id),
-        outstanding,
-    )
+    if expires:
+        logger.info(
+            "%s completion held — %d background agent(s) still running (#917)",
+            log_ctx(thread_id=info.thread_id),
+            outstanding,
+        )
+    else:
+        logger.info(
+            "%s completion held — the turn is waiting for a menu answer; it goes out "
+            "when the turn ends in the transcript (#1170)",
+            log_ctx(thread_id=info.thread_id),
+        )
 
 
 def _release(thread_id: int, reason: str | None) -> bool:

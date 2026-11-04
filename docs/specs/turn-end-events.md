@@ -65,6 +65,10 @@ ID はすべて**文字列**（Discord の snowflake は JavaScript の数値で
 
 - **`completion`**: 普通にターンが終わった。最後の返事と統計行を投稿し終えたあとに **1 件だけ**。
 - **`blocked`**: AskUserQuestion や plan 承認のメニューが Discord に出て、誰かの答えを待っている。**メニューを出した時点**で 1 件（質問が複数でも 1 件）。答えが返ってターンが終わると、あとで `completion` が出る。
+  答えを待っている間は、何分たっても `completion` は出ない（#1170。C-lord がペインの見張りを5分で切り上げても、
+  ターンが終わったことにはしない。以前はここで `last_message_id: null` の `completion` が出ていた）。
+  `completion` は、答えのあと transcript でターンが終わったときに 1 件出る。待っている間に新しい依頼が来てメニューが
+  閉じられたら、その分は出さない（新しいターンの終わりが出す）。背景のサブエージェントの保留と違い、1 時間の時間切れは無い。
   許可プロンプトはペイン内で自動承認されて Discord に出ないので、`blocked` にはならない。
 - **`failure`**: 起動できなかった（`workspace_setup`）・クラッシュした（`crashed`）・タイムアウトした（`timeout`）・
   プラン上限に当たった（`usage_limit`）・ログアウトしている（`login_required`）・モデルが使えない（`model_unavailable`）・

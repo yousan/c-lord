@@ -626,7 +626,13 @@ async def run_claude_with_config(config: RunConfig) -> str | None:
                 turn = config.outcome.turn
                 turn_events.end_turn(turn)
                 if outcome in ("ok", "error", "stopped", "crashed"):
-                    turn_events.finish_turn(turn, failure_reason=_failure_reason(config, outcome))
+                    turn_events.finish_turn(
+                        turn,
+                        failure_reason=_failure_reason(config, outcome),
+                        # #1170: parked on a menu — the answer's turn end speaks.
+                        awaiting_answer=getattr(config.runner, "ended_awaiting_answer", False)
+                        is True,
+                    )
             except Exception:
                 logger.warning(
                     "%s could not hand the turn end to the event outlet (#917)",

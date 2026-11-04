@@ -1591,6 +1591,9 @@ class TmuxClaudeRunner:
         self._resume_baseline = 0
         self._stopped = False
         self._silent_stop = False
+        # #1170: the run ended because its pane is a menu waiting for an answer
+        # (the #751 backstop), not because the turn finished.
+        self.ended_awaiting_answer = False
         self._last_capture: str = ""
         # #809: why the last menu answer did not reach the TUI, in words the
         # thread can be shown. Empty until an answer fails.
@@ -2759,6 +2762,9 @@ class TmuxClaudeRunner:
                         waiting_on.header or waiting_on.question[:80],
                     )
                     error = None
+                    # #1170: the turn is parked, not over — its completion
+                    # waits for the answer (turn_events.finish_turn).
+                    self.ended_awaiting_answer = True
                 else:
                     error = f"Timed out after {self.timeout_seconds} seconds"
             else:
