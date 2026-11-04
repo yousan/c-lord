@@ -171,6 +171,17 @@ def _as_int(value: object) -> int | None:
     return number if _INT64_MIN <= number <= _INT64_MAX else None
 
 
+def _task_int(value: object) -> int | None:
+    """:func:`_as_int` for a task's ``interval_seconds`` / ``channel_id``, minus booleans.
+
+    ``true`` was saved as ``1`` — a task that ran every second (#1184). The
+    mirror of #1038: a boolean field takes no ``0`` / ``1``, so an integer field
+    takes no ``true`` / ``false``. A decimal string and a fraction stay
+    accepted (#1126 — Discord ids often travel as strings).
+    """
+    return None if isinstance(value, bool) else _as_int(value)
+
+
 def _strict_int(value: object) -> int | None:
     """*value* if it is a JSON integer SQLite can hold — not a bool, string or float.
 
@@ -665,7 +676,7 @@ class ApiServer:
 
         numbers: dict[str, int] = {}
         for field in ("interval_seconds", "channel_id"):
-            number = _as_int(data[field])
+            number = _task_int(data[field])
             if number is None:
                 # Not a name clash: answering 409 here sent callers looking for a
                 # task that did not exist (#1037).
@@ -732,7 +743,7 @@ class ApiServer:
         if "prompt" in data:
             patch_kwargs["prompt"] = str(data["prompt"])
         if "interval_seconds" in data:
-            interval = _as_int(data["interval_seconds"])
+            interval = _task_int(data["interval_seconds"])
             if interval is None or interval < 1:
                 # #1064: 0 / negative / false were saved with a 200.
                 return web.json_response({"error": _INTERVAL_ERROR}, status=400)
