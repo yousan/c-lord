@@ -163,3 +163,86 @@ async def test_reply_goes_out_without_progress_when_tmp_is_full(tmp_path: Path, 
     assert len(errors) == 1 and "progress.txt" in errors[0].getMessage(), [
         r.getMessage() for r in errors
     ]
+
+
+async def test_persistent_stat_permission_error_leaves_a_record(tmp_path: Path, caplog) -> None:
+    """#1188 (#1102 AC2): the transcript's stat() keeps failing with EACCES from some
+    point on. Nothing can reach the thread — and the log said nothing about why:
+    the tail dropped every error but a vanished file without a word."""
+    import inspect
+    import pathlib
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = clord_transcript(project / "s.jsonl")
+    os.utime(jsonl, (1, 1))
+    posted: list[str] = []
+
+    async def sink(t: str) -> None:
+        posted.append(t)
+
+    real_stat = pathlib.Path.stat
+    broken = {"on": False}
+
+    def stat(self, *a, **k):
+        if broken["on"] and self.name == "s.jsonl" and inspect.stack()[1].function == "_poll_once":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *a, **k)
+
+    caplog.set_level(logging.DEBUG)
+    m = TranscriptMirror(
+        thread_id=11, project_dir=project, sink=sink, poll_interval=0.02, idle_flush_seconds=0
+    )
+    with mock.patch.object(pathlib.Path, "stat", stat):
+        m.start()
+        try:
+            await asyncio.sleep(0.15)
+            broken["on"] = True
+            with jsonl.open("a", encoding="utf-8") as f:
+                row = {"type": "user", "message": {"role": "user", "content": "後の依頼"}}
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            await asyncio.sleep(0.6)
+        finally:
+            await m.stop()
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert posted == []  # nothing gets through while stat fails (expected)
+    assert errors, "the thread is silent and nothing at ERROR says why"
+    # Once an hour, not once per poll (#810).
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+
+
+async def test_a_vanished_transcript_is_still_quiet(tmp_path: Path, caplog) -> None:
+    """#1188 AC2: FileNotFoundError on stat is the ordinary "deleted / rotated"
+    case — dropped without a word, as before."""
+    import inspect
+    import pathlib
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = clord_transcript(project / "s.jsonl")
+    os.utime(jsonl, (1, 1))
+
+    async def sink(t: str) -> None:
+        pass
+
+    real_stat = pathlib.Path.stat
+    broken = {"on": False}
+
+    def stat(self, *a, **k):
+        if broken["on"] and self.name == "s.jsonl" and inspect.stack()[1].function == "_poll_once":
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_stat(self, *a, **k)
+
+    caplog.set_level(logging.DEBUG)
+    m = TranscriptMirror(
+        thread_id=12, project_dir=project, sink=sink, poll_interval=0.02, idle_flush_seconds=0
+    )
+    with mock.patch.object(pathlib.Path, "stat", stat):
+        m.start()
+        try:
+            await asyncio.sleep(0.15)
+            broken["on"] = True
+            await asyncio.sleep(0.3)
+        finally:
+            await m.stop()
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []

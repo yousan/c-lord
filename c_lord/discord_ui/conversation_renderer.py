@@ -482,6 +482,43 @@ def _line_h(font: object, gap: int = 6) -> int:
     return ascent + descent + gap
 
 
+def _find_fence_outside_inline_code(text: str) -> int:
+    """Index of the first ``` in *text* that is not inside an inline code span, or -1.
+
+    A run of one or two backticks opens an inline span that closes at the next
+    run of the same length; a ``` inside it is not a fence (#1175 — counting it
+    flipped code and text for the rest of the message). A backtick run with no
+    closer is literal text. A run of three or more is a fence.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        run = j - i
+        if run >= 3:
+            return i
+        k = j
+        closer = -1
+        while k < n:
+            if text[k] != "`":
+                k += 1
+                continue
+            m = k
+            while m < n and text[m] == "`":
+                m += 1
+            if m - k == run:
+                closer = m
+                break
+            k = m
+        i = closer if closer != -1 else j
+    return -1
+
+
 def _split_code_blocks(content: str) -> list[tuple[str, str]]:
     """Split *content* into ``("text"|"code", body)`` blocks on ``` fences.
 
@@ -508,7 +545,7 @@ def _split_code_blocks(content: str) -> list[tuple[str, str]]:
                     blocks.append(("code", rest[:close]))
                     buf = []
                     after = rest[close + 3 :]
-                    reopen = after.find("```")
+                    reopen = _find_fence_outside_inline_code(after)
                     if reopen == -1:
                         if after.strip():
                             buf.append(after)
