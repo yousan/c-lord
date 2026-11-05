@@ -475,6 +475,22 @@ def _chunk_for_send_keys(text: str, limit: int = _SEND_KEYS_CHUNK_BYTES) -> list
     return chunks
 
 
+def _argv_word(chunk: str) -> str:
+    """*chunk* as an argv word that tmux types back exactly (#1284).
+
+    tmux reads a command-line word ending in ``;`` as a command separator —
+    even after ``--`` and with ``-l`` — and drops that ``;``; a word ending in
+    ``\\;`` becomes a literal ``;`` instead. So ``foo;`` used to arrive as
+    ``foo``, ``a\\;`` as ``a;``, and a long message cut into pieces at a ``;``
+    lost it from the middle. Escaping the trailing ``;`` as ``\\;`` makes tmux
+    type exactly one ``;``, whatever comes before it (``;;``, ``\\;``, a lone
+    ``;``). Only the last character matters: a ``;`` anywhere else in the word is
+    already typed as is. The word stays one ``send-keys``, so a piece still
+    arrives as one burst (#560, #872) and grows by one byte at most.
+    """
+    return chunk[:-1] + "\\;" if chunk.endswith(";") else chunk
+
+
 # #529: the cold-start prompt used to be typed at the pane's shell prompt as
 # part of the command line. oh-my-zsh binds ``url-quote-magic`` to
 # ``self-insert``, so zsh backslash-escaped ``?``/``=``/``&`` inside any URL as
@@ -2786,7 +2802,7 @@ class TmuxSessionManager:
             # resetting the terminal and typing nothing. The first chunk of a
             # bulleted menu answer and any later chunk of a long message can both
             # start with ``-``.
-            result = _run(["tmux", "send-keys", "-l", "-t", target, "--", chunk])
+            result = _run(["tmux", "send-keys", "-l", "-t", target, "--", _argv_word(chunk)])
             if result.returncode != 0:
                 error = result.stderr.strip()
                 logger.warning(
