@@ -246,3 +246,51 @@ async def test_a_vanished_transcript_is_still_quiet(tmp_path: Path, caplog) -> N
         finally:
             await m.stop()
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_unreadable_error_and_poll_exception_each_get_their_own_line(
+    tmp_path: Path, caplog
+) -> None:
+    """#1216: in one transcript directory, a poll that raised and a transcript that
+    cannot be read (#1188) are two different reasons the thread hears nothing. They
+    shared one hourly sampler keyed by the directory, so whichever came first kept
+    the other out of the log for an hour — and the reader could not tell them apart
+    (#678). Each must get its own line."""
+    import threading
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    jsonl = clord_transcript(project / "s.jsonl")
+    os.utime(jsonl, (1, 1))
+
+    calls = {"n": 0}
+    done = threading.Event()
+
+    def fake_poll(state):  # noqa: ANN001, ANN202
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "Input/output error")
+        state.read_error = PermissionError(13, "Permission denied")
+        if calls["n"] >= 3:
+            done.set()
+        return []
+
+    caplog.set_level(logging.DEBUG)
+
+    async def consume() -> None:
+        async for _ in tail_mod.tail_events(project, poll_interval=0.01):
+            pass
+
+    with mock.patch.object(tail_mod, "_poll_once", fake_poll):
+        task = asyncio.create_task(consume())
+        try:
+            assert await asyncio.to_thread(done.wait, 10.0), "the tail never polled 3 times"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("reading the transcript failed" in m for m in messages), messages
+    assert any("cannot read the transcript" in m for m in messages), messages
+    # Still once an hour each (#810): three polls, two lines.
+    assert len(messages) == 2, messages
