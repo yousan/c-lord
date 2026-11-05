@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -66,7 +67,7 @@ def _read_setting(path: Path) -> int | None:
         return None
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except ValueError:  # JSONDecodeError, or an integer past 4300 digits (#1240)
         logger.warning("retention: %s is not valid JSON — ignoring", path)
         return None
     if not isinstance(data, dict):
@@ -78,6 +79,13 @@ def _read_setting(path: Path) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         logger.warning(
             "retention: %s=%r in %s is not a number — ignoring", SETTING_KEY, value, path
+        )
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        # #1240: JSON ``1e999`` loads as infinity and ``NaN`` as NaN; ``int()``
+        # of either raised instead of this docstring's None.
+        logger.warning(
+            "retention: %s=%r in %s is not a finite number — ignoring", SETTING_KEY, value, path
         )
         return None
     days = int(value)
