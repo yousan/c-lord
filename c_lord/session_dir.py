@@ -369,8 +369,13 @@ def _ls_remote_key(cwd: str, url: str) -> str:
     return os.path.normpath(os.path.join(os.path.realpath(cwd), url))
 
 
-def _ls_remote_refs(cwd: str, name: str, url: str, pre: list[str]) -> dict[str, str] | None:
+def _ls_remote_refs(
+    cwd: str, name: str, url: str, pre: list[str], *, tags: bool = False
+) -> dict[str, str] | None:
     """``refs/heads/<branch>`` → object name on remote *name*, cached by *url* (#903).
+
+    With *tags*, ``refs/tags/<tag>`` (and git's peeled ``^{}`` lines) instead,
+    cached apart (#1246).
 
     ``None`` when the remote could not be asked (failed, timed out) — the
     caller then keeps; that answer is cached for the TTL too. *pre* is the
@@ -378,11 +383,13 @@ def _ls_remote_refs(cwd: str, name: str, url: str, pre: list[str]) -> dict[str, 
     gone, #1245).
     """
     key = _ls_remote_key(cwd, url)
+    if tags:
+        key = f"tags\0{key}"
     with _ls_remote_lock:
         cached = _ls_remote_cache.get(key)
     if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
         return cached[1]
-    heads = _ask_ls_remote(_remote_target(cwd, url))
+    heads = _ask_ls_remote(_remote_target(cwd, url), tags=tags)
     with _ls_remote_lock:
         _ls_remote_cache[key] = (time.monotonic(), heads)
     return heads
@@ -394,8 +401,8 @@ def _remote_target(cwd: str, url: str) -> str:
     return local if local is not None else url
 
 
-def _ask_ls_remote(target: str) -> dict[str, str] | None:
-    """``git ls-remote --heads`` of *target*, run from outside the workspace.
+def _ask_ls_remote(target: str, *, tags: bool = False) -> dict[str, str] | None:
+    """``git ls-remote --heads`` (or ``--tags``) of *target*, run from outside the workspace.
 
     Review of 3eaa7da: by URL, from a neutral directory, so none of the
     workspace's config applies — no ``remote.<name>.uploadpack``, no
@@ -409,7 +416,9 @@ def _ask_ls_remote(target: str) -> dict[str, str] | None:
     try:
         with tempfile.TemporaryDirectory(prefix="clord-ls-remote-") as neutral:
             result = _run(
-                ["git", "ls-remote", "--symref", "--", target, "HEAD", "refs/heads/*"],
+                ["git", "ls-remote", "--tags", "--", target]
+                if tags  # #1246: tags only, through the same neutral dir
+                else ["git", "ls-remote", "--symref", "--", target, "HEAD", "refs/heads/*"],
                 cwd=neutral,
                 timeout=_LS_REMOTE_TIMEOUT_SECONDS,
                 extra_env={"GIT_TERMINAL_PROMPT": "0", **_neutral_env(neutral)},
@@ -422,7 +431,10 @@ def _ask_ls_remote(target: str) -> dict[str, str] | None:
     for line in result.stdout.splitlines():
         value, _, ref = line.partition("\t")
         value, ref = value.strip(), ref.strip()
-        if ref == "HEAD" and value.startswith("ref: refs/heads/"):
+        if tags:
+            if ref.startswith("refs/tags/") and value:
+                heads[ref] = value
+        elif ref == "HEAD" and value.startswith("ref: refs/heads/"):
             heads[_DEFAULT_BRANCH] = value[len("ref: ") :]
         elif ref.startswith("refs/heads/") and value:
             heads[ref] = value
@@ -629,7 +641,12 @@ _MODULES_UNREADABLE = "modules unknown (unreadable)"
 
 
 def _submodule_stashes(
-    path: str, *, prefix: str = "", depth: int = 0, pushed: list[_Repo] | None = None
+    path: str,
+    *,
+    prefix: str = "",
+    depth: int = 0,
+    pushed: list[_Repo] | None = None,
+    root: str | None = None,
 ) -> list[str]:
     """Work that lives only inside submodules: stashes and unpushed commits.
 
@@ -664,12 +681,15 @@ def _submodule_stashes(
 
     Every repo whose count came back 0 is appended to *pushed*, for the
     network check the caller may make (#1245).
+
+    *root* (default *path*) is the workspace, for :func:`_tag_only_work` (#1246).
     """
     pushed = [] if pushed is None else pushed
+    root = path if root is None else root
     found: list[str] = []
     seen: set[Path] = set()
     found += _checked_out_submodule_stashes(
-        path, prefix=prefix, depth=depth, seen=seen, pushed=pushed
+        path, prefix=prefix, depth=depth, seen=seen, pushed=pushed, root=root
     )
     if depth == 0:
         modules = Path(path) / ".git" / "modules"
@@ -677,12 +697,20 @@ def _submodule_stashes(
         if kind is None:
             found.append(_named(prefix, _MODULES_UNREADABLE))
         elif kind == "dir":
-            found += _module_dir_stashes(modules, prefix="", depth=0, seen=seen, pushed=pushed)
+            found += _module_dir_stashes(
+                modules, prefix="", depth=0, seen=seen, pushed=pushed, root=root
+            )
     return found
 
 
 def _checked_out_submodule_stashes(
-    path: str, *, prefix: str, depth: int, seen: set[Path], pushed: list[_Repo] | None = None
+    path: str,
+    *,
+    prefix: str,
+    depth: int,
+    seen: set[Path],
+    pushed: list[_Repo] | None = None,
+    root: str | None = None,
 ) -> list[str]:
     pushed = [] if pushed is None else pushed
     listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
@@ -707,12 +735,20 @@ def _checked_out_submodule_stashes(
         if depth >= _MAX_SUBMODULE_DEPTH:
             # #1198: past the limit a nested repo is unknown, never "nothing".
             return [f"{prefix.rstrip('/')}: nested repos too deep to check"]
-        found += _repo_notes(sub, f"{prefix}{rel}", depth=depth, seen=seen, pushed=pushed)
+        found += _repo_notes(
+            sub, f"{prefix}{rel}", depth=depth, seen=seen, pushed=pushed, root=root
+        )
     return found
 
 
 def _repo_notes(
-    sub: Path, name: str, *, depth: int, seen: set[Path], pushed: list[_Repo]
+    sub: Path,
+    name: str,
+    *,
+    depth: int,
+    seen: set[Path],
+    pushed: list[_Repo],
+    root: str | None = None,
 ) -> list[str]:
     """Stash, unpushed commits and nested repos of the checked-out repo *sub*."""
     found: list[str] = []
@@ -725,14 +761,14 @@ def _repo_notes(
     # #1198: the parent's status says nothing about commits that are on a
     # branch HEAD left, or that the parent recorded and pushed.
     own_git_dir = linked if linked is not None else sub / ".git"  # .git exists here
-    count = _local_only_commits(str(sub), own_git_dir)
+    count = _local_only_commits(str(sub), own_git_dir, root=root)
     note = _unpushed_note(name, count)
     if note:
         found.append(note)
     elif count == 0:
         pushed.append(_Repo(name, str(sub), False, own_git_dir))
     found += _checked_out_submodule_stashes(
-        str(sub), prefix=f"{name}/", depth=depth + 1, seen=seen, pushed=pushed
+        str(sub), prefix=f"{name}/", depth=depth + 1, seen=seen, pushed=pushed, root=root
     )
     # #1198: an embedded repo (``.git`` a directory) keeps its own
     # submodules' git dirs in ``.git/modules``; deinit'd ones are only there.
@@ -744,7 +780,12 @@ def _repo_notes(
             found.append(f"{name}: {_MODULES_UNREADABLE}")
         elif kind == "dir":
             found += _module_dir_stashes(
-                own_modules, prefix=f"{name}/", depth=depth + 1, seen=seen, pushed=pushed
+                own_modules,
+                prefix=f"{name}/",
+                depth=depth + 1,
+                seen=seen,
+                pushed=pushed,
+                root=root,
             )
     return found
 
@@ -756,6 +797,7 @@ def _module_dir_stashes(
     depth: int,
     seen: set[Path],
     pushed: list[_Repo] | None = None,
+    root: str | None = None,
 ) -> list[str]:
     """Stashes and unpushed commits in the git dirs under a ``modules`` dir
     that no checkout claimed (#1181, #1198).
@@ -793,14 +835,14 @@ def _module_dir_stashes(
             continue
         if not (head == "file" and objects == "dir"):
             found += _module_dir_stashes(
-                child, prefix=f"{name}/", depth=depth + 1, seen=seen, pushed=pushed
+                child, prefix=f"{name}/", depth=depth + 1, seen=seen, pushed=pushed, root=root
             )
             continue
         if child.resolve() not in seen:
             note = _stash_note(name, _stash_entries(str(child), git_dir=True))
             if note:
                 found.append(note)
-            count = _local_only_commits(str(child), child, git_dir=True)
+            count = _local_only_commits(str(child), child, git_dir=True, root=root)
             note = _unpushed_note(name, count)
             if note:
                 found.append(note)
@@ -808,7 +850,12 @@ def _module_dir_stashes(
                 pushed.append(_Repo(name, str(child), True, child))
         if nested == "dir":
             found += _module_dir_stashes(
-                child / "modules", prefix=f"{name}/", depth=depth + 1, seen=seen, pushed=pushed
+                child / "modules",
+                prefix=f"{name}/",
+                depth=depth + 1,
+                seen=seen,
+                pushed=pushed,
+                root=root,
             )
     return found
 
@@ -900,37 +947,43 @@ def _own_git_dir(checkout: Path) -> Path | None:
     return dot if dot.is_dir() else _linked_git_dir(checkout)
 
 
-def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) -> int | str:
+def _local_only_commits(
+    path: str, own_git_dir: Path, *, git_dir: bool = False, root: str | None = None
+) -> int | str:
     """Commits in a submodule that exist on no remote (#1198).
 
     Every local ref counts (``--all``: branches, tags, notes, ``refs/original``,
     ``refs/keep/*``, HEAD and the linked worktrees' HEADs), plus what the
     linked worktrees hold on their own (:func:`_worktree_tips`), ``--not
-    --remotes``. Tags never count as pushed — a tag lives in the same git dir
-    that deleting removes, and a fetched tag cannot be told from a hand-made
-    ``git tag wip``; a fetched tag on a pushed commit is reachable from the
-    remotes and so adds nothing. The stash is left out (``--exclude``): it is
-    counted on its own, as ``N stash entries``. A repo with no remote counts
-    every commit — there are no remote refs to subtract.
+    --remotes``. A local tag is never proof of a push — it lives in the same
+    git dir that deleting removes; a fetched tag on a pushed commit is
+    reachable from the remotes and so adds nothing. Commits reachable *only*
+    from tags are work unless a tag upstream with the same name and object
+    vouches for them (:func:`_tag_only_work`, #1246). The stash is left out
+    (``--exclude``): it is counted on its own, as ``N stash entries``. A repo
+    with no remote counts every commit — there are no remote refs to subtract.
 
     Broader than the workspace's own count (:func:`_unpushed_commits`, HEAD
-    and branches, then ``ls-remote``): a submodule's git dir is never asked
-    over the network, so every ref it holds is assumed to be work.
+    and branches, then ``ls-remote``): here a submodule's branches are never
+    asked over the network (only its tags, #1246), so every other ref it holds
+    is assumed to be work.
 
-    One git call. No ``--ignore-missing``: it also silenced a branch whose
-    tip object was gone, and the commits below it were deleted. So a ref or
-    worktree HEAD naming a missing object fails the call — unknown, kept (an
-    accepted over-keep). ``--all`` skips an unborn HEAD by itself. Unknown
-    comes back as the reason (a ``str``) — the caller keeps the dir then.
+    One git call when nothing is local-only (more for tag-only commits). No
+    ``--ignore-missing``: it also silenced a branch whose tip object was gone,
+    and the commits below it were deleted. So a ref or worktree HEAD naming a
+    missing object fails the call — unknown, kept (an accepted over-keep).
+    ``--all`` skips an unborn HEAD by itself. Unknown comes back as the reason
+    (a ``str``) — the caller keeps the dir then.
 
     With *git_dir*, *path* is a git dir whose checkout may be gone — as in
     :func:`_stash_entries`, it stands in as its own work tree. *own_git_dir*
-    is the git dir holding ``worktrees/``.
+    is the git dir holding ``worktrees/``. *root* is the workspace: a remote
+    inside it vouches for no tag (``None``: no local-path remote does).
     """
     extra = _worktree_tips(own_git_dir)
     if extra is None:
         return _WORKTREE_UNREADABLE
-    pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
+    pre = _git_pre(path, git_dir)
     # The worktree tips go through stdin: thousands of ref files overflow argv.
     # A ``--not`` on the command line does not reach them (they stay positive).
     result = _run(
@@ -942,9 +995,87 @@ def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) 
     if result.returncode != 0:
         return "git failed"
     try:
-        return int(result.stdout.strip() or "0")
+        n = int(result.stdout.strip() or "0")
     except ValueError:
         return "git failed"
+    if not n:
+        return 0
+    tagged = _tag_only_work(path, pre, extra, root)
+    if isinstance(tagged, str):
+        return tagged
+    held, work = tagged
+    return n - held + work
+
+
+def _tag_only_work(
+    path: str, pre: list[str], extra: list[str], root: str | None
+) -> tuple[int, int] | str:
+    """Of the commits only tags hold: how many, and how many are still work (#1246).
+
+    #1198 counted them all, so an upstream release tag on a commit on no
+    branch (its release branch deleted) kept an untouched workspace forever.
+    Now the remotes are asked whenever there are such commits (``git
+    ls-remote --tags``, by resolved URL from outside the workspace, 20 s,
+    cached 60 s per URL like the heads): a local tag whose name and object
+    are both upstream vouches for what it reaches. Every other tag-only commit
+    is work. A remote inside *root* vouches for nothing; a remote that cannot
+    be asked is unknown — the reason comes back as a ``str``, the dir is kept.
+
+    The reflogs never decide that a tag-only commit came from upstream (review
+    of 4e4bd18): a commit made in a removed linked worktree, by plumbing
+    (``commit-tree``, ``stash create``, ``fast-import``, a bundle) or as a
+    dropped stash has no "created here" entry, and a ``git tag wip`` on it
+    was its only copy. A tag fetched and then deleted upstream is therefore
+    kept — an accepted over-keep (spec).
+
+    Cost: one ``rev-list`` when the count is not 0; with tag-only commits, one
+    ``config``, one ``for-each-ref``, one ``ls-remote --tags`` per remote URL
+    and one more ``rev-list`` when a tag vouches.
+    """
+    # Reachable from tags and from nothing else that _local_only_commits counts
+    # or subtracts (the stash and probe refs left out on both sides, so the two
+    # counts add up). Stdin revs are not flipped by --not: hence the ``^``.
+    tag_only = [*pre, "rev-list", "--tags", "--not", "--exclude=refs/stash"]
+    tag_only += [f"--exclude={_PROBE_NS}*", "--exclude=refs/tags/*", "--all", "--remotes"]
+    tag_only.append("--stdin")
+    stdin = "".join(f"^{t}\n" for t in extra)
+    only = _run(tag_only, cwd=path, stdin=stdin)
+    if only.returncode != 0:
+        return "git failed"
+    held = set(only.stdout.split())
+    if not held:
+        return 0, 0
+    config = _remote_config(path, pre)
+    if config is None:
+        return "git failed"
+    asked: list[tuple[str, str]] = []
+    for name, url in sorted(config[0].items()):
+        local = _local_remote_path(path, url)
+        if local is not None and (root is None or _inside(local, root)):
+            continue  # deleted with the workspace: no copy (as in _stale_tracking_note)
+        asked.append((name, url))
+    if not asked:
+        return len(held), len(held)
+    tags = _run([*pre, "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/"], cwd=path)
+    if tags.returncode != 0:
+        return "git failed"
+    upstream: list[dict[str, str]] = []
+    for name, url in asked:
+        got = _ls_remote_refs(path, name, url, pre, tags=True)
+        if got is None:
+            return "ls-remote failed"
+        upstream.append(got)
+    vouch: set[str] = set()
+    for line in tags.stdout.splitlines():
+        sha, _, ref = line.partition(" ")
+        if sha and any(got.get(ref) == sha for got in upstream):
+            vouch.add(sha)  # same name, same object upstream: a copy exists there
+    if not vouch:
+        return len(held), len(held)
+    left = _run(tag_only, cwd=path, stdin=stdin + "".join(f"^{v}\n" for v in sorted(vouch)))
+    if left.returncode != 0:
+        return "git failed"
+    return len(held), len(held & set(left.stdout.split()))
 
 
 def _unpushed_note(name: str, n: int | str) -> str | None:
@@ -1573,7 +1704,9 @@ def _unpushed_commits(
 _MAX_IGNORED_REPO_DEPTH = 2
 
 
-def _ignored_repo_notes(path: str, rel: str, pushed: list[_Repo]) -> list[str]:
+def _ignored_repo_notes(
+    path: str, rel: str, pushed: list[_Repo], ws_root: str | None = None
+) -> list[str]:
     """Work in git repos cloned into the ignored directory *rel* (#1241).
 
     An ignored ``vendor/`` is skipped as something a tool rebuilds — but a
@@ -1608,7 +1741,7 @@ def _ignored_repo_notes(path: str, rel: str, pushed: list[_Repo]) -> list[str]:
             found.append(f"{name}: nested repos unknown (unreadable)")
             continue
         if dot != "missing":
-            found += _ignored_repo_work(here, name, pushed)
+            found += _ignored_repo_work(here, name, pushed, path if ws_root is None else ws_root)
             continue  # its own content is the repo's to judge
         bare = _bare_repo_note(here, name)
         if bare is not None:
@@ -1654,8 +1787,8 @@ def _bare_repo_note(here: Path, name: str) -> str | None:
     return f"{name}: bare repository (holds refs)" if refs.stdout.strip() else ""
 
 
-def _ignored_repo_work(repo: Path, name: str, pushed: list[_Repo]) -> list[str]:
-    found = _repo_notes(repo, name, depth=1, seen=set(), pushed=pushed)
+def _ignored_repo_work(repo: Path, name: str, pushed: list[_Repo], root: str) -> list[str]:
+    found = _repo_notes(repo, name, depth=1, seen=set(), pushed=pushed, root=root)
     if found:
         return found  # kept already: its status is not needed (W57 round 12)
     # --ignored (review of 43caee1): the repo's own ignored files (a local
@@ -1760,7 +1893,7 @@ def _worktree_status(path: str, *, _depth: int, _root: str) -> WorktreeStatus:
     # The network is asked only when nothing else keeps the dir (#903).
     unpushed, unchecked = _unpushed_commits(path, ask_remote=not user and stash == 0, root=_root)
     pushed: list[_Repo] = []
-    nested = _submodule_stashes(path, pushed=pushed)
+    nested = _submodule_stashes(path, pushed=pushed, root=_root)
     for i, rel in enumerate(ignored_dirs):
         if user or stash != 0 or unpushed != 0 or nested:
             # Kept already: the rest is not searched (W57 round 12) — and the
@@ -1768,7 +1901,7 @@ def _worktree_status(path: str, *, _depth: int, _root: str) -> WorktreeStatus:
             # whole (W57 round 13).
             nested.append(_not_checked(ignored_dirs[i:]))
             break
-        nested += _ignored_repo_notes(path, rel, pushed)
+        nested += _ignored_repo_notes(path, rel, pushed, _root)
     if not user and stash == 0 and unpushed == 0 and not nested:
         # #1245: a nested repo's "pushed" rests on local tracking refs; ask the
         # remotes only now, as for the workspace, and stop at the first reason.

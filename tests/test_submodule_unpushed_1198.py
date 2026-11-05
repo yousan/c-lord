@@ -308,9 +308,9 @@ def test_embedded_repo_local_only_commits_are_kept(tmp_path: Path) -> None:
 def test_deinit_submodule_pinned_to_a_tag_on_no_branch_is_kept(tmp_path: Path) -> None:
     """A submodule pinned to a release tag whose commit is on no branch is kept.
 
-    Accepted over-keep: tags never count as pushed. The tag lives in the same
-    ``.git/modules/sub`` that deleting removes, and a fetched tag cannot be told
-    from a hand-made ``git tag wip`` (which lost the only copy of a commit)."""
+    Accepted over-keep: the deinit'd module's HEAD still points at that commit,
+    and HEAD is a ref that counts — the tag has nothing to do with it (#1246
+    lets an upstream tag vouch only for commits that tags alone hold)."""
     ws, subr = _workspace(tmp_path)
     seed = tmp_path / "subremote-seed"
     git(seed, "checkout", "-q", "--detach")
@@ -909,10 +909,11 @@ def test_module_dirs_past_the_depth_limit_are_unknown(tmp_path: Path) -> None:
     assert notes and "too deep" in notes[0]
 
 
-def test_upstream_tag_on_no_branch_is_kept_known_over_keep(tmp_path: Path) -> None:
-    """Known over-keep (documented): the submodule's upstream tags a commit no
-    branch holds (a deleted release branch). Nothing local, yet tags never
-    count as pushed, so the workspace is kept with a reason naming the module."""
+def test_upstream_tag_on_no_branch_is_deleted(tmp_path: Path) -> None:
+    """The submodule's upstream tags a commit no branch holds (a deleted release
+    branch). Was a known over-keep (kept as ``sub: 1 unpushed commit(s)``);
+    #1246: the same tag is still upstream (``ls-remote --tags``), so it vouches.
+    More in test_submodule_tags_1246."""
     parent = _bare_with_commit(tmp_path, "parent")
     subr = _bare_with_commit(tmp_path, "subremote")
     seed = tmp_path / "subremote-seed"
@@ -929,10 +930,8 @@ def test_upstream_tag_on_no_branch_is_kept_known_over_keep(tmp_path: Path) -> No
     git(ws, "commit", "-qm", "add sub")
     git(ws, "push", "-q", "origin", "HEAD:main")
     assert "v1.0" in git(ws / "sub", "tag")
-    res = _kept(ws)
-    assert "sub: 1 unpushed commit(s)" in res.reason
-    git(ws / "sub", "tag", "-d", "v1.0")  # how a user clears it (spec)
-    assert _delete(ws).removed
+    res = _delete(ws)
+    assert res.removed, res.reason
 
 
 def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
