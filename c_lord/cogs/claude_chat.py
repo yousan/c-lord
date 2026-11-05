@@ -3381,12 +3381,14 @@ class ClaudeChatCog(commands.Cog):
         """
         ctx = log_ctx(thread_id=thread.id)
         # #1248: newest first, paged, so the bound cuts the oldest end of the
-        # window and never the moment c-lord was away; then back in order.
+        # window and never the moment c-lord was away; then back in order. One
+        # past the bound is fetched to tell "exactly full" from "cut".
         history = [
-            m async for m in thread.history(limit=HISTORY_MAX, after=since, oldest_first=False)
+            m async for m in thread.history(limit=HISTORY_MAX + 1, after=since, oldest_first=False)
         ]
         history.sort(key=lambda m: m.id)
-        if len(history) >= HISTORY_MAX:
+        if len(history) > HISTORY_MAX:
+            history = history[-HISTORY_MAX:]
             logger.warning(
                 "%s read back only the newest %d messages posted since %s — older ones "
                 "were not read (#745/#1248)",
