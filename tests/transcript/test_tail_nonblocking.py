@@ -203,10 +203,13 @@ async def test_a_slow_poll_cycle_does_not_stall_the_event_loop(
 ) -> None:
     """AC-c: while one poll cycle is in flight, other coroutines keep running.
 
-    The cost is injected into ``latest_session_jsonl`` as a plain ``sleep`` of a
-    *known* size, so the assertion measures **where** the work runs rather than
-    how fast the machine is: run inline it stalls the loop for its full cost;
-    handed to a worker thread it costs the loop nothing.
+    #1217: this used to inject a 0.3 s ``sleep`` and bound the loop's longest gap
+    by the wall clock, and on macOS CI runners that bound flaked. Now nothing here
+    is timed. The poll blocks until **the event loop itself** lets it go, and the
+    loop does that only after it has been told the poll started and has then run
+    another coroutine to completion. A poll that runs on the loop can never be
+    let go that way — the loop is stuck inside it — so it is the order of events,
+    not how long anything took, that tells the two apart.
     """
     project = tmp_path / "proj"
     project.mkdir()
@@ -214,37 +217,57 @@ async def test_a_slow_poll_cycle_does_not_stall_the_event_loop(
     _write_event(jsonl, {"type": "assistant", "uuid": "seed"})
     os.utime(jsonl, (1, 1))
 
-    poll_cost = 0.3  # stands in for glob+stat of a 2481-file project dir
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    poll_started: asyncio.Future[None] = loop.create_future()
+    release = threading.Event()
+    armed = threading.Event()  # set once the tail is past its start-up scan
+    order: list[str] = []
     real = resolver_mod.ThreadSessionResolver.resolve
 
     def slow(self):
-        time.sleep(poll_cost)
+        if armed.is_set() and not release.is_set():
+            order.append("poll started")
+            if threading.get_ident() == loop_thread:
+                # The bug: this poll *is* the event loop, so nothing on the loop
+                # can ever set ``release``. Waiting would only hang the test until
+                # the safety timeout; the order below already records the stall.
+                order.append("poll ran on the event loop")
+            else:
+                loop.call_soon_threadsafe(poll_started.set_result, None)
+                release.wait(60.0)  # safety net against a hang, never the assertion
+            order.append("poll finished")
         return real(self)
 
     monkeypatch.setattr(resolver_mod.ThreadSessionResolver, "resolve", slow)
 
-    agen = tail_events(project, poll_interval=0.01).__aiter__()
-    watchdog = _LoopWatchdog()
-
-    async def producer() -> None:
-        await asyncio.sleep(poll_cost * 1.5)
+    async def on_start(_path: Path | None, _offset: int) -> None:
         _write_event(jsonl, {"type": "assistant", "uuid": "u1"})
+        armed.set()
 
-    prod = asyncio.create_task(producer())
-    watchdog.start()
-    await asyncio.sleep(0.02)  # let the watchdog take its first sample
+    async def other_work() -> None:
+        await asyncio.sleep(0)
+        order.append("loop ran other work")
+
+    async def let_the_poll_go() -> None:
+        await poll_started
+        await asyncio.create_task(other_work())
+        release.set()
+
+    agen = tail_events(project, poll_interval=0.01, on_start=on_start).__aiter__()
+    releaser = asyncio.create_task(let_the_poll_go())
     try:
-        events = await _drain(agen, 1, timeout=10.0)
+        events = await _drain(agen, 1, timeout=60.0)  # safety net, never the assertion
     finally:
-        prod.cancel()
-        await asyncio.gather(prod, return_exceptions=True)
-        await watchdog.stop()
+        release.set()
+        releaser.cancel()
+        await asyncio.gather(releaser, return_exceptions=True)
         await agen.aclose()
 
     assert [e["uuid"] for e in events] == ["u1"]
-    assert watchdog.max_gap < poll_cost / 3, (
-        f"loop blocked {watchdog.max_gap:.3f}s — comparable to the {poll_cost:.3f}s a "
-        f"poll cycle costs, so the cycle is still running inline on the event loop"
+    assert order == ["poll started", "loop ran other work", "poll finished"], (
+        f"{order} — the event loop did not get to run anything while the poll cycle "
+        "was in flight, so the cycle is still running inline on the event loop"
     )
 
 
