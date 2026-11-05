@@ -140,3 +140,59 @@ def test_leftover_cleanup_runs_no_workspace_hook(tmp_path: Path, monkeypatch) ->
     (hooks / "reference-transaction").chmod(0o755)
     assert _delete(ws).removed
     assert not marker.exists(), marker.read_text()
+
+
+# ---- W57 round 12: the neutral directory may sit inside someone's repo ----
+
+
+def _enclosing_repo_tmp(tmp: Path, monkeypatch) -> Path:  # noqa: ANN001
+    """TMPDIR inside a git repo (``git init /tmp`` happens)."""
+    import tempfile
+
+    root = tmp / "evilroot"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    t = root / "tmp"
+    t.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(t))
+    return root
+
+
+def test_ls_remote_ignores_a_repo_enclosing_tmpdir_ssh_command(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    ws, subr = _workspace(tmp_path)
+    _pr_flow(tmp_path, ws, ff=False)
+    git(ws / ".git" / "modules" / "sub", "--git-dir=.", "config", "remote.origin.url",
+        f"ssh://fakehost{subr}")  # fmt: skip
+    root = _enclosing_repo_tmp(tmp_path, monkeypatch)
+    log = tmp_path / "ran.log"
+    s = tmp_path / "evil-ssh.sh"
+    s.write_text(f'#!/bin/bash\necho "evil-ssh $*" >> "{log}"\n[ "$1" = -G ] && exit 0\n'
+                 'eval "${@: -1}"\n')  # fmt: skip
+    s.chmod(0o755)
+    git(root, "config", "core.sshCommand", str(s))
+    _delete(ws)
+    assert not log.exists(), log.read_text()
+
+
+def test_ls_remote_ignores_a_repo_enclosing_tmpdir_insteadof(tmp_path: Path, monkeypatch) -> None:
+    """A decoy ``insteadOf`` there would point the ls-remote at a repo still holding the branch."""
+    ws, subr = _workspace(tmp_path)
+    sub = ws / "sub"
+    git(sub, "checkout", "-q", "-b", "work")
+    (sub / "w.txt").write_text("only copy\n")
+    git(sub, "add", "w.txt")
+    git(sub, "commit", "-qm", "work")
+    git(sub, "push", "-q", "origin", "work")
+    decoy = tmp_path / "decoy.git"
+    git(tmp_path, "clone", "-q", "--bare", str(subr), str(decoy))
+    git(subr, "update-ref", "-d", "refs/heads/work")
+    git(subr, "gc", "-q", "--prune=now")
+    git(sub, "checkout", "-q", "main")
+    git(sub, "branch", "-q", "-D", "work")
+    assert not _delete(ws).removed, "control"
+    sd._ls_remote_cache.clear()
+    root = _enclosing_repo_tmp(tmp_path, monkeypatch)
+    git(root, "config", f"url.{decoy}.insteadOf", str(subr))
+    assert not _delete(ws).removed

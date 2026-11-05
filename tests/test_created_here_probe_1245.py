@@ -214,3 +214,70 @@ def test_a_probe_fetch_that_fails_keeps(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sd, "_run", failing_fetch)
     res = _kept(ws)
     assert "unknown" in res.reason, res.reason
+
+
+# ---- W57 round 12: a merged-and-deleted PR branch, a push of an existing commit ----
+
+
+def _merge_on_remote(tmp_path: Path, subr: Path, branch: str, *, ff: bool) -> None:
+    other = tmp_path / f"merger-{branch}"
+    git(tmp_path, "clone", "-q", str(subr), str(other))
+    mode = "--ff-only" if ff else "--no-ff"
+    git(other, "merge", "-q", mode, "-m", "Merge PR", f"origin/{branch}")
+    git(other, "push", "-q", "origin", "main")
+    git(other, "push", "-q", "origin", "--delete", branch)
+
+
+@pytest.mark.parametrize("ff", [True, False], ids=["ff-merge", "merge-commit"])
+def test_pr_merged_and_branch_deleted_without_a_fetch_is_deleted(
+    tmp_path: Path, monkeypatch, ff: bool
+) -> None:
+    """GitHub's default flow: commit on ``work``, push, PR merged (merge commit or
+    fast-forward) and the branch deleted; the workspace never fetched again. The
+    commit is on the remote's ``main`` — the default branch is probed."""
+    ws, subr = _workspace(tmp_path)
+    sub = ws / "sub"
+    git(sub, "checkout", "-q", "-b", "work")
+    sha = _commit(sub, "w.txt")
+    git(sub, "push", "-q", "origin", "work")
+    _record_sub(ws)
+    _merge_on_remote(tmp_path, subr, "work", ff=ff)
+    assert git(subr, "merge-base", "--is-ancestor", sha, "main") == ""
+    net = _net(monkeypatch)
+    res = _delete(ws)
+    assert res.removed, res.reason
+    assert net == {"ls-remote": 1, "fetch": 0 if ff else 1}, net
+
+
+def test_branch_deleted_upstream_with_its_commit_on_no_other_branch_is_still_kept(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1245 itself: the probe of the other heads finds the commit nowhere."""
+    ws, subr = _workspace(tmp_path)
+    sub = ws / "sub"
+    git(sub, "checkout", "-q", "-b", "work")
+    _commit(sub, "w.txt")
+    git(sub, "push", "-q", "origin", "work")
+    _record_sub(ws)
+    _upstream_moves(tmp_path)  # main moves on: not here, so it is probed
+    git(subr, "update-ref", "-d", "refs/heads/work")
+    git(subr, "gc", "-q", "--prune=now")
+    res = _kept(ws)
+    assert "sub: 1 unpushed commit(s) (remote branch deleted or rewritten)" in res.reason
+
+
+def test_pushed_existing_commit_as_new_branch_then_upstream_moves_is_deleted(
+    tmp_path: Path,
+) -> None:
+    """No commit made here: ``git push origin origin/main:refs/heads/release``,
+    then someone pushes to ``release``. The push record makes it verified; the
+    move to a commit not here is probed."""
+    ws, subr = _workspace(tmp_path)
+    sub = ws / "sub"
+    git(sub, "push", "-q", "origin", "origin/main:refs/heads/release")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", "-b", "release", str(subr), str(other))
+    _commit(other, "r.txt")
+    git(other, "push", "-q", "origin", "release")
+    res = _delete(ws)
+    assert res.removed, res.reason

@@ -382,23 +382,47 @@ def _ask_ls_remote(target: str) -> dict[str, str] | None:
     """
     # Through _run (#1198): on a timeout the transport child (ssh,
     # remote-https, upload-pack) is killed with git, not left running.
+    # ``--symref HEAD``: the default branch, probed first when a branch is
+    # gone (W57 round 12). Branches only — no tags, no ``refs/pull/*``.
     try:
-        result = _run(
-            ["git", "ls-remote", "--heads", "--", target],
-            cwd=tempfile.gettempdir(),
-            timeout=_LS_REMOTE_TIMEOUT_SECONDS,
-            extra_env={"GIT_TERMINAL_PROMPT": "0"},
-        )
+        with tempfile.TemporaryDirectory(prefix="clord-ls-remote-") as neutral:
+            result = _run(
+                ["git", "ls-remote", "--symref", "--", target, "HEAD", "refs/heads/*"],
+                cwd=neutral,
+                timeout=_LS_REMOTE_TIMEOUT_SECONDS,
+                extra_env={"GIT_TERMINAL_PROMPT": "0", **_neutral_env(neutral)},
+            )
     except OSError:
         return None
     if result.returncode != 0:
         return None
     heads: dict[str, str] = {}
     for line in result.stdout.splitlines():
-        sha, _, ref = line.partition("\t")
-        if sha.strip() and ref.strip():
-            heads[ref.strip()] = sha.strip()
+        value, _, ref = line.partition("\t")
+        value, ref = value.strip(), ref.strip()
+        if ref == "HEAD" and value.startswith("ref: refs/heads/"):
+            heads[_DEFAULT_BRANCH] = value[len("ref: ") :]
+        elif ref.startswith("refs/heads/") and value:
+            heads[ref] = value
     return heads
+
+
+#: Key of :func:`_ask_ls_remote`'s answer naming the default branch (``refs/heads/…``).
+_DEFAULT_BRANCH = "HEAD"
+
+
+def _head_shas(heads: dict[str, str]) -> set[str]:
+    """The branch heads' object names in an :func:`_ask_ls_remote` answer."""
+    return {sha for ref, sha in heads.items() if ref.startswith("refs/heads/")}
+
+
+def _neutral_env(directory: str) -> dict[str, str]:
+    """Run git in the empty *directory* without finding a repo above it (W57 round 12).
+
+    ``TMPDIR`` may sit inside a git repository (``git init /tmp``): git would
+    then read that repo's ``core.sshCommand`` or ``insteadOf`` for the sweep.
+    """
+    return {"GIT_CEILING_DIRECTORIES": str(Path(directory).parent)}
 
 
 def _remote_head_shas(path: str, skip: frozenset[str] = frozenset()) -> frozenset[str] | None:
@@ -421,7 +445,7 @@ def _remote_head_shas(path: str, skip: frozenset[str] = frozenset()) -> frozense
         heads = _ls_remote_refs(path, name, url.stdout.strip(), ["git"])
         if heads is None:
             return None
-        shas |= set(heads.values())
+        shas |= _head_shas(heads)
     return frozenset(shas)
 
 
@@ -1085,23 +1109,31 @@ def _drop_leftover_probes(cwd: str, pre: list[str], git_dir: Path) -> None:
 
 
 def _probe_ancestor(
-    cwd: str, pre: list[str], git_dir: Path, url: str, branch: str, old: str, now: str
+    cwd: str,
+    pre: list[str],
+    git_dir: Path,
+    url: str,
+    branches: tuple[str, ...],
+    old: str,
+    fingerprint: str,
 ) -> bool | None:
-    """Is *old* an ancestor of the remote's *branch* (now at *now*, not here)? (#1245)
+    """Is *old* an ancestor of any of the remote's *branches*? (#1245)
 
-    One bounded fetch of that branch only — into a throwaway bare repo in a
-    temporary directory that borrows the workspace's objects
-    (``objects/info/alternates``), so the workspace gets no ref, no object and
-    no config change, and none of its hooks or config run (review of
-    3eaa7da). No tags, no ``FETCH_HEAD``, no submodules, no auto gc; through
-    :func:`_run` with the ``ls-remote`` timeout (20 s). The answer is cached
-    with the ``ls-remote`` answers by (resolved URL, branch, old, now); a
-    failure by (resolved URL, branch), so a hanging remote costs once per TTL.
-    ``None`` — failed or timed out — is unknown.
+    *branches* are branch names, or ``("*",)`` for every head. One bounded
+    fetch of those branches only — into a throwaway bare repo in a temporary
+    directory that borrows the workspace's objects (``objects/info/alternates``),
+    so the workspace gets no ref, no object and no config change, and none of
+    its hooks or config run (review of 3eaa7da). No tags, no ``FETCH_HEAD``,
+    no submodules, no auto gc; through :func:`_run` with the ``ls-remote``
+    timeout (20 s). The answer is cached with the ``ls-remote`` answers by
+    (resolved URL, branches, old, *fingerprint* — the remote heads asked
+    about); a failure by (resolved URL, branches), so a hanging remote costs
+    once per TTL. ``None`` — failed or timed out — is unknown.
     """
     url_key = _ls_remote_key(cwd, url)
-    fail_key = f"probe-failed\0{url_key}\0{branch}"
-    key = f"probe\0{url_key}\0{branch}\0{old}\0{now}"
+    which = " ".join(branches)
+    fail_key = f"probe-failed\0{url_key}\0{which}"
+    key = f"probe\0{url_key}\0{which}\0{old}\0{fingerprint}"
     with _ls_remote_lock:
         failed = _ls_remote_cache.get(fail_key)
         cached = _ls_remote_cache.get(key)
@@ -1114,7 +1146,8 @@ def _probe_ancestor(
     verdict: bool | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="clord-probe-") as tmp:
-            init = _run(["git", "init", "-q", "--bare", tmp], cwd=tmp)
+            neutral = _neutral_env(tmp)
+            init = _run(["git", "init", "-q", "--bare", tmp], cwd=tmp, extra_env=neutral)
             if init.returncode == 0:
                 alternates = Path(tmp) / "objects" / "info" / "alternates"
                 alternates.write_text(f"{(git_dir / 'objects').resolve()}\n", encoding="utf-8")
@@ -1122,17 +1155,21 @@ def _probe_ancestor(
                 fetched = _run(
                     [*probe, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch"]
                     + ["--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules"]
-                    + ["--", _remote_target(cwd, url), f"+refs/heads/{branch}:refs/probe"],
+                    + ["--", _remote_target(cwd, url)]
+                    + [f"+refs/heads/{b}:refs/probe/{b}" for b in branches],
                     cwd=tmp,
                     timeout=_LS_REMOTE_TIMEOUT_SECONDS,
-                    extra_env={"GIT_TERMINAL_PROMPT": "0"},
+                    extra_env={"GIT_TERMINAL_PROMPT": "0", **neutral},
                 )
                 if fetched.returncode == 0:
-                    ancestor = _run(
-                        [*probe, "merge-base", "--is-ancestor", old, "refs/probe"], cwd=tmp
+                    holding = _run(
+                        [*probe, "for-each-ref", "--count=1", "--format=%(refname)"]
+                        + [f"--contains={old}", "refs/probe/"],
+                        cwd=tmp,
+                        extra_env=neutral,
                     )
-                    if ancestor.returncode in (0, 1):
-                        verdict = ancestor.returncode == 0
+                    if holding.returncode == 0:
+                        verdict = bool(holding.stdout.strip())
     except OSError:
         verdict = None
     with _ls_remote_lock:
@@ -1141,6 +1178,45 @@ def _probe_ancestor(
         else:
             _ls_remote_cache[key] = (time.monotonic(), {"ancestor": "yes" if verdict else "no"})
     return verdict
+
+
+def _count_unvouched(path: str, pre: list[str], extra: list[str], vouch: set[str]) -> int | None:
+    """Commits from every local ref (stale tracking refs too) but none of *vouch*."""
+    # Same tips as _local_only_commits, but ``--all`` now counts the tracking
+    # refs that do not vouch too; only those that do are subtracted.
+    result = _run(
+        [*pre, "rev-list", "--count", "--exclude=refs/stash", f"--exclude={_PROBE_NS}*"]
+        + ["--all", "--stdin"],
+        cwd=path,
+        stdin="".join(f"{t}\n" for t in extra) + "".join(f"^{v}\n" for v in sorted(vouch)),
+    )
+    try:
+        return int(result.stdout.strip() or "0") if result.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def _on_another_remote_head(
+    repo: _Repo, pre: list[str], url: str, heads: dict[str, str], present: set[str], sha: str
+) -> bool:
+    """Is *sha* (its branch gone upstream) on one of the remote's other heads?
+
+    The default branch first (``ls-remote --symref``), then every head; heads
+    already here are skipped (they vouch locally). ``False`` when unknown too —
+    the commit then counts and the workspace is kept.
+    """
+    fingerprint = ",".join(sorted(_head_shas(heads)))
+    default = heads.get(_DEFAULT_BRANCH, "")
+    if default in heads and heads[default] not in present:
+        branch = default[len("refs/heads/") :]
+        if _probe_ancestor(repo.path, pre, repo.own_git_dir, url, (branch,), sha, fingerprint):
+            return True
+    others = [r for r in heads if r.startswith("refs/heads/") and r != default]
+    if any(heads[r] not in present for r in others):
+        return bool(
+            _probe_ancestor(repo.path, pre, repo.own_git_dir, url, ("*",), sha, fingerprint)
+        )
+    return False
 
 
 def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
@@ -1227,6 +1303,7 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         return None
     heads: dict[str, dict[str, str]] = {}
     moved: list[tuple[str, str, str, str]] = []
+    gone_refs: list[tuple[str, str]] = []
     gone = False
     for ref, sha, remote in verify:
         if remote not in heads:
@@ -1239,12 +1316,13 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
             vouch.add(sha)
         elif now is None:
             gone = True
+            gone_refs.append((sha, remote))
         else:
             moved.append((ref, sha, now, remote))
     if not no_vouch and not gone and not moved:
         return None
     # Which of the asked remotes' heads are here — those vouch for what they reach.
-    remote_shas = sorted({s for h in heads.values() for s in h.values()})
+    remote_shas = sorted({s for h in heads.values() for s in _head_shas(h)})
     present: set[str] = set()
     if remote_shas:
         check = _run(
@@ -1265,10 +1343,12 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         # a commit made here, fetch that one branch once and ask git whether the
         # old tip is an ancestor. Never for other refs (untouched submodules
         # stay offline), never with created-here unknown.
+        # W57 round 12: a ref verified for its push record alone (``git push
+        # origin origin/main:refs/heads/release``) is probed too.
         branch = ref[len(f"refs/remotes/{remote}/") :]
         verdict = (
-            _probe_ancestor(repo.path, pre, repo.own_git_dir, urls[remote], branch, sha, now)
-            if created is not None and ref in holding
+            _probe_ancestor(repo.path, pre, repo.own_git_dir, urls[remote], (branch,), sha, now)
+            if created is not None
             else None
         )
         if verdict is None:
@@ -1287,18 +1367,16 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     extra = _worktree_tips(repo.own_git_dir)
     if extra is None:
         return f"{repo.name}: unpushed commits unknown ({_WORKTREE_UNREADABLE})"
-    # Same tips as _local_only_commits, but ``--all`` now counts the tracking
-    # refs that do not vouch too; only those that do are subtracted.
-    result = _run(
-        [*pre, "rev-list", "--count", "--exclude=refs/stash", f"--exclude={_PROBE_NS}*"]
-        + ["--all", "--stdin"],
-        cwd=repo.path,
-        stdin="".join(f"{t}\n" for t in extra) + "".join(f"^{v}\n" for v in sorted(vouch)),
-    )
-    try:
-        n = int(result.stdout.strip() or "0") if result.returncode == 0 else None
-    except ValueError:
-        n = None
+    n = _count_unvouched(repo.path, pre, extra, vouch)
+    if n and gone_refs and created is not None:
+        # W57 round 12: a PR merged with a merge commit and its branch deleted —
+        # GitHub's default — left the commit on the remote's ``main``, which this
+        # clone never fetched. Probe the default branch, then every head; only
+        # heads not here (those here already vouch above).
+        for sha, remote in gone_refs:
+            if _on_another_remote_head(repo, pre, urls[remote], heads[remote], present, sha):
+                vouch.add(sha)
+        n = _count_unvouched(repo.path, pre, extra, vouch)
     if n is None:
         return f"{repo.name}: unpushed commits unknown (git failed)"
     if not n:
@@ -1422,11 +1500,21 @@ def _ignored_repo_notes(path: str, rel: str, pushed: list[_Repo]) -> list[str]:
     ``git status`` (its changes show nowhere else). A directory that cannot be
     read is unknown, kept. Symlinks are not followed (deleting the workspace
     does not reach their target either).
+
+    A bare repository there (``build/x.git`` — a push target, a mirror) that
+    holds any ref is kept too: it is deleted with the workspace (W57 round 12).
+
+    Stops at the first repo that keeps the workspace (W57 round 12: each slow
+    repo cost its own timeout); what was not looked at is said as
+    ``"<dir>: …and more not checked"``.
     """
     root = Path(path)
     found: list[str] = []
     stack = [(root / rel.rstrip("/"), 0)]
     while stack:
+        if found:
+            found.append(f"{rel.rstrip('/')}: …and more not checked")
+            break
         here, depth = stack.pop()
         name = here.relative_to(root).as_posix()
         if here.is_symlink():
@@ -1438,6 +1526,11 @@ def _ignored_repo_notes(path: str, rel: str, pushed: list[_Repo]) -> list[str]:
         if dot != "missing":
             found += _ignored_repo_work(here, name, pushed)
             continue  # its own content is the repo's to judge
+        bare = _bare_repo_note(here, name)
+        if bare is not None:
+            if bare:
+                found.append(bare)
+            continue  # a bare repo's content is objects, not work files
         if depth >= _MAX_IGNORED_REPO_DEPTH:
             continue
         try:
@@ -1450,8 +1543,26 @@ def _ignored_repo_notes(path: str, rel: str, pushed: list[_Repo]) -> list[str]:
     return found
 
 
+def _bare_repo_note(here: Path, name: str) -> str | None:
+    """``None``: *here* is no bare repo. ``""``: one with no ref. Else why it is kept."""
+    kinds = [_kind(here / "HEAD"), _kind(here / "objects"), _kind(here / "refs")]
+    if None in kinds:
+        return f"{name}: nested repos unknown (unreadable)"
+    if kinds != ["file", "dir", "dir"]:
+        return None
+    refs = _run(
+        ["git", f"--git-dir={here}", "for-each-ref", "--count=1", "--format=%(refname)"],
+        cwd=str(here),
+    )
+    if refs.returncode != 0:
+        return f"{name}: bare repository unknown (git failed)"
+    return f"{name}: bare repository (holds refs)" if refs.stdout.strip() else ""
+
+
 def _ignored_repo_work(repo: Path, name: str, pushed: list[_Repo]) -> list[str]:
     found = _repo_notes(repo, name, depth=1, seen=set(), pushed=pushed)
+    if found:
+        return found  # kept already: its status is not needed (W57 round 12)
     # --ignored (review of 43caee1): the repo's own ignored files (a local
     # ``.env``) are in no commit either. What a tool rebuilds is not work, by
     # the workspace's own rule; any other ignored file or dir is.
@@ -1556,6 +1667,8 @@ def _worktree_status(path: str, *, _depth: int, _root: str) -> WorktreeStatus:
     pushed: list[_Repo] = []
     nested = _submodule_stashes(path, pushed=pushed)
     for rel in ignored_dirs:
+        if user or stash != 0 or unpushed != 0 or nested:
+            break  # kept already: the rest is not needed (W57 round 12)
         nested += _ignored_repo_notes(path, rel, pushed)
     if not user and stash == 0 and unpushed == 0 and not nested:
         # #1245: a nested repo's "pushed" rests on local tracking refs; ask the

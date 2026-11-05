@@ -101,7 +101,8 @@ def test_repo_whose_origin_is_a_bare_repo_inside_the_workspace_is_kept(tmp_path:
     there is no backup — it is deleted with the workspace."""
     ws, _ = _workspace(tmp_path)
     _ignore(ws, "vendor/")
-    up = ws / "vendor" / "up.git"
+    # Deeper than the ignored-dir scan (2 levels): only "inside the workspace" keeps it.
+    up = ws / "vendor" / "a" / "b" / "up.git"
     git(tmp_path, "init", "-q", "--bare", str(up))
     lib = ws / "vendor" / "lib"
     git(tmp_path, "clone", "-q", str(up), str(lib))
@@ -126,3 +127,40 @@ def test_undecodable_ignored_file_name_inside_a_vendor_repo_is_kept(tmp_path: Pa
         pytest.skip("this file system refuses non-UTF-8 file names")
     res = _kept(ws)
     assert "vendor/lib: uncommitted changes" in res.reason, res.reason
+
+
+def test_slow_nested_repos_cost_one_timeout(tmp_path: Path, monkeypatch) -> None:
+    """W57 round 12: each repo in an ignored dir was asked even after the first
+    already kept the workspace — N slow repos cost N timeouts."""
+    import time
+
+    from c_lord import session_dir as sd
+
+    monkeypatch.setattr(sd._run, "__kwdefaults__", {**sd._run.__kwdefaults__, "timeout": 2.0})
+    ws, subr = _workspace(tmp_path)
+    (ws / ".git" / "info" / "exclude").write_text("vendor/\n")
+    slow = tmp_path / "slow.sh"
+    slow.write_text("#!/bin/sh\nsleep 30\ncat\n")
+    slow.chmod(0o755)
+    for i in range(4):
+        lib = ws / "vendor" / f"lib{i}"
+        git(tmp_path, "clone", "-q", str(subr), str(lib))
+        git(lib, "config", "filter.x.clean", str(slow))
+        (lib / ".git" / "info" / "attributes").write_text("* filter=x\n")
+        future = time.time() + 5
+        os.utime(lib / "README.md", (future, future))
+    t0 = time.monotonic()
+    res = _delete(ws)
+    took = time.monotonic() - t0
+    assert not res.removed
+    assert took < 4.0, f"took {took:.1f}s: {res.reason!r}"
+    assert "more not checked" in res.reason, res.reason
+
+
+def test_bare_repo_with_refs_in_an_ignored_dir_is_kept(tmp_path: Path) -> None:
+    """A bare repo under ``build/`` (a push target, a mirror) is deleted with the workspace."""
+    ws, subr = _workspace(tmp_path)
+    _ignore(ws, "build/")
+    git(tmp_path, "clone", "-q", "--bare", str(subr), str(ws / "build" / "x.git"))
+    res = _kept(ws)
+    assert "build/x.git: bare repository" in res.reason, res.reason

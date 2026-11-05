@@ -270,7 +270,8 @@ def test_remote_inside_the_workspace_never_vouches(tmp_path: Path) -> None:
     git(ws, "add", ".gitignore")
     git(ws, "commit", "-qm", "ignore build")
     git(ws, "push", "-q", "origin", "HEAD:main")
-    mirror = ws / "build" / "mirror.git"
+    # Deeper than the ignored-dir scan (2 levels): only "inside the workspace" keeps it.
+    mirror = ws / "build" / "a" / "b" / "mirror.git"
     git(tmp_path, "clone", "-q", "--bare", str(subr), str(mirror))
     git(ws / "sub", "remote", "set-url", "origin", str(mirror))
     _pushed_branch(ws)
