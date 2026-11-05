@@ -100,6 +100,9 @@ class OrphanSweepResult:
     #: counts once — uncommitted files win when it has both.
     kept_uncommitted: int = 0
     kept_unpushed: int = 0
+    #: Kept because git could not answer (#1286): it timed out, or could not
+    #: count the unpushed commits. Neither "not a git repo" nor known work.
+    kept_unknown: int = 0
     #: 持ち主のいない docker コンテナの名前 (#612)。**止めはしない** — 中身は
     #: 誰かのデータで、勝手に落とす判断はディレクトリの削除より重い。まず
     #: 「在ることが分かる」状態にする。
@@ -300,7 +303,7 @@ async def sweep_orphan_dirs(
         find_orphan_dirs, root, known_dirs, min_idle_days=min_idle_days
     )
     removed = kept = 0
-    removed_clord_only = kept_not_repo = kept_uncommitted = kept_unpushed = 0
+    removed_clord_only = kept_not_repo = kept_uncommitted = kept_unpushed = kept_unknown = 0
     reclaimed = 0
     for candidate in candidates:
         if removed >= max_per_pass:
@@ -317,9 +320,21 @@ async def sweep_orphan_dirs(
         elif outcome in (DirOutcome.KEPT_DIRTY, DirOutcome.KEPT_UNSAFE):
             kept += 1
             if status is not None and not status.is_repo:
-                kept_not_repo += 1
+                # #1286: git timing out is not "not a git repo".
+                if status.unknown:
+                    kept_unknown += 1
+                else:
+                    kept_not_repo += 1
             elif status is not None and status.user_changes:
                 kept_uncommitted += 1
+            elif (
+                status is not None
+                and status.unpushed_commits is None
+                and not status.stash_entries
+                and not status.submodule_stashes
+            ):
+                # #1286: nothing known to be work — git could not count the commits.
+                kept_unknown += 1
             elif status is not None:
                 # #1250: commits never pushed / stashes — not "uncommitted".
                 kept_unpushed += 1
@@ -331,7 +346,8 @@ async def sweep_orphan_dirs(
         logger.info(
             "orphan sweep: removed %d directory(ies) (%.1f GB; %d held only c-lord's own "
             "files), kept %d (%d with uncommitted user work, %d with unpushed commits or "
-            "stashes only, %d not a git repo, %d unsafe or failed to remove)",
+            "stashes only, %d not a git repo, %d could not be checked, "
+            "%d unsafe or failed to remove)",
             removed,
             reclaimed / 1024**3,
             removed_clord_only,
@@ -339,7 +355,8 @@ async def sweep_orphan_dirs(
             kept_uncommitted,
             kept_unpushed,
             kept_not_repo,
-            kept - kept_user_work - kept_not_repo,
+            kept_unknown,
+            kept - kept_user_work - kept_not_repo - kept_unknown,
         )
     return OrphanSweepResult(
         removed=removed,
@@ -350,6 +367,7 @@ async def sweep_orphan_dirs(
         kept_not_repo=kept_not_repo,
         kept_uncommitted=kept_uncommitted,
         kept_unpushed=kept_unpushed,
+        kept_unknown=kept_unknown,
     )
 
 

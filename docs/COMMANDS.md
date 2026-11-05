@@ -628,6 +628,11 @@ selectors) and the braille blank U+2800. One visible character is enough: a ZWJ 
 a letter or emoji followed by VS16, or a combining accent is accepted as before. `name` cannot be
 changed with `PATCH`. The same holds for each choice's `label` / `description`
 on `/api/prompt-choice` (`choices[0].label must be a string`; a `null` label is "label is required").
+Text that the API posts to Discord is held to the same "nothing visible" test (#1288 — before,
+a single zero-width space was posted with a 200 / 201 as a message with nothing in it): `message`
+on `/api/lounge`, `/api/notify` and `/api/schedule`, `content` on `/api/threads/{id}/messages`
+and `/api/reply`, and `question` and each choice's `label` on `/api/prompt-choice` are a
+`400 {"error": "<field> is required"}`, and nothing is posted or saved.
 
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,
 `channel_id`, `thread_id` or numeric ID in the path is a `400`, and a `PATCH` that fails this way

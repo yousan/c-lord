@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · Claude Ultra
+ ▝▝   ▝▝   /…/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80-4fbe-aacd-9eec20e92c64/scratchpad/review16/1276_work · /rc
+
+⚠ Your login expires in 3 days · run /login to renew
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                              
+
+
+                                                                                                                                                              
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                              
+                                                                                                                                                                
+                                                                                                                                         ctrl+g to edit in Vim  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [Pasted text #19 +17 lines] (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。
+  - 項目017: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目018: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目019: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本                          
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5.5  v2.1.318  Style: default  Ctx: 0  Context: [░░░░░░░░░░░░░░░░] 0/1.0M (0%)  Ctx Used: 0.0%  Ctx(u) Used: 0.0%                                
+   Cost: $0.00  5h: 0.0%  Weekly: 84.0%  Session: <1m  Reset: 1hr 14m  Weekly Reset: 11hr 14m  Block: 3hr 45m  In: 0  Out: 0  Cached: 0  Total: 0  In: — ...    
+   ⎇ master  (+0,-0)  +0  -0  1276_work  𖠰 main  cwd: /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80...
+  paste again to expand                                                                                                                                     

@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from c_lord.orphan_dirs import sweep_orphan_dirs
+from c_lord import orphan_dirs
+from c_lord.orphan_dirs import OrphanSweepResult, sweep_orphan_dirs
+from c_lord.session_dir import WorktreeStatus
 
 DAY = 86400.0
 
@@ -122,5 +125,65 @@ async def test_summary_counts_each_kept_dir_under_one_reason(
     (summary,) = [r.getMessage() for r in caplog.records if "directory(ies)" in r.getMessage()]
     assert (
         "kept 4 (2 with uncommitted user work, 2 with unpushed commits or stashes only, "
-        "0 not a git repo, 0 unsafe or failed to remove)"
+        "0 not a git repo, 0 could not be checked, 0 unsafe or failed to remove)"
     ) in summary, summary
+
+
+# #1286: a directory git could not answer for — unpushed commits unknown, or git
+# timed out — was counted as "unpushed commits or stashes only" / "not a git
+# repo" in the summary while its own line said "unknown". The operator reads the
+# summary to decide what to delete by hand; it now gets its own count.
+
+
+def _single_ws(tmp_path: Path) -> Path:
+    ws = tmp_path / "111" / "222"
+    ws.mkdir(parents=True)
+    (ws / "f").write_text("x")
+    when = time.time() - 40 * DAY
+    os.utime(ws, (when, when))
+    return ws
+
+
+async def _keep_and_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: WorktreeStatus,
+) -> tuple[str, str, OrphanSweepResult]:
+    ws = _single_ws(tmp_path)
+    monkeypatch.setattr(orphan_dirs, "worktree_status", lambda *a, **k: status)
+    with caplog.at_level(logging.INFO, logger="c_lord.orphan_dirs"):
+        r = await orphan_dirs.sweep_orphan_dirs(tmp_path, known_dirs=set(), min_idle_days=30)
+    assert r.kept == 1 and ws.exists()
+    msgs = [x.getMessage() for x in caplog.records]
+    keep = next(m for m in msgs if "keeping" in m)
+    summ = next(m for m in msgs if "orphan sweep: removed" in m)
+    return keep, summ, r
+
+
+@pytest.mark.asyncio
+async def test_unknown_unpushed_is_not_called_unpushed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    keep, summ, r = await _keep_and_summary(
+        tmp_path, monkeypatch, caplog, WorktreeStatus(is_repo=True, unpushed_commits=None)
+    )
+    assert "unknown" in keep
+    assert not re.search(r"\b1 with unpushed commits or stashes only", summ), (keep, summ)
+    assert "1 could not be checked" in summ, summ
+    assert (r.kept_unpushed, r.kept_unknown) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_git_timeout_is_not_called_not_a_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    keep, summ, r = await _keep_and_summary(
+        tmp_path, monkeypatch, caplog, WorktreeStatus(is_repo=False, unknown="git timed out")
+    )
+    assert "status unknown" in keep
+    assert "1 not a git repo" not in summ, (keep, summ)
+    assert "1 could not be checked" in summ, summ
+    # the counts still add up to ``kept``: nothing lands in "unsafe or failed"
+    assert "0 unsafe or failed to remove" in summ, summ
+    assert (r.kept_not_repo, r.kept_unknown) == (0, 1)

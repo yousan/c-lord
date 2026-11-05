@@ -276,7 +276,9 @@ async def test_an_answer_written_while_reading_back_is_delivered(
     one, and what Claude wrote in between reached neither — the answer was lost."""
     from c_lord.transcript import mirror as mirror_mod
 
-    original = mirror_mod._turn_state_at_end
+    # #1281: the read-back goes through ``_read_back_state`` (``_turn_state_at_end``
+    # plus whether an agent's report still waits for its turn end).
+    original = mirror_mod._read_back_state
     holder: dict = {}
 
     def slow_read_back(path: Path, *args: object, **kwargs: object):
@@ -285,7 +287,7 @@ async def test_an_answer_written_while_reading_back_is_delivered(
         _write(holder["jsonl"], _text("最終回答です。"), TURN_END)
         return result
 
-    monkeypatch.setattr(mirror_mod, "_turn_state_at_end", slow_read_back)
+    monkeypatch.setattr(mirror_mod, "_read_back_state", slow_read_back)
     restored = _Restored(tmp_path, _tool_use())
     holder["jsonl"] = restored.jsonl
     async with restored:
