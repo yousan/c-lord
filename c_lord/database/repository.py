@@ -467,13 +467,19 @@ class SessionRepository:
         while len(self._in_flight) > 1000:
             self._in_flight.pop(next(iter(self._in_flight)))
 
-    def end_trigger_in_flight(self, thread_id: int, message_id: int) -> None:
-        """The turn of *message_id* is over, sent or not (#1262)."""
+    def end_trigger_in_flight(self, thread_id: int, message_id: int) -> bool:
+        """The turn of *message_id* is over, sent or not (#1262).
+
+        ``True`` when it was still in flight — its prompt never reached the pane
+        (:meth:`note_trigger_sent` takes the mark off first).
+        """
         waiting = self._in_flight.get(thread_id)
-        if waiting is not None:
-            waiting.discard(message_id)
-            if not waiting:
-                del self._in_flight[thread_id]
+        if waiting is None or message_id not in waiting:
+            return False
+        waiting.discard(message_id)
+        if not waiting:
+            del self._in_flight[thread_id]
+        return True
 
     def trigger_in_flight(self, thread_id: int, message_id: int) -> bool:
         """Whether *message_id*'s prompt is still on its way to the pane (#1262)."""

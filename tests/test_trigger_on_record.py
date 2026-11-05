@@ -284,6 +284,9 @@ async def test_a_first_turn_that_reaches_system_keeps_its_trigger(tmp_path) -> N
     async def run(config) -> None:  # noqa: ANN001
         calls.append("run")
         await real_save(42, "sess-1")
+        # The prompt then reaches the pane (#1262: a turn whose prompt never
+        # does owns no answer, and its trigger is dropped when it ends).
+        await config.on_prompt_sent()
 
     cog = _make_chat_cog()
     cog.repo = repo

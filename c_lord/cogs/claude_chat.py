@@ -4425,6 +4425,37 @@ class ClaudeChatCog(commands.Cog):
                 dashboard, thread.id, ThreadState.WAITING_INPUT, description, thread=thread
             )
 
+    async def _end_trigger_in_flight(self, thread_id: int, message_id: int) -> None:
+        """This message turn is over; if its prompt never reached the pane, drop
+        its trigger — #1262 (W57 round 13).
+
+        A turn whose prompt never got into the pane owns no answer: whatever the
+        pane says next answers someone else's input (a ``/skill`` sent meanwhile,
+        or the turn before). Left on record, that answer would be posted as a
+        reply to this message and, after a restart, the ❌ would ping its author.
+        Exact ids only — a newer turn's trigger is never touched. Never raises.
+        """
+        try:
+            unsent = self.repo.end_trigger_in_flight(thread_id, message_id) is True
+        except Exception:
+            return
+        if not unsent:
+            return
+        mirror = getattr(self.bot, "transcript_mirror_cog", None)
+        forget = getattr(mirror, "forget_trigger_message", None)
+        if callable(forget):
+            with contextlib.suppress(Exception):
+                forget(thread_id, only=message_id)
+        try:
+            await self.repo.clear_trigger_message(thread_id, only={message_id})
+        except Exception:
+            # Refused (locked): the repository keeps it for the next save / shutdown.
+            logger.warning(
+                "%s could not forget the trigger of a turn that never reached the pane",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
+
     def _prompt_sent_noter(self, thread_id: int, message_id: int) -> Callable[[], Awaitable[None]]:
         """The ``on_prompt_sent`` hook of a message turn (#1262)."""
 
@@ -4796,8 +4827,7 @@ class ClaudeChatCog(commands.Cog):
                     on_prompt_sent=self._prompt_sent_noter(thread.id, user_message.id),
                 )
             except BaseException:
-                with contextlib.suppress(Exception):
-                    self.repo.end_trigger_in_flight(thread.id, user_message.id)
+                await self._end_trigger_in_flight(thread.id, user_message.id)
                 raise
 
             try:
@@ -4821,8 +4851,7 @@ class ClaudeChatCog(commands.Cog):
                 with contextlib.suppress(Exception):
                     self.repo.discard_pending_trigger(thread.id, user_message.id)
                 # #1262: sent or not, this turn's prompt is no longer on its way.
-                with contextlib.suppress(Exception):
-                    self.repo.end_trigger_in_flight(thread.id, user_message.id)
+                await self._end_trigger_in_flight(thread.id, user_message.id)
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)

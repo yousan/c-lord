@@ -650,3 +650,95 @@ async def test_a_turn_that_fails_before_its_run_is_not_left_in_flight(tmp_path) 
     ):
         await _chat_turn(repo, mirror, 556)
     assert not repo.trigger_in_flight(42, 556)
+
+
+# -- A message turn whose prompt never reached the pane owns no answer --------
+
+
+async def _after_restart(db: str) -> str:
+    """The ❌ a fresh process (new repository on the same file) posts for 42."""
+    repo2 = SessionRepository(db)
+    bot, channels = _bot({555: _msg(555, P), 556: _msg(556, A)})
+    turn_events.reset()
+    return await _api_error(bot, repo2, 42, channels)
+
+
+async def test_a_in_flight_when_skill_sent_then_a_send_fails(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """W57 round 13: A's message is recorded during /skill's prepare; /skill's
+    prompt reaches the pane while A is in flight; then A's send FAILS (A gets its
+    own ❌). The pane's last input is S's /skill — its answer must not reply to
+    A, and after a real restart (a new repository) its ❌ must not ping A."""
+    monkeypatch.delenv(turn_events.ENV_LOG, raising=False)
+    monkeypatch.delenv(turn_events.ENV_URL, raising=False)
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    a_noted = asyncio.Event()
+    a_may_send = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def a_before_send() -> None:
+        a_noted.set()
+        await a_may_send.wait()
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        tasks.append(
+            asyncio.create_task(
+                _chat_turn(repo, mirror, 556, before_send=a_before_send, delivered=False)
+            )
+        )
+        await a_noted.wait()
+        return True, "/sessions/999/42"
+
+    async def skill_after_send() -> None:
+        a_may_send.set()
+        await asyncio.gather(*tasks)
+
+    turn_events.reset()
+    try:
+        with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+            await _skill_turn(repo, 42, S, mirror=mirror, after_send=skill_after_send)
+        ref = await mirror._build_trigger_reference(42)
+        after = await _after_restart(repo.db_path)
+    finally:
+        turn_events.reset()
+    assert (ref is None or ref.message_id != 556) and not after.endswith(f"<@{A}>"), (
+        "reply_to",
+        ref and ref.message_id,
+        "after_restart",
+        after,
+        "row",
+        _row_trigger(repo.db_path),
+    )
+
+
+async def test_a_turn_recorded_and_ended_undelivered_during_prepare(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """W57 round 13: same harm, but A's turn (send failed) is already over
+    before /skill's prompt reaches the pane — never in the pane, so it owns no
+    answer."""
+    monkeypatch.delenv(turn_events.ENV_LOG, raising=False)
+    monkeypatch.delenv(turn_events.ENV_URL, raising=False)
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        await _chat_turn(repo, mirror, 556, delivered=False)
+        return True, "/sessions/999/42"
+
+    turn_events.reset()
+    try:
+        with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+            await _skill_turn(repo, 42, S, mirror=mirror)
+        ref = await mirror._build_trigger_reference(42)
+        after = await _after_restart(repo.db_path)
+    finally:
+        turn_events.reset()
+    assert not repo.trigger_in_flight(42, 556)
+    assert (ref is None or ref.message_id != 556) and not after.endswith(f"<@{A}>"), (
+        "reply_to",
+        ref and ref.message_id,
+        "after_restart",
+        after,
+        "row",
+        _row_trigger(repo.db_path),
+    )
+
+
+# -- PR's "known limit" (ii): the #870 shutdown write-back -------------------------
