@@ -365,7 +365,7 @@ def _ask_ls_remote(cwd: str, name: str, pre: list[str]) -> dict[str, str] | None
     return heads
 
 
-def _remote_head_shas(path: str) -> frozenset[str] | None:
+def _remote_head_shas(path: str, skip: frozenset[str] = frozenset()) -> frozenset[str] | None:
     """Every branch head on every remote of *path*, by asking the remotes (#903).
 
     A session dir is a single-branch clone: pushing a work branch leaves no
@@ -377,6 +377,8 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
         return None
     shas: set[str] = set()
     for name in remotes.stdout.split():
+        if name in skip:
+            continue  # inside the workspace: deleted with it, never vouches
         url = _run(["git", "remote", "get-url", "--", name], cwd=path)
         if url.returncode != 0:
             return None
@@ -387,7 +389,7 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
     return frozenset(shas)
 
 
-def _start_refs(path: str) -> list[str] | None:
+def _start_refs(path: str, inside: frozenset[str] = frozenset()) -> list[str] | None:
     """HEAD and every local ref but tags and notes, by name. ``None``: git failed.
 
     Not only branches (#1198): a commit held only by ``refs/original`` or
@@ -412,11 +414,17 @@ def _start_refs(path: str) -> list[str] | None:
     refs = _run(["git", "for-each-ref", "--format=%(refname)"], cwd=path)
     if refs.returncode != 0:
         return None
+    own = tuple(f"refs/remotes/{n}/" for n in inside)
     tips = [
         ref
         for ref in refs.stdout.split()
-        if not ref.startswith(("refs/remotes/", "refs/tags/", "refs/notes/"))
-        and ref != "refs/stash"
+        # A remote inside the workspace is deleted with it: its refs are
+        # local work like branches (third review of ef8f0fc).
+        if (ref.startswith(own) if own else False)
+        or (
+            not ref.startswith(("refs/remotes/", "refs/tags/", "refs/notes/"))
+            and ref != "refs/stash"
+        )
     ]
     # Only when present: an unborn HEAD would fail rev-list.
     found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
@@ -916,6 +924,96 @@ def _pushed_from_here(git_dir: Path, ref: str, logged: bool) -> bool:
     return any(line.split(b"\t", 1)[-1].startswith(b"update by push") for line in data.splitlines())
 
 
+#: Reflog messages of updates that write a commit made here (#1245, third review of
+#: ef8f0fc). ``pull`` covers ``pull --rebase`` and a pull that merged; a
+#: fast-forward, or a rebase's ``(start)`` checkout of upstream, writes none.
+_CREATED_PREFIXES: tuple[bytes, ...] = (
+    b"commit",
+    b"merge",
+    b"rebase",
+    b"pull",
+    b"cherry-pick",
+    b"revert",
+    b"am:",
+)
+
+
+def _created_here(git_dir: Path, logged: bool) -> set[str] | None:
+    """Commits created in this clone, read from its reflogs. ``None``: cannot tell.
+
+    HEAD's reflog, every ``logs/refs/heads/*`` and each linked worktree's
+    ``logs/HEAD``; the new side of each entry whose message says a commit was
+    written here (:data:`_CREATED_PREFIXES`). With ref logging off, or HEAD's
+    reflog missing, empty or unreadable (expired — ``reflog expire --all``), it
+    is unknown. A commit whose entries expired while HEAD's reflog kept later
+    ones reads as not created here — a known limit (spec).
+    """
+    if not logged:
+        return None
+    files = [git_dir / "logs" / "HEAD"]
+    heads = git_dir / "logs" / "refs" / "heads"
+    kind = _kind(heads)
+    if kind is None or (kind == "dir" and not _ref_files(heads, files, set())):
+        return None
+    try:
+        worktrees = sorted((git_dir / "worktrees").iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        worktrees = []
+    except OSError:
+        return None
+    for wt in worktrees:
+        log = wt / "logs" / "HEAD"
+        wt_kind = _kind(log)
+        if wt_kind is None:
+            return None
+        if wt_kind == "file":
+            files.append(log)
+    created: set[str] = set()
+    for i, f in enumerate(files):
+        try:
+            data = f.read_bytes()
+        except OSError:
+            return None
+        if i == 0 and not data.strip():
+            return None  # HEAD's reflog emptied: nothing can be told
+        for line in data.splitlines():
+            meta, _, msg = line.partition(b"\t")
+            parts = meta.split()
+            if len(parts) < 2 or not msg.startswith(_CREATED_PREFIXES):
+                continue
+            if b"fast-forward" in msg.lower() or b"(start)" in msg:
+                continue
+            new = parts[1].decode("ascii", "replace").lower()
+            if _SHA_RE.match(new) and set(new) != {"0"}:
+                created.add(new)
+    return created
+
+
+def _refs_containing(path: str, pre: list[str], commits: set[str]) -> frozenset[str] | None:
+    """The tracking refs that reach any of *commits* (one ``cat-file``, one ``for-each-ref``).
+
+    Commits no longer in the object store are dropped first (``--contains``
+    fails on them). ``None``: git failed.
+    """
+    check = _run(
+        [*pre, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        cwd=path,
+        stdin="".join(f"{c}\n" for c in sorted(commits)),
+    )
+    if check.returncode != 0:
+        return None
+    present = [line.split()[0] for line in check.stdout.splitlines() if line.endswith(" commit")]
+    if not present:
+        return frozenset()
+    contains = [f"--contains={c}" for c in present]
+    result = _run(
+        [*pre, "for-each-ref", "--format=%(refname)", *contains, "refs/remotes/"], cwd=path
+    )
+    if result.returncode != 0:
+        return None
+    return frozenset(result.stdout.split())
+
+
 def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     """Does a remote-tracking ref in *repo* vouch for commits the remote no longer has? (#1245)
 
@@ -971,6 +1069,14 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     urls, logged = config
     names = sorted(urls, key=len, reverse=True)  # ``a/b`` before ``a``
     inside = {n for n, u in urls.items() if _inside(_local_remote_path(repo.path, u), ws_root)}
+    # Third review of ef8f0fc: a commit made here can reach a *fetched* ref (pushed by
+    # URL or via another remote and fetched back, fast-forwarded upstream into
+    # another branch), so the push reflog alone does not tell. The refs that
+    # hold a commit created here are asked; with no usable HEAD reflog, all.
+    created = _created_here(repo.own_git_dir, logged)
+    holding = _refs_containing(repo.path, pre, created) if created else frozenset[str]()
+    if holding is None:
+        return f"{repo.name}: unpushed commits unknown (git failed)"
     vouch: set[str] = set()
     verify: list[tuple[str, str, str]] = []
     no_vouch = False
@@ -978,8 +1084,12 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         remote = next((n for n in names if ref.startswith(f"refs/remotes/{n}/")), None)
         if remote in inside:
             no_vouch = True
-        elif not _pushed_from_here(repo.own_git_dir, ref, logged):
-            vouch.add(sha)  # came from the remote (clone / fetch)
+        elif (
+            created is not None
+            and ref not in holding
+            and not _pushed_from_here(repo.own_git_dir, ref, logged)
+        ):
+            vouch.add(sha)  # holds only what came from the remote (clone / fetch)
         elif remote is None:
             no_vouch = True
         else:
@@ -1048,7 +1158,16 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     return f"{repo.name}: {n} unpushed commit(s) (only on a remote inside the workspace)"
 
 
-def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
+def _glob_escape(name: str) -> str:
+    return re.sub(r"([*?\[\\])", r"\\\1", name)
+
+
+def _count_not_on(
+    path: str,
+    tips: list[str],
+    also_on: frozenset[str] = frozenset(),
+    inside: frozenset[str] = frozenset(),
+) -> int | None:
     """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
 
     *also_on* are remote heads. A head whose commit is not in this clone is
@@ -1074,7 +1193,10 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
     # Tips through stdin too (#1198: a worktree with thousands of refs
     # overflowed argv); stdin revs are not flipped by the command line's --not.
     result = _run(
-        ["git", "rev-list", "--count", "--not", "--remotes", "--stdin"],
+        ["git", "rev-list", "--count", "--not"]
+        # *inside*: remotes in the workspace subtract nothing (third review of ef8f0fc).
+        + [f"--exclude={_glob_escape(n)}/*" for n in sorted(inside)]
+        + ["--remotes", "--stdin"],
         cwd=path,
         stdin="".join(f"{t}\n" for t in tips) + present,
     )
@@ -1086,7 +1208,9 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
         return None
 
 
-def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
+def _unpushed_commits(
+    path: str, *, ask_remote: bool, root: str | None = None
+) -> tuple[int | None, bool]:
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
     Counts from HEAD (a detached commit is on no branch), every local ref but
@@ -1108,17 +1232,26 @@ def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]
     extra = _worktree_tips(own) if own is not None else []
     if extra is None:
         return None, False
-    start = _start_refs(path)
+    config = _remote_config(path, ["git"])
+    if config is None:
+        return None, False
+    # Third review of ef8f0fc (b3): a remote whose URL is inside the workspace
+    # (``build/backup.git``) is deleted with it — neither its tracking refs
+    # nor its ``ls-remote`` heads vouch for anything.
+    inside = frozenset(
+        n for n, u in config[0].items() if _inside(_local_remote_path(path, u), root or path)
+    )
+    start = _start_refs(path, inside)
     if start is None:
         return None, False
     tips = sorted(set(start) | set(extra))
-    local = _count_not_on(path, tips)
+    local = _count_not_on(path, tips, inside=inside)
     if not ask_remote or not local:
         return local, False
-    heads = _remote_head_shas(path)
+    heads = _remote_head_shas(path, skip=inside)
     if heads is None:
         return local, True
-    return _count_not_on(path, tips, heads), False
+    return _count_not_on(path, tips, heads, inside=inside), False
 
 
 #: How far below an ignored directory a cloned repo is looked for (#1241):
@@ -1188,7 +1321,7 @@ def _ignored_repo_work(repo: Path, name: str, pushed: list[_Repo]) -> list[str]:
     return found
 
 
-def _is_clean_worktree(path: str, xy: str, rel: str, depth: int) -> bool:
+def _is_clean_worktree(path: str, xy: str, rel: str, depth: int, root: str) -> bool:
     """Is this entry a Claude Code worktree with nothing uncommitted inside?
 
     The parent's ``git status`` shows a nested checkout as one line and never
@@ -1196,10 +1329,11 @@ def _is_clean_worktree(path: str, xy: str, rel: str, depth: int) -> bool:
     """
     if xy != "??" or not _WORKTREE_ENTRY_RE.match(rel) or depth >= _MAX_WORKTREE_DEPTH:
         return False
-    return worktree_status(str(Path(path) / rel), _depth=depth + 1).clean
+    # *root*: "inside the workspace" is the outer workspace, not the worktree.
+    return worktree_status(str(Path(path) / rel), _depth=depth + 1, _root=root).clean
 
 
-def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
+def worktree_status(path: str, *, _depth: int = 0, _root: str | None = None) -> WorktreeStatus:
     """Classify ``git status`` of *path* into the user's changes and c-lord's (#749).
 
     Safety invariant (module docstring): anything that *might* be the user's
@@ -1213,7 +1347,7 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
     /workspace-delete with an exception).
     """
     try:
-        return _worktree_status(path, _depth=_depth)
+        return _worktree_status(path, _depth=_depth, _root=_root or path)
     except OSError as exc:
         logger.warning("worktree status of %s unknown: %s", path, exc)
         return WorktreeStatus(is_repo=False, unknown=f"unreadable: {exc.strerror or exc}")
@@ -1222,7 +1356,7 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
         return WorktreeStatus(is_repo=False, unknown=f"check failed: {type(exc).__name__}")
 
 
-def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
+def _worktree_status(path: str, *, _depth: int, _root: str) -> WorktreeStatus:
     # -uall: a wholly untracked ``.claude/`` must be listed file by file, or the
     # injected SKILL.md and a user's own file would hide behind one line.
     # -z: paths come back unquoted, so spaces and non-ASCII names parse as-is.
@@ -1256,7 +1390,7 @@ def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
         if "R" in xy or "C" in xy:
             next(fields, None)  # the source path of a rename/copy
         line = f"{xy} {rel}"
-        if _is_clord_change(xy, rel) or _is_clean_worktree(path, xy, rel, _depth):
+        if _is_clord_change(xy, rel) or _is_clean_worktree(path, xy, rel, _depth, _root):
             clord.append(line)
         elif xy == "!!" and (
             _is_regenerable(rel) or (rel.endswith("/") and not _ignored_dir_holds_work(path, rel))
@@ -1268,7 +1402,7 @@ def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
             user.append(line)
     stash = _stash_entries(path)
     # The network is asked only when nothing else keeps the dir (#903).
-    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user and stash == 0)
+    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user and stash == 0, root=_root)
     pushed: list[_Repo] = []
     nested = _submodule_stashes(path, pushed=pushed)
     for rel in ignored_dirs:
@@ -1277,7 +1411,7 @@ def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
         # #1245: a nested repo's "pushed" rests on local tracking refs; ask the
         # remotes only now, as for the workspace, and stop at the first reason.
         for repo in pushed:
-            note = _stale_tracking_note(repo, path)
+            note = _stale_tracking_note(repo, _root)
             if note:
                 nested.append(note)
                 break
@@ -1297,7 +1431,24 @@ def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
 _MAX_LOGGED_CHANGES = 5
 
 
+def _printable(text: str) -> str:
+    """*text* with undecodable bytes as ``\\xNN`` (third review of ef8f0fc).
+
+    git's output is read with ``surrogateescape``; a lone surrogate must never
+    reach Discord or the logs.
+    """
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    except UnicodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def describe_changes(status: WorktreeStatus) -> str:
+    """Why a directory is being kept — :func:`_describe_changes`, printable."""
+    return _printable(_describe_changes(status))
+
+
+def _describe_changes(status: WorktreeStatus) -> str:
     """Why a directory is being kept, for the INFO line (#749, #903).
 
     Names the entries, because "uncommitted work" alone read as 80 dirs of user
@@ -1541,16 +1692,20 @@ class SessionDirManager:
             return results
 
         for entry in entries:
-            if not entry.is_dir():
-                continue
             if not _THREAD_DIR_RE.match(entry.name):
                 continue
-            if not (entry / ".git").exists():
-                continue
-
             path = str(entry)
             thread_id = int(entry.name)
             try:
+                # Inside the try (third review of ef8f0fc): a dir that cannot be
+                # stat'ed is reported as unknown, not raised or skipped.
+                if not entry.is_dir():
+                    continue
+                dot = _kind(entry / ".git")
+                if dot is None:
+                    raise PermissionError(f"cannot stat {entry / '.git'}")
+                if dot == "missing":
+                    continue
                 commit = _get_commit(path)
                 status = worktree_status(path)
             except Exception as exc:  # noqa: BLE001 — one dir never stops the scan
@@ -1669,5 +1824,5 @@ class SessionDirManager:
                 path=path,
                 thread_id=thread_id,
                 removed=False,
-                reason=f"removal failed: {exc}",
+                reason=_printable(f"removal failed: {exc}"),
             )

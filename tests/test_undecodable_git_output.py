@@ -57,3 +57,37 @@ def test_cleanup_orphaned_goes_on_past_a_failing_workspace(tmp_path: Path, monke
     by_id = {r.thread_id: r for r in results}
     assert by_id[2].removed and not (base / "2").exists()
     assert not by_id[1].removed and (base / "1").exists()
+
+
+def test_reason_never_carries_surrogates(tmp_path: Path) -> None:
+    """Third review: a non-UTF-8 name reached Discord and the logs as a lone surrogate."""
+    import os
+
+    ws, _ = _workspace(tmp_path)
+    with open(os.path.join(os.fsencode(ws), b"caf\xe9.env"), "wb") as f:
+        f.write(b"x")
+    res = _delete(ws)
+    assert not res.removed
+    res.reason.encode("utf-8")  # no lone surrogate
+    assert "caf\\xe9.env" in res.reason, res.reason
+
+
+def test_unreadable_session_dir_is_reported_and_the_scan_goes_on(tmp_path: Path) -> None:
+    import os
+
+    import pytest
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes")
+    base = tmp_path / "sessions"
+    for n in ("1", "2"):
+        (base / n).mkdir(parents=True)
+        git(base / n, "init", "-q")
+    (base / "1").chmod(0o600)
+    try:
+        results = SessionDirManager(base_dir=str(base), source_repo="/x").cleanup_orphaned(set())
+        by_id = {r.thread_id: r for r in results}
+        assert 1 in by_id and not by_id[1].removed and "unknown" in by_id[1].reason, by_id
+        assert by_id[2].removed
+    finally:
+        (base / "1").chmod(0o755)

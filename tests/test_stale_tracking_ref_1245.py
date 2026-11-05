@@ -314,3 +314,40 @@ def test_a_failed_ls_remote_is_cached_as_unknown(tmp_path: Path, monkeypatch) ->
     for repo in repos:
         assert sd._ls_remote_refs(str(repo), "origin", str(tmp_path / "gone.git"), ["git"]) is None
     assert len(calls) == 1, calls
+
+
+# ---- third review of ef8f0fc: a remote inside the workspace, top level too ----
+
+
+def _backup_inside(ws: Path) -> Path:
+    (ws / ".gitignore").write_text("build/\n")
+    git(ws, "add", ".gitignore")
+    git(ws, "commit", "-qm", "ignore build")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    backup = ws / "build" / "backup.git"
+    git(ws, "init", "-q", "--bare", str(backup))
+    git(ws, "remote", "add", "backup", str(backup))
+    return backup
+
+
+def test_b3_workspace_branch_pushed_only_to_a_remote_inside_it_is_kept(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    _backup_inside(ws)
+    git(ws, "checkout", "-q", "-b", "work")
+    _commit(ws, "w.txt")
+    git(ws, "push", "-q", "backup", "work")
+    res = _kept(ws)
+    assert "1 unpushed commit(s)" in res.reason, res.reason
+
+
+def test_claude_worktree_judges_inside_by_the_outer_workspace(tmp_path: Path) -> None:
+    """A Claude Code worktree under ``.claude/worktrees/x``: ``build/backup.git``
+    is inside the workspace, not inside the worktree — it still never vouches."""
+    ws, _ = _workspace(tmp_path)
+    _backup_inside(ws)
+    wt = ws / ".claude" / "worktrees" / "x"
+    git(ws, "worktree", "add", "-q", "-b", "wt-work", str(wt))
+    _commit(wt, "w.txt")
+    git(wt, "push", "-q", "backup", "wt-work")
+    st = worktree_status(str(ws))
+    assert "?? .claude/worktrees/x/" in st.user_changes, st
