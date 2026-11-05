@@ -1574,6 +1574,8 @@ class TmuxClaudeRunner:
     ) -> None:
         self._tmux = tmux_manager
         self._thread_id = thread_id
+        # #1223: the turn-end bus token of the turn in progress, if any.
+        self._turn_token: object | None = None
         self.model = model
         self.working_dir = working_dir
         self.timeout_seconds = timeout_seconds
@@ -1748,6 +1750,25 @@ class TmuxClaudeRunner:
     ) -> AsyncGenerator[StreamEvent, None]:
         """Start Claude in tmux and yield extracted response events.
 
+        See :meth:`_run_turn`. This wrapper only tells the turn-end bus when the
+        turn is over, however it ends (#1223).
+        """
+        try:
+            async with contextlib.aclosing(self._run_turn(prompt, session_id)) as events:
+                async for event in events:
+                    yield event
+        finally:
+            if (token := self._turn_token) is not None:
+                self._turn_token = None
+                turn_end_bus.note_turn_ended(self._thread_id, token)
+
+    async def _run_turn(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Start Claude in tmux and yield extracted response events.
+
         1. Check if Claude is already running; if not, start it.
         2. Handle trust/safety prompts automatically.
         3. Send the user's prompt.
@@ -1795,6 +1816,11 @@ class TmuxClaudeRunner:
         # need a late baseline: the turn this prompt displaces has its prompt
         # before this moment, so its ending never follows a prompt of ours.
         turn_started_at = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
+        # #1223: a transcript c-lord named but Claude has not written yet (a wake
+        # names it with no prompt; a fresh start names it just below) is due
+        # with this turn's instruction — its grace counts from this turn, not
+        # from when it was named. ``run`` ends the turn on the bus.
+        self._turn_token = turn_end_bus.note_turn_started(self._thread_id)
 
         # Start Claude or send a new prompt to an already-running instance.
         claude_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)

@@ -158,3 +158,131 @@ async def test_an_old_name_whose_transcript_never_came_does_not_hold(tmp_path: P
         assert not turn_end_bus.is_tailing(THREAD)
     finally:
         await mirror.stop()
+
+
+async def test_first_pasted_prompt_long_after_a_fresh_wake_still_holds(
+    tmux_manager: MagicMock,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """#1223 (regression of the #1190 fix): a workspace woken with nothing to continue
+    (``wake()`` → ``start_claude(prompt=None)``, e.g. /tmux-screenshot) names its
+    transcript at wake time, but Claude writes it only with the first prompt. When
+    that first (pasted) message came more than 120 s after the wake, the name was
+    "old", the mirror said it was not reading, and the pane closed the turn early
+    — 📊 / 🟡 / ``completion`` while the work went on (the #1132 symptom)."""
+    import os
+
+    from c_lord.transcript.claim import claim_path
+    from c_lord.transcript.resolver import CLAIM_GRACE_SECONDS
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    write_claim(project, SESSION_ID)  # the wake's fresh start named the session
+    woke = time.time() - CLAIM_GRACE_SECONDS - 60  # user wrote 3 min later
+    os.utime(claim_path(project), (woke, woke))
+    mirror = TranscriptMirror(thread_id=THREAD, project_dir=project, sink=_sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        await asyncio.sleep(0.15)
+        events, calls, _ = await _run(tmux_manager, _script, start_grace=0.5)
+        assert [e.error for e in events if e.is_complete] == [None]
+        assert calls["n"] >= 40, f"closed early at poll {calls['n']} (#1132 is back)"
+    finally:
+        await mirror.stop()
+
+
+def test_a_named_transcript_that_never_came_holds_only_its_first_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1223 keeps #1190's point: the grace counts from the first instruction sent
+    under a name, once. A name whose transcript never came after that turn does not
+    hold every later turn; a new name (another wake) gets its own first turn."""
+    from c_lord import turn_end_bus as bus_mod
+    from c_lord.transcript.resolver import CLAIM_GRACE_SECONDS
+
+    now = {"t": 1000.0}
+    monkeypatch.setattr(bus_mod.time, "monotonic", lambda: now["t"])
+    bus = bus_mod.TurnEndBus()
+
+    bus.note_pending_claim(THREAD, "a@1")
+    assert not bus.is_tailing(THREAD), "an old name with no turn running does not hold"
+    bus.note_turn_started(THREAD)
+    assert bus.is_tailing(THREAD), "the first instruction under the name is due to appear"
+
+    now["t"] += CLAIM_GRACE_SECONDS + 1
+    assert not bus.is_tailing(THREAD)
+    bus.note_turn_started(THREAD)
+    assert not bus.is_tailing(THREAD), "the same name must not hold every later turn"
+
+    bus.note_pending_claim(THREAD, "b@2")  # woken again: a new name
+    bus.note_turn_started(THREAD)
+    assert bus.is_tailing(THREAD)
+
+    bus.note_pending_claim(THREAD, None)  # the transcript appeared, or the mirror stopped
+    assert not bus.is_tailing(THREAD)
+
+
+def test_a_fresh_start_spends_its_name_on_its_own_first_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of #1223 (1): on a fresh start ``start_claude`` writes the name *after*
+    the turn began, so the name appears mid-turn. That turn is the name's first and
+    takes the grace; turn 2, ten minutes later, must not take it again and wait
+    120 s for a transcript that never came (#1190 coming back on turn 2)."""
+    from c_lord import turn_end_bus as bus_mod
+
+    now = {"t": 1000.0}
+    monkeypatch.setattr(bus_mod.time, "monotonic", lambda: now["t"])
+    bus = bus_mod.TurnEndBus()
+
+    bus.note_turn_started(THREAD)  # turn 1 begins; start_claude names the session...
+    bus.note_pending_claim(THREAD, "s@1")  # ...and the tail sees the name mid-turn
+    assert bus.is_tailing(THREAD), "the name's first turn is due its transcript"
+    now["t"] += 600
+    bus.note_turn_started(THREAD)  # turn 2: the transcript never came
+    assert not bus.is_tailing(THREAD), "turn 2 re-granted a name turn 1 already spent"
+
+
+async def test_first_prompt_after_a_wake_holds_even_if_the_mirror_starts_with_the_turn(
+    tmux_manager: MagicMock,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """Review of #1223 (2): after idle-sleep, a wake and a first message > 120 s later,
+    the mirror is created just before the turn runs. Its first poll may publish the
+    name only after the turn began; the turn is still the name's first and holds."""
+    import os
+
+    from c_lord.transcript.claim import claim_path
+    from c_lord.transcript.resolver import CLAIM_GRACE_SECONDS
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    write_claim(project, SESSION_ID)
+    woke = time.time() - CLAIM_GRACE_SECONDS - 60
+    os.utime(claim_path(project), (woke, woke))
+    mirror = TranscriptMirror(thread_id=THREAD, project_dir=project, sink=_sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        events, calls, _ = await _run(tmux_manager, _script, start_grace=0.5)
+        assert [e.error for e in events if e.is_complete] == [None]
+        assert calls["n"] >= 40, f"closed early at poll {calls['n']} (#1132 is back)"
+    finally:
+        await mirror.stop()
+
+
+def test_spent_names_are_bounded_like_the_turn_records() -> None:
+    """Review of #1223: the record of which name spent its turn kept one entry per
+    thread that ever had a pending name, for the life of the process (nothing in
+    c-lord calls ``forget``). It is bounded like the turn records, oldest first."""
+    from c_lord import turn_end_bus as bus_mod
+
+    bus = bus_mod.TurnEndBus()
+    first = 10_000
+    last = first + bus_mod._MAX_THREADS + 50
+    for tid in range(first, last):
+        bus.note_pending_claim(tid, f"s{tid}@1")
+        bus.note_turn_ended(tid, bus.note_turn_started(tid))
+    assert len(bus._claim_turn) <= bus_mod._MAX_THREADS
+    assert first not in bus._claim_turn, "the oldest entry is the one dropped"
+    assert last - 1 in bus._claim_turn, "the newest grant is kept"
+    assert bus.is_tailing(last - 1)
