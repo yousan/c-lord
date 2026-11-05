@@ -107,10 +107,11 @@ EMERGENCY_LOW_FRACTION = 0.10
 #: 0.00) does not trip it, short enough to act before the host swaps itself flat.
 EMERGENCY_CONSECUTIVE_SAMPLES = 3
 
-#: How many cap ticks a victim whose sleep was attempted and failed stays behind
-#: every other candidate (#1219, W57 round 8). Bounded: deferred until the user
-#: came back, one transient failure kept the longest-idle workspace awake while
-#: younger ones were slept in its place. A repeat failure defers it again.
+#: How many cap ticks without a new failure the victims whose sleep was attempted
+#: and failed stay behind every other candidate (#1219, W57 round 8). Bounded:
+#: deferred until the user came back, one transient failure kept the longest-idle
+#: workspace awake while younger ones were slept in its place. A repeat failure
+#: defers it again. They are released together, not each on its own clock (#1244).
 DEFERRAL_TICKS = 10
 
 #: How often to sample memory. The cap itself is re-checked on the same tick;
@@ -771,13 +772,15 @@ class ResidentCapLoop:
                 self._deferred[t] = max(n, self._deferred.get(t, 0))
                 self._deferred_at[t] = self._cap_tick
         self._attempted = {}
-        # Bounded by the residents, and in time: after DEFERRAL_TICKS a deferred
-        # thread is back in plain LRU order (#1219, W57 round 8).
-        self._deferred = {
-            t: n
-            for t, n in self._deferred.items()
-            if t in resident and self._cap_tick - self._deferred_at.get(t, 0) < DEFERRAL_TICKS
-        }
+        # Bounded by the residents, and in time: DEFERRAL_TICKS after the latest
+        # failure the deferred threads are back in plain LRU order (#1219, W57
+        # round 8) — all together. Each on its own clock, 11 or more refusers
+        # put one of them back in front on every tick and the killable ones
+        # were never tried (#1244).
+        self._deferred = {t: n for t, n in self._deferred.items() if t in resident}
+        latest = max((self._deferred_at.get(t, 0) for t in self._deferred), default=0)
+        if self._cap_tick - latest >= DEFERRAL_TICKS:
+            self._deferred = {}
         self._deferred_at = {t: v for t, v in self._deferred_at.items() if t in self._deferred}
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
