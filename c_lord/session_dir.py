@@ -171,7 +171,9 @@ class WorktreeStatus:
     stash_entries: int = 0
     #: Stashes inside submodules, as ``"<path>: N stash entries"`` (#1121). They
     #: live in ``<ws>/.git/modules/<name>`` — deleting the dir deletes them —
-    #: and the parent's status and ``refs/stash`` never show them.
+    #: and the parent's status and ``refs/stash`` never show them. A submodule
+    #: git dir with no checkout also reports ``"<name>: N unpushed commit(s)"``
+    #: here (#1198): after deinit / ``git rm`` its commits are in no checkout.
     submodule_stashes: tuple[str, ...] = ()
 
     @property
@@ -444,6 +446,9 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
             note = _stash_note(name, _stash_entries(str(child), git_dir=True))
             if note:
                 found.append(note)
+            note = _unpushed_note(name, _module_unpushed(child))
+            if note:
+                found.append(note)
         if (child / "modules").is_dir():
             found += _module_dir_stashes(
                 child / "modules", prefix=f"{name}/", depth=depth + 1, seen=seen
@@ -451,7 +456,41 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
     return found
 
 
-def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
+def _module_unpushed(git_dir: Path) -> int | None:
+    """Commits in a submodule git dir with no checkout that no remote has (#1198).
+
+    The same count as the workspace's own (:func:`_unpushed_commits`): HEAD
+    (detached too) and every local branch, ``--not --remotes``. Local refs
+    only — no ``ls-remote`` for a module nobody has checked out. ``None`` when
+    git failed; the caller keeps the dir then.
+    """
+    path = str(git_dir)
+    # As in _stash_entries(git_dir=True): core.worktree names a folder that is gone.
+    git = ("git", f"--git-dir={path}", f"--work-tree={path}")
+    branches = _run([*git, "for-each-ref", "--format=%(objectname)", "refs/heads"], cwd=path)
+    head = _run([*git, "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
+    if branches.returncode != 0 or head.returncode not in (0, 1):
+        return None
+    tips = {line.strip() for line in branches.stdout.splitlines() if line.strip()}
+    if head.returncode == 0 and head.stdout.strip():
+        tips.add(head.stdout.strip())
+    return _count_not_on(path, sorted(tips), git=git)
+
+
+def _unpushed_note(name: str, n: int | None) -> str | None:
+    """``"<name>: N unpushed commit(s)"`` (#1198), or ``None`` with none."""
+    if n is None:
+        return f"{name}: unpushed commits unknown (git rev-list failed)"
+    return f"{name}: {n} unpushed commit(s)" if n else None
+
+
+def _count_not_on(
+    path: str,
+    tips: list[str],
+    also_on: frozenset[str] = frozenset(),
+    *,
+    git: tuple[str, ...] = ("git",),
+) -> int | None:
     """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
 
     *also_on* are remote heads. A head whose commit is not in this clone is
@@ -463,7 +502,7 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
     present = ""
     if also_on:
         check = _run(
-            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            [*git, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
             cwd=path,
             stdin="\n".join(also_on),
         )
@@ -475,7 +514,7 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
             if line.endswith(" commit")
         )
     result = _run(
-        ["git", "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
+        [*git, "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
         cwd=path,
         stdin=present,
     )
