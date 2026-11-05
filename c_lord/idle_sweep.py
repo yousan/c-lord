@@ -167,6 +167,10 @@ class IdleSweepLoop:
         """Stop this tick before the next candidate (a subclass's own cap — #1228)."""
         return False
 
+    def _order(self, due: list[int]) -> list[int]:
+        """The order this tick visits *due* in (a subclass may put some last — #1236)."""
+        return due
+
     def _threshold_label(self) -> str:
         return str(self._threshold)
 
@@ -279,6 +283,7 @@ class IdleSweepLoop:
         ]
         if not due:
             return 0
+        due = self._order(due)
 
         backlog = len(due)
         if backlog > self._max_per_tick:
