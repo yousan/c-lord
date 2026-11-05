@@ -88,6 +88,8 @@ MAX_UNSURE_PER_TICK = 5
 # long — the sign of a stall (tmux timeouts are 30 s). A permanent cause (not a
 # thread, no tmux manager) answers at once and must not hold back healthy
 # threads queued behind it; it still meets the per-thread ``_MAX_UNSURE``.
+# A slow ``False`` does not count toward ``_MAX_UNSURE`` (#1236): tmux stalling
+# says nothing about the window, so it is tried again once tmux answers.
 _STALL_SECONDS = 2.0
 _clock = time.monotonic
 
@@ -232,6 +234,11 @@ class IdleSleepLoop(IdleSweepLoop):
         self._unsure_now: set[int] = set()
         # Slow ``False`` answers so far this tick (``MAX_UNSURE_PER_TICK``).
         self._unsure_this_tick = 0
+        # #1236: threads whose attempt stalled -> when (``_stall_seq``). Not given
+        # up on, so they are visited after every other thread, oldest stall
+        # first: otherwise the same five would take every stalled tick.
+        self._stalled: dict[int, int] = {}
+        self._stall_seq = 0
         # Where Claude Code keeps its transcripts. None = its real location;
         # tests point it at a tmp dir.
         self._projects_root: Path | None = None
@@ -345,7 +352,16 @@ class IdleSleepLoop(IdleSweepLoop):
             # because the same answer also covers causes that never go away.
             self._unsure_now.add(thread_id)
             if took >= _STALL_SECONDS:
+                # #1236: a stalled tmux is not the window's fault — do not count
+                # it toward giving up, or a 30-minute stall left the windows
+                # tried then awake after tmux recovered, until someone spoke.
+                # ``MAX_UNSURE_PER_TICK`` still bounds what a stall costs a tick.
                 self._unsure_this_tick += 1
+                self._stall_seq += 1
+                self._stalled[thread_id] = self._stall_seq
+                self._busy.add(thread_id)
+                return False
+            self._stalled.pop(thread_id, None)
             last_used = self._last_used.get(thread_id, "")
             counted_at, count = self._unsure_counts.get(thread_id, (last_used, 0))
             count = (count if counted_at == last_used else 0) + 1
@@ -362,11 +378,19 @@ class IdleSleepLoop(IdleSweepLoop):
             )
             return False
         self._unsure_counts.pop(thread_id, None)
+        self._stalled.pop(thread_id, None)
         return bool(slept)
 
     async def tick(self) -> int:
         self._unsure_this_tick = 0
         return await super().tick()
+
+    def _order(self, due: list[int]) -> list[int]:
+        stalled = self._stalled
+        self._stalled = {t: v for t, v in stalled.items() if t in due}
+        return [t for t in due if t not in stalled] + sorted(
+            (t for t in due if t in stalled), key=stalled.__getitem__
+        )
 
     def _tick_exhausted(self) -> bool:
         if self._unsure_this_tick < MAX_UNSURE_PER_TICK:
