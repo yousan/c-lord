@@ -798,7 +798,9 @@ def test_workspace_commit_held_only_by_a_local_tag_is_kept(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("ref", ["refs/keep/wip", "refs/original/refs/heads/main"])
-def test_workspace_commit_held_only_by_notes_or_original_is_kept(tmp_path: Path, ref: str) -> None:
+def test_workspace_commit_held_only_by_a_keep_ref_or_original_is_kept(
+    tmp_path: Path, ref: str
+) -> None:
     ws, _ = _workspace(tmp_path)
     git(ws, "checkout", "-q", "--detach")
     sha = _commit(ws, "w.txt")

@@ -345,10 +345,10 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
 
 
 def _start_refs(path: str) -> list[str] | None:
-    """HEAD and every local ref but tags, by name. ``None``: git failed.
+    """HEAD and every local ref but tags and notes, by name. ``None``: git failed.
 
-    Not only branches (#1198): a commit held only by notes, ``refs/original``
-    or another local ref was deleted with the workspace. Left out:
+    Not only branches (#1198): a commit held only by ``refs/original`` or
+    another local ref was deleted with the workspace. Left out:
 
     - ``refs/remotes/*`` — what the count subtracts;
     - ``refs/stash`` — counted on its own (:func:`_stash_entries`, #1045), a
@@ -738,7 +738,7 @@ def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
     Counts from HEAD (a detached commit is on no branch), every local ref but
-    tags (branches, notes, ``refs/original`` — #1198) and what the linked
+    tags and notes (branches, ``refs/original`` — #1198) and what the linked
     worktrees hold — their detached HEADs and per-worktree refs, read from
     files (#1198: ``git worktree add --detach`` elsewhere kept its commit
     only in this git dir). The stash is counted
