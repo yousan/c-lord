@@ -150,6 +150,8 @@ class TranscriptMirrorCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
+        # #1249: completions the previous process held for background agents.
+        turn_events.restore_held()
         # Sessions are bounded by Discord usage; 10k is well above realistic.
         rows = await self._session_repo.list_all(limit=10_000)
         started = 0
