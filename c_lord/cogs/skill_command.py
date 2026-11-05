@@ -440,6 +440,15 @@ class SkillCommandCog(commands.Cog):
             if record:
                 session_id = record.session_id
 
+            # #1234 (W57): what is on record *now*, before the workspace is
+            # prepared — a message that arrives meanwhile is a newer turn and
+            # keeps its trigger; only these are forgotten below.
+            mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
+            seen_memory = getattr(mirror_cog, "trigger_message", None)
+            prior_memory = seen_memory(channel.id) if callable(seen_memory) else None
+            prior_record = record.trigger_message_id if record else None
+            prior_pending = self.repo.pending_trigger(channel.id)
+
             display = f"`/{name} {args}`" if args else f"`/{name}`"
             await respond(f"Running {display} in this thread…")
 
@@ -458,12 +467,13 @@ class SkillCommandCog(commands.Cog):
             # #1234: this turn has no trigger message, so the previous turn's
             # must not stay on record — after a restart its author would be
             # pinged for this turn. Nothing on record → the owner (#1212).
-            mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
             forget = getattr(mirror_cog, "forget_trigger_message", None)
-            if callable(forget):
-                forget(channel.id)
+            if callable(forget) and prior_memory is not None:
+                forget(channel.id, only=prior_memory)
             try:
-                await self.repo.clear_trigger_message(channel.id)
+                await self.repo.clear_trigger_message(
+                    channel.id, recorded=prior_record, pending=prior_pending
+                )
             except Exception:
                 logger.warning(
                     "%s /skill could not clear the recorded trigger message",

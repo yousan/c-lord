@@ -331,3 +331,34 @@ async def test_slow_fetch_is_bounded(tmp_path, monkeypatch) -> None:  # noqa: AN
         assert (await _api_error(bot, repo, 42, channels)).endswith(f"<@{OWNER}>")
     finally:
         turn_events.reset()
+
+
+async def test_message_during_skill_prepare_keeps_its_trigger(tmp_path) -> None:  # noqa: ANN001
+    """#1234 (W57 review 11): B runs /skill; while the workspace is being prepared,
+    A sends a message and its turn records 556. /skill may only forget the trigger
+    that was on record when it started — not A's newer one, or A's answer is not a
+    reply to A and after a restart the owner is pinged instead of A."""
+    from c_lord.cogs import skill_command
+
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.save(42, "sess-1")
+    bot, _ = _bot({556: _msg(556, A)})
+    mirror = TranscriptMirrorCog(bot, session_repo=repo)
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        # A's message turn starts meanwhile (claude_chat.py: set_trigger_message).
+        mirror.set_trigger_message(42, 556)
+        await repo.update_trigger_message(42, 556)
+        return True, "/sessions/999/42"
+
+    with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+        turn_events.reset()
+        try:
+            await _skill_turn(repo, 42, B, mirror=mirror)
+        finally:
+            turn_events.reset()
+    assert await mirror._build_trigger_reference(42) is not None, "A's answer would not reply to A"
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id == 556, record.trigger_message_id

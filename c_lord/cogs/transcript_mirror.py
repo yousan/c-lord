@@ -122,11 +122,18 @@ class TranscriptMirrorCog(commands.Cog):
         # In-flight cancellations of displaced mirrors — see :meth:`_release`.
         self._releasing: set[asyncio.Task[None]] = set()
 
-    def forget_trigger_message(self, thread_id: int) -> None:
+    def trigger_message(self, thread_id: int) -> int | None:
+        """The trigger remembered for ``thread_id``, if any."""
+        return self._trigger_messages.get(thread_id)
+
+    def forget_trigger_message(self, thread_id: int, only: int | None = None) -> None:
         """Drop the remembered trigger for ``thread_id`` — a turn with no
         trigger message (``/skill``) must not answer the previous turn's
-        request (#1234). The recorded copy is cleared by the caller."""
-        self._trigger_messages.pop(thread_id, None)
+        request (#1234). With *only*, drop it only if it is still that message:
+        a message that arrived since keeps its own (W57 review). The recorded
+        copy is cleared by the caller."""
+        if only is None or self._trigger_messages.get(thread_id) == only:
+            self._trigger_messages.pop(thread_id, None)
 
     def set_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Record the Discord message ID that triggered the current Claude turn.

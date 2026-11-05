@@ -10,6 +10,10 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 
+# "Whatever is there" for :meth:`SessionRepository.clear_trigger_message`.
+_ANY: object = object()
+
+
 @dataclass
 class SessionRecord:
     """A stored session mapping."""
@@ -427,7 +431,17 @@ class SessionRepository:
         else:
             self._pending_triggers.pop(thread_id, None)
 
-    async def clear_trigger_message(self, thread_id: int) -> None:
+    def pending_trigger(self, thread_id: int) -> int | None:
+        """The first-turn trigger still waiting for *thread_id*'s row, if any."""
+        return self._pending_triggers.get(thread_id)
+
+    async def clear_trigger_message(
+        self,
+        thread_id: int,
+        *,
+        recorded: int | None | object = _ANY,
+        pending: int | None | object = _ANY,
+    ) -> None:
         """Forget the trigger message on record for *thread_id* — #1234.
 
         For a turn that starts without a message of its own (``/skill``): the
@@ -436,13 +450,30 @@ class SessionRepository:
         pinged (#1212). With nothing on record the ping falls back to the owner,
         and the #115 reply is sent unquoted. A pending first-turn trigger is
         dropped too, so the row this turn creates does not carry it (#1235).
+
+        *recorded* / *pending* are what the caller saw when its turn started. When
+        given, only that trigger is forgotten: a message that arrived since (its
+        own, newer turn) keeps its trigger (W57 review of #1234). ``None`` means
+        nothing was there, so nothing is forgotten.
         """
-        self._pending_triggers.pop(thread_id, None)
+        if pending is _ANY:
+            self._pending_triggers.pop(thread_id, None)
+        elif isinstance(pending, int):
+            self.discard_pending_trigger(thread_id, pending)
+        if recorded is None:
+            return
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET trigger_message_id = NULL WHERE thread_id = ?",
-                (thread_id,),
-            )
+            if recorded is _ANY:
+                await db.execute(
+                    "UPDATE sessions SET trigger_message_id = NULL WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE sessions SET trigger_message_id = NULL"
+                    " WHERE thread_id = ? AND trigger_message_id = ?",
+                    (thread_id, recorded),
+                )
             await db.commit()
 
     def discard_pending_trigger(self, thread_id: int, message_id: int) -> None:
