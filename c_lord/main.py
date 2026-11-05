@@ -342,7 +342,9 @@ async def build_api_server(
         if api_port_env.isascii() and api_port_env.isdigit():
             # #1237: ``int()`` of more than 4300 digits raises; any value past
             # 65535 is refused the same way, so a long one is kept as 65536.
-            api_port = int(api_port_env) if len(api_port_env) <= 5 else _MAX_PORT + 1
+            # Leading zeros don't count: ``008080`` was always 8080.
+            digits = api_port_env.lstrip("0") or "0"
+            api_port = int(digits) if len(digits) <= 5 else _MAX_PORT + 1
             if api_port > _MAX_PORT:
                 # Still the port that was set (#258: pinned = as-is or not at
                 # all) — start_api_server reports it and the bot runs without it.

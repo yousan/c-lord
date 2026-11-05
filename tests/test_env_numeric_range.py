@@ -55,3 +55,17 @@ async def test_out_of_range_api_port_does_not_crash_start(
     finally:
         if srv is not None:
             await srv.stop()
+
+
+@pytest.mark.parametrize(("value", "port"), [("008080", 8080), ("0000000080", 80), ("08080", 8080)])
+async def test_valid_port_with_leading_zeros(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, port: int
+) -> None:
+    """#1237 (review): the length guard counted leading zeros, so ``008080`` — read
+    as 8080 before — was taken as out of range and the API did not start."""
+    from c_lord.main import build_api_server
+
+    monkeypatch.setenv("CLORD_API_PORT", value)
+    srv = await build_api_server(MagicMock(), default_channel_id=1, data_dir=tmp_path)
+    assert srv is not None
+    assert srv.port == port
