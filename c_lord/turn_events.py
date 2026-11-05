@@ -72,6 +72,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -522,6 +523,39 @@ def announce_recovered_turn(
         _spawn(_deliver("completion", info, reason="restart_crossed"))
 
 
+def note_read_back_at_rest(thread_id: int) -> None:
+    """A restored mirror read *thread_id*'s transcript back and found it at rest (#1281).
+
+    No turn open, no background agent out, and the turn Claude started on the
+    last agent's report has ended. When that all happened while c-lord was down,
+    the tail (which resumes at the end of the transcript) never sees the turn end
+    that would release a completion held before the restart (#1249), so it is
+    released here — the request's own ``started_by`` and reason, not
+    ``background_agents_unresolved`` an hour later. A hold waiting on a menu
+    answer (#1170) is the answer's to release, and is left alone.
+    """
+    if not enabled():
+        return
+    try:
+        _ensure_held_loaded()
+        held = _HELD.get(thread_id)
+        if held is None or not held.expires or thread_id in _ACTIVE:
+            return
+        logger.info(
+            "%s held completion released — the agents reported back and the turn ended "
+            "while c-lord was down (#1281)",
+            log_ctx(thread_id=thread_id),
+        )
+        _release(thread_id, reason=None)
+    except Exception:
+        # Runs inside the mirror's read-back: a bug here must not stop delivery.
+        logger.warning(
+            "%s could not release the held completion (#1281)",
+            log_ctx(thread_id=thread_id),
+            exc_info=True,
+        )
+
+
 def _as_utc(moment: datetime) -> datetime:
     return moment.replace(tzinfo=_UTC) if moment.tzinfo is None else moment.astimezone(_UTC)
 
@@ -631,18 +665,48 @@ def _info_to_dict(info: TurnInfo) -> dict[str, Any]:
     }
 
 
+#: Discord ids are unsigned 64-bit snowflakes.
+_MAX_ID = 2**64 - 1
+
+
+def _id_from_json(value: object) -> int:
+    """*value* as a Discord id; ``ValueError`` unless it is a whole number in range (#1282).
+
+    ``json.loads`` reads ``Infinity`` / ``NaN`` and integers of any size, and
+    ``int()`` of those raised ``OverflowError`` — which nobody caught.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_ID:
+        raise ValueError(f"not a Discord id: {value!r}")
+    return value
+
+
+def _deadline_from_json(value: object) -> float | None:
+    """*value* as a wall-clock deadline; ``ValueError`` unless a finite number (#1282)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"not a deadline: {value!r}")
+    try:
+        deadline = float(value)
+    except OverflowError as exc:  # an integer too large for a float
+        raise ValueError(f"not a deadline: {value!r}") from exc
+    if not math.isfinite(deadline):
+        raise ValueError(f"not a deadline: {value!r}")
+    return deadline
+
+
 def _info_from_dict(raw: dict[str, Any]) -> TurnInfo:
     by = raw["started_by"]
 
     def opt_int(value: object) -> int | None:
-        return int(value) if value is not None else None  # type: ignore[arg-type]
+        return _id_from_json(value) if value is not None else None
 
     def opt_str(value: object) -> str | None:
         return str(value) if value is not None else None
 
     started_at = _as_utc(datetime.fromisoformat(str(raw["started_at"])))
     return TurnInfo(
-        thread_id=int(raw["thread_id"]),
+        thread_id=_id_from_json(raw["thread_id"]),
         guild_id=opt_int(raw.get("guild_id")),
         channel_id=opt_int(raw.get("channel_id")),
         started_by=StartedBy(str(by["type"]), opt_str(by.get("id")), opt_str(by.get("name"))),
@@ -650,7 +714,7 @@ def _info_from_dict(raw: dict[str, Any]) -> TurnInfo:
         # The old process's monotonic clock means nothing here; nothing compares
         # a held turn's start against this process's snapshots.
         started_mono=time.monotonic() - max(0.0, time.time() - started_at.timestamp()),
-        baseline_reply_id=int(raw.get("baseline_reply_id") or 0),
+        baseline_reply_id=opt_int(raw.get("baseline_reply_id")) or 0,
     )
 
 
@@ -718,14 +782,15 @@ def _ensure_held_loaded() -> None:
     for entry in entries if isinstance(entries, list) else []:
         try:
             info = _info_from_dict(entry["info"])
-            deadline = entry.get("deadline")
             held = _Held(
                 info,
                 reason=entry.get("reason"),
                 expires=bool(entry.get("expires", True)),
-                deadline=float(deadline) if deadline is not None else None,
+                deadline=_deadline_from_json(entry.get("deadline")),
             )
-        except (AttributeError, KeyError, TypeError, ValueError):
+        # #1282: OverflowError too — a number no check above foresaw must still
+        # cost only its own entry, never begin_turn or the entries after it.
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             logger.warning("skipping an unreadable held completion in %s (#1249)", path)
             continue
         if info.thread_id in _HELD or info.thread_id in _ACTIVE:
