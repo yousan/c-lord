@@ -48,6 +48,17 @@ if TYPE_CHECKING:
 # unrelated trailing-numeric path components (PIDs, ports, etc.).
 _THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
 
+
+def _is_ascii_number(text: str) -> bool:
+    """Whether *text* is ASCII digits only — the only numbers c-lord writes into tmux.
+
+    #1239: ``"²".isdigit()`` is True but ``int("²")`` raises. The tmux server is
+    shared, so a window renamed ``w²`` or a stray tag made rebuilding the
+    thread -> window map raise. Anything else is not a c-lord window / row.
+    """
+    return text.isascii() and text.isdigit()
+
+
 # tmux's immutable per-window handle, e.g. ``@218``. Unique for the life of the
 # server, so it needs no session qualifier and — unlike a window *name* — can
 # never resolve to a sibling that happens to share it (#649).
@@ -327,7 +338,7 @@ def parse_work_number(window_name: str) -> int | None:
     for prefix in (WINDOW_PREFIX, _LEGACY_WINDOW_PREFIX):
         if window_name.startswith(prefix):
             suffix = window_name[len(prefix) :]
-            if suffix.isdigit():
+            if _is_ascii_number(suffix):
                 return int(suffix)
     return None
 
@@ -1447,7 +1458,7 @@ class TmuxSessionManager:
                 continue
             names[window_id] = window_name
 
-            if tag.isdigit():
+            if _is_ascii_number(tag):
                 opt_claims.setdefault(int(tag), []).append(window_id)
             elif pane_path:
                 m = _THREAD_ID_FROM_PATH_RE.search(pane_path)
@@ -1726,7 +1737,7 @@ class TmuxSessionManager:
         live_names = self._window_names()
 
         for tid_str, window_name in data.items():
-            if not tid_str.isdigit():
+            if not _is_ascii_number(tid_str):
                 continue
             thread_id = int(tid_str)
             if thread_id in target:
@@ -3940,7 +3951,7 @@ class TmuxSessionManager:
                 )
                 continue
 
-            if not tid_str.isdigit():
+            if not _is_ascii_number(tid_str):
                 if self._is_reapable_untagged(window, target) and self._kill_if_still_tagged(
                     target, tid_str
                 ):
@@ -4108,7 +4119,7 @@ def _claude_panes_listing(*, owned_only: bool = False) -> dict[int, str] | None:
         pane_id = pane_id.strip()
         if owned_only and owner.strip() not in ("", mine):
             continue
-        if tid.isdigit() and "claude" in command.strip().lower():
+        if _is_ascii_number(tid) and "claude" in command.strip().lower():
             panes[int(tid)] = pane_id
     return panes
 
@@ -4172,7 +4183,7 @@ def live_claude_panes() -> LiveClaude | None:
         command, _, path = rest.partition("\t")
         if "claude" not in command.strip().lower():
             continue
-        if tid.strip().isdigit():
+        if _is_ascii_number(tid.strip()):
             thread_ids.add(int(tid.strip()))
         if path.strip():
             paths.add(path.strip())

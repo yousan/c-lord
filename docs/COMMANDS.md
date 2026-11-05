@@ -360,7 +360,7 @@ So whether a swept thread still has its checkout depends on whether work was lef
 | clone only | the work is there, the conversation is not |
 | neither | nothing left to reconnect to |
 
-**Two cleaners run on the same schedule.** Claude Code expires its own transcripts under `~/.claude/projects/` via `cleanupPeriodDays` (default 30), independently of c-lord. Since #575 the sweep period follows that same setting, so a checkout that survives usually survives without its transcript (the middle row). c-lord cannot restore a conversation it never deleted — raise `cleanupPeriodDays` in your Claude Code settings if you want longer history.
+**Two cleaners run on the same schedule.** Claude Code expires its own transcripts under `~/.claude/projects/` via `cleanupPeriodDays` (default 30), independently of c-lord. Since #575 the sweep period follows that same setting, so a checkout that survives usually survives without its transcript (the middle row). c-lord cannot restore a conversation it never deleted — raise `cleanupPeriodDays` in your Claude Code settings if you want longer history. A value that is not a finite positive number (`1e999`, `NaN`, `0`, text) is ignored with a WARNING and the default applies; a very large one is capped at 1,000,000 days, which in practice means "keep" (#1240).
 
 **Screenshot height (#471)**: `/tmux-screenshot` (and the `/resync` PNG snapshot) show **more history than the live ~40-row window**. Claude's TUI keeps no scrollback, so before capturing, c-lord transiently grows the window so Claude redraws more of the conversation, captures the taller screen, then restores the exact original size (the human's attached view is unchanged). The default height is **100 rows**; override it with `CLORD_TMUX_SCREENSHOT_ROWS` (rows), or set it to `0` to capture the current window as-is.
 
@@ -617,8 +617,9 @@ task's `prompt: ["x"]` ran as the instruction `['x']`). Absent or `null` is the 
 field out (`label` falls back to `AI`, `source` to `cli`, `reason` to `self_restart`; a `PATCH` with
 `"prompt": null` does not touch the prompt). An empty `prompt` is a `400 {"error": "prompt is
 required"}` on `PATCH` as on `POST`, and the saved prompt stays as it was (#1229 — before, `PATCH`
-saved `""` with a 200 and every run after that sent Claude an empty instruction). `name` cannot be
-changed with `PATCH`. The same holds for each choice's `label` / `description`
+saved `""` with a 200 and every run after that sent Claude an empty instruction). A `prompt` (or a
+`POST`'s `name`) of only spaces, tabs or newlines counts as empty, as on `/api/spawn` (#1238 —
+before, `"   "` was saved with a 201 / 200). `name` cannot be changed with `PATCH`. The same holds for each choice's `label` / `description`
 on `/api/prompt-choice` (`choices[0].label must be a string`; a `null` label is "label is required").
 
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,
