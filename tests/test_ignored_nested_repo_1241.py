@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from c_lord.session_dir import describe_changes, worktree_status
 
 from .test_submodule_unpushed_1198 import _commit, _delete, _kept, _workspace, git
@@ -117,7 +119,10 @@ def test_undecodable_ignored_file_name_inside_a_vendor_repo_is_kept(tmp_path: Pa
     lib = ws / "vendor" / "lib"
     git(tmp_path, "clone", "-q", str(subr), str(lib))
     (lib / ".git" / "info" / "exclude").write_text("*.bin\n")
-    with open(os.path.join(os.fsencode(lib), b"caf\xe9.bin"), "wb") as f:
-        f.write(b"x")
+    try:
+        with open(os.path.join(os.fsencode(lib), b"caf\xe9.bin"), "wb") as f:
+            f.write(b"x")
+    except OSError:  # APFS (macOS) refuses non-UTF-8 file names
+        pytest.skip("this file system refuses non-UTF-8 file names")
     res = _kept(ws)
     assert "vendor/lib: uncommitted changes" in res.reason, res.reason

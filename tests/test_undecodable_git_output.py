@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from c_lord import session_dir as sd
 from c_lord.session_dir import SessionDirManager, describe_changes, worktree_status
 
@@ -64,8 +66,11 @@ def test_reason_never_carries_surrogates(tmp_path: Path) -> None:
     import os
 
     ws, _ = _workspace(tmp_path)
-    with open(os.path.join(os.fsencode(ws), b"caf\xe9.env"), "wb") as f:
-        f.write(b"x")
+    try:
+        with open(os.path.join(os.fsencode(ws), b"caf\xe9.env"), "wb") as f:
+            f.write(b"x")
+    except OSError:  # APFS (macOS) refuses non-UTF-8 file names
+        pytest.skip("this file system refuses non-UTF-8 file names")
     res = _delete(ws)
     assert not res.removed
     res.reason.encode("utf-8")  # no lone surrogate
