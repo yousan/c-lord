@@ -2011,11 +2011,22 @@ class SessionManageCog(commands.Cog):
         tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is None:
             return False
+        # #1206: one lookup that can say "did not answer". A stalled tmux
+        # (``tmux -V`` / ``show-option`` / ``list-windows`` timing out) made
+        # ``session_exists`` answer "no window", which the resident cap counted
+        # as gone and never made up for. Could not tell is "still there".
+        present = await asyncio.to_thread(tmux_mgr.window_present, thread_id)
+        if present is None:
+            logger.warning(
+                "%s sleep: tmux did not answer — counted as still there",
+                log_ctx(thread_id=thread_id),
+            )
+            return False
 
         # Already asleep (or never resident): there is nothing to reclaim, and
         # going further would re-post the docker line on every tick — which is
         # how an invisible feature turns into a nuisance.
-        if not await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
+        if not present:
             return None
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the
@@ -2061,7 +2072,8 @@ class SessionManageCog(commands.Cog):
                 session_dir = str(Path(sdm.base_dir) / str(thread_id))
                 containers = await containers_for_session_dir(session_dir)
 
-        if any(c.running for c in containers):
+        # Paused / restarting ones hold their ports too (review of #1182).
+        if any(c.holds_ports for c in containers):
             # Built by the shared inventory builder, not a bespoke line: a notice
             # says what stopped *and what survived*, because "did I just lose
             # something?" is the reader's actual question (#571). Two functions

@@ -678,6 +678,11 @@ class ApiServer:
         for field in ("name", "prompt", "interval_seconds", "channel_id"):
             if not data.get(field):
                 return web.json_response({"error": f"{field} is required"}, status=400)
+        for field in ("name", "prompt"):
+            # #1208: ``["x"]`` was saved through ``str()`` as the prompt ``['x']``.
+            _, err = _text(data, field)
+            if err is not None:
+                return err
         run_immediately = data.get("run_immediately", True)
         if not isinstance(run_immediately, bool):
             return _not_a_boolean("run_immediately")
@@ -752,8 +757,11 @@ class ApiServer:
         if "enabled" in data and not isinstance(data["enabled"], bool):
             return _not_a_boolean("enabled")
         patch_kwargs: dict[str, object] = {}
-        if "prompt" in data:
-            patch_kwargs["prompt"] = str(data["prompt"])
+        if data.get("prompt") is not None:
+            prompt, err = _text(data, "prompt")  # #1208: no more str(["x"]) -> "['x']"
+            if err is not None:
+                return err
+            patch_kwargs["prompt"] = prompt
         if "interval_seconds" in data:
             interval = _task_int(data["interval_seconds"])
             if interval is None or interval < 1:
@@ -853,7 +861,10 @@ class ApiServer:
         if not message:
             return web.json_response({"error": "message is required"}, status=400)
 
-        label = str(data.get("label", "AI")).strip() or "AI"
+        raw_label, err = _text(data, "label")  # #1208
+        if err is not None:
+            return err
+        label = (raw_label or "").strip() or "AI"
 
         stored = await self.lounge_repo.post(message=message, label=label)  # type: ignore[union-attr]
 
@@ -998,6 +1009,10 @@ class ApiServer:
         if err is not None:
             return err
 
+        _, err = _text(data, "reason")  # #1208: ``str()`` saved ["x"] as "['x']"
+        if err is not None:
+            return err
+
         raw_thread_id = data.get("thread_id")
         if not raw_thread_id:
             return web.json_response({"error": "thread_id is required"}, status=400)
@@ -1129,7 +1144,10 @@ class ApiServer:
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
-        source = str(data.get("source", "cli")).strip() or "cli"
+        raw_source, err = _text(data, "source")  # #1208
+        if err is not None:
+            return err
+        source = (raw_source or "").strip() or "cli"
 
         # Resolve the thread/channel
         raw = self.bot.get_channel(thread_id)
@@ -1369,10 +1387,17 @@ class ApiServer:
         for i, ch in enumerate(choices):
             if not isinstance(ch, dict):
                 return web.json_response({"error": f"choices[{i}] must be an object"}, status=400)
-            label = str(ch.get("label", "")).strip()
+            # #1208 (review): text, or absent / null — never ``str()`` of a list.
+            raw_label, raw_desc = ch.get("label"), ch.get("description")
+            for key, value in (("label", raw_label), ("description", raw_desc)):
+                if value is not None and not isinstance(value, str):
+                    return web.json_response(
+                        {"error": f"choices[{i}].{key} must be a string"}, status=400
+                    )
+            label = (raw_label or "").strip()
             if not label:
                 return web.json_response({"error": f"choices[{i}].label is required"}, status=400)
-            desc = str(ch.get("description", "")).strip()
+            desc = (raw_desc or "").strip()
             normalized.append((label, desc))
 
         raw = self.bot.get_channel(thread_id)

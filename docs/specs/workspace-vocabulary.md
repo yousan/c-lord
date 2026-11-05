@@ -77,7 +77,7 @@
 
 - **会話履歴と docker volume は、削除を含むどの操作でも消えない。** 通知は毎回そう言う
 - **`開発環境 (docker)` の行は、コンテナが無くても「— （なし）」と出す。** 棚卸しの行を黙って減らさない
-- **止まっている（exited）コンテナしか無いときも「— （なし）」と出す**（#1182）。`/workspace-stop` → `/workspace-delete` の順だと `docker ps -a` は exited のコンテナを見つけるが、ポートも掴んでおらず止めるものも無い。以前はこれを「▶️ 動いたまま」と出し、後始末が失敗したように読めた。「▶️ 動いたまま」は、ポートを掴んだままのコンテナ（`running` に加えて `paused`・`restarting`。`exited`・`created`・`dead` 以外）が残ったときだけ。`paused`・`restarting` は止める対象にしていないので、残っていれば「動いたまま」と出す（「なし」と言うと、ポートを握ったままなのに無いと読める）
+- **止まっている（exited）コンテナしか無いときも「— （なし）」と出す**（#1182）。`/workspace-stop` → `/workspace-delete` の順だと `docker ps -a` は exited のコンテナを見つけるが、ポートも掴んでおらず止めるものも無い。以前はこれを「▶️ 動いたまま」と出し、後始末が失敗したように読めた。「▶️ 動いたまま」は、ポートを掴んだままのコンテナ（`running` に加えて `paused`・`restarting`。`exited`・`created`・`dead` 以外）が残ったときだけ。`paused`・`restarting` は止める対象にしていないので、残っていれば「動いたまま」と出す（「なし」と言うと、ポートを握ったままなのに無いと読める）。スリープの通知（コンテナは止めない）も同じで、ポートを握ったままのコンテナがあれば、paused・restarting でもそのポートを挙げる
 - **自動と手動で変わってよいのは説明の1行だけ。** 棚卸しの中身は完全に同一
 
 最後の項目は構造で担保する。同じ結果になる文面を2箇所に書くと必ずズレる — #538 がまさにその事故（挙動を案内する側と実装する側で条件が食い違った）だった。だから通知は `c_lord/workspace_notice.py` の **1つの関数**が組み立て、`reason` 引数は説明行しか変えられない。
@@ -236,7 +236,7 @@ session cleanup: keeping /…/1559120173389062204 — uncommitted user work: !! 
 
 **`/workspace-cleanup` も残した理由を同じ言い方で出す**（#1016）。Discord の「⚠️ Dirty — not removed」欄の
 各行は `` `<パス>` — 2 unpushed commit(s) on no remote branch `` / `` `<パス>` — uncommitted user work: !! .env `` の形で、
-dry run の「Would skip」欄も同じ理由を出す。stash は push していないコミットとは別に `1 stash entry` と書く（#1045。以前は stash のコミットが `2 unpushed commit(s)` と数えられていた）。`refs/stash` が在れば、reflog が空でも（`git reflog expire` の後や `update-ref` で置いた stash）最低1件と数えて残す（#1080。以前は 0 件と数えてフォルダごと stash を消していた）。**サブモジュールの中の stash も数える**（#1121）。サブモジュールの stash は `<ワークスペース>/.git/modules/<名前>` にあってフォルダと一緒に消えるのに、親の `git status` にも `refs/stash` にも出ないため、以前は clean と読んで stash ごと消していた。理由は `sub: 1 stash entry` のようにサブモジュールのパス付きで出す（入れ子は3段まで）。**チェックアウトの無いサブモジュールも見る**（#1181）: `git submodule deinit` や `git rm` の後はフォルダに `.git` が無くなるが、stash は `.git/modules/<名前>` に残っていてフォルダと一緒に消える。そこで `.git/modules` の下の git ディレクトリのうちチェックアウトに対応しないものも確かめ、モジュール名付きで理由に出す（以前はチェックアウトされているものだけを見ていて、stash ごと消していた）。残すかどうかと理由は**同じ1回の `git status` から**決める（2回取ると、間で `ls-remote` の答えが変わったとき理由が空になった）。`/workspace-delete` で残したときは `ℹ️ Session directory kept — <理由>` と出す。ログは INFO 1 行
+dry run の「Would skip」欄も同じ理由を出す。stash は push していないコミットとは別に `1 stash entry` と書く（#1045。以前は stash のコミットが `2 unpushed commit(s)` と数えられていた）。`refs/stash` が在れば、reflog が空でも（`git reflog expire` の後や `update-ref` で置いた stash）最低1件と数えて残す（#1080。以前は 0 件と数えてフォルダごと stash を消していた）。**サブモジュールの中の stash も数える**（#1121）。サブモジュールの stash は `<ワークスペース>/.git/modules/<名前>` にあってフォルダと一緒に消えるのに、親の `git status` にも `refs/stash` にも出ないため、以前は clean と読んで stash ごと消していた。理由は `sub: 1 stash entry` のようにサブモジュールのパス付きで出す（入れ子は3段まで）。`.gitmodules` に載っていない、`git add` しただけの入れ子のリポジトリ（gitlink）の stash も同じように数える（#1207。以前は `.gitmodules` が無いと見に行かず、stash ごと消していた）。**チェックアウトの無いサブモジュールも見る**（#1181）: `git submodule deinit` や `git rm` の後はフォルダに `.git` が無くなるが、stash は `.git/modules/<名前>` に残っていてフォルダと一緒に消える。そこで `.git/modules` の下の git ディレクトリのうちチェックアウトに対応しないものも確かめ、モジュール名付きで理由に出す（以前はチェックアウトされているものだけを見ていて、stash ごと消していた）。残すかどうかと理由は**同じ1回の `git status` から**決める（2回取ると、間で `ls-remote` の答えが変わったとき理由が空になった）。`/workspace-delete` で残したときは `ℹ️ Session directory kept — <理由>` と出す。ログは INFO 1 行
 （`Keeping session dir <パス> (thread_id=…) — <理由> (#1016)`）。以前は一律
 「session directory has uncommitted changes」で、`git status` に何も出ないフォルダの理由が分からなかった。
 

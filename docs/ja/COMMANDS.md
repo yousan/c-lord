@@ -193,6 +193,13 @@ Bot は 2 つの認可方式に対応しています（OR 条件 — どちら�
 | `GET` | `/api/lounge` | AI Lounge の最新メッセージ一覧 |
 | `POST` | `/api/lounge` | AI Lounge にメッセージを投稿 |
 
+文字列の欄は JSON の文字列で送る。`POST /api/tasks` の `name` / `prompt`、`PATCH /api/tasks/{id}` の
+`prompt`、`/api/lounge` の `label`、`/api/threads/{id}/messages` の `source`、`/api/mark-resume` の
+`reason` に数値・`true`・リスト・オブジェクトを送ると `400 {"error": "<欄> must be a string"}` になり、
+何も保存・投稿されない（#1208。以前は受け付けて `str()` で保存し、タスクの `prompt: ["x"]` が
+`['x']` という指示として定期実行されていた）。欄が無い・`null` は送らなかったのと同じ（`label` は
+`AI`、`source` は `cli`、`reason` は `self_restart`。`PATCH` の `"prompt": null` はプロンプトを変えない）。
+
 ### 使用例
 
 通知を送信:
