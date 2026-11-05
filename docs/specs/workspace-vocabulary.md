@@ -277,7 +277,11 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
       （W57 の12回目のレビュー。GitHub の既定の流れ — PR を merge commit で merge してブランチを消す — で、fetch していない
       ワークスペースが `sub: 1 unpushed commit(s) (remote branch deleted or rewritten)` のまま消えなくなっていた）。まず remote の
       既定のブランチ（`ls-remote --symref` の `HEAD`）を1回 fetch し、無ければすべてのブランチを1回 fetch して、どれかの祖先に
-      あれば証にする。手元にすでにある先端は fetch しない（手元で証になる）。ここで作ったか分からないとき（reflog が使えない）は
+      あれば証にする。消えたブランチが同じ remote にいくつあっても、既定のブランチとすべてのブランチはそれぞれ1回だけ fetch し、
+      すべてのコミットをその1回で確かめる。すべてのブランチの確認では、どのブランチにも無いコミットが1つ見つかった時点で
+      やめる（残すにはそれで足りる。W57 の13回目のレビュー。以前は消えたブランチごとに取り直していた）。既定のブランチの
+      fetch が失敗・打ち切りなら、その remote ではすべてのブランチの fetch もしない。失敗は URL ごとに 60 秒使い回すので、
+      止まる remote で待つのは 60 秒あたり1回。手元にすでにある先端は fetch しない（手元で証になる）。ここで作ったか分からないとき（reflog が使えない）は
       fetch しない。どのブランチにも無ければ（#1245 そのもの）数えて `sub: 1 unpushed commit(s) (remote branch deleted or rewritten)`
       として残す。**squash マージされて remote で消された、
       自分が push したブランチは、ワークスペースを残し続ける。** `/workspace-delete` に強制して消す指定は無いので、消してよいと
@@ -292,8 +296,10 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
       `.claude/worktrees/<名前>/`（Claude Code の worktree）を開いて判定するときも、「中」かどうかは外側のワークスペースで測る。
       この判定のために、ワークスペースごとに `git config` を1回足す。
     - **remote にはワークスペースの外から、URL で聞く**（#1245 の5回目のレビュー）。`ls-remote` は解決した URL を渡して中立の
-      ディレクトリ（空の一時ディレクトリ。`GIT_CEILING_DIRECTORIES` でその上のリポジトリを探さない — `TMPDIR` が誰かの git
-      リポジトリの中にあると、その `core.sshCommand` や `insteadOf` が効いていた。W57 の12回目のレビュー）で走らせるので、ワークスペースの設定（`remote.<name>.uploadpack`・`core.sshCommand`・credential helper・
+      ディレクトリ（空の一時ディレクトリを手で空の git ディレクトリにし、`GIT_DIR` でそれを指す — リポジトリを探しに行かないので、
+      `TMPDIR` が誰かの git リポジトリの中にあっても、パスに `:` があっても、bot の環境に `GIT_DIR` があっても、その
+      `core.sshCommand` や `insteadOf` は効かない。W57 の12・13回目のレビュー。12回目の `GIT_CEILING_DIRECTORIES` は `:` で
+      区切られて効かなかった）で走らせるので、ワークスペースの設定（`remote.<name>.uploadpack`・`core.sshCommand`・credential helper・
       `insteadOf`）は効かない。bot の global の設定と環境（ssh の鍵・`GIT_SSH_COMMAND`・global の credential helper）は効くので、
       ふつうの ssh / https の remote はそのまま使える。調べるだけの git の呼び出しはすべて `core.fsmonitor=false`・
       `core.hooksPath=/dev/null`・`protocol.ext.allow=never` で走らせ（ワークスペースが仕込んだ fsmonitor のコマンドや hook は
@@ -353,7 +359,9 @@ stash・push していないコミット・その中のサブモジュールを�
 **最初に「残す」理由が見つかった時点で探すのをやめる**（W57 の12回目のレビュー。以前は見つけた後も残りのリポジトリを1つずつ
 調べ、遅いリポジトリ（フィルタが止まるなど）が N 個あると打ち切りの待ちが N 回積み重なった）。見なかった分は
 `vendor: …and more not checked` と書く。ほかの理由（利用者の変更・stash・push していないコミット・サブモジュール）ですでに
-残すと決まっているときは、無視ディレクトリの中は探さない。
+残すと決まっているときは、無視ディレクトリの中は探さない。そのときも探さなかったディレクトリを
+`…and more not checked: vendor/, build/ (+2 more)` と書く（W57 の13回目のレビュー。書かないと、`/workspace-cleanup` の dry run が
+途中までの理由をすべての理由のように見せていた）。
 **無視されたディレクトリの中の bare リポジトリ**（`build/x.git` のような push 先・ミラー。`HEAD`・`objects/`・`refs/` を持つ）も、
 ref を1つでも持っていれば `build/x.git: bare repository (holds refs)` として残す（ワークスペースと一緒に消えるため）。git の
 呼び出しは1つにつき `for-each-ref` 1回。同じ2段までしか探さないので、それより深い bare リポジトリは「ワークスペースの中の

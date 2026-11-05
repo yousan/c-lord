@@ -196,3 +196,80 @@ def test_ls_remote_ignores_a_repo_enclosing_tmpdir_insteadof(tmp_path: Path, mon
     root = _enclosing_repo_tmp(tmp_path, monkeypatch)
     git(root, "config", f"url.{decoy}.insteadOf", str(subr))
     assert not _delete(ws).removed
+
+
+# ---- W57 round 13: wherever TMPDIR sits (a ':' split GIT_CEILING_DIRECTORIES) ----
+
+
+def _evil_ssh_repo(at: Path, script: Path) -> None:
+    at.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(at)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(at), "config", "core.sshCommand", str(script)], check=True)
+
+
+def _tmpdir_layout(tmp: Path, case: str, script: Path) -> Path:
+    if case == "tmpdir-is-repo":
+        _evil_ssh_repo(tmp / "R", script)
+        return tmp / "R"
+    if case == "grandparent-is-repo":
+        _evil_ssh_repo(tmp / "R", script)
+        (tmp / "R" / "a" / "tmp").mkdir(parents=True)
+        return tmp / "R" / "a" / "tmp"
+    if case == "symlink-into-repo":
+        _evil_ssh_repo(tmp / "R", script)
+        (tmp / "R" / "tmp").mkdir()
+        link = tmp / "outside" / "tmplink"
+        link.parent.mkdir()
+        link.symlink_to(tmp / "R" / "tmp")
+        return link
+    if case == "colon-in-tmpdir-repo":
+        _evil_ssh_repo(tmp / "a:b", script)
+        return tmp / "a:b"
+    _evil_ssh_repo(tmp / "a:b", script)  # colon-above-tmpdir
+    (tmp / "a:b" / "tmp").mkdir()
+    return tmp / "a:b" / "tmp"
+
+
+@pytest.mark.parametrize("call", ["ls-remote", "probe"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tmpdir-is-repo",
+        "grandparent-is-repo",
+        "symlink-into-repo",
+        "colon-in-tmpdir-repo",
+        "colon-above-tmpdir",
+    ],
+)
+def test_enclosing_repo_config_not_used(tmp_path: Path, monkeypatch, case: str, call: str) -> None:
+    import tempfile
+
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    log = tmp_path / "ran.log"
+    script = tmp_path / "evil-ssh.sh"
+    script.write_text(f'#!/bin/sh\necho "evil-ssh $*" >> "{log}"\nexit 1\n')
+    script.chmod(0o755)
+    monkeypatch.setattr(tempfile, "tempdir", str(_tmpdir_layout(tmp_path, case, script)))
+    if call == "ls-remote":
+        sd._ask_ls_remote("ssh://fakehost/x.git")
+    else:
+        ws = tmp_path / "probe-ws"
+        git(tmp_path, "init", "-q", str(ws))
+        git(ws, "commit", "-q", "--allow-empty", "-m", "x")
+        old = git(ws, "rev-parse", "HEAD").strip()
+        sd._probe_contains(str(ws), ["git"], ws / ".git", "ssh://fakehost/x.git", ("main",), [old])
+    assert not log.exists(), log.read_text()
+
+
+def test_bot_env_git_dir_is_not_used(tmp_path: Path, monkeypatch) -> None:
+    """A ``GIT_DIR`` in the bot's environment does not pick the repo either."""
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    log = tmp_path / "ran.log"
+    script = tmp_path / "evil-ssh.sh"
+    script.write_text(f'#!/bin/sh\necho "evil-ssh $*" >> "{log}"\nexit 1\n')
+    script.chmod(0o755)
+    _evil_ssh_repo(tmp_path / "R", script)
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "R" / ".git"))
+    sd._ask_ls_remote("ssh://fakehost/x.git")
+    assert not log.exists(), log.read_text()

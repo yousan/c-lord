@@ -164,3 +164,38 @@ def test_bare_repo_with_refs_in_an_ignored_dir_is_kept(tmp_path: Path) -> None:
     git(tmp_path, "clone", "-q", "--bare", str(subr), str(ws / "build" / "x.git"))
     res = _kept(ws)
     assert "build/x.git: bare repository" in res.reason, res.reason
+
+
+def _local_repo(at: Path, name: str) -> None:
+    at.mkdir(parents=True)
+    git(at, "init", "-q")
+    _commit(at, name)
+
+
+def test_a_skipped_ignored_dir_is_named(tmp_path: Path) -> None:
+    """W57 round 13: ``node_modules/``'s stash kept it first and ``vendor/`` was not
+    even hinted at — the dry run presented a partial list as complete."""
+    ws, subr = _workspace(tmp_path)
+    (ws / ".gitignore").write_text("vendor/\nnode_modules/\n")
+    git(ws, "add", ".gitignore")
+    git(ws, "commit", "-qm", "ignore")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    nm = ws / "node_modules"
+    git(tmp_path, "clone", "-q", str(subr), str(nm))
+    (nm / "README.md").write_text("changed\n")
+    git(nm, "stash", "-q")
+    _local_repo(ws / "vendor" / "lib", "patch.txt")
+    res = _kept(ws)
+    assert "node_modules: 1 stash entry" in res.reason, res.reason
+    assert "…and more not checked: vendor/" in res.reason, res.reason
+
+
+def test_ignored_dirs_skipped_for_user_changes_are_named(tmp_path: Path) -> None:
+    """A user change keeps it; the ignored dirs are not searched, and the reason says so."""
+    ws, _ = _workspace(tmp_path)
+    _ignore(ws, "vendor/")
+    _local_repo(ws / "vendor" / "lib", "patch.txt")
+    (ws / "notes.txt").write_text("draft\n")
+    res = _kept(ws)
+    assert "?? notes.txt" in res.reason, res.reason
+    assert "…and more not checked: vendor/" in res.reason, res.reason

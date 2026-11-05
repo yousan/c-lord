@@ -281,3 +281,60 @@ def test_pushed_existing_commit_as_new_branch_then_upstream_moves_is_deleted(
     git(other, "push", "-q", "origin", "release")
     res = _delete(ws)
     assert res.removed, res.reason
+
+
+# ---- W57 round 13: the all-heads probe once per remote, a failure once per URL ----
+
+
+def _closed_prs_with_other_branches(tmp_path: Path, n: int) -> Path:
+    """*n* pushed branches closed unmerged (deleted upstream); main moved; 5 other branches."""
+    ws, subr = _workspace(tmp_path)
+    sub = ws / "sub"
+    for i in range(n):
+        git(sub, "checkout", "-q", "-b", f"w{i}", "origin/main")
+        _commit(sub, f"w{i}.txt")
+        git(sub, "push", "-q", "origin", f"w{i}")
+    git(sub, "checkout", "-q", "--detach", "origin/main")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(subr), str(other))
+    for b in range(5):
+        git(other, "checkout", "-q", "-B", f"b{b}", "origin/main")
+        _commit(other, f"b{b}.txt")
+        git(other, "push", "-q", "origin", f"b{b}")
+    git(other, "checkout", "-q", "main")
+    _commit(other, "mm.txt")
+    git(other, "push", "-q", "origin", "main")
+    for i in range(n):
+        git(other, "push", "-q", "origin", "--delete", f"w{i}")
+    git(subr, "gc", "-q", "--prune=now")
+    return ws
+
+
+@pytest.mark.parametrize("n", [1, 3])
+def test_all_heads_are_fetched_once_per_remote(tmp_path: Path, monkeypatch, n: int) -> None:
+    """W57 round 13: each gone ref re-fetched the default branch and then every branch."""
+    ws = _closed_prs_with_other_branches(tmp_path, n)
+    net = _net(monkeypatch)
+    res = _kept(ws)
+    assert "unpushed commit(s) (remote branch deleted or rewritten)" in res.reason, res.reason
+    assert net == {"ls-remote": 1, "fetch": 2}, net  # default once, all heads once
+
+
+def test_a_hanging_probe_costs_one_timeout_per_url(tmp_path: Path, monkeypatch) -> None:
+    """The default-branch probe hangs: no all-heads probe after it, and the next
+    sweep within the TTL does not fetch again."""
+    monkeypatch.setattr(sd, "_LS_REMOTE_TIMEOUT_SECONDS", 2.0)
+    ws = _closed_prs_with_other_branches(tmp_path, 1)
+    real = sd._run
+    fetches = {"n": 0}
+
+    def hang(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        if "fetch" in cmd:
+            fetches["n"] += 1
+            cmd = ["git", "-c", "alias.zz=!sleep 30", "zz"]
+        return real(cmd, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sd, "_run", hang)
+    assert not _kept(ws).removed
+    assert not _kept(ws).removed
+    assert fetches["n"] == 1, fetches
