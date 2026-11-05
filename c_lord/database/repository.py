@@ -10,6 +10,10 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 
+# "Whatever is there" for :meth:`SessionRepository.clear_trigger_message`.
+_ANY: object = object()
+
+
 @dataclass
 class SessionRecord:
     """A stored session mapping."""
@@ -426,6 +430,67 @@ class SessionRepository:
                 self._pending_triggers.pop(next(iter(self._pending_triggers)))
         else:
             self._pending_triggers.pop(thread_id, None)
+
+    def pending_trigger(self, thread_id: int) -> int | None:
+        """The first-turn trigger still waiting for *thread_id*'s row, if any."""
+        return self._pending_triggers.get(thread_id)
+
+    async def clear_trigger_message(
+        self,
+        thread_id: int,
+        *,
+        recorded: int | None | object = _ANY,
+        pending: int | None | object = _ANY,
+    ) -> None:
+        """Forget the trigger message on record for *thread_id* — #1234.
+
+        For a turn that starts without a message of its own (``/skill``): the
+        record would otherwise still name the previous turn's message, and after
+        a restart its author — who did not ask for this turn — is who gets
+        pinged (#1212). With nothing on record the ping falls back to the owner,
+        and the #115 reply is sent unquoted. A pending first-turn trigger is
+        dropped too, so the row this turn creates does not carry it (#1235).
+
+        *recorded* / *pending* are what the caller saw when its turn started. When
+        given, only that trigger is forgotten: a message that arrived since (its
+        own, newer turn) keeps its trigger (W57 review of #1234). ``None`` means
+        nothing was there, so nothing is forgotten.
+        """
+        if pending is _ANY:
+            self._pending_triggers.pop(thread_id, None)
+        elif isinstance(pending, int):
+            self.discard_pending_trigger(thread_id, pending)
+        # A pending trigger may have been written onto the row since it was seen
+        # (its turn reached SYSTEM) — it is forgotten there too.
+        seen = [v for v in (recorded, pending) if isinstance(v, int)]
+        if recorded is not _ANY and not seen:
+            return
+        async with aiosqlite.connect(self.db_path) as db:
+            if recorded is _ANY:
+                await db.execute(
+                    "UPDATE sessions SET trigger_message_id = NULL WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            else:
+                marks = ", ".join("?" * len(seen))
+                await db.execute(
+                    "UPDATE sessions SET trigger_message_id = NULL"
+                    f" WHERE thread_id = ? AND trigger_message_id IN ({marks})",
+                    (thread_id, *seen),
+                )
+            await db.commit()
+
+    def discard_pending_trigger(self, thread_id: int, message_id: int) -> None:
+        """Drop *message_id* if it is still waiting for *thread_id*'s row — #1235.
+
+        Called when the turn it triggered is over. A turn that ended before its
+        SYSTEM event never made the row, and the next row ``save`` makes belongs
+        to some other turn (a ``/skill``, a scheduled run) — it must not carry
+        this message. Only *message_id* itself is dropped: a newer turn's trigger
+        that replaced it stays.
+        """
+        if self._pending_triggers.get(thread_id) == message_id:
+            del self._pending_triggers[thread_id]
 
     async def set_mirror_replied_uuid(self, thread_id: int, uuid: str) -> None:
         """Persist the uuid of the last final answer the mirror delivered.

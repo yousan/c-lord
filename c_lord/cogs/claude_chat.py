@@ -4767,6 +4767,10 @@ class ClaudeChatCog(commands.Cog):
                     self._active_runners.pop(thread.id, None)
                 if self._active_tasks.get(thread.id) is current_task:
                     self._active_tasks.pop(thread.id, None)
+                # #1235: a first turn that ended before its session row existed
+                # must not leave its trigger for the next row (another turn's).
+                with contextlib.suppress(Exception):
+                    self.repo.discard_pending_trigger(thread.id, user_message.id)
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)
