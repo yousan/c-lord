@@ -1795,6 +1795,10 @@ class TmuxClaudeRunner:
         # need a late baseline: the turn this prompt displaces has its prompt
         # before this moment, so its ending never follows a prompt of ours.
         turn_started_at = datetime.now(timezone.utc)  # noqa: UP017 — 3.11+, we run 3.10
+        # #1223: a transcript c-lord named but Claude has not written yet (a wake
+        # names it with no prompt) is due with this instruction — count its
+        # grace from here, not from when it was named.
+        turn_end_bus.note_turn_started(self._thread_id)
 
         # Start Claude or send a new prompt to an already-running instance.
         claude_running = await asyncio.to_thread(self._tmux.is_claude_running, self._thread_id)
