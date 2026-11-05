@@ -120,3 +120,40 @@ async def test_fuzz_many_refusers_still_converge(seed: int) -> None:
             await _one_tick_checked(w, loop, limit)
     ours = w.resident & set(w.records)
     assert len(ours) <= limit, (sorted(ours - refusers), limit, k)
+
+
+async def test_steady_trickle_of_transient_failures_keeps_oldest_deferred() -> None:
+    """Review of 73a2253: the group was released only after 10 ticks with no new
+    failure anywhere. The oldest window O fails one kill and is killable again
+    afterwards; one workspace opens per tick (excess 1); among 120 older idle
+    windows every 5th fails its first kill once. Each one-off failure restarted
+    the group's clock, so O stayed awake for 60+ ticks while 60 younger windows
+    were slept in its place. A window must come back within a bounded number of
+    ticks after its *own* failure."""
+    n = 121
+    w = _world(n)  # n = O, the oldest
+    once = {n} | {t for t in range(1, n) if t % 5 == 0}
+    for t in once:
+        w.mode[t] = "refuse"
+    impl = w.impl
+
+    async def refuse_once(*, channel, reason, idle_label):  # noqa: ANN001
+        out = await impl(channel=channel, reason=reason, idle_label=idle_label)
+        w.mode[channel.id] = "ok"
+        return out
+
+    w.impl = refuse_once  # type: ignore[method-assign]
+    loop = _make(w, n)
+    slept_at = None
+    with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
+        for tick in range(1, 61):
+            new = max(w.records) + 1
+            w.records[new] = _rec(new, hours_ago=0)
+            w.mode[new] = "ok"
+            w.resident.add(new)
+            await _one_tick_checked(w, loop, n)
+            if n not in w.resident:
+                slept_at = tick
+                break
+    # O failed on tick 1; it is back in front well within twice the deferral.
+    assert slept_at is not None and slept_at <= 1 + 2 * DEFERRAL_TICKS, slept_at

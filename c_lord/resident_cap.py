@@ -111,7 +111,10 @@ EMERGENCY_CONSECUTIVE_SAMPLES = 3
 #: and failed stay behind every other candidate (#1219, W57 round 8). Bounded:
 #: deferred until the user came back, one transient failure kept the longest-idle
 #: workspace awake while younger ones were slept in its place. A repeat failure
-#: defers it again. They are released together, not each on its own clock (#1244).
+#: defers it again. They are released together, not each on its own 10-tick clock
+#: (#1244); a window is also released on its own once its failure is
+#: DEFERRAL_TICKS + (number deferred) ticks old, so new failures elsewhere cannot
+#: keep it deferred for good.
 DEFERRAL_TICKS = 10
 
 #: How often to sample memory. The cap itself is re-checked on the same tick;
@@ -781,6 +784,18 @@ class ResidentCapLoop:
         latest = max((self._deferred_at.get(t, 0) for t in self._deferred), default=0)
         if self._cap_tick - latest >= DEFERRAL_TICKS:
             self._deferred = {}
+        # ...and each one on its own as well, DEFERRAL_TICKS + the group's size
+        # after its own failure (#1244 review): with only the group clock, a
+        # steady trickle of one-off failures elsewhere kept the oldest window
+        # deferred for good. The group's size in the bound leaves k refusers at
+        # least DEFERRAL_TICKS ticks per round in which none of them is due, so
+        # the killable ones still get their turn.
+        bound = DEFERRAL_TICKS + len(self._deferred)
+        self._deferred = {
+            t: n
+            for t, n in self._deferred.items()
+            if self._cap_tick - self._deferred_at.get(t, 0) < bound
+        }
         self._deferred_at = {t: v for t, v in self._deferred_at.items() if t in self._deferred}
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
