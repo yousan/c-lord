@@ -163,6 +163,10 @@ class IdleSweepLoop:
         """
         return changed
 
+    def _tick_exhausted(self) -> bool:
+        """Stop this tick before the next candidate (a subclass's own cap — #1228)."""
+        return False
+
     def _threshold_label(self) -> str:
         return str(self._threshold)
 
@@ -291,7 +295,7 @@ class IdleSweepLoop:
         acted = 0
         spent = 0
         for thread_id in due:
-            if spent >= self._max_per_tick:
+            if spent >= self._max_per_tick or self._tick_exhausted():
                 break
             # Count against the cap only once a workspace actually changed, and
             # keep walking past the ones that cannot be reached. Slicing the

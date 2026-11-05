@@ -18,7 +18,7 @@ import discord
 import pytest
 
 import c_lord.tmux as T
-from c_lord.idle_sleep import IdleSleepLoop
+from c_lord.idle_sleep import MAX_SLEEPS_PER_TICK, MAX_UNSURE_PER_TICK, IdleSleepLoop
 from tests.test_idle_sleep import NOW, _rec
 from tests.test_resident_cap_stalled_lookup_1206 import _real_impl_cog, _stalled
 
@@ -145,3 +145,38 @@ async def test_a_stall_costs_at_most_max_per_tick_attempts() -> None:
     loop, impl = _many_threads_loop(10, max_per_tick=4)
     assert await loop.tick() == 0
     assert impl.await_count == 4  # not 10 tmux timeouts in one tick
+
+
+# --- second review of the #1228 fix: the budget above is 1000 by default (and
+# ``list_all`` returns at most 1000), so it never bounded a stall in practice;
+# and the failure count outlived a human speaking in the thread.
+
+
+async def test_a_stall_costs_a_few_attempts_per_tick_with_the_default_budget() -> None:
+    loop, impl = _many_threads_loop(30, max_per_tick=MAX_SLEEPS_PER_TICK)
+    assert await loop.tick() == 0
+    assert impl.await_count == MAX_UNSURE_PER_TICK
+    assert await loop.tick() == 0  # the next tick moves on, it does not stop for good
+    assert impl.await_count == 2 * MAX_UNSURE_PER_TICK
+
+
+async def test_successes_after_the_cap_are_not_blocked_by_earlier_ticks() -> None:
+    """The cap is per tick: once tmux answers again, the next tick sleeps normally."""
+    loop, impl = _many_threads_loop(30, max_per_tick=MAX_SLEEPS_PER_TICK)
+    await loop.tick()
+    impl.return_value = True
+    assert await loop.tick() == 30
+
+
+async def test_someone_speaking_resets_the_failure_count() -> None:
+    loop = _loop()
+    impl = AsyncMock(return_value=False)
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl  # type: ignore[attr-defined]
+    await loop.tick()
+    await loop.tick()  # two stalls
+    assert impl.await_count == 2
+    # someone speaks; later the thread is idle again
+    loop._repo.list_all = AsyncMock(return_value=[_rec(3, hours_ago=5)])  # type: ignore[attr-defined]
+    for _ in range(6):
+        await loop.tick()
+    assert impl.await_count == 2 + 3  # three fresh attempts, then visited
