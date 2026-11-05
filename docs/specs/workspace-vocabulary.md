@@ -295,6 +295,18 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
       追跡 ref は引き算に使わず（`--remotes` からその remote を除く）、それ自体を手元の ref として数え、`ls-remote` もしない。
       `.claude/worktrees/<名前>/`（Claude Code の worktree）を開いて判定するときも、「中」かどうかは外側のワークスペースで測る。
       この判定のために、ワークスペースごとに `git config` を1回足す。
+    - **remote の URL がワークスペースの置き場（`SessionDirManager` の base dir・30日掃除と孤児掃除の sessions root）の下の
+      パスでも、その remote は無いものとして扱う**（#1265）。そこは隣のワークスペースで、同じ掃除で消えうるので控えにならない。
+      2つのワークスペースのサブモジュールが互いを remote にして（`git remote add a <隣>/sub` して fetch し、`a/work` から `work` を
+      作る、を両側で）、片方のローカルのブランチにしか無いコミットを互いの追跡 ref が辿れる状態にすると、以前は1回の
+      `cleanup_orphaned` で両方を「push 済み」と読んで両方消し、そのコミットはどこにも残らなかった。いまはその remote の追跡 ref を
+      証にせず、`ls-remote` も fetch での照合もしない。ワークスペースの中の remote と同じく、ワークスペース自身では追跡 ref を
+      手元の ref として数え（`--remotes` から除く）、サブモジュールでは `sub: 1 unpushed commit(s) (only on a remote under the
+      sessions dir)` のように数えて残す。タグの照合（#1246）と同じ扱い。置き場が分からない呼び出し（`worktree_status(path)` を
+      `sessions_root` 無しで呼んだとき）では、**ワークスペースの外のローカルパスの remote も証にしない**（`... (only on a remote at a
+      local path)`。安全側。c-lord 自身の掃除はいつも置き場を渡す）。github・ssh・https の remote は今までどおり証になり、URL から
+      クローンした何もしていないサブモジュールのワークスペースは今までどおりネットワーク 0 回で消せる。git の呼び出しは増えない
+      （remote の URL はすでに読んでいる `git config` から判定する）。
     - **remote にはワークスペースの外から、URL で聞く**（#1245 の5回目のレビュー）。`ls-remote` は解決した URL を渡して中立の
       ディレクトリ（空の一時ディレクトリを手で空の git ディレクトリにし、`GIT_DIR` でそれを指す — リポジトリを探しに行かないので、
       `TMPDIR` が誰かの git リポジトリの中にあっても、パスに `:` があっても、bot の環境に `GIT_DIR` があっても、その

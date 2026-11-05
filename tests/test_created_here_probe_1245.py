@@ -178,7 +178,7 @@ def test_probe_ref_is_removed_and_no_other_ref_moves(tmp_path: Path) -> None:
     sub = ws / "sub"
     before = git(sub, "for-each-ref", "--format=%(refname) %(objectname)")
     tags_before = git(sub, "tag")
-    st = sd.worktree_status(str(ws))
+    st = sd.worktree_status(str(ws), sessions_root=str(ws.parent))
     assert st.clean, sd.describe_changes(st)
     assert git(sub, "for-each-ref", "--format=%(refname) %(objectname)") == before
     assert git(sub, "tag") == tags_before

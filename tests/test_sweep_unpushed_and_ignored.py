@@ -343,7 +343,7 @@ def test_only_clord_owned_ignored_files_is_still_removed(tmp_path: Path) -> None
     with (ws / ".git" / "info" / "exclude").open("a") as f:
         f.write("/.clord/\n")
 
-    status = worktree_status(str(ws))
+    status = worktree_status(str(ws), sessions_root=str(ws.parent))
     assert status.clean, status
 
     assert _sweep(ws, tmp_path) is DirOutcome.REMOVED
