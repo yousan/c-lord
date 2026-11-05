@@ -534,12 +534,16 @@ def test_pushed_submodule_with_detached_worktree_is_clean(tmp_path: Path) -> Non
     assert _delete(ws).removed
 
 
-def test_worktree_head_naming_a_missing_object_is_clean(tmp_path: Path) -> None:
+def test_worktree_head_naming_a_missing_object_is_kept(tmp_path: Path) -> None:
+    """A dangling worktree HEAD makes the count unknown — kept (accepted over-keep).
+
+    Ignoring missing objects also silenced a branch whose tip object was gone,
+    and deleted the commits below it (review of e6fcc04)."""
     ws, _ = _workspace(tmp_path)
     git(ws / "sub", "worktree", "add", "-q", "--detach", str(tmp_path / "elsewhere" / "wt"))
     (_wt_meta(ws) / "HEAD").write_text("1" * 40 + "\n")
     st = worktree_status(str(ws))
-    assert st.clean, describe_changes(st)
+    assert "sub: unpushed commits unknown (git failed)" in describe_changes(st)
 
 
 def test_fetched_tag_on_a_pushed_commit_is_clean(tmp_path: Path) -> None:
@@ -558,3 +562,150 @@ def test_corrupt_module_git_dir_is_kept(tmp_path: Path) -> None:
     git(ws, "submodule", "deinit", "-q", "-f", "sub")
     (ws / ".git" / "modules" / "sub" / "HEAD").write_text("garbage\n")
     assert not _delete(ws).removed
+
+
+# ---- review of e6fcc04: symlinked ref dirs, missing objects, many refs, no hang ----
+
+
+def test_ref_under_symlinked_dir_in_worktree_refs_is_kept(tmp_path: Path) -> None:
+    """git follows a symlinked directory in ``worktrees/<n>/refs/``; so must we."""
+    ws, subr = _workspace(tmp_path)
+    wt, sha = _wt_detached_commit(ws, tmp_path)
+    ext = tmp_path / "extrefs"
+    ext.mkdir()
+    (ext / "keep").write_text(sha + "\n")
+    refs = _wt_meta(ws) / "refs" / "worktree"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "ext").symlink_to(ext, target_is_directory=True)
+    (ext / "loop").symlink_to(refs, target_is_directory=True)  # a cycle must not hang
+    assert git(wt, "rev-parse", "refs/worktree/ext/keep").strip() == sha
+    git(wt, "checkout", "-q", "--detach", "HEAD~1")
+    # counted through the link — not merely "unknown"
+    assert "sub: 1 unpushed commit(s)" in describe_changes(worktree_status(str(ws)))
+    _assert_kept(ws, subr, sha)
+
+
+def _drop_object(git_dir: Path, sha: str) -> None:
+    (git_dir / "objects" / sha[:2] / sha[2:]).unlink()
+
+
+def test_branch_whose_tip_object_is_missing_is_kept(tmp_path: Path) -> None:
+    """``work`` = c1 → c2 with c2's object gone: c1 is still the only copy."""
+    ws, subr = _workspace(tmp_path)
+    c1 = _commit_in_sub(ws, branch="work")
+    sub = ws / "sub"
+    (sub / "c2.txt").write_text("c2\n")
+    git(sub, "add", "c2.txt")
+    git(sub, "commit", "-qm", "c2")
+    c2 = git(sub, "rev-parse", "HEAD").strip()
+    git(sub, "checkout", "-q", "--detach", "origin/main")
+    _drop_object(ws / ".git" / "modules" / "sub", c2)
+    _assert_kept(ws, subr, c1)
+
+
+def _many_commits(repo: Path, n: int) -> list[str]:
+    """*n* distinct commits that no ref holds, made fast with ``git fast-import``."""
+    lines = []
+    for i in range(1, n + 1):
+        lines.append(
+            f"commit refs/heads/tmp-many\nmark :{i}\ncommitter t <t@e> {i} +0000\ndata 0\n"
+        )
+        if i > 1:
+            lines.append(f"from :{i - 1}\n")
+        lines.append("\n")
+    subprocess.run(
+        ["git", "fast-import", "--quiet"], cwd=repo, input="".join(lines), text=True, check=True
+    )
+    shas = git(repo, "rev-list", "refs/heads/tmp-many").split()
+    git(repo, "update-ref", "-d", "refs/heads/tmp-many")
+    return shas
+
+
+def _write_refs(meta: Path, shas: list[str]) -> None:
+    many = meta / "refs" / "worktree" / "many"
+    many.mkdir(parents=True)
+    for i, sha in enumerate(shas):
+        (many / f"r{i}").write_text(sha + "\n")
+
+
+_MANY = 60_000  # 60,000 x 41 bytes is past the kernel's argument limit
+
+
+def test_many_worktree_refs_do_not_break_the_count(tmp_path: Path) -> None:
+    """60,000 per-worktree refs: the tips go through ``--stdin``, not argv
+    (``OSError: Argument list too long`` stopped the sweep for every dir)."""
+    ws, subr = _workspace(tmp_path)
+    wt, sha = _wt_detached_commit(ws, tmp_path)
+    _write_refs(_wt_meta(ws), _many_commits(wt, _MANY))
+    _assert_kept(ws, subr, sha)
+
+
+def test_many_refs_in_the_workspace_own_worktree_do_not_break_the_count(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    wt, _ = _wt_detached_commit(ws, tmp_path, repo=ws)
+    (meta,) = list((ws / ".git" / "worktrees").iterdir())
+    _write_refs(meta, _many_commits(wt, _MANY))
+    st = worktree_status(str(ws))
+    assert not st.clean
+    assert st.unpushed_commits is not None and st.unpushed_commits > _MANY, describe_changes(st)
+
+
+def test_git_calls_have_a_timeout_and_never_lazy_fetch(monkeypatch) -> None:
+    """A partial clone's missing object must not start a network fetch, and no
+    inspection call may hang the sweep forever."""
+    seen: dict[str, object] = {}
+
+    def fake(args, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(sd.subprocess, "run", fake)
+    sd._run(["git", "rev-list", "--count", "--all"], cwd="/")
+    assert seen["env"]["GIT_NO_LAZY_FETCH"] == "1"  # type: ignore[index]
+    assert seen["timeout"] and float(seen["timeout"]) <= 120  # type: ignore[arg-type]
+
+
+def _time_out(monkeypatch, match) -> None:  # noqa: ANN001
+    real = subprocess.run
+
+    def slow(args, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if match(args):
+            raise subprocess.TimeoutExpired(args, kw.get("timeout") or 0)
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(sd.subprocess, "run", slow)
+
+
+def test_a_timed_out_stash_check_is_not_no_stash(tmp_path: Path, monkeypatch) -> None:
+    """Only ``rev-parse refs/stash`` in the submodule times out; it has a stash."""
+    ws, _ = _workspace(tmp_path)
+    (ws / "sub" / "README.md").write_text("wip\n")
+    git(ws / "sub", "stash", "-q")
+    _time_out(monkeypatch, lambda a: "refs/stash" in a and "rev-parse" in a)
+    st = worktree_status(str(ws))
+    assert not st.clean, describe_changes(st)
+
+
+def test_a_timed_out_branch_listing_is_not_no_branches(tmp_path: Path, monkeypatch) -> None:
+    """Only the workspace's ``for-each-ref refs/heads`` times out; a branch has a commit."""
+    ws, _ = _workspace(tmp_path)
+    git(ws, "checkout", "-q", "-b", "work")
+    (ws / "w.txt").write_text("w\n")
+    git(ws, "add", "w.txt")
+    git(ws, "commit", "-qm", "work")
+    git(ws, "checkout", "-q", "main")
+    _time_out(monkeypatch, lambda a: "for-each-ref" in a and "refs/heads" in a)
+    st = worktree_status(str(ws))
+    assert not st.clean and st.unpushed_commits is None, describe_changes(st)
+
+
+def test_a_timed_out_ls_files_is_not_no_submodules(tmp_path: Path, monkeypatch) -> None:
+    """Only the workspace's ``ls-files`` times out; an embedded repo holds the only copy."""
+    ws = _session_clone(tmp_path)
+    _local_repo(ws / "emb")
+    _git(ws, "add", "emb")
+    _git(ws, "commit", "-qm", "embed emb")
+    _git(ws, "push", "-q", "origin", "main")
+    _time_out(monkeypatch, lambda a: "ls-files" in a)
+    st = worktree_status(str(ws))
+    assert not st.clean, describe_changes(st)

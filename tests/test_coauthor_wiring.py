@@ -18,7 +18,7 @@ from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.session_dir import SessionDirManager
 
 
-def _fake_clone(args, cwd=None):  # noqa: ANN001, ANN202 — test helper
+def _fake_clone(args, cwd=None, **kwargs):  # noqa: ANN001, ANN003, ANN202 — test helper
     """Stand in for `_run`: make `git clone` produce a real (empty) repo."""
     if "clone" in args:
         target = Path(args[-1])

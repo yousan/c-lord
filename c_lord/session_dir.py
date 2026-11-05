@@ -46,17 +46,42 @@ _THREAD_DIR_RE = re.compile(r"^\d+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
 
+#: How long one inspecting git call may take before it counts as failed (#1198).
+_GIT_TIMEOUT_SECONDS = 60.0
+
+#: Exit status of a call that timed out (as ``timeout(1)`` reports it).
+_TIMEOUT_RETURNCODE = 124
+
+
 def _run(
-    args: list[str], cwd: str | None = None, *, stdin: str | None = None
+    args: list[str],
+    cwd: str | None = None,
+    *,
+    stdin: str | None = None,
+    timeout: float | None = _GIT_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess and return the result (never raises on non-zero exit)."""
-    return subprocess.run(
-        args,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
+    """Run a subprocess and return the result (never raises on non-zero exit).
+
+    #1198: a call that takes longer than *timeout* comes back as a failure
+    (exit 124) — callers read a failure as "unknown", which keeps a workspace,
+    instead of hanging the sweep. ``GIT_NO_LAZY_FETCH=1``: in a partial clone a
+    missing object would otherwise be fetched over the network mid-inspection
+    (ignored by git before 2.44). ``git clone`` passes ``timeout=None``.
+    """
+    try:
+        return subprocess.run(
+            args,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=timeout,
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, _TIMEOUT_RETURNCODE, "", f"timed out after {timeout}s"
+        )
 
 
 #: Files c-lord itself writes into every session dir (#749). They show up in
@@ -296,22 +321,27 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
     return frozenset(shas)
 
 
-def _start_refs(path: str) -> dict[str, str]:
-    """HEAD and every local branch, as ref → commit.
+def _start_refs(path: str) -> dict[str, str] | None:
+    """HEAD and every local branch, as ref → commit. ``None``: git failed.
 
     Not the stash: its entries are counted on their own (:func:`_stash_entries`,
     #1045) — a stash commit is no "unpushed commit" a user could push.
+    A failed (or timed-out) call is unknown, never "no branches" (#1198).
     """
     tips: dict[str, str] = {}
     branches = _run(
         ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], cwd=path
     )
+    if branches.returncode != 0:
+        return None
     for line in branches.stdout.splitlines():
         sha, _, ref = line.partition(" ")
         if ref:
             tips[ref] = sha
     # Only when present: an unborn HEAD would fail rev-list.
     found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
+    if found.returncode not in (0, 1):
+        return None
     if found.returncode == 0:
         tips["HEAD"] = found.stdout.strip()
     return tips
@@ -328,11 +358,12 @@ def _stash_entries(path: str, *, git_dir: bool = False) -> int | None:
     With *git_dir*, *path* is a git directory whose checkout may be gone
     (#1181). Its ``core.worktree`` then names a missing folder and every git
     command dies on it, so the git dir itself stands in as the work tree; and
-    a failure other than "no such ref" is unknown, not "no stash".
+    a failure other than "no such ref" is unknown, not "no stash" — in either
+    mode since #1198, as a timed-out call must never read as "no stash".
     """
     pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
     found = _run([*pre, "rev-parse", "-q", "--verify", "refs/stash"], cwd=path)
-    if git_dir and found.returncode not in (0, 1):
+    if found.returncode not in (0, 1):
         return None
     if found.returncode != 0 or not found.stdout.strip():
         return 0  # no stash at all
@@ -415,7 +446,8 @@ def _checked_out_submodule_stashes(
     listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
     if listed.returncode != 0:
         if depth == 0:
-            return []  # .git/modules is still walked (#1181)
+            # .git/modules is still walked (#1181); checked-out ones are unknown.
+            return ["submodules unknown (git ls-files failed)"]
         # #1227: nested repos in this submodule could not be listed — keep.
         return [f"{prefix.rstrip('/')}: nested repos unknown (git ls-files failed)"]
     found: list[str] = []
@@ -512,12 +544,8 @@ def _worktree_tips(git_dir: Path) -> list[str] | None:
     for entry in entries:
         files = [entry / "HEAD"]
         refs = entry / "refs"
-        if refs.is_dir():
-            errors: list[OSError] = []
-            for root, _, names in os.walk(refs, onerror=errors.append):
-                files += [Path(root) / n for n in names]
-            if errors:
-                return None
+        if refs.is_dir() and not _ref_files(refs, files, set()):
+            return None
         for f in files:
             try:
                 line = f.read_text(encoding="utf-8", errors="replace").strip()
@@ -528,7 +556,37 @@ def _worktree_tips(git_dir: Path) -> list[str] | None:
             if not _SHA_RE.match(line.lower()):
                 return None
             tips.append(line.lower())
-    return tips
+    return sorted(set(tips))
+
+
+def _ref_files(directory: Path, out: list[Path], visited: set[str]) -> bool:
+    """Every file under *directory*, following directory symlinks as git does.
+
+    ``os.walk`` does not follow them, and a ref behind a symlinked directory
+    was not counted (#1198). A directory already visited (by real path) is
+    skipped, so a symlink loop ends. ``False`` when anything cannot be listed
+    or is neither a file nor a directory (a dangling link) — unknown.
+    """
+    real = os.path.realpath(directory)
+    if real in visited:
+        return True
+    visited.add(real)
+    try:
+        entries = sorted(os.scandir(directory), key=lambda e: e.name)
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            if entry.is_dir():  # follows symlinks
+                if not _ref_files(Path(entry.path), out, visited):
+                    return False
+            elif entry.is_file():
+                out.append(Path(entry.path))
+            else:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _own_git_dir(checkout: Path) -> Path | None:
@@ -554,9 +612,11 @@ def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) 
     and branches, then ``ls-remote``): a submodule's git dir is never asked
     over the network, so every ref it holds is assumed to be work.
 
-    One git call; ``--ignore-missing`` lets an unborn HEAD or a worktree HEAD
-    naming a missing object count as nothing. Unknown comes back as the reason
-    (a ``str``) — the caller keeps the dir then.
+    One git call. No ``--ignore-missing``: it also silenced a branch whose
+    tip object was gone, and the commits below it were deleted. So a ref or
+    worktree HEAD naming a missing object fails the call — unknown, kept (an
+    accepted over-keep). ``--all`` skips an unborn HEAD by itself. Unknown
+    comes back as the reason (a ``str``) — the caller keeps the dir then.
 
     With *git_dir*, *path* is a git dir whose checkout may be gone — as in
     :func:`_stash_entries`, it stands in as its own work tree. *own_git_dir*
@@ -566,9 +626,13 @@ def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) 
     if extra is None:
         return _WORKTREE_UNREADABLE
     pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
-    revs = ["--exclude=refs/stash", "--all", *extra]
+    # The worktree tips go through stdin: thousands of ref files overflow argv.
+    # A ``--not`` on the command line does not reach them (they stay positive).
     result = _run(
-        [*pre, "rev-list", "--count", "--ignore-missing", *revs, "--not", "--remotes"], cwd=path
+        [*pre, "rev-list", "--count", "--exclude=refs/stash", "--all"]
+        + ["--not", "--remotes", "--stdin"],
+        cwd=path,
+        stdin="".join(f"{sha}\n" for sha in extra),
     )
     if result.returncode != 0:
         return "git failed"
@@ -611,10 +675,12 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
             for line in check.stdout.splitlines()
             if line.endswith(" commit")
         )
+    # Tips through stdin too (#1198: a worktree with thousands of refs
+    # overflowed argv); stdin revs are not flipped by the command line's --not.
     result = _run(
-        ["git", "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
+        ["git", "rev-list", "--count", "--not", "--remotes", "--stdin"],
         cwd=path,
-        stdin=present,
+        stdin="".join(f"{t}\n" for t in tips) + present,
     )
     if result.returncode != 0:
         return None
@@ -645,7 +711,10 @@ def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]
     extra = _worktree_tips(own) if own is not None else []
     if extra is None:
         return None, False
-    tips = sorted(set(_start_refs(path).values()) | set(extra))
+    start = _start_refs(path)
+    if start is None:
+        return None, False
+    tips = sorted(set(start.values()) | set(extra))
     local = _count_not_on(path, tips)
     if not ask_remote or not local:
         return local, False
@@ -908,7 +977,7 @@ class SessionDirManager:
             # .validate_repo_url() is the other half of this guard.
             args.extend(["--", self._source_repo, target])
 
-            result = _run(args)
+            result = _run(args, timeout=None)  # a big clone may take long
             if result.returncode != 0:
                 logger.error(
                     "git clone failed for thread %d: %s",
