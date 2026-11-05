@@ -935,12 +935,9 @@ def test_upstream_tag_on_no_branch_is_kept_known_over_keep(tmp_path: Path) -> No
     assert _delete(ws).removed
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known limit: a branch pushed and then deleted on the remote still has a stale "
-    "local tracking ref; telling that apart needs the network (pre-existing, spec)",
-)
 def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
+    """#1245 (was a known limit): the submodule's remote is asked whether the
+    branch behind a tracking ref still exists. More in test_stale_tracking_ref_1245."""
     ws, subr = _workspace(tmp_path)
     git(ws / "sub", "checkout", "-q", "-b", "work")
     sha = _commit(ws / "sub", "w.txt")
@@ -951,7 +948,8 @@ def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
     git(subr, "gc", "-q", "--prune=now")
     assert not _object_exists(subr, sha)
     assert git(ws, "status", "--porcelain").strip() == ""
-    _kept(ws)
+    res = _kept(ws)
+    assert "sub: 1 unpushed commit(s) (remote branch deleted or rewritten)" in res.reason
 
 
 # ---- review of 77df9cc: the workspace's own tags kept pushed workspaces ----
