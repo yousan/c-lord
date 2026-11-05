@@ -618,8 +618,15 @@ field out (`label` falls back to `AI`, `source` to `cli`, `reason` to `self_rest
 `"prompt": null` does not touch the prompt). An empty `prompt` is a `400 {"error": "prompt is
 required"}` on `PATCH` as on `POST`, and the saved prompt stays as it was (#1229 — before, `PATCH`
 saved `""` with a 200 and every run after that sent Claude an empty instruction). A `prompt` (or a
-`POST`'s `name`) of only spaces, tabs or newlines counts as empty, as on `/api/spawn` (#1238 —
-before, `"   "` was saved with a 201 / 200). `name` cannot be changed with `PATCH`. The same holds for each choice's `label` / `description`
+`POST`'s `name`) with nothing visible in it counts as empty, here and on `/api/spawn`: spaces,
+tabs, newlines, zero-width spaces and the BOM (#1238 — before, `"   "` was saved with a 201 /
+200), and every other character that shows nothing on its own (#1258): Unicode's control (`Cc`),
+format (`Cf` — direction marks such as LRM / RLM / LRI…PDI, the soft hyphen, U+2061) and
+separator (`Zs` / `Zl` / `Zp`) characters, the default-ignorable ones outside those (variation
+selectors, U+034F, the Hangul fillers U+115F / U+1160 / U+3164 / U+FFA0, the Mongolian
+selectors) and the braille blank U+2800. One visible character is enough: a ZWJ emoji sequence,
+a letter or emoji followed by VS16, or a combining accent is accepted as before. `name` cannot be
+changed with `PATCH`. The same holds for each choice's `label` / `description`
 on `/api/prompt-choice` (`choices[0].label must be a string`; a `null` label is "label is required").
 
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,

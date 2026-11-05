@@ -42,6 +42,8 @@ def _init_repo(path: Path) -> Path:
         "i",
     )
     # #903: the commit is on origin, as in a real clone — else it is unpushed work.
+    # A configured origin (review of f870f5b: a ref of no remote vouches for nothing).
+    _git(path, "remote", "add", "origin", "https://example.invalid/repo.git")
     _git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
     return path
 

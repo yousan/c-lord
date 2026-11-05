@@ -16,6 +16,11 @@ idle), so the guard works from what the pane shows, whatever the cause:
   first piece is gone. Clear the box and type the message again, once. If it is
   still wrong, clear it and report a delivery failure — never press Enter on it.
 
+#1263 moved the check to right after the first piece (the box after the last
+piece can be taller than the box's maximum height and show only its end), so
+the pane model below shows, after the first piece, what each final frame
+implies: the head-lost frame is an empty box there.
+
 Fixtures are real ``capture-pane -p`` frames from CLI 2.1.295 on an isolated
 tmux server (#701): the normal pre-Enter state of a two-piece message, and the
 same box holding only the second piece (the production failure).
@@ -36,6 +41,11 @@ _FIX = Path(__file__).parent / "fixtures" / "panes"
 BOX_EMPTY = (_FIX / "input_box_empty.txt").read_text()
 PASTED = (_FIX / "input_box_multichunk_pasted.txt").read_text()
 HEAD_LOST = (_FIX / "input_box_head_lost.txt").read_text()
+# #1263: the box right after the first piece alone (real frame, CLI 2.1.318).
+FIRST_PIECE_FOLDED = (_FIX / "i1263_after_first_piece_872_v2_1_318.txt").read_text()
+# What the box showed after the first piece, for each final frame above: the
+# head-lost frame is the first piece never arriving (an empty box).
+_AFTER_FIRST_PIECE = {HEAD_LOST: BOX_EMPTY, PASTED: FIRST_PIECE_FOLDED}
 
 # The message both fixtures were made from (two pieces: 1,110 + 628 chars).
 _LINE = "試作の発注文。ふりがなを小さくしてセーフエリアに収める指示を詳しく書いた行です。"
@@ -65,14 +75,19 @@ def _mgr() -> TmuxSessionManager:
 
 
 class _Pane:
-    """The box shows ``after_typing[n]`` once the n-th full typing has landed."""
+    """The box shows ``after_typing[n]`` once the n-th typing has landed.
+
+    Since #1263 the first piece is typed and checked on its own, so a typing is
+    counted at the first piece, and the box then shows what that typing's
+    final frame implies about the first piece (:data:`_AFTER_FIRST_PIECE`).
+    """
 
     def __init__(self, *after_typing: str) -> None:
         self.after_typing = list(after_typing)
         self.frame = BOX_EMPTY
         self.typings = 0
         self.keys: list[list[str]] = []
-        self._chunks_left = 0
+        self._final = BOX_EMPTY
 
     def run(self, args: list[str]) -> MagicMock:
         if "capture-pane" in args:
@@ -80,13 +95,14 @@ class _Pane:
         if "send-keys" in args:
             self.keys.append(list(args))
             if "-l" in args:
-                if self._chunks_left == 0:
-                    self._chunks_left = len(_chunk_for_send_keys(LONG))
-                self._chunks_left -= 1
-                if self._chunks_left == 0:
+                chunks = _chunk_for_send_keys(LONG)
+                if args[-1] == chunks[0]:
                     index = min(self.typings, len(self.after_typing) - 1)
-                    self.frame = self.after_typing[index]
+                    self._final = self.after_typing[index]
+                    self.frame = _AFTER_FIRST_PIECE.get(self._final, self._final)
                     self.typings += 1
+                if args[-1] == chunks[-1]:
+                    self.frame = self._final
             elif "C-u" in args or "Enter" in args:
                 self.frame = BOX_EMPTY
         return MagicMock(returncode=0, stdout="", stderr="")

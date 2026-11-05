@@ -19,6 +19,9 @@ from pathlib import Path
 from c_lord.database.repository import SessionRecord
 from c_lord.session_cleanup import DirOutcome, remove_clean_session_dir, retire_swept_workspace
 
+#: Never asked: the count is 0 once its tracking ref vouches.
+_ORIGIN = "https://example.invalid/repo.git"
+
 THREAD = 1545252058666635266
 
 
@@ -31,6 +34,8 @@ def _repo(path: Path) -> Path:
     subprocess.run(["git", "add", "-A"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True)
     # #903: the commit is on origin, so only the location decides here.
+    # A configured origin (review of f870f5b: a ref of no remote vouches for nothing).
+    subprocess.run(["git", "remote", "add", "origin", _ORIGIN], cwd=path, check=True)
     subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=path, check=True)
     return path
 

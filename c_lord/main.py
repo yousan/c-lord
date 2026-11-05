@@ -18,6 +18,7 @@ from dotenv import find_dotenv, load_dotenv
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
 from .command_gate import is_trusted_bot_id_text
+from .coordination.env import MAX_ID_DIGITS as COORDINATION_MAX_ID_DIGITS
 from .git_mirrors import stop_running_git
 from .session_cleanup import DirOutcome, retire_swept_workspace, sweep_days
 from .setup import setup_bridge
@@ -28,6 +29,13 @@ if TYPE_CHECKING:
     from .ext.api_server import ApiServer
 
 logger = logging.getLogger(__name__)
+
+#: Defaults of the two numeric limits (#1119).
+_DEFAULT_MAX_CONCURRENT = "3"
+_DEFAULT_TIMEOUT = "300"
+#: More digits than this in a limit is ignored with a WARNING (#1256): no limit
+#: or timeout that large means anything, and ``int()`` of 4300+ digits raises.
+_MAX_LIMIT_DIGITS = 18
 
 #: Days of disuse after which a ``sessions`` row is swept at startup. Named here
 #: rather than inlined because #554 made it user-visible: the notice posted into
@@ -227,6 +235,17 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
                 value,
             )
             sys.exit(1)
+    # #1256: a value longer than any Discord id (``int()`` of 4300+ digits
+    # raises further down) is not an id. The channel is optional, so it is
+    # said once and left unset — like a bad CLORD_TRUSTED_BOT_IDS entry (#1237).
+    if len(coordination_raw) > COORDINATION_MAX_ID_DIGITS:
+        logger.warning(
+            "COORDINATION_CHANNEL_ID must be a Discord channel ID of at most %d digits,"
+            " got %d digits — ignored; no coordination channel this run.",
+            COORDINATION_MAX_ID_DIGITS,
+            len(coordination_raw),
+        )
+        coordination_raw = ""
 
     # #1218: a companion bot id that is not ASCII digits is ignored, said once
     # here (``command_gate`` reads the list per message and must not raise).
@@ -249,20 +268,35 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     # used to start a bot on which every turn waited forever behind a
     # Semaphore(0) — no error, no log line; ``-1`` and ``three`` died with a
     # traceback that named no setting. Fail with the key, like the IDs above.
-    max_concurrent = os.getenv("MAX_CONCURRENT_SESSIONS", "3")
-    timeout = os.getenv("SESSION_TIMEOUT_SECONDS", "300")
-    for key, value in (
-        ("MAX_CONCURRENT_SESSIONS", max_concurrent),
-        ("SESSION_TIMEOUT_SECONDS", timeout),
+    limits: dict[str, str] = {}
+    for key, default in (
+        ("MAX_CONCURRENT_SESSIONS", _DEFAULT_MAX_CONCURRENT),
+        ("SESSION_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT),
     ):
+        value = os.getenv(key, default)
         text = value.strip()
-        if not (text.isascii() and text.isdigit() and int(text) >= 1):
-            logger.error(
-                "%s must be a whole number of at least 1, got %r.",
+        is_number = text.isascii() and text.isdigit()
+        # #1256: ``int()`` of more than 4300 digits raises a ValueError that
+        # names no setting. A number that long means nothing as a limit, so it
+        # is said once and the default is used — like CLORD_API_PORT (#1237).
+        # Leading zeros don't count (``0007`` was always 7).
+        digits = (text.lstrip("0") or "0") if is_number else ""
+        if is_number and len(digits) > _MAX_LIMIT_DIGITS:
+            logger.warning(
+                "%s must be a whole number of at most %d digits, got %d digits — "
+                "ignored; using the default %s.",
                 key,
-                value,
+                _MAX_LIMIT_DIGITS,
+                len(digits),
+                default,
             )
+            digits = default
+        elif not (is_number and int(digits) >= 1):
+            logger.error("%s must be a whole number of at least 1, got %r.", key, value)
             sys.exit(1)
+        limits[key] = digits
+    max_concurrent = limits["MAX_CONCURRENT_SESSIONS"]
+    timeout = limits["SESSION_TIMEOUT_SECONDS"]
 
     return {
         "token": token,
@@ -276,8 +310,8 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "claude_effort_source": _env_source("CLAUDE_EFFORT", resolved_env_path, "未設定"),
         "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
         "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
-        "max_concurrent": max_concurrent.strip(),
-        "timeout": timeout.strip(),
+        "max_concurrent": max_concurrent,
+        "timeout": timeout,
         "owner_id": owner_id_raw,
         "coordination_channel_id": coordination_raw,
     }

@@ -79,7 +79,7 @@ def test_deinit_submodule_with_pushed_branch_is_clean(tmp_path: Path) -> None:
     ws = _with_submodule(tmp_path)
     _git(ws / "sub", "checkout", "-q", "-b", "work")  # same commit as origin/main
     _git(ws, "submodule", "deinit", "-q", "-f", "sub")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 
@@ -278,7 +278,7 @@ def test_checked_out_submodule_on_its_remote_is_clean(tmp_path: Path) -> None:
     """Control: a checked-out submodule whose commits are all on its remote."""
     ws, _ = _workspace(tmp_path)
     git(ws / "sub", "checkout", "-q", "-b", "work")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 
@@ -376,10 +376,10 @@ def _embedded_with_submodule(tmp_path: Path) -> tuple[Path, Path]:
 def test_deinit_submodule_inside_embedded_repo_unpushed_commit_is_kept(tmp_path: Path) -> None:
     """The embedded repo's own ``.git/modules`` holds the deinit'd submodule's commit."""
     ws, emb = _embedded_with_submodule(tmp_path)
-    assert worktree_status(str(ws)).clean
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
     _commit_on_work_branch(emb / "inner")
     git(emb, "submodule", "deinit", "-q", "-f", "inner")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert not st.clean, describe_changes(st)
     assert "emb/inner: 1 unpushed commit(s)" in describe_changes(st)
 
@@ -530,7 +530,9 @@ def test_workspace_own_detached_linked_worktree_is_kept(tmp_path: Path) -> None:
 def test_pushed_submodule_with_detached_worktree_is_clean(tmp_path: Path) -> None:
     ws, _ = _workspace(tmp_path)
     git(ws / "sub", "worktree", "add", "-q", "--detach", str(tmp_path / "elsewhere" / "wt"))
-    assert worktree_status(str(ws)).clean, describe_changes(worktree_status(str(ws)))
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean, (
+        describe_changes(worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")))
+    )
     git(ws, "submodule", "deinit", "-q", "-f", "sub")
     assert _delete(ws).removed
 
@@ -813,7 +815,7 @@ def test_workspace_pushed_with_fetched_tag_is_clean(tmp_path: Path) -> None:
     """Control: a tag on a pushed commit adds nothing."""
     ws, _ = _workspace(tmp_path)
     git(ws, "tag", "v0")
-    assert worktree_status(str(ws)).clean
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
 
 
 def test_depth4_embedded_repo_under_three_submodules(tmp_path: Path) -> None:
@@ -983,7 +985,7 @@ def test_depth1_clone_after_fetch_tags_is_clean(tmp_path: Path) -> None:
     git(tmp_path, "clone", "-q", "--depth=1", "--single-branch", f"file://{origin}", str(ws))
     git(ws, "fetch", "-q", "--tags")
     assert "v1" in git(ws, "tag")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
 
@@ -998,7 +1000,7 @@ def test_local_clone_with_a_tag_on_a_deleted_branch_is_clean(tmp_path: Path) -> 
     ws = base / "4242"
     git(tmp_path, "clone", "-q", "--local", str(src), str(ws))
     assert "rel-1" in git(ws, "tag")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
 
@@ -1068,5 +1070,5 @@ def test_workspace_with_pushed_notes_is_clean(tmp_path: Path) -> None:
     ws, _ = _workspace(tmp_path)
     git(ws, "notes", "add", "-m", "a note")
     git(ws, "push", "-q", "origin", "refs/notes/commits")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, st
