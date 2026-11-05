@@ -4783,8 +4783,19 @@ class ClaudeChatCog(commands.Cog):
                 if transcript_cog is not None:
                     with contextlib.suppress(Exception):
                         transcript_cog.set_trigger_message(thread.id, user_message.id)
-                with contextlib.suppress(Exception):
+                try:
                     await self.repo.update_trigger_message(thread.id, user_message.id)
+                except Exception:
+                    # #1254: refused (locked) — the repository keeps it for the
+                    # next save / shutdown. Not silent (#678): left on the row,
+                    # the older message's author is who a restart's ❌ pings.
+                    logger.warning(
+                        "%s could not record the trigger message %s now; "
+                        "it is written with the next session save (#1254)",
+                        log_ctx(thread_id=thread.id),
+                        user_message.id,
+                        exc_info=True,
+                    )
 
                 stop_view = self._make_stop_view(runner, thread)
                 # #632: the Stop-button notice is decoration too. If Discord refuses
