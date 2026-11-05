@@ -43,6 +43,10 @@ completion goes out at once), and only agents are counted, not background shell
 commands. An agent that never reports back cannot hold the event forever:
 ``CLORD_EVENT_DEFER_MAX_SECONDS`` (default 3600) releases it with
 ``reason: "background_agents_unresolved"``.
+A held completion is also written to ``~/.c-lord/<instance>/held-completions.json``
+(#1249): the next process reads it back, so the request's ``completion`` still
+goes out — with the requester's ``started_by`` — when the agents report back
+after a restart, and the time limit keeps counting from the original hold.
 
 **Turns Claude starts by itself** (#961). When a background *shell command*
 (CI, a long pytest) finishes, Claude Code starts a turn on its own, just as for
@@ -74,8 +78,10 @@ import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .clord_home import clord_home, instance_name
 from .notify_policy import Kind
 from .utils.logger import log_ctx
 
@@ -145,6 +151,8 @@ class _Held:
     reason: str | None = None
     #: False while the turn waits on a menu answer (#1170): no time limit.
     expires: bool = True
+    #: wall-clock time the time limit runs out (#1249: survives a restart).
+    deadline: float | None = None
 
 
 _ACTIVE: dict[int, TurnInfo] = {}
@@ -159,13 +167,24 @@ _LAST_INFO: dict[int, TurnInfo] = {}
 #: thread -> the open turn Claude started by itself on a notification (#961).
 _SELF: dict[int, TurnInfo] = {}
 _TASKS: set[asyncio.Task[None]] = set()
+#: Whether ``_HELD`` has been read back from disk in this process (#1249).
+_held_loaded = False
+
+_HELD_FILE = "held-completions.json"
+_HELD_FILE_VERSION = 1
 
 
 def reset() -> None:
-    """Forget everything. For tests."""
+    """Forget everything in memory — as a new process would. For tests.
+
+    The held completions on disk (#1249) are kept: they are what a restart
+    carries over, and the next call reads them back.
+    """
+    global _held_loaded
     for held in _HELD.values():
         if held.timer is not None:
             held.timer.cancel()
+    _held_loaded = False
     _ACTIVE.clear()
     _LAST_END.clear()
     _BLOCKED_AT.clear()
@@ -260,11 +279,13 @@ def begin_turn(thread: discord.Thread | Any, started_by: StartedBy) -> TurnInfo 
         # error ❌'s ping, #1149) does not depend on an event outlet.
         _remember(_LAST_INFO, thread.id, _info_for(thread, started_by))
         return None
+    _ensure_held_loaded()
     held = _HELD.pop(thread.id, None)
     if held is not None:
         # A new turn takes the thread over; its own end is the one to announce.
         if held.timer is not None:
             held.timer.cancel()
+        _save_held()
         logger.info(
             "%s held completion dropped — a new turn started (#917)",
             log_ctx(thread_id=thread.id),
@@ -361,6 +382,7 @@ def note_turn_end(
     if not enabled():
         return
     try:
+        _ensure_held_loaded()
         ended = at.timestamp() if at is not None else time.time()
         _remember(_LAST_END, thread_id, (time.monotonic(), outstanding, ended))
         started = _SELF.pop(thread_id, None)
@@ -384,8 +406,10 @@ def note_turn_end(
             # #1131: one failure — the held request's if there is one, it is the
             # request whose work just stopped; else this turn's own.
             held = _HELD.pop(thread_id, None)
-            if held is not None and held.timer is not None:
-                held.timer.cancel()
+            if held is not None:
+                if held.timer is not None:
+                    held.timer.cancel()
+                _save_held()
             _spawn(
                 _deliver("failure", held.info if held is not None else own, reason=failure_reason)
             )
@@ -519,17 +543,16 @@ def _hold(
     ``background_agents_unresolved``. Off for a turn waiting on a menu answer
     (#1170) — that wait is the user's, and blocked already said so.
     """
+    _ensure_held_loaded()
     previous = _HELD.pop(info.thread_id, None)
     if previous is not None and previous.timer is not None:
         previous.timer.cancel()
     held = _Held(info, reason=reason, expires=expires)
     if expires:
-        with contextlib.suppress(RuntimeError):
-            loop = asyncio.get_running_loop()
-            held.timer = loop.call_later(
-                _defer_max_seconds(), _release, info.thread_id, "background_agents_unresolved"
-            )
+        held.deadline = time.time() + _defer_max_seconds()
+        _arm(held)
     _HELD[info.thread_id] = held
+    _save_held()
     if expires:
         logger.info(
             "%s completion held — %d background agent(s) still running (#917)",
@@ -546,13 +569,172 @@ def _hold(
 
 def _release(thread_id: int, reason: str | None) -> bool:
     """Send the completion held for *thread_id*; whether there was one."""
+    _ensure_held_loaded()
     held = _HELD.pop(thread_id, None)
     if held is None:
         return False
     if held.timer is not None:
         held.timer.cancel()
+    _save_held()
     _spawn(_deliver("completion", held.info, reason=reason or held.reason))
     return True
+
+
+def _arm(held: _Held) -> None:
+    """Release *held* as ``background_agents_unresolved`` when its deadline comes."""
+    if held.deadline is None:
+        return
+    with contextlib.suppress(RuntimeError):
+        loop = asyncio.get_running_loop()
+        held.timer = loop.call_later(
+            max(0.0, held.deadline - time.time()),
+            _release,
+            held.info.thread_id,
+            "background_agents_unresolved",
+        )
+
+
+# --- held completions on disk (#1249) ---------------------------------------
+# A hold lived only in memory, so a restart before the agents reported back lost
+# the request's completion for good (4 times in 19 hours of production). It is
+# written on every change and read back once per process, lazily (the first
+# call that needs it) and at startup (:func:`restore_held`, which re-arms the
+# time limit even for a thread that never ends a turn again).
+
+
+def held_state_path() -> Path:
+    """``~/.c-lord/<instance>/held-completions.json`` — per instance, like its sessions."""
+    return clord_home() / instance_name() / _HELD_FILE
+
+
+def _info_to_dict(info: TurnInfo) -> dict[str, Any]:
+    return {
+        "thread_id": info.thread_id,
+        "guild_id": info.guild_id,
+        "channel_id": info.channel_id,
+        "started_by": info.started_by.as_dict(),
+        "started_at": info.started_at.isoformat(),
+        "baseline_reply_id": info.baseline_reply_id,
+    }
+
+
+def _info_from_dict(raw: dict[str, Any]) -> TurnInfo:
+    by = raw["started_by"]
+
+    def opt_int(value: object) -> int | None:
+        return int(value) if value is not None else None  # type: ignore[arg-type]
+
+    def opt_str(value: object) -> str | None:
+        return str(value) if value is not None else None
+
+    started_at = _as_utc(datetime.fromisoformat(str(raw["started_at"])))
+    return TurnInfo(
+        thread_id=int(raw["thread_id"]),
+        guild_id=opt_int(raw.get("guild_id")),
+        channel_id=opt_int(raw.get("channel_id")),
+        started_by=StartedBy(str(by["type"]), opt_str(by.get("id")), opt_str(by.get("name"))),
+        started_at=started_at,
+        # The old process's monotonic clock means nothing here; nothing compares
+        # a held turn's start against this process's snapshots.
+        started_mono=time.monotonic() - max(0.0, time.time() - started_at.timestamp()),
+        baseline_reply_id=int(raw.get("baseline_reply_id") or 0),
+    )
+
+
+def _save_held() -> None:
+    """Write every held completion to disk. Never raises: a failure only loses the carry-over."""
+    path = held_state_path()
+    entries = [
+        {
+            "info": _info_to_dict(held.info),
+            "reason": held.reason,
+            "expires": held.expires,
+            "deadline": held.deadline,
+        }
+        for held in _HELD.values()
+    ]
+    try:
+        if not entries:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps({"v": _HELD_FILE_VERSION, "held": entries}, ensure_ascii=False)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning(
+            "could not write the held completions to %s — a restart now loses them (#1249)",
+            path,
+            exc_info=True,
+        )
+
+
+def _ensure_held_loaded() -> None:
+    """Read the held completions a previous process left, once per process.
+
+    One whose time limit ran out while c-lord was down goes out at once, as
+    ``background_agents_unresolved``.
+    """
+    global _held_loaded
+    if _held_loaded:
+        return
+    _held_loaded = True
+    path = held_state_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        logger.warning(
+            "could not read the held completions in %s — ignoring them (#1249)",
+            path,
+            exc_info=True,
+        )
+        return
+    entries = raw.get("held") if isinstance(raw, dict) else None
+    expired: list[int] = []
+    for entry in entries if isinstance(entries, list) else []:
+        try:
+            info = _info_from_dict(entry["info"])
+            deadline = entry.get("deadline")
+            held = _Held(
+                info,
+                reason=entry.get("reason"),
+                expires=bool(entry.get("expires", True)),
+                deadline=float(deadline) if deadline is not None else None,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            logger.warning("skipping an unreadable held completion in %s (#1249)", path)
+            continue
+        if info.thread_id in _HELD or info.thread_id in _ACTIVE:
+            continue  # this process already moved on in that thread
+        _HELD[info.thread_id] = held
+        if held.deadline is not None and held.deadline <= time.time():
+            expired.append(info.thread_id)
+        else:
+            _arm(held)
+        logger.info(
+            "%s completion held before the restart restored (#1249)",
+            log_ctx(thread_id=info.thread_id),
+        )
+    for thread_id in expired:
+        _release(thread_id, "background_agents_unresolved")
+
+
+def restore_held() -> None:
+    """At startup: read back the held completions and re-arm their time limits (#1249).
+
+    Without this, they would be read back only by the next turn event, and a
+    thread that never ends a turn again would keep its hold past the limit.
+    Safe to call more than once.
+    """
+    if not enabled():
+        return
+    try:
+        _ensure_held_loaded()
+    except Exception:
+        logger.warning("could not restore the held completions (#1249)", exc_info=True)
 
 
 def _spawn(coro: Coroutine[Any, Any, None]) -> None:
