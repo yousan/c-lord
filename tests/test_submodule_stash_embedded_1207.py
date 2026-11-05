@@ -34,16 +34,12 @@ def _embedded(tmp_path: Path) -> Path:
     """A nested repo added as a bare gitlink (no .gitmodules, .git dir inside).
 
     A clone, so its commits are on its ``origin`` — a copy of ``seed`` has no
-    remote, and its commit then is the only copy (#1198 keeps that). Its own
-    remote: sharing the workspace's, the push below moves ``main`` to a commit
-    ``emb`` does not have, which reads as unknown and keeps (#1245 review).
+    remote, and its commit then is the only copy (#1198 keeps that).
     """
     ws = _session_clone(tmp_path)
-    emb_origin = tmp_path / "emb-origin.git"
     subprocess.run(
-        ["git", "clone", "-q", "--bare", str(tmp_path / "origin.git"), str(emb_origin)], check=True
+        ["git", "clone", "-q", str(tmp_path / "origin.git"), str(ws / "emb")], check=True
     )
-    subprocess.run(["git", "clone", "-q", str(emb_origin), str(ws / "emb")], check=True)
     _git(ws, "add", "emb")
     _git(ws, "commit", "-qm", "emb")
     _git(ws, "push", "-q", "origin", "main")

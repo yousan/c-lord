@@ -44,6 +44,28 @@ def _pushed_then_deleted_on_remote(ws: Path, subr: Path) -> str:
     return sha
 
 
+def _workspace_with_upstream_branch(tmp: Path, branch: str) -> tuple[Path, Path]:
+    """A workspace whose submodule was cloned while upstream had *branch* too."""
+    from .test_submodule_unpushed_1198 import _bare_with_commit
+
+    parent = _bare_with_commit(tmp, "parent")
+    subr = _bare_with_commit(tmp, "subremote")
+    seed = tmp / "subremote-seed"
+    git(seed, "checkout", "-q", "-b", branch)
+    _commit(seed, "branch.txt")
+    git(seed, "push", "-q", "origin", branch)
+    git(seed, "checkout", "-q", "main")
+    base = tmp / "sessions"
+    base.mkdir()
+    ws = base / "4242"
+    git(tmp, "clone", "-q", "--single-branch", str(parent), str(ws))
+    git(ws, "submodule", "add", "-q", str(subr), "sub")
+    git(ws, "commit", "-qm", "add sub")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    assert f"origin/{branch}" in git(ws / "sub", "branch", "-r")
+    return ws, subr
+
+
 def _count_ls_remote(monkeypatch) -> list[list[str]]:  # noqa: ANN001
     calls: list[list[str]] = []
     real = sd._run
@@ -79,15 +101,72 @@ def test_pushed_branch_still_on_remote_is_clean(tmp_path: Path) -> None:
     assert _delete(ws).removed
 
 
-def test_remote_branch_moved_to_a_commit_not_fetched_is_unknown(tmp_path: Path) -> None:
-    """Review of 43caee1: upstream ``main`` moved to a commit this clone never
-    fetched. Fast-forward or force-push cannot be told without a fetch, and a
-    fetch is not made — unknown, kept (an accepted over-keep)."""
+def test_untouched_submodule_whose_upstream_moved_is_deleted_offline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Second review of 0e9b09c: a commit to upstream ``main`` made every workspace
+    with that submodule undeletable. Nothing was pushed from here, so the
+    tracking refs hold only what came from the remote — trusted, no network."""
     ws, _ = _workspace(tmp_path)
     _commit(tmp_path / "subremote-seed", "later.txt")
     git(tmp_path / "subremote-seed", "push", "-q", "origin", "HEAD:main")
+    calls = _count_ls_remote(monkeypatch)
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
+    assert calls == []
+    assert _delete(ws).removed
+    assert calls == []
+
+
+def test_upstream_force_push_of_a_branch_present_at_clone_is_deleted(tmp_path: Path) -> None:
+    """The reviewer's ``dependabot/x``: fetched with the clone, force-pushed since."""
+    seed = tmp_path / "subremote-seed"
+    ws, _ = _workspace_with_upstream_branch(tmp_path, "dependabot/x")
+    git(seed, "checkout", "-q", "-B", "dependabot/x", "main")
+    _commit(seed, "rewritten.txt")
+    git(seed, "push", "-q", "-f", "origin", "dependabot/x")
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
+    assert _delete(ws).removed
+
+
+def test_upstream_branch_deleted_after_the_clone_is_deleted(tmp_path: Path) -> None:
+    ws, subr = _workspace_with_upstream_branch(tmp_path, "feature/gone")
+    git(subr, "update-ref", "-d", "refs/heads/feature/gone")
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
+    assert "unpushed commit" not in describe_changes(st)
+    assert _delete(ws).removed
+
+
+def test_user_pushed_branch_moved_on_the_remote_to_a_commit_not_here_is_kept(
+    tmp_path: Path,
+) -> None:
+    """Pushed from here, then someone else pushed on top: unknown without a fetch."""
+    ws, _ = _workspace(tmp_path)
+    sub = ws / "sub"
+    git(sub, "checkout", "-q", "-b", "work")
+    _commit(sub, "w.txt")
+    git(sub, "push", "-q", "origin", "work")
+    git(sub, "checkout", "-q", "--detach", "HEAD~1")
+    git(sub, "branch", "-q", "-D", "work")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", "-b", "work", str(tmp_path / "subremote.git"), str(other))
+    _commit(other, "theirs.txt")
+    git(other, "push", "-q", "origin", "work")
     res = _kept(ws)
     assert "sub: unpushed commits unknown (remote branch moved to a commit not here)" in res.reason
+
+
+def test_without_reflogs_a_moved_branch_is_verified(tmp_path: Path) -> None:
+    """``core.logAllRefUpdates=false``: a push leaves no trace, so every tracking
+    ref is verified; one that moved to a commit not here is unknown — kept."""
+    ws, _ = _workspace(tmp_path)
+    git(ws / "sub", "config", "core.logAllRefUpdates", "false")
+    _commit(tmp_path / "subremote-seed", "later.txt")
+    git(tmp_path / "subremote-seed", "push", "-q", "origin", "HEAD:main")
+    res = _kept(ws)
+    assert "remote branch moved to a commit not here" in res.reason
 
 
 def test_branch_deleted_and_recreated_elsewhere_is_unknown(tmp_path: Path) -> None:
@@ -137,11 +216,28 @@ def test_remote_branch_rewritten_and_fetched_is_kept(tmp_path: Path) -> None:
     assert "sub: 1 unpushed commit(s) (remote branch deleted or rewritten)" in res.reason
 
 
+def _pushed_branch(ws: Path) -> None:
+    sub = ws / "sub"
+    git(sub, "checkout", "-q", "-b", "work")
+    _commit(sub, "w.txt")
+    git(sub, "push", "-q", "origin", "work")
+    git(sub, "checkout", "-q", "--detach", "HEAD~1")
+
+
 def test_submodule_remote_that_cannot_be_asked_keeps(tmp_path: Path) -> None:
+    """A branch pushed from here needs the remote; it cannot be asked — kept."""
     ws, _ = _workspace(tmp_path)
+    _pushed_branch(ws)
     git(ws / "sub", "remote", "set-url", "origin", str(tmp_path / "gone.git"))
     res = _kept(ws)
     assert "sub: unpushed commits unknown (ls-remote failed)" in res.reason
+
+
+def test_untouched_submodule_whose_remote_is_gone_is_deleted(tmp_path: Path) -> None:
+    """Nothing pushed from here: the remote is not needed, so not asked."""
+    ws, _ = _workspace(tmp_path)
+    git(ws / "sub", "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    assert _delete(ws).removed
 
 
 def test_network_is_not_asked_when_something_else_keeps(tmp_path: Path, monkeypatch) -> None:
@@ -155,12 +251,30 @@ def test_network_is_not_asked_when_something_else_keeps(tmp_path: Path, monkeypa
 
 
 def test_one_ls_remote_per_submodule_remote(tmp_path: Path, monkeypatch) -> None:
-    """The clean path asks each submodule remote once (cached per URL)."""
+    """A branch pushed from here: the remote is asked once (cached per URL)."""
     ws, _ = _workspace(tmp_path)
+    _pushed_branch(ws)
     calls = _count_ls_remote(monkeypatch)
     assert worktree_status(str(ws)).clean
     assert worktree_status(str(ws)).clean
     assert len(calls) == 1, calls
+
+
+def test_remote_inside_the_workspace_never_vouches(tmp_path: Path) -> None:
+    """Second review (b): the submodule's origin re-pointed to ``build/mirror.git``
+    inside the workspace. Deleting the workspace deletes that remote too."""
+    ws, subr = _workspace(tmp_path)
+    (ws / ".gitignore").write_text("build/\n")
+    git(ws, "add", ".gitignore")
+    git(ws, "commit", "-qm", "ignore build")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    mirror = ws / "build" / "mirror.git"
+    git(tmp_path, "clone", "-q", "--bare", str(subr), str(mirror))
+    git(ws / "sub", "remote", "set-url", "origin", str(mirror))
+    _pushed_branch(ws)
+    res = _kept(ws)
+    # As if there were no remote: every commit counts, the cloned ``main`` too.
+    assert "sub: 2 unpushed commit(s) (only on a remote inside the workspace)" in res.reason
 
 
 # ---- review of 43caee1: the ls-remote cache ----

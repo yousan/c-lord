@@ -85,6 +85,9 @@ def _run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # A non-UTF-8 file name or URL must not raise UnicodeDecodeError
+        # (second review of 0e9b09c); bytes round-trip back into git.
+        errors="surrogateescape",
         cwd=cwd,
         env=env,
         start_new_session=timeout is not None,
@@ -853,46 +856,100 @@ def _git_pre(path: str, git_dir: bool) -> list[str]:
     return ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
 
 
-def _remote_urls(path: str, pre: list[str]) -> dict[str, str] | None:
-    """Remote name → URL, in one ``git config`` call. ``None``: git failed."""
-    result = _run([*pre, "config", "--get-regexp", r"^remote\..*\.url$"], cwd=path)
+def _remote_config(path: str, pre: list[str]) -> tuple[dict[str, str], bool] | None:
+    """Remote name → URL, and whether ref updates are logged, in one ``git config`` call.
+
+    ``core.logAllRefUpdates`` is on unless set to ``false`` (a module git dir is
+    non-bare). ``None``: git failed.
+    """
+    result = _run(
+        [*pre, "config", "--get-regexp", r"^(remote\..*\.url|core\.logallrefupdates)$"],
+        cwd=path,
+    )
     if result.returncode == 1:
-        return {}  # no remote configured
+        return {}, True  # neither set: no remote, default logging
     if result.returncode != 0:
         return None
     urls: dict[str, str] = {}
+    logged = True
     for line in result.stdout.splitlines():
-        key, _, url = line.partition(" ")
-        if key.startswith("remote.") and key.endswith(".url") and url:
-            urls.setdefault(key[len("remote.") : -len(".url")], url)
-    return urls
+        key, _, value = line.partition(" ")
+        if key == "core.logallrefupdates":
+            logged = value.strip().lower() not in ("false", "no", "off", "0")
+        elif key.startswith("remote.") and key.endswith(".url") and value:
+            urls.setdefault(key[len("remote.") : -len(".url")], value)
+    return urls, logged
 
 
-def _stale_tracking_note(repo: _Repo) -> str | None:
+def _local_remote_path(cwd: str, url: str) -> str | None:
+    """The real path a local remote URL names; ``None`` for a network URL."""
+    if url.startswith("file://"):
+        rest = url[len("file://") :]
+        url = rest[rest.index("/") :] if "/" in rest else rest  # file://host/path
+    elif _NETWORK_URL_RE.match(url):
+        return None
+    return os.path.realpath(os.path.join(os.path.realpath(cwd), url))
+
+
+def _inside(path: str | None, root: str) -> bool:
+    if path is None:
+        return False
+    real_root = os.path.realpath(root)
+    return path == real_root or path.startswith(real_root.rstrip("/") + "/")
+
+
+def _pushed_from_here(git_dir: Path, ref: str, logged: bool) -> bool:
+    """Was *ref* (``refs/remotes/<r>/<b>``) ever updated by a push from this clone?
+
+    Its reflog says so: ``update by push``. A ref that only ``clone`` /
+    ``fetch`` / ``pull`` wrote holds what came *from* the remote — trusted
+    without asking. ``git clone`` writes no reflog for the refs it creates, so
+    a missing reflog is "from the clone" while ref updates are logged; with
+    logging off (or the reflog unreadable) nothing can be told — verify.
+    """
+    try:
+        data = (git_dir / "logs" / ref).read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return not logged
+    except OSError:
+        return True
+    return any(line.split(b"\t", 1)[-1].startswith(b"update by push") for line in data.splitlines())
+
+
+def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     """Does a remote-tracking ref in *repo* vouch for commits the remote no longer has? (#1245)
 
     :func:`_local_only_commits` counts a commit as pushed when a local
     ``refs/remotes/*`` reaches it. A branch pushed and then deleted on the
     remote (a PR closed with its branch) leaves that ref behind, and the
-    commits — whose only copy is in this git dir — read as pushed. So this
-    asks each remote the tracking refs belong to (``git ls-remote --heads``,
-    cached per URL like the workspace's own check) and counts again with only
-    the refs that still vouch:
+    commits — whose only copy is in this git dir — read as pushed.
+
+    Only a tracking ref this clone **pushed to** can vouch for work made here,
+    so only those are checked (:func:`_pushed_from_here`); refs that only the
+    clone or a fetch wrote hold what came from the remote and are trusted with
+    no network call — upstream activity (``main`` moving on, a force-pushed
+    ``dependabot/*``, a feature branch deleted) never keeps a workspace with no
+    work of its own (second review of 0e9b09c). A pushed-to ref is asked about
+    (``git ls-remote --heads``, cached per URL) and vouches when:
 
     - the branch is still on the remote at the same commit;
     - or it moved, and the remote's commit is here: that commit vouches for
       what it reaches (a fast-forward covers the old commits, a force-push
       does not).
 
-    A branch that moved to a commit this clone does not have (fast-forward,
-    force-push, or deleted and recreated — indistinguishable without a fetch,
-    and nothing is fetched) is unknown: kept.
+    It moved to a commit not here (fast-forward, force-push, or deleted and
+    recreated — indistinguishable without a fetch, and nothing is fetched):
+    unknown, kept. Gone from the remote: vouches for nothing. A remote that
+    cannot be asked: unknown, kept.
 
-    A branch gone from the remote, and a tracking ref of no configured remote,
-    vouch for nothing. Any remote that cannot be asked is unknown — kept.
-    Costs one ``for-each-ref`` and one ``config``, one ``ls-remote`` per remote
-    URL (cached), and only when a branch is gone or moved a ``cat-file`` and a
-    ``rev-list``.
+    A remote whose URL is a path inside *ws_root* is deleted with the
+    workspace, so none of its refs vouch, pushed or fetched — as if there were
+    no remote (second review). A ref of no configured remote vouches only when
+    not pushed to from here.
+
+    Cost: one ``for-each-ref``, one ``config``, reflog file reads; one
+    ``ls-remote`` per remote URL (cached) only for pushed-to refs; a
+    ``cat-file`` and a ``rev-list`` only when a ref does not vouch.
     """
     pre = _git_pre(repo.path, repo.git_dir)
     refs = _run(
@@ -908,19 +965,31 @@ def _stale_tracking_note(repo: _Repo) -> str | None:
             tracking.append((ref, sha))
     if not tracking:
         return None
-    urls = _remote_urls(repo.path, pre)
-    if urls is None:
+    config = _remote_config(repo.path, pre)
+    if config is None:
         return f"{repo.name}: unpushed commits unknown (git failed)"
+    urls, logged = config
     names = sorted(urls, key=len, reverse=True)  # ``a/b`` before ``a``
-    heads: dict[str, dict[str, str]] = {}
+    inside = {n for n, u in urls.items() if _inside(_local_remote_path(repo.path, u), ws_root)}
     vouch: set[str] = set()
-    moved: list[tuple[str, str]] = []
-    stale = False
+    verify: list[tuple[str, str, str]] = []
+    no_vouch = False
     for ref, sha in tracking:
         remote = next((n for n in names if ref.startswith(f"refs/remotes/{n}/")), None)
-        if remote is None:
-            stale = True
-            continue
+        if remote in inside:
+            no_vouch = True
+        elif not _pushed_from_here(repo.own_git_dir, ref, logged):
+            vouch.add(sha)  # came from the remote (clone / fetch)
+        elif remote is None:
+            no_vouch = True
+        else:
+            verify.append((ref, sha, remote))
+    if not no_vouch and not verify:
+        return None
+    heads: dict[str, dict[str, str]] = {}
+    moved: list[tuple[str, str]] = []
+    gone = False
+    for ref, sha, remote in verify:
         if remote not in heads:
             got = _ls_remote_refs(repo.path, remote, urls[remote], pre)
             if got is None:
@@ -930,12 +999,12 @@ def _stale_tracking_note(repo: _Repo) -> str | None:
         if now == sha:
             vouch.add(sha)
         elif now is None:
-            stale = True
+            gone = True
         else:
             moved.append((sha, now))
-    if not stale and not moved:
+    if not no_vouch and not gone and not moved:
         return None
-    # Which of the remote's heads are here — those vouch for what they reach.
+    # Which of the asked remotes' heads are here — those vouch for what they reach.
     remote_shas = sorted({s for h in heads.values() for s in h.values()})
     present: set[str] = set()
     if remote_shas:
@@ -959,8 +1028,8 @@ def _stale_tracking_note(repo: _Repo) -> str | None:
     extra = _worktree_tips(repo.own_git_dir)
     if extra is None:
         return f"{repo.name}: unpushed commits unknown ({_WORKTREE_UNREADABLE})"
-    # Same tips as _local_only_commits, but ``--all`` now counts the stale
-    # tracking refs too; only the refs that still vouch are subtracted.
+    # Same tips as _local_only_commits, but ``--all`` now counts the tracking
+    # refs that do not vouch too; only those that do are subtracted.
     result = _run(
         [*pre, "rev-list", "--count", "--exclude=refs/stash", "--all", "--stdin"],
         cwd=repo.path,
@@ -974,7 +1043,9 @@ def _stale_tracking_note(repo: _Repo) -> str | None:
         return f"{repo.name}: unpushed commits unknown (git failed)"
     if not n:
         return None
-    return f"{repo.name}: {n} unpushed commit(s) (remote branch deleted or rewritten)"
+    if gone or moved:
+        return f"{repo.name}: {n} unpushed commit(s) (remote branch deleted or rewritten)"
+    return f"{repo.name}: {n} unpushed commit(s) (only on a remote inside the workspace)"
 
 
 def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
@@ -1135,8 +1206,9 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
     uncommitted work lands in ``user_changes``. Only files c-lord writes itself
     are set aside, and a Claude Code worktree only when it is itself clean.
 
-    Never raises ``OSError``: a file the checks cannot read is unknown — the
-    dir is kept, and a sweep goes on to the next one (review of 43caee1: a
+    Never raises: a file the checks cannot read, or any other failure (an
+    undecodable name — second review of 0e9b09c), is unknown — the dir is
+    kept, and a sweep goes on to the next one (review of 43caee1: a
     ``PermissionError`` stopped ``cleanup_orphaned`` and failed
     /workspace-delete with an exception).
     """
@@ -1145,6 +1217,9 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
     except OSError as exc:
         logger.warning("worktree status of %s unknown: %s", path, exc)
         return WorktreeStatus(is_repo=False, unknown=f"unreadable: {exc.strerror or exc}")
+    except Exception as exc:  # noqa: BLE001 — any failure is unknown, never "clean"
+        logger.exception("worktree status of %s unknown", path)
+        return WorktreeStatus(is_repo=False, unknown=f"check failed: {type(exc).__name__}")
 
 
 def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
@@ -1202,7 +1277,7 @@ def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
         # #1245: a nested repo's "pushed" rests on local tracking refs; ask the
         # remotes only now, as for the workspace, and stop at the first reason.
         for repo in pushed:
-            note = _stale_tracking_note(repo)
+            note = _stale_tracking_note(repo, path)
             if note:
                 nested.append(note)
                 break
@@ -1302,6 +1377,8 @@ class SessionDirInfo:
     is_clean: bool
     #: why it is not clean — :func:`describe_changes` of the same snapshot (#1016)
     kept_reason: str = ""
+    #: the scan of this dir failed; it is never removed on that scan's word
+    failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1473,8 +1550,23 @@ class SessionDirManager:
 
             path = str(entry)
             thread_id = int(entry.name)
-            commit = _get_commit(path)
-            status = worktree_status(path)
+            try:
+                commit = _get_commit(path)
+                status = worktree_status(path)
+            except Exception as exc:  # noqa: BLE001 — one dir never stops the scan
+                logger.exception("Cannot inspect session dir %s", path)
+                results.append(
+                    SessionDirInfo(
+                        path=path,
+                        thread_id=thread_id,
+                        source_repo=self._source_repo,
+                        commit="",
+                        is_clean=False,
+                        kept_reason=f"status unknown (check failed: {type(exc).__name__})",
+                        failed=True,
+                    )
+                )
+                continue
             clean = status.clean
 
             results.append(
@@ -1526,7 +1618,29 @@ class SessionDirManager:
                 )
                 continue
 
-            result = self._try_remove(info.path, info.thread_id)
+            if info.failed:
+                results.append(
+                    CleanupResult(
+                        path=info.path,
+                        thread_id=info.thread_id,
+                        removed=False,
+                        reason=info.kept_reason,
+                        kept_work=True,
+                    )
+                )
+                continue
+            # Second review of 0e9b09c: one workspace that fails never stops the sweep.
+            try:
+                result = self._try_remove(info.path, info.thread_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Cleanup of session dir %s failed", info.path)
+                result = CleanupResult(
+                    path=info.path,
+                    thread_id=info.thread_id,
+                    removed=False,
+                    reason=f"status unknown (check failed: {type(exc).__name__})",
+                    kept_work=True,
+                )
             results.append(result)
 
         return results

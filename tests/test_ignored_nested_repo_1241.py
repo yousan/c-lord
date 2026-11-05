@@ -9,6 +9,7 @@ copy of that commit. A tool can rebuild ``vendor/``; it cannot rebuild a commit.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from c_lord.session_dir import describe_changes, worktree_status
@@ -91,3 +92,32 @@ def test_regenerable_files_inside_an_ignored_repo_are_not_work(tmp_path: Path) -
     (lib / "__pycache__" / "m.pyc").write_bytes(b"\0")
     st = worktree_status(str(ws))
     assert st.clean, describe_changes(st)
+
+
+def test_repo_whose_origin_is_a_bare_repo_inside_the_workspace_is_kept(tmp_path: Path) -> None:
+    """Second review (a): ``vendor/up.git`` is ``vendor/lib``'s origin. Pushing
+    there is no backup — it is deleted with the workspace."""
+    ws, _ = _workspace(tmp_path)
+    _ignore(ws, "vendor/")
+    up = ws / "vendor" / "up.git"
+    git(tmp_path, "init", "-q", "--bare", str(up))
+    lib = ws / "vendor" / "lib"
+    git(tmp_path, "clone", "-q", str(up), str(lib))
+    _commit(lib, "patch.txt")
+    git(lib, "push", "-q", "origin", "HEAD:main")
+    res = _kept(ws)
+    assert "vendor/lib: 1 unpushed commit(s)" in res.reason, res.reason
+
+
+def test_undecodable_ignored_file_name_inside_a_vendor_repo_is_kept(tmp_path: Path) -> None:
+    """Second review (C): a non-UTF-8 name made ``git status`` output undecodable,
+    and the UnicodeDecodeError escaped /workspace-delete."""
+    ws, subr = _workspace(tmp_path)
+    _ignore(ws, "vendor/")
+    lib = ws / "vendor" / "lib"
+    git(tmp_path, "clone", "-q", str(subr), str(lib))
+    (lib / ".git" / "info" / "exclude").write_text("*.bin\n")
+    with open(os.path.join(os.fsencode(lib), b"caf\xe9.bin"), "wb") as f:
+        f.write(b"x")
+    res = _kept(ws)
+    assert "vendor/lib: uncommitted changes" in res.reason, res.reason
