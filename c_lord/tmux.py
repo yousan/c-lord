@@ -44,19 +44,27 @@ from .utils.logger import log_ctx
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+#: The longest number c-lord writes into tmux: a Discord snowflake is at most 20
+#: digits, and work numbers are small (#1287).
+MAX_TMUX_NUMBER_DIGITS = 20
+
 # Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
-# unrelated trailing-numeric path components (PIDs, ports, etc.).
-_THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
+# unrelated trailing-numeric path components (PIDs, ports, etc.). #1287: and at
+# most 20 — the whole run, not its tail — so a 5000-digit directory name never
+# reaches ``int()``'s 4300-digit limit.
+_THREAD_ID_FROM_PATH_RE = re.compile(rf"(?<!\d)(\d{{10,{MAX_TMUX_NUMBER_DIGITS}}})/*$")
 
 
 def _is_ascii_number(text: str) -> bool:
-    """Whether *text* is ASCII digits only — the only numbers c-lord writes into tmux.
+    """Whether *text* is a number c-lord could have written into tmux.
 
     #1239: ``"²".isdigit()`` is True but ``int("²")`` raises. The tmux server is
     shared, so a window renamed ``w²`` or a stray tag made rebuilding the
-    thread -> window map raise. Anything else is not a c-lord window / row.
+    thread -> window map raise. #1287: likewise more than 4300 ASCII digits —
+    ``int()``'s limit — so anything over :data:`MAX_TMUX_NUMBER_DIGITS` is refused.
+    Anything else is not a c-lord window / row.
     """
-    return text.isascii() and text.isdigit()
+    return text.isascii() and text.isdigit() and len(text) <= MAX_TMUX_NUMBER_DIGITS
 
 
 # tmux's immutable per-window handle, e.g. ``@218``. Unique for the life of the
