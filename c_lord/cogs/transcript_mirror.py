@@ -52,6 +52,7 @@ from ..transcript.subagents import (
     subagent_progress_seconds,
     subagent_voices_enabled,
 )
+from ..utils.logger import log_ctx
 
 if TYPE_CHECKING:
     from ..database.repository import SessionRepository
@@ -603,6 +604,10 @@ class TranscriptMirrorCog(commands.Cog):
             if started_by is not None and started_by.type == "user" and started_by.id:
                 with contextlib.suppress(ValueError):
                     mention_id = int(started_by.id)
+            elif started_by is None:
+                # #1212: this process has not run a turn here since it started —
+                # the last one's trigger message, on record, names who asked.
+                mention_id = await self._requester_on_record(thread_id, channel)
             if mention_id is None:
                 mention_id = owner_notify_id(bot, kind="failure")
             body = f"❌ Claude Code が API エラーで止まりました。{advice(error_text)}"
@@ -616,6 +621,45 @@ class TranscriptMirrorCog(commands.Cog):
             )
 
         return api_error_sink
+
+    async def _requester_on_record(self, thread_id: int, channel: object) -> int | None:
+        """The person whose message started *thread_id*'s last turn, or ``None`` (#1212).
+
+        What :func:`turn_events.last_started_by` knows dies with the process;
+        the trigger message's id is on record (``sessions.trigger_message_id``,
+        #115). A webhook, a bot or c-lord's own seed message is nobody to ping
+        (#520/#525), and neither is a trigger that cannot be read. Never raises.
+        """
+        try:
+            record = await self._session_repo.get(thread_id)
+            trigger_id = getattr(record, "trigger_message_id", None) if record else None
+            if not isinstance(trigger_id, int):
+                return None
+            try:
+                message = await channel.fetch_message(trigger_id)  # type: ignore[attr-defined]
+            except discord.NotFound:
+                # A thread's first message is its starter, which lives in the
+                # parent channel under the thread's own id.
+                parent = getattr(channel, "parent", None)
+                if parent is None:
+                    raise
+                message = await parent.fetch_message(trigger_id)
+            if getattr(message, "webhook_id", None) is not None:
+                return None
+            author = getattr(message, "author", None)
+            author_id = getattr(author, "id", None)
+            self_id = getattr(getattr(self.bot, "user", None), "id", None)
+            if not isinstance(author_id, int) or getattr(author, "bot", False):
+                return None
+            return None if author_id == self_id else author_id
+        except Exception:
+            logger.info(
+                "%s API error notice: could not read the last turn's requester — "
+                "pinging the owner fallback (#1212)",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
+            return None
 
     def _make_reply_sink(self, thread_id: int):
         """Return an awaitable callable for final assistant text (no progress.txt).
