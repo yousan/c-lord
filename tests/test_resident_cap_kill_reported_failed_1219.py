@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from c_lord.resident_cap import ResidentCapLoop
 from c_lord.tmux import PaneTurnStates
 from tests.test_resident_cap_failure_paths import OK, _bot, _cog, _rec, _repo
@@ -268,3 +270,34 @@ async def test_two_stuck_oldest_with_unanswered_re_reads_do_not_hold_the_cap() -
             await loop.tick()
     assert len(resident) <= 3, f"still {sorted(resident)} resident after 50 ticks (limit 3)"
     assert {5, 6} <= resident
+
+
+@pytest.mark.parametrize("stuck", [2, 3, 4, 5])
+async def test_many_stuck_oldest_with_unanswered_re_reads_do_not_hold_the_cap(stuck: int) -> None:
+    """Review of 5641d83: remembering only the last tick, four or more stuck oldest
+    ones took turns in pairs and nothing behind them was ever tried — 10 resident
+    for 50 ticks with limit 6. A deferred thread stays deferred until its sleep or
+    its re-read gives an answer, or it leaves the residents."""
+    n, limit = 10, 6
+    resident = set(range(1, n + 1))
+    stuck_ids = set(range(n - stuck + 1, n + 1))  # the oldest
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        if channel.id in stuck_ids:
+            return False
+        resident.discard(channel.id)
+        return True
+
+    loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, n, limit)
+    with (
+        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
+        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        for tick in range(50):
+            before = len(resident)
+            over = max(0, before - limit)
+            await loop.tick()
+            assert before - len(resident) <= over + 1, f"tick {tick} slept too many"
+    assert len(resident) <= limit, f"still {sorted(resident)} resident after 50 ticks"
+    assert stuck_ids <= resident

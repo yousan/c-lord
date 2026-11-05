@@ -394,11 +394,12 @@ class ResidentCapLoop:
         # windows are closed rather than skipped — skipped, each one held a
         # slot forever and a live workspace was slept in its place (#1086).
         self._gone: set[int] = set()
-        # Threads whose failed sleep got an unanswered re-read last tick (#1219,
-        # review of f15c8ee). Tried last on the next tick: otherwise two stuck
-        # oldest ones used up the tick's make-up every time and held the cap
-        # above its limit for good.
-        self._unanswered_last_tick: set[int] = set()
+        # Threads whose failed sleep got an unanswered re-read (#1219, reviews of
+        # f15c8ee / 5641d83). Tried after every other candidate, and kept here
+        # until their sleep or re-read gives an answer or they leave the
+        # residents: otherwise the stuck oldest ones used up each tick's make-up
+        # (two at a time, taking turns) and held the cap above its limit for good.
+        self._deferred: set[int] = set()
         self._task: object | None = None
 
     @property
@@ -725,6 +726,7 @@ class ResidentCapLoop:
         # workspaces, and counting a corpse slept a live one in its place.
         await self._close_known_gone(self._resident())
         resident = self._resident() - self._gone
+        self._deferred &= resident  # bounded by the residents (#1219)
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
@@ -761,7 +763,7 @@ class ResidentCapLoop:
             )
             if tid not in self._unresolvable
         ]
-        deferred = self._unanswered_last_tick
+        deferred = self._deferred
         victims = [t for t in victims if t not in deferred] + [t for t in victims if t in deferred]
         if not victims:
             # Say so: "over the cap and doing nothing" must not look like "fine".
@@ -791,10 +793,11 @@ class ResidentCapLoop:
         label = f"{self._limit}本"
         slept = 0
         unanswered = 0  # failed sleeps whose re-read tmux did not answer (#1219)
-        self._unanswered_last_tick = set()
         for thread_id in victims:
             if slept >= over:
                 break
+            # Deferred again below only if the re-read is unanswered once more.
+            self._deferred.discard(thread_id)
             outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
             if outcome:
                 slept += 1
@@ -826,7 +829,7 @@ class ResidentCapLoop:
                     # failure per tick is made up for; a second ends the tick
                     # (about over+1 at worst), and the next tick counts again.
                     unanswered += 1
-                    self._unanswered_last_tick.add(thread_id)
+                    self._deferred.add(thread_id)
                     quiet = self._quiet.sample("cap-reread-unanswered")
                     if quiet.emit:
                         logger.warning(
