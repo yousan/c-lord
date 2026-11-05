@@ -221,19 +221,20 @@ class SkillCommandCog(commands.Cog):
         turn, and the answer would be posted as a reply to them. Nothing on
         record → the owner (#1212).
 
-        *prior* — what was on record (memory, row, pending) when this ``/skill``
-        started — is forgotten from the row with this turn's own SYSTEM save.
-        The rest is decided by the pane, which answers the input it got last:
-        the returned hook runs the moment the ``/skill`` prompt is really in the
-        pane (``RunConfig.on_prompt_sent``) and also forgets the trigger of a
-        message turn whose prompt got there first. A message turn whose prompt
-        arrives after this one is the newer turn and keeps its trigger.
+        Everything happens in the returned hook, which runs the moment the
+        ``/skill`` prompt is really in the pane (``RunConfig.on_prompt_sent``) —
+        the pane answers the input it got last, and a ``/skill`` whose send
+        failed changes nothing. Forgotten then: what was on record (memory, row,
+        pending) when this ``/skill`` started (*prior*), except a message turn
+        still on its way to the pane (in flight — its prompt arrives after this
+        one, so it is the newer turn); and the trigger of a message turn whose
+        prompt got there first. A message recorded since that has not been sent
+        keeps its trigger.
         """
         known = {mid for mid in prior if isinstance(mid, int)}
-        self.repo.clear_trigger_at_next_save(thread_id, known)
 
         async def on_prompt_sent() -> None:
-            stale = set(known)
+            stale = {mid for mid in known if not self.repo.trigger_in_flight(thread_id, mid)}
             sent = self.repo.sent_trigger(thread_id)
             if isinstance(sent, int):
                 stale.add(sent)
@@ -244,10 +245,10 @@ class SkillCommandCog(commands.Cog):
             current = seen_memory(thread_id) if callable(seen_memory) else None
             if callable(forget) and current in stale:
                 forget(thread_id, only=current)
-            if not stale - known:
+            if not stale:
                 return
             try:
-                await self.repo.clear_trigger_message(thread_id, only=stale - known)
+                await self.repo.clear_trigger_message(thread_id, only=stale)
             except Exception:
                 # The repository keeps the ids for the next session save.
                 logger.warning(

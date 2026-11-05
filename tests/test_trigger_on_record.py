@@ -85,11 +85,13 @@ async def _skill_turn(
     *,
     before_send: Callable[[], Awaitable[None]] | None = None,
     after_send: Callable[[], Awaitable[None]] | None = None,
+    delivered: bool = True,
 ) -> None:
     """Run ``/skill`` in an existing thread; the run itself does what a real one
     does to the record, in the runner's order: begin the turn for the invoker,
     save at SYSTEM, then the prompt reaches the pane (``on_prompt_sent``, #1262).
-    *before_send* / *after_send* run around that moment."""
+    *before_send* / *after_send* run around that moment; ``delivered=False`` is
+    a send that failed (the hook never runs)."""
     bot = MagicMock()
     bot.settings_repo = None
     bot.transcript_mirror_cog = mirror if mirror is not None else MagicMock()
@@ -126,7 +128,7 @@ async def _skill_turn(
         if before_send is not None:
             await before_send()
         # RunConfig.on_prompt_sent (#1262); absent before it existed.
-        if (sent := getattr(config, "on_prompt_sent", None)) is not None:
+        if delivered and (sent := getattr(config, "on_prompt_sent", None)) is not None:
             await sent()
         if after_send is not None:
             await after_send()

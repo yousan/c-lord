@@ -4701,6 +4701,10 @@ class ClaudeChatCog(commands.Cog):
                         thread.id,
                         exc_info=True,
                     )
+            # #1262: from here until its prompt is in the pane (or the turn
+            # ends), a /skill sent meanwhile does not take this trigger away.
+            with contextlib.suppress(Exception):
+                self.repo.note_trigger_in_flight(thread.id, user_message.id)
             # Record the trigger message so TranscriptMirror / ApiServer can
             # thread the final answer back as a Discord reply (Issue #115).
             if transcript_cog is not None:
@@ -4783,6 +4787,9 @@ class ClaudeChatCog(commands.Cog):
                 # must not leave its trigger for the next row (another turn's).
                 with contextlib.suppress(Exception):
                     self.repo.discard_pending_trigger(thread.id, user_message.id)
+                # #1262: sent or not, this turn's prompt is no longer on its way.
+                with contextlib.suppress(Exception):
+                    self.repo.end_trigger_in_flight(thread.id, user_message.id)
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)

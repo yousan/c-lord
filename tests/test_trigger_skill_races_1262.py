@@ -62,6 +62,7 @@ async def _chat_turn(
     *,
     before_send: Callable[[], Awaitable[None]] | None = None,
     before_run: Callable[[], Awaitable[None]] | None = None,
+    delivered: bool = True,
 ) -> None:
     """A's message turn through the real ClaudeChatCog._run_claude, to its end.
 
@@ -103,7 +104,7 @@ async def _chat_turn(
         if before_send is not None:
             await before_send()
         # RunConfig.on_prompt_sent (#1262); absent before it existed.
-        if (sent := getattr(config, "on_prompt_sent", None)) is not None:
+        if delivered and (sent := getattr(config, "on_prompt_sent", None)) is not None:
             await sent()
 
     with patch("c_lord.cogs.claude_chat.run_claude_with_config", side_effect=run):
@@ -125,11 +126,11 @@ async def _setup(tmp_path):  # noqa: ANN001, ANN202
 async def test_db_write_landing_after_the_skill_started_does_not_ping_a(
     tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
-    """A's message comes just before /skill: claude_chat sets the memory (sync)
-    then awaits the DB write; /skill looks at the record before that write
-    commits. A's prompt never reaches the pane before /skill's, so /skill is the
-    last turn: A is forgotten from memory and from the row, and a restart does
-    not ping A."""
+    """556 is in memory when /skill starts and its DB write lands during the
+    prepare, but no message turn is on its way to the pane with it (not in
+    flight, never sent) — it is an earlier turn's. /skill is the last turn: 556
+    is forgotten from memory and from the row together (they used to disagree),
+    and a restart does not ping A."""
     monkeypatch.delenv(turn_events.ENV_LOG, raising=False)
     monkeypatch.delenv(turn_events.ENV_URL, raising=False)
     repo, bot, channels, mirror = await _setup(tmp_path)
@@ -297,46 +298,126 @@ async def test_skill_turn_with_locked_db_does_not_ping_a_after_restart(
     assert not after.endswith(f"<@{P}>"), after
 
 
-async def test_a_clear_refused_by_a_locked_db_lands_with_the_next_save(tmp_path) -> None:  # noqa: ANN001
-    """The immediate clear fails (locked); the ids are kept and the thread's next
-    session save forgets them."""
-    db = str(tmp_path / "s.db")
-    await init_db(db)
-    repo = SessionRepository(db)
-    await repo.update_trigger_message(42, 555)
-    await repo.save(42, "sess-1")
-    conn = _locked(db)
+def _row_trigger(db: str) -> int | None:
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute(
+            "SELECT trigger_message_id FROM sessions WHERE thread_id = 42"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+async def _refused_clear(repo: SessionRepository, ids: set[int]) -> None:
+    conn = _locked(repo.db_path)
     try:
         try:
-            await repo.clear_trigger_message(42, only={555})
+            await repo.clear_trigger_message(42, only=ids)
         except sqlite3.OperationalError:
-            pass
-        else:
-            raise AssertionError("the clear should have been refused")
+            return
+        raise AssertionError("the clear should have been refused")
     finally:
         conn.rollback()
         conn.close()
-    record = await repo.get(42)
-    assert record is not None and record.trigger_message_id == 555
-    await repo.save(42, "sess-1")
-    record = await repo.get(42)
-    assert record is not None and record.trigger_message_id is None
 
 
-async def test_a_waiting_clear_never_wipes_a_newer_message(tmp_path) -> None:  # noqa: ANN001
-    """A clear waiting for the next save names exact ids: a newer message written
-    to the row in the meantime stays (so no separate "a newer write cancels the
-    waiting clear" rule is needed)."""
+async def test_a_clear_refused_by_a_locked_db_lands_with_the_next_save(tmp_path) -> None:  # noqa: ANN001
+    """The clear fails (locked): the ids are kept — hidden from reads in this
+    process, and written by the thread's next session save."""
     db = str(tmp_path / "s.db")
     await init_db(db)
     repo = SessionRepository(db)
     await repo.update_trigger_message(42, 555)
     await repo.save(42, "sess-1")
-    repo.clear_trigger_at_next_save(42, {555})
-    await repo.update_trigger_message(42, 556)
+    await _refused_clear(repo, {555})
+    assert _row_trigger(db) == 555
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id is None
     await repo.save(42, "sess-1")
+    assert _row_trigger(db) is None
+
+
+async def test_a_refused_clear_never_wipes_a_newer_message(tmp_path) -> None:  # noqa: ANN001
+    """A refused clear names exact ids: a newer message written to the row in the
+    meantime stays, through reads and through the next save (so no separate "a
+    newer write cancels the waiting clear" rule is needed)."""
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)
+    await repo.save(42, "sess-1")
+    await _refused_clear(repo, {555})
+    await repo.update_trigger_message(42, 556)
     record = await repo.get(42)
     assert record is not None and record.trigger_message_id == 556
+    await repo.save(42, "sess-1")
+    assert _row_trigger(db) == 556
+
+
+async def test_a_turn_in_flight_when_skill_starts_and_sent_after_it_keeps_its_reply(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    """A's trigger is recorded (memory and row) and then /skill starts — so it is
+    in /skill's snapshot. A is still posting its Stop notice and saving at SYSTEM,
+    so /skill's prompt reaches the pane first and A's goes last. A owns the
+    answer: its reply and its row stay."""
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    a_noted = asyncio.Event()
+    a_may_go = asyncio.Event()
+
+    async def a_before_run() -> None:
+        a_noted.set()
+        await a_may_go.wait()
+
+    a_task = asyncio.create_task(_chat_turn(repo, mirror, 556, before_run=a_before_run))
+    await a_noted.wait()  # A's trigger is on record, its prompt not sent
+
+    async def skill_after_send() -> None:
+        a_may_go.set()  # A's prompt reaches the pane after /skill's
+        await a_task
+
+    turn_events.reset()
+    try:
+        await _skill_turn(repo, 42, S, mirror=mirror, after_send=skill_after_send)
+    finally:
+        turn_events.reset()
+    assert repo.sent_trigger(42) == 556
+    assert mirror.trigger_message(42) == 556
+    ref = await mirror._build_trigger_reference(42)
+    assert ref is not None and ref.message_id == 556
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id == 556
+
+
+async def test_a_turn_that_ended_without_reaching_the_pane_is_no_longer_in_flight(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    """A's message turn recorded 556 and ended without its prompt reaching the
+    pane (the send failed). It is not on its way any more, so a later /skill —
+    the last turn the pane got — forgets it from memory and row."""
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    turn_events.reset()
+    try:
+        await _chat_turn(repo, mirror, 556, delivered=False)
+        await _skill_turn(repo, 42, S, mirror=mirror)
+    finally:
+        turn_events.reset()
+    assert not repo.trigger_in_flight(42, 556)
+    assert mirror.trigger_message(42) is None
+    assert _row_trigger(repo.db_path) is None
+
+
+async def test_a_skill_whose_send_failed_forgets_nothing(tmp_path) -> None:  # noqa: ANN001
+    """/skill saves at SYSTEM but its prompt never reaches the pane. P's turn is
+    still the last one the pane got: memory and row both keep P's 555."""
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    turn_events.reset()
+    try:
+        await _skill_turn(repo, 42, S, mirror=mirror, delivered=False)
+    finally:
+        turn_events.reset()
+    assert mirror.trigger_message(42) == 555
+    assert _row_trigger(repo.db_path) == 555
 
 
 async def test_two_skills_back_to_back_leave_nothing_of_the_earlier_requester(
