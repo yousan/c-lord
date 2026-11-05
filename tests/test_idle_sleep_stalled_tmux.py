@@ -152,12 +152,59 @@ async def test_a_stall_costs_at_most_max_per_tick_attempts() -> None:
 # and the failure count outlived a human speaking in the thread.
 
 
+def _slow_false(clock: list[float]) -> AsyncMock:
+    """A stalled tmux: the answer is ``False`` and it took its timeouts to come."""
+
+    async def answer(**_: object) -> bool:
+        clock[0] += 30.0
+        return False
+
+    return AsyncMock(side_effect=answer)
+
+
 async def test_a_stall_costs_a_few_attempts_per_tick_with_the_default_budget() -> None:
-    loop, impl = _many_threads_loop(30, max_per_tick=MAX_SLEEPS_PER_TICK)
-    assert await loop.tick() == 0
-    assert impl.await_count == MAX_UNSURE_PER_TICK
-    assert await loop.tick() == 0  # the next tick moves on, it does not stop for good
-    assert impl.await_count == 2 * MAX_UNSURE_PER_TICK
+    loop, _ = _many_threads_loop(30, max_per_tick=MAX_SLEEPS_PER_TICK)
+    clock = [0.0]
+    impl = _slow_false(clock)
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl  # type: ignore[attr-defined]
+    with patch("c_lord.idle_sleep._clock", lambda: clock[0], create=True):
+        assert await loop.tick() == 0
+        assert impl.await_count == MAX_UNSURE_PER_TICK
+        assert await loop.tick() == 0  # the next tick moves on, it does not stop for good
+        assert impl.await_count == 2 * MAX_UNSURE_PER_TICK
+
+
+# --- third review of the #1228 fix: a ``False`` that comes back at once is a
+# cause that never goes away (not a thread, no tmux manager), not a stall. It
+# must not use up the per-tick cap and hold back the healthy threads behind it.
+
+
+async def test_fast_falses_do_not_hold_back_healthy_threads() -> None:
+    loop = _loop()
+    bad = list(range(200, 205))  # oldest first
+    good = [300, 301, 302]
+    threads = {}
+    for tid in bad + good:
+        t = MagicMock(spec=discord.Thread)
+        t.id = tid
+        t.parent_id = 10
+        threads[tid] = t
+    loop._bot.get_channel = MagicMock(side_effect=lambda tid: threads[tid])  # type: ignore[attr-defined]
+    loop._repo.list_all = AsyncMock(  # type: ignore[attr-defined]
+        return_value=[_rec(t, hours_ago=10) for t in bad] + [_rec(t, hours_ago=9) for t in good]
+    )
+
+    async def answer(*, channel: object, **_: object) -> bool:
+        return channel.id in good  # type: ignore[attr-defined]
+
+    impl = AsyncMock(side_effect=answer)
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl  # type: ignore[attr-defined]
+    assert await loop.tick() == 3  # was 0 (then 0, 0, 3)
+    # the fast falses still meet the 3-strikes rule: tried 3 ticks, then left alone
+    for _ in range(4):
+        await loop.tick()
+    tried = [c.kwargs["channel"].id for c in impl.await_args_list]
+    assert all(tried.count(t) == 3 for t in bad)
 
 
 async def test_successes_after_the_cap_are_not_blocked_by_earlier_ticks() -> None:

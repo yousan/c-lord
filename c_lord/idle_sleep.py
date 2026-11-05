@@ -39,6 +39,7 @@ import inspect
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -82,6 +83,13 @@ _MAX_UNSURE = 3
 # have cost several tmux timeouts; ``MAX_SLEEPS_PER_TICK`` (1000, as many as
 # ``list_all`` returns) never bounds a stall, so the failures get their own cap.
 MAX_UNSURE_PER_TICK = 5
+
+# #1228: a ``False`` counts toward ``MAX_UNSURE_PER_TICK`` only when it took this
+# long — the sign of a stall (tmux timeouts are 30 s). A permanent cause (not a
+# thread, no tmux manager) answers at once and must not hold back healthy
+# threads queued behind it; it still meets the per-thread ``_MAX_UNSURE``.
+_STALL_SECONDS = 2.0
+_clock = time.monotonic
 
 #: Every 10 minutes. The threshold is hours, so this is already 24× finer than
 #: it needs to be, and each tick reads the whole session table once.
@@ -222,7 +230,7 @@ class IdleSleepLoop(IdleSweepLoop):
         self._last_used: dict[int, str] = {}
         # Threads whose attempt this tick answered ``False`` (see ``_spent_budget``).
         self._unsure_now: set[int] = set()
-        # ``False`` answers so far this tick (``MAX_UNSURE_PER_TICK``).
+        # Slow ``False`` answers so far this tick (``MAX_UNSURE_PER_TICK``).
         self._unsure_this_tick = 0
         # Where Claude Code keeps its transcripts. None = its real location;
         # tests point it at a tmp dir.
@@ -322,11 +330,13 @@ class IdleSleepLoop(IdleSweepLoop):
 
         from .workspace_notice import WorkspaceReason
 
+        started = _clock()
         slept = await impl(
             channel=channel,
             reason=WorkspaceReason.IDLE,
             idle_label=idle_label_for_hours(self._hours),
         )
+        took = _clock() - started
         if slept is False:
             # #1228: ``False`` is "could not tell / could not kill" (a stalled
             # tmux — #1192 / #1206), not "nothing to kill" (``None``). Marking it
@@ -334,7 +344,8 @@ class IdleSleepLoop(IdleSweepLoop):
             # the busy skip above, the next tick looks again — up to a bound,
             # because the same answer also covers causes that never go away.
             self._unsure_now.add(thread_id)
-            self._unsure_this_tick += 1
+            if took >= _STALL_SECONDS:
+                self._unsure_this_tick += 1
             last_used = self._last_used.get(thread_id, "")
             counted_at, count = self._unsure_counts.get(thread_id, (last_used, 0))
             count = (count if counted_at == last_used else 0) + 1
