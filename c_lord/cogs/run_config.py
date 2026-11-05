@@ -157,6 +157,10 @@ class RunConfig:
     # #917: who started this turn, for the turn-end event (``CLORD_EVENT_LOG`` /
     # ``CLORD_EVENT_WEBHOOK_URL``). ``None`` ⇒ a user.
     started_by: StartedBy | None = None
+    # #1262: awaited the moment this turn's prompt reaches Claude's pane (the
+    # send or the start succeeded) — the pane answers the input it got last,
+    # so this is where a turn becomes "the latest". ``None`` ⇒ nothing to do.
+    on_prompt_sent: Callable[[], Awaitable[None]] | None = None
 
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is

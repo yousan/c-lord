@@ -4401,6 +4401,14 @@ class ClaudeChatCog(commands.Cog):
                 dashboard, thread.id, ThreadState.WAITING_INPUT, description, thread=thread
             )
 
+    def _prompt_sent_noter(self, thread_id: int, message_id: int) -> Callable[[], Awaitable[None]]:
+        """The ``on_prompt_sent`` hook of a message turn (#1262)."""
+
+        async def on_prompt_sent() -> None:
+            self.repo.note_trigger_sent(thread_id, message_id)
+
+        return on_prompt_sent
+
     async def _run_claude(
         self,
         user_message: discord.Message,
@@ -4750,11 +4758,11 @@ class ClaudeChatCog(commands.Cog):
                 # exists, not on a next naming pass that may never come.
                 on_session_saved=self.on_session_saved,
                 started_by=started_by,
+                # #1262: when this message's prompt is really in the pane, it is
+                # the turn the pane answers — a /skill sent before it no longer
+                # takes this trigger away, one sent after it does.
+                on_prompt_sent=self._prompt_sent_noter(thread.id, user_message.id),
             )
-            # #1262: this message's input is going to the pane now — a /skill
-            # sent after it is the newer turn and makes this trigger stop counting.
-            with contextlib.suppress(Exception):
-                self.repo.note_trigger_sent(thread.id, user_message.id)
             try:
                 await run_claude_with_config(run_config)
             finally:

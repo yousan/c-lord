@@ -646,6 +646,9 @@ async def _run_turn(config: RunConfig, ctx: str) -> str | None:
     _register_session(config)
 
     runner = config.runner
+    if config.on_prompt_sent is not None:
+        # #1262: the runner knows when the prompt is really in the pane.
+        runner.on_prompt_sent = config.on_prompt_sent
     processor = EventProcessor(config)
     run_errored = False
 

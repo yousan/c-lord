@@ -1,29 +1,34 @@
 """``/skill`` and a message turn racing for the trigger on record (#1262).
 
 A ``/skill`` run in an existing thread has no trigger message of its own, so it
-makes the previous turn's stop counting (#1234). #1252 did this by remembering
-what was on record when ``/skill`` started and forgetting only that. Three ways
-the wrong person was still pinged after a restart, or ``/skill``'s answer was
-posted as a reply to someone else's message:
+makes the earlier turns' stop counting (#1234). Claude's pane answers the input
+it got last, so which turn is "the latest" is decided by the order in which the
+prompts *reached the pane* — not by when a trigger was recorded, and not by when
+a cog called ``run_claude_with_config`` (the runner sends much later: after
+SYSTEM, the session save, the menu check). Ways the wrong person was pinged
+after a restart, or ``/skill``'s answer was posted as a reply to someone else:
 
 * A's message turn sets the trigger in memory, and its DB write is still
   running when ``/skill`` looks. ``/skill`` forgot only the old value on the
-  row, and A's write landed afterwards: after a restart A — who did not ask for
-  the ``/skill`` turn — was pinged.
-* A's message arrives while ``/skill`` prepares its workspace, and A's turn is
-  handed to Claude's pane *before* ``/skill``'s. ``/skill`` is the last turn, but
-  A's trigger stayed: ``/skill``'s answer replied to A and a restart pinged A.
-  (The control: A's turn handed over *after* ``/skill`` keeps A's trigger.)
-* The DB is locked when ``/skill`` clears the record: the clear failed and the
-  #1234 symptom came back.
+  row, and A's write landed afterwards: after a restart A was pinged.
+* A's message arrives while ``/skill`` prepares, and A's prompt reaches the pane
+  *before* ``/skill``'s. ``/skill`` is the last turn, but A's trigger stayed.
+* A's prompt reaches the pane *after* ``/skill``'s: A's is the last turn and must
+  keep its reply — a guess of "sent" made before the real send took it away.
+* The DB is locked when ``/skill`` clears the record: the #1234 symptom came back.
 
 Real SQLite, real ``SkillCommandCog._run_skill_impl``, real
-``ClaudeChatCog._run_claude``, real ``TranscriptMirrorCog``.
+``ClaudeChatCog._run_claude``, real ``TranscriptMirrorCog``. The fake runs call
+``RunConfig.on_prompt_sent`` where the real runner does: after the SYSTEM save,
+when the prompt is in the pane.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sqlite3
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -50,8 +55,20 @@ def _locked(db: str) -> sqlite3.Connection:
     return conn
 
 
-async def _chat_turn(repo: SessionRepository, mirror: TranscriptMirrorCog, mid: int) -> None:
-    """A's message turn through the real ClaudeChatCog._run_claude, to its end."""
+async def _chat_turn(
+    repo: SessionRepository,
+    mirror: TranscriptMirrorCog,
+    mid: int,
+    *,
+    before_send: Callable[[], Awaitable[None]] | None = None,
+    before_run: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """A's message turn through the real ClaudeChatCog._run_claude, to its end.
+
+    *before_run* runs when the trigger is recorded and the Stop notice is being
+    posted — before ``run_claude_with_config``. The run does what the runner
+    does, in its order: begin the turn, save at SYSTEM, then (after
+    *before_send*) the prompt reaches the pane."""
     cog = _make_chat_cog()
     cog.repo = repo
     cog.bot.transcript_mirror_cog = mirror
@@ -68,7 +85,14 @@ async def _chat_turn(repo: SessionRepository, mirror: TranscriptMirrorCog, mid: 
     thread = MagicMock(spec=discord.Thread)
     thread.id = 42
     thread.parent_id = 500
-    thread.send = AsyncMock(return_value=MagicMock())
+    notice = MagicMock()
+
+    async def send(*args, **kwargs) -> MagicMock:  # noqa: ANN002, ANN003
+        if before_run is not None:
+            await before_run()
+        return notice
+
+    thread.send = AsyncMock(side_effect=send)
     message = _chat_message()
     message.id = mid
     message.webhook_id = None
@@ -76,6 +100,11 @@ async def _chat_turn(repo: SessionRepository, mirror: TranscriptMirrorCog, mid: 
     async def run(config) -> None:  # noqa: ANN001
         turn_events.begin_turn(config.thread, config.started_by or turn_events.StartedBy("user"))
         await repo.save(42, "sess-1")
+        if before_send is not None:
+            await before_send()
+        # RunConfig.on_prompt_sent (#1262); absent before it existed.
+        if (sent := getattr(config, "on_prompt_sent", None)) is not None:
+            await sent()
 
     with patch("c_lord.cogs.claude_chat.run_claude_with_config", side_effect=run):
         await cog._run_claude(message, thread, "hi", None)
@@ -98,8 +127,9 @@ async def test_db_write_landing_after_the_skill_started_does_not_ping_a(
 ) -> None:  # noqa: ANN001
     """A's message comes just before /skill: claude_chat sets the memory (sync)
     then awaits the DB write; /skill looks at the record before that write
-    commits. The memory and the record must agree afterwards, and a restart must
-    not ping A unless A's trigger is still the one /skill's answer replies to."""
+    commits. A's prompt never reaches the pane before /skill's, so /skill is the
+    last turn: A is forgotten from memory and from the row, and a restart does
+    not ping A."""
     monkeypatch.delenv(turn_events.ENV_LOG, raising=False)
     monkeypatch.delenv(turn_events.ENV_URL, raising=False)
     repo, bot, channels, mirror = await _setup(tmp_path)
@@ -119,36 +149,12 @@ async def test_db_write_landing_after_the_skill_started_does_not_ping_a(
     finally:
         turn_events.reset()
     record = await repo.get(42)
-    assert record is not None
-    assert (mem is None) == (record.trigger_message_id is None), (mem, record.trigger_message_id)
-    assert not after.endswith(f"<@{A}>") or mem == 556, after
-
-
-async def test_trigger_seen_only_in_memory_when_the_skill_started_is_forgotten_everywhere(
-    tmp_path,
-) -> None:  # noqa: ANN001
-    """Same start as above, stricter: what /skill saw in memory when it started
-    is on record as far as /skill is concerned, so it is forgotten from the row
-    too once its write lands — not only from memory (#1262, W57's fix)."""
-    repo, _bot_, _ch, mirror = await _setup(tmp_path)
-    mirror.set_trigger_message(42, 556)
-
-    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
-        await repo.update_trigger_message(42, 556)
-        return True, "/sessions/999/42"
-
-    turn_events.reset()
-    try:
-        with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
-            await _skill_turn(repo, 42, S, mirror=mirror)
-    finally:
-        turn_events.reset()
-    record = await repo.get(42)
-    assert mirror.trigger_message(42) is None
+    assert mem is None, mem
     assert record is not None and record.trigger_message_id is None, record.trigger_message_id
+    assert after.endswith(f"<@{OWNER}>"), after
 
 
-async def test_a_turn_handed_to_claude_during_skill_prepare_does_not_own_the_answer(
+async def test_a_prompt_in_the_pane_before_skill_prepare_ends_does_not_own_the_answer(
     tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
     """S runs /skill; during its prepare A's message turn runs and ends (A's
@@ -179,23 +185,78 @@ async def test_a_turn_handed_to_claude_during_skill_prepare_does_not_own_the_ans
     assert not after.endswith(f"<@{A}>"), (after, record.trigger_message_id if record else None)
 
 
-async def test_a_turn_not_yet_handed_to_claude_keeps_its_reply(tmp_path) -> None:  # noqa: ANN001
-    """Control: A's message arrives during /skill's prepare and its turn has not
-    reached the pane yet, so it goes after /skill's and is the last one. A's
-    answer replies to A."""
+async def test_a_prompt_in_the_pane_after_skill_run_began_but_before_its_send(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    """A's message is recorded during /skill's prepare; /skill's run starts and
+    saves at SYSTEM; A's turn then runs and its prompt reaches the pane; only
+    then /skill's does. The pane answers /skill last — its answer is not a reply
+    to A, and A is not on the row."""
     repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    a_noted = asyncio.Event()
+    a_may_send = asyncio.Event()
+    a_sent = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def a_before_run() -> None:
+        a_noted.set()
+        await a_may_send.wait()
+
+    async def a_turn() -> None:
+        await _chat_turn(repo, mirror, 556, before_run=a_before_run)
+        a_sent.set()
 
     async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
-        mirror.set_trigger_message(42, 556)
-        await repo.update_trigger_message(42, 556)
+        tasks.append(asyncio.create_task(a_turn()))
+        await a_noted.wait()  # A's trigger is recorded, its prompt not sent yet
         return True, "/sessions/999/42"
+
+    async def skill_before_send() -> None:
+        a_may_send.set()
+        await a_sent.wait()  # A's prompt reaches the pane first
 
     turn_events.reset()
     try:
         with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
-            await _skill_turn(repo, 42, S, mirror=mirror)
+            await _skill_turn(repo, 42, S, mirror=mirror, before_send=skill_before_send)
+        await asyncio.gather(*tasks)
     finally:
         turn_events.reset()
+    ref = await mirror._build_trigger_reference(42)
+    record = await repo.get(42)
+    assert ref is None or ref.message_id != 556, f"S's answer replies to A's {ref.message_id}"
+    assert record is not None and record.trigger_message_id is None, record.trigger_message_id
+
+
+async def test_a_prompt_in_the_pane_after_skills_keeps_its_reply(tmp_path) -> None:  # noqa: ANN001
+    """Control, through the real "sent" path: A's message is recorded during
+    /skill's prepare, and A's prompt reaches the pane only after /skill's. A's
+    is the last turn: its answer replies to A, and A stays on the row."""
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    a_noted = asyncio.Event()
+    a_may_send = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def a_before_send() -> None:
+        a_noted.set()
+        await a_may_send.wait()
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        tasks.append(asyncio.create_task(_chat_turn(repo, mirror, 556, before_send=a_before_send)))
+        await a_noted.wait()
+        return True, "/sessions/999/42"
+
+    async def skill_after_send() -> None:
+        a_may_send.set()  # A's prompt goes in after /skill's
+        await asyncio.gather(*tasks)
+
+    turn_events.reset()
+    try:
+        with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+            await _skill_turn(repo, 42, S, mirror=mirror, after_send=skill_after_send)
+    finally:
+        turn_events.reset()
+    assert mirror.trigger_message(42) == 556
     ref = await mirror._build_trigger_reference(42)
     assert ref is not None and ref.message_id == 556
     record = await repo.get(42)
@@ -236,6 +297,48 @@ async def test_skill_turn_with_locked_db_does_not_ping_a_after_restart(
     assert not after.endswith(f"<@{P}>"), after
 
 
+async def test_a_clear_refused_by_a_locked_db_lands_with_the_next_save(tmp_path) -> None:  # noqa: ANN001
+    """The immediate clear fails (locked); the ids are kept and the thread's next
+    session save forgets them."""
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)
+    await repo.save(42, "sess-1")
+    conn = _locked(db)
+    try:
+        try:
+            await repo.clear_trigger_message(42, only={555})
+        except sqlite3.OperationalError:
+            pass
+        else:
+            raise AssertionError("the clear should have been refused")
+    finally:
+        conn.rollback()
+        conn.close()
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id == 555
+    await repo.save(42, "sess-1")
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id is None
+
+
+async def test_a_waiting_clear_never_wipes_a_newer_message(tmp_path) -> None:  # noqa: ANN001
+    """A clear waiting for the next save names exact ids: a newer message written
+    to the row in the meantime stays (so no separate "a newer write cancels the
+    waiting clear" rule is needed)."""
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)
+    await repo.save(42, "sess-1")
+    repo.clear_trigger_at_next_save(42, {555})
+    await repo.update_trigger_message(42, 556)
+    await repo.save(42, "sess-1")
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id == 556
+
+
 async def test_two_skills_back_to_back_leave_nothing_of_the_earlier_requester(
     tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
@@ -259,7 +362,7 @@ async def test_two_skills_back_to_back_leave_nothing_of_the_earlier_requester(
 async def test_pending_trigger_and_a_newer_row_during_prepare(tmp_path) -> None:  # noqa: ANN001
     """Guard: P's first-turn 555 is pending (no row) when /skill starts. During
     prepare P's turn reaches SYSTEM (row=555) and A's message 556 is recorded but
-    not handed to Claude yet. /skill forgets 555 only; A's 556 stays."""
+    not sent to the pane yet. /skill forgets 555 only; A's 556 stays."""
     db = str(tmp_path / "s.db")
     await init_db(db)
     repo = SessionRepository(db)
@@ -282,3 +385,124 @@ async def test_pending_trigger_and_a_newer_row_during_prepare(tmp_path) -> None:
     record = await repo.get(42)
     assert record is not None and record.trigger_message_id == 556
     assert repo.pending_trigger(42) is None
+
+
+# -- Where "sent" is decided: the runner, after the send succeeds -------------
+
+
+def _tmux(*, running: bool, send_ok: bool = True, calls: list[str] | None = None) -> MagicMock:
+    log = calls if calls is not None else []
+    mgr = MagicMock()
+    mgr.capture_pane.return_value = ""
+    mgr.is_claude_running.return_value = running
+    mgr.send_input.side_effect = lambda *a, **k: log.append("send_input") or send_ok
+    mgr.start_claude.side_effect = lambda *a, **k: log.append("start_claude") or True
+    mgr.input_box_holds.return_value = False
+    mgr.duplicate_window_names.return_value = []
+    mgr.session_name = "clord"
+    mgr._find_window_for_thread.return_value = "work1"
+    return mgr
+
+
+async def _until_hook_or_end(runner, calls: list[str]) -> list:  # noqa: ANN001
+    """Drive *runner* until its hook ran or it yielded a final event."""
+    from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+    assert isinstance(runner, TmuxClaudeRunner)
+    events: list = []
+    agen = runner.run("hi")
+
+    async def go() -> None:
+        async for event in agen:
+            events.append(event)
+            if event.is_complete:
+                return
+
+    task = asyncio.create_task(go())
+    for _ in range(200):
+        if "hook" in calls or task.done():
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+    await agen.aclose()
+    return events
+
+
+async def test_the_runner_reports_the_prompt_only_after_send_input_succeeded() -> None:
+    from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+    calls: list[str] = []
+    runner = TmuxClaudeRunner(_tmux(running=True, calls=calls), thread_id=42)
+
+    async def hook() -> None:
+        calls.append("hook")
+
+    runner.on_prompt_sent = hook
+    with patch.object(TmuxClaudeRunner, "peek_pending_ask", AsyncMock(return_value=None)):
+        await _until_hook_or_end(runner, calls)
+    assert calls[:2] == ["send_input", "hook"], calls
+
+
+async def test_the_runner_does_not_report_a_prompt_that_was_not_delivered() -> None:
+    from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+    calls: list[str] = []
+    runner = TmuxClaudeRunner(_tmux(running=True, send_ok=False, calls=calls), thread_id=42)
+
+    async def hook() -> None:
+        calls.append("hook")
+
+    runner.on_prompt_sent = hook
+    with patch.object(TmuxClaudeRunner, "peek_pending_ask", AsyncMock(return_value=None)):
+        events = await _until_hook_or_end(runner, calls)
+    assert "hook" not in calls, calls
+    assert events and events[-1].is_complete and events[-1].error
+
+
+async def test_the_runner_reports_the_prompt_of_a_cold_start() -> None:
+    from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+    calls: list[str] = []
+    runner = TmuxClaudeRunner(_tmux(running=False, calls=calls), thread_id=42)
+
+    async def hook() -> None:
+        calls.append("hook")
+
+    runner.on_prompt_sent = hook
+    with patch.object(TmuxClaudeRunner, "_handle_startup_prompts", AsyncMock()):
+        await _until_hook_or_end(runner, calls)
+    assert calls[:2] == ["start_claude", "hook"], calls
+
+
+async def test_run_claude_with_config_hands_on_prompt_sent_to_the_runner(monkeypatch) -> None:  # noqa: ANN001
+    from c_lord.claude.types import MessageType, StreamEvent
+    from c_lord.cogs import _run_helper
+    from tests.test_run_helper_paths import _config
+
+    for var in (turn_events.ENV_LOG, turn_events.ENV_URL, turn_events.ENV_SECRET):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(_run_helper, "_post_context_usage", AsyncMock())
+    _run_helper._IN_FLIGHT.clear()
+    calls: list[str] = []
+
+    async def hook() -> None:
+        calls.append("hook")
+
+    config = _config(on_prompt_sent=hook)
+    runner = config.runner
+
+    async def run(prompt: str, session_id: str | None = None):  # noqa: ANN202
+        yield StreamEvent(message_type=MessageType.SYSTEM, session_id="s1")
+        await runner.on_prompt_sent()
+        yield StreamEvent(message_type=MessageType.RESULT, is_complete=True)
+
+    runner.run = run
+    turn_events.reset()
+    try:
+        await _run_helper.run_claude_with_config(config)
+    finally:
+        turn_events.reset()
+        _run_helper._IN_FLIGHT.clear()
+    assert calls == ["hook"]

@@ -211,44 +211,53 @@ class SkillCommandCog(commands.Cog):
             choices.append(app_commands.Choice(name=label[:100], value=s["name"]))
         return choices
 
-    async def _forget_earlier_triggers(
+    def _earlier_triggers_forgetter(
         self, thread_id: int, mirror_cog: object, prior: set[int | None]
-    ) -> None:
+    ) -> Callable[[], Awaitable[None]]:
         """Make the earlier turns' trigger messages stop counting — #1234 / #1262.
 
-        A ``/skill`` turn has no trigger message, so the previous turn's must not
+        A ``/skill`` turn has no trigger message, so an earlier turn's must not
         stay on record — after a restart its author would be pinged for this
         turn, and the answer would be posted as a reply to them. Nothing on
         record → the owner (#1212).
 
-        Forgotten: what was on record when this ``/skill`` started (*prior*), and
-        the trigger of the last message turn already handed to Claude — the pane
-        answers whatever reached it last, and that is this ``/skill``. A message
-        recorded meanwhile whose turn has not been sent yet goes after this one
-        and keeps its trigger. Called right before the prompt is sent.
+        *prior* — what was on record (memory, row, pending) when this ``/skill``
+        started — is forgotten from the row with this turn's own SYSTEM save.
+        The rest is decided by the pane, which answers the input it got last:
+        the returned hook runs the moment the ``/skill`` prompt is really in the
+        pane (``RunConfig.on_prompt_sent``) and also forgets the trigger of a
+        message turn whose prompt got there first. A message turn whose prompt
+        arrives after this one is the newer turn and keeps its trigger.
         """
-        stale = {mid for mid in prior if isinstance(mid, int)}
-        sent = self.repo.sent_trigger(thread_id)
-        if isinstance(sent, int):
-            stale.add(sent)
-        if not stale:
-            return
-        seen_memory = getattr(mirror_cog, "trigger_message", None)
-        forget = getattr(mirror_cog, "forget_trigger_message", None)
-        current = seen_memory(thread_id) if callable(seen_memory) else None
-        if callable(forget) and current in stale:
-            forget(thread_id, only=current)
-        try:
-            await self.repo.clear_trigger_message(thread_id, only=stale)
-        except Exception:
-            # #1262: the repository keeps the clear and applies it with this
-            # turn's own session save, so a locked DB does not bring #1234 back.
-            logger.warning(
-                "%s /skill could not clear the recorded trigger message now; "
-                "it is applied with the next session save (#1262)",
-                log_ctx(thread_id=thread_id),
-                exc_info=True,
-            )
+        known = {mid for mid in prior if isinstance(mid, int)}
+        self.repo.clear_trigger_at_next_save(thread_id, known)
+
+        async def on_prompt_sent() -> None:
+            stale = set(known)
+            sent = self.repo.sent_trigger(thread_id)
+            if isinstance(sent, int):
+                stale.add(sent)
+            # This /skill is now what the pane answers.
+            self.repo.note_trigger_sent(thread_id, None)
+            seen_memory = getattr(mirror_cog, "trigger_message", None)
+            forget = getattr(mirror_cog, "forget_trigger_message", None)
+            current = seen_memory(thread_id) if callable(seen_memory) else None
+            if callable(forget) and current in stale:
+                forget(thread_id, only=current)
+            if not stale - known:
+                return
+            try:
+                await self.repo.clear_trigger_message(thread_id, only=stale - known)
+            except Exception:
+                # The repository keeps the ids for the next session save.
+                logger.warning(
+                    "%s /skill could not clear the recorded trigger message now; "
+                    "it is applied with the next session save (#1262)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+
+        return on_prompt_sent
 
     def _make_runner(
         self,
@@ -483,7 +492,7 @@ class SkillCommandCog(commands.Cog):
             # prepared — memory, row and pending (#1262: the memory too, since the
             # row may still be waiting for that message's write). These are
             # forgotten below; a message that arrives meanwhile keeps its trigger
-            # unless its turn reaches Claude before this one.
+            # unless its prompt reaches the pane before this one.
             mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
             seen_memory = getattr(mirror_cog, "trigger_message", None)
             prior = {
@@ -514,11 +523,10 @@ class SkillCommandCog(commands.Cog):
                 turn=turn,
                 try_continue=restarted and session_id is not None,
             )
+            # #1234 / #1262: the earlier turns' triggers stop counting.
+            on_prompt_sent = self._earlier_triggers_forgetter(channel.id, mirror_cog, prior)
             # #754: a /skill run is on 📊 Session Status while it runs.
             async with board_turn(dashboard_of(self.bot), channel.id, prompt):
-                # Right before the prompt goes to the pane: the pane answers the
-                # input that reached it last (#1262).
-                await self._forget_earlier_triggers(channel.id, mirror_cog, prior)
                 await run_claude_with_config(
                     RunConfig(
                         thread=channel,
@@ -537,6 +545,7 @@ class SkillCommandCog(commands.Cog):
                         # #480: ping the invoking user if a question-mode pause blocks the skill.
                         notify_user_id=user.id,
                         started_by=StartedBy("user", str(user.id)),
+                        on_prompt_sent=on_prompt_sent,
                     )
                 )
             return
