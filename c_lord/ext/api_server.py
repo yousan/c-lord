@@ -462,7 +462,7 @@ class ApiServer:
         await self._runner.setup()
         try:
             self.port = await self._bind()
-        except OSError:
+        except (OSError, OverflowError):  # OverflowError: a port past 65535 (#1237)
             await self._runner.cleanup()
             self._runner = None
             raise

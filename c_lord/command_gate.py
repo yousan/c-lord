@@ -54,13 +54,25 @@ NOT_AUTHORIZED = "You are not authorized to use this command."
 _Resolver = Callable[..., Awaitable[Any]]
 
 
+#: A Discord id is a 64-bit snowflake: at most 20 digits.
+_MAX_ID_DIGITS = 20
+
+
+def is_trusted_bot_id_text(text: str) -> bool:
+    """Whether one ``CLORD_TRUSTED_BOT_IDS`` entry (already stripped) is read as an id."""
+    # #1218: ASCII digits only, like every other ID (#1084). ``"²".isdigit()``
+    # is True but ``int("²")`` raises. #1237: and no longer than an id can be —
+    # ``int()`` of more than 4300 digits raises too.
+    return text.isascii() and text.isdigit() and len(text) <= _MAX_ID_DIGITS
+
+
 def _trusted_bot_ids() -> set[int]:
     """Bot ids allowed to drive c-lord like a human (``CLORD_TRUSTED_BOT_IDS``)."""
-    # #1218: ASCII digits only, like every other ID (#1084). ``"²".isdigit()``
-    # is True but ``int("²")`` raises — every bot message then raised, and the
-    # correctly listed bots were ignored too. ``load_config`` warns about the rest.
+    # Every bot message reads this: one raising entry made every bot message
+    # raise, and the correctly listed bots were ignored too (#1218 / #1237).
+    # ``load_config`` warns about the rest.
     parts = (x.strip() for x in os.getenv("CLORD_TRUSTED_BOT_IDS", "").split(","))
-    return {int(x) for x in parts if x.isascii() and x.isdigit()}
+    return {int(x) for x in parts if is_trusted_bot_id_text(x)}
 
 
 def is_message_authorized(
