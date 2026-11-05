@@ -123,3 +123,19 @@ async def test_what_this_process_remembers_still_wins(monkeypatch) -> None:  # n
         turn_events.reset()
     assert channel.send.call_args.args[0].endswith("<@888>")
     channel.fetch_message.assert_not_awaited()
+
+
+async def test_a_first_turns_trigger_is_on_record(tmp_path) -> None:  # noqa: ANN001
+    """Review of #1212: the turn-start write comes before the session row exists
+    (the row is made at the turn's SYSTEM event). The first turn's trigger must
+    still be recorded, or the common one-request thread pings the owner."""
+    from c_lord.database.models import init_db
+    from c_lord.database.repository import SessionRepository
+
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)  # turn start: no row yet
+    await repo.save(42, "sess-1")  # the SYSTEM event creates it
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id == 555

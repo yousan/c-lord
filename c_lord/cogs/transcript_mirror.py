@@ -607,7 +607,16 @@ class TranscriptMirrorCog(commands.Cog):
             elif started_by is None:
                 # #1212: this process has not run a turn here since it started —
                 # the last one's trigger message, on record, names who asked.
-                mention_id = await self._requester_on_record(thread_id, channel)
+                # Bounded: this runs inside the mirror's read loop (review).
+                try:
+                    mention_id = await asyncio.wait_for(
+                        self._requester_on_record(thread_id, channel), timeout=10.0
+                    )
+                except asyncio.TimeoutError:  # noqa: UP041 — not builtin on 3.10
+                    logger.info(
+                        "%s could not look up the requester in time — pinging the owner (#1212)",
+                        log_ctx(thread_id=thread_id),
+                    )
             if mention_id is None:
                 mention_id = owner_notify_id(bot, kind="failure")
             body = f"❌ Claude Code が API エラーで止まりました。{advice(error_text)}"
