@@ -227,3 +227,64 @@ async def test_failed_silent_post_reaches_the_thread_when_the_next_turn_starts(t
     assert replies == ["A", "B"], out.posted
     assert out.cursor == ["a1", "b1"]
     assert final_answer_needs_recovery(project, out.cursor[-1]) is None
+
+
+async def _owed_then_pane_bang(tmp_path: Path, *, next_person_turn: bool) -> tuple[_Run, Path]:
+    """A's post fails (A owed), then ``!ls`` typed in the pane and Claude's answer to it."""
+    project = tmp_path / "p"
+    run = _Run()
+    orig = run.sink
+
+    async def failing_sink(text: str):
+        if text == "A":
+            raise RuntimeError("discord 503")
+        return await orig(text)
+
+    run.sink = failing_sink  # type: ignore[method-assign]
+    import tests.transcript.test_answer_cursor_replay as mod
+
+    steps = [
+        (_user("依頼", "u0"), 0.05),
+        (_text("A", "a1"), 0.05),
+        (_tool("t1", "a2"), 0.05),
+        (_result("t1", "u1"), 0.05),
+        (END, 0.1),
+        # the pane's ``!ls`` — a harness record, not anyone's turn (#1013/#1052)
+        (_user("<bash-input>ls</bash-input>", "bi1"), 0.05),
+        (_user("<bash-stdout>a.txt</bash-stdout><bash-stderr></bash-stderr>", "bo1"), 0.05),
+        (_text("BANG", "bang1"), 0.05),
+        (dict(END, uuid="end-2"), 0.1),
+    ]
+    if next_person_turn:
+        steps.append((_user("次の依頼", "u3"), 0.1))
+    real_run = mod._Run
+    mod._Run = lambda: run  # type: ignore[assignment]
+    try:
+        out = await _replay(project, steps)
+    finally:
+        mod._Run = real_run  # type: ignore[assignment]
+    return out, project
+
+
+def _body_order(run: _Run) -> list[str]:
+    return [t.rsplit("\n", 1)[-1] for _, t in run.posted if t.rsplit("\n", 1)[-1] in ("A", "BANG")]
+
+
+async def test_owed_answer_is_not_committed_behind_a_later_pane_bang_answer(tmp_path, log):
+    """Review of #1224/#1225: A owed, ``!ls`` answered (cursor → bang1), then the next
+    person turn posted A and moved the cursor *back* to a1 — a restart before that
+    turn ended re-posted the ``!`` answer. A goes out before the later answer, and
+    the cursor only ever moves forward."""
+    run, project = await _owed_then_pane_bang(tmp_path, next_person_turn=True)
+    assert _body_order(run) == ["A", "BANG"], run.posted
+    assert run.cursor == ["a1", "bang1"], run.cursor
+    assert final_answer_needs_recovery(project, run.cursor[-1]) is None
+
+
+async def test_owed_answer_is_not_lost_behind_a_pane_bang_answer(tmp_path, log):
+    """Same, but the restart comes before any person turn: A was owed in memory only
+    and the cursor already sat past it — it never reached the thread."""
+    run, project = await _owed_then_pane_bang(tmp_path, next_person_turn=False)
+    assert _body_order(run) == ["A", "BANG"], run.posted
+    assert run.cursor == ["a1", "bang1"], run.cursor
+    assert final_answer_needs_recovery(project, run.cursor[-1]) is None

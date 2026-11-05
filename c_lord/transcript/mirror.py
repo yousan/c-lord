@@ -80,8 +80,8 @@ logger = logging.getLogger(__name__)
 # thread, carrying the count of the reports it stands for.
 _idle_unresolved_log = LogSampler(3600.0)
 
-#: Posts one message. The cog's returns the ``discord.Message`` it sent (#1125);
-#: anything else may return ``None``.
+#: Posts one message and returns the message it posted (the cog's: the
+#: ``discord.Message``, #1125). ``None`` means it did not post (#1225).
 Sink = Callable[[str], Awaitable[object]]
 # The final-answer sinks: ``(text)`` / ``(text, progress_path)``, plus a keyword
 # ``reply_to=<message id>`` passed only when the answer belongs to an earlier
@@ -1373,11 +1373,20 @@ class TranscriptMirror:
                 reply_tracker.record_reply_message(self.thread_id, cast(Any, silent[1]))
 
         async def _deliver_owed() -> None:
-            """#1224: post the turn before's answer nobody posted, then record it."""
+            """#1224: post the turn before's answer nobody posted, then record it.
+
+            Called before anything later is posted as an answer or committed (a
+            new turn, a reply flush, a pane-bridged text, a turn end): posted
+            after one, the thread reads out of order, and committed after one,
+            the cursor moves back and a restart re-posts that later answer.
+            """
             nonlocal _owed, _delivered_uuid
             owed, _owed = _owed, None
             if owed is None:
                 return
+            # Anything already marked delivered is later than the owed text —
+            # commit the owed one first, then keep that (the cursor only moves on).
+            later = _delivered_uuid
             logger.info(
                 "%s TranscriptMirror: posting the previous turn's answer, which never "
                 "reached the thread (#1224)",
@@ -1390,6 +1399,7 @@ class TranscriptMirror:
                 await self._try_sink(owed[1])
             _delivered_uuid = owed[0]
             await _commit_cursor()
+            _delivered_uuid = later
 
         async def _commit_cursor() -> None:
             nonlocal _delivered_uuid
@@ -1445,6 +1455,9 @@ class TranscriptMirror:
             nonlocal _pending_text, _pending_progress, _pending_uuid, _delivered_uuid, _last_silent
             if _pending_text is None:
                 return
+            # #1224: a turn before's answer nobody posted goes out ahead of this one
+            # — e.g. this is the answer to a ``!`` typed in the pane (no turn start).
+            await _deliver_owed()
             # #747: the answer is never folded, and it ends any loop before it.
             await self._fold.reset()
             # #912: a text written before a newer instruction was accepted answers
@@ -1675,6 +1688,10 @@ class TranscriptMirror:
                             await self._fold.reset()
                             # Turn boundary: flush pending as the final reply.
                             await _flush_pending_as_reply()
+                            # #1224: an older owed answer first (a ``!`` turn has
+                            # no start to deliver it), and before this turn's own
+                            # unposted text can take its place.
+                            await _deliver_owed()
                             _adopt_last_silent_as_answer()
                             await _commit_cursor()
                             # #399: disarm unconsumed pane-bridge entries — the
@@ -1916,6 +1933,7 @@ class TranscriptMirror:
                                     # The pane bridge already delivered this text, so
                                     # it counts as delivered for cursor purposes
                                     # (#215).
+                                    await _deliver_owed()  # #1224 (see _deliver_owed)
                                     _delivered_uuid = event.get("uuid") or _delivered_uuid
                                     _last_silent = None  # #1186 (see _flush_pending_as_reply)
                                     logger.info(
