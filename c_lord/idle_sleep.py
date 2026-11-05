@@ -299,13 +299,19 @@ class IdleSleepLoop(IdleSweepLoop):
 
         from .workspace_notice import WorkspaceReason
 
-        return bool(
-            await impl(
-                channel=channel,
-                reason=WorkspaceReason.IDLE,
-                idle_label=idle_label_for_hours(self._hours),
-            )
+        slept = await impl(
+            channel=channel,
+            reason=WorkspaceReason.IDLE,
+            idle_label=idle_label_for_hours(self._hours),
         )
+        if slept is False:
+            # #1228: ``False`` is "could not tell / could not kill" (a stalled
+            # tmux — #1192 / #1206), not "nothing to kill" (``None``). Marking it
+            # visited kept the idle window awake until a human spoke again; like
+            # the busy skip above, the next tick looks again.
+            self._busy.add(thread_id)
+            return False
+        return bool(slept)
 
     def _log_summary(self, acted: int) -> None:
         # Report the *output* side. A sweep that only counts its candidates
