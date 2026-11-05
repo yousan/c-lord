@@ -263,7 +263,10 @@ def _index_by_thread_id(
     by_tid: dict[int, dict[str, str]] = {}
     for w in windows:
         tid = w.get("thread_id") or ""
-        if tid.isdigit():
+        # #1255: ASCII digits only, like tmux.py (#1239). ``"²".isdigit()`` is
+        # True but ``int("²")`` raises — one such tag on the shared tmux server
+        # stopped the whole sync. Anything else is not a c-lord window.
+        if tid.isascii() and tid.isdigit():
             by_tid[int(tid)] = w
     return by_tid
 
@@ -689,7 +692,9 @@ class MenuWatchdogLoop:
         managed = await self._managed_session_names()
         for w in windows:
             tid = w.get("thread_id") or ""
-            if not tid.isdigit():
+            # #1255: ASCII digits only (#1239) — a ``²`` tag made int() raise
+            # and stopped the sweep for every window after it.
+            if not (tid.isascii() and tid.isdigit()):
                 continue
             thread_id = int(tid)
             session_name = w.get("session_name", "")
