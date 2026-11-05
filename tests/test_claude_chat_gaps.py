@@ -864,23 +864,68 @@ class TestGatewayGaps:
         assert await cog._threads_active_since(NOW) == [fresh]
 
     async def test_a_full_history_page_is_flagged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """#745: hitting the history cap is said in the log — it may have missed more."""
+        """#745: hitting the history cap is said in the log — it may have missed more.
+
+        #1248: the cap counts back from the present, so it is the oldest that were not read.
+        """
         cog = _make_cog()
         thread = _thread(9)
 
-        async def _history(**_kw: object):  # noqa: ANN202
-            for i in range(2):
+        async def _history(*, limit: int, **_kw: object):  # noqa: ANN202
+            for i in range(min(limit, 3)):
                 yield MagicMock(id=i)
 
         thread.history = _history
         cog._is_runnable_request = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        with patch(f"{MOD}.HISTORY_LIMIT", 2), caplog.at_level(logging.WARNING):
+        with patch(f"{MOD}.HISTORY_MAX", 2), caplog.at_level(logging.WARNING):
             got = await cog._pick_up_thread(
                 thread, _record(), since=NOW, down_at=NOW, back_at=NOW, cause="gateway"
             )
         assert got == 0
-        assert "read back only the first 2 messages" in caplog.text
+        assert "read back only the newest 2 messages" in caplog.text
         thread.send.assert_not_awaited()
+
+    async def test_exactly_the_cap_is_not_flagged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """#1248 review: a window holding exactly the cap lost nothing — no WARNING."""
+        cog = _make_cog()
+        thread = _thread(9)
+
+        async def _history(*, limit: int, **_kw: object):  # noqa: ANN202
+            for i in range(min(limit, 2)):
+                yield MagicMock(id=i)
+
+        thread.history = _history
+        cog._is_runnable_request = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        with patch(f"{MOD}.HISTORY_MAX", 2), caplog.at_level(logging.WARNING):
+            await cog._pick_up_thread(
+                thread, _record(), since=NOW, down_at=NOW, back_at=NOW, cause="gateway"
+            )
+        assert "read back only" not in caplog.text
+
+    async def test_past_the_cap_only_the_newest_are_considered(self) -> None:
+        """#1248 review: the one extra message fetched to detect a cut is not used."""
+        cog = _make_cog()
+        thread = _thread(9)
+        seen: list[int] = []
+
+        async def _history(*, limit: int, **_kw: object):  # noqa: ANN202
+            for i in reversed(range(3)):  # newest first, as Discord returns it
+                if limit <= 0:
+                    return
+                limit -= 1
+                yield MagicMock(id=i)
+
+        async def _runnable(m: MagicMock) -> bool:
+            seen.append(m.id)
+            return False
+
+        thread.history = _history
+        cog._is_runnable_request = _runnable  # type: ignore[method-assign]
+        with patch(f"{MOD}.HISTORY_MAX", 2):
+            await cog._pick_up_thread(
+                thread, _record(), since=NOW, down_at=NOW, back_at=NOW, cause="gateway"
+            )
+        assert seen == [1, 2]
 
 
 # ── thread reply path ─────────────────────────────────────────────────────

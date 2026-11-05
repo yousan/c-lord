@@ -68,7 +68,7 @@ from ..discord_ui.views import (
     TextAnsweredMenuView,
 )
 from ..gateway_backfill import (
-    HISTORY_LIMIT,
+    HISTORY_MAX,
     OUTAGE_SETTING,
     Cause,
     GatewayWatch,
@@ -3401,14 +3401,20 @@ class ClaudeChatCog(commands.Cog):
         bot, :func:`last_mark_before`) are missed.
         """
         ctx = log_ctx(thread_id=thread.id)
+        # #1248: newest first, paged, so the bound cuts the oldest end of the
+        # window and never the moment c-lord was away; then back in order. One
+        # past the bound is fetched to tell "exactly full" from "cut".
         history = [
-            m async for m in thread.history(limit=HISTORY_LIMIT, after=since, oldest_first=True)
+            m async for m in thread.history(limit=HISTORY_MAX + 1, after=since, oldest_first=False)
         ]
-        if len(history) >= HISTORY_LIMIT:
+        history.sort(key=lambda m: m.id)
+        if len(history) > HISTORY_MAX:
+            history = history[-HISTORY_MAX:]
             logger.warning(
-                "%s read back only the first %d messages posted since %s (#745)",
+                "%s read back only the newest %d messages posted since %s — older ones "
+                "were not read (#745/#1248)",
                 ctx,
-                HISTORY_LIMIT,
+                HISTORY_MAX,
                 _local_stamp(since),
             )
         requests = [m for m in history if await self._is_runnable_request(m)]
