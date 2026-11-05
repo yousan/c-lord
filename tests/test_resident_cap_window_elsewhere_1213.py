@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 import c_lord.tmux as T
 from c_lord.resident_cap import ResidentCapLoop
 from c_lord.tmux import PaneTurnStates
@@ -208,6 +210,12 @@ def _listing_with_a_foreign_pane(argv: list[str]) -> MagicMock:
     return MagicMock(returncode=0, stdout="", stderr="")  # our session: no window for 3
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="known limit (docs/specs/resident-cap.md): the count counts every owner, so "
+    "our own windows with an old @clord_owner are not missed (#503); a pane of another "
+    "c-lord carrying one of our thread ids needs two instances sharing a thread id",
+)
 async def test_foreign_window_elsewhere_holds_cap_above_limit_forever() -> None:
     """Limit 2, our residents 1 and 2, and 3's only pane belongs to another bot.
     Adapted from the review: the count is the real reader (no ``resident_fn``),
@@ -242,3 +250,99 @@ async def test_foreign_window_elsewhere_holds_cap_above_limit_forever() -> None:
             await loop.tick()
         assert T.resident_thread_ids() == {1, 2}
     assert calls == [], f"another bot's pane was counted as ours: tried {calls}"
+
+
+# --- review of 4d5c777: our own windows with an old owner must still count ---
+#
+# Panes survive a bot restart (#503) and a reused window is not re-tagged, so
+# after ``CLORD_INSTANCE_ID`` changes or the checkout moves, our own windows
+# still carry the old ``@clord_owner``. Counted owned-only, the cap saw 0
+# residents and the emergency brake slept nothing under memory pressure.
+
+OLD_OWNER = "/home/yousan/c-lord"
+
+
+def _old_owner_listing(argv: list[str]) -> MagicMock:
+    if argv[:2] == ["tmux", "-V"]:
+        return MagicMock(returncode=0, stdout="tmux 3.4", stderr="")
+    if argv[:3] == ["tmux", "list-panes", "-a"]:
+        own = any(T.OWNER_OPTION in a for a in argv)
+        out = "".join(
+            f"{i}\tclaude\t%{i}" + (f"\t{OLD_OWNER}" if own else "") + "\n" for i in (1, 2, 3)
+        )
+        return MagicMock(returncode=0, stdout=out, stderr="")
+    return MagicMock(returncode=0, stdout="", stderr="")
+
+
+def _old_owner_loop(mem: object) -> tuple[ResidentCapLoop, MagicMock]:
+    cog = MagicMock()
+    cog._sleep_workspace_impl = AsyncMock(return_value=True)
+    ch = {i: MagicMock(id=i, parent_id=10) for i in (1, 2, 3)}
+    loop = ResidentCapLoop(
+        _bot(cog=cog, channels=ch),
+        _repo([_rec(i, hours_ago=i) for i in range(1, 4)]),
+        limit=1,
+        in_flight_fn=set,
+        mem_fn=mem,
+        activity_fn=lambda r: None,
+    )
+    return loop, cog
+
+
+async def test_our_windows_with_an_old_owner_are_counted_by_the_cap() -> None:
+    loop, cog = _old_owner_loop(lambda: OK)
+    with (
+        patch("c_lord.tmux._run", side_effect=_old_owner_listing),
+        patch("c_lord.tmux.instance_owner", return_value="prod"),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        assert T.resident_thread_ids() == {1, 2, 3}
+        assert await loop.tick() == 2, "the cap saw none of our own old-owner windows"
+    assert cog._sleep_workspace_impl.await_count == 2
+
+
+async def test_our_windows_with_an_old_owner_are_seen_by_the_emergency_brake() -> None:
+    from tests.test_resident_cap_failure_paths import LOW
+
+    loop, cog = _old_owner_loop(lambda: LOW)
+    loop._limit = 10  # under the cap: only the brake can act
+    with (
+        patch("c_lord.tmux._run", side_effect=_old_owner_listing),
+        patch("c_lord.tmux.instance_owner", return_value="prod"),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        slept = 0
+        for _ in range(5):
+            slept += await loop.tick()
+    assert slept > 0, "the brake slept nothing under memory pressure"
+    assert cog._sleep_workspace_impl.await_count > 0
+
+
+def _own_session_old_owner(argv: list[str]) -> MagicMock:
+    """Our session lists thread 3's window (tagged @thread_id, old owner) and kills it."""
+    if argv[:2] == ["tmux", "-V"]:
+        return MagicMock(returncode=0, stdout="tmux 3.4", stderr="")
+    if argv[:2] == ["tmux", "list-windows"] and "-a" not in argv:
+        return MagicMock(returncode=0, stdout="@3\tw3\t3\t/tmp/x/3\n", stderr="")
+    if argv[:2] == ["tmux", "show-option"] or argv[:3] == ["tmux", "show-options", "-wqv"]:
+        return MagicMock(returncode=0, stdout="3\n", stderr="")
+    if argv[:2] == ["tmux", "kill-window"]:
+        return MagicMock(returncode=0, stdout="", stderr="")
+    if argv[:3] == ["tmux", "list-panes", "-a"]:
+        return MagicMock(returncode=0, stdout=f"3\tclaude\t%3\t{OLD_OWNER}\n", stderr="")
+    return MagicMock(returncode=0, stdout="", stderr="")
+
+
+async def test_our_old_owner_window_in_our_session_is_slept() -> None:
+    """The sleep looks the window up in the thread's own session, not by owner, so
+    an old-owner window of ours is killed (the count and the sleep cannot leave it
+    stuck as "counted but never sleepable")."""
+    mgr = _new_session_mgr()
+    cog = _real_impl_cog(mgr)
+    with (
+        patch("c_lord.tmux._run", side_effect=_own_session_old_owner) as run,
+        patch("c_lord.tmux.instance_owner", return_value="prod"),
+    ):
+        out = await cog._sleep_workspace_impl(channel=_thread3(), reason=MagicMock())
+    assert out is True
+    assert any(c.args[0][:2] == ["tmux", "kill-window"] for c in run.call_args_list)

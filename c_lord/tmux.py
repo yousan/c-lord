@@ -4255,19 +4255,21 @@ class TmuxNoAnswerError(RuntimeError):
 
 
 def resident_thread_ids() -> set[int]:
-    """Thread ids whose tmux pane is running Claude right now — this instance's (#576).
+    """Thread ids whose tmux pane is running Claude right now, host-wide (#576).
 
-    Read host-wide in one ``list-panes -a``, but only panes owned by this c-lord
-    (or by none — windows from before #790) count: prod and staging share one
-    tmux server, and the sleep's own host-wide check (:func:`is_resident_anywhere`)
-    already counts only ours. Counting another bot's pane for one of our thread
-    ids held the cap at limit+1 for good (whole-branch review of #1219).
+    Every owner counts. Panes survive a bot restart (#503) and a reused window is
+    not re-tagged, so after ``CLORD_INSTANCE_ID`` changes or the checkout moves,
+    our own windows still carry the old ``@clord_owner`` — counted owned-only,
+    the cap and the emergency brake saw none of them (review of #1219). The cost,
+    a known limit: another c-lord's pane carrying one of our thread ids is
+    counted (it needs two instances sharing a thread id; see
+    ``docs/specs/resident-cap.md``).
 
     Raises :class:`TmuxNoAnswerError` when ``list-panes`` (or ``tmux -V``) timed
     out: "nobody is resident" would be a guess (#1219 review). No tmux installed,
     or no server, is an answer — an empty set.
     """
-    panes = _claude_panes_listing(owned_only=True)
+    panes = _claude_panes_listing()
     if panes is None:
         raise TmuxNoAnswerError("tmux list-panes did not answer")
     return set(panes)
