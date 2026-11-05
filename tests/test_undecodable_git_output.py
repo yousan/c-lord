@@ -24,7 +24,7 @@ def test_non_utf8_remote_url_in_a_submodule_does_not_raise(tmp_path: Path) -> No
     ws, _ = _workspace(tmp_path)
     with (ws / ".git" / "modules" / "sub" / "config").open("ab") as f:
         f.write(b'[remote "x"]\n\turl = /nowhere/caf\xe9.git\n')
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
 

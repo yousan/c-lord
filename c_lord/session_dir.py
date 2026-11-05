@@ -34,7 +34,8 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+from urllib.parse import unquote
 
 from .attachments import ATTACHMENT_SUBDIR
 from .coauthor import install_coauthor_hook
@@ -499,8 +500,15 @@ def _remote_head_shas(path: str, skip: frozenset[str] = frozenset()) -> frozense
     return frozenset(shas)
 
 
-def _start_refs(path: str, inside: frozenset[str] = frozenset()) -> list[str] | None:
-    """HEAD and every local ref but tags and notes, by name. ``None``: git failed.
+def _start_refs(path: str, trusted: frozenset[str]) -> tuple[list[str], list[str]] | None:
+    """HEAD and every local ref but tags and notes, by name, and the tracking
+    refs that vouch. ``None``: git failed.
+
+    A tracking ref vouches only when it is of a remote in *trusted* (the longest
+    configured name it starts with — ``a/b`` before ``a``). Every other one is
+    local work like a branch: a remote that is no copy (third review of ef8f0fc,
+    #1265) and a ref of no configured remote at all (review of f870f5b: ``git
+    fetch <neighbour> 'refs/heads/*:refs/remotes/b/*'``).
 
     Not only branches (#1198): a commit held only by ``refs/original`` or
     another local ref was deleted with the workspace. Left out:
@@ -524,25 +532,28 @@ def _start_refs(path: str, inside: frozenset[str] = frozenset()) -> list[str] | 
     refs = _run(["git", "for-each-ref", "--format=%(refname)"], cwd=path)
     if refs.returncode != 0:
         return None
-    own = tuple(f"refs/remotes/{n}/" for n in inside)
-    tips = [
-        ref
-        for ref in refs.stdout.split()
-        # A remote inside the workspace is deleted with it: its refs are
-        # local work like branches (third review of ef8f0fc).
-        if (ref.startswith(own) if own else False)
-        or (
-            not ref.startswith(("refs/remotes/", "refs/tags/", "refs/notes/", _PROBE_NS))
-            and ref != "refs/stash"
-        )
-    ]
+    tips: list[str] = []
+    vouching: list[str] = []
+    for ref in refs.stdout.split():
+        if ref.startswith("refs/remotes/"):
+            (vouching if _tracking_remote(ref, trusted) else tips).append(ref)
+        elif not ref.startswith(("refs/tags/", "refs/notes/", _PROBE_NS)) and ref != "refs/stash":
+            tips.append(ref)
     # Only when present: an unborn HEAD would fail rev-list.
     found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
     if found.returncode not in (0, 1):
         return None
     if found.returncode == 0:
         tips.append("HEAD")
-    return tips
+    return tips, vouching
+
+
+def _tracking_remote(ref: str, names: frozenset[str]) -> str | None:
+    """The longest of *names* that ``refs/remotes/<name>/`` *ref* starts with."""
+    return next(
+        (n for n in sorted(names, key=len, reverse=True) if ref.startswith(f"refs/remotes/{n}/")),
+        None,
+    )
 
 
 def _stash_entries(path: str, *, git_dir: bool = False) -> int | None:
@@ -1025,12 +1036,10 @@ def _tag_only_note(repo: _Repo, ws_root: str, sessions_root: str | None) -> str 
     config = _remote_config(repo.path, pre)
     if config is None:
         return f"{repo.name}: unpushed commits unknown (git failed)"
+    no_copy = _no_copy_remotes(repo.path, pre, config, ws_root, sessions_root)
     asked: list[tuple[str, str]] = []
-    for name, url in sorted(config[0].items()):
-        local = _local_remote_path(repo.path, url)
-        if local is not None and (
-            sessions_root is None or _inside(local, ws_root) or _inside(local, sessions_root)
-        ):
+    for name, url in sorted(config.urls.items()):
+        if name in no_copy:
             continue  # may be deleted too: no copy
         asked.append((name, url))
     vouch: set[str] = set()
@@ -1078,29 +1087,85 @@ def _git_pre(path: str, git_dir: bool) -> list[str]:
     return ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
 
 
-def _remote_config(path: str, pre: list[str]) -> tuple[dict[str, str], bool] | None:
-    """Remote name → URL, and whether ref updates are logged, in one ``git config`` call.
+class _RemoteConfig(NamedTuple):
+    """What ``git config`` says about a repo's remotes (:func:`_remote_config`)."""
+
+    #: Remote name → its first ``url`` (what ``ls-remote`` is asked by).
+    urls: dict[str, str]
+    #: ``core.logAllRefUpdates`` is on.
+    logged: bool
+    #: Remote name → every ``url`` and ``pushurl`` as configured (#1265).
+    every: dict[str, list[str]]
+    #: Some ``url.<base>.insteadOf`` / ``pushInsteadOf`` may rewrite them (#1265).
+    rewrites: bool
+
+
+def _remote_config(path: str, pre: list[str]) -> _RemoteConfig | None:
+    """Remotes' URLs and push URLs, URL rewrites, and whether ref updates are
+    logged, in one ``git config`` call.
 
     ``core.logAllRefUpdates`` is on unless set to ``false`` (a module git dir is
     non-bare). ``None``: git failed.
     """
     result = _run(
-        [*pre, "config", "--get-regexp", r"^(remote\..*\.url|core\.logallrefupdates)$"],
+        [*pre, "config", "--get-regexp"]
+        + [
+            r"^(remote\..*\.(url|pushurl)|core\.logallrefupdates"
+            r"|url\..*\.(insteadof|pushinsteadof))$"
+        ],
         cwd=path,
     )
     if result.returncode == 1:
-        return {}, True  # neither set: no remote, default logging
+        return _RemoteConfig({}, True, {}, False)  # none set: no remote, default logging
     if result.returncode != 0:
         return None
     urls: dict[str, str] = {}
+    every: dict[str, list[str]] = {}
     logged = True
+    rewrites = False
     for line in result.stdout.splitlines():
         key, _, value = line.partition(" ")
         if key == "core.logallrefupdates":
             logged = value.strip().lower() not in ("false", "no", "off", "0")
-        elif key.startswith("remote.") and key.endswith(".url") and value:
-            urls.setdefault(key[len("remote.") : -len(".url")], value)
-    return urls, logged
+        elif key.startswith("url.") and key.endswith(("insteadof", "pushinsteadof")):
+            rewrites = True
+        elif key.startswith("remote.") and key.endswith((".url", ".pushurl")) and value:
+            name, _, var = key[len("remote.") :].rpartition(".")
+            every.setdefault(name, []).append(value)
+            if var == "url":
+                urls.setdefault(name, value)
+    return _RemoteConfig(urls, logged, every, rewrites)
+
+
+def _no_copy_remotes(
+    path: str, pre: list[str], config: _RemoteConfig, ws_root: str, sessions_root: str | None
+) -> frozenset[str]:
+    """The configured remotes that are no copy of anything (#1265, review of f870f5b).
+
+    A remote is no copy when **any** of its URLs or push URLs is
+    (:func:`_no_copy`): a push through a ``pushurl`` into another workspace
+    updates ``refs/remotes/<name>/*`` just as a fetch does. URLs are taken as
+    git uses them: when an ``insteadOf`` / ``pushInsteadOf`` rule exists, they
+    are asked from git (``git remote get-url --all`` and ``--push --all``) —
+    ``wsb:x`` looks like a network URL but may name a neighbour workspace. A
+    remote whose URLs git cannot tell is no copy either: if in doubt, keep.
+    """
+    out: set[str] = set()
+    for name, configured in config.every.items():
+        resolved: list[str] = []
+        if config.rewrites:
+            for push in ((), ("--push",)):
+                got = _run([*pre, "remote", "get-url", *push, "--all", "--", name], cwd=path)
+                if got.returncode != 0:
+                    resolved = []
+                    out.add(name)
+                    break
+                resolved += got.stdout.splitlines()
+        if name in out:
+            continue
+        if any(_no_copy(path, u, ws_root, sessions_root) for u in [*configured, *resolved]):
+            out.add(name)
+    return frozenset(out)
 
 
 def _local_remote_path(cwd: str, url: str) -> str | None:
@@ -1108,6 +1173,8 @@ def _local_remote_path(cwd: str, url: str) -> str | None:
     if url.startswith("file://"):
         rest = url[len("file://") :]
         url = rest[rest.index("/") :] if "/" in rest else rest  # file://host/path
+        # git decodes %xx in a file:// URL: ``s%65ssions`` is ``sessions`` (W57 round 16).
+        url = unquote(url)
     elif _NETWORK_URL_RE.match(url):
         return None
     return os.path.realpath(os.path.join(os.path.realpath(cwd), url))
@@ -1118,6 +1185,22 @@ def _inside(path: str | None, root: str) -> bool:
         return False
     real_root = os.path.realpath(root)
     return path == real_root or path.startswith(real_root.rstrip("/") + "/")
+
+
+def _no_copy(cwd: str, url: str, ws_root: str, sessions_root: str | None) -> bool:
+    """Is the remote at *url* no copy at all — it may be deleted with this workspace?
+
+    A local path inside *ws_root* is deleted with it; one under *sessions_root*
+    is another workspace, which the same sweep may delete (#1246 tags, #1265
+    branches: two workspaces that were each other's remote vouched for each
+    other's only copy, and one sweep deleted both). With *sessions_root*
+    unknown, no local path outside the workspace is trusted either — keep.
+    A network URL (ssh, https, ``host:path``) always may vouch.
+    """
+    local = _local_remote_path(cwd, url)
+    if local is None:
+        return False
+    return sessions_root is None or _inside(local, ws_root) or _inside(local, sessions_root)
 
 
 def _pushed_from_here(git_dir: Path, ref: str, logged: bool) -> bool:
@@ -1413,7 +1496,7 @@ def _on_other_remote_heads(
     return reached
 
 
-def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
+def _stale_tracking_note(repo: _Repo, ws_root: str, sessions_root: str | None = None) -> str | None:
     """Does a remote-tracking ref in *repo* vouch for commits the remote no longer has? (#1245)
 
     :func:`_local_only_commits` counts a commit as pushed when a local
@@ -1441,8 +1524,14 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
 
     A remote whose URL is a path inside *ws_root* is deleted with the
     workspace, so none of its refs vouch, pushed or fetched — as if there were
-    no remote (second review). A ref of no configured remote vouches only when
-    not pushed to from here.
+    no remote (second review). So is one under *sessions_root* — another
+    workspace, which the same sweep may delete (#1265: two workspaces that were
+    each other's remote vouched for each other's only copy) — and, with
+    *sessions_root* unknown, any local path (:func:`_no_copy`). Such a remote is
+    never asked nor probed — by any of its URLs or push URLs, as git rewrites
+    them (:func:`_no_copy_remotes`). A ref of no configured remote never
+    vouches (review of f870f5b: ``git fetch <neighbour> 'refs/heads/*:
+    refs/remotes/b/*'`` names no remote, and where it came from is unknown).
 
     Cost: one ``for-each-ref``, one ``config``, reflog file reads; one
     ``ls-remote`` per remote URL (cached) only for pushed-to refs; a
@@ -1465,9 +1554,12 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     config = _remote_config(repo.path, pre)
     if config is None:
         return f"{repo.name}: unpushed commits unknown (git failed)"
-    urls, logged = config
-    names = sorted(urls, key=len, reverse=True)  # ``a/b`` before ``a``
+    urls, logged = config.urls, config.logged
+    names = sorted(config.every, key=len, reverse=True)  # ``a/b`` before ``a``
     inside = {n for n, u in urls.items() if _inside(_local_remote_path(repo.path, u), ws_root)}
+    # #1265: a remote in another workspace (or any local one, root unknown) is no copy
+    # either — by any of its URLs or push URLs, as git rewrites them.
+    no_copy = _no_copy_remotes(repo.path, pre, config, ws_root, sessions_root)
     # Third review of ef8f0fc: a commit made here can reach a *fetched* ref (pushed by
     # URL or via another remote and fetched back, fast-forwarded upstream into
     # another branch), so the push reflog alone does not tell. The refs that
@@ -1479,18 +1571,23 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     vouch: set[str] = set()
     verify: list[tuple[str, str, str]] = []
     no_vouch = False
+    elsewhere = False  # a no-copy remote outside the workspace (#1265)
+    unconfigured = False
     for ref, sha in tracking:
         remote = next((n for n in names if ref.startswith(f"refs/remotes/{n}/")), None)
-        if remote in inside:
+        if remote is None or remote not in urls:
+            # Review of f870f5b: ``git fetch <path> 'refs/heads/*:refs/remotes/b/*'``
+            # leaves refs of no remote — where they came from is unknown: keep.
+            no_vouch = unconfigured = True
+        elif remote in no_copy:
             no_vouch = True
+            elsewhere = elsewhere or remote not in inside
         elif (
             created is not None
             and ref not in holding
             and not _pushed_from_here(repo.own_git_dir, ref, logged)
         ):
             vouch.add(sha)  # holds only what came from the remote (clone / fetch)
-        elif remote is None:
-            no_vouch = True
         else:
             verify.append((ref, sha, remote))
     if not no_vouch and not verify:
@@ -1585,6 +1682,11 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         return None
     if gone or moved:
         return f"{repo.name}: {n} unpushed commit(s) (remote branch deleted or rewritten)"
+    if unconfigured:
+        return f"{repo.name}: {n} unpushed commit(s) (only on refs of no configured remote)"
+    if elsewhere:
+        where = "under the sessions dir" if sessions_root else "at a local path"
+        return f"{repo.name}: {n} unpushed commit(s) (only on a remote {where})"
     return f"{repo.name}: {n} unpushed commit(s) (only on a remote inside the workspace)"
 
 
@@ -1596,9 +1698,9 @@ def _count_not_on(
     path: str,
     tips: list[str],
     also_on: frozenset[str] = frozenset(),
-    inside: frozenset[str] = frozenset(),
+    vouching: list[str] | tuple[str, ...] = (),
 ) -> int | None:
-    """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
+    """Commits reachable from *tips* but from none of the *vouching* tracking refs nor *also_on*.
 
     *also_on* are remote heads. A head whose commit is not in this clone is
     skipped: a branch pushed from here is present, and one that moved on since
@@ -1620,15 +1722,14 @@ def _count_not_on(
             for line in check.stdout.splitlines()
             if line.endswith(" commit")
         )
-    # Tips through stdin too (#1198: a worktree with thousands of refs
-    # overflowed argv); stdin revs are not flipped by the command line's --not.
+    # Tips and the refs subtracted through stdin (#1198: a worktree with
+    # thousands of refs overflowed argv). Only the *vouching* refs are
+    # subtracted, by name — not ``--remotes``: a ref of a remote that is no
+    # copy, or of no configured remote, subtracts nothing (#1265).
     result = _run(
-        ["git", "rev-list", "--count", "--not"]
-        # *inside*: remotes in the workspace subtract nothing (third review of ef8f0fc).
-        + [f"--exclude={_glob_escape(n)}/*" for n in sorted(inside)]
-        + ["--remotes", "--stdin"],
+        ["git", "rev-list", "--count", "--stdin"],
         cwd=path,
-        stdin="".join(f"{t}\n" for t in tips) + present,
+        stdin="".join(f"{t}\n" for t in tips) + "".join(f"^{v}\n" for v in vouching) + present,
     )
     if result.returncode != 0:
         return None
@@ -1639,7 +1740,7 @@ def _count_not_on(
 
 
 def _unpushed_commits(
-    path: str, *, ask_remote: bool, root: str | None = None
+    path: str, *, ask_remote: bool, root: str | None = None, sessions_root: str | None = None
 ) -> tuple[int | None, bool]:
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
@@ -1657,6 +1758,11 @@ def _unpushed_commits(
     heads — no guessing at squash merges. The second value is ``True`` when
     the remote could not be asked; the local count is returned then, so the
     dir is kept.
+
+    A remote that may be deleted too (:func:`_no_copy_remotes`: any URL or
+    push URL inside the workspace, under *sessions_root*, or any local path
+    when that is unknown — #1265) is treated as no remote: its tracking refs
+    are local work, it is not asked. So are the refs of no configured remote.
     """
     own = _own_git_dir(Path(path))
     extra = _worktree_tips(own) if own is not None else []
@@ -1667,21 +1773,23 @@ def _unpushed_commits(
         return None, False
     # Third review of ef8f0fc (b3): a remote whose URL is inside the workspace
     # (``build/backup.git``) is deleted with it — neither its tracking refs
-    # nor its ``ls-remote`` heads vouch for anything.
-    inside = frozenset(
-        n for n, u in config[0].items() if _inside(_local_remote_path(path, u), root or path)
-    )
-    start = _start_refs(path, inside)
+    # nor its ``ls-remote`` heads vouch for anything. #1265: nor one in another
+    # workspace, which the same sweep may delete — by any URL or push URL, as
+    # git rewrites them — nor a ref of no configured remote.
+    no_copy = _no_copy_remotes(path, ["git"], config, root or path, sessions_root)
+    trusted = frozenset(config.urls) - no_copy
+    start = _start_refs(path, trusted)
     if start is None:
         return None, False
-    tips = sorted(set(start) | set(extra))
-    local = _count_not_on(path, tips, inside=inside)
+    refs, vouching = start
+    tips = sorted(set(refs) | set(extra))
+    local = _count_not_on(path, tips, vouching=vouching)
     if not ask_remote or not local:
         return local, False
-    heads = _remote_head_shas(path, skip=inside)
+    heads = _remote_head_shas(path, skip=frozenset(config.every) - trusted)
     if heads is None:
         return local, True
-    return _count_not_on(path, tips, heads, inside=inside), False
+    return _count_not_on(path, tips, heads, vouching=vouching), False
 
 
 #: How far below an ignored directory a cloned repo is looked for (#1241):
@@ -1795,7 +1903,9 @@ def _ignored_repo_work(repo: Path, name: str, pushed: list[_Repo]) -> list[str]:
     return found
 
 
-def _is_clean_worktree(path: str, xy: str, rel: str, depth: int, root: str) -> bool:
+def _is_clean_worktree(
+    path: str, xy: str, rel: str, depth: int, root: str, sessions_root: str | None
+) -> bool:
     """Is this entry a Claude Code worktree with nothing uncommitted inside?
 
     The parent's ``git status`` shows a nested checkout as one line and never
@@ -1804,7 +1914,9 @@ def _is_clean_worktree(path: str, xy: str, rel: str, depth: int, root: str) -> b
     if xy != "??" or not _WORKTREE_ENTRY_RE.match(rel) or depth >= _MAX_WORKTREE_DEPTH:
         return False
     # *root*: "inside the workspace" is the outer workspace, not the worktree.
-    return worktree_status(str(Path(path) / rel), _depth=depth + 1, _root=root).clean
+    return worktree_status(
+        str(Path(path) / rel), sessions_root=sessions_root, _depth=depth + 1, _root=root
+    ).clean
 
 
 def worktree_status(
@@ -1828,7 +1940,8 @@ def worktree_status(
 
     *sessions_root* is where every workspace lives (``SessionDirManager``'s
     base dir): a remote there may be deleted in the same sweep, so it vouches
-    for no tag (#1246). ``None``: no local-path remote outside *path* does.
+    for no tag (#1246) and no branch (#1265). ``None``: no local-path remote
+    outside *path* does either.
     """
     try:
         return _worktree_status(
@@ -1878,7 +1991,9 @@ def _worktree_status(
         if "R" in xy or "C" in xy:
             next(fields, None)  # the source path of a rename/copy
         line = f"{xy} {rel}"
-        if _is_clord_change(xy, rel) or _is_clean_worktree(path, xy, rel, _depth, _root):
+        if _is_clord_change(xy, rel) or _is_clean_worktree(
+            path, xy, rel, _depth, _root, sessions_root
+        ):
             clord.append(line)
         elif xy == "!!" and (
             _is_regenerable(rel) or (rel.endswith("/") and not _ignored_dir_holds_work(path, rel))
@@ -1890,7 +2005,9 @@ def _worktree_status(
             user.append(line)
     stash = _stash_entries(path)
     # The network is asked only when nothing else keeps the dir (#903).
-    unpushed, unchecked = _unpushed_commits(path, ask_remote=not user and stash == 0, root=_root)
+    unpushed, unchecked = _unpushed_commits(
+        path, ask_remote=not user and stash == 0, root=_root, sessions_root=sessions_root
+    )
     pushed: list[_Repo] = []
     nested = _submodule_stashes(path, pushed=pushed)
     for i, rel in enumerate(ignored_dirs):
@@ -1909,7 +2026,7 @@ def _worktree_status(
         unasked = []
         for i, repo in enumerate(pushed):
             note = _tag_only_note(repo, _root, sessions_root) if repo.tag_only else None
-            note = note or _stale_tracking_note(repo, _root)
+            note = note or _stale_tracking_note(repo, _root, sessions_root)
             if note:
                 nested.append(note)
                 unasked = pushed[i + 1 :]
@@ -2055,15 +2172,27 @@ class SessionDirManager:
     Args:
         base_dir: Parent directory for all session dirs.
         source_repo: Git repository URL or local path to clone from.
+        sessions_root: Where every workspace lives, all channels' (the
+            ``session_dir_base`` the 30-day and orphan sweeps use). A remote
+            under it vouches for nothing: it is another workspace, which a
+            sweep may delete (#1246, #1265). Default: *base_dir*'s parent when
+            *base_dir* is a channel dir (``<root>/<channel_id>``, as
+            ``ChannelRepoCog`` builds it — review of f870f5b: a neighbour in
+            another channel vouched, and both were deleted), else *base_dir*.
     """
 
     def __init__(
         self,
         base_dir: str,
         source_repo: str,
+        sessions_root: str | None = None,
     ) -> None:
         self._base_dir = base_dir
         self._source_repo = source_repo
+        if sessions_root is None:
+            base = Path(base_dir)
+            sessions_root = str(base.parent) if base.name.isdigit() else base_dir
+        self._sessions_root = sessions_root
 
     @property
     def base_dir(self) -> str:
@@ -2072,6 +2201,11 @@ class SessionDirManager:
     @property
     def source_repo(self) -> str:
         return self._source_repo
+
+    @property
+    def sessions_root(self) -> str:
+        """Where every workspace lives, across channels (#1265)."""
+        return self._sessions_root
 
     def _mirror_for_clone(self) -> Path | None:
         """共有オブジェクトの置き場。用意できなければ ``None`` (#643).
@@ -2209,7 +2343,7 @@ class SessionDirManager:
                 if dot == "missing":
                     continue
                 commit = _get_commit(path)
-                status = worktree_status(path, sessions_root=self._base_dir)
+                status = worktree_status(path, sessions_root=self._sessions_root)
             except Exception as exc:  # noqa: BLE001 — one dir never stops the scan
                 logger.exception("Cannot inspect session dir %s", path)
                 results.append(
@@ -2304,7 +2438,7 @@ class SessionDirManager:
 
     def _try_remove(self, path: str, thread_id: int | None) -> CleanupResult:
         """Check cleanliness and remove the directory if safe."""
-        status = worktree_status(path, sessions_root=self._base_dir)
+        status = worktree_status(path, sessions_root=self._sessions_root)
         if not status.clean:
             # #1016: say what the work is — an unpushed commit or a ``.env``
             # shows nothing in ``git status``, so "uncommitted changes" misled.

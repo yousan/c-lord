@@ -19,6 +19,9 @@ import pytest
 from c_lord.database.repository import SessionRecord
 from c_lord.session_cleanup import DirOutcome, remove_clean_session_dir
 
+#: Never asked: the count is 0 once its tracking ref vouches.
+_ORIGIN = "https://example.invalid/repo.git"
+
 
 def _repo(path: Path, *, dirty: bool = False) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -29,6 +32,8 @@ def _repo(path: Path, *, dirty: bool = False) -> None:
     subprocess.run(["git", "add", "-A"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True)
     # #903: the commit is on origin, as in a real clone — else it is unpushed work.
+    # A configured origin (review of f870f5b: a ref of no remote vouches for nothing).
+    subprocess.run(["git", "remote", "add", "origin", _ORIGIN], cwd=path, check=True)
     subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=path, check=True)
     if dirty:
         (path / "uncommitted.txt").write_text("work in progress", encoding="utf-8")

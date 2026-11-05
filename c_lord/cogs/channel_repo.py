@@ -114,6 +114,7 @@ class ChannelRepoCog(commands.Cog):
                 manager = SessionDirManager(
                     base_dir=str(Path(base) / str(channel_id)),
                     source_repo=thread_binding["source_repo"],
+                    sessions_root=base,  # #1265: every channel's workspaces
                 )
                 self._thread_manager_cache[thread_id] = manager
                 return manager
@@ -130,6 +131,7 @@ class ChannelRepoCog(commands.Cog):
         manager = SessionDirManager(
             base_dir=str(Path(base) / str(channel_id)),
             source_repo=binding["source_repo"],
+            sessions_root=base,  # #1265: every channel's workspaces
         )
         self._manager_cache[channel_id] = manager
         return manager
