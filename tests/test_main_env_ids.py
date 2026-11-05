@@ -178,25 +178,50 @@ def test_a_non_ascii_digit_coordination_id_does_not_raise(tmp_path, monkeypatch,
     assert _api(tmp_path).lounge_channel_id is None
 
 
+# #1215: the test above only grepped setup_bridge's source for the call, so a
+# setup_bridge that read the env and then dropped the value (``bot.lounge_channel_id
+# = None``) passed every test — and the lounge silently posted nowhere.
+_NO_LOOPS = {
+    "CLORD_IDLE_STOP_DAYS": "0",
+    "CLORD_STOPPED_SWEEP": "0",
+    "CLORD_IDLE_SLEEP_HOURS": "0",
+    "CLORD_MAX_RESIDENT_WORKSPACES": "0",
+    "CLORD_ORPHAN_SWEEP_DAYS": "0",
+    "CLORD_MENU_WATCHDOG": "0",
+    "CLORD_THREAD_LAMP": "0",
+}
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(" 1505747831447883806 ", 1505747831447883806), ("²", None), ("１２３", None), ("", None)],
+    [(" 123 ", 123), ("²", None), ("１２３", None), ("", None)],
 )
-def test_setup_bridge_lounge_reads_the_coordination_id_the_same_way(
-    monkeypatch, value, expected
+async def test_setup_bridge_takes_the_lounge_channel_from_coordination_id(
+    tmp_path, monkeypatch, value, expected
 ) -> None:  # noqa: ANN001
-    """setup.py, api_server.py and claude_chat.py share one reading (review of #1194)."""
-    import inspect
+    """setup_bridge, called for real, puts COORDINATION_CHANNEL_ID on the bot (#1194/#1215)."""
+    from unittest.mock import AsyncMock, MagicMock
 
-    from c_lord import setup as setup_mod
-    from c_lord.coordination.env import coordination_channel_id_from_env
+    from c_lord.setup import setup_bridge
 
+    for key, off in _NO_LOOPS.items():
+        monkeypatch.setenv(key, off)
+    monkeypatch.setenv("SESSION_DIR_BASE", str(tmp_path / "sessions"))
+    monkeypatch.delenv("SESSION_SOURCE_REPO", raising=False)
     monkeypatch.setenv("COORDINATION_CHANNEL_ID", value)
-    assert coordination_channel_id_from_env() == expected
-    # setup_bridge hands that value on as the lounge channel (not just calls it).
-    assert "lounge_channel_id = coordination_channel_id_from_env()" in inspect.getsource(
-        setup_mod.setup_bridge
+    bot = MagicMock()
+    bot.add_cog = AsyncMock()
+    runner = MagicMock()
+    runner.clone.return_value = runner
+
+    await setup_bridge(
+        bot,
+        runner,
+        session_db_path=str(tmp_path / "db" / "sessions.db"),
+        enable_scheduler=False,
     )
+
+    assert bot.lounge_channel_id == expected
 
 
 def test_claude_chat_coordination_ignores_a_superscript_id(monkeypatch) -> None:  # noqa: ANN001

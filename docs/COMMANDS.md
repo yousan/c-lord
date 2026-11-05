@@ -541,7 +541,7 @@ user never needs a header. Anything else gets `403`.
 | `DELETE` | `/api/tasks/{id}` | Remove a scheduled task |
 | `POST` | `/api/spawn` | Create a new thread and start Claude Code |
 | `POST` | `/api/threads/{thread_id}/messages` | Post a message to a Discord thread |
-| `POST` | `/api/threads/{thread_id}/sleep` | Put the thread's workspace to sleep — the same sleep as the 4-hour idle one (#572): the Claude window closes and the next message resumes it without a word. Returns `{"status": "slept"}` or `"not_resident"` (no window). `scripts/staging.sh release` uses it (#955) |
+| `POST` | `/api/threads/{thread_id}/sleep` | Put the thread's workspace to sleep — the same sleep as the 4-hour idle one (#572): the Claude window closes and the next message resumes it without a word. Returns `{"status": "slept"}` or `"not_resident"` (no window), both 200. When the window could not be closed and may still be there (the kill failed, or tmux did not answer) it returns **503** `{"status": "failed"}` — never `not_resident` (#1214). A kill that reported failure but was carried out (tmux then answers the window is gone) is `slept`. A window the bot's sleep cannot reach — its Claude runs in another tmux session of this bot (the thread's binding changed and the window has not moved yet), no tmux manager, or a channel that is not a thread — is `not_resident`, as before #1214, so release closes that pane by id. `scripts/staging.sh release` uses it (#955): `failed` / 5xx is "the bot knows the window and could not sleep it", so release leaves the window alone and lists it |
 | `POST` | `/api/mark-resume` | Mark a thread for resumption after restart |
 | `GET` | `/api/lounge` | List recent AI Lounge messages. Sessions are not told the lounge exists, so nothing posts here unless you set that up (#758) |
 | `POST` | `/api/lounge` | Post a message to the AI Lounge. No c-lord component calls this today — the lounge context is not delivered to sessions (#758) |
@@ -615,7 +615,10 @@ JSON strings. A number, `true`, a list or an object is a `400 {"error": "<field>
 and nothing is saved or posted (#1208 — before, it was accepted and saved through `str()`, so a
 task's `prompt: ["x"]` ran as the instruction `['x']`). Absent or `null` is the same as leaving the
 field out (`label` falls back to `AI`, `source` to `cli`, `reason` to `self_restart`; a `PATCH` with
-`"prompt": null` does not touch the prompt). The same holds for each choice's `label` / `description`
+`"prompt": null` does not touch the prompt). An empty `prompt` is a `400 {"error": "prompt is
+required"}` on `PATCH` as on `POST`, and the saved prompt stays as it was (#1229 — before, `PATCH`
+saved `""` with a 200 and every run after that sent Claude an empty instruction). `name` cannot be
+changed with `PATCH`. The same holds for each choice's `label` / `description`
 on `/api/prompt-choice` (`choices[0].label must be a string`; a `null` label is "label is required").
 
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,

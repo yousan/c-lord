@@ -44,9 +44,15 @@ from .resolver import CLAIM_GRACE_SECONDS, ThreadSessionResolver
 
 logger = logging.getLogger(__name__)
 
+_UNSET = object()
+
 #: #1102: a read that keeps failing (a permission flipped, a dying disk) is on
 #: record in full once per transcript directory an hour, not once per poll.
 _POLL_FAILURE_LOG = LogSampler(3600.0)
+#: #1188: a transcript that cannot be stat'ed / opened, on the same terms. #1216:
+#: its own sampler — sharing the one above let either line keep the other out of
+#: the log for an hour, and they are two different reasons a thread goes quiet.
+_READ_ERROR_LOG = LogSampler(3600.0)
 
 # How long the resolver may come back empty before the reader is told (#773).
 #
@@ -80,6 +86,7 @@ StartCb = Callable[[Path | None, int], Awaitable[None]]
 #: ``True`` once there is a transcript to read (or one c-lord named and Claude is
 #: about to write), ``False`` while there is none (#1190). Called on each change.
 ResolvedCb = Callable[[bool], None]
+PendingClaimCb = Callable[[str | None], None]
 
 # Read the seeding baseline in bounded slices instead of one ``read(offset)``:
 # a production transcript reaches ~100 MB and the seeding of every session now
@@ -460,6 +467,23 @@ def _poll_once(state: _FollowState) -> list[dict[str, Any]]:
     return events
 
 
+def _pending_claim(state: _FollowState, project_dir: Path) -> str | None:
+    """The named transcript that has not appeared yet, as ``<id>@<mtime>`` (#1223).
+
+    ``None`` once the tail reads a transcript, or with no name. The key changes
+    whenever the claim is written again, so the bus can grant each name its one
+    first turn.
+    """
+    session_id = state.resolver.claimed_session_id
+    if state.resolved or session_id is None:
+        return None
+    try:
+        written = claim_path(project_dir).stat().st_mtime_ns
+    except OSError:
+        return None
+    return f"{session_id}@{written}"
+
+
 def _claim_still_young(resolver: ThreadSessionResolver, project_dir: Path) -> bool:
     """A transcript c-lord named that may still be about to appear (#1190).
 
@@ -487,6 +511,7 @@ async def tail_events(
     unresolved_after: float = UNRESOLVED_NOTICE_SECONDS,
     on_start: StartCb | None = None,
     on_resolved: ResolvedCb | None = None,
+    on_pending_claim: PendingClaimCb | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Yield JSONL events as they appear under ``project_dir``.
 
@@ -518,6 +543,12 @@ async def tail_events(
         tail has a transcript to follow (#1190): one it resolved, or the one
         c-lord named in ``.clord-session`` that Claude writes with its first
         prompt. Synchronous; an exception is logged, never raised.
+    on_pending_claim
+        Called after the first poll and whenever it changes, with the key of a
+        named transcript that has not appeared yet, or ``None`` (#1223). A wake
+        names it long before the first instruction makes Claude write it, so the
+        caller counts that instruction's grace from when it is sent. Synchronous;
+        an exception is logged, never raised.
     """
     # Issue #433: events already yielded (or present at start) must not be
     # re-emitted when the read offset is reset to 0 (truncation / in-place
@@ -534,6 +565,8 @@ async def tail_events(
     unresolved_since: float | None = None
     # What on_resolved last heard (#1190); None until the first poll.
     reported_found: bool | None = None
+    # What on_pending_claim last heard (#1223); the sentinel forces the first call.
+    reported_pending: str | None | object = _UNSET
 
     while True:
         # The whole cycle — glob, stat, read, parse — in one worker-thread hop.
@@ -558,8 +591,9 @@ async def tail_events(
             state.more_to_read = False
         if state.read_error is not None:
             # #1188: _poll_once kept going, but the thread hears nothing while
-            # this lasts. Same sampler as above: once per directory an hour.
-            sample = _POLL_FAILURE_LOG.sample(str(project_dir))
+            # this lasts. Once per directory an hour, sampled apart from the
+            # poll exception above (#1216).
+            sample = _READ_ERROR_LOG.sample(str(project_dir))
             if sample.emit:
                 logger.error(
                     "tail_events: cannot read the transcript (%s: %s) — this thread gets no "
@@ -578,6 +612,18 @@ async def tail_events(
                 logger.warning(
                     "tail_events: resolved callback failed for %s", project_dir, exc_info=True
                 )
+        if on_pending_claim is not None:
+            pending = _pending_claim(state, project_dir)
+            if pending != reported_pending:
+                reported_pending = pending
+                try:
+                    on_pending_claim(pending)
+                except Exception:
+                    logger.warning(
+                        "tail_events: pending-claim callback failed for %s",
+                        project_dir,
+                        exc_info=True,
+                    )
 
         for event in events:
             yield event

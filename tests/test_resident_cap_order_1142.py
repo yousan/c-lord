@@ -148,7 +148,10 @@ async def test_a_window_that_vanished_on_its_own_is_not_made_up_for_1094() -> No
 
 @pytest.mark.asyncio
 async def test_a_sleep_that_really_failed_is_still_made_up_for_1094() -> None:
-    """窓が残ったまま失敗した (Discord エラー等) 候補は、従来どおり次の候補で補う。"""
+    """窓が残ったまま失敗した (Discord エラー等) 候補は、次の候補で補う。
+
+    #1219 (2026-11-05) から、補うのは同じ tick ではなく次の tick（失敗も1回の試み
+    に数え、1回の tick で超過分を超えて眠らせない）。失敗した 4 は最後に回る。"""
     live = {1, 2, 3, 4}
 
     async def impl(*, channel: object, reason: object, idle_label: object) -> bool:
@@ -168,6 +171,8 @@ async def test_a_sleep_that_really_failed_is_still_made_up_for_1094() -> None:
         mem_fn=lambda: OK,
     )
     with patch("c_lord.tmux.pane_turn_states", return_value=_NO_PANE_EVIDENCE):
+        await loop.tick()
+        assert live == {1, 2, 4}
         await loop.tick()
     assert live == {1, 4}
 

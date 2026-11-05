@@ -154,6 +154,19 @@ class IdleSweepLoop:
     def _mark_visited(self, record: SessionRecord) -> None:
         """Called once *record* has been visited without raising."""
 
+    def _spent_budget(self, thread_id: int, changed: bool) -> bool:
+        """Whether this visit counts against ``max_per_tick``.
+
+        By default only a workspace that changed does (#593). A subclass whose
+        failed attempts are expensive (a stalled tmux timing out — #1228) counts
+        those too, so a stall costs at most ``max_per_tick`` attempts per tick.
+        """
+        return changed
+
+    def _tick_exhausted(self) -> bool:
+        """Stop this tick before the next candidate (a subclass's own cap — #1228)."""
+        return False
+
     def _threshold_label(self) -> str:
         return str(self._threshold)
 
@@ -280,8 +293,9 @@ class IdleSweepLoop:
             )
 
         acted = 0
+        spent = 0
         for thread_id in due:
-            if acted >= self._max_per_tick:
+            if spent >= self._max_per_tick or self._tick_exhausted():
                 break
             # Count against the cap only once a workspace actually changed, and
             # keep walking past the ones that cannot be reached. Slicing the
@@ -298,6 +312,8 @@ class IdleSweepLoop:
             self._mark_visited(by_id[thread_id])
             if changed:
                 acted += 1
+            if self._spent_budget(thread_id, changed):
+                spent += 1
 
         if acted:
             self._log_summary(acted)
