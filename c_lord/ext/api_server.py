@@ -244,12 +244,9 @@ _INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff"
 
 def _is_blank(text: str | None) -> bool:
     """True when *text* has nothing visible — whitespace and invisible marks only."""
-    rest = text or ""
-    while True:
-        stripped = rest.strip().strip(_INVISIBLE)
-        if stripped == rest:
-            return not rest
-        rest = stripped
+    # One pass — peeling whitespace and marks in turn was quadratic on input
+    # like " \u200b" * n and blocked the event loop.
+    return all(c.isspace() or c in _INVISIBLE for c in text or "")
 
 
 def _text(data: dict[str, Any], field: str) -> tuple[str | None, web.Response | None]:

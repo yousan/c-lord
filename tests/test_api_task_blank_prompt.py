@@ -64,3 +64,16 @@ async def test_invisible_only_prompt_is_blank(env, value):  # type: ignore[no-un
     assert r.status == 400
     r = await c.patch(f"/api/tasks/{tid}", json={"prompt": value})
     assert r.status == 400 and (await tr.get(tid))["prompt"] == "original"
+
+
+def test_is_blank_is_linear() -> None:
+    """#1238 (review): peeling one layer per pass was quadratic — ``" \\u200b" * n``
+    of about 500k chars blocked the event loop for seconds on one request."""
+    import time
+
+    from c_lord.ext.api_server import _is_blank
+
+    start = time.perf_counter()
+    assert _is_blank(" ​" * 300_000)
+    assert not _is_blank(" ​" * 300_000 + "x")
+    assert time.perf_counter() - start < 1.0
