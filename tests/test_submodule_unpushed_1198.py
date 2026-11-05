@@ -18,6 +18,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from c_lord import session_dir as sd
 from c_lord.session_dir import describe_changes, worktree_status
 
@@ -427,3 +429,132 @@ def test_detached_commit_in_linked_worktree_of_submodule_is_kept(tmp_path: Path)
     assert git(ws, "status", "--porcelain").strip() == ""
     _assert_kept(ws, subr, sha)
     assert "sub: 1 unpushed commit(s)" in describe_changes(worktree_status(str(ws)))
+
+
+# ---- review of 7f2dd2b: every local ref, per-worktree refs, unreadable = unknown ----
+
+
+def _wt_detached_commit(ws: Path, tmp: Path, repo: Path | None = None) -> tuple[Path, str]:
+    wt = tmp / "elsewhere" / "wt"
+    git(repo or ws / "sub", "worktree", "add", "-q", "--detach", str(wt))
+    (wt / "wt.txt").write_text("x\n")
+    git(wt, "add", "wt.txt")
+    git(wt, "commit", "-qm", "wt work")
+    return wt, git(wt, "rev-parse", "HEAD").strip()
+
+
+def _wt_meta(ws: Path) -> Path:
+    (d,) = list((ws / ".git" / "modules" / "sub" / "worktrees").iterdir())
+    return d
+
+
+@pytest.mark.parametrize("ref", ["refs/worktree/keep", "refs/bisect/bad"])
+def test_per_worktree_ref_in_linked_worktree_is_kept(tmp_path: Path, ref: str) -> None:
+    """A commit held only by a per-worktree ref (``<gitdir>/worktrees/*/refs``):
+    ``rev-list --all`` does not see other worktrees' refs on git 2.43."""
+    ws, subr = _workspace(tmp_path)
+    wt, sha = _wt_detached_commit(ws, tmp_path)
+    git(wt, "update-ref", ref, sha)
+    git(wt, "checkout", "-q", "--detach", "HEAD~1")
+    _assert_kept(ws, subr, sha)
+
+
+def test_custom_ref_in_submodule_is_kept(tmp_path: Path) -> None:
+    """``refs/keep/*`` (or notes, ``refs/original``): no branch, but the commit is work."""
+    ws, subr = _workspace(tmp_path)
+    recorded = git(ws / "sub", "rev-parse", "HEAD").strip()
+    sha = _commit_in_sub(ws, branch=None)
+    git(ws / "sub", "update-ref", "refs/keep/x", sha)
+    git(ws / "sub", "checkout", "-q", recorded)
+    git(ws, "submodule", "deinit", "-q", "-f", "sub")
+    _assert_kept(ws, subr, sha)
+
+
+def test_garbage_worktree_head_is_unknown(tmp_path: Path) -> None:
+    ws, subr = _workspace(tmp_path)
+    _, sha = _wt_detached_commit(ws, tmp_path)
+    (_wt_meta(ws) / "HEAD").write_text("garbage\n")
+    _assert_kept(ws, subr, sha)
+    assert "sub: unpushed commits unknown" in describe_changes(worktree_status(str(ws)))
+
+
+def test_crlf_worktree_head_is_read(tmp_path: Path) -> None:
+    ws, subr = _workspace(tmp_path)
+    _, sha = _wt_detached_commit(ws, tmp_path)
+    (_wt_meta(ws) / "HEAD").write_text(sha + "\r\n")
+    _assert_kept(ws, subr, sha)
+
+
+def test_unreadable_worktree_head_is_unknown(tmp_path: Path) -> None:
+    ws, subr = _workspace(tmp_path)
+    _, sha = _wt_detached_commit(ws, tmp_path)
+    head = _wt_meta(ws) / "HEAD"
+    head.chmod(0)
+    try:
+        _assert_kept(ws, subr, sha)
+        why = describe_changes(worktree_status(str(ws)))
+        assert "sub: unpushed commits unknown (worktree HEAD unreadable)" in why
+    finally:
+        if head.exists():
+            head.chmod(0o644)
+
+
+def test_unlistable_worktrees_dir_is_unknown(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    _wt_detached_commit(ws, tmp_path)
+    d = ws / ".git" / "modules" / "sub" / "worktrees"
+    d.chmod(0o300)  # writable+exec but not listable
+    try:
+        why = describe_changes(worktree_status(str(ws)))
+        assert "sub: unpushed commits unknown (worktree HEAD unreadable)" in why
+        assert not _delete(ws).removed
+    finally:
+        if d.exists():
+            d.chmod(0o755)
+
+
+def test_workspace_own_detached_linked_worktree_is_kept(tmp_path: Path) -> None:
+    """The workspace's own ``git worktree add --detach``: its commit is only in ws/.git."""
+    ws, _ = _workspace(tmp_path)
+    _, sha = _wt_detached_commit(ws, tmp_path, repo=ws)
+    st = worktree_status(str(ws))
+    r = _delete(ws)
+    assert ws.exists(), f"removed={r.removed} reason={r.reason!r} why={describe_changes(st)!r}"
+    assert "1 unpushed commit(s)" in r.reason
+
+
+# Controls: nothing to lose stays deletable.
+
+
+def test_pushed_submodule_with_detached_worktree_is_clean(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    git(ws / "sub", "worktree", "add", "-q", "--detach", str(tmp_path / "elsewhere" / "wt"))
+    assert worktree_status(str(ws)).clean, describe_changes(worktree_status(str(ws)))
+    git(ws, "submodule", "deinit", "-q", "-f", "sub")
+    assert _delete(ws).removed
+
+
+def test_worktree_head_naming_a_missing_object_is_clean(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    git(ws / "sub", "worktree", "add", "-q", "--detach", str(tmp_path / "elsewhere" / "wt"))
+    (_wt_meta(ws) / "HEAD").write_text("1" * 40 + "\n")
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
+
+
+def test_fetched_tag_on_a_pushed_commit_is_clean(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    seed = tmp_path / "subremote-seed"
+    git(seed, "tag", "v0")
+    git(seed, "push", "-q", "origin", "v0")
+    git(ws / "sub", "fetch", "-q", "--tags")
+    git(ws / "sub", "checkout", "-q", "v0")
+    git(ws, "submodule", "deinit", "-q", "-f", "sub")
+    assert _delete(ws).removed, describe_changes(worktree_status(str(ws)))
+
+
+def test_corrupt_module_git_dir_is_kept(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    git(ws, "submodule", "deinit", "-q", "-f", "sub")
+    (ws / ".git" / "modules" / "sub" / "HEAD").write_text("garbage\n")
+    assert not _delete(ws).removed

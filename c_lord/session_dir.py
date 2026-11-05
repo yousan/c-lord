@@ -435,7 +435,7 @@ def _checked_out_submodule_stashes(
             found.append(note)
         # #1198: the parent's status says nothing about commits that are on a
         # branch HEAD left, or that the parent recorded and pushed.
-        own_git_dir = linked if linked is not None else sub / ".git"
+        own_git_dir = linked if linked is not None else sub / ".git"  # .git exists here
         note = _unpushed_note(name, _local_only_commits(str(sub), own_git_dir))
         if note:
             found.append(note)
@@ -485,63 +485,106 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
     return found
 
 
-def _worktree_heads(git_dir: Path) -> list[str]:
-    """Detached HEADs of the linked worktrees of *git_dir* (``worktrees/*/HEAD``).
+#: Why a submodule's commits could not be counted (#1198).
+_WORKTREE_UNREADABLE = "worktree HEAD unreadable"
 
-    A commit made in ``git worktree add --detach`` lives in this git dir and is
-    on no branch; only that file points at it (#1198). A worktree on a branch
-    is already counted through ``--branches``. A plain file read, no git call.
+
+def _worktree_tips(git_dir: Path) -> list[str] | None:
+    """Commits the linked worktrees of *git_dir* hold: detached HEADs and per-worktree refs.
+
+    ``git worktree add --detach`` keeps its HEAD in ``worktrees/<name>/HEAD``,
+    and ``refs/worktree/*`` / ``refs/bisect/*`` made there in
+    ``worktrees/<name>/refs/`` — a ``rev-list --all`` run elsewhere does not
+    see those refs (git 2.43), and the commits may be on nothing else (#1198).
+    Plain file reads, no git call. A symbolic ``ref: …`` is skipped: its target
+    is a shared ref (``--all``) or one of the files read here.
+
+    ``None`` when anything cannot be read or is no object name — unknown is
+    work, never "nothing to lose". No ``worktrees/`` at all is ``[]``.
     """
-    heads: list[str] = []
     try:
-        entries = sorted((git_dir / "worktrees").iterdir())
+        entries = sorted(p for p in (git_dir / "worktrees").iterdir() if p.is_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
     except OSError:
-        return heads
+        return None
+    tips: list[str] = []
     for entry in entries:
-        try:
-            line = (entry / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            continue
-        if _SHA_RE.match(line):
-            heads.append(line)
-    return heads
+        files = [entry / "HEAD"]
+        refs = entry / "refs"
+        if refs.is_dir():
+            errors: list[OSError] = []
+            for root, _, names in os.walk(refs, onerror=errors.append):
+                files += [Path(root) / n for n in names]
+            if errors:
+                return None
+        for f in files:
+            try:
+                line = f.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                return None
+            if line.startswith("ref: "):
+                continue
+            if not _SHA_RE.match(line.lower()):
+                return None
+            tips.append(line.lower())
+    return tips
 
 
-def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) -> int | None:
+def _own_git_dir(checkout: Path) -> Path | None:
+    """The git dir of a checkout: its ``.git`` directory, or where a ``.git`` file points."""
+    dot = checkout / ".git"
+    return dot if dot.is_dir() else _linked_git_dir(checkout)
+
+
+def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) -> int | str:
     """Commits in a submodule that exist on no remote (#1198).
 
-    The same rule as the workspace's own count (:func:`_unpushed_commits`):
-    HEAD (detached too), every local branch and every linked worktree's
-    detached HEAD, ``--not --remotes``. A repo with no remote counts every
-    commit — there are no remote refs to subtract. Local refs only, no
-    ``ls-remote``; one git call. ``--ignore-missing`` lets an unborn HEAD count
-    as nothing. ``None`` when git failed; the caller keeps the dir then.
+    Every local ref counts (``--all``: branches, tags, notes, ``refs/original``,
+    ``refs/keep/*``, HEAD and the linked worktrees' HEADs), plus what the
+    linked worktrees hold on their own (:func:`_worktree_tips`), ``--not
+    --remotes``. Tags never count as pushed — a tag lives in the same git dir
+    that deleting removes, and a fetched tag cannot be told from a hand-made
+    ``git tag wip``; a fetched tag on a pushed commit is reachable from the
+    remotes and so adds nothing. The stash is left out (``--exclude``): it is
+    counted on its own, as ``N stash entries``. A repo with no remote counts
+    every commit — there are no remote refs to subtract.
 
-    Tags never count as pushed: a tag lives in the same git dir that deleting
-    removes, and a fetched tag cannot be told from a hand-made ``git tag wip``
-    — counting tags lost the only copy of a tagged detached commit.
+    Broader than the workspace's own count (:func:`_unpushed_commits`, HEAD
+    and branches, then ``ls-remote``): a submodule's git dir is never asked
+    over the network, so every ref it holds is assumed to be work.
+
+    One git call; ``--ignore-missing`` lets an unborn HEAD or a worktree HEAD
+    naming a missing object count as nothing. Unknown comes back as the reason
+    (a ``str``) — the caller keeps the dir then.
 
     With *git_dir*, *path* is a git dir whose checkout may be gone — as in
     :func:`_stash_entries`, it stands in as its own work tree. *own_git_dir*
     is the git dir holding ``worktrees/``.
     """
+    extra = _worktree_tips(own_git_dir)
+    if extra is None:
+        return _WORKTREE_UNREADABLE
     pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
-    revs = ["HEAD", "--branches", *_worktree_heads(own_git_dir)]
+    revs = ["--exclude=refs/stash", "--all", *extra]
     result = _run(
         [*pre, "rev-list", "--count", "--ignore-missing", *revs, "--not", "--remotes"], cwd=path
     )
     if result.returncode != 0:
-        return None
+        return "git failed"
     try:
         return int(result.stdout.strip() or "0")
     except ValueError:
-        return None
+        return "git failed"
 
 
-def _unpushed_note(name: str, n: int | None) -> str | None:
-    """``"<name>: N unpushed commit(s)"`` (#1198), or ``None`` with none."""
-    if n is None:
-        return f"{name}: unpushed commits unknown (git failed)"
+def _unpushed_note(name: str, n: int | str) -> str | None:
+    """``"<name>: N unpushed commit(s)"`` (#1198), or ``None`` with none.
+
+    A ``str`` is why the count is unknown — reported, so the dir is kept.
+    """
+    if isinstance(n, str):
+        return f"{name}: unpushed commits unknown ({n})"
     return f"{name}: {n} unpushed commit(s)" if n else None
 
 
@@ -584,9 +627,13 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
 def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
-    Counts from HEAD (a detached commit is on no branch) and every local
-    branch; the stash is counted apart (#1045). A repository with no remote at
-    all counts every commit — there is nowhere else they exist.
+    Counts from HEAD (a detached commit is on no branch), every local branch
+    and what the linked worktrees hold — their detached HEADs and
+    per-worktree refs, read from files (#1198: ``git worktree add --detach``
+    elsewhere kept its commit only in this git dir). The stash is counted
+    apart (#1045). A repository with no remote at all counts every commit —
+    there is nowhere else they exist. A worktree file that cannot be read is
+    unknown (``None``).
 
     With *ask_remote*, a commit at or below a branch head on a remote counts
     as pushed even without a local tracking ref (``git ls-remote``). Only exact
@@ -594,14 +641,18 @@ def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]
     the remote could not be asked; the local count is returned then, so the
     dir is kept.
     """
-    tips = _start_refs(path)
-    local = _count_not_on(path, sorted(set(tips.values())))
+    own = _own_git_dir(Path(path))
+    extra = _worktree_tips(own) if own is not None else []
+    if extra is None:
+        return None, False
+    tips = sorted(set(_start_refs(path).values()) | set(extra))
+    local = _count_not_on(path, tips)
     if not ask_remote or not local:
         return local, False
     heads = _remote_head_shas(path)
     if heads is None:
         return local, True
-    return _count_not_on(path, sorted(set(tips.values())), heads), False
+    return _count_not_on(path, tips, heads), False
 
 
 def _is_clean_worktree(path: str, xy: str, rel: str, depth: int) -> bool:
@@ -690,7 +741,7 @@ def describe_changes(status: WorktreeStatus) -> str:
         return "not a git repo (cannot tell work from leftovers)"
     reasons: list[str] = []
     if status.unpushed_commits is None:
-        reasons.append("unpushed commits unknown (git rev-list failed)")
+        reasons.append("unpushed commits unknown (git rev-list failed or worktree unreadable)")
     elif status.unpushed_commits:
         reason = f"{status.unpushed_commits} unpushed commit(s) on no remote branch"
         if status.remote_unchecked:
