@@ -95,6 +95,11 @@ class OrphanSweepResult:
     #: ディレクトリが「利用者の作業」に見える。
     kept_user_work: int = 0
     kept_not_repo: int = 0
+    #: ``kept_user_work`` split by reason (#1250): files not committed, versus a
+    #: clean worktree kept only for unpushed commits or stashes. One directory
+    #: counts once — uncommitted files win when it has both.
+    kept_uncommitted: int = 0
+    kept_unpushed: int = 0
     #: 持ち主のいない docker コンテナの名前 (#612)。**止めはしない** — 中身は
     #: 誰かのデータで、勝手に落とす判断はディレクトリの削除より重い。まず
     #: 「在ることが分かる」状態にする。
@@ -294,7 +299,7 @@ async def sweep_orphan_dirs(
         find_orphan_dirs, root, known_dirs, min_idle_days=min_idle_days
     )
     removed = kept = 0
-    removed_clord_only = kept_user_work = kept_not_repo = 0
+    removed_clord_only = kept_not_repo = kept_uncommitted = kept_unpushed = 0
     reclaimed = 0
     for candidate in candidates:
         if removed >= max_per_pass:
@@ -312,21 +317,26 @@ async def sweep_orphan_dirs(
             kept += 1
             if status is not None and not status.is_repo:
                 kept_not_repo += 1
+            elif status is not None and status.user_changes:
+                kept_uncommitted += 1
             elif status is not None:
-                kept_user_work += 1
+                # #1250: commits never pushed / stashes — not "uncommitted".
+                kept_unpushed += 1
 
+    kept_user_work = kept_uncommitted + kept_unpushed
     if removed or kept:
         # 「kept N with work in them」の一行だけだった頃 (#749 以前)、80 件の
         # うち 60 件は c-lord 自身の SKILL.md だった。内訳を分けて出す。
         logger.info(
             "orphan sweep: removed %d directory(ies) (%.1f GB; %d held only c-lord's own "
-            "files), kept %d (%d with uncommitted user work, %d not a git repo, "
-            "%d unsafe or failed to remove)",
+            "files), kept %d (%d with uncommitted user work, %d with unpushed commits or "
+            "stashes only, %d not a git repo, %d unsafe or failed to remove)",
             removed,
             reclaimed / 1024**3,
             removed_clord_only,
             kept,
-            kept_user_work,
+            kept_uncommitted,
+            kept_unpushed,
             kept_not_repo,
             kept - kept_user_work - kept_not_repo,
         )
@@ -337,6 +347,8 @@ async def sweep_orphan_dirs(
         removed_clord_only=removed_clord_only,
         kept_user_work=kept_user_work,
         kept_not_repo=kept_not_repo,
+        kept_uncommitted=kept_uncommitted,
+        kept_unpushed=kept_unpushed,
     )
 
 
