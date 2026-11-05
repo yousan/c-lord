@@ -701,7 +701,11 @@ It binds `CLORD_API_HOST:CLORD_API_PORT` (default `127.0.0.1:8080`). With
 next free one (8081, 8082, … then any free port) and logs where it went, so two
 clones on one host both get an API with nothing to configure (#258). A port you
 **set** is used as-is: if it is taken the bot logs a WARNING and runs without the
-API rather than failing to start.
+API rather than failing to start. A value that is not ASCII digits (`²`, a word)
+is ignored with a WARNING naming `CLORD_API_PORT`, as if it were unset; spaces
+around the digits are ignored (#1218). Likewise an entry of `CLORD_TRUSTED_BOT_IDS`
+that is not ASCII digits is ignored with a startup WARNING, and the other ids in
+the list keep working.
 
 Claude in every session is told where the API is as the `CLORD_API_URL`
 environment variable — the port that was actually bound, so it never has to be

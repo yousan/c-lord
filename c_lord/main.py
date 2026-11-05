@@ -227,6 +227,21 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
             )
             sys.exit(1)
 
+    # #1218: a companion bot id that is not ASCII digits is ignored, said once
+    # here (``command_gate`` reads the list per message and must not raise).
+    # Not a stop: such an entry was silently ignored before, and the rest of the
+    # list still works (#1194 — an update alone must not break a working .env).
+    bad_trusted = [
+        x
+        for x in (p.strip() for p in os.getenv("CLORD_TRUSTED_BOT_IDS", "").split(","))
+        if x and not (x.isascii() and x.isdigit())
+    ]
+    if bad_trusted:
+        logger.warning(
+            "CLORD_TRUSTED_BOT_IDS must be comma-separated numeric Discord user ids; ignoring %s.",
+            ", ".join(repr(x) for x in bad_trusted),
+        )
+
     # #1119: the two numeric limits must be whole numbers of at least 1. ``0``
     # used to start a bot on which every turn waited forever behind a
     # Semaphore(0) — no error, no log line; ``-1`` and ``three`` died with a
@@ -314,10 +329,21 @@ async def build_api_server(
     if port_override is not None:
         api_port = port_override
     else:
-        api_port_env = os.getenv("CLORD_API_PORT", "")
-        if api_port_env.isdigit():
+        # #1218: ASCII digits only (#1084), spaces around them ignored (#1194).
+        # ``"²".isdigit()`` is True and ``int("²")`` crashed the start with a
+        # traceback that named no setting. Anything else is the unset case, said.
+        raw_port = os.getenv("CLORD_API_PORT", "")
+        api_port_env = raw_port.strip()
+        if api_port_env.isascii() and api_port_env.isdigit():
             api_port = int(api_port_env)
         else:
+            if api_port_env:
+                logger.warning(
+                    "CLORD_API_PORT must be a port number, got %r — ignored; "
+                    "the REST API picks a free port from %d as if it were unset.",
+                    raw_port,
+                    DEFAULT_API_PORT,
+                )
             api_port = DEFAULT_API_PORT
             auto_port = True
 
