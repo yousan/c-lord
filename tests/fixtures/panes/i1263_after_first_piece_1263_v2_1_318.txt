@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · Claude Ultra
+ ▝▝   ▝▝   /…/-home-yousan-c-lord-sessions-1505747831447883806-1566967064349114438/ba14e307-7d60-4da6-9688-0614dd64e99d/scratchpad/e2e1263/work-piece1 · /rc
+
+⚠ Your login expires in 3 days · run /login to renew
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                            ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [Pasted text #2 +20 lines]                                                                                                                                  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5.5  v2.1.318  Style: default  Ctx: 0  Context: [░░░░░░░░░░░░░░░░] 0/1.0M (0%)  Ctx Used: 0.0%  Ctx(u) Used: 0.0% 
+   Cost: $0.00  5h: 0.0%  Weekly: 79.0%  Session: <1m  Reset: 38m  Weekly Reset: 15hr 38m  Block: 4hr 21m  In: 0  Out: 0  Cached: 0  Total: 0  In: —  Out...    
+   ⎇ master  (+0,-0)  +0  -0  work-piece1  𖠰 main  cwd: /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1566967064349114438/ba14e307-7d...
+  paste again to expand                              
