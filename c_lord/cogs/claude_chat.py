@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import re
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -678,8 +677,9 @@ class ClaudeChatCog(commands.Cog):
             if existing is not None:
                 self._coordination = existing
             else:
-                channel_id_str = os.getenv("COORDINATION_CHANNEL_ID", "")
-                channel_id = int(channel_id_str) if channel_id_str.isdigit() else None
+                from ..coordination.env import coordination_channel_id_from_env
+
+                channel_id = coordination_channel_id_from_env()  # #1194
                 self._coordination = CoordinationService(self.bot, channel_id)
         return self._coordination
 

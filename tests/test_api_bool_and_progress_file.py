@@ -494,6 +494,45 @@ class TestProgressFileOpenedOnceInsideTheBoundary:
         assert _sent_files(thread_mock) == []
 
     @pytest.mark.asyncio
+    async def test_a_dir_one_may_pass_but_not_list_still_attaches(
+        self, repos, thread_mock: MagicMock, tmp_path: Path
+    ) -> None:
+        """#1185: 途中に「読めないが通れる」ディレクトリ（0311）があっても添付する。
+
+        #1160 で途中のディレクトリを ``O_RDONLY`` で開くようになり、読み取り権限の
+        無いディレクトリの下の progress が ``progress_file not found`` の 400 になった
+        （以前は 200 で添付）。通るのに要るのは実行権限だけ。
+        """
+        import os
+
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory permissions")
+        if not (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0)):
+            pytest.skip("no O_PATH / O_SEARCH: a directory can only be opened to read it")
+        base = tmp_path / "sessions"
+        xonly = base / "1" / "2" / "xonly"
+        xonly.mkdir(parents=True)
+        (xonly / "p.txt").write_text("ok\n")
+        xonly.chmod(0o311)
+        client = await _reply_client(repos, thread_mock, base)
+        try:
+            resp = await client.post(
+                "/api/reply",
+                json={
+                    "thread_id": 555666777,
+                    "content": "x",
+                    "progress_file": str(xonly / "p.txt"),
+                },
+            )
+            body = await resp.text()
+        finally:
+            xonly.chmod(0o755)
+            await client.close()
+
+        assert resp.status == 200, body
+        assert len(_sent_files(thread_mock)) == 1
+
+    @pytest.mark.asyncio
     async def test_the_warning_stays_on_one_line(
         self, repos, thread_mock: MagicMock, tmp_path: Path, caplog
     ) -> None:

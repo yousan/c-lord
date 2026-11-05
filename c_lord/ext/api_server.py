@@ -128,13 +128,17 @@ def _open_inside(base: str | None, requested: object) -> io.BufferedReader | str
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
+    # #1185: a directory is only walked through, never listed — so open it for
+    # search (O_PATH on Linux, O_SEARCH elsewhere), not for reading. O_RDONLY
+    # needed read permission and turned a file under a 0311 dir into a 400.
+    walk = getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY
     try:
-        dir_fd = os.open(root, os.O_RDONLY | directory | cloexec)
+        dir_fd = os.open(root, walk | directory | cloexec)
     except OSError:
         return _UNOPENABLE
     try:
         for name in parts[:-1]:
-            nxt = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=dir_fd)
+            nxt = os.open(name, walk | directory | nofollow | cloexec, dir_fd=dir_fd)
             os.close(dir_fd)
             dir_fd = nxt
         # O_NONBLOCK: a FIFO planted here must not hang the request.
@@ -169,6 +173,24 @@ def _as_int(value: object) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if _INT64_MIN <= number <= _INT64_MAX else None
+
+
+def _task_int(value: object) -> int | None:
+    """:func:`_as_int` for a task's ``interval_seconds`` / ``channel_id``, minus booleans.
+
+    ``true`` was saved as ``1`` — a task that ran every second (#1184). The
+    mirror of #1038: a boolean field takes no ``0`` / ``1``, so an integer field
+    takes no ``true`` / ``false``. A decimal string and a fraction stay
+    accepted (#1126 — Discord ids often travel as strings).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not (value.isascii() and value.isdigit()):
+        # #1184 (review): "a string of decimal digits", as the docs say — not
+        # what ``int()`` also reads (``"１２０"``, ``"1_000"``, ``"+60"``, ``" 60 "``).
+        # The same rule as the .env ids (#1084).
+        return None
+    return _as_int(value)
 
 
 def _strict_int(value: object) -> int | None:
@@ -213,6 +235,18 @@ def _optional_channel_and_color(
                 ),
             )
     return channel_id, color, None
+
+
+def _text(data: dict[str, Any], field: str) -> tuple[str | None, web.Response | None]:
+    """``data[field]`` as text — ``None`` when absent or ``null`` — or the 400 naming it.
+
+    A number, list or object in a text field reached ``.strip()`` or SQLite and
+    came back as a 500 with no reason (#1183).
+    """
+    value = data.get(field)
+    if value is None or isinstance(value, str):
+        return value, None
+    return None, web.json_response({"error": f"{field} must be a string"}, status=400)
 
 
 def _message_and_title(data: dict[str, Any]) -> tuple[str, str | None, web.Response | None]:
@@ -294,8 +328,9 @@ class ApiServer:
         self.session_dir_base: str | None = None
         # Fall back to COORDINATION_CHANNEL_ID so lounge shares the same channel
         if lounge_channel_id is None:
-            ch_str = os.getenv("COORDINATION_CHANNEL_ID", "")
-            lounge_channel_id = int(ch_str) if ch_str.isdigit() else None
+            from ..coordination.env import coordination_channel_id_from_env
+
+            lounge_channel_id = coordination_channel_id_from_env()  # #1194
         self.lounge_channel_id = lounge_channel_id
 
         # #457: the UID this bot runs as. Only that user (and root, which can
@@ -647,9 +682,13 @@ class ApiServer:
         if not isinstance(run_immediately, bool):
             return _not_a_boolean("run_immediately")
 
+        working_dir, err = _text(data, "working_dir")
+        if err is not None:
+            return err
+
         numbers: dict[str, int] = {}
         for field in ("interval_seconds", "channel_id"):
-            number = _as_int(data[field])
+            number = _task_int(data[field])
             if number is None:
                 # Not a name clash: answering 409 here sent callers looking for a
                 # task that did not exist (#1037).
@@ -665,7 +704,7 @@ class ApiServer:
                 prompt=str(data["prompt"]),
                 interval_seconds=numbers["interval_seconds"],
                 channel_id=numbers["channel_id"],
-                working_dir=data.get("working_dir"),
+                working_dir=working_dir,
                 run_immediately=run_immediately,
             )
         except sqlite3.IntegrityError as exc:
@@ -716,13 +755,17 @@ class ApiServer:
         if "prompt" in data:
             patch_kwargs["prompt"] = str(data["prompt"])
         if "interval_seconds" in data:
-            interval = _as_int(data["interval_seconds"])
+            interval = _task_int(data["interval_seconds"])
             if interval is None or interval < 1:
                 # #1064: 0 / negative / false were saved with a 200.
                 return web.json_response({"error": _INTERVAL_ERROR}, status=400)
             patch_kwargs["interval_seconds"] = interval
-        if "working_dir" in data:
-            patch_kwargs["working_dir"] = str(data["working_dir"])
+        if data.get("working_dir") is not None:
+            # #1183: a list was saved as the text "['x']" — same rule as on create.
+            # ``null`` is "not given", as everywhere (it was saved as "None").
+            if not isinstance(data["working_dir"], str):
+                return web.json_response({"error": "working_dir must be a string"}, status=400)
+            patch_kwargs["working_dir"] = data["working_dir"]
 
         if await self.task_repo.get(task_id) is None:  # type: ignore[union-attr]
             return web.json_response({"error": "Task not found"}, status=404)
@@ -803,7 +846,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        message = data.get("message", "").strip()
+        raw_message, err = _text(data, "message")
+        if err is not None:
+            return err
+        message = (raw_message or "").strip()
         if not message:
             return web.json_response({"error": "message is required"}, status=400)
 
@@ -852,7 +898,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        prompt = (data.get("prompt") or "").strip()
+        raw_prompt, err = _text(data, "prompt")
+        if err is not None:
+            return err
+        prompt = (raw_prompt or "").strip()
         if not prompt:
             return web.json_response({"error": "prompt is required"}, status=400)
 
@@ -863,6 +912,10 @@ class ApiServer:
         channel_id = _as_int(raw_channel_id)
         if channel_id is None:
             return web.json_response({"error": "channel_id must be an integer"}, status=400)
+
+        raw_thread_name, err = _text(data, "thread_name")  # #1183 (review)
+        if err is not None:
+            return err
 
         # Resolve ClaudeChatCog lazily from the bot (zero-config; no constructor change).
         from ..cogs.claude_chat import ClaudeChatCog  # avoid circular import at module level
@@ -889,7 +942,7 @@ class ApiServer:
                 status=400,
             )
 
-        thread_name: str | None = data.get("thread_name") or None
+        thread_name: str | None = raw_thread_name or None
 
         try:
             thread = await cog.spawn_session(raw, prompt, thread_name=thread_name)
@@ -953,9 +1006,15 @@ class ApiServer:
         if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
-        session_id: str | None = data.get("session_id") or None
+        raw_session_id, err = _text(data, "session_id")
+        if err is not None:
+            return err
+        raw_resume_prompt, err = _text(data, "resume_prompt")
+        if err is not None:
+            return err
+        session_id: str | None = raw_session_id or None
         reason: str = str(data.get("reason") or "self_restart")
-        resume_prompt: str | None = data.get("resume_prompt") or None
+        resume_prompt: str | None = raw_resume_prompt or None
 
         # Auto-resolve session_id from the sessions table if not provided.
         if session_id is None and self.session_repo is not None:
@@ -1063,7 +1122,10 @@ class ApiServer:
         if err is not None:
             return err
 
-        content = (data.get("content") or "").strip()
+        raw_content, err = _text(data, "content")
+        if err is not None:
+            return err
+        content = (raw_content or "").strip()
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
@@ -1120,7 +1182,10 @@ class ApiServer:
         if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
-        content = (data.get("content") or "").strip()
+        raw_content, err = _text(data, "content")
+        if err is not None:
+            return err
+        content = (raw_content or "").strip()
         if not content:
             return web.json_response({"error": "content is required"}, status=400)
 
@@ -1288,7 +1353,10 @@ class ApiServer:
         if thread_id is None:
             return web.json_response({"error": "thread_id must be an integer"}, status=400)
 
-        question = (data.get("question") or "").strip()
+        raw_question, err = _text(data, "question")
+        if err is not None:
+            return err
+        question = (raw_question or "").strip()
         if not question:
             return web.json_response({"error": "question is required"}, status=400)
 

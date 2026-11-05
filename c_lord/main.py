@@ -195,7 +195,9 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         logger.error("DISCORD_BOT_TOKEN is required")
         sys.exit(1)
 
-    channel_id = os.getenv("DISCORD_CHANNEL_ID", "")
+    # #1194: spaces around an ID (``KEY="123 "``) started before #1084 — ``int()``
+    # ignores them — so strip them here, as the counts below do (#1119).
+    channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
     if not channel_id:
         logger.error("DISCORD_CHANNEL_ID is required")
         sys.exit(1)
@@ -205,9 +207,9 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     # for being non-empty — so ``int()`` further down raised ValueError and the
     # user got a traceback that named no setting. A garbage value must fail
     # loudly (#323), with the value and how to fix it (#451).
-    expected_bot_user_id = os.getenv("EXPECTED_BOT_USER_ID", "")
-    owner_id_raw = os.getenv("DISCORD_OWNER_ID", "")
-    coordination_raw = os.getenv("COORDINATION_CHANNEL_ID", "")
+    expected_bot_user_id = os.getenv("EXPECTED_BOT_USER_ID", "").strip()
+    owner_id_raw = os.getenv("DISCORD_OWNER_ID", "").strip()
+    coordination_raw = os.getenv("COORDINATION_CHANNEL_ID", "").strip()
     for key, value, what in (
         ("DISCORD_CHANNEL_ID", channel_id, "channel ID"),
         ("DISCORD_OWNER_ID", owner_id_raw, "user ID (snowflake)"),

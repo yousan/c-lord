@@ -590,6 +590,10 @@ curl -X POST http://127.0.0.1:8080/api/tasks \
 ```
 
 `interval_seconds` and `channel_id` must be integers — anything else is a `400` naming the field.
+"Integer" here means a JSON integer, a string of ASCII decimal digits only (`"86400"` — Discord ids
+often travel as strings; `"１２０"`, `"1_000"`, `"+60"` and `" 60 "` are a `400`, as for the `.env` ids) or a JSON number with a fraction, which is cut toward zero (`90.7` is saved as `90`).
+`true` / `false` are not integers: they are a `400` on create and on `PATCH`, and nothing is saved
+(before #1184, `true` was saved as an interval of 1 second).
 `409` means only that a task with that `name` already exists. Every endpoint that reads a body
 answers `400 {"error": "Body must be a JSON object"}` to valid JSON that is not an object (#1037).
 
@@ -613,3 +617,10 @@ On `/api/notify` and `/api/schedule`, `channel_id` (optional) must be a positive
 `NaN` are a `400` naming the field, and `/api/schedule` saves nothing. `scheduled_at` must be an
 ISO 8601 string, `message` a non-empty string and `title` (optional) a string (#1083). A
 `channel_id` of `0` or `null` still means the default channel.
+
+A text field sent as anything other than a JSON string — a number, `true`, a list, an object —
+is a `400 {"error": "<field> must be a string"}`, not a `500` (#1183): `content` on `/api/reply`
+and `/api/threads/{id}/messages`, `question` on `/api/prompt-choice`, `prompt` / `thread_name` on
+`/api/spawn`, `message` on `/api/lounge`, `session_id` / `resume_prompt` on `/api/mark-resume`, and
+`working_dir` on `POST` / `PATCH /api/tasks` (a `PATCH` that fails this way changes nothing).
+Absent or `null` is the same as leaving the field out.
