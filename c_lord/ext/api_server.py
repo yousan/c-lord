@@ -20,6 +20,7 @@ import logging
 import os
 import sqlite3
 import stat
+import unicodedata
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -237,16 +238,48 @@ def _optional_channel_and_color(
     return channel_id, color, None
 
 
-# Characters ``str.strip()`` keeps but nobody can see (#1238): zero-width space /
-# non-joiner / joiner, word joiner, BOM.
-_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff"
+# What counts as "nothing visible" (#1238 / #1258). A hand list of five
+# characters (ZWSP, ZWNJ, ZWJ, WJ, BOM) let direction marks, the soft hyphen, a
+# lone variation selector, the Hangul filler… through, so it is decided by
+# Unicode instead: control (Cc), format (Cf — direction marks, soft hyphen,
+# U+180E, U+2061, tags, ZW*, BOM) and separator (Zs / Zl / Zp) categories, plus
+# the Default_Ignorable_Code_Point characters outside them, plus the braille
+# blank, which renders as an empty cell. Unassigned code points (Cn) are NOT
+# blank as a class: an emoji newer than Python's Unicode data is Cn here.
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Zs", "Zl", "Zp"})
+_INVISIBLE_RANGES = (
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn)
+    (0x115F, 0x1160),  # HANGUL CHOSEONG / JUNGSEONG FILLER (Lo)
+    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ / AA (Mn)
+    (0x180B, 0x180F),  # MONGOLIAN FREE VARIATION SELECTORS (Mn; U+180E is Cf)
+    (0x2065, 0x2065),  # reserved default-ignorable (Cn)
+    (0x2800, 0x2800),  # BRAILLE PATTERN BLANK (So) — renders as nothing
+    (0x3164, 0x3164),  # HANGUL FILLER (Lo)
+    (0xFE00, 0xFE0F),  # VARIATION SELECTOR-1..16 (Mn)
+    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo)
+    (0xFFF0, 0xFFF8),  # reserved default-ignorable (Cn)
+    (0xE0000, 0xE0FFF),  # tags (Cf), VARIATION SELECTOR-17..256 (Mn), reserved
+)
+
+
+def _is_invisible(c: str) -> bool:
+    """Whether the single character *c* shows nothing on its own (#1258)."""
+    if c.isspace() or unicodedata.category(c) in _INVISIBLE_CATEGORIES:
+        return True
+    cp = ord(c)
+    return any(lo <= cp <= hi for lo, hi in _INVISIBLE_RANGES)
 
 
 def _is_blank(text: str | None) -> bool:
-    """True when *text* has nothing visible — whitespace and invisible marks only."""
-    # One pass — peeling whitespace and marks in turn was quadratic on input
-    # like " \u200b" * n and blocked the event loop.
-    return all(c.isspace() or c in _INVISIBLE for c in text or "")
+    """True when *text* has nothing visible — whitespace and invisible marks only.
+
+    A character that is visible makes the whole text not blank, whatever marks
+    surround it: a ZWJ emoji sequence or a letter + VS16 is accepted (#1258).
+    """
+    # Linear: each distinct character is looked at once (``set`` is one C-speed
+    # pass). Peeling whitespace and marks in turn was quadratic on input like
+    # " \u200b" * n and blocked the event loop (#1238).
+    return all(_is_invisible(c) for c in set(text or ""))
 
 
 def _text(data: dict[str, Any], field: str) -> tuple[str | None, web.Response | None]:
