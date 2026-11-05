@@ -12,6 +12,8 @@ lines in 23 seconds — nothing new for the reader, just a thread filled up.
 docs/specs/turn-end-notification.md — the mirror shows the first sentence of the
 English error as one small line. Within one turn the same line is posted once; a
 different error in the same turn is still posted, and the next turn posts again.
+A line whose post failed does not count as posted, and a prompt typed straight into
+the pane after an interrupted turn (no ``turn_duration``) starts afresh.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ import asyncio
 import json
 import os
 from pathlib import Path
+
+import pytest
 
 from c_lord.transcript.mirror import TranscriptMirror
 
@@ -88,16 +92,37 @@ def _turn_end(uuid: str, parent: str) -> dict:
     return end
 
 
-async def _api_lines(tmp_path: Path, items: list[dict | str]) -> list[str]:
+def _pane_prompt(uuid: str, parent: str) -> dict:
+    """A prompt a person typed straight into the pane — no ``note_turn_started``."""
+    prompt = _base("user", "2026-11-04T13:01:44.000Z", uuid, parent)
+    prompt["message"] = {"role": "user", "content": "続けて"}
+    return prompt
+
+
+async def _api_lines(
+    tmp_path: Path, items: list[dict | str], fail_first: str | None = None
+) -> list[str]:
+    """The API-error lines the thread got.
+
+    *fail_first* makes the first API-error post fail: ``"raise"`` (the sink
+    raised) or ``"none"`` (the sink returned no message). Those are not counted.
+    """
     project = tmp_path / "proj"
     project.mkdir()
     jsonl = project / "s.jsonl"
     clord_transcript(jsonl)
     os.utime(jsonl, (1, 1))
     posted: list[str] = []
+    failed = [fail_first]
 
-    async def sink(text: str) -> None:
+    async def sink(text: str) -> object:
+        if text.startswith("-# ⚠️ API Error") and failed[0] is not None:
+            how, failed[0] = failed[0], None
+            if how == "raise":
+                raise RuntimeError("Discord 503")
+            return None
         posted.append(text)
+        return object()  # the posted message, as the cog's sink returns it
 
     async def reply_sink(text: str, **_: object) -> None:
         posted.append(text)
@@ -167,6 +192,35 @@ async def test_the_next_turn_posts_the_same_error_again(tmp_path: Path) -> None:
     rows.append(_TURN)
     rows += _refusal(_TIMES[1], 1)
     rows.append(_turn_end("end1", "err1"))
+
+    api_lines = await _api_lines(tmp_path, rows)
+
+    assert len(api_lines) == 2, api_lines
+
+
+@pytest.mark.parametrize("fail_first", ["raise", "none"])
+async def test_a_line_whose_post_failed_is_posted_on_the_next_repeat(
+    tmp_path: Path, fail_first: str
+) -> None:
+    rows: list[dict | str] = [_TURN]
+    for n, ts in enumerate(_TIMES[:3]):
+        rows += _refusal(ts, n)
+    rows.append(_turn_end("end", "res2"))
+
+    api_lines = await _api_lines(tmp_path, rows, fail_first=fail_first)
+
+    assert len(api_lines) == 1, api_lines
+
+
+async def test_a_pane_typed_prompt_after_an_interrupted_turn_posts_again(
+    tmp_path: Path,
+) -> None:
+    rows: list[dict | str] = [_TURN]
+    rows += _refusal(_TIMES[0], 0)
+    # interrupted: no turn_duration; the next prompt is typed into the pane
+    rows.append(_pane_prompt("typed", "res0"))
+    rows += _refusal(_TIMES[1], 1)
+    rows.append(_turn_end("end", "res1"))
 
     api_lines = await _api_lines(tmp_path, rows)
 

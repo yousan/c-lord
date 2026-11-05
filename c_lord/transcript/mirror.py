@@ -1544,6 +1544,9 @@ class TranscriptMirror:
                         turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                         _limit_reported = False
                         usage_limit_notices.clear_thread(self.thread_id)
+                        # #1251: a prompt typed into the pane after an interrupted
+                        # turn (no turn_duration, no note_turn_started) starts afresh.
+                        self._turn_api_error_lines.clear()
                         # #913: a notification only *starts* a turn between turns;
                         # one that lands in a person's turn leaves it theirs. A
                         # scheduled wakeup is the same kind of start (#1092).
@@ -1815,9 +1818,10 @@ class TranscriptMirror:
                             else "",
                             headline(failed)[:200],
                         )
-                        if not repeated:
+                        # Counted as posted only when the post went out: a failed
+                        # one must not silence the next repeat in this turn.
+                        if not repeated and await self._try_sink(line) is not None:
                             self._turn_api_error_lines.add(line)
-                            await self._try_sink(line)
                         continue
                     if rendered.kind == "assistant_text":
                         limit = banner_only(rendered.body)
