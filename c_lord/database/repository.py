@@ -460,7 +460,10 @@ class SessionRepository:
             self._pending_triggers.pop(thread_id, None)
         elif isinstance(pending, int):
             self.discard_pending_trigger(thread_id, pending)
-        if recorded is None:
+        # A pending trigger may have been written onto the row since it was seen
+        # (its turn reached SYSTEM) — it is forgotten there too.
+        seen = [v for v in (recorded, pending) if isinstance(v, int)]
+        if recorded is not _ANY and not seen:
             return
         async with aiosqlite.connect(self.db_path) as db:
             if recorded is _ANY:
@@ -469,10 +472,11 @@ class SessionRepository:
                     (thread_id,),
                 )
             else:
+                marks = ", ".join("?" * len(seen))
                 await db.execute(
                     "UPDATE sessions SET trigger_message_id = NULL"
-                    " WHERE thread_id = ? AND trigger_message_id = ?",
-                    (thread_id, recorded),
+                    f" WHERE thread_id = ? AND trigger_message_id IN ({marks})",
+                    (thread_id, *seen),
                 )
             await db.commit()
 

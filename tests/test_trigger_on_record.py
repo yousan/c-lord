@@ -362,3 +362,30 @@ async def test_message_during_skill_prepare_keeps_its_trigger(tmp_path) -> None:
     assert await mirror._build_trigger_reference(42) is not None, "A's answer would not reply to A"
     record = await repo.get(42)
     assert record is not None and record.trigger_message_id == 556, record.trigger_message_id
+
+
+async def test_pending_promoted_during_prepare_is_still_cleared(tmp_path) -> None:  # noqa: ANN001
+    """#1234 (review): A's first message is still waiting for the row (pending 555)
+    when B runs /skill. While /skill prepares, A's turn reaches SYSTEM and 555 is
+    written onto the row. /skill saw 555 as pending — it must still be forgotten
+    from the row, or after a restart B's turn pings A."""
+    from c_lord.cogs import skill_command
+
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)  # no row yet → pending
+    assert repo.pending_trigger(42) == 555
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        await repo.save(42, "sess-1")  # A's SYSTEM event writes 555 onto the row
+        return True, "/sessions/999/42"
+
+    with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+        turn_events.reset()
+        try:
+            await _skill_turn(repo, 42, B)
+        finally:
+            turn_events.reset()
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id is None, record.trigger_message_id
