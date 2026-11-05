@@ -763,7 +763,7 @@ def test_timed_out_status_leaves_no_index_lock_and_no_orphans(tmp_path: Path, mo
     info.mkdir(exist_ok=True)
     (info / "attributes").write_text("* filter=slow\n")
     os.utime(sub / "README.md", (2_000_000_000, 2_000_000_000))  # same size, new mtime
-    monkeypatch.setattr(sd._run, "__kwdefaults__", {"stdin": None, "timeout": 2.0})
+    monkeypatch.setattr(sd._run, "__kwdefaults__", {**sd._run.__kwdefaults__, "timeout": 2.0})
     try:
         st = worktree_status(str(ws))
         assert not (ws / ".git" / "index.lock").exists(), "index.lock left behind"
@@ -780,6 +780,12 @@ def test_timed_out_status_leaves_no_index_lock_and_no_orphans(tmp_path: Path, mo
             os.kill(int(pidfile.read_text()), 9)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="known limit: the workspace's own tags are not counted — a fetched tag cannot "
+    "be told from a hand-made one, and counting them kept every workspace that fetched "
+    "tags (shallow clone + fetch --tags, a tag on a deleted branch). Spec.",
+)
 def test_workspace_commit_held_only_by_a_local_tag_is_kept(tmp_path: Path) -> None:
     """Detached commit → ``git tag wip`` → ``checkout main``: only the tag holds it."""
     ws, _ = _workspace(tmp_path)
@@ -944,3 +950,111 @@ def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
     assert not _object_exists(subr, sha)
     assert git(ws, "status", "--porcelain").strip() == ""
     _kept(ws)
+
+
+# ---- review of 77df9cc: the workspace's own tags kept pushed workspaces ----
+
+
+def _origin_with_tags(tmp: Path) -> Path:
+    """A bare origin whose ``main`` has 3 commits, the first two tagged, plus a
+    tag on a commit of a branch that was deleted since."""
+    origin = _bare_with_commit(tmp, "tagged")
+    seed = tmp / "tagged-seed"
+    git(seed, "tag", "-a", "-m", "t0", "v0")
+    _commit(seed, "c1.txt")
+    git(seed, "tag", "v1")
+    _commit(seed, "c2.txt")
+    git(seed, "checkout", "-q", "-b", "release")
+    _commit(seed, "rel.txt")
+    git(seed, "tag", "-a", "-m", "rel", "rel-1")
+    git(seed, "checkout", "-q", "main")
+    git(seed, "push", "-q", "origin", "main", "release", "--tags")
+    git(seed, "push", "-q", "origin", "--delete", "release")
+    git(seed, "branch", "-q", "-D", "release")
+    return origin
+
+
+def test_depth1_clone_after_fetch_tags_is_clean(tmp_path: Path) -> None:
+    """A ``--depth=1`` session clone, then ``git fetch --tags``: the tags point
+    below the shallow boundary and at a deleted branch. Nothing is unpushed."""
+    origin = _origin_with_tags(tmp_path)
+    base = tmp_path / "sessions"
+    base.mkdir()
+    ws = base / "4242"
+    git(tmp_path, "clone", "-q", "--depth=1", "--single-branch", f"file://{origin}", str(ws))
+    git(ws, "fetch", "-q", "--tags")
+    assert "v1" in git(ws, "tag")
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
+    assert _delete(ws).removed
+
+
+def test_local_clone_with_a_tag_on_a_deleted_branch_is_clean(tmp_path: Path) -> None:
+    """``git clone --local`` (what a local source repo gets) takes every tag."""
+    _origin_with_tags(tmp_path)
+    src = tmp_path / "tagged-seed"
+    git(src, "fetch", "-q", "origin", "--tags")  # rel-1 back into the source
+    base = tmp_path / "sessions"
+    base.mkdir()
+    ws = base / "4242"
+    git(tmp_path, "clone", "-q", "--local", str(src), str(ws))
+    assert "rel-1" in git(ws, "tag")
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
+    assert _delete(ws).removed
+
+
+def test_workspace_ref_to_a_nested_annotated_tag_is_peeled_fully(tmp_path: Path) -> None:
+    """A non-tag ref (``refs/keep/x``) to a tag of a tag of an unpushed commit:
+    peeling one level saw a tag, not a commit, and dropped the ref."""
+    ws, _ = _workspace(tmp_path)
+    git(ws, "checkout", "-q", "--detach")
+    sha = _commit(ws, "w.txt")
+    t1 = subprocess.run(
+        ["git", "mktag"],
+        cwd=ws,
+        input=f"object {sha}\ntype commit\ntag t1\ntagger t <t@e> 0 +0000\n\nt1\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    t2 = subprocess.run(
+        ["git", "mktag"],
+        cwd=ws,
+        input=f"object {t1}\ntype tag\ntag t2\ntagger t <t@e> 0 +0000\n\nt2\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    git(ws, "update-ref", "refs/keep/x", t2)
+    git(ws, "checkout", "-q", "main")
+    res = _kept(ws)
+    assert "1 unpushed commit(s)" in res.reason
+
+
+def test_a_timed_out_ls_remote_leaves_no_child_running(tmp_path: Path, monkeypatch) -> None:
+    """``ls-remote`` runs its transport (ssh, remote-https, upload-pack) as a
+    child; a timeout must stop the whole group, not only ``git``."""
+    ws, _ = _workspace(tmp_path)
+    git(ws, "checkout", "-q", "-b", "feature")
+    _commit(ws, "f.txt")  # an unpushed commit, so the remote is asked
+    pidfile = tmp_path / "upload.pid"
+    fake = tmp_path / "slow-upload-pack"
+    fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nsleep 20\n")
+    fake.chmod(0o755)
+    git(ws, "config", "remote.origin.uploadpack", str(fake))
+    sd._ls_remote_cache.clear()
+    monkeypatch.setattr(sd, "_LS_REMOTE_TIMEOUT_SECONDS", 1.0)
+    try:
+        st = worktree_status(str(ws))
+        assert st.remote_unchecked, describe_changes(st)
+        assert pidfile.exists(), "setup: the slow upload-pack should have started"
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 3
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(pid), "ls-remote's transport outlived the timeout"
+    finally:
+        sd._ls_remote_cache.clear()
+        if pidfile.exists() and _pid_alive(int(pidfile.read_text())):
+            os.kill(int(pidfile.read_text()), 9)

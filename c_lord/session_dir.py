@@ -61,6 +61,7 @@ def _run(
     *,
     stdin: str | None = None,
     timeout: float | None = _GIT_TIMEOUT_SECONDS,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess and return the result (never raises on non-zero exit).
 
@@ -76,7 +77,7 @@ def _run(
     (ignored by git before 2.44). ``git clone`` passes ``timeout=None`` and
     keeps the caller's process group.
     """
-    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0"}
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0", **(extra_env or {})}
     proc = subprocess.Popen(
         args,
         stdin=subprocess.PIPE if stdin is not None else None,
@@ -323,16 +324,16 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
         if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
             shas |= cached[1]
             continue
+        # Through _run (#1198): on a timeout the transport child (ssh,
+        # remote-https, upload-pack) is killed with git, not left running.
         try:
-            result = subprocess.run(
+            result = _run(
                 ["git", "ls-remote", "--heads", "--", name],
-                capture_output=True,
-                text=True,
                 cwd=path,
                 timeout=_LS_REMOTE_TIMEOUT_SECONDS,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                extra_env={"GIT_TERMINAL_PROMPT": "0"},
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
             return None
         if result.returncode != 0:
             return None
@@ -343,45 +344,39 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
     return frozenset(shas)
 
 
-def _start_refs(path: str) -> dict[str, str] | None:
-    """Every local ref and HEAD, as ref → commit. ``None``: git failed.
+def _start_refs(path: str) -> list[str] | None:
+    """HEAD and every local ref but tags, by name. ``None``: git failed.
 
-    Not only branches (#1198): a commit held only by a local tag, notes or
-    ``refs/original`` was deleted with the workspace. Remote-tracking refs are
-    what the count subtracts, and the stash is counted on its own
-    (:func:`_stash_entries`, #1045) — a stash commit is no "unpushed commit" a
-    user could push. A tag is peeled to what it points at; a ref to no commit
-    (a tag of a tree) holds no commit to lose. A failed (or timed-out) call is
-    unknown, never "no refs".
+    Not only branches (#1198): a commit held only by notes, ``refs/original``
+    or another local ref was deleted with the workspace. Left out:
+
+    - ``refs/remotes/*`` — what the count subtracts;
+    - ``refs/stash`` — counted on its own (:func:`_stash_entries`, #1045), a
+      stash commit is no "unpushed commit" a user could push;
+    - ``refs/tags/*`` — a fetched tag cannot be told from a hand-made one, and
+      counting them kept every workspace that fetched tags (a ``--depth=1``
+      clone after ``git fetch --tags``, a tag on a deleted branch: the
+      ``ls-remote`` heads cannot vouch for those). A commit held only by a
+      local tag is therefore not counted — a known limit (spec).
+
+    Names, not object names: ``rev-list`` peels a ref to an annotated tag
+    fully (one level of ``%(*objectname)`` did not). A failed (or timed-out)
+    call is unknown, never "no refs".
     """
-    tips: dict[str, str] = {}
-    refs = _run(
-        [
-            "git",
-            "for-each-ref",
-            "--format=%(objecttype) %(objectname) %(*objecttype) %(*objectname) %(refname)",
-        ],
-        cwd=path,
-    )
+    refs = _run(["git", "for-each-ref", "--format=%(refname)"], cwd=path)
     if refs.returncode != 0:
         return None
-    for line in refs.stdout.splitlines():
-        parts = line.split(" ", 4)
-        if len(parts) != 5:
-            continue
-        kind, sha, peeled_kind, peeled, ref = parts
-        if ref.startswith("refs/remotes/") or ref == "refs/stash":
-            continue
-        if peeled_kind:
-            kind, sha = peeled_kind, peeled
-        if kind == "commit":
-            tips[ref] = sha
+    tips = [
+        ref
+        for ref in refs.stdout.split()
+        if not ref.startswith(("refs/remotes/", "refs/tags/")) and ref != "refs/stash"
+    ]
     # Only when present: an unborn HEAD would fail rev-list.
     found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
     if found.returncode not in (0, 1):
         return None
     if found.returncode == 0:
-        tips["HEAD"] = found.stdout.strip()
+        tips.append("HEAD")
     return tips
 
 
@@ -738,8 +733,8 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
 def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
-    Counts from HEAD (a detached commit is on no branch), every local ref
-    (branches, tags, notes, ``refs/original`` — #1198) and what the linked
+    Counts from HEAD (a detached commit is on no branch), every local ref but
+    tags (branches, notes, ``refs/original`` — #1198) and what the linked
     worktrees hold — their detached HEADs and per-worktree refs, read from
     files (#1198: ``git worktree add --detach`` elsewhere kept its commit
     only in this git dir). The stash is counted
@@ -760,7 +755,7 @@ def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]
     start = _start_refs(path)
     if start is None:
         return None, False
-    tips = sorted(set(start.values()) | set(extra))
+    tips = sorted(set(start) | set(extra))
     local = _count_not_on(path, tips)
     if not ask_remote or not local:
         return local, False

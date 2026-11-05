@@ -195,9 +195,14 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 #903 まではどちらも「クリーン」と見なされて消えていた（2026-10-16 に本番コードで確認）:
 
 - **どの remote ブランチにも載っていないコミット** — Claude がブランチに commit したが
-  push していない作業。HEAD（detached を含む）と**手元のすべての ref**（ブランチ・タグ・notes・`refs/original` など。
-  `refs/remotes/*` と、別に数える stash を除く）から辿れて、`refs/remotes/*` のどれからも辿れないコミットを数える
-  （#1198。以前はブランチと HEAD だけを見ていて、detached のコミットに `git tag wip` を打って `main` に戻ると、そのコミットを消していた）。
+  push していない作業。HEAD（detached を含む）と**手元の ref**（ブランチ・notes・`refs/original` など。
+  `refs/remotes/*`・別に数える stash・タグを除く）から辿れて、`refs/remotes/*` のどれからも辿れないコミットを数える
+  （#1198。以前はブランチと HEAD だけを見ていて、notes や `refs/original` にしか無いコミットを消していた）。
+  annotated tag を指す ref も中のコミットまで辿る（ref の名前のまま `git rev-list` に渡す）。
+  - **ワークスペース自身のタグにしか無いコミットは数えない**（既知の限界。サブモジュールではタグも数える）。
+    手元では fetch したタグと手で打った `git tag wip` を見分けられず、タグを数えると、タグを取ってきただけの
+    ワークスペース（`--depth=1` の clone のあとの `git fetch --tags`、消されたブランチに打たれたタグを持つ `--local` の clone）が
+    すべて「未 push」になって消せなくなったため（`ls-remote` のブランチ先端では、shallow の境界の下や消えたブランチのタグを確かめられない）。
   1 件でもあれば残す。remote が1つも無いリポジトリでは全コミットがこれに当たる（他にどこにも無いので）。
   リンクされた worktree（`git worktree add --detach` で別の場所に作ったもの）の detached HEAD と、その worktree だけの ref
   （`refs/worktree/*`・`refs/bisect/*`、`.git/worktrees/<名前>/` の中のファイル。シンボリックリンクのディレクトリも git と同じく辿る）からも数える（#1198。以前は数えず、
@@ -205,6 +210,7 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
   `unpushed commits unknown (git rev-list failed or worktree unreadable)` として残す。数える起点は標準入力で `git rev-list --stdin` に渡す（ref が何万あってもコマンドラインがあふれない）。
   - **git の呼び出しはどれも 60 秒で打ち切り、打ち切りは「分からない」として残す**（#1198。`git clone` だけは打ち切らない）。
     打ち切るときは、git が起こしたサブモジュールの `git status` やフィルタもまとめて止める（git は自分のプロセスグループで動かす）。
+    remote に聞く `git ls-remote` も同じで、打ち切ると ssh・`git-remote-https`・`upload-pack` などの子もまとめて止める（打ち切りは 20 秒のまま）。
     調べるだけの git は任意のロックを取らない（`GIT_OPTIONAL_LOCKS=0`。`git status` が `index.lock` を持ったまま止められると、
     残したワークスペースで次の `git commit` が失敗していた）。`git status` 自体が打ち切られたときの理由は `status unknown (git timed out)`（「git リポジトリではない」とは書かない）。
     「分からない」を「stash 無し」「ブランチ無し」「サブモジュール無し」と読む箇所は無い。partial clone（`--filter=blob:none`）で
