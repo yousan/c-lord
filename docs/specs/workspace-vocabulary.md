@@ -243,6 +243,8 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
     - **既知の限界**: このクローンで作ったコミットの reflog の行が `gc.reflogExpire`（既定 90 日）より古くて期限切れになり、
       push の記録も期限切れになり、いまは上流で消されたブランチの fetch した追跡 ref だけが持っている場合は、作ったことが分からず
       信じて消す（HEAD の reflog にその後の行が残っている部分的な期限切れ）。
+    - **既知の限界**: stash のコミットを URL を指定して push し（追跡 ref に push の記録が無い）、fetch したあと stash を drop すると、
+      `logs/refs/stash` からその行が消えるので「ここで作った」と分からず、上流でブランチが消されると信じて消す。
     - **既知の限界**: 削除したリンクされた worktree（`git worktree remove`）で作ったコミットは、その worktree の reflog が一緒に
       消えるので「ここで作った」と分からない。そのコミットを URL を指定して push しただけ（追跡 ref に push の記録が無い）で、
       いまは fetch した追跡 ref だけが持っている場合は、上流でブランチが消されると信じて消す。
@@ -252,15 +254,18 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
       消して作り直したブランチから外れたコミットは数えて残す）。
     - 確かめた追跡 ref（ここで作ったコミットを持つもの）のブランチが**手元に無いコミットへ**進んでいるときは、そのブランチだけを
       1回 fetch して確かめる（#1245 の4回目のレビュー。PR を merge してブランチを消し、`pull` したあと、誰かが上流の `main` に
-      push しただけで、ずっと「分からない」になっていた）。fetch は使い捨ての ref（`refs/clord-probe/<remote>/<branch>`）に取り、
-      タグ・`FETCH_HEAD`・ほかの ref（追跡 ref を含む — `--refmap=`）は動かさず、サブモジュールも取らず、自動 gc もしない。
-      `_run` を通るので打ち切り（60 秒）・プロセスグループごとの停止・プロンプト無しは `ls-remote` と同じ。取った先端の祖先に
-      元の追跡 ref の先端があれば証になり、無ければ（force-push・消して作り直した）証にならず数えて残す。fetch が失敗・打ち切り
-      なら `sub: unpushed commits unknown (remote branch moved to a commit not here)` として残す。使い捨ての ref は必ず消す。
-      答えは `ls-remote` と同じく 60 秒、（解決した URL・ブランチ・元の先端・remote の先端）ごとに使い回す。ここで作ったコミットを
-      持たない追跡 ref と、作ったか分からないとき（reflog が使えない）は fetch しない（後者は「分からない」として残す）。取った
-      オブジェクトはリポジトリに残る（消すワークスペースなら一緒に消え、残すワークスペースでは害が無い）。partial clone の設定を
-      書き換えないよう `--filter` は付けない。ネットワークの回数は、手元で何もしていないサブモジュールは 0 回、PR の流れで上流が
+      push しただけで、ずっと「分からない」になっていた）。fetch は一時ディレクトリに作る使い捨ての bare リポジトリに取る。
+      そのリポジトリはワークスペースのオブジェクトを `objects/info/alternates` で借りるので、祖先かどうかはそこで確かめられ、
+      **ワークスペースには ref もオブジェクトも設定も増えず、ワークスペースの hook や設定も一切動かない**（#1245 の5回目の
+      レビュー）。タグ・`FETCH_HEAD`・サブモジュールは取らず、自動 gc もしない。`_run` を通るので打ち切り（`ls-remote` と同じ
+      20 秒）・プロセスグループごとの停止・プロンプト無しは `ls-remote` と同じ。取った先端の祖先に元の追跡 ref の先端があれば証に
+      なり、無ければ（force-push・消して作り直した）証にならず数えて残す。fetch が失敗・打ち切りなら
+      `sub: unpushed commits unknown (remote branch moved to a commit not here)` として残す。答えは `ls-remote` と同じく 60 秒、
+      （解決した URL・ブランチ・元の先端・remote の先端）ごとに使い回し、失敗は（解決した URL・ブランチ）ごとに使い回す（止まる
+      remote で待つのは 60 秒あたり1回）。ここで作ったコミットを持たない追跡 ref と、作ったか分からないとき（reflog が使えない）は
+      fetch しない（後者は「分からない」として残す）。partial clone の設定を書き換えないよう `--filter` は付けない。
+      以前の版（3eaa7da）が使っていた `refs/clord-probe/*` は、手元の作業として数えず（掃除が途中で止まって残っても、ワークスペースを
+      残し続けない）、見つかれば `.lock` ごと消す。ネットワークの回数は、手元で何もしていないサブモジュールは 0 回、PR の流れで上流が
       動いていなければ `ls-remote` 1回、動いていれば `ls-remote` 1回と fetch 1回。
     - 確かめた追跡 ref のブランチが remote で消えていたら何の証にもならず、そこからしか辿れないコミットを数えて
       `sub: 1 unpushed commit(s) (remote branch deleted or rewritten)` として残す。**squash マージされて remote で消された、
@@ -275,6 +280,13 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
       追跡 ref は引き算に使わず（`--remotes` からその remote を除く）、それ自体を手元の ref として数え、`ls-remote` もしない。
       `.claude/worktrees/<名前>/`（Claude Code の worktree）を開いて判定するときも、「中」かどうかは外側のワークスペースで測る。
       この判定のために、ワークスペースごとに `git config` を1回足す。
+    - **remote にはワークスペースの外から、URL で聞く**（#1245 の5回目のレビュー）。`ls-remote` は解決した URL を渡して中立の
+      ディレクトリで走らせるので、ワークスペースの設定（`remote.<name>.uploadpack`・`core.sshCommand`・credential helper・
+      `insteadOf`）は効かない。bot の global の設定と環境（ssh の鍵・`GIT_SSH_COMMAND`・global の credential helper）は効くので、
+      ふつうの ssh / https の remote はそのまま使える。調べるだけの git の呼び出しはすべて `core.fsmonitor=false`・
+      `core.hooksPath=/dev/null`・`protocol.ext.allow=never` で走らせ（ワークスペースが仕込んだ fsmonitor のコマンドや hook は
+      動かない。`-c` は git が起こすサブモジュールの git にも届く）、bot の秘密（`SENSITIVE_ENV_KEYS`、#353）は子プロセスの環境から
+      除く。clean/smudge フィルタ（`.gitattributes` と `filter.<名前>.clean`）は `git status` が走らせうる（既知の限界）。
     - remote に聞けない（失敗・打ち切り）ときは `sub: unpushed commits unknown (ls-remote failed)` として残す。聞くのは確かめる
       追跡 ref があるときだけなので、ネットワークの無いホストでも、手元で何もコミットを作っていないサブモジュールは妨げにならない。
     - 使い回しの鍵は remote の URL で、ローカルのパス（`../sub.git` など）はそのリポジトリの場所から解決した絶対パスにする

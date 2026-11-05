@@ -1039,16 +1039,19 @@ def test_a_timed_out_ls_remote_leaves_no_child_running(tmp_path: Path, monkeypat
     git(ws, "checkout", "-q", "-b", "feature")
     _commit(ws, "f.txt")  # an unpushed commit, so the remote is asked
     pidfile = tmp_path / "upload.pid"
-    fake = tmp_path / "slow-upload-pack"
+    fake = tmp_path / "slow-ssh"
     fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nsleep 20\n")
     fake.chmod(0o755)
-    git(ws, "config", "remote.origin.uploadpack", str(fake))
+    # The transport comes from the bot's environment: since the review of
+    # 3eaa7da the workspace's own ``remote.origin.uploadpack`` is not used.
+    monkeypatch.setenv("GIT_SSH_COMMAND", str(fake))
+    git(ws, "remote", "set-url", "origin", "ssh://example.invalid/repo.git")
     sd._ls_remote_cache.clear()
     monkeypatch.setattr(sd, "_LS_REMOTE_TIMEOUT_SECONDS", 1.0)
     try:
         st = worktree_status(str(ws))
         assert st.remote_unchecked, describe_changes(st)
-        assert pidfile.exists(), "setup: the slow upload-pack should have started"
+        assert pidfile.exists(), "setup: the slow transport should have started"
         pid = int(pidfile.read_text())
         deadline = time.monotonic() + 3
         while _pid_alive(pid) and time.monotonic() < deadline:

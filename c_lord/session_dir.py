@@ -28,6 +28,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from contextlib import suppress
@@ -41,6 +42,7 @@ from .git_exclude import add_git_exclude
 from .git_mirrors import ensure_mirror, mirrors_root_for
 from .session_reattach import HISTORY_FILENAME
 from .skills.injector import LEGACY_SKILL_NAMES, READ_SKILL_NAME
+from .tmux import SENSITIVE_ENV_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,18 @@ _GIT_TIMEOUT_SECONDS = 60.0
 
 #: Exit status of a call that timed out (as ``timeout(1)`` reports it).
 _TIMEOUT_RETURNCODE = 124
+
+#: ``-c`` for every inspecting git call (review of 3eaa7da): nothing the workspace
+#: planted runs — no ``core.fsmonitor`` command (``git status``), no hook
+#: (``reference-transaction`` on a ref update), no ``ext::`` remote.
+_INSPECT_CONFIG: tuple[str, ...] = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "protocol.ext.allow=never",
+)
 
 
 def _run(
@@ -79,6 +93,15 @@ def _run(
     keeps the caller's process group.
     """
     env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0", **(extra_env or {})}
+    # Review of 3eaa7da: the workspace's config and hooks are Claude's to write,
+    # and this runs with the bot's environment. The secrets never reach a child
+    # (#353's list), and an inspecting git call (a timeout is set — ``git
+    # clone`` passes none) runs no fsmonitor command, no hook and no ``ext::``
+    # transport. ``-c`` reaches the git processes it starts (submodules) too.
+    for key in SENSITIVE_ENV_KEYS:
+        env.pop(key, None)
+    if timeout is not None and args[:1] == ["git"]:
+        args = ["git", *_INSPECT_CONFIG, *args[1:]]
     proc = subprocess.Popen(
         args,
         stdin=subprocess.PIPE if stdin is not None else None,
@@ -337,19 +360,32 @@ def _ls_remote_refs(cwd: str, name: str, url: str, pre: list[str]) -> dict[str, 
         cached = _ls_remote_cache.get(key)
     if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
         return cached[1]
-    heads = _ask_ls_remote(cwd, name, pre)
+    heads = _ask_ls_remote(_remote_target(cwd, url))
     with _ls_remote_lock:
         _ls_remote_cache[key] = (time.monotonic(), heads)
     return heads
 
 
-def _ask_ls_remote(cwd: str, name: str, pre: list[str]) -> dict[str, str] | None:
+def _remote_target(cwd: str, url: str) -> str:
+    """What to hand git for *url*: a local path resolved against *cwd*, else the URL."""
+    local = _local_remote_path(cwd, url)
+    return local if local is not None else url
+
+
+def _ask_ls_remote(target: str) -> dict[str, str] | None:
+    """``git ls-remote --heads`` of *target*, run from outside the workspace.
+
+    Review of 3eaa7da: by URL, from a neutral directory, so none of the
+    workspace's config applies — no ``remote.<name>.uploadpack``, no
+    ``core.sshCommand``, no credential helper or ``insteadOf`` of its own. The
+    bot's global config and environment (its ssh keys, its helpers) still do.
+    """
     # Through _run (#1198): on a timeout the transport child (ssh,
     # remote-https, upload-pack) is killed with git, not left running.
     try:
         result = _run(
-            [*pre, "ls-remote", "--heads", "--", name],
-            cwd=cwd,
+            ["git", "ls-remote", "--heads", "--", target],
+            cwd=tempfile.gettempdir(),
             timeout=_LS_REMOTE_TIMEOUT_SECONDS,
             extra_env={"GIT_TERMINAL_PROMPT": "0"},
         )
@@ -422,7 +458,7 @@ def _start_refs(path: str, inside: frozenset[str] = frozenset()) -> list[str] | 
         # local work like branches (third review of ef8f0fc).
         if (ref.startswith(own) if own else False)
         or (
-            not ref.startswith(("refs/remotes/", "refs/tags/", "refs/notes/"))
+            not ref.startswith(("refs/remotes/", "refs/tags/", "refs/notes/", _PROBE_NS))
             and ref != "refs/stash"
         )
     ]
@@ -836,7 +872,7 @@ def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) 
     # The worktree tips go through stdin: thousands of ref files overflow argv.
     # A ``--not`` on the command line does not reach them (they stay positive).
     result = _run(
-        [*pre, "rev-list", "--count", "--exclude=refs/stash", "--all"]
+        [*pre, "rev-list", "--count", "--exclude=refs/stash", f"--exclude={_PROBE_NS}*", "--all"]
         + ["--not", "--remotes", "--stdin"],
         cwd=path,
         stdin="".join(f"{sha}\n" for sha in extra),
@@ -1030,46 +1066,80 @@ def _refs_containing(path: str, pre: list[str], commits: set[str]) -> frozenset[
     return frozenset(result.stdout.split())
 
 
+#: Where 3eaa7da's probe fetch wrote its throwaway ref. Never counted as work
+#: (a sweep killed before its ``finally`` left one, and it kept the workspace
+#: forever — review of 3eaa7da); leftovers are removed before a probe.
+_PROBE_NS = "refs/clord-probe/"
+
+
+def _drop_leftover_probes(cwd: str, pre: list[str], git_dir: Path) -> None:
+    """Best effort: delete ``refs/clord-probe/*`` and their ``.lock`` files."""
+    listed = _run([*pre, "for-each-ref", "--format=%(refname)", _PROBE_NS], cwd=cwd)
+    for ref in listed.stdout.split() if listed.returncode == 0 else []:
+        _run([*pre, "update-ref", "-d", ref], cwd=cwd)
+    for current, _dirs, files in os.walk(git_dir / _PROBE_NS):
+        for name in files:
+            if name.endswith(".lock"):
+                with suppress(OSError):
+                    os.unlink(os.path.join(current, name))
+
+
 def _probe_ancestor(
-    cwd: str, pre: list[str], remote: str, url: str, branch: str, old: str, now: str
+    cwd: str, pre: list[str], git_dir: Path, url: str, branch: str, old: str, now: str
 ) -> bool | None:
     """Is *old* an ancestor of the remote's *branch* (now at *now*, not here)? (#1245)
 
-    One bounded fetch of that branch only, into a throwaway ref: no tags, no
-    ``FETCH_HEAD``, no other ref moved (``--refmap=``), no submodules, no
-    auto gc; through :func:`_run` (process group, timeout, no prompt). The
-    probe ref is deleted in a ``finally``. The answer is cached with the
-    ``ls-remote`` answers, by (resolved URL, branch, old, now). ``None`` —
-    fetch failed or timed out — is unknown, and cached too.
+    One bounded fetch of that branch only — into a throwaway bare repo in a
+    temporary directory that borrows the workspace's objects
+    (``objects/info/alternates``), so the workspace gets no ref, no object and
+    no config change, and none of its hooks or config run (review of
+    3eaa7da). No tags, no ``FETCH_HEAD``, no submodules, no auto gc; through
+    :func:`_run` with the ``ls-remote`` timeout (20 s). The answer is cached
+    with the ``ls-remote`` answers by (resolved URL, branch, old, now); a
+    failure by (resolved URL, branch), so a hanging remote costs once per TTL.
+    ``None`` — failed or timed out — is unknown.
     """
-    key = f"probe\0{_ls_remote_key(cwd, url)}\0{branch}\0{old}\0{now}"
+    url_key = _ls_remote_key(cwd, url)
+    fail_key = f"probe-failed\0{url_key}\0{branch}"
+    key = f"probe\0{url_key}\0{branch}\0{old}\0{now}"
     with _ls_remote_lock:
+        failed = _ls_remote_cache.get(fail_key)
         cached = _ls_remote_cache.get(key)
-    if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
-        return None if cached[1] is None else cached[1].get("ancestor") == "yes"
-    probe = f"refs/clord-probe/{remote}/{branch}"
+    fresh = time.monotonic() - _LS_REMOTE_TTL_SECONDS
+    if failed is not None and failed[0] > fresh:
+        return None
+    if cached is not None and cached[0] > fresh and cached[1] is not None:
+        return cached[1].get("ancestor") == "yes"
+    _drop_leftover_probes(cwd, pre, git_dir)
     verdict: bool | None = None
     try:
-        fetched = _run(
-            [*pre, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--quiet"]
-            + ["--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--refmap="]
-            + ["--", remote, f"+refs/heads/{branch}:{probe}"],
-            cwd=cwd,
-            extra_env={"GIT_TERMINAL_PROMPT": "0"},
-        )
-        if fetched.returncode == 0:
-            ancestor = _run([*pre, "merge-base", "--is-ancestor", old, probe], cwd=cwd)
-            if ancestor.returncode in (0, 1):
-                verdict = ancestor.returncode == 0
+        with tempfile.TemporaryDirectory(prefix="clord-probe-") as tmp:
+            init = _run(["git", "init", "-q", "--bare", tmp], cwd=tmp)
+            if init.returncode == 0:
+                alternates = Path(tmp) / "objects" / "info" / "alternates"
+                alternates.write_text(f"{(git_dir / 'objects').resolve()}\n", encoding="utf-8")
+                probe = ["git", f"--git-dir={tmp}"]
+                fetched = _run(
+                    [*probe, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch"]
+                    + ["--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules"]
+                    + ["--", _remote_target(cwd, url), f"+refs/heads/{branch}:refs/probe"],
+                    cwd=tmp,
+                    timeout=_LS_REMOTE_TIMEOUT_SECONDS,
+                    extra_env={"GIT_TERMINAL_PROMPT": "0"},
+                )
+                if fetched.returncode == 0:
+                    ancestor = _run(
+                        [*probe, "merge-base", "--is-ancestor", old, "refs/probe"], cwd=tmp
+                    )
+                    if ancestor.returncode in (0, 1):
+                        verdict = ancestor.returncode == 0
     except OSError:
         verdict = None
-    finally:
-        _run([*pre, "update-ref", "-d", probe], cwd=cwd)
     with _ls_remote_lock:
-        _ls_remote_cache[key] = (
-            time.monotonic(),
-            None if verdict is None else {"ancestor": "yes" if verdict else "no"},
-        )
+        if verdict is None:
+            _ls_remote_cache[fail_key] = (time.monotonic(), None)
+        else:
+            _ls_remote_cache[key] = (time.monotonic(), {"ancestor": "yes" if verdict else "no"})
     return verdict
 
 
@@ -1197,7 +1267,7 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         # stay offline), never with created-here unknown.
         branch = ref[len(f"refs/remotes/{remote}/") :]
         verdict = (
-            _probe_ancestor(repo.path, pre, remote, urls[remote], branch, sha, now)
+            _probe_ancestor(repo.path, pre, repo.own_git_dir, urls[remote], branch, sha, now)
             if created is not None and ref in holding
             else None
         )
@@ -1220,7 +1290,8 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     # Same tips as _local_only_commits, but ``--all`` now counts the tracking
     # refs that do not vouch too; only those that do are subtracted.
     result = _run(
-        [*pre, "rev-list", "--count", "--exclude=refs/stash", "--all", "--stdin"],
+        [*pre, "rev-list", "--count", "--exclude=refs/stash", f"--exclude={_PROBE_NS}*"]
+        + ["--all", "--stdin"],
         cwd=repo.path,
         stdin="".join(f"{t}\n" for t in extra) + "".join(f"^{v}\n" for v in sorted(vouch)),
     )
