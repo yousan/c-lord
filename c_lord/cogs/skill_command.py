@@ -211,6 +211,55 @@ class SkillCommandCog(commands.Cog):
             choices.append(app_commands.Choice(name=label[:100], value=s["name"]))
         return choices
 
+    def _earlier_triggers_forgetter(
+        self, thread_id: int, mirror_cog: object, prior: set[int | None]
+    ) -> Callable[[], Awaitable[None]]:
+        """Make the earlier turns' trigger messages stop counting — #1234 / #1262.
+
+        A ``/skill`` turn has no trigger message, so an earlier turn's must not
+        stay on record — after a restart its author would be pinged for this
+        turn, and the answer would be posted as a reply to them. Nothing on
+        record → the owner (#1212).
+
+        Everything happens in the returned hook, which runs the moment the
+        ``/skill`` prompt is really in the pane (``RunConfig.on_prompt_sent``) —
+        the pane answers the input it got last, and a ``/skill`` whose send
+        failed changes nothing. Forgotten then: what was on record (memory, row,
+        pending) when this ``/skill`` started (*prior*), except a message turn
+        still on its way to the pane (in flight — its prompt arrives after this
+        one, so it is the newer turn); and the trigger of a message turn whose
+        prompt got there first. A message recorded since that has not been sent
+        keeps its trigger.
+        """
+        known = {mid for mid in prior if isinstance(mid, int)}
+
+        async def on_prompt_sent() -> None:
+            stale = {mid for mid in known if not self.repo.trigger_in_flight(thread_id, mid)}
+            sent = self.repo.sent_trigger(thread_id)
+            if isinstance(sent, int):
+                stale.add(sent)
+            # This /skill is now what the pane answers.
+            self.repo.note_trigger_sent(thread_id, None)
+            seen_memory = getattr(mirror_cog, "trigger_message", None)
+            forget = getattr(mirror_cog, "forget_trigger_message", None)
+            current = seen_memory(thread_id) if callable(seen_memory) else None
+            if callable(forget) and current in stale:
+                forget(thread_id, only=current)
+            if not stale:
+                return
+            try:
+                await self.repo.clear_trigger_message(thread_id, only=stale)
+            except Exception:
+                # The repository keeps the ids for the next session save.
+                logger.warning(
+                    "%s /skill could not clear the recorded trigger message now; "
+                    "it is applied with the next session save (#1262)",
+                    log_ctx(thread_id=thread_id),
+                    exc_info=True,
+                )
+
+        return on_prompt_sent
+
     def _make_runner(
         self,
         tmux: TmuxSessionManager,
@@ -441,13 +490,17 @@ class SkillCommandCog(commands.Cog):
                 session_id = record.session_id
 
             # #1234 (W57): what is on record *now*, before the workspace is
-            # prepared — a message that arrives meanwhile is a newer turn and
-            # keeps its trigger; only these are forgotten below.
+            # prepared — memory, row and pending (#1262: the memory too, since the
+            # row may still be waiting for that message's write). These are
+            # forgotten below; a message that arrives meanwhile keeps its trigger
+            # unless its prompt reaches the pane before this one.
             mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
             seen_memory = getattr(mirror_cog, "trigger_message", None)
-            prior_memory = seen_memory(channel.id) if callable(seen_memory) else None
-            prior_record = record.trigger_message_id if record else None
-            prior_pending = self.repo.pending_trigger(channel.id)
+            prior = {
+                seen_memory(channel.id) if callable(seen_memory) else None,
+                record.trigger_message_id if record else None,
+                self.repo.pending_trigger(channel.id),
+            }
 
             display = f"`/{name} {args}`" if args else f"`/{name}`"
             await respond(f"Running {display} in this thread…")
@@ -464,22 +517,6 @@ class SkillCommandCog(commands.Cog):
             )
             if not ready:
                 return
-            # #1234: this turn has no trigger message, so the previous turn's
-            # must not stay on record — after a restart its author would be
-            # pinged for this turn. Nothing on record → the owner (#1212).
-            forget = getattr(mirror_cog, "forget_trigger_message", None)
-            if callable(forget) and prior_memory is not None:
-                forget(channel.id, only=prior_memory)
-            try:
-                await self.repo.clear_trigger_message(
-                    channel.id, recorded=prior_record, pending=prior_pending
-                )
-            except Exception:
-                logger.warning(
-                    "%s /skill could not clear the recorded trigger message",
-                    log_ctx(thread_id=channel.id),
-                    exc_info=True,
-                )
             runner = self._make_runner(
                 tmux,
                 channel.id,
@@ -487,6 +524,8 @@ class SkillCommandCog(commands.Cog):
                 turn=turn,
                 try_continue=restarted and session_id is not None,
             )
+            # #1234 / #1262: the earlier turns' triggers stop counting.
+            on_prompt_sent = self._earlier_triggers_forgetter(channel.id, mirror_cog, prior)
             # #754: a /skill run is on 📊 Session Status while it runs.
             async with board_turn(dashboard_of(self.bot), channel.id, prompt):
                 await run_claude_with_config(
@@ -507,6 +546,7 @@ class SkillCommandCog(commands.Cog):
                         # #480: ping the invoking user if a question-mode pause blocks the skill.
                         notify_user_id=user.id,
                         started_by=StartedBy("user", str(user.id)),
+                        on_prompt_sent=on_prompt_sent,
                     )
                 )
             return

@@ -17,6 +17,7 @@ after a bot restart, ping the author of the recorded trigger message
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -77,10 +78,20 @@ async def _api_error(bot, repo, thread_id: int, channels) -> str:  # noqa: ANN00
 
 
 async def _skill_turn(
-    repo: SessionRepository, thread_id: int, user_id: int, mirror: object | None = None
+    repo: SessionRepository,
+    thread_id: int,
+    user_id: int,
+    mirror: object | None = None,
+    *,
+    before_send: Callable[[], Awaitable[None]] | None = None,
+    after_send: Callable[[], Awaitable[None]] | None = None,
+    delivered: bool = True,
 ) -> None:
     """Run ``/skill`` in an existing thread; the run itself does what a real one
-    does to the record: begin the turn for the invoker, save at SYSTEM."""
+    does to the record, in the runner's order: begin the turn for the invoker,
+    save at SYSTEM, then the prompt reaches the pane (``on_prompt_sent``, #1262).
+    *before_send* / *after_send* run around that moment; ``delivered=False`` is
+    a send that failed (the hook never runs)."""
     bot = MagicMock()
     bot.settings_repo = None
     bot.transcript_mirror_cog = mirror if mirror is not None else MagicMock()
@@ -114,6 +125,13 @@ async def _skill_turn(
             turn_events.StartedBy("user", str(user_id)),
         )
         await repo.save(thread_id, "sess-1")
+        if before_send is not None:
+            await before_send()
+        # RunConfig.on_prompt_sent (#1262); absent before it existed.
+        if delivered and (sent := getattr(config, "on_prompt_sent", None)) is not None:
+            await sent()
+        if after_send is not None:
+            await after_send()
 
     with (
         patch("c_lord.cogs.skill_command.run_claude_with_config", side_effect=run),
@@ -266,6 +284,9 @@ async def test_a_first_turn_that_reaches_system_keeps_its_trigger(tmp_path) -> N
     async def run(config) -> None:  # noqa: ANN001
         calls.append("run")
         await real_save(42, "sess-1")
+        # The prompt then reaches the pane (#1262: a turn whose prompt never
+        # does owns no answer, and its trigger is dropped when it ends).
+        await config.on_prompt_sent()
 
     cog = _make_chat_cog()
     cog.repo = repo

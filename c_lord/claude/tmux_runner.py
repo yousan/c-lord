@@ -16,7 +16,7 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1596,6 +1596,14 @@ class TmuxClaudeRunner:
         # #1170: the run ended because its pane is a menu waiting for an answer
         # (the #751 backstop), not because the turn finished.
         self.ended_awaiting_answer = False
+        # #1262: awaited right after this run's prompt reached the pane (the
+        # send or the start succeeded) — the moment that decides which turn the
+        # pane answers. Set by ``run_claude_with_config`` from the RunConfig.
+        self.on_prompt_sent: Callable[[], Awaitable[None]] | None = None
+        # #1262: called right before this run's prompt is handed to tmux (the
+        # send / start runs in a worker thread and can take ~20s, #1169). A turn
+        # cancelled after this may still have delivered its keys.
+        self.on_send_started: Callable[[], None] | None = None
         self._last_capture: str = ""
         # #809: why the last menu answer did not reach the TUI, in words the
         # thread can be shown. Empty until an answer fails.
@@ -1743,6 +1751,37 @@ class TmuxClaudeRunner:
         )
         return _missing_window("Claude の起動", self._thread_id)
 
+    def _note_send_started(self) -> None:
+        """Tell :attr:`on_send_started` the prompt is being handed to tmux (#1262)."""
+        hook = self.on_send_started
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            logger.warning(
+                "%s on_send_started failed (#1262)",
+                log_ctx(thread_id=self._thread_id),
+                exc_info=True,
+            )
+
+    async def _note_prompt_sent(self) -> None:
+        """Tell :attr:`on_prompt_sent` that this run's prompt is in the pane (#1262).
+
+        Never fails the turn: the prompt is already delivered.
+        """
+        hook = self.on_prompt_sent
+        if hook is None:
+            return
+        try:
+            await hook()
+        except Exception:
+            logger.warning(
+                "%s on_prompt_sent failed (#1262)",
+                log_ctx(thread_id=self._thread_id),
+                exc_info=True,
+            )
+
     async def run(
         self,
         prompt: str,
@@ -1845,6 +1884,7 @@ class TmuxClaudeRunner:
                 yield stopped
                 return
             self._take_send_failure()  # #809: only this send's refusal may explain it
+            self._note_send_started()
             ok = await asyncio.to_thread(
                 self._tmux.send_input,
                 self._thread_id,
@@ -1896,6 +1936,7 @@ class TmuxClaudeRunner:
                     error=await self._fleet_tmux_error(server_at_start) or reason,
                 )
                 return
+            await self._note_prompt_sent()
         else:
             if (stopped := self._stopped_before_delivery()) is not None:
                 yield stopped
@@ -1906,6 +1947,7 @@ class TmuxClaudeRunner:
                 # Try --continue first; if Claude exits immediately (no session),
                 # fall back to a fresh start (issue #123 Part 2).
                 await self._note_resume_baseline()
+                self._note_send_started()
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,
@@ -1935,6 +1977,7 @@ class TmuxClaudeRunner:
                         "falling back to fresh start",
                         self._thread_id,
                     )
+                    self._note_send_started()
                     ok = await asyncio.to_thread(
                         self._tmux.start_claude,
                         self._thread_id,
@@ -1957,9 +2000,11 @@ class TmuxClaudeRunner:
                             ),
                         )
                         return
+                await self._note_prompt_sent()
             else:
                 # Normal cold start: /clear, new thread, any non-resume path.
                 # Always fresh — never --continue (would recover cleared history).
+                self._note_send_started()
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,
@@ -1982,6 +2027,7 @@ class TmuxClaudeRunner:
                         ),
                     )
                     return
+                await self._note_prompt_sent()
 
             # Handle trust prompt if it appears.
             await self._handle_startup_prompts()
