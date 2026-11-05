@@ -186,3 +186,59 @@ def test_is_resident_anywhere_ignores_another_instances_pane() -> None:
         patch("c_lord.tmux.instance_owner", return_value="this-bot"),
     ):
         assert T.is_resident_anywhere(3) is False
+
+
+# --- whole-branch review of 79fc532: the count and the sleep must agree on owners ---
+#
+# The sleep's host-wide check counts only this instance's panes, but the count
+# (``resident_thread_ids``) counted every pane. Another bot's pane carrying one of
+# our thread ids was counted, every attempt on it answered "gone", and the cap sat
+# at limit+1 for good with no "still over" line.
+
+
+def _listing_with_a_foreign_pane(argv: list[str]) -> MagicMock:
+    if argv[:2] == ["tmux", "-V"]:
+        return MagicMock(returncode=0, stdout="tmux 3.4", stderr="")
+    if argv[:3] == ["tmux", "list-panes", "-a"]:
+        if any(T.OWNER_OPTION in a for a in argv):
+            out = "1\tclaude\t%1\tthis-bot\n2\tclaude\t%2\t\n3\tclaude\t%3\tother-bot\n"
+        else:
+            out = "1\tclaude\t%1\n2\tclaude\t%2\n3\tclaude\t%3\n"
+        return MagicMock(returncode=0, stdout=out, stderr="")
+    return MagicMock(returncode=0, stdout="", stderr="")  # our session: no window for 3
+
+
+async def test_foreign_window_elsewhere_holds_cap_above_limit_forever() -> None:
+    """Limit 2, our residents 1 and 2, and 3's only pane belongs to another bot.
+    Adapted from the review: the count is the real reader (no ``resident_fn``),
+    since the bug is in what it counts. We are at the limit: nothing is tried."""
+    real = _real_impl_cog(_new_session_mgr())
+    calls: list[int] = []
+
+    async def impl(*, channel: object, reason: object, idle_label: object) -> bool | None:
+        calls.append(channel.id)  # type: ignore[attr-defined]
+        return await real._sleep_workspace_impl(
+            channel=channel, reason=reason, idle_label=idle_label
+        )
+
+    cog = MagicMock()
+    cog._sleep_workspace_impl = AsyncMock(side_effect=impl)
+    ch = {i: MagicMock(id=i, parent_id=10) for i in (1, 2)}
+    ch[3] = _thread3()
+    loop = ResidentCapLoop(
+        _bot(cog=cog, channels=ch),
+        _repo([_rec(i, hours_ago=i) for i in range(1, 4)]),
+        limit=2,
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+        activity_fn=lambda r: None,
+    )
+    with (
+        patch("c_lord.tmux._run", side_effect=_listing_with_a_foreign_pane),
+        patch("c_lord.tmux.instance_owner", return_value="this-bot"),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        for _ in range(10):
+            await loop.tick()
+        assert T.resident_thread_ids() == {1, 2}
+    assert calls == [], f"another bot's pane was counted as ours: tried {calls}"

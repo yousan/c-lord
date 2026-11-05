@@ -4250,13 +4250,31 @@ def close_thread_windows(thread_id: int) -> int:
     return closed
 
 
+class TmuxNoAnswerError(RuntimeError):
+    """tmux was asked and did not answer (a timeout) — not "nothing there"."""
+
+
 def resident_thread_ids() -> set[int]:
-    """Thread ids whose tmux pane is running Claude right now, host-wide (#576)."""
-    return set(_claude_panes_by_thread())
+    """Thread ids whose tmux pane is running Claude right now — this instance's (#576).
+
+    Read host-wide in one ``list-panes -a``, but only panes owned by this c-lord
+    (or by none — windows from before #790) count: prod and staging share one
+    tmux server, and the sleep's own host-wide check (:func:`is_resident_anywhere`)
+    already counts only ours. Counting another bot's pane for one of our thread
+    ids held the cap at limit+1 for good (whole-branch review of #1219).
+
+    Raises :class:`TmuxNoAnswerError` when ``list-panes`` (or ``tmux -V``) timed
+    out: "nobody is resident" would be a guess (#1219 review). No tmux installed,
+    or no server, is an answer — an empty set.
+    """
+    panes = _claude_panes_listing(owned_only=True)
+    if panes is None:
+        raise TmuxNoAnswerError("tmux list-panes did not answer")
+    return set(panes)
 
 
 def is_resident_anywhere(thread_id: int) -> bool | None:
-    """Whether *thread_id* counts in :func:`resident_thread_ids`; ``None``: tmux did not answer.
+    """Whether *thread_id* is in :func:`resident_thread_ids`; ``None``: tmux did not answer.
 
     The same source the resident cap counts with (#1213): a window that sits in
     a session other than the one the thread's binding now resolves to (moved on

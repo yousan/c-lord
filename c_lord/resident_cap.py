@@ -394,12 +394,15 @@ class ResidentCapLoop:
         # windows are closed rather than skipped — skipped, each one held a
         # slot forever and a live workspace was slept in its place (#1086).
         self._gone: set[int] = set()
-        # Threads whose failed sleep got an unanswered re-read (#1219, reviews of
-        # f15c8ee / 5641d83). Tried after every other candidate, and kept here
-        # until their sleep or re-read gives an answer or they leave the
-        # residents: otherwise the stuck oldest ones used up each tick's make-up
-        # (two at a time, taking turns) and held the cap above its limit for good.
-        self._deferred: set[int] = set()
+        # Threads whose sleep failed (#1219), mapped to *when* it last failed (a
+        # counter). Tried after every other candidate, in that order — oldest
+        # failure first, so a re-failure moves behind the others. Ordered by age
+        # instead, one window that can never be killed was retried ahead of a
+        # younger one that failed only once, which was never tried again (whole-
+        # branch review of 79fc532). Kept until the sleep succeeds, tmux answers
+        # "gone", or the thread leaves the residents.
+        self._deferred: dict[int, int] = {}
+        self._failures = 0
         # Whether the last ``_sleep_one`` got as far as the sleep itself (#1219).
         self._sleep_reached = False
         self._task: object | None = None
@@ -449,15 +452,26 @@ class ResidentCapLoop:
     # ── inputs ───────────────────────────────────────────────────────────
 
     def _resident(self) -> set[int]:
+        answer = self._resident_answer()
+        return set() if answer is None else answer
+
+    def _resident_answer(self) -> set[int] | None:
+        """The residents, or ``None`` when the read did not answer (#1219 review).
+
+        :func:`c_lord.tmux.resident_thread_ids` raises on a timed-out
+        ``list-panes``; a ``resident_fn`` says "could not read" by raising too.
+        """
         if self._resident_fn is not None:
-            with contextlib.suppress(Exception):
+            try:
                 return set(self._resident_fn())  # type: ignore[operator]
-            return set()
+            except Exception:
+                return None
         from .tmux import resident_thread_ids
 
-        with contextlib.suppress(Exception):
+        try:
             return resident_thread_ids()
-        return set()
+        except Exception:
+            return None
 
     async def _left_residents(self, thread_id: int) -> bool | None:
         """Whether a fresh read **answers** that *thread_id* is no longer resident (#1219).
@@ -726,9 +740,19 @@ class ResidentCapLoop:
         # #1086: a thread Discord deleted holds memory nobody can use. Close it
         # whatever the count — and never count it: the cap is about live
         # workspaces, and counting a corpse slept a live one in its place.
-        await self._close_known_gone(self._resident())
-        resident = self._resident() - self._gone
-        self._deferred &= resident  # bounded by the residents (#1219)
+        # A read that did not answer says nothing about who is resident: skip
+        # the tick, and keep the memory of failed victims (#1219 review — read
+        # as "nobody", it emptied ``_deferred`` on every stalled tick).
+        answer = self._resident_answer()
+        if answer is None:
+            return 0
+        await self._close_known_gone(answer)
+        answer = self._resident_answer()
+        if answer is None:
+            return 0
+        resident = answer - self._gone
+        # Bounded by the residents (#1219).
+        self._deferred = {t: n for t, n in self._deferred.items() if t in resident}
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
@@ -765,7 +789,9 @@ class ResidentCapLoop:
             if tid not in self._unresolvable
         ]
         deferred = self._deferred
-        victims = [t for t in victims if t not in deferred] + [t for t in victims if t in deferred]
+        victims = [t for t in victims if t not in deferred] + sorted(
+            (t for t in victims if t in deferred), key=deferred.__getitem__
+        )
         if not victims:
             # Say so: "over the cap and doing nothing" must not look like "fine".
             # Sampled, because a fleet that is entirely busy stays over the cap
@@ -806,7 +832,7 @@ class ResidentCapLoop:
         for thread_id in victims:
             if attempts >= over:
                 break
-            self._deferred.discard(thread_id)
+            self._deferred.pop(thread_id, None)
             outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
             if outcome is False and not self._sleep_reached:
                 # Not an attempt: the thread could not be resolved (or the cog is
@@ -835,7 +861,8 @@ class ResidentCapLoop:
                     freed += 1
                     continue
                 # Still there, or tmux did not answer: tried last from now on.
-                self._deferred.add(thread_id)
+                self._failures += 1
+                self._deferred[thread_id] = self._failures
                 if left is None:
                     quiet = self._quiet.sample("cap-reread-unanswered")
                     if quiet.emit:
