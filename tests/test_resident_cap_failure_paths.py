@@ -355,14 +355,17 @@ class TestOneBadVictimDoesNotTakeOthersDown:
             mem_fn=lambda: OK,
         )
         with caplog.at_level(logging.INFO, logger="c_lord.resident_cap"):
-            # #1033: 4 の失敗は次の 2 で補い、1回の tick で上限まで戻す
-            assert await loop.tick() == 2
-        assert _slept(cog) == [4, 3, 2]
+            # #1219 (2026-11-05): 失敗も1回の試みに数える — 1回の tick で超過分を
+            # 超えて眠らせない。4 の失敗は次の tick で補う（4 は最後に回す）
+            assert await loop.tick() == 1
+            assert _slept(cog) == [4, 3]
+            assert await loop.tick() == 2  # 常駐一覧が古いまま {1..4}: 3 と 2
+        assert _slept(cog) == [4, 3, 3, 2]
         assert any(
             r.levelno == logging.ERROR and "failed to sleep thread=4" in r.getMessage()
             for r in caplog.records
         )
-        assert any("slept 2 workspace(s)" in r.getMessage() for r in caplog.records)
+        assert any("slept 1 workspace(s)" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_a_sleep_that_kills_nothing_is_not_counted(self, caplog) -> None:

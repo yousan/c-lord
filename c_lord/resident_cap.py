@@ -400,6 +400,8 @@ class ResidentCapLoop:
         # residents: otherwise the stuck oldest ones used up each tick's make-up
         # (two at a time, taking turns) and held the cap above its limit for good.
         self._deferred: set[int] = set()
+        # Whether the last ``_sleep_one`` got as far as the sleep itself (#1219).
+        self._sleep_reached = False
         self._task: object | None = None
 
     @property
@@ -746,11 +748,10 @@ class ResidentCapLoop:
             return 0
 
         over = len(resident) - self._limit
-        # The whole LRU order, not just the oldest *over*: a candidate that
-        # cannot be slept (its thread is gone from Discord, a sleep that failed)
-        # is made up for by the next one, so one tick gets back under the limit
-        # (#1033 — slicing first let one dead thread hold the cap at limit+1
-        # forever, the #593 shape).
+        # The whole LRU order, not just the oldest *over*: threads that cannot be
+        # resolved are filtered out, and one whose sleep failed is moved to the
+        # end, so the next ones get their turn (#1033 — slicing first let one
+        # dead thread hold the cap at limit+1 forever, the #593 shape; #1219).
         in_flight = await self._turns_in_flight(resident)
         victims = [
             tid
@@ -792,66 +793,67 @@ class ResidentCapLoop:
 
         label = f"{self._limit}本"
         slept = 0
-        unanswered = 0  # failed sleeps whose re-read tmux did not answer (#1219)
+        freed = 0  # slept, or found gone (#1094 / #1086 / the #1219 re-read)
+        # #1219 (decided 2026-11-05): every attempt counts toward ``over``, so one
+        # tick never sleeps more than the excess. Making up for failures within
+        # the tick was patched three times and each rule opened a new case: a
+        # kill that times out may still be carried out, and under a sustained
+        # stall the make-ups slept the whole fleet. The next tick re-counts —
+        # a kill that did happen then reads as gone, and a real failed kill
+        # (#1192) is made up for by the next candidate, the failed one being
+        # tried after every other (``_deferred``).
+        attempts = 0
         for thread_id in victims:
-            if slept >= over:
+            if attempts >= over:
                 break
-            # Deferred again below only if the re-read is unanswered once more.
             self._deferred.discard(thread_id)
             outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
+            if outcome is False and not self._sleep_reached:
+                # Not an attempt: the thread could not be resolved (or the cog is
+                # missing), so no kill was sent and nothing can have died behind
+                # our back. The next candidate takes its turn now (#1033).
+                if thread_id in self._gone:
+                    # Found deleted just now (#1086): it never counted, so it
+                    # frees no slot to make up for — close it, lower the bar.
+                    await self._close_gone(thread_id)
+                    over -= 1
+                continue
+            attempts += 1
             if outcome:
                 slept += 1
+                freed += 1
             elif outcome is None:
                 # Nothing to sleep — its claude ended on its own between the
-                # count and the kill (#1094). It left the residents by itself,
-                # so it is one fewer over, not a failure to make up for with a
-                # live workspace (that slept the cap below its limit).
-                over -= 1
-            elif thread_id in self._gone:
-                # Found deleted just now (#1086): it never counted, so it frees
-                # no slot to make up for — close it and lower the bar instead.
-                await self._close_gone(thread_id)
-                over -= 1
+                # count and the kill (#1094). It left the residents by itself.
+                freed += 1
             else:
                 left = await self._left_residents(thread_id)
                 if left:
-                    # #1219: the sleep said it failed, but the window is gone (a
-                    # ``kill-window`` that timed out and was carried out anyway).
-                    # Making up for it slept the whole fleet in one tick when
-                    # every kill behaved that way. Like ``None``: one fewer over.
-                    over -= 1
-                elif left is None:
-                    # #1219 (review): tmux is not answering, and a kill that
-                    # timed out may still be carried out — making up for each
-                    # one slept the whole fleet under a sustained stall. But
-                    # stopping at the first one let a stuck oldest hold the cap
-                    # above its limit for good (review of db65406). So one such
-                    # failure per tick is made up for; a second ends the tick
-                    # (about over+1 at worst), and the next tick counts again.
-                    unanswered += 1
-                    self._deferred.add(thread_id)
+                    # #1219: the sleep said it failed, but tmux answers that the
+                    # window is gone (a ``kill-window`` that timed out and was
+                    # carried out anyway).
+                    freed += 1
+                    continue
+                # Still there, or tmux did not answer: tried last from now on.
+                self._deferred.add(thread_id)
+                if left is None:
                     quiet = self._quiet.sample("cap-reread-unanswered")
                     if quiet.emit:
                         logger.warning(
                             "%s resident-cap: the sleep failed and tmux did not answer the "
-                            "re-read — %s%s",
+                            "re-read — the next tick counts again%s",
                             log_ctx(thread_id=thread_id),
-                            "making up for it once this tick"
-                            if unanswered == 1
-                            else "not making up for more this tick",
                             quiet.suffix,
                         )
-                    if unanswered > 1:
-                        break
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
-        if slept < over:
+        if freed < over:
             short = self._quiet.sample("cap-short")
             if short.emit:
                 logger.info(
                     "resident-cap: still %d over limit %d — the rest are running or "
                     "could not be slept%s",
-                    over - slept,
+                    over - freed,
                     self._limit,
                     short.suffix,
                 )
@@ -882,6 +884,7 @@ class ResidentCapLoop:
         Only the sleep's own ``None`` means gone (#1192): reading every falsy
         answer as gone left the cap above its limit whenever a kill failed.
         """
+        self._sleep_reached = False
         cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
         impl = getattr(cog, "_sleep_workspace_impl", None)
         if impl is None:
@@ -891,6 +894,8 @@ class ResidentCapLoop:
         channel = await self._resolve_thread(thread_id)
         if channel is None:
             return False
+        # From here a kill may be sent, so a failure counts as an attempt (#1219).
+        self._sleep_reached = True
         try:
             slept = await impl(channel=channel, reason=reason, idle_label=label)
         except Exception:
