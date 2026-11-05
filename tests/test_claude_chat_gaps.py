@@ -864,7 +864,10 @@ class TestGatewayGaps:
         assert await cog._threads_active_since(NOW) == [fresh]
 
     async def test_a_full_history_page_is_flagged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """#745: hitting the history cap is said in the log — it may have missed more."""
+        """#745: hitting the history cap is said in the log — it may have missed more.
+
+        #1248: the cap counts back from the present, so it is the oldest that were not read.
+        """
         cog = _make_cog()
         thread = _thread(9)
 
@@ -874,12 +877,12 @@ class TestGatewayGaps:
 
         thread.history = _history
         cog._is_runnable_request = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        with patch(f"{MOD}.HISTORY_LIMIT", 2), caplog.at_level(logging.WARNING):
+        with patch(f"{MOD}.HISTORY_MAX", 2), caplog.at_level(logging.WARNING):
             got = await cog._pick_up_thread(
                 thread, _record(), since=NOW, down_at=NOW, back_at=NOW, cause="gateway"
             )
         assert got == 0
-        assert "read back only the first 2 messages" in caplog.text
+        assert "read back only the newest 2 messages" in caplog.text
         thread.send.assert_not_awaited()
 
 
