@@ -63,9 +63,16 @@ MARGIN = timedelta(minutes=2)
 # c-lord deployment, and the ids cost a few hundred KB.
 SEEN_CAPACITY = 10_000
 
-# Messages read back per thread on one reconnect. A thread that collected more
-# than this while we were away is logged as such rather than paged through.
+# One page of thread history (Discord's own maximum per request).
 HISTORY_LIMIT = 100
+
+# Messages read back per thread on one reconnect, at most, counted back from the
+# present (#1248). Read newest first, so what a busy thread loses past this is
+# the oldest end of the window — not the moment c-lord was away. Reading the
+# oldest 100 first, a thread with sub-agent lines and voices (#971, ~200 an
+# hour) never reached the restart gap: the read ran out an hour before it.
+# Ten pages: a restart's hour-long window in such a thread is three.
+HISTORY_MAX = 10 * HISTORY_LIMIT
 
 # How far back the first connect of a process reads (#776). A restart leaves
 # a gap of seconds, a crash waiting on its supervisor minutes. Past an hour the
