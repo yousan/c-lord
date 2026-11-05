@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from c_lord import session_dir as sd
 
 from .test_submodule_unpushed_1198 import _commit, _workspace, git
@@ -256,3 +258,70 @@ def test_insteadof_to_a_network_url_still_vouches(tmp_path: Path) -> None:
     git(w, "push", "-q", "m", "work")
     st = sd.worktree_status(str(w), sessions_root=_root(tmp_path))
     assert st.clean, sd.describe_changes(st)
+
+
+# ---- W57 round 16: a percent-encoded file:// URL -----------------------------------
+#
+# git decodes ``%xx`` in a ``file://`` URL, so ``file:///…/s%65ssions/…`` names the
+# neighbour workspace. c-lord compared the path still encoded, read it as outside
+# the sessions root, and one sweep deleted both again.
+
+
+def _seed_root(tmp: Path) -> Path:
+    import shutil
+
+    seed, _ = _workspace(tmp)
+    shutil.rmtree(seed)
+    return tmp / "sessions"
+
+
+def _flat_ws(tmp: Path, root: Path, name: str) -> Path:
+    ws = root / name
+    git(tmp, "clone", "-q", "--single-branch", str(tmp / "parent.git"), str(ws))
+    git(ws, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    return ws
+
+
+def _pct(t: Path) -> str:
+    s = str(t)
+    i = s.index("sessions")
+    return "file://" + s[:i] + "s%65ssions" + s[i + len("sessions") :]
+
+
+def _sweep_root(root: Path) -> list[tuple[int | None, bool, str]]:
+    mgr = sd.SessionDirManager(base_dir=str(root), source_repo="/repo")
+    return [(r.thread_id, r.removed, r.reason) for r in mgr.cleanup_orphaned(set())]
+
+
+@pytest.mark.parametrize("sub", [False, True])
+def test_pct_file_url_cycle_one_sweep(tmp_path: Path, sub: bool) -> None:
+    root = _seed_root(tmp_path)
+    a, b = _flat_ws(tmp_path, root, "4242"), _flat_ws(tmp_path, root, "4343")
+    pa, pb = (a / "sub", b / "sub") if sub else (a, b)
+    git(pa, "checkout", "-q", "-b", "work")
+    sha = _commit(pa, "w.txt", "only copy\n")
+    git(pa, "checkout", "-q", "main")
+    git(pb, "remote", "add", "a", _pct(pa))
+    git(pb, "fetch", "-q", "a")
+    git(pb, "branch", "-q", "work", "a/work")
+    git(pa, "remote", "add", "b", _pct(pb))
+    git(pa, "fetch", "-q", "b")
+    r = _sweep_root(root)
+    assert a.exists() or b.exists(), f"one sweep deleted both; {sha} gone: {r}"
+
+
+def test_pct_file_url_tag_cycle_one_sweep(tmp_path: Path) -> None:
+    """#1246 tag path with the same percent-encoded neighbour URL."""
+    sd._ls_remote_cache.clear()
+    root = _seed_root(tmp_path)
+    a, b = _flat_ws(tmp_path, root, "4242"), _flat_ws(tmp_path, root, "4343")
+    sa, sb = a / "sub", b / "sub"
+    git(sa, "checkout", "-q", "--detach")
+    sha = _commit(sa, "wip.txt", "only copy\n")
+    git(sa, "tag", "wip")
+    git(sa, "checkout", "-q", "main")
+    git(sb, "remote", "add", "a", _pct(sa))
+    git(sb, "fetch", "-q", "a", "tag", "wip")
+    git(sa, "remote", "add", "b", _pct(sb))
+    r = _sweep_root(root)
+    assert a.exists() or b.exists(), f"one sweep deleted both; {sha} gone: {r}"
