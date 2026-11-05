@@ -4425,7 +4425,9 @@ class ClaudeChatCog(commands.Cog):
                 dashboard, thread.id, ThreadState.WAITING_INPUT, description, thread=thread
             )
 
-    async def _end_trigger_in_flight(self, thread_id: int, message_id: int) -> None:
+    async def _end_trigger_in_flight(
+        self, thread_id: int, message_id: int, *, cancelled: bool = False
+    ) -> None:
         """This message turn is over; if its prompt never reached the pane, drop
         its trigger — #1262 (W57 round 13).
 
@@ -4434,12 +4436,17 @@ class ClaudeChatCog(commands.Cog):
         or the turn before). Left on record, that answer would be posted as a
         reply to this message and, after a restart, the ❌ would ping its author.
         Exact ids only — a newer turn's trigger is never touched. Never raises.
+
+        Not when the turn was *cancelled* (a shutdown, a preempting message):
+        its ``send_input`` may still have been running in the worker thread
+        (#1169 can take ~20s), the keys may well have landed and Claude may
+        answer after the restart — so the trigger stays, as before.
         """
         try:
             unsent = self.repo.end_trigger_in_flight(thread_id, message_id) is True
         except Exception:
             return
-        if not unsent:
+        if not unsent or cancelled:
             return
         mirror = getattr(self.bot, "transcript_mirror_cog", None)
         forget = getattr(mirror, "forget_trigger_message", None)
@@ -4826,12 +4833,21 @@ class ClaudeChatCog(commands.Cog):
                     # takes this trigger away, one sent after it does.
                     on_prompt_sent=self._prompt_sent_noter(thread.id, user_message.id),
                 )
-            except BaseException:
-                await self._end_trigger_in_flight(thread.id, user_message.id)
+            except BaseException as exc:
+                await self._end_trigger_in_flight(
+                    thread.id,
+                    user_message.id,
+                    cancelled=isinstance(exc, asyncio.CancelledError),
+                )
                 raise
+
+            run_cancelled = False
 
             try:
                 await run_claude_with_config(run_config)
+            except asyncio.CancelledError:
+                run_cancelled = True
+                raise
             finally:
                 # Issue #91: wrap every Discord call so that RuntimeError("Session is
                 # closed") during bot shutdown doesn't propagate and turn the bot into
@@ -4851,7 +4867,9 @@ class ClaudeChatCog(commands.Cog):
                 with contextlib.suppress(Exception):
                     self.repo.discard_pending_trigger(thread.id, user_message.id)
                 # #1262: sent or not, this turn's prompt is no longer on its way.
-                await self._end_trigger_in_flight(thread.id, user_message.id)
+                await self._end_trigger_in_flight(
+                    thread.id, user_message.id, cancelled=run_cancelled
+                )
 
                 with contextlib.suppress(Exception):
                     await coordination.post_session_end(thread)

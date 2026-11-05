@@ -742,3 +742,87 @@ async def test_a_turn_recorded_and_ended_undelivered_during_prepare(tmp_path, mo
 
 
 # -- PR's "known limit" (ii): the #870 shutdown write-back -------------------------
+
+
+async def test_a_turn_cancelled_before_its_send_returned_keeps_its_trigger(tmp_path) -> None:  # noqa: ANN001
+    """A's turn is cancelled (a shutdown) while its send_input is still running
+    in the worker thread. The keystrokes may well have landed — Claude answers
+    after the restart — so the trigger is not dropped as "never delivered"."""
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    sending = asyncio.Event()
+
+    async def before_send() -> None:
+        sending.set()
+        await asyncio.Event().wait()  # send_input still running
+
+    task = asyncio.create_task(_chat_turn(repo, mirror, 556, before_send=before_send))
+    await sending.wait()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert not repo.trigger_in_flight(42, 556)
+    assert mirror.trigger_message(42) == 556
+    assert _row_trigger(repo.db_path) == 556
+
+
+def _resume_runner(calls: list[str], *, resume_failed: bool, start_ok: bool = True):  # noqa: ANN202
+    from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+    mgr = _tmux(running=False, calls=calls)
+    mgr.start_claude.side_effect = lambda *a, **k: calls.append("start_claude") or start_ok
+    runner = TmuxClaudeRunner(mgr, thread_id=42, try_continue=True)
+
+    async def hook() -> None:
+        calls.append("hook")
+
+    runner.on_prompt_sent = hook
+    return runner, [
+        patch.object(TmuxClaudeRunner, "_handle_startup_prompts", AsyncMock()),
+        patch.object(TmuxClaudeRunner, "_note_resume_baseline", AsyncMock()),
+        patch.object(TmuxClaudeRunner, "_resume_failed", AsyncMock(return_value=resume_failed)),
+    ]
+
+
+async def test_the_runner_reports_the_prompt_of_a_resume() -> None:
+    """Restart-resume (``--continue``): the hook fires once the start succeeded."""
+    calls: list[str] = []
+    runner, patches = _resume_runner(calls, resume_failed=False)
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _until_hook_or_end(runner, calls)
+    assert calls[:2] == ["start_claude", "hook"], calls
+
+
+async def test_the_runner_reports_the_prompt_once_after_a_resume_falls_back() -> None:
+    """``--continue`` found no session, so a fresh start follows: the hook fires
+    once, after the fresh start — not after the failed resume."""
+    calls: list[str] = []
+    runner, patches = _resume_runner(calls, resume_failed=True)
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _until_hook_or_end(runner, calls)
+    assert calls[:3] == ["start_claude", "start_claude", "hook"], calls
+    assert calls.count("hook") == 1
+
+
+async def test_the_runner_does_not_report_a_cold_start_that_failed() -> None:
+    from c_lord.claude.tmux_runner import TmuxClaudeRunner
+
+    calls: list[str] = []
+    mgr = _tmux(running=False, calls=calls)
+    mgr.start_claude.side_effect = lambda *a, **k: calls.append("start_claude") or False
+    runner = TmuxClaudeRunner(mgr, thread_id=42)
+
+    async def hook() -> None:
+        calls.append("hook")
+
+    runner.on_prompt_sent = hook
+    with (
+        patch.object(TmuxClaudeRunner, "_handle_startup_prompts", AsyncMock()),
+        patch.object(TmuxClaudeRunner, "_start_failure_reason", AsyncMock(return_value="x")),
+    ):
+        events = await _until_hook_or_end(runner, calls)
+    assert "hook" not in calls, calls
+    assert events and events[-1].is_complete and events[-1].error
