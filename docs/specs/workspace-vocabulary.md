@@ -224,8 +224,12 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
     リポジトリ」も同じ）の数えが 0 のとき、**ほかに残す理由が何も無い場合だけ**、そのリポジトリの remote-tracking ref を確かめる。
     - **確かめるのは、このクローンで作ったコミットを持つ追跡 ref だけ**（#1245 の3回目のレビュー）。「このクローンで作ったコミット」は
       このクローン自身の reflog（`logs/HEAD`・`logs/refs/heads/*`・リンクされた worktree の `logs/HEAD`）の、`commit`（`amend`・
-      `merge`・`initial` を含む）・`merge`・`rebase`・`pull`（rebase や merge をしたもの）・`cherry-pick`・`revert`・`am` の行が
-      書いたコミット（fast-forward と rebase の `(start)` は除く）。それを持つ追跡 ref は、push したかどうかに関わらず確かめる —
+      `merge`・`initial` を含む）・`cherry-pick`・`revert`・`am` の行と、`rebase`・`pull --rebase` で書き直したコミットの行
+      （`pick`・`reword`・`squash`・`fixup`・`edit`。`(start)` は上流を checkout するだけ、`(finish)` は最後の先端 — 何も書き直さない
+      同期では上流の先端そのもの — なので除く）、`merge`・`pull` の行（`: Fast-forward` で終わるものは除く）が書いたコミットと、
+      `logs/refs/stash` のすべての行（stash は必ずここで作る）。判定するのはメッセージの最初の `": "` より前（操作の名前）だけで、
+      後ろのコミットの件名に "fast-forward" や "(start)" と書いてあっても数えるのをやめない（#1245 の4回目のレビュー。以前は件名で
+      読み違えて、そのコミットを消していた）。それを持つ追跡 ref は、push したかどうかに関わらず確かめる —
       URL を直接指定して push してから fetch した、別名の remote（同じ URL）に push してから origin を fetch した、push したブランチが
       上流で `release` に fast-forward され、それを fetch した、のどれでも、作ったコミットは fetch した追跡 ref の下にあるため。
       reflog に `update by push` がある追跡 ref も確かめる（念のため）。それ以外の追跡 ref は remote から来たものしか持たないので
@@ -239,12 +243,25 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
     - **既知の限界**: このクローンで作ったコミットの reflog の行が `gc.reflogExpire`（既定 90 日）より古くて期限切れになり、
       push の記録も期限切れになり、いまは上流で消されたブランチの fetch した追跡 ref だけが持っている場合は、作ったことが分からず
       信じて消す（HEAD の reflog にその後の行が残っている部分的な期限切れ）。
+    - **既知の限界**: 削除したリンクされた worktree（`git worktree remove`）で作ったコミットは、その worktree の reflog が一緒に
+      消えるので「ここで作った」と分からない。そのコミットを URL を指定して push しただけ（追跡 ref に push の記録が無い）で、
+      いまは fetch した追跡 ref だけが持っている場合は、上流でブランチが消されると信じて消す。
     - 確かめるときは、その追跡 ref が属する remote に `git ls-remote --heads` で聞く（ワークスペース自身の照合と同じ `_run`・
       20 秒の打ち切り・60 秒の使い回し）。証になるのは、そのブランチが remote にまだあって同じコミットを指しているときと、
       進んだ先の remote の先端のコミットが手元にあるとき（その先端から辿れるもの＝先端の祖先だけが載っている。force-push や
       消して作り直したブランチから外れたコミットは数えて残す）。
-    - 確かめた追跡 ref のブランチが**手元に無いコミットへ**進んでいる（fetch していない。fast-forward・force-push・消して作り直した、の
-      区別がつかない）ときは `sub: unpushed commits unknown (remote branch moved to a commit not here)` として残す。fetch はしない。
+    - 確かめた追跡 ref（ここで作ったコミットを持つもの）のブランチが**手元に無いコミットへ**進んでいるときは、そのブランチだけを
+      1回 fetch して確かめる（#1245 の4回目のレビュー。PR を merge してブランチを消し、`pull` したあと、誰かが上流の `main` に
+      push しただけで、ずっと「分からない」になっていた）。fetch は使い捨ての ref（`refs/clord-probe/<remote>/<branch>`）に取り、
+      タグ・`FETCH_HEAD`・ほかの ref（追跡 ref を含む — `--refmap=`）は動かさず、サブモジュールも取らず、自動 gc もしない。
+      `_run` を通るので打ち切り（60 秒）・プロセスグループごとの停止・プロンプト無しは `ls-remote` と同じ。取った先端の祖先に
+      元の追跡 ref の先端があれば証になり、無ければ（force-push・消して作り直した）証にならず数えて残す。fetch が失敗・打ち切り
+      なら `sub: unpushed commits unknown (remote branch moved to a commit not here)` として残す。使い捨ての ref は必ず消す。
+      答えは `ls-remote` と同じく 60 秒、（解決した URL・ブランチ・元の先端・remote の先端）ごとに使い回す。ここで作ったコミットを
+      持たない追跡 ref と、作ったか分からないとき（reflog が使えない）は fetch しない（後者は「分からない」として残す）。取った
+      オブジェクトはリポジトリに残る（消すワークスペースなら一緒に消え、残すワークスペースでは害が無い）。partial clone の設定を
+      書き換えないよう `--filter` は付けない。ネットワークの回数は、手元で何もしていないサブモジュールは 0 回、PR の流れで上流が
+      動いていなければ `ls-remote` 1回、動いていれば `ls-remote` 1回と fetch 1回。
     - 確かめた追跡 ref のブランチが remote で消えていたら何の証にもならず、そこからしか辿れないコミットを数えて
       `sub: 1 unpushed commit(s) (remote branch deleted or rewritten)` として残す。**squash マージされて remote で消された、
       自分が push したブランチは、ワークスペースを残し続ける。** `/workspace-delete` に強制して消す指定は無いので、消してよいと

@@ -924,18 +924,27 @@ def _pushed_from_here(git_dir: Path, ref: str, logged: bool) -> bool:
     return any(line.split(b"\t", 1)[-1].startswith(b"update by push") for line in data.splitlines())
 
 
-#: Reflog messages of updates that write a commit made here (#1245, third review of
-#: ef8f0fc). ``pull`` covers ``pull --rebase`` and a pull that merged; a
-#: fast-forward, or a rebase's ``(start)`` checkout of upstream, writes none.
-_CREATED_PREFIXES: tuple[bytes, ...] = (
-    b"commit",
-    b"merge",
-    b"rebase",
-    b"pull",
-    b"cherry-pick",
-    b"revert",
-    b"am:",
-)
+def _writes_a_commit_here(msg: bytes) -> bool:
+    """Does a reflog entry with message *msg* write a commit made in this clone? (#1245)
+
+    Only the action — the text before the first ``": "`` — is read; the rest
+    is the commit's subject, and a subject saying "fast-forward" or "(start)"
+    hid that commit (review of 28f29b3).
+
+    - ``commit…`` (``(amend)``, ``(merge)``, ``(initial)``), ``cherry-pick``,
+      ``revert``, ``am``: always.
+    - ``rebase…`` / ``pull --rebase…``: each rewritten commit (``pick``,
+      ``reword``, ``squash``, ``fixup``, ``edit``), not ``(start)`` (checks out
+      upstream) nor ``(finish)`` (writes the last tip — upstream's own tip when
+      nothing was rebased; the commits rewritten were logged as picks).
+    - ``merge…`` / ``pull…``: unless the whole message ends ``: Fast-forward``.
+    """
+    action = msg.split(b": ", 1)[0]
+    if action.startswith((b"rebase", b"pull --rebase")):
+        return b"(start)" not in action and b"(finish)" not in action
+    if action.startswith((b"merge", b"pull")):
+        return not msg.rstrip().endswith(b": Fast-forward")
+    return action.startswith((b"commit", b"cherry-pick", b"revert")) or action == b"am"
 
 
 def _created_here(git_dir: Path, logged: bool) -> set[str] | None:
@@ -943,10 +952,12 @@ def _created_here(git_dir: Path, logged: bool) -> set[str] | None:
 
     HEAD's reflog, every ``logs/refs/heads/*`` and each linked worktree's
     ``logs/HEAD``; the new side of each entry whose message says a commit was
-    written here (:data:`_CREATED_PREFIXES`). With ref logging off, or HEAD's
-    reflog missing, empty or unreadable (expired — ``reflog expire --all``), it
-    is unknown. A commit whose entries expired while HEAD's reflog kept later
-    ones reads as not created here — a known limit (spec).
+    written here (:func:`_writes_a_commit_here`). Every entry of
+    ``logs/refs/stash``: a stash commit is made here whatever its message.
+    With ref logging off, or HEAD's reflog missing, empty or unreadable
+    (expired — ``reflog expire --all``), it is unknown. A commit whose
+    entries expired while HEAD's reflog kept later ones reads as not created
+    here — a known limit (spec).
     """
     if not logged:
         return None
@@ -968,8 +979,15 @@ def _created_here(git_dir: Path, logged: bool) -> set[str] | None:
             return None
         if wt_kind == "file":
             files.append(log)
+    stash = git_dir / "logs" / "refs" / "stash"
+    stash_kind = _kind(stash)
+    if stash_kind is None:
+        return None
+    if stash_kind == "file":
+        files.append(stash)
     created: set[str] = set()
     for i, f in enumerate(files):
+        every = f == stash
         try:
             data = f.read_bytes()
         except OSError:
@@ -979,9 +997,7 @@ def _created_here(git_dir: Path, logged: bool) -> set[str] | None:
         for line in data.splitlines():
             meta, _, msg = line.partition(b"\t")
             parts = meta.split()
-            if len(parts) < 2 or not msg.startswith(_CREATED_PREFIXES):
-                continue
-            if b"fast-forward" in msg.lower() or b"(start)" in msg:
+            if len(parts) < 2 or not (every or _writes_a_commit_here(msg)):
                 continue
             new = parts[1].decode("ascii", "replace").lower()
             if _SHA_RE.match(new) and set(new) != {"0"}:
@@ -1012,6 +1028,49 @@ def _refs_containing(path: str, pre: list[str], commits: set[str]) -> frozenset[
     if result.returncode != 0:
         return None
     return frozenset(result.stdout.split())
+
+
+def _probe_ancestor(
+    cwd: str, pre: list[str], remote: str, url: str, branch: str, old: str, now: str
+) -> bool | None:
+    """Is *old* an ancestor of the remote's *branch* (now at *now*, not here)? (#1245)
+
+    One bounded fetch of that branch only, into a throwaway ref: no tags, no
+    ``FETCH_HEAD``, no other ref moved (``--refmap=``), no submodules, no
+    auto gc; through :func:`_run` (process group, timeout, no prompt). The
+    probe ref is deleted in a ``finally``. The answer is cached with the
+    ``ls-remote`` answers, by (resolved URL, branch, old, now). ``None`` —
+    fetch failed or timed out — is unknown, and cached too.
+    """
+    key = f"probe\0{_ls_remote_key(cwd, url)}\0{branch}\0{old}\0{now}"
+    with _ls_remote_lock:
+        cached = _ls_remote_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
+        return None if cached[1] is None else cached[1].get("ancestor") == "yes"
+    probe = f"refs/clord-probe/{remote}/{branch}"
+    verdict: bool | None = None
+    try:
+        fetched = _run(
+            [*pre, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--quiet"]
+            + ["--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", "--refmap="]
+            + ["--", remote, f"+refs/heads/{branch}:{probe}"],
+            cwd=cwd,
+            extra_env={"GIT_TERMINAL_PROMPT": "0"},
+        )
+        if fetched.returncode == 0:
+            ancestor = _run([*pre, "merge-base", "--is-ancestor", old, probe], cwd=cwd)
+            if ancestor.returncode in (0, 1):
+                verdict = ancestor.returncode == 0
+    except OSError:
+        verdict = None
+    finally:
+        _run([*pre, "update-ref", "-d", probe], cwd=cwd)
+    with _ls_remote_lock:
+        _ls_remote_cache[key] = (
+            time.monotonic(),
+            None if verdict is None else {"ancestor": "yes" if verdict else "no"},
+        )
+    return verdict
 
 
 def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
@@ -1097,7 +1156,7 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
     if not no_vouch and not verify:
         return None
     heads: dict[str, dict[str, str]] = {}
-    moved: list[tuple[str, str]] = []
+    moved: list[tuple[str, str, str, str]] = []
     gone = False
     for ref, sha, remote in verify:
         if remote not in heads:
@@ -1111,7 +1170,7 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         elif now is None:
             gone = True
         else:
-            moved.append((sha, now))
+            moved.append((ref, sha, now, remote))
     if not no_vouch and not gone and not moved:
         return None
     # Which of the asked remotes' heads are here — those vouch for what they reach.
@@ -1128,10 +1187,30 @@ def _stale_tracking_note(repo: _Repo, ws_root: str) -> str | None:
         present = {
             line.split()[0] for line in check.stdout.splitlines() if line.endswith(" commit")
         }
-    if any(now not in present for _, now in moved):
-        # Fast-forward or force-push (or deleted and recreated) cannot be told
-        # without the commit, and nothing is fetched: unknown, kept.
-        return f"{repo.name}: unpushed commits unknown (remote branch moved to a commit not here)"
+    for ref, sha, now, remote in moved:
+        if now in present:
+            continue  # vouches below for what it reaches
+        # Review of 28f29b3 (d5/d6): the normal PR flow — push, merge, pull — then
+        # any later push upstream left this unknown forever. For a ref that holds
+        # a commit made here, fetch that one branch once and ask git whether the
+        # old tip is an ancestor. Never for other refs (untouched submodules
+        # stay offline), never with created-here unknown.
+        branch = ref[len(f"refs/remotes/{remote}/") :]
+        verdict = (
+            _probe_ancestor(repo.path, pre, remote, urls[remote], branch, sha, now)
+            if created is not None and ref in holding
+            else None
+        )
+        if verdict is None:
+            # Fast-forward or force-push (or deleted and recreated) cannot be
+            # told without the commit: unknown, kept.
+            return (
+                f"{repo.name}: unpushed commits unknown (remote branch moved to a commit not here)"
+            )
+        if verdict:
+            vouch.add(sha)  # the old tip is on the live branch
+        else:
+            gone = True  # rewritten: the old tip vouches for nothing
     # A moved branch's new head vouches for what it reaches, and only that: the
     # old tracking ref's commits count unless they are its ancestors.
     vouch |= present

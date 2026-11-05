@@ -139,10 +139,12 @@ def test_upstream_branch_deleted_after_the_clone_is_deleted(tmp_path: Path) -> N
     assert _delete(ws).removed
 
 
-def test_user_pushed_branch_moved_on_the_remote_to_a_commit_not_here_is_kept(
+def test_user_pushed_branch_fast_forwarded_by_someone_else_is_deleted_after_a_probe(
     tmp_path: Path,
 ) -> None:
-    """Pushed from here, then someone else pushed on top: unknown without a fetch."""
+    """Pushed from here, then someone else pushed on top. Was "unknown, kept";
+    since the review of 28f29b3 one probe fetch shows the commit is on the live
+    branch."""
     ws, _ = _workspace(tmp_path)
     sub = ws / "sub"
     git(sub, "checkout", "-q", "-b", "work")
@@ -154,8 +156,8 @@ def test_user_pushed_branch_moved_on_the_remote_to_a_commit_not_here_is_kept(
     git(tmp_path, "clone", "-q", "-b", "work", str(tmp_path / "subremote.git"), str(other))
     _commit(other, "theirs.txt")
     git(other, "push", "-q", "origin", "work")
-    res = _kept(ws)
-    assert "sub: unpushed commits unknown (remote branch moved to a commit not here)" in res.reason
+    res = _delete(ws)
+    assert res.removed, res.reason
 
 
 def test_without_reflogs_a_moved_branch_is_verified(tmp_path: Path) -> None:
