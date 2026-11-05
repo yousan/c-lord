@@ -1213,22 +1213,47 @@ def _no_copy(cwd: str, url: str, ws_root: str, sessions_root: str | None) -> boo
     return _in_clord_workspace(local)
 
 
+def mark_sessions_root(root: str | os.PathLike[str] | None) -> None:
+    """Leave :data:`SESSIONS_ROOT_MARKER` at a sessions root (#1289). Never raises.
+
+    Lets *another* c-lord instance on this host (prod vs staging) tell that a
+    remote under this root is a workspace that a sweep may delete. Written at
+    startup, by every sweep that has a root, and by ``SessionDirManager`` — an
+    idle bot builds no manager (review of c309374). Only a hint: never creates
+    the root.
+    """
+    if not root:
+        return
+    try:
+        base = Path(root)
+        marker = base / SESSIONS_ROOT_MARKER
+        if base.is_dir() and not os.path.lexists(marker):
+            marker.write_text(
+                "c-lord sessions root: workspaces here may be deleted by its sweeps\n",
+                encoding="utf-8",
+            )
+    except (OSError, ValueError) as exc:
+        logger.info("could not mark sessions root %s: %s", root, exc)
+
+
 def _in_clord_workspace(local: str) -> bool:
     """Is *local* inside any c-lord sessions root or workspace, of any instance (#1289)?
 
-    True when it, or a directory above it, carries :data:`SESSIONS_ROOT_MARKER`
-    or is a checkout c-lord has worked in (a ``.git`` with c-lord's co-author
-    file, or the injected ``discord-read`` skill next to a ``.git``). A
-    question that cannot be answered counts as yes: keep.
+    True when it, or a directory above it, carries :data:`SESSIONS_ROOT_MARKER`,
+    or when a directory above it has the workspace shape ``<root>/<channel>/<thread>``
+    (both all digits) and c-lord has worked in it (a ``.git`` with c-lord's
+    co-author file, or the injected ``discord-read`` skill). The shape matters
+    (review of c309374): c-lord also injects into checkouts outside any root — a
+    channel's local source repo, a dotfiles repo at ``~`` — and those must still
+    vouch, or every untouched clone of them is kept forever. A question that
+    cannot be answered counts as yes: keep.
     """
     try:
         here = Path(local)
         for d in (here, *here.parents):
             if os.path.lexists(d / SESSIONS_ROOT_MARKER):
                 return True
-            if os.path.lexists(d / COAUTHOR_DATA_FILE):  # *d* is a workspace's git dir
-                return True
-            if not os.path.lexists(d / ".git"):
+            if not (d.name.isdigit() and d.parent.name.isdigit()):
                 continue
             if os.path.lexists(d / ".git" / COAUTHOR_DATA_FILE) or os.path.lexists(
                 d / ".claude" / "skills" / READ_SKILL_NAME
@@ -2232,22 +2257,7 @@ class SessionDirManager:
         self._mark_sessions_root()
 
     def _mark_sessions_root(self) -> None:
-        """Leave :data:`SESSIONS_ROOT_MARKER` at the sessions root (#1289).
-
-        Lets *another* c-lord instance on this host (prod vs staging) tell that
-        a remote under this root is a workspace that a sweep may delete. Only
-        a hint: never creates the root, never raises.
-        """
-        try:
-            root = Path(self._sessions_root)
-            marker = root / SESSIONS_ROOT_MARKER
-            if root.is_dir() and not os.path.lexists(marker):
-                marker.write_text(
-                    "c-lord sessions root: workspaces here may be deleted by its sweeps\n",
-                    encoding="utf-8",
-                )
-        except (OSError, ValueError) as exc:
-            logger.info("could not mark sessions root %s: %s", self._sessions_root, exc)
+        mark_sessions_root(self._sessions_root)
 
     @property
     def base_dir(self) -> str:

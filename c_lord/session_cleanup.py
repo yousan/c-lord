@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .retention import claude_transcript_retention_days
-from .session_dir import describe_changes, worktree_status
+from .session_dir import describe_changes, mark_sessions_root, worktree_status
 from .tmux import release_window_number
 from .transcript.resolver import derive_project_dir, latest_session_jsonl
 
@@ -258,6 +258,7 @@ def remove_clean_session_dir(
     not a git repository at all", where cleanliness cannot be established, and
     "where session dirs live is unknown" (``sessions_root=None``).
     """
+    mark_sessions_root(sessions_root)  # #1289: another instance must see this root
     working_dir = (record.working_dir or "").strip()
     if not working_dir:
         return DirOutcome.ABSENT

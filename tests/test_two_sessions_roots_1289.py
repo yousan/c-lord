@@ -110,13 +110,116 @@ def test_two_roots_both_instances_running(tmp_path: Path, sub: bool) -> None:
     assert not st_b.clean, f"B vouched by prod's workspace: {sha}"
 
 
+@pytest.mark.parametrize("marker", ["coauthor", "skill"])
 @pytest.mark.parametrize("sub", [False, True])
-def test_neighbour_workspace_with_clord_markers_does_not_vouch(tmp_path: Path, sub: bool) -> None:
-    """No root marker (an older instance), but B is a checkout c-lord has worked in."""
-    root, _other, a, b, sha = _mutual(tmp_path, sub)
-    assert install_coauthor_hook(b) is not None
+def test_neighbour_workspace_with_clord_markers_does_not_vouch(
+    tmp_path: Path, sub: bool, marker: str
+) -> None:
+    """No root marker (an older instance), but B at ``<root>/<ch>/<thr>`` is c-lord's."""
+    root = _seed(tmp_path)
+    a = _ws(tmp_path, root / "111", "4242")
+    b = _ws(tmp_path, tmp_path / "other-sessions" / "222", "4343")
+    p = _sub(sub)
+    sha = _work(p(a))
+    git(p(b), "fetch", "-q", str(p(a)), "work:work")
+    git(p(a), "remote", "add", "b", str(p(b)))
+    git(p(a), "fetch", "-q", "b")
+    _mark_workspace(b, marker)
+    assert not (tmp_path / "other-sessions" / sd.SESSIONS_ROOT_MARKER).exists()
     st = sd.worktree_status(str(a), sessions_root=str(root))
     assert not st.clean, f"A vouched by a c-lord workspace outside its root: {sha}"
+
+
+def _mark_workspace(ws: Path, marker: str) -> None:
+    if marker == "coauthor":
+        assert install_coauthor_hook(ws) is not None
+    else:
+        skill = ws / ".claude" / "skills" / "discord-read"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("x\n")
+
+
+@pytest.mark.parametrize("marker", ["coauthor", "skill"])
+def test_local_source_repo_with_clord_markers_still_vouches(tmp_path: Path, marker: str) -> None:
+    """Review of c309374 (over-keep): c-lord also injects into checkouts outside any root.
+
+    A channel bound to a local source repo (``origin=/home/<user>/c-lord``) that
+    carries the co-author file or the skill must still vouch, or every untouched
+    clone of it would be kept forever.
+    """
+    _seed(tmp_path)
+    src = tmp_path / "home" / "src"
+    git(tmp_path, "clone", "-q", str(tmp_path / "parent.git"), str(src))
+    _mark_workspace(src, marker)
+    root = tmp_path / "sessions"
+    mgr = sd.SessionDirManager(base_dir=str(root / "111"), source_repo=str(src))
+    ws = Path(mgr.create_session_dir(4242))
+    r = mgr.cleanup_for_thread(4242)
+    assert not ws.exists(), r.reason
+
+
+@pytest.mark.parametrize("sub", [False, True])
+def test_unmarked_roots_swept_one_by_one_keep_a_copy(tmp_path: Path, sub: bool) -> None:
+    """Review of c309374 (loss): no manager was ever built, so neither root is marked.
+
+    Old workspaces carry no c-lord marker. The orphan sweep of each root (it
+    builds no ``SessionDirManager``) must mark its own root before it judges,
+    so the second sweep does not trust the first one's deleted workspace.
+    """
+    from c_lord.orphan_dirs import remove_orphan_dir
+
+    root, other, a, b, sha = _mutual(tmp_path, sub)
+    assert not (root / sd.SESSIONS_ROOT_MARKER).exists()
+    assert not (other / sd.SESSIONS_ROOT_MARKER).exists()
+    r = [remove_orphan_dir(a, sessions_root=root), remove_orphan_dir(b, sessions_root=other)]
+    assert _alive(a, b), f"prod then staging orphan sweep deleted {sha}: {r}"
+
+
+class _NoRows:
+    async def all_working_dirs(self) -> set[str]:
+        return set()
+
+
+async def test_orphan_sweep_loop_marks_its_root(tmp_path: Path) -> None:
+    """The loop's first pass runs 5 min after start: the root is marked at start."""
+    from c_lord.orphan_dirs import OrphanSweepLoop
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    loop = OrphanSweepLoop(_NoRows(), root, min_idle_days=30, container_scan=_no_containers)
+    loop.start()
+    try:
+        assert (root / sd.SESSIONS_ROOT_MARKER).is_file()
+    finally:
+        await loop.stop()
+    (root / sd.SESSIONS_ROOT_MARKER).unlink()
+    await loop.tick()
+    assert (root / sd.SESSIONS_ROOT_MARKER).is_file()
+
+
+async def _no_containers(known: set[str]) -> list:
+    return []
+
+
+def test_thirty_day_sweep_marks_its_root(tmp_path: Path) -> None:
+    from c_lord.database.repository import SessionRecord
+    from c_lord.session_cleanup import remove_clean_session_dir
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    rec = SessionRecord(1, "s", str(root / "1" / "1"), None, "chat", None, "", "")
+    remove_clean_session_dir(rec, sessions_root=root)
+    assert (root / sd.SESSIONS_ROOT_MARKER).is_file()
+
+
+async def test_startup_marks_the_session_dir_base(tmp_path: Path, monkeypatch) -> None:
+    """An idle bot builds no manager: setup itself marks the root it was given."""
+    from .test_setup import _boot_for_base
+
+    base = tmp_path / "sessions"
+    base.mkdir()
+    await _boot_for_base(tmp_path, monkeypatch, session_dir_base=str(base))
+    assert (base / sd.SESSIONS_ROOT_MARKER).is_file()
 
 
 @pytest.mark.parametrize("sub", [False, True])
