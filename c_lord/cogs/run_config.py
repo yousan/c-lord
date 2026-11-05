@@ -161,6 +161,9 @@ class RunConfig:
     # send or the start succeeded) — the pane answers the input it got last,
     # so this is where a turn becomes "the latest". ``None`` ⇒ nothing to do.
     on_prompt_sent: Callable[[], Awaitable[None]] | None = None
+    # #1262: called right before the prompt is handed to tmux — after this, a
+    # cancelled turn may still have delivered it. ``None`` ⇒ nothing to do.
+    on_send_started: Callable[[], None] | None = None
 
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is

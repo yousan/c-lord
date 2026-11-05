@@ -1600,6 +1600,10 @@ class TmuxClaudeRunner:
         # send or the start succeeded) — the moment that decides which turn the
         # pane answers. Set by ``run_claude_with_config`` from the RunConfig.
         self.on_prompt_sent: Callable[[], Awaitable[None]] | None = None
+        # #1262: called right before this run's prompt is handed to tmux (the
+        # send / start runs in a worker thread and can take ~20s, #1169). A turn
+        # cancelled after this may still have delivered its keys.
+        self.on_send_started: Callable[[], None] | None = None
         self._last_capture: str = ""
         # #809: why the last menu answer did not reach the TUI, in words the
         # thread can be shown. Empty until an answer fails.
@@ -1747,6 +1751,20 @@ class TmuxClaudeRunner:
         )
         return _missing_window("Claude の起動", self._thread_id)
 
+    def _note_send_started(self) -> None:
+        """Tell :attr:`on_send_started` the prompt is being handed to tmux (#1262)."""
+        hook = self.on_send_started
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            logger.warning(
+                "%s on_send_started failed (#1262)",
+                log_ctx(thread_id=self._thread_id),
+                exc_info=True,
+            )
+
     async def _note_prompt_sent(self) -> None:
         """Tell :attr:`on_prompt_sent` that this run's prompt is in the pane (#1262).
 
@@ -1866,6 +1884,7 @@ class TmuxClaudeRunner:
                 yield stopped
                 return
             self._take_send_failure()  # #809: only this send's refusal may explain it
+            self._note_send_started()
             ok = await asyncio.to_thread(
                 self._tmux.send_input,
                 self._thread_id,
@@ -1928,6 +1947,7 @@ class TmuxClaudeRunner:
                 # Try --continue first; if Claude exits immediately (no session),
                 # fall back to a fresh start (issue #123 Part 2).
                 await self._note_resume_baseline()
+                self._note_send_started()
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,
@@ -1957,6 +1977,7 @@ class TmuxClaudeRunner:
                         "falling back to fresh start",
                         self._thread_id,
                     )
+                    self._note_send_started()
                     ok = await asyncio.to_thread(
                         self._tmux.start_claude,
                         self._thread_id,
@@ -1983,6 +2004,7 @@ class TmuxClaudeRunner:
             else:
                 # Normal cold start: /clear, new thread, any non-resume path.
                 # Always fresh — never --continue (would recover cleared history).
+                self._note_send_started()
                 ok = await asyncio.to_thread(
                     self._tmux.start_claude,
                     self._thread_id,

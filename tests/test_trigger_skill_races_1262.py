@@ -63,8 +63,12 @@ async def _chat_turn(
     before_send: Callable[[], Awaitable[None]] | None = None,
     before_run: Callable[[], Awaitable[None]] | None = None,
     delivered: bool = True,
+    sending: bool = False,
 ) -> None:
     """A's message turn through the real ClaudeChatCog._run_claude, to its end.
+
+    ``sending=True``: the runner has begun the send (``on_send_started``) before
+    *before_send* — the keys may land even if the turn is cancelled there.
 
     *before_run* runs when the trigger is recorded and the Stop notice is being
     posted — before ``run_claude_with_config``. The run does what the runner
@@ -101,6 +105,8 @@ async def _chat_turn(
     async def run(config) -> None:  # noqa: ANN001
         turn_events.begin_turn(config.thread, config.started_by or turn_events.StartedBy("user"))
         await repo.save(42, "sess-1")
+        if sending and (started := getattr(config, "on_send_started", None)) is not None:
+            started()
         if before_send is not None:
             await before_send()
         # RunConfig.on_prompt_sent (#1262); absent before it existed.
@@ -521,9 +527,10 @@ async def test_the_runner_reports_the_prompt_only_after_send_input_succeeded() -
         calls.append("hook")
 
     runner.on_prompt_sent = hook
+    runner.on_send_started = lambda: calls.append("started")
     with patch.object(TmuxClaudeRunner, "peek_pending_ask", AsyncMock(return_value=None)):
         await _until_hook_or_end(runner, calls)
-    assert calls[:2] == ["send_input", "hook"], calls
+    assert calls[:3] == ["started", "send_input", "hook"], calls
 
 
 async def test_the_runner_does_not_report_a_prompt_that_was_not_delivered() -> None:
@@ -552,9 +559,10 @@ async def test_the_runner_reports_the_prompt_of_a_cold_start() -> None:
         calls.append("hook")
 
     runner.on_prompt_sent = hook
+    runner.on_send_started = lambda: calls.append("started")
     with patch.object(TmuxClaudeRunner, "_handle_startup_prompts", AsyncMock()):
         await _until_hook_or_end(runner, calls)
-    assert calls[:2] == ["start_claude", "hook"], calls
+    assert calls[:3] == ["started", "start_claude", "hook"], calls
 
 
 async def test_run_claude_with_config_hands_on_prompt_sent_to_the_runner(monkeypatch) -> None:  # noqa: ANN001
@@ -571,11 +579,12 @@ async def test_run_claude_with_config_hands_on_prompt_sent_to_the_runner(monkeyp
     async def hook() -> None:
         calls.append("hook")
 
-    config = _config(on_prompt_sent=hook)
+    config = _config(on_prompt_sent=hook, on_send_started=lambda: calls.append("started"))
     runner = config.runner
 
     async def run(prompt: str, session_id: str | None = None):  # noqa: ANN202
         yield StreamEvent(message_type=MessageType.SYSTEM, session_id="s1")
+        runner.on_send_started()
         await runner.on_prompt_sent()
         yield StreamEvent(message_type=MessageType.RESULT, is_complete=True)
 
@@ -586,7 +595,7 @@ async def test_run_claude_with_config_hands_on_prompt_sent_to_the_runner(monkeyp
     finally:
         turn_events.reset()
         _run_helper._IN_FLIGHT.clear()
-    assert calls == ["hook"]
+    assert calls == ["started", "hook"]
 
 
 # -- Shutdown: refused clears are written before the process stops ----------
@@ -755,7 +764,7 @@ async def test_a_turn_cancelled_before_its_send_returned_keeps_its_trigger(tmp_p
         sending.set()
         await asyncio.Event().wait()  # send_input still running
 
-    task = asyncio.create_task(_chat_turn(repo, mirror, 556, before_send=before_send))
+    task = asyncio.create_task(_chat_turn(repo, mirror, 556, before_send=before_send, sending=True))
     await sending.wait()
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -776,6 +785,7 @@ def _resume_runner(calls: list[str], *, resume_failed: bool, start_ok: bool = Tr
         calls.append("hook")
 
     runner.on_prompt_sent = hook
+    runner.on_send_started = lambda: calls.append("started")
     return runner, [
         patch.object(TmuxClaudeRunner, "_handle_startup_prompts", AsyncMock()),
         patch.object(TmuxClaudeRunner, "_note_resume_baseline", AsyncMock()),
@@ -791,7 +801,7 @@ async def test_the_runner_reports_the_prompt_of_a_resume() -> None:
         for p in patches:
             stack.enter_context(p)
         await _until_hook_or_end(runner, calls)
-    assert calls[:2] == ["start_claude", "hook"], calls
+    assert calls[:3] == ["started", "start_claude", "hook"], calls
 
 
 async def test_the_runner_reports_the_prompt_once_after_a_resume_falls_back() -> None:
@@ -803,7 +813,7 @@ async def test_the_runner_reports_the_prompt_once_after_a_resume_falls_back() ->
         for p in patches:
             stack.enter_context(p)
         await _until_hook_or_end(runner, calls)
-    assert calls[:3] == ["start_claude", "start_claude", "hook"], calls
+    assert calls[:5] == ["started", "start_claude", "started", "start_claude", "hook"], calls
     assert calls.count("hook") == 1
 
 
@@ -826,3 +836,96 @@ async def test_the_runner_does_not_report_a_cold_start_that_failed() -> None:
         events = await _until_hook_or_end(runner, calls)
     assert "hook" not in calls, calls
     assert events and events[-1].is_complete and events[-1].error
+
+
+# -- A turn cancelled before its send began owns no answer (W57 round 14) -----
+#
+# "Cancelled before the send" = A's task is cancelled while still posting its
+# Stop notice (``before_run``: run_claude_with_config never started) or after
+# its run started but before the runner began the send (``before_send``).
+
+
+async def _cancel_a(where: str, repo, mirror):  # noqa: ANN001, ANN202
+    """Start A's turn, wait until it parks at *where*, return (task, cancel())."""
+    parked = asyncio.Event()
+
+    async def park() -> None:
+        parked.set()
+        await asyncio.Event().wait()
+
+    kw = {"before_run": park} if where == "before_run" else {"before_send": park}
+    task = asyncio.create_task(_chat_turn(repo, mirror, 556, **kw))
+    await parked.wait()
+
+    async def cancel() -> None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    return task, cancel
+
+
+def _verdict(repo, ref, after):  # noqa: ANN001, ANN202
+    """S's answer must not reply to A, and a restart must not ping A."""
+    return (
+        (ref is None or ref.message_id != 556) and not after.endswith(f"<@{A}>"),
+        ("reply_to", ref and ref.message_id, "after", after, "row", _row_trigger(repo.db_path)),
+    )
+
+
+async def _s2(tmp_path, monkeypatch, where: str):  # noqa: ANN001, ANN202
+    monkeypatch.delenv(turn_events.ENV_LOG, raising=False)
+    monkeypatch.delenv(turn_events.ENV_URL, raising=False)
+    repo, _b, _c, mirror = await _setup(tmp_path)
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        _t, cancel = await _cancel_a(where, repo, mirror)
+        await cancel()  # A never reached run / never sent
+        return True, "/sessions/999/42"
+
+    turn_events.reset()
+    try:
+        with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+            await _skill_turn(repo, 42, S, mirror=mirror)
+        ref = await mirror._build_trigger_reference(42)
+        after = await _after_restart(repo.db_path)
+    finally:
+        turn_events.reset()
+    return _verdict(repo, ref, after)
+
+
+async def test_s2_a_cancelled_before_run_during_skill_prepare(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    ok, info = await _s2(tmp_path, monkeypatch, "before_run")
+    assert ok, info
+
+
+async def test_s2_a_cancelled_before_send_during_skill_prepare(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    ok, info = await _s2(tmp_path, monkeypatch, "before_send")
+    assert ok, info
+
+
+async def test_s3_skill_sent_while_a_in_flight_then_a_cancelled_before_send(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    monkeypatch.delenv(turn_events.ENV_LOG, raising=False)
+    monkeypatch.delenv(turn_events.ENV_URL, raising=False)
+    repo, _b, _c, mirror = await _setup(tmp_path)
+    holder: list = []
+
+    async def prepare(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        holder.append(await _cancel_a("before_send", repo, mirror))
+        return True, "/sessions/999/42"
+
+    async def skill_after_send() -> None:
+        await holder[0][1]()  # A cancelled; its prompt was never sent
+
+    turn_events.reset()
+    try:
+        with patch.object(skill_command.SkillCommandCog, "_prepare_workspace", prepare):
+            await _skill_turn(repo, 42, S, mirror=mirror, after_send=skill_after_send)
+        ref = await mirror._build_trigger_reference(42)
+        after = await _after_restart(repo.db_path)
+    finally:
+        turn_events.reset()
+    ok, info = _verdict(repo, ref, after)
+    assert ok, info

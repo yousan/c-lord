@@ -4426,7 +4426,7 @@ class ClaudeChatCog(commands.Cog):
             )
 
     async def _end_trigger_in_flight(
-        self, thread_id: int, message_id: int, *, cancelled: bool = False
+        self, thread_id: int, message_id: int, *, send_may_have_landed: bool = False
     ) -> None:
         """This message turn is over; if its prompt never reached the pane, drop
         its trigger — #1262 (W57 round 13).
@@ -4437,16 +4437,18 @@ class ClaudeChatCog(commands.Cog):
         reply to this message and, after a restart, the ❌ would ping its author.
         Exact ids only — a newer turn's trigger is never touched. Never raises.
 
-        Not when the turn was *cancelled* (a shutdown, a preempting message):
-        its ``send_input`` may still have been running in the worker thread
-        (#1169 can take ~20s), the keys may well have landed and Claude may
-        answer after the restart — so the trigger stays, as before.
+        Not when the turn was cancelled (a shutdown, a preempting message)
+        *after the runner began the send* (*send_may_have_landed*): its
+        ``send_input`` may still have been running in the worker thread (#1169
+        can take ~20s), the keys may well have landed and Claude may answer
+        after the restart — so the trigger stays. A turn cancelled before the
+        send began delivered nothing and is dropped like any other (W57 r14).
         """
         try:
             unsent = self.repo.end_trigger_in_flight(thread_id, message_id) is True
         except Exception:
             return
-        if not unsent or cancelled:
+        if not unsent or send_may_have_landed:
             return
         mirror = getattr(self.bot, "transcript_mirror_cog", None)
         forget = getattr(mirror, "forget_trigger_message", None)
@@ -4763,6 +4765,7 @@ class ClaudeChatCog(commands.Cog):
                         thread.id,
                         exc_info=True,
                     )
+            send_began = asyncio.Event()  # #1262: set by the runner's on_send_started
             # #1262: from here until its prompt is in the pane (or the turn
             # ends), a /skill sent meanwhile does not take this trigger away. The
             # run's ``finally`` removes the mark; this one covers the steps before.
@@ -4832,13 +4835,12 @@ class ClaudeChatCog(commands.Cog):
                     # the turn the pane answers — a /skill sent before it no longer
                     # takes this trigger away, one sent after it does.
                     on_prompt_sent=self._prompt_sent_noter(thread.id, user_message.id),
+                    # #1262: from here a cancel may have delivered the prompt.
+                    on_send_started=send_began.set,
                 )
-            except BaseException as exc:
-                await self._end_trigger_in_flight(
-                    thread.id,
-                    user_message.id,
-                    cancelled=isinstance(exc, asyncio.CancelledError),
-                )
+            except BaseException:
+                # Before the run: nothing was sent, cancelled or not.
+                await self._end_trigger_in_flight(thread.id, user_message.id)
                 raise
 
             run_cancelled = False
@@ -4868,7 +4870,9 @@ class ClaudeChatCog(commands.Cog):
                     self.repo.discard_pending_trigger(thread.id, user_message.id)
                 # #1262: sent or not, this turn's prompt is no longer on its way.
                 await self._end_trigger_in_flight(
-                    thread.id, user_message.id, cancelled=run_cancelled
+                    thread.id,
+                    user_message.id,
+                    send_may_have_landed=run_cancelled and send_began.is_set(),
                 )
 
                 with contextlib.suppress(Exception):
