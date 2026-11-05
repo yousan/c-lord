@@ -42,6 +42,8 @@ from .skills.injector import LEGACY_SKILL_NAMES, READ_SKILL_NAME
 logger = logging.getLogger(__name__)
 
 _THREAD_DIR_RE = re.compile(r"^\d+$")
+#: A full object name, as a detached ``HEAD`` file holds it (#1198).
+_SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
 
 def _run(
@@ -172,7 +174,7 @@ class WorktreeStatus:
     #: Stashes inside submodules, as ``"<path>: N stash entries"`` (#1121). They
     #: live in ``<ws>/.git/modules/<name>`` — deleting the dir deletes them —
     #: and the parent's status and ``refs/stash`` never show them. Commits in a
-    #: submodule on no remote-tracking ref nor tag are reported here too, as
+    #: submodule on no remote-tracking ref (tags never count) are reported here too, as
     #: ``"<path>: N unpushed commit(s)"`` (#1198) — checked out or not, the
     #: parent's status need not show them.
     submodule_stashes: tuple[str, ...] = ()
@@ -385,8 +387,8 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
     per checked-out submodule one ``rev-parse`` (stash), one ``rev-list``
     (unpushed) and — while nesting may go deeper — one ``ls-files`` of its own.
     Each unclaimed module git dir costs one ``rev-parse`` and one ``rev-list``.
-    A ``rev-list`` that finds commits asks up to three more, to let tags vouch
-    for a pinned HEAD (:func:`_local_only_commits`). An embedded repo's own
+    Tags never count as pushed (:func:`_local_only_commits`). Linked
+    worktrees' HEADs are read from files, not asked. An embedded repo's own
     ``.git/modules`` is walked the same way (a ``stat`` when it has none).
     #1181 had kept checked-out submodules to the stash call alone; #1198 showed
     their commits are lost without the parent's ``git status`` showing anything
@@ -433,7 +435,8 @@ def _checked_out_submodule_stashes(
             found.append(note)
         # #1198: the parent's status says nothing about commits that are on a
         # branch HEAD left, or that the parent recorded and pushed.
-        note = _unpushed_note(name, _local_only_commits(str(sub)))
+        own_git_dir = linked if linked is not None else sub / ".git"
+        note = _unpushed_note(name, _local_only_commits(str(sub), own_git_dir))
         if note:
             found.append(note)
         found += _checked_out_submodule_stashes(
@@ -472,7 +475,7 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
             note = _stash_note(name, _stash_entries(str(child), git_dir=True))
             if note:
                 found.append(note)
-            note = _unpushed_note(name, _local_only_commits(str(child), git_dir=True))
+            note = _unpushed_note(name, _local_only_commits(str(child), child, git_dir=True))
             if note:
                 found.append(note)
         if (child / "modules").is_dir():
@@ -482,53 +485,57 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
     return found
 
 
-def _local_only_commits(path: str, *, git_dir: bool = False) -> int | None:
+def _worktree_heads(git_dir: Path) -> list[str]:
+    """Detached HEADs of the linked worktrees of *git_dir* (``worktrees/*/HEAD``).
+
+    A commit made in ``git worktree add --detach`` lives in this git dir and is
+    on no branch; only that file points at it (#1198). A worktree on a branch
+    is already counted through ``--branches``. A plain file read, no git call.
+    """
+    heads: list[str] = []
+    try:
+        entries = sorted((git_dir / "worktrees").iterdir())
+    except OSError:
+        return heads
+    for entry in entries:
+        try:
+            line = (entry / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if _SHA_RE.match(line):
+            heads.append(line)
+    return heads
+
+
+def _local_only_commits(path: str, own_git_dir: Path, *, git_dir: bool = False) -> int | None:
     """Commits in a submodule that exist on no remote (#1198).
 
-    The same idea as the workspace's own count (:func:`_unpushed_commits`):
-    HEAD (detached too) and every local branch, ``--not --remotes``; a repo
-    with no remote counts every commit. Local refs only — no ``ls-remote``.
-    ``None`` when git failed; the caller keeps the dir then.
+    The same rule as the workspace's own count (:func:`_unpushed_commits`):
+    HEAD (detached too), every local branch and every linked worktree's
+    detached HEAD, ``--not --remotes``. A repo with no remote counts every
+    commit — there are no remote refs to subtract. Local refs only, no
+    ``ls-remote``; one git call. ``--ignore-missing`` lets an unborn HEAD count
+    as nothing. ``None`` when git failed; the caller keeps the dir then.
 
-    Tags vouch only for a commit HEAD reaches and no branch does — a submodule
-    pinned to a release tag on no branch is nothing to lose, and was kept
-    forever. They never vouch for a branch's commits (a local ``git tag wip``
-    hid a work branch), nor in a repo with no remote (its tags are no copy).
-
-    Usually one call: ``rev-list HEAD --branches --not --remotes`` is 0, done.
-    Only when it is not are up to three more asked (is there a remote; HEAD's
-    own commits past tags; the branches' count). ``--ignore-missing`` lets an
-    unborn HEAD count as nothing.
+    Tags never count as pushed: a tag lives in the same git dir that deleting
+    removes, and a fetched tag cannot be told from a hand-made ``git tag wip``
+    — counting tags lost the only copy of a tagged detached commit.
 
     With *git_dir*, *path* is a git dir whose checkout may be gone — as in
-    :func:`_stash_entries`, it stands in as its own work tree.
+    :func:`_stash_entries`, it stands in as its own work tree. *own_git_dir*
+    is the git dir holding ``worktrees/``.
     """
     pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
-
-    def count(*revs: str) -> int | None:
-        result = _run([*pre, "rev-list", "--count", "--ignore-missing", *revs], cwd=path)
-        if result.returncode != 0:
-            return None
-        try:
-            return int(result.stdout.strip() or "0")
-        except ValueError:
-            return None
-
-    total = count("HEAD", "--branches", "--not", "--remotes")
-    if not total:
-        return total  # 0, or None (unknown)
-    remotes = _run(
-        [*pre, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes"], cwd=path
+    revs = ["HEAD", "--branches", *_worktree_heads(own_git_dir)]
+    result = _run(
+        [*pre, "rev-list", "--count", "--ignore-missing", *revs, "--not", "--remotes"], cwd=path
     )
-    if remotes.returncode != 0:
+    if result.returncode != 0:
         return None
-    if not remotes.stdout.strip():
-        return total  # no remote: every commit is the only copy
-    head_only = count("HEAD", "--not", "--branches", "--remotes", "--tags")
-    branches = count("--branches", "--not", "--remotes")
-    if head_only is None or branches is None:
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
         return None
-    return branches + head_only
 
 
 def _unpushed_note(name: str, n: int | None) -> str | None:

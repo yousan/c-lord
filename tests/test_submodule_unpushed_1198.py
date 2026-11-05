@@ -302,9 +302,12 @@ def test_embedded_repo_local_only_commits_are_kept(tmp_path: Path) -> None:
     assert "emb: 1 unpushed commit(s)" in r.reason
 
 
-def test_deinit_submodule_pinned_to_a_tag_on_no_branch_is_clean(tmp_path: Path) -> None:
-    """A submodule pinned to a release tag whose commit is on no branch: the tag
-    is on the remote, so nothing is lost — not kept forever as "unpushed"."""
+def test_deinit_submodule_pinned_to_a_tag_on_no_branch_is_kept(tmp_path: Path) -> None:
+    """A submodule pinned to a release tag whose commit is on no branch is kept.
+
+    Accepted over-keep: tags never count as pushed. The tag lives in the same
+    ``.git/modules/sub`` that deleting removes, and a fetched tag cannot be told
+    from a hand-made ``git tag wip`` (which lost the only copy of a commit)."""
     ws, subr = _workspace(tmp_path)
     seed = tmp_path / "subremote-seed"
     git(seed, "checkout", "-q", "--detach")
@@ -319,11 +322,11 @@ def test_deinit_submodule_pinned_to_a_tag_on_no_branch_is_clean(tmp_path: Path) 
     assert not git(sub, "branch", "-r", "--contains", "v1").strip()  # on no branch
     git(ws, "submodule", "deinit", "-q", "-f", "sub")
     st = worktree_status(str(ws))
-    assert st.clean, describe_changes(st)
-    assert _delete(ws).removed
+    assert "sub: 1 unpushed commit(s)" in describe_changes(st)
+    assert not _delete(ws).removed
 
 
-# ---- review of 7890ea3: tags only vouch for a pinned HEAD, and only with a remote ----
+# ---- review of 7890ea3 and 2e59e3b: tags never count as pushed ----
 
 
 def test_tagged_commit_in_repo_with_no_remote_is_kept(tmp_path: Path) -> None:
@@ -386,3 +389,41 @@ def test_deinit_submodule_inside_embedded_repo_stash_is_kept(tmp_path: Path) -> 
     st = worktree_status(str(ws))
     assert not st.clean, describe_changes(st)
     assert "emb/inner: 1 stash entry" in describe_changes(st)
+
+
+def _detached_commit_with_local_tag(ws: Path) -> str:
+    sha = _commit_in_sub(ws, branch=None)
+    git(ws / "sub", "tag", "wip")  # made here: the tag is no copy anywhere else
+    return sha
+
+
+def test_local_tag_on_detached_commit_recorded_by_parent_is_kept(tmp_path: Path) -> None:
+    ws, subr = _workspace(tmp_path)
+    sha = _detached_commit_with_local_tag(ws)
+    git(ws, "add", "sub")
+    git(ws, "commit", "-qm", "bump sub")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    assert git(ws, "status", "--porcelain").strip() == ""
+    _assert_kept(ws, subr, sha)
+
+
+def test_local_tag_on_detached_commit_then_deinit_is_kept(tmp_path: Path) -> None:
+    ws, subr = _workspace(tmp_path)
+    sha = _detached_commit_with_local_tag(ws)
+    git(ws, "submodule", "deinit", "-q", "-f", "sub")
+    _assert_kept(ws, subr, sha)
+
+
+def test_detached_commit_in_linked_worktree_of_submodule_is_kept(tmp_path: Path) -> None:
+    """``git worktree add --detach`` elsewhere: its HEAD is only in
+    ``<gitdir>/worktrees/*/HEAD``, and its commit only in .git/modules/sub."""
+    ws, subr = _workspace(tmp_path)
+    wt = tmp_path / "elsewhere" / "wt"
+    git(ws / "sub", "worktree", "add", "-q", "--detach", str(wt))
+    (wt / "wt.txt").write_text("only in the worktree\n")
+    git(wt, "add", "wt.txt")
+    git(wt, "commit", "-qm", "worktree work")
+    sha = git(wt, "rev-parse", "HEAD").strip()
+    assert git(ws, "status", "--porcelain").strip() == ""
+    _assert_kept(ws, subr, sha)
+    assert "sub: 1 unpushed commit(s)" in describe_changes(worktree_status(str(ws)))
