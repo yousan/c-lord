@@ -230,6 +230,9 @@ _TRUST_BOOT_TIMEOUT = 20.0
 _PASTE_FOLD_MIN_CHARS = 300
 # Pause between the last chunk of text and Enter, so the fold completes first.
 _PASTE_SETTLE = 0.4
+# #872/#1263: how many times an empty box is read after the first piece of a
+# long message before the piece counts as lost (each look waits _PASTE_SETTLE).
+_FIRST_PIECE_LOOKS = 4
 # #560: waits around reading the input box back after Enter. The first check is
 # delayed so the TUI has redrawn; later ones pace the retries.
 _SUBMIT_SETTLE = 0.35
@@ -813,30 +816,40 @@ def _input_box_retains(pane_text: str, payload: str) -> bool | None:
     return head in box or tail in box
 
 
-def _input_box_lost_head(pane_text: str, payload: str) -> bool:
-    """Does the box hold *payload*'s end but not its start? (#872)
+# A fold placeholder in a whitespace-free box: ``[Pastedtext#3+22lines]``. The
+# count is the pasted text's newline count (measured on 2.1.318: a piece with 22
+# newlines folds to ``+22 lines``).
+_FOLD_RE = re.compile(r"\[Pastedtext#\d+(?:\+(\d+)lines?)?\]")
 
-    Only meaningful for a payload typed in more than one piece: the first piece
-    always folds into ``[Pasted text …]``, so a box with neither that fold nor
-    the payload's first characters — yet with its last ones — lost the first
-    piece. Anything less certain is ``False``.
 
-    #1263: "start not visible" is not enough. The box has a maximum height
-    (15 rows in a 40-row pane on 2.1.318) and scrolls to the cursor, so a
-    message taller than that shows only its last rows — fold and first
-    characters included in what is scrolled away. A 5,909-character request
-    was refused twice that way. The evidence is therefore the shape #872
-    actually saw: the box holds **exactly** the pieces after a piece boundary
-    (``す。`` — mid-sentence, where the second piece began). A scrolled box
-    starts at a display row instead and does not match. A head lost *and*
-    scrolled out of view cannot be told apart from a whole message, so it is
-    let through (#544); the transcript-side #872 WARNING still reports it.
+def _first_piece_state(pane_text: str, piece: str) -> str | None:
+    """Did the first piece of a multi-piece message land whole? (#872, #1263)
+
+    Read right after the first piece is typed, while the box is still small —
+    after the rest it may be taller than the box's maximum height and show
+    only its last rows (#1263), which says nothing about the start.
+
+    * ``"landed"`` — the box holds a ``[Pasted text …]`` fold whose line count
+      is the piece's own (or has none to compare), or the piece's first
+      characters typed as text.
+    * ``"empty"`` — nothing arrived (yet).
+    * ``"lost"`` — something else: only the piece's end, a U+FFFD, a fold of
+      another size. The piece did not arrive whole.
+    * ``None`` — no box to read (#544: never act without evidence).
     """
     box = _input_box_text(pane_text)
-    if not box or _PASTED_PLACEHOLDER in box:
-        return False
-    chunks = _chunk_for_send_keys(payload)
-    return any(box == _squash("".join(chunks[k:])) for k in range(1, len(chunks)))
+    if box is None:
+        return None
+    if not box:
+        return "empty"
+    counts = [m.group(1) for m in _FOLD_RE.finditer(box)]
+    if counts:
+        known = [int(c) for c in counts if c is not None]
+        if not known or sum(known) == piece.count("\n") or known[-1] == piece.count("\n"):
+            return "landed"
+        return "lost"
+    head = _squash(piece)[:_PAYLOAD_FINGERPRINT]
+    return "landed" if head and head in box else "lost"
 
 
 def _pane_has_open_menu(pane_text: str) -> bool:
@@ -3079,7 +3092,19 @@ class TmuxSessionManager:
 
         payload = shield_input(text, as_command=as_command)
         errors: list[str] = []
-        if not self._type_literal(target, payload, what="send_input", errors=errors):
+        pieces = _chunk_for_send_keys(payload)
+        # #872/#1263: a message typed in pieces must not go out without its
+        # first one. The first piece is typed and checked on its own, while
+        # the box is still small enough to show it, before the rest follows.
+        if len(pieces) > 1:
+            if not self._ensure_head_landed(target, payload, thread_id):
+                return False
+            rest = payload[len(pieces[0]) :]
+            if not self._type_literal(target, rest, what="send_input", errors=errors):
+                self._note_send_failure(thread_id, errors)
+                self._wipe_box(target, payload)
+                return False
+        elif not self._type_literal(target, payload, what="send_input", errors=errors):
             self._note_send_failure(thread_id, errors)
             return False
         _remember_typed(thread_id, payload)
@@ -3096,12 +3121,6 @@ class TmuxSessionManager:
         # the old zero-latency path.
         if len(payload) >= _PASTE_FOLD_MIN_CHARS:
             time.sleep(_PASTE_SETTLE)
-
-        # #872: a message typed in pieces must not go out without its first one.
-        if len(_chunk_for_send_keys(payload)) > 1 and not self._ensure_head_landed(
-            target, payload, thread_id
-        ):
-            return False
 
         # Press Enter to submit
         result = _run(["tmux", "send-keys", "-t", target, "Enter"])
@@ -3183,54 +3202,91 @@ class TmuxSessionManager:
         return False
 
     def _ensure_head_landed(self, target: str, payload: str, thread_id: int) -> bool:
-        """Make sure the first piece of a multi-piece message is in the box (#872).
+        """Type the first piece of a multi-piece message and make sure it landed (#872).
 
-        A message over one ``send-keys`` is typed in pieces (#527). The first is
-        a ~3,000-byte burst that the TUI folds into ``[Pasted text …]``; the rest
-        follow as text. In production (CLI 2.1.283, panes idle for 20–80
-        minutes) the first piece twice never arrived, Enter submitted the rest,
-        and Claude started on the second half of a sentence. The CLI-side cause
-        was not reproduced, so this checks the result instead: a box holding
-        exactly the pieces after the first, without the fold, has lost its head
-        (:func:`_input_box_lost_head`; a merely scrolled box does not count, #1263).
+        A message over one ``send-keys`` is typed in pieces (#527). In
+        production (CLI 2.1.283, panes idle for 20–80 minutes) the first piece
+        twice never arrived, Enter submitted the rest, and Claude started on
+        the second half of a sentence. The CLI-side cause was not reproduced,
+        so the result is checked instead — right after the first piece, while
+        the box is small (#1263: after the rest, a tall message shows only its
+        last rows and its start cannot be seen). See :func:`_first_piece_state`.
 
-        Such a box is cleared and the message typed once more. Still wrong, it
-        is cleared again and the send fails — a delivery failure the user sees
-        beats Claude working from half an instruction. Anything that cannot be
-        read is let through (#544: act only on positive evidence).
+        A piece that did not land whole is cleared and typed once more. Still
+        wrong, it is cleared again and the send fails before the rest is typed
+        — a delivery failure the user sees beats Claude working from half an
+        instruction. A box that cannot be read is let through (#544).
         """
+        piece = _chunk_for_send_keys(payload)[0]
         for attempt in range(1, 3):
-            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
-            if capture.returncode != 0 or not _input_box_lost_head(capture.stdout, payload):
+            errors: list[str] = []
+            if not self._type_literal(target, piece, what="send_input", errors=errors):
+                self._note_send_failure(thread_id, errors)
+                return False
+            state = self._read_first_piece(target, piece)
+            if state in (None, "landed"):
                 if attempt > 1:
                     logger.info(
-                        "%s send_input: the retyped message arrived whole (#872)",
+                        "%s send_input: the retyped first part arrived whole (#872)",
                         log_ctx(thread_id=thread_id),
                     )
                 return True
             logger.warning(
-                "%s send_input: the input box holds the end of the %d-character message "
-                "but not its first part (attempt %d/2); clearing it%s (#872)",
+                "%s send_input: the first part of the %d-character message did not reach "
+                "the input box whole (box %s, attempt %d/2); clearing it%s (#872)",
                 log_ctx(thread_id=thread_id),
                 len(payload),
+                state,
                 attempt,
                 " and typing it again" if attempt == 1 else "",
             )
-            if self._clear_box(target, payload) is False or attempt == 2:
+            if not self._wipe_box(target, piece):
                 break
-            errors: list[str] = []
-            if not self._type_literal(target, payload, what="send_input", errors=errors):
-                self._note_send_failure(thread_id, errors)
-                return False
-            time.sleep(_PASTE_SETTLE)
         logger.error(
             "%s send_input: the first part of the message did not reach the input box "
-            "twice; not submitting the rest on its own (#872)",
+            "twice; not typing or submitting the rest (#872)",
             log_ctx(thread_id=thread_id),
         )
         self._note_send_failure(
             thread_id, ["the first part of the message did not reach Claude's input box"]
         )
+        return False
+
+    def _read_first_piece(self, target: str, piece: str) -> str | None:
+        """:func:`_first_piece_state` after the fold settles; an empty box is re-read.
+
+        One capture in the normal case. Only an empty box — the piece may still
+        be on its way to a busy TUI — is looked at again, for up to
+        :data:`_FIRST_PIECE_LOOKS` × :data:`_PASTE_SETTLE`, before it counts.
+        """
+        state: str | None = None
+        for _look in range(_FIRST_PIECE_LOOKS):
+            time.sleep(_PASTE_SETTLE)
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            if capture.returncode != 0:
+                return None
+            state = _first_piece_state(capture.stdout, piece)
+            if state != "empty":
+                return state
+        return state
+
+    def _wipe_box(self, target: str, typed: str) -> bool:
+        """Empty the input box after a damaged partial send; False if it stays full.
+
+        Unlike :meth:`_clear_box`, this does not first look for *typed* in the
+        box: what is there is a damaged copy of it (only its end, a U+FFFD…),
+        which is exactly what must not be left to join the next message.
+        """
+        lines = typed.count("\n") + 2
+        for _attempt in range(_CLEAR_ATTEMPTS):
+            _run(["tmux", "send-keys", "-t", target, *(["C-u", "BSpace"] * lines)])
+            time.sleep(_CLEAR_SETTLE)
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            if capture.returncode != 0:
+                return True
+            box = _input_box_text(capture.stdout)
+            if not box:
+                return True
         return False
 
     def input_box_holds(self, thread_id: int, text: str) -> bool | None:

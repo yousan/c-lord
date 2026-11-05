@@ -15,8 +15,10 @@ isolated tmux server (``-L``, #701), 160x40 like c-lord's windows, idle after a
 turn: the first piece typed in one burst (folded), the rest typed as text. The
 message, delivered by Enter on the same CLI, reached the transcript whole.
 
-#872's own failure (the box holds exactly the pieces after the first) must
-still be refused — tests/test_send_input_head_lost.py stays green.
+The fix checks the first piece right after it is typed, while the box is
+small (tests/test_send_input_first_piece.py); the box after the last piece is
+no longer read for the head at all. #872's own failure must still be refused —
+tests/test_send_input_head_lost.py stays green.
 """
 
 from __future__ import annotations
@@ -26,12 +28,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from c_lord.tmux import TmuxSessionManager, _chunk_for_send_keys, _input_box_lost_head
+from c_lord.tmux import TmuxSessionManager, _chunk_for_send_keys, _first_piece_state
 
 _FIX = Path(__file__).parent / "fixtures" / "panes"
 
 BOX_EMPTY = (_FIX / "input_box_empty.txt").read_text()
 SCROLLED = (_FIX / "i1263_long_input_box_scrolled_v2_1_318.txt").read_text()
+FIRST_PIECE_FOLDED = (_FIX / "i1263_after_first_piece_1263_v2_1_318.txt").read_text()
 HEAD_LOST_872 = (_FIX / "input_box_head_lost.txt").read_text()
 
 # The message the fixture was made from: 5,888 characters, 9,104 bytes, 4 pieces.
@@ -66,13 +69,17 @@ def test_fixture_message_is_typed_in_four_pieces() -> None:
     assert len(_chunk_for_send_keys(LONG_1263)) == 4
 
 
-def test_a_scrolled_box_has_not_lost_the_head() -> None:
-    """The box shows the message's last rows only — not evidence of a lost head."""
-    assert _input_box_lost_head(SCROLLED, LONG_1263) is False
+def test_the_first_piece_of_the_request_is_seen_to_land() -> None:
+    """Real frame right after piece 1 of this message: one fold, +20 lines."""
+    piece = _chunk_for_send_keys(LONG_1263)[0]
+    assert piece.count("\n") == 20
+    assert _first_piece_state(FIRST_PIECE_FOLDED, piece) == "landed"
 
 
 def test_the_872_failure_is_still_a_lost_head() -> None:
-    assert _input_box_lost_head(HEAD_LOST_872, LONG_872) is True
+    """#872: the first piece never arrived — the box is empty after it."""
+    assert _first_piece_state(BOX_EMPTY, _chunk_for_send_keys(LONG_872)[0]) == "empty"
+    assert _first_piece_state(HEAD_LOST_872, _chunk_for_send_keys(LONG_872)[0]) == "lost"
 
 
 class _Pane:
@@ -80,7 +87,6 @@ class _Pane:
         self.after_typing = after_typing
         self.frame = BOX_EMPTY
         self.keys: list[list[str]] = []
-        self._chunks_left = 0
         self.typings = 0
 
     def run(self, args: list[str]) -> MagicMock:
@@ -89,12 +95,12 @@ class _Pane:
         if "send-keys" in args:
             self.keys.append(list(args))
             if "-l" in args:
-                if self._chunks_left == 0:
-                    self._chunks_left = len(_chunk_for_send_keys(LONG_1263))
-                self._chunks_left -= 1
-                if self._chunks_left == 0:
-                    self.frame = self.after_typing
+                chunks = _chunk_for_send_keys(LONG_1263)
+                if args[-1] == chunks[0]:
+                    self.frame = FIRST_PIECE_FOLDED
                     self.typings += 1
+                if args[-1] == chunks[-1]:
+                    self.frame = self.after_typing
             elif "C-u" in args or "Enter" in args:
                 self.frame = BOX_EMPTY
         return MagicMock(returncode=0, stdout="", stderr="")
