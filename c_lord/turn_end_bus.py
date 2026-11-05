@@ -223,7 +223,14 @@ class TurnEndBus:
         """Give *key* its one turn of grace, unless a turn already spent it."""
         granted = self._claim_turn.get(thread_id)
         if granted is None or granted[0] != key:
+            # Re-inserted so the bound below drops the thread granted longest
+            # ago; bounded like ``_threads`` — nothing in c-lord calls forget().
+            # A dropped entry can only let that thread's old name hold one more
+            # turn, never lose a reply.
+            self._claim_turn.pop(thread_id, None)
             self._claim_turn[thread_id] = (key, time.monotonic())
+            while len(self._claim_turn) > _MAX_THREADS:
+                self._claim_turn.pop(next(iter(self._claim_turn)))  # oldest first
 
     def note_turn_started(self, thread_id: int) -> object:
         """c-lord is about to send *thread_id* an instruction (#1223).

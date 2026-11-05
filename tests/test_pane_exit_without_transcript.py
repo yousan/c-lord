@@ -268,3 +268,21 @@ async def test_first_prompt_after_a_wake_holds_even_if_the_mirror_starts_with_th
         assert calls["n"] >= 40, f"closed early at poll {calls['n']} (#1132 is back)"
     finally:
         await mirror.stop()
+
+
+def test_spent_names_are_bounded_like_the_turn_records() -> None:
+    """Review of #1223: the record of which name spent its turn kept one entry per
+    thread that ever had a pending name, for the life of the process (nothing in
+    c-lord calls ``forget``). It is bounded like the turn records, oldest first."""
+    from c_lord import turn_end_bus as bus_mod
+
+    bus = bus_mod.TurnEndBus()
+    first = 10_000
+    last = first + bus_mod._MAX_THREADS + 50
+    for tid in range(first, last):
+        bus.note_pending_claim(tid, f"s{tid}@1")
+        bus.note_turn_ended(tid, bus.note_turn_started(tid))
+    assert len(bus._claim_turn) <= bus_mod._MAX_THREADS
+    assert first not in bus._claim_turn, "the oldest entry is the one dropped"
+    assert last - 1 in bus._claim_turn, "the newest grant is kept"
+    assert bus.is_tailing(last - 1)
