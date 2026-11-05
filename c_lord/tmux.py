@@ -820,16 +820,23 @@ def _input_box_lost_head(pane_text: str, payload: str) -> bool:
     always folds into ``[Pasted text …]``, so a box with neither that fold nor
     the payload's first characters — yet with its last ones — lost the first
     piece. Anything less certain is ``False``.
+
+    #1263: "start not visible" is not enough. The box has a maximum height
+    (15 rows in a 40-row pane on 2.1.318) and scrolls to the cursor, so a
+    message taller than that shows only its last rows — fold and first
+    characters included in what is scrolled away. A 5,909-character request
+    was refused twice that way. The evidence is therefore the shape #872
+    actually saw: the box holds **exactly** the pieces after a piece boundary
+    (``す。`` — mid-sentence, where the second piece began). A scrolled box
+    starts at a display row instead and does not match. A head lost *and*
+    scrolled out of view cannot be told apart from a whole message, so it is
+    let through (#544); the transcript-side #872 WARNING still reports it.
     """
     box = _input_box_text(pane_text)
     if not box or _PASTED_PLACEHOLDER in box:
         return False
-    squashed = _squash(payload)
-    if len(squashed) < 2 * _PAYLOAD_FINGERPRINT:
-        return False
-    if squashed[:_PAYLOAD_FINGERPRINT] in box:
-        return False
-    return squashed[-_PAYLOAD_FINGERPRINT:] in box
+    chunks = _chunk_for_send_keys(payload)
+    return any(box == _squash("".join(chunks[k:])) for k in range(1, len(chunks)))
 
 
 def _pane_has_open_menu(pane_text: str) -> bool:
@@ -3184,7 +3191,8 @@ class TmuxSessionManager:
         minutes) the first piece twice never arrived, Enter submitted the rest,
         and Claude started on the second half of a sentence. The CLI-side cause
         was not reproduced, so this checks the result instead: a box holding
-        the message's end but neither the fold nor its start has lost its head.
+        exactly the pieces after the first, without the fold, has lost its head
+        (:func:`_input_box_lost_head`; a merely scrolled box does not count, #1263).
 
         Such a box is cleared and the message typed once more. Still wrong, it
         is cleared again and the send fails — a delivery failure the user sees
