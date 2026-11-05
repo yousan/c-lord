@@ -1852,12 +1852,16 @@ class SessionManageCog(commands.Cog):
             # rather than announcing a release that did not occur (#571).
             all_stopped = all(c.name in stopped for c in holding)
             docker_outcome = DockerOutcome.STOPPED if all_stopped else DockerOutcome.LEFT_RUNNING
-            # The notice names what still holds a port *after* the stop (review of
-            # #1182): the ones just stopped no longer do.
-            containers = [
-                replace(c, status="exited") if c.running and c.name in stopped else c
-                for c in containers
-            ]
+            if docker_outcome is DockerOutcome.LEFT_RUNNING:
+                # The notice names what still holds a port *after* the stop (review
+                # of #1182): the ones just stopped no longer do.
+                containers = [
+                    replace(c, status="exited") if c.running and c.name in stopped else c
+                    for c in containers
+                ]
+            # #1221: on STOPPED the list stays as found. What held a port then is
+            # exactly what this stop freed, and "⏹ 停止（:N を解放）" names only
+            # those — not a container that was already exited.
 
         return _StopTeardown(
             tmux_mgr=tmux_mgr, killed=killed, containers=containers, docker=docker_outcome

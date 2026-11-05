@@ -162,17 +162,15 @@ def _running_ports(containers: list[DevContainer]) -> list[int]:
     return sorted(ports)
 
 
-def _all_ports(containers: list[DevContainer]) -> list[int]:
-    """Every host port these containers bind, running or not."""
-    return sorted({p for c in containers for p in c.ports})
-
-
 def _docker_value(outcome: DockerOutcome, containers: list[DevContainer]) -> str:
     if outcome is DockerOutcome.NONE or not containers:
         return "— （なし）"
     if outcome is DockerOutcome.LEFT_RUNNING:
         return "▶️ 動いたまま"
-    ports = _all_ports(containers)
+    # #1221: only what held a port can free one. An exited container listed by
+    # ``docker ps -a`` held nothing, so its port was never "解放" by this action.
+    # Callers pass the containers as found before a STOPPED / REMOVED action.
+    ports = _running_ports(containers)
     freed = f"（:{' :'.join(str(p) for p in ports)} を解放）" if ports else ""
     if outcome is DockerOutcome.REMOVED:
         return f"🗑️ 削除{freed}"
@@ -306,7 +304,8 @@ def restored_devenv_line(containers: list[DevContainer]) -> str | None:
 
     * **no containers.** Most threads never start docker; they must not grow a
       notice describing a thing they do not have.
-    * **everything is already running.** A *sleep* leaves docker up on purpose,
+    * **everything still holds its ports** (running, paused or restarting —
+      ``holds_ports``, #1182 / #1221). A *sleep* leaves docker up on purpose,
       so a restore from one has nothing to report — and going unnoticed is the
       entire point of sleep (#572).
 
@@ -314,7 +313,9 @@ def restored_devenv_line(containers: list[DevContainer]) -> str | None:
     is precisely the state a reader cannot infer, and the one that produces
     "why is this connection refused?" ten minutes later.
     """
-    stopped = [c for c in containers if not c.running]
+    # #1221: the same rule as the stop / sleep notices, which call a paused
+    # container "▶️ 動いたまま" — this line must not call it "停止したまま".
+    stopped = [c for c in containers if not c.holds_ports]
     if not stopped:
         return None
     return _RESTORED_DEVENV.format(what=_name_list(stopped))
