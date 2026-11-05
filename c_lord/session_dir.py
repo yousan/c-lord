@@ -38,6 +38,7 @@ from typing import Any, NamedTuple
 from urllib.parse import unquote
 
 from .attachments import ATTACHMENT_SUBDIR
+from .coauthor import DATA_FILE_NAME as COAUTHOR_DATA_FILE
 from .coauthor import install_coauthor_hook
 from .git_exclude import add_git_exclude
 from .git_mirrors import ensure_mirror, mirrors_root_for
@@ -48,6 +49,11 @@ from .tmux import SENSITIVE_ENV_KEYS
 logger = logging.getLogger(__name__)
 
 _THREAD_DIR_RE = re.compile(r"^\d+$")
+
+#: Left at every sessions root by ``SessionDirManager`` (#1289): a local remote
+#: under a directory carrying it is a workspace of *some* c-lord instance — prod
+#: and staging on one host each have their own root — and vouches for nothing.
+SESSIONS_ROOT_MARKER = ".clord-sessions-root"
 #: A full object name, as a detached ``HEAD`` file holds it (#1198).
 _SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
@@ -1200,7 +1206,37 @@ def _no_copy(cwd: str, url: str, ws_root: str, sessions_root: str | None) -> boo
     local = _local_remote_path(cwd, url)
     if local is None:
         return False
-    return sessions_root is None or _inside(local, ws_root) or _inside(local, sessions_root)
+    if sessions_root is None or _inside(local, ws_root) or _inside(local, sessions_root):
+        return True
+    # #1289: another instance's root (prod + staging on one host) is outside ours
+    # but just as deletable — also once that workspace is gone and only its root is left.
+    return _in_clord_workspace(local)
+
+
+def _in_clord_workspace(local: str) -> bool:
+    """Is *local* inside any c-lord sessions root or workspace, of any instance (#1289)?
+
+    True when it, or a directory above it, carries :data:`SESSIONS_ROOT_MARKER`
+    or is a checkout c-lord has worked in (a ``.git`` with c-lord's co-author
+    file, or the injected ``discord-read`` skill next to a ``.git``). A
+    question that cannot be answered counts as yes: keep.
+    """
+    try:
+        here = Path(local)
+        for d in (here, *here.parents):
+            if os.path.lexists(d / SESSIONS_ROOT_MARKER):
+                return True
+            if os.path.lexists(d / COAUTHOR_DATA_FILE):  # *d* is a workspace's git dir
+                return True
+            if not os.path.lexists(d / ".git"):
+                continue
+            if os.path.lexists(d / ".git" / COAUTHOR_DATA_FILE) or os.path.lexists(
+                d / ".claude" / "skills" / READ_SKILL_NAME
+            ):
+                return True
+    except (OSError, ValueError):
+        return True
+    return False
 
 
 def _pushed_from_here(git_dir: Path, ref: str, logged: bool) -> bool:
@@ -2193,6 +2229,25 @@ class SessionDirManager:
             base = Path(base_dir)
             sessions_root = str(base.parent) if base.name.isdigit() else base_dir
         self._sessions_root = sessions_root
+        self._mark_sessions_root()
+
+    def _mark_sessions_root(self) -> None:
+        """Leave :data:`SESSIONS_ROOT_MARKER` at the sessions root (#1289).
+
+        Lets *another* c-lord instance on this host (prod vs staging) tell that
+        a remote under this root is a workspace that a sweep may delete. Only
+        a hint: never creates the root, never raises.
+        """
+        try:
+            root = Path(self._sessions_root)
+            marker = root / SESSIONS_ROOT_MARKER
+            if root.is_dir() and not os.path.lexists(marker):
+                marker.write_text(
+                    "c-lord sessions root: workspaces here may be deleted by its sweeps\n",
+                    encoding="utf-8",
+                )
+        except (OSError, ValueError) as exc:
+            logger.info("could not mark sessions root %s: %s", self._sessions_root, exc)
 
     @property
     def base_dir(self) -> str:
@@ -2244,6 +2299,7 @@ class SessionDirManager:
 
         if not already_existed:
             Path(self._base_dir).mkdir(parents=True, exist_ok=True)
+            self._mark_sessions_root()  # #1289: the root may be new
 
             args = ["git", "clone"]
             if _is_local_repo(self._source_repo):
