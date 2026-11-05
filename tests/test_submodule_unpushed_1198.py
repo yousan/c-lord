@@ -321,3 +321,68 @@ def test_deinit_submodule_pinned_to_a_tag_on_no_branch_is_clean(tmp_path: Path) 
     st = worktree_status(str(ws))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
+
+
+# ---- review of 7890ea3: tags only vouch for a pinned HEAD, and only with a remote ----
+
+
+def test_tagged_commit_in_repo_with_no_remote_is_kept(tmp_path: Path) -> None:
+    """A tag in a repo with no remote is no copy anywhere else: every commit counts."""
+    ws = _session_clone(tmp_path)
+    _local_repo(ws / "emb")
+    _git(ws / "emb", "tag", "v1")
+    _git(ws, "add", "emb")
+    _git(ws, "commit", "-qm", "embed emb")
+    _git(ws, "push", "-q", "origin", "main")
+    st = worktree_status(str(ws))
+    assert not st.clean, describe_changes(st)
+    assert "emb: 1 unpushed commit(s)" in describe_changes(st)
+
+
+def test_local_tag_does_not_hide_unpushed_branch_commits(tmp_path: Path) -> None:
+    """A local-only tag on a work branch: ``git submodule update`` puts HEAD back on
+    the recorded commit, and the branch's commit is still on no remote."""
+    ws, subr = _workspace(tmp_path)
+    sha = _commit_in_sub(ws, branch="work")
+    git(ws / "sub", "tag", "wip")
+    git(ws, "submodule", "update", "-q")
+    assert git(ws, "status", "--porcelain").strip() == ""
+    _assert_kept(ws, subr, sha)
+    assert "sub: 1 unpushed commit(s)" in describe_changes(worktree_status(str(ws)))
+
+
+def _embedded_with_submodule(tmp_path: Path) -> tuple[Path, Path]:
+    """``ws/emb``: a clone (own remote) ``git add``-ed and pushed, with submodule ``inner``."""
+    ws = _session_clone(tmp_path)
+    emb_bare = _bare_with_commit(tmp_path, "emb")
+    inner_bare = _bare_with_commit(tmp_path, "inner")
+    emb = ws / "emb"
+    git(tmp_path, "clone", "-q", str(emb_bare), str(emb))
+    git(emb, "submodule", "add", "-q", str(inner_bare), "inner")
+    git(emb, "commit", "-qm", "inner")
+    git(emb, "push", "-q", "origin", "HEAD:main")
+    git(ws, "add", "emb")
+    git(ws, "commit", "-qm", "emb")
+    git(ws, "push", "-q", "origin", "main")
+    return ws, emb
+
+
+def test_deinit_submodule_inside_embedded_repo_unpushed_commit_is_kept(tmp_path: Path) -> None:
+    """The embedded repo's own ``.git/modules`` holds the deinit'd submodule's commit."""
+    ws, emb = _embedded_with_submodule(tmp_path)
+    assert worktree_status(str(ws)).clean
+    _commit_on_work_branch(emb / "inner")
+    git(emb, "submodule", "deinit", "-q", "-f", "inner")
+    st = worktree_status(str(ws))
+    assert not st.clean, describe_changes(st)
+    assert "emb/inner: 1 unpushed commit(s)" in describe_changes(st)
+
+
+def test_deinit_submodule_inside_embedded_repo_stash_is_kept(tmp_path: Path) -> None:
+    ws, emb = _embedded_with_submodule(tmp_path)
+    (emb / "inner" / "README.md").write_text("wip\n")
+    git(emb / "inner", "stash", "-q")
+    git(emb, "submodule", "deinit", "-q", "-f", "inner")
+    st = worktree_status(str(ws))
+    assert not st.clean, describe_changes(st)
+    assert "emb/inner: 1 stash entry" in describe_changes(st)

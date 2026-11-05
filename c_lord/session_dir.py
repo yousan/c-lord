@@ -385,6 +385,9 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
     per checked-out submodule one ``rev-parse`` (stash), one ``rev-list``
     (unpushed) and — while nesting may go deeper — one ``ls-files`` of its own.
     Each unclaimed module git dir costs one ``rev-parse`` and one ``rev-list``.
+    A ``rev-list`` that finds commits asks up to three more, to let tags vouch
+    for a pinned HEAD (:func:`_local_only_commits`). An embedded repo's own
+    ``.git/modules`` is walked the same way (a ``stat`` when it has none).
     #1181 had kept checked-out submodules to the stash call alone; #1198 showed
     their commits are lost without the parent's ``git status`` showing anything
     (HEAD moved back to the recorded commit, or the commit recorded and pushed
@@ -436,6 +439,12 @@ def _checked_out_submodule_stashes(
         found += _checked_out_submodule_stashes(
             str(sub), prefix=f"{name}/", depth=depth + 1, seen=seen
         )
+        # #1198: an embedded repo (``.git`` a directory) keeps its own
+        # submodules' git dirs in ``.git/modules``; deinit'd ones are only there.
+        # After the line above, so its checked-out submodules are in *seen*.
+        own_modules = sub / ".git" / "modules"
+        if linked is None and own_modules.is_dir():
+            found += _module_dir_stashes(own_modules, prefix=f"{name}/", depth=depth + 1, seen=seen)
     return found
 
 
@@ -474,42 +483,52 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
 
 
 def _local_only_commits(path: str, *, git_dir: bool = False) -> int | None:
-    """Commits in a submodule that no remote-tracking ref nor tag reaches (#1198).
+    """Commits in a submodule that exist on no remote (#1198).
 
     The same idea as the workspace's own count (:func:`_unpushed_commits`):
     HEAD (detached too) and every local branch, ``--not --remotes``; a repo
-    with no remote counts every commit. Tags count as covered too: a
-    submodule pinned to a release tag on no branch is nothing to lose, and
-    without ``--tags`` it was kept forever. Local refs only — no
-    ``ls-remote``, so a shallow submodule pinned below a branch tip may still
-    read as unpushed and is kept (the safe side). One git
-    call: ``--ignore-missing`` lets an unborn HEAD count as nothing. ``None``
-    when git failed; the caller keeps the dir then.
+    with no remote counts every commit. Local refs only — no ``ls-remote``.
+    ``None`` when git failed; the caller keeps the dir then.
+
+    Tags vouch only for a commit HEAD reaches and no branch does — a submodule
+    pinned to a release tag on no branch is nothing to lose, and was kept
+    forever. They never vouch for a branch's commits (a local ``git tag wip``
+    hid a work branch), nor in a repo with no remote (its tags are no copy).
+
+    Usually one call: ``rev-list HEAD --branches --not --remotes`` is 0, done.
+    Only when it is not are up to three more asked (is there a remote; HEAD's
+    own commits past tags; the branches' count). ``--ignore-missing`` lets an
+    unborn HEAD count as nothing.
 
     With *git_dir*, *path* is a git dir whose checkout may be gone — as in
     :func:`_stash_entries`, it stands in as its own work tree.
     """
     pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
-    result = _run(
-        [
-            *pre,
-            "rev-list",
-            "--count",
-            "--ignore-missing",
-            "HEAD",
-            "--branches",
-            "--not",
-            "--remotes",
-            "--tags",
-        ],
-        cwd=path,
+
+    def count(*revs: str) -> int | None:
+        result = _run([*pre, "rev-list", "--count", "--ignore-missing", *revs], cwd=path)
+        if result.returncode != 0:
+            return None
+        try:
+            return int(result.stdout.strip() or "0")
+        except ValueError:
+            return None
+
+    total = count("HEAD", "--branches", "--not", "--remotes")
+    if not total:
+        return total  # 0, or None (unknown)
+    remotes = _run(
+        [*pre, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes"], cwd=path
     )
-    if result.returncode != 0:
+    if remotes.returncode != 0:
         return None
-    try:
-        return int(result.stdout.strip() or "0")
-    except ValueError:
+    if not remotes.stdout.strip():
+        return total  # no remote: every commit is the only copy
+    head_only = count("HEAD", "--not", "--branches", "--remotes", "--tags")
+    branches = count("--branches", "--not", "--remotes")
+    if head_only is None or branches is None:
         return None
+    return branches + head_only
 
 
 def _unpushed_note(name: str, n: int | None) -> str | None:
