@@ -147,6 +147,14 @@ def test_uninitialized_submodule_is_clean(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("n", [1, 5])
 def test_no_extra_git_calls_for_checked_out_submodules(tmp_path: Path, monkeypatch, n: int) -> None:
+    """The cost stays linear and local: 1 + 3 calls per checked-out submodule.
+
+    One ``ls-files`` for the workspace, then per submodule one ``rev-parse``
+    (stash), one ``rev-list`` (unpushed commits, #1198) and one ``ls-files`` for
+    nested repos (#1227). #1181 kept this to the stash call alone, but #1198
+    showed a checked-out submodule's commits can be lost with the parent's
+    ``git status`` empty — not deleting wins over the call count.
+    """
     ws = _session_clone(tmp_path)
     for i in range(n):
         _git(
@@ -169,7 +177,8 @@ def test_no_extra_git_calls_for_checked_out_submodules(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(sd, "_run", spy)
     sd._submodule_stashes(str(ws))
-    assert len(calls) == 1 + n  # ls-files + one rev-parse per submodule (no stash)
+    assert len(calls) == 1 + 3 * n  # ls-files + (rev-parse, rev-list, ls-files) per submodule
+    assert not any("ls-remote" in c for c in calls)  # no network
 
 
 def _repo(tmp_path: Path, name: str) -> Path:

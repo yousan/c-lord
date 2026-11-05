@@ -171,9 +171,10 @@ class WorktreeStatus:
     stash_entries: int = 0
     #: Stashes inside submodules, as ``"<path>: N stash entries"`` (#1121). They
     #: live in ``<ws>/.git/modules/<name>`` — deleting the dir deletes them —
-    #: and the parent's status and ``refs/stash`` never show them. A submodule
-    #: git dir with no checkout also reports ``"<name>: N unpushed commit(s)"``
-    #: here (#1198): after deinit / ``git rm`` its commits are in no checkout.
+    #: and the parent's status and ``refs/stash`` never show them. Commits in a
+    #: submodule on no remote-tracking ref nor tag are reported here too, as
+    #: ``"<path>: N unpushed commit(s)"`` (#1198) — checked out or not, the
+    #: parent's status need not show them.
     submodule_stashes: tuple[str, ...] = ()
 
     @property
@@ -366,20 +367,31 @@ def _linked_git_dir(checkout: Path) -> Path | None:
 
 
 def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[str]:
-    """``"<path>: N stash entries"`` for every submodule with a stash (#1121, #1181).
+    """Work that lives only inside submodules: stashes and unpushed commits.
 
-    Checked-out submodules are named by their path. Then every git dir under
-    ``.git/modules`` that no checkout claimed is asked too (#1181): after
-    ``git submodule deinit`` or ``git rm`` the checkout is gone but the stash
-    is still there — and deleting the workspace deletes it. Those are named by
-    their module name. Every ``160000`` gitlink in the workspace's index is
-    asked, ``.gitmodules`` or not (#1207): a nested repo that was only
-    ``git add``-ed has no ``.gitmodules`` entry, and requiring one let its stash
-    be deleted with the workspace. So a plain checkout costs one
-    ``git ls-files`` and a ``stat``; inside a submodule only one with a
-    ``.gitmodules`` is listed. A submodule whose
-    stash cannot be read is reported as having one — unknown is work too, as
-    for the parent.
+    ``"<path>: N stash entries"`` (#1121, #1181) and ``"<path>: N unpushed
+    commit(s)"`` (#1198). Checked-out submodules are named by their path. Then
+    every git dir under ``.git/modules`` that no checkout claimed is asked too
+    (#1181): after ``git submodule deinit`` or ``git rm`` the checkout is gone
+    but the stash and the commits are still there — and deleting the workspace
+    deletes them. Those are named by their module name.
+
+    Every ``160000`` gitlink in an index is asked, ``.gitmodules`` or not
+    (#1207), at every depth (#1227): a nested repo that was only ``git add``-ed
+    has no ``.gitmodules`` entry, and requiring one let its stash be deleted
+    with the workspace.
+
+    Cost, all local (no network): one ``git ls-files`` for the workspace, then
+    per checked-out submodule one ``rev-parse`` (stash), one ``rev-list``
+    (unpushed) and — while nesting may go deeper — one ``ls-files`` of its own.
+    Each unclaimed module git dir costs one ``rev-parse`` and one ``rev-list``.
+    #1181 had kept checked-out submodules to the stash call alone; #1198 showed
+    their commits are lost without the parent's ``git status`` showing anything
+    (HEAD moved back to the recorded commit, or the commit recorded and pushed
+    in the parent), and not deleting wins over the call count.
+
+    Unknown is work too, as for the parent: a stash or count git cannot read is
+    reported, never read as "none".
     """
     found: list[str] = []
     seen: set[Path] = set()
@@ -395,13 +407,12 @@ def _checked_out_submodule_stashes(
 ) -> list[str]:
     if depth >= _MAX_SUBMODULE_DEPTH:
         return []
-    if depth > 0 and not (Path(path) / ".gitmodules").is_file():
-        # #1207 is the workspace's own index; inside a submodule the old rule
-        # stands, so checked-out submodules cost no extra ``git`` call (#1181).
-        return []
     listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
     if listed.returncode != 0:
-        return []  # .git/modules is still walked (#1181)
+        if depth == 0:
+            return []  # .git/modules is still walked (#1181)
+        # #1227: nested repos in this submodule could not be listed — keep.
+        return [f"{prefix.rstrip('/')}: nested repos unknown (git ls-files failed)"]
     found: list[str] = []
     for entry in listed.stdout.split("\0"):
         meta, _, rel = entry.partition("\t")
@@ -417,6 +428,11 @@ def _checked_out_submodule_stashes(
         note = _stash_note(name, _stash_entries(str(sub)))
         if note:
             found.append(note)
+        # #1198: the parent's status says nothing about commits that are on a
+        # branch HEAD left, or that the parent recorded and pushed.
+        note = _unpushed_note(name, _local_only_commits(str(sub)))
+        if note:
+            found.append(note)
         found += _checked_out_submodule_stashes(
             str(sub), prefix=f"{name}/", depth=depth + 1, seen=seen
         )
@@ -424,7 +440,8 @@ def _checked_out_submodule_stashes(
 
 
 def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Path]) -> list[str]:
-    """Stashes in the git dirs under a ``modules`` dir that no checkout claimed (#1181).
+    """Stashes and unpushed commits in the git dirs under a ``modules`` dir
+    that no checkout claimed (#1181, #1198).
 
     A module name may hold ``/`` (``libs/foo`` → ``modules/libs/foo``), so a
     dir that is no git dir is descended into; a git dir's own ``modules`` holds
@@ -446,7 +463,7 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
             note = _stash_note(name, _stash_entries(str(child), git_dir=True))
             if note:
                 found.append(note)
-            note = _unpushed_note(name, _module_unpushed(child))
+            note = _unpushed_note(name, _local_only_commits(str(child), git_dir=True))
             if note:
                 found.append(note)
         if (child / "modules").is_dir():
@@ -456,41 +473,53 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
     return found
 
 
-def _module_unpushed(git_dir: Path) -> int | None:
-    """Commits in a submodule git dir with no checkout that no remote has (#1198).
+def _local_only_commits(path: str, *, git_dir: bool = False) -> int | None:
+    """Commits in a submodule that no remote-tracking ref nor tag reaches (#1198).
 
-    The same count as the workspace's own (:func:`_unpushed_commits`): HEAD
-    (detached too) and every local branch, ``--not --remotes``. Local refs
-    only — no ``ls-remote`` for a module nobody has checked out. ``None`` when
-    git failed; the caller keeps the dir then.
+    The same idea as the workspace's own count (:func:`_unpushed_commits`):
+    HEAD (detached too) and every local branch, ``--not --remotes``; a repo
+    with no remote counts every commit. Tags count as covered too: a
+    submodule pinned to a release tag on no branch is nothing to lose, and
+    without ``--tags`` it was kept forever. Local refs only — no
+    ``ls-remote``, so a shallow submodule pinned below a branch tip may still
+    read as unpushed and is kept (the safe side). One git
+    call: ``--ignore-missing`` lets an unborn HEAD count as nothing. ``None``
+    when git failed; the caller keeps the dir then.
+
+    With *git_dir*, *path* is a git dir whose checkout may be gone — as in
+    :func:`_stash_entries`, it stands in as its own work tree.
     """
-    path = str(git_dir)
-    # As in _stash_entries(git_dir=True): core.worktree names a folder that is gone.
-    git = ("git", f"--git-dir={path}", f"--work-tree={path}")
-    branches = _run([*git, "for-each-ref", "--format=%(objectname)", "refs/heads"], cwd=path)
-    head = _run([*git, "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
-    if branches.returncode != 0 or head.returncode not in (0, 1):
+    pre = ["git", f"--git-dir={path}", f"--work-tree={path}"] if git_dir else ["git"]
+    result = _run(
+        [
+            *pre,
+            "rev-list",
+            "--count",
+            "--ignore-missing",
+            "HEAD",
+            "--branches",
+            "--not",
+            "--remotes",
+            "--tags",
+        ],
+        cwd=path,
+    )
+    if result.returncode != 0:
         return None
-    tips = {line.strip() for line in branches.stdout.splitlines() if line.strip()}
-    if head.returncode == 0 and head.stdout.strip():
-        tips.add(head.stdout.strip())
-    return _count_not_on(path, sorted(tips), git=git)
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
+        return None
 
 
 def _unpushed_note(name: str, n: int | None) -> str | None:
     """``"<name>: N unpushed commit(s)"`` (#1198), or ``None`` with none."""
     if n is None:
-        return f"{name}: unpushed commits unknown (git rev-list failed)"
+        return f"{name}: unpushed commits unknown (git failed)"
     return f"{name}: {n} unpushed commit(s)" if n else None
 
 
-def _count_not_on(
-    path: str,
-    tips: list[str],
-    also_on: frozenset[str] = frozenset(),
-    *,
-    git: tuple[str, ...] = ("git",),
-) -> int | None:
+def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozenset()) -> int | None:
     """Commits reachable from *tips* but from no remote-tracking ref nor *also_on*.
 
     *also_on* are remote heads. A head whose commit is not in this clone is
@@ -502,7 +531,7 @@ def _count_not_on(
     present = ""
     if also_on:
         check = _run(
-            [*git, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
             cwd=path,
             stdin="\n".join(also_on),
         )
@@ -514,7 +543,7 @@ def _count_not_on(
             if line.endswith(" commit")
         )
     result = _run(
-        [*git, "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
+        ["git", "rev-list", "--count", *tips, "--not", "--remotes", "--stdin"],
         cwd=path,
         stdin=present,
     )
