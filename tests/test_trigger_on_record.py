@@ -76,12 +76,14 @@ async def _api_error(bot, repo, thread_id: int, channels) -> str:  # noqa: ANN00
     return channels[thread_id].send.call_args.args[0]
 
 
-async def _skill_turn(repo: SessionRepository, thread_id: int, user_id: int) -> None:
+async def _skill_turn(
+    repo: SessionRepository, thread_id: int, user_id: int, mirror: object | None = None
+) -> None:
     """Run ``/skill`` in an existing thread; the run itself does what a real one
     does to the record: begin the turn for the invoker, save at SYSTEM."""
     bot = MagicMock()
     bot.settings_repo = None
-    bot.transcript_mirror_cog = MagicMock()
+    bot.transcript_mirror_cog = mirror if mirror is not None else MagicMock()
     default_runner = MagicMock(
         model="sonnet", working_dir="/srv/default", timeout_seconds=300, effort=None
     )
@@ -179,6 +181,27 @@ async def test_skill_turn_by_b_after_restart_pings_b_not_a(tmp_path, monkeypatch
         turn_events.reset()
     assert before.endswith(f"<@{B}>"), before
     assert after.endswith(f"<@{B}>") or after.endswith(f"<@{OWNER}>"), after
+
+
+async def test_skill_turn_answer_does_not_quote_the_previous_message(tmp_path) -> None:  # noqa: ANN001
+    """#1234 (review): the mirror keeps its own copy of the trigger in memory and
+    reads it before the record. B's /skill answer must not reply to A's message
+    in the same process either — not only after a restart."""
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    thread = 42
+    await repo.update_trigger_message(thread, 555)  # A's message
+    await repo.save(thread, "sess-1")
+    bot, _channels = _bot({555: _msg(555, A)})
+    mirror = TranscriptMirrorCog(bot, session_repo=repo)
+    mirror.set_trigger_message(thread, 555)
+    turn_events.reset()
+    try:
+        await _skill_turn(repo, thread, B, mirror=mirror)
+    finally:
+        turn_events.reset()
+    assert await mirror._build_trigger_reference(thread) is None
 
 
 async def test_two_threads_first_turns_do_not_mix(tmp_path, monkeypatch) -> None:  # noqa: ANN001

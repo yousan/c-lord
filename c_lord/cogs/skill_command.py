@@ -458,6 +458,10 @@ class SkillCommandCog(commands.Cog):
             # #1234: this turn has no trigger message, so the previous turn's
             # must not stay on record — after a restart its author would be
             # pinged for this turn. Nothing on record → the owner (#1212).
+            mirror_cog = getattr(self.bot, "transcript_mirror_cog", None)
+            forget = getattr(mirror_cog, "forget_trigger_message", None)
+            if callable(forget):
+                forget(channel.id)
             try:
                 await self.repo.clear_trigger_message(channel.id)
             except Exception:
