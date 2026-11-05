@@ -455,6 +455,17 @@ class SkillCommandCog(commands.Cog):
             )
             if not ready:
                 return
+            # #1234: this turn has no trigger message, so the previous turn's
+            # must not stay on record — after a restart its author would be
+            # pinged for this turn. Nothing on record → the owner (#1212).
+            try:
+                await self.repo.clear_trigger_message(channel.id)
+            except Exception:
+                logger.warning(
+                    "%s /skill could not clear the recorded trigger message",
+                    log_ctx(thread_id=channel.id),
+                    exc_info=True,
+                )
             runner = self._make_runner(
                 tmux,
                 channel.id,

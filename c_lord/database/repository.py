@@ -427,6 +427,24 @@ class SessionRepository:
         else:
             self._pending_triggers.pop(thread_id, None)
 
+    async def clear_trigger_message(self, thread_id: int) -> None:
+        """Forget the trigger message on record for *thread_id* — #1234.
+
+        For a turn that starts without a message of its own (``/skill``): the
+        record would otherwise still name the previous turn's message, and after
+        a restart its author — who did not ask for this turn — is who gets
+        pinged (#1212). With nothing on record the ping falls back to the owner,
+        and the #115 reply is sent unquoted.
+        A pending first-turn trigger is dropped too: it is not this turn's.
+        """
+        self._pending_triggers.pop(thread_id, None)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET trigger_message_id = NULL WHERE thread_id = ?",
+                (thread_id,),
+            )
+            await db.commit()
+
     async def set_mirror_replied_uuid(self, thread_id: int, uuid: str) -> None:
         """Persist the uuid of the last final answer the mirror delivered.
 
