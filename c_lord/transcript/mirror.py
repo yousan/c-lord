@@ -1544,9 +1544,6 @@ class TranscriptMirror:
                         turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                         _limit_reported = False
                         usage_limit_notices.clear_thread(self.thread_id)
-                        # #1251: a prompt typed into the pane after an interrupted
-                        # turn (no turn_duration, no note_turn_started) starts afresh.
-                        self._turn_api_error_lines.clear()
                         # #913: a notification only *starts* a turn between turns;
                         # one that lands in a person's turn leaves it theirs. A
                         # scheduled wakeup is the same kind of start (#1092).
@@ -1581,6 +1578,11 @@ class TranscriptMirror:
                             # #1125: a new turn's answer is its own (a notice
                             # inside a turn leaves the turn — and its text — as is).
                             _last_silent = None
+                            # #1251: a prompt typed into the pane after an interrupted
+                            # turn (no turn_duration, no note_turn_started) starts
+                            # afresh. #1285: a notification or bare system-reminder
+                            # inside a turn does not — it would post the line again.
+                            self._turn_api_error_lines.clear()
                         if started_by is not None:
                             self._turn_open = True
                             self._model_spoke = False
