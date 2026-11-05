@@ -237,6 +237,18 @@ def _optional_channel_and_color(
     return channel_id, color, None
 
 
+# Characters ``str.strip()`` keeps but nobody can see (#1238): zero-width space /
+# non-joiner / joiner, word joiner, BOM.
+_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff"
+
+
+def _is_blank(text: str | None) -> bool:
+    """True when *text* has nothing visible — whitespace and invisible marks only."""
+    # One pass — peeling whitespace and marks in turn was quadratic on input
+    # like " \u200b" * n and blocked the event loop.
+    return all(c.isspace() or c in _INVISIBLE for c in text or "")
+
+
 def _text(data: dict[str, Any], field: str) -> tuple[str | None, web.Response | None]:
     """``data[field]`` as text — ``None`` when absent or ``null`` — or the 400 naming it.
 
@@ -462,7 +474,7 @@ class ApiServer:
         await self._runner.setup()
         try:
             self.port = await self._bind()
-        except OSError:
+        except (OSError, OverflowError):  # OverflowError: a port past 65535 (#1237)
             await self._runner.cleanup()
             self._runner = None
             raise
@@ -680,9 +692,13 @@ class ApiServer:
                 return web.json_response({"error": f"{field} is required"}, status=400)
         for field in ("name", "prompt"):
             # #1208: ``["x"]`` was saved through ``str()`` as the prompt ``['x']``.
-            _, err = _text(data, field)
+            text, err = _text(data, field)
             if err is not None:
                 return err
+            if _is_blank(text):
+                # #1238: ``"   "`` was saved and woke Claude with no instruction
+                # on every run; /api/spawn already strips before this check.
+                return web.json_response({"error": f"{field} is required"}, status=400)
         run_immediately = data.get("run_immediately", True)
         if not isinstance(run_immediately, bool):
             return _not_a_boolean("run_immediately")
@@ -761,9 +777,10 @@ class ApiServer:
             prompt, err = _text(data, "prompt")  # #1208: no more str(["x"]) -> "['x']"
             if err is not None:
                 return err
-            if not prompt:
+            if _is_blank(prompt):
                 # #1229: POST refuses an empty prompt; PATCH saved it with a 200,
                 # and every run after that woke Claude with no instruction.
+                # #1238: whitespace only is empty too, as for POST and /api/spawn.
                 return web.json_response({"error": "prompt is required"}, status=400)
             patch_kwargs["prompt"] = prompt
         if "interval_seconds" in data:
@@ -917,7 +934,7 @@ class ApiServer:
         if err is not None:
             return err
         prompt = (raw_prompt or "").strip()
-        if not prompt:
+        if _is_blank(prompt):
             return web.json_response({"error": "prompt is required"}, status=400)
 
         raw_channel_id = data.get("channel_id") or self.default_channel_id

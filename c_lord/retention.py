@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -39,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 #: The Claude Code settings key that governs transcript retention.
 SETTING_KEY = "cleanupPeriodDays"
+# About 2,700 years: "keep" in practice, and far inside SQLite's and
+# ``timedelta``'s ranges (#1240).
+MAX_RETENTION_DAYS = 1_000_000
 
 #: Used when the key is absent or unusable.
 #:
@@ -66,7 +70,7 @@ def _read_setting(path: Path) -> int | None:
         return None
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except ValueError:  # JSONDecodeError, or an integer past 4300 digits (#1240)
         logger.warning("retention: %s is not valid JSON — ignoring", path)
         return None
     if not isinstance(data, dict):
@@ -80,7 +84,26 @@ def _read_setting(path: Path) -> int | None:
             "retention: %s=%r in %s is not a number — ignoring", SETTING_KEY, value, path
         )
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        # #1240: JSON ``1e999`` loads as infinity and ``NaN`` as NaN; ``int()``
+        # of either raised instead of this docstring's None.
+        logger.warning(
+            "retention: %s=%r in %s is not a finite number — ignoring", SETTING_KEY, value, path
+        )
+        return None
     days = int(value)
+    if days > MAX_RETENTION_DAYS:
+        # #1240: a huge keep-period means "keep"; uncapped it overflowed SQLite in
+        # the startup sweep and the bot did not start. Capped, not refused — None
+        # falls back to the default and would sweep sooner than asked.
+        logger.warning(
+            "retention: %s in %s is larger than %d days — using %d",
+            SETTING_KEY,
+            path,
+            MAX_RETENTION_DAYS,
+            MAX_RETENTION_DAYS,
+        )
+        return MAX_RETENTION_DAYS
     if days <= 0:
         logger.warning(
             "retention: %s=%r in %s is not positive — ignoring", SETTING_KEY, value, path

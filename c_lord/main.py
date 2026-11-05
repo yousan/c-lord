@@ -17,6 +17,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
+from .command_gate import is_trusted_bot_id_text
 from .git_mirrors import stop_running_git
 from .session_cleanup import DirOutcome, retire_swept_workspace, sweep_days
 from .setup import setup_bridge
@@ -236,7 +237,7 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     bad_trusted = [
         x
         for x in (p.strip() for p in os.getenv("CLORD_TRUSTED_BOT_IDS", "").split(","))
-        if x and not (x.isascii() and x.isdigit())
+        if x and not is_trusted_bot_id_text(x)
     ]
     if bad_trusted:
         logger.warning(
@@ -284,6 +285,8 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
 
 # Where the REST API listens when ``CLORD_API_PORT`` is not set.
 DEFAULT_API_PORT = 8080
+#: The largest TCP port; a larger CLORD_API_PORT is refused, not a crash (#1237).
+_MAX_PORT = 65535
 
 
 async def build_api_server(
@@ -337,7 +340,19 @@ async def build_api_server(
         raw_port = os.getenv("CLORD_API_PORT", "")
         api_port_env = raw_port.strip()
         if api_port_env.isascii() and api_port_env.isdigit():
-            api_port = int(api_port_env)
+            # #1237: ``int()`` of more than 4300 digits raises; any value past
+            # 65535 is refused the same way, so a long one is kept as 65536.
+            # Leading zeros don't count: ``008080`` was always 8080.
+            digits = api_port_env.lstrip("0") or "0"
+            api_port = int(digits) if len(digits) <= 5 else _MAX_PORT + 1
+            if api_port > _MAX_PORT:
+                # Still the port that was set (#258: pinned = as-is or not at
+                # all) — start_api_server reports it and the bot runs without it.
+                logger.warning(
+                    "CLORD_API_PORT must be 0-%d, got %r — the REST API will not start this run.",
+                    _MAX_PORT,
+                    raw_port if len(raw_port) <= 40 else raw_port[:40] + "…",
+                )
         else:
             if api_port_env:
                 logger.warning(
@@ -382,6 +397,18 @@ async def start_api_server(api_server: ApiServer | None) -> bool:
         return False
     try:
         await api_server.start()
+    except OverflowError as exc:
+        # #1237: a port past 65535 (a typo in CLORD_API_PORT) is not an OSError;
+        # it used to stop the whole bot. It costs the API, like a taken port.
+        logger.warning(
+            "REST API could not bind %s:%d (%s) — /api/* is unavailable this run. "
+            "Set CLORD_API_PORT to a port between 0 and %d.",
+            api_server.host,
+            api_server.port,
+            exc,
+            _MAX_PORT,
+        )
+        return False
     except OSError as exc:
         logger.warning(
             "REST API could not bind %s:%d (%s) — /api/* is unavailable this run. "
