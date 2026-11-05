@@ -229,8 +229,10 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
 
     # #1218: a companion bot id that is not ASCII digits is ignored, said once
     # here (``command_gate`` reads the list per message and must not raise).
-    # Not a stop: such an entry was silently ignored before, and the rest of the
-    # list still works (#1194 — an update alone must not break a working .env).
+    # Not a stop: a word or a link was silently ignored before, and the rest of
+    # the list still works (#1194 — an update alone must not break a working .env).
+    # Full-width digits (``１２３``) were read as 123 before; now they are ignored
+    # too, like every other ID (#1084), and this WARNING says so.
     bad_trusted = [
         x
         for x in (p.strip() for p in os.getenv("CLORD_TRUSTED_BOT_IDS", "").split(","))

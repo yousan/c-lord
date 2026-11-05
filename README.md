@@ -705,7 +705,8 @@ API rather than failing to start. A value that is not ASCII digits (`²`, a word
 is ignored with a WARNING naming `CLORD_API_PORT`, as if it were unset; spaces
 around the digits are ignored (#1218). Likewise an entry of `CLORD_TRUSTED_BOT_IDS`
 that is not ASCII digits is ignored with a startup WARNING, and the other ids in
-the list keep working.
+the list keep working. That includes full-width digits (`１２３`), which used to be
+read as the id 123 — write the id in ASCII digits.
 
 Claude in every session is told where the API is as the `CLORD_API_URL`
 environment variable — the port that was actually bound, so it never has to be
