@@ -402,7 +402,7 @@ async def start_api_server(api_server: ApiServer | None) -> bool:
         # it used to stop the whole bot. It costs the API, like a taken port.
         logger.warning(
             "REST API could not bind %s:%d (%s) — /api/* is unavailable this run. "
-            "Set CLORD_API_PORT to a port between 1 and %d.",
+            "Set CLORD_API_PORT to a port between 0 and %d.",
             api_server.host,
             api_server.port,
             exc,

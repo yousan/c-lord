@@ -237,6 +237,21 @@ def _optional_channel_and_color(
     return channel_id, color, None
 
 
+# Characters ``str.strip()`` keeps but nobody can see (#1238): zero-width space /
+# non-joiner / joiner, word joiner, BOM.
+_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff"
+
+
+def _is_blank(text: str | None) -> bool:
+    """True when *text* has nothing visible — whitespace and invisible marks only."""
+    rest = text or ""
+    while True:
+        stripped = rest.strip().strip(_INVISIBLE)
+        if stripped == rest:
+            return not rest
+        rest = stripped
+
+
 def _text(data: dict[str, Any], field: str) -> tuple[str | None, web.Response | None]:
     """``data[field]`` as text — ``None`` when absent or ``null`` — or the 400 naming it.
 
@@ -683,7 +698,7 @@ class ApiServer:
             text, err = _text(data, field)
             if err is not None:
                 return err
-            if not (text or "").strip():
+            if _is_blank(text):
                 # #1238: ``"   "`` was saved and woke Claude with no instruction
                 # on every run; /api/spawn already strips before this check.
                 return web.json_response({"error": f"{field} is required"}, status=400)
@@ -765,7 +780,7 @@ class ApiServer:
             prompt, err = _text(data, "prompt")  # #1208: no more str(["x"]) -> "['x']"
             if err is not None:
                 return err
-            if not (prompt or "").strip():
+            if _is_blank(prompt):
                 # #1229: POST refuses an empty prompt; PATCH saved it with a 200,
                 # and every run after that woke Claude with no instruction.
                 # #1238: whitespace only is empty too, as for POST and /api/spawn.
@@ -922,7 +937,7 @@ class ApiServer:
         if err is not None:
             return err
         prompt = (raw_prompt or "").strip()
-        if not prompt:
+        if _is_blank(prompt):
             return web.json_response({"error": "prompt is required"}, status=400)
 
         raw_channel_id = data.get("channel_id") or self.default_channel_id

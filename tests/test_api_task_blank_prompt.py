@@ -51,3 +51,16 @@ async def test_patch_empty_prompt_on_missing_task(env):  # type: ignore[no-untyp
     r1 = await c.patch("/api/tasks/9999", json={"prompt": ""})
     r2 = await c.patch("/api/tasks/9999", json={"interval_seconds": 0})
     assert r1.status == r2.status
+
+
+@pytest.mark.parametrize("value", ["​", "﻿", " ​　\n"], ids=repr)
+async def test_invisible_only_prompt_is_blank(env, value):  # type: ignore[no-untyped-def]  # noqa: F811
+    """#1238 (W57 review): ``str.strip()`` keeps zero-width spaces and the BOM, so a
+    prompt of only those was saved like ``"   "`` used to be."""
+    c, tr, tid = env
+    r = await c.post(
+        "/api/tasks", json={"name": "b", "prompt": value, "interval_seconds": 60, "channel_id": 1}
+    )
+    assert r.status == 400
+    r = await c.patch(f"/api/tasks/{tid}", json={"prompt": value})
+    assert r.status == 400 and (await tr.get(tid))["prompt"] == "original"
