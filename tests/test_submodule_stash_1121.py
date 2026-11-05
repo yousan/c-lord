@@ -45,7 +45,7 @@ def test_stash_inside_a_submodule_keeps_the_workspace(tmp_path: Path) -> None:
 
 def test_a_submodule_without_a_stash_is_still_clean(tmp_path: Path) -> None:
     ws = _with_submodule(tmp_path)
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 
@@ -106,7 +106,7 @@ def test_removed_submodule_without_stash_is_clean(tmp_path: Path) -> None:
     """A leftover .git/modules/sub with nothing stashed is no reason to keep the dir."""
     ws = _with_submodule(tmp_path)
     _git(ws, "submodule", "deinit", "-q", "sub")
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 
@@ -142,7 +142,7 @@ def test_uninitialized_submodule_is_clean(tmp_path: Path) -> None:
         ["git", "clone", "-q", str(tmp_path / "origin.git"), str(clone)], check=True, env=_GIT_ENV
     )
     assert not (clone / ".git" / "modules").exists()
-    assert worktree_status(str(clone), sessions_root=str(clone.parent)).clean
+    assert worktree_status(str(clone), sessions_root=str(tmp_path / "c2")).clean
 
 
 @pytest.mark.parametrize("n", [1, 5])
@@ -202,9 +202,9 @@ def test_nested_submodule_stash_is_named_once(tmp_path: Path) -> None:
     _git(ws, *allow, "submodule", "update", "--init", "--recursive", "-q")
     _git(ws, "commit", "-qm", "mid")
     _git(ws, "push", "-q", "origin", "main")
-    assert worktree_status(str(ws), sessions_root=str(ws.parent)).clean
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
     (ws / "mid" / "inner" / "f.txt").write_text("wip\n")
     _git(ws / "mid" / "inner", "stash", "-q")
-    assert worktree_status(str(ws), sessions_root=str(ws.parent)).submodule_stashes == (
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).submodule_stashes == (
         "mid/inner: 1 stash entry",
     )

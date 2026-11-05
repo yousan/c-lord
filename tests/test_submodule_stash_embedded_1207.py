@@ -62,7 +62,7 @@ def test_embedded_repo_without_gitmodules_delete(tmp_path: Path) -> None:
 
 def test_embedded_repo_without_a_stash_is_still_clean(tmp_path: Path) -> None:
     ws = _embedded(tmp_path)
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 

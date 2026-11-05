@@ -96,7 +96,7 @@ def test_pushed_branch_still_on_remote_is_clean(tmp_path: Path) -> None:
     git(ws / "sub", "push", "-q", "origin", "work")
     git(ws / "sub", "checkout", "-q", "--detach", "HEAD~1")
     git(ws / "sub", "branch", "-q", "-D", "work")
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
 
@@ -111,7 +111,7 @@ def test_untouched_submodule_whose_upstream_moved_is_deleted_offline(
     _commit(tmp_path / "subremote-seed", "later.txt")
     git(tmp_path / "subremote-seed", "push", "-q", "origin", "HEAD:main")
     calls = _count_ls_remote(monkeypatch)
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert calls == []
     assert _delete(ws).removed
@@ -125,7 +125,7 @@ def test_upstream_force_push_of_a_branch_present_at_clone_is_deleted(tmp_path: P
     git(seed, "checkout", "-q", "-B", "dependabot/x", "main")
     _commit(seed, "rewritten.txt")
     git(seed, "push", "-q", "-f", "origin", "dependabot/x")
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
 
@@ -133,7 +133,7 @@ def test_upstream_force_push_of_a_branch_present_at_clone_is_deleted(tmp_path: P
 def test_upstream_branch_deleted_after_the_clone_is_deleted(tmp_path: Path) -> None:
     ws, subr = _workspace_with_upstream_branch(tmp_path, "feature/gone")
     git(subr, "update-ref", "-d", "refs/heads/feature/gone")
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert "unpushed commit" not in describe_changes(st)
     assert _delete(ws).removed
@@ -193,7 +193,7 @@ def test_remote_branch_moved_and_the_new_head_is_here_is_clean(tmp_path: Path) -
     # without a local ref holding them.
     git(ws / "sub", "fetch", "-q", "--refmap=", "origin", "main:refs/tmp/upstream")
     git(ws / "sub", "update-ref", "-d", "refs/tmp/upstream")
-    st = worktree_status(str(ws), sessions_root=str(ws.parent))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 
@@ -257,8 +257,8 @@ def test_one_ls_remote_per_submodule_remote(tmp_path: Path, monkeypatch) -> None
     ws, _ = _workspace(tmp_path)
     _pushed_branch(ws)
     calls = _count_ls_remote(monkeypatch)
-    assert worktree_status(str(ws), sessions_root=str(ws.parent)).clean
-    assert worktree_status(str(ws), sessions_root=str(ws.parent)).clean
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
+    assert worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
     assert len(calls) == 1, calls
 
 
