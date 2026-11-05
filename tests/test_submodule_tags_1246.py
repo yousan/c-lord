@@ -554,3 +554,67 @@ def test_one_sweep_two_workspaces_vouching_for_each_other_one_is_kept(tmp_path: 
     results = mgr.cleanup_orphaned(set())
     reasons = [(r.thread_id, r.removed, r.reason) for r in results]
     assert a.exists() or b.exists(), f"one sweep deleted both; {sha} is gone: {reasons}"
+
+
+# ---- W57 round 14: tag-only commits are named even when not checked ----------
+#
+# When something else keeps the workspace, or the check stopped at an earlier
+# repo, a repo's tag-only commits were neither asked about nor named: a dry run
+# showed a partial list as the whole (the 8b43fa8 "…and more not checked" rule).
+
+
+def _branch_work(repo: Path) -> None:
+    git(repo, "checkout", "-q", "-b", "work")
+    _commit(repo, "work.txt", "only copy\n")
+    git(repo, "checkout", "-q", "main")
+
+
+def _ignore(ws: Path, *dirs: str) -> None:
+    (ws / ".gitignore").write_text("".join(f"{d}/\n" for d in dirs))
+    git(ws, "add", ".gitignore")
+    git(ws, "commit", "-qm", "ignore")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+
+
+def _clone_into(ws: Path, subr: Path, rel: str) -> Path:
+    dest = ws / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    git(dest.parent, "clone", "-q", str(subr), dest.name)
+    return dest
+
+
+def _why(ws: Path) -> str:
+    return sd.describe_changes(sd.worktree_status(str(ws), sessions_root=str(ws.parent)))
+
+
+def test_reason_names_sub_hand_tag_next_to_ignored_work(tmp_path: Path, monkeypatch) -> None:
+    ws, subr = _workspace(tmp_path)
+    _ignore(ws, "vendor")
+    _branch_work(_clone_into(ws, subr, "vendor/lib"))
+    _wip(ws / "sub", "wip")
+    calls = _count_ls_remote(monkeypatch)
+    why = _why(ws)
+    _kept(ws)
+    assert "sub" in why.replace("vendor/lib", ""), f"sub's wip silently left out: {why!r}"
+    assert calls == []  # #903: kept anyway, nothing asked
+
+
+def test_reason_names_sub_hand_tag_next_to_user_change(tmp_path: Path) -> None:
+    ws, _ = _workspace(tmp_path)
+    (ws / "notes.txt").write_text("mine\n")
+    _wip(ws / "sub", "wip")
+    why = _why(ws)
+    _kept(ws)
+    assert "sub" in why, f"sub's wip silently left out: {why!r}"
+    assert "sub: 1 commit(s) only on tags (not checked upstream)" in why, why
+
+
+def test_reason_names_second_tag_only_repo(tmp_path: Path) -> None:
+    """Two hand tags (sub, vendor/lib): stop at the first — the second is marked."""
+    ws, subr = _workspace(tmp_path)
+    _ignore(ws, "vendor")
+    _wip(_clone_into(ws, subr, "vendor/lib"), "wip")
+    _wip(ws / "sub", "wip")
+    why = _why(ws)
+    _kept(ws)
+    assert "vendor" in why, f"vendor/lib's wip neither named nor marked unchecked: {why!r}"

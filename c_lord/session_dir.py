@@ -995,6 +995,11 @@ def _tag_only_commits(
     return set(result.stdout.split())
 
 
+def _tags_not_checked(repo: _Repo) -> str:
+    """``"sub: 2 commit(s) only on tags (not checked upstream)"`` (#1246, W57 round 14)."""
+    return f"{repo.name}: {len(repo.tag_only)} commit(s) only on tags (not checked upstream)"
+
+
 def _tag_only_note(repo: _Repo, ws_root: str, sessions_root: str | None) -> str | None:
     """Are the commits only *repo*'s tags reach on the remote? (#1246)
 
@@ -1896,16 +1901,22 @@ def _worktree_status(
             nested.append(_not_checked(ignored_dirs[i:]))
             break
         nested += _ignored_repo_notes(path, rel, pushed)
+    unasked = pushed
     if not user and stash == 0 and unpushed == 0 and not nested:
         # #1245: a nested repo's "pushed" rests on local tracking refs; ask the
         # remotes only now, as for the workspace, and stop at the first reason.
         # #1246: its tag-only commits likewise — never when something else keeps.
-        for repo in pushed:
+        unasked = []
+        for i, repo in enumerate(pushed):
             note = _tag_only_note(repo, _root, sessions_root) if repo.tag_only else None
             note = note or _stale_tracking_note(repo, _root)
             if note:
                 nested.append(note)
+                unasked = pushed[i + 1 :]
                 break
+    # Kept already: tag-only commits not asked about are still named, never left
+    # out of the reason (W57 round 14 — as 8b43fa8's "…and more not checked").
+    nested += [_tags_not_checked(r) for r in unasked if r.tag_only]
     return WorktreeStatus(
         is_repo=True,
         user_changes=tuple(user),
