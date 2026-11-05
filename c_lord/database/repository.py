@@ -434,8 +434,8 @@ class SessionRepository:
         record would otherwise still name the previous turn's message, and after
         a restart its author — who did not ask for this turn — is who gets
         pinged (#1212). With nothing on record the ping falls back to the owner,
-        and the #115 reply is sent unquoted.
-        A pending first-turn trigger is dropped too: it is not this turn's.
+        and the #115 reply is sent unquoted. A pending first-turn trigger is
+        dropped too, so the row this turn creates does not carry it (#1235).
         """
         self._pending_triggers.pop(thread_id, None)
         async with aiosqlite.connect(self.db_path) as db:
@@ -444,6 +444,18 @@ class SessionRepository:
                 (thread_id,),
             )
             await db.commit()
+
+    def discard_pending_trigger(self, thread_id: int, message_id: int) -> None:
+        """Drop *message_id* if it is still waiting for *thread_id*'s row — #1235.
+
+        Called when the turn it triggered is over. A turn that ended before its
+        SYSTEM event never made the row, and the next row ``save`` makes belongs
+        to some other turn (a ``/skill``, a scheduled run) — it must not carry
+        this message. Only *message_id* itself is dropped: a newer turn's trigger
+        that replaced it stays.
+        """
+        if self._pending_triggers.get(thread_id) == message_id:
+            del self._pending_triggers[thread_id]
 
     async def set_mirror_replied_uuid(self, thread_id: int, uuid: str) -> None:
         """Persist the uuid of the last final answer the mirror delivered.
