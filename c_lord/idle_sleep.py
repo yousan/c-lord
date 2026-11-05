@@ -73,6 +73,10 @@ _ENV_VAR = "CLORD_IDLE_SLEEP_HOURS"
 #: reason to bound a tick is to keep one sweep from running unboundedly long.
 MAX_SLEEPS_PER_TICK = 1000
 
+# #1228: consecutive "could not sleep" answers before a thread is left alone
+# until someone speaks in it again.
+_MAX_UNSURE = 3
+
 #: Every 10 minutes. The threshold is hours, so this is already 24× finer than
 #: it needs to be, and each tick reads the whole session table once.
 _TICK_INTERVAL_SECONDS = 600.0
@@ -202,6 +206,12 @@ class IdleSleepLoop(IdleSweepLoop):
         # #991, the cog was not loaded). They must not be marked visited, or they
         # would never be looked at again.
         self._busy: set[int] = set()
+        # #1228: consecutive "could not sleep" (``False``) answers per thread.
+        # A stalled tmux clears up, but ``False`` also means causes that never do
+        # (not a thread, no binding); after ``_MAX_UNSURE`` the thread is visited.
+        self._unsure_counts: dict[int, int] = {}
+        # Threads whose attempt this tick answered ``False`` (see ``_spent_budget``).
+        self._unsure_now: set[int] = set()
         # Where Claude Code keeps its transcripts. None = its real location;
         # tests point it at a tmp dir.
         self._projects_root: Path | None = None
@@ -308,10 +318,31 @@ class IdleSleepLoop(IdleSweepLoop):
             # #1228: ``False`` is "could not tell / could not kill" (a stalled
             # tmux — #1192 / #1206), not "nothing to kill" (``None``). Marking it
             # visited kept the idle window awake until a human spoke again; like
-            # the busy skip above, the next tick looks again.
-            self._busy.add(thread_id)
+            # the busy skip above, the next tick looks again — up to a bound,
+            # because the same answer also covers causes that never go away.
+            self._unsure_now.add(thread_id)
+            count = self._unsure_counts.get(thread_id, 0) + 1
+            if count < _MAX_UNSURE:
+                self._unsure_counts[thread_id] = count
+                self._busy.add(thread_id)
+                return False
+            self._unsure_counts.pop(thread_id, None)
+            logger.info(
+                "idle-sleep: thread=%d could not be slept %d ticks in a row — "
+                "not trying again until someone speaks there (#1228)",
+                thread_id,
+                count,
+            )
             return False
+        self._unsure_counts.pop(thread_id, None)
         return bool(slept)
+
+    def _spent_budget(self, thread_id: int, changed: bool) -> bool:
+        # #1228: a failed attempt may have cost several tmux timeouts; during a
+        # long stall every idle thread would otherwise be tried in every tick.
+        unsure = thread_id in self._unsure_now
+        self._unsure_now.discard(thread_id)
+        return changed or unsure
 
     def _log_summary(self, acted: int) -> None:
         # Report the *output* side. A sweep that only counts its candidates

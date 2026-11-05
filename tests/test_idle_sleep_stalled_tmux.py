@@ -11,9 +11,11 @@ the busy skip of #922 / #991: the next tick looks again. ``None`` is still
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import pytest
 
 import c_lord.tmux as T
 from c_lord.idle_sleep import IdleSleepLoop
@@ -87,3 +89,59 @@ async def test_could_not_sleep_is_asked_again_next_tick() -> None:
     assert await loop.tick() == 0
     assert await loop.tick() == 0
     assert impl.await_count == 2
+
+
+# --- review of the #1228 fix: ``False`` is also returned for causes that never go
+# away (not a Thread, no repo binding / tmux manager). Retrying those every tick
+# forever, silently, and without a per-tick bound, is its own bug.
+
+
+async def test_could_not_sleep_three_times_is_given_up_with_one_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    loop = _loop()
+    impl = AsyncMock(return_value=False)
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl  # type: ignore[attr-defined]
+    with caplog.at_level(logging.INFO, logger="c_lord.idle_sleep"):
+        for _ in range(6):
+            assert await loop.tick() == 0
+    assert impl.await_count == 3  # then visited, as before #1228
+    given_up = [
+        r
+        for r in caplog.records
+        if "thread=3" in r.getMessage() and "not trying again" in r.getMessage()
+    ]
+    assert [r.levelno for r in given_up] == [logging.INFO]
+
+
+async def test_a_success_in_between_resets_the_count() -> None:
+    loop = _loop()
+    impl = AsyncMock(side_effect=[False, False, None])
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl  # type: ignore[attr-defined]
+    for _ in range(3):
+        await loop.tick()
+    assert loop._unsure_counts == {}
+
+
+def _many_threads_loop(n: int, max_per_tick: int) -> tuple[IdleSleepLoop, AsyncMock]:
+    loop = _loop()
+    loop._max_per_tick = max_per_tick
+    threads = {}
+    for tid in range(100, 100 + n):
+        t = MagicMock(spec=discord.Thread)
+        t.id = tid
+        t.parent_id = 10
+        threads[tid] = t
+    loop._bot.get_channel = MagicMock(side_effect=lambda tid: threads[tid])  # type: ignore[attr-defined]
+    loop._repo.list_all = AsyncMock(  # type: ignore[attr-defined]
+        return_value=[_rec(tid, hours_ago=9) for tid in threads]
+    )
+    impl = AsyncMock(return_value=False)
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl  # type: ignore[attr-defined]
+    return loop, impl
+
+
+async def test_a_stall_costs_at_most_max_per_tick_attempts() -> None:
+    loop, impl = _many_threads_loop(10, max_per_tick=4)
+    assert await loop.tick() == 0
+    assert impl.await_count == 4  # not 10 tmux timeouts in one tick
