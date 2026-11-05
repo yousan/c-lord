@@ -235,7 +235,8 @@ async def test_a_slow_poll_cycle_does_not_stall_the_event_loop(
                 order.append("poll ran on the event loop")
             else:
                 loop.call_soon_threadsafe(poll_started.set_result, None)
-                release.wait(60.0)  # safety net against a hang, never the assertion
+                # A hang guard, never the assertion: a healthy loop releases at once.
+                release.wait(10.0)
             order.append("poll finished")
         return real(self)
 
