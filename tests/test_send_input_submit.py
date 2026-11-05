@@ -45,6 +45,23 @@ LONG_MESSAGE = "\n".join(f"{j + 1}行目: " + "あ" * 200 for j in range(6))
 SHORT_MESSAGE = "ok"
 
 
+def _first_piece_folded(text: str) -> str:
+    """The box right after the first piece of a multi-piece *text* (#872/#1263).
+
+    send_input reads the box just before the first piece (the extra
+    ``BOX_EMPTY`` frame in the tests below) and once it is typed; the TUI has folded
+    it into ``[Pasted text #N +M lines]`` with M the piece's newline count.
+    Built from the real empty-box frame with only the box line replaced.
+    """
+    from c_lord.tmux import _chunk_for_send_keys
+
+    newlines = _chunk_for_send_keys(text)[0].count("\n")
+    lines = BOX_EMPTY.splitlines()
+    i = next(i for i, line in enumerate(lines) if line.startswith("❯"))
+    lines[i] = f"❯ [Pasted text #1 +{newlines} lines]"
+    return "\n".join(lines) + "\n"
+
+
 def _mgr() -> TmuxSessionManager:
     mgr = TmuxSessionManager(mapping_path="")
     mgr._available = True
@@ -128,7 +145,7 @@ def test_retry_that_lands_reports_success() -> None:
 
 def test_submitted_message_reports_success_without_extra_enter() -> None:
     """The normal path: box empty after Enter → done, no second keypress."""
-    pane = _Pane(BOX_EMPTY, BOX_EMPTY)
+    pane = _Pane(BOX_EMPTY, BOX_EMPTY, _first_piece_folded(LONG_MESSAGE), BOX_EMPTY)
     assert _send(pane, LONG_MESSAGE) is True
     assert pane.enters == 1, "a message that submitted must not get a spurious extra Enter"
 
@@ -215,7 +232,7 @@ def test_chunked_payload_settles_and_is_verified() -> None:
     huge = "\n".join(f"{j + 1}行目: " + "あ" * 400 for j in range(60))
     assert len(_chunk_for_send_keys(huge)) > 1, "fixture must actually be chunked"
 
-    pane = _Pane(BOX_EMPTY, BOX_EMPTY)
+    pane = _Pane(BOX_EMPTY, BOX_EMPTY, _first_piece_folded(huge), BOX_EMPTY)
     assert _send(pane, huge) is True
     assert _PASTE_SETTLE in pane.slept  # type: ignore[attr-defined]
     # Every chunk typed, then exactly one Enter, then the confirming capture.
@@ -227,7 +244,7 @@ def test_chunked_payload_settles_and_is_verified() -> None:
 def test_chunked_payload_stuck_in_box_is_reported_as_failure() -> None:
     """AC6 + AC2: a chunked message that never submits must not read as success."""
     huge = STUCK_PASTE_PAYLOAD * 20
-    pane = _Pane(BOX_EMPTY, BOX_STUCK_PASTE)
+    pane = _Pane(BOX_EMPTY, BOX_EMPTY, _first_piece_folded(huge), BOX_STUCK_PASTE)
     assert _send(pane, huge) is False
 
 

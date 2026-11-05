@@ -28,7 +28,8 @@ import pytest
 
 from c_lord.tmux import (
     TmuxSessionManager,
-    _input_box_lost_head,
+    _chunk_for_send_keys,
+    _first_piece_state,
     _input_box_retains,
 )
 
@@ -162,15 +163,18 @@ class TestConfirmSubmitted:
 
 
 class TestHeadLost:
-    def test_short_payload_is_never_judged_head_lost(self) -> None:
-        """Only a payload long enough to have a distinct head and tail qualifies."""
-        assert _input_box_lost_head(HEAD_LOST, "TAILMARK872 と書いた") is False
+    """Since #1263 the first piece is judged right after it is typed (it is
+    what :func:`_first_piece_state` reads); see tests/test_send_input_first_piece.py."""
 
-    def test_box_holding_the_head_has_not_lost_it(self) -> None:
-        assert _input_box_lost_head(HEAD_LOST, "- 項目22: " + _LINE * 2) is False
+    def test_a_box_holding_the_pieces_start_has_it(self) -> None:
+        piece = "- 項目22: " + _LINE * 2
+        assert _first_piece_state(HEAD_LOST, piece) == "landed"
 
-    def test_the_production_frame_is_head_lost(self) -> None:
-        assert _input_box_lost_head(HEAD_LOST, LONG_872) is True
+    def test_a_box_without_the_pieces_start_has_lost_it(self) -> None:
+        assert _first_piece_state(HEAD_LOST, _chunk_for_send_keys(LONG_872)[0]) == "lost"
+
+    def test_an_empty_box_is_reported_as_empty(self) -> None:
+        assert _first_piece_state(BOX_EMPTY, _chunk_for_send_keys(LONG_872)[0]) == "empty"
 
     def test_refused_retype_is_a_reported_failure_and_no_enter(self) -> None:
         """#872 + #809: the retype tmux refuses ends the send, with tmux's reason.
