@@ -317,3 +317,32 @@ async def test_a_fast_answer_resets_the_slow_streak() -> None:
         await loop.tick()  # the 10th slow one in a row
         await loop.tick()
     assert len(seen) == len(plan) + 1, seen
+
+
+async def test_a_fast_could_not_sleep_does_not_prove_tmux_answered() -> None:
+    """W57 review 12: a fast ``False`` ("not a thread", "no tmux manager") may never
+    have reached tmux, so it must not stand in for the probe. Here tmux is stalled
+    (the probe fails); one window answers a fast ``False`` every tick and another
+    times out every tick. The slow one must not be given up during the stall."""
+    loop, repo, recs = _setup(real_count=False)
+    repo.list_all = AsyncMock(return_value=recs[:2])
+    clock = Clock()
+    seen: Counter[int] = Counter()
+
+    async def impl(**kw):  # type: ignore[no-untyped-def]
+        tid = kw["channel"].id
+        seen[tid] += 1
+        if tid == 2:
+            clock.t += tmux_mod._RUN_TIMEOUT_SECONDS
+        return False
+
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl
+    loop._tmux_answers = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    with (
+        patch.object(idle_sleep_mod, "_clock", clock),
+        patch.object(idle_sleep_mod, "_MAX_UNSURE", 1000),  # keep the fast one coming
+        patch("c_lord.tmux._run", _healthy),
+    ):
+        for _ in range(idle_sleep_mod._MAX_SLOW + 5):
+            await loop.tick()
+    assert seen[2] == idle_sleep_mod._MAX_SLOW + 5, dict(seen)
