@@ -232,7 +232,9 @@ def is_voice_webhook(webhook_id: int | None) -> bool:
         ):
             # #1176: ours is not on disk yet — try again, quietly. #1204: nor
             # if the file was removed — our own voices may be all that posts.
-            _flush_ours(registry_path(), quiet=True)
+            # #1222: quiet only once a failure has been reported (``_unwritten``);
+            # a removed file that cannot be recreated is otherwise never logged.
+            _flush_ours(registry_path(), quiet=_unwritten)
         if webhook_id in _load():
             return True
         # Unknown here — another instance may have registered it since (#1024).
