@@ -281,7 +281,8 @@ def remove_clean_session_dir(
         logger.info("session cleanup: keeping %s — %s (thread=%s)", path, reason, record.thread_id)
         return DirOutcome.KEPT_FOREIGN
 
-    status = worktree_status(str(path))
+    # #1246: other workspaces under *sessions_root* vouch for no tag.
+    status = worktree_status(str(path), sessions_root=str(sessions_root) if sessions_root else None)
     if not status.clean:
         logger.info(
             "session cleanup: keeping %s — %s (thread=%s)",

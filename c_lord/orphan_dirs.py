@@ -209,17 +209,19 @@ def find_orphan_dirs(
     return found
 
 
-def remove_orphan_dir(path: Path | str) -> DirOutcome:
+def remove_orphan_dir(path: Path | str, *, sessions_root: Path | str | None = None) -> DirOutcome:
     """安全なときだけ *path* を消す。Never raises.
 
     :func:`c_lord.session_cleanup.remove_clean_session_dir` と同じ判定を、行を
     持たないディレクトリに対して行う。判定を書き直さないのは意図的 — 「消して
     よいか」の定義が2つに分かれた瞬間に、片方だけが緩む。
     """
-    return _remove_orphan_dir(path)[0]
+    return _remove_orphan_dir(path, sessions_root=sessions_root)[0]
 
 
-def _remove_orphan_dir(path: Path | str) -> tuple[DirOutcome, WorktreeStatus | None]:
+def _remove_orphan_dir(
+    path: Path | str, *, sessions_root: Path | str | None = None
+) -> tuple[DirOutcome, WorktreeStatus | None]:
     """:func:`remove_orphan_dir` の本体。サマリの内訳のために判定結果も返す。
 
     残す理由は **INFO** に出す (#749/#678)。DEBUG に落としていた間、掃除が
@@ -237,7 +239,10 @@ def _remove_orphan_dir(path: Path | str) -> tuple[DirOutcome, WorktreeStatus | N
     except (OSError, ValueError):
         return DirOutcome.ABSENT, None
 
-    status = worktree_status(str(target))
+    # #1246: other workspaces under *sessions_root* vouch for no tag.
+    status = worktree_status(
+        str(target), sessions_root=str(sessions_root) if sessions_root else None
+    )
     if not status.clean:
         logger.info("orphan sweep: keeping %s — %s", target, describe_changes(status))
         return DirOutcome.KEPT_DIRTY, status
@@ -295,7 +300,9 @@ async def sweep_orphan_dirs(
         if removed >= max_per_pass:
             break
         size = await asyncio.to_thread(_size_of, candidate.path)
-        outcome, status = await asyncio.to_thread(_remove_orphan_dir, candidate.path)
+        outcome, status = await asyncio.to_thread(
+            lambda p=candidate.path: _remove_orphan_dir(p, sessions_root=root)
+        )
         if outcome is DirOutcome.REMOVED:
             removed += 1
             reclaimed += size
