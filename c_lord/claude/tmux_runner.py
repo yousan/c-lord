@@ -27,6 +27,7 @@ from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import count_usage_limit, extract_usage_limit
 from ..utils.logger import log_ctx
+from ..workspace_failure import redact_credentials
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import (
     FREE_TEXT_NONE,
@@ -817,43 +818,89 @@ def _permission_zone(text: str) -> str:
 _DIALOG_RULE_RE = re.compile(r"^[─━═╌┄┈\-\s]+$")
 
 
-def _permission_dialog_open(pane: str) -> bool:
-    """True when a permission dialog — not prose — has the keyboard (#1247).
+# #1247: the questions the Edit / Write dialogs ask, from real captures
+# (``i1247_edit_dialog_…`` / ``i1247_create_dialog_…``, Claude Code 2.1.318).
+# Only the pre-send hold reads them. They are deliberately NOT in
+# ``_PERMISSION_PROMPT_MARKERS``: that tuple drives decision 4's in-turn
+# auto-accept, where these dialogs are reported as an unknown prompt instead.
+_EDIT_PERMISSION_MARKERS = ("Do you want to make this edit to ", "Do you want to create ")
+_HOLD_MARKERS = _PERMISSION_PROMPT_MARKERS + _EDIT_PERMISSION_MARKERS
 
-    ``_has_permission_prompt`` alone reads Claude's own last sentence ("Do you
-    want to proceed?") in the bottom rows as a dialog (#156). Inside a turn a
-    false hit costs an Enter on an idle prompt; before a send it would hold the
-    request for half an hour. A real dialog replaces the input box (verified on
-    ``i1247_permission_dialog_background_agent_v2_1_318.txt``), so a visible
-    input box means the marker is prose.
+
+def _dialog_question_row(lines: list[str]) -> int | None:
+    """Index of the last dialog-question row in the bottom zone, or None (#1247)."""
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    for i in range(end - 1, max(0, end - _PERMISSION_SCAN_LINES) - 1, -1):
+        if any(marker in lines[i] for marker in _HOLD_MARKERS):
+            return i
+    return None
+
+
+def _permission_dialog_open(pane: str) -> bool:
+    """True when a permission dialog — not prose, not a menu — has the keyboard (#1247).
+
+    A marker alone reads Claude's own last sentence ("Do you want to proceed?")
+    as a dialog (#156); before a send that would hold the request for half an
+    hour. A real dialog draws no input box under its question (verified on the
+    ``i1247_*_dialog_background_agent_v2_1_318.txt`` captures), so only the rows
+    *below* the question are searched for one — a bare ``>`` or ``❯`` line in
+    the command above it is not an input box. An AskUserQuestion / plan menu
+    whose question happens to be a marker is a menu: #358 handles those.
     """
-    return TmuxClaudeRunner._has_permission_prompt(pane) and not TmuxClaudeRunner._has_input_prompt(
+    lines = pane.splitlines()
+    row = _dialog_question_row(lines)
+    if row is None:
+        return False
+    if TmuxClaudeRunner._has_input_prompt("\n".join(lines[row + 1 :])):
+        return False
+    return (_parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)) is None
+
+
+def _permission_dialog_closed(pane: str) -> bool:
+    """True once the dialog's question is gone AND the input box is back (#1247).
+
+    Both, because a redraw between two states shows neither — that is not an
+    answer, and the next agent's dialog can be one frame away.
+    """
+    return _dialog_question_row(pane.splitlines()) is None and TmuxClaudeRunner._has_input_prompt(
         pane
     )
+
+
+def pane_shows_permission_dialog(raw: object) -> bool:
+    """:func:`_permission_dialog_open` on a raw capture; unreadable ⇒ False (#1247)."""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    return _permission_dialog_open(_normalize_capture(raw))
 
 
 def _permission_dialog_summary(pane: str) -> str:
     """The dialog's own rows above its question, trimmed for Discord (#1247).
 
-    On the real dialog that is the tool, the requester ("from the
-    general-purpose agent"), Claude's description and the command itself. Tips
-    and frame rules are dropped; backticks are neutralised so the text cannot
-    close the code block it is shown in.
+    On the real dialogs that is the tool, the requester ("from the
+    general-purpose agent"), Claude's description and the command or diff.
+    Tips and frame rules are dropped, URL credentials are redacted, and
+    backticks are neutralised so the text cannot close its code block.
     """
-    lines = _permission_zone(pane).splitlines()
-    end = next(
-        (i for i, line in enumerate(lines) if any(m in line for m in _PERMISSION_PROMPT_MARKERS)),
-        len(lines),
-    )
+    lines = pane.splitlines()
+    end = _dialog_question_row(lines)
+    if end is None:
+        return ""
+    # The first question row (Bash dialogs have two: "requires approval" + "proceed?").
+    zone_start = max(0, end - _PERMISSION_SCAN_LINES)
+    while end > zone_start and any(m in lines[end - 1] for m in _HOLD_MARKERS):
+        end -= 1
     rows: list[str] = []
-    for line in reversed(lines[:end]):
+    for line in reversed(lines[zone_start:end]):
         stripped = line.strip()
         if stripped.startswith("─") and _DIALOG_RULE_RE.match(stripped):
             break  # the rule above the dialog: everything higher is conversation
         if not stripped or _DIALOG_RULE_RE.match(stripped) or stripped.startswith("Tip:"):
             continue
         rows.append(stripped)
-    text = "\n".join(reversed(rows)).replace("`", "ˋ")
+    text = redact_credentials("\n".join(reversed(rows))).replace("`", "ˋ")
     if len(text) > _PERMISSION_SUMMARY_MAX:
         text = text[: _PERMISSION_SUMMARY_MAX - 1] + "…"
     return text
@@ -1672,6 +1719,10 @@ class TmuxClaudeRunner:
         # #1247: the normalised pane the last ``peek_pending_ask`` read (None
         # when it read nothing — a dead pane, or a peek a test replaced).
         self._last_peek_pane: str | None = None
+        # #1247: one deadline for every dialog this turn waits behind, and the
+        # dialogs the thread was already told about.
+        self._hold_deadline: float | None = None
+        self._hold_notified: set[str] = set()
         # #1170: the run ended because its pane is a menu waiting for an answer
         # (the #751 backstop), not because the turn finished.
         self.ended_awaiting_answer = False
@@ -1956,14 +2007,23 @@ class TmuxClaudeRunner:
             # sub-agent's Bash call) has the keyboard. Typing the request would
             # answer it "Yes" with the Enter and lose the text, so hold the
             # request — no text, no key — until a human answers it in the pane.
-            # Judged on the pane the peek above just read (no extra capture).
-            if (peeked := self._last_peek_pane) is not None and _permission_dialog_open(peeked):
+            # Judged on the pane the peek above just read (no extra capture), and
+            # again on the re-peek after every hold: the next agent's dialog can
+            # open the moment this one is answered. A menu (``pending``) is
+            # #358's business, whatever its question says.
+            while (
+                pending is None
+                and not self._stopped
+                and (peeked := self._last_peek_pane) is not None
+                and _permission_dialog_open(peeked)
+            ):
                 async for held in self._hold_for_permission_dialog(peeked):
                     yield held
                     if held.message_type == MessageType.RESULT:
                         return
-                if not self._stopped:
-                    pending = await self.peek_pending_ask()
+                if self._stopped:
+                    break
+                pending = await self.peek_pending_ask()
             if pending is not None:
                 logger.info(
                     "Open menu detected before delivering new input; dismissing it "
@@ -3073,34 +3133,46 @@ class TmuxClaudeRunner:
     async def _hold_for_permission_dialog(self, pane: str) -> AsyncGenerator[StreamEvent, None]:
         """Keep the prompt out of an open permission dialog (#1247).
 
-        *pane* is the normalised pane that showed the dialog. Yields one SYSTEM
-        notice (``permission_dialog_hold``) and polls the pane until the dialog
-        closes — then returns and the caller sends as usual — or until a stop
-        (the caller's ``_stopped_before_delivery`` ends the turn), or until
-        ``_PERMISSION_HOLD_TIMEOUT``, when it yields the turn's error RESULT.
+        *pane* is the normalised pane that showed the dialog. Posts a SYSTEM
+        notice (``permission_dialog_hold``) once per distinct dialog, then polls
+        until the dialog is answered — its question gone **and** the input box
+        back — and returns; the caller re-peeks and holds again if another
+        dialog is already up. A stop returns too (the caller's
+        ``_stopped_before_delivery`` ends the turn). One deadline,
+        ``_PERMISSION_HOLD_TIMEOUT``, covers every dialog of the turn; past it
+        this yields the turn's error RESULT.
 
         Never presses a key: this dialog is answered by a human only. The
         in-turn auto-accept (``_accept_permission_prompt``) is a separate path.
         """
-        if self._stopped:
-            return
-        logger.warning(
-            "%s permission dialog open in the pane; holding the request until a human "
-            "answers it (#1247)",
-            log_ctx(thread_id=self._thread_id),
-        )
+        loop = asyncio.get_running_loop()
+        if self._hold_deadline is None:
+            self._hold_deadline = loop.time() + _PERMISSION_HOLD_TIMEOUT
         self._held_for_permission = True
         try:
-            yield StreamEvent(
-                raw={},
-                message_type=MessageType.SYSTEM,
-                permission_dialog_hold=_permission_dialog_summary(pane)
-                or "(内容を読めませんでした)",
-            )
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + _PERMISSION_HOLD_TIMEOUT
             while not self._stopped:
-                if loop.time() >= deadline:
+                if _permission_dialog_open(pane):
+                    summary = _permission_dialog_summary(pane) or "(内容を読めませんでした)"
+                    if summary not in self._hold_notified:
+                        self._hold_notified.add(summary)
+                        logger.warning(
+                            "%s permission dialog open in the pane; holding the request "
+                            "until a human answers it (#1247)",
+                            log_ctx(thread_id=self._thread_id),
+                        )
+                        yield StreamEvent(
+                            raw={},
+                            message_type=MessageType.SYSTEM,
+                            permission_dialog_hold=summary,
+                        )
+                elif _permission_dialog_closed(pane):
+                    logger.info(
+                        "%s permission dialog answered; checking the pane again before "
+                        "sending the held request (#1247)",
+                        log_ctx(thread_id=self._thread_id),
+                    )
+                    return
+                if loop.time() >= self._hold_deadline:
                     logger.error(
                         "%s permission dialog still open after %.0fs; ending the turn "
                         "without sending the request (#1247)",
@@ -3118,14 +3190,8 @@ class TmuxClaudeRunner:
                 if self._stopped:
                     return
                 raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
-                if not raw.strip():
-                    continue  # a capture hiccup is not evidence the dialog closed (#485)
-                if not _permission_dialog_open(_normalize_capture(raw)):
-                    logger.info(
-                        "%s permission dialog closed; sending the held request (#1247)",
-                        log_ctx(thread_id=self._thread_id),
-                    )
-                    return
+                if raw.strip():  # an empty capture is not evidence of anything (#485)
+                    pane = _normalize_capture(raw)
         finally:
             self._held_for_permission = False
 

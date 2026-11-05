@@ -111,6 +111,10 @@ def _fast():  # noqa: ANN202 — a patch stack
         stack.enter_context(patch(f"c_lord.claude.tmux_runner.{name}", value))
     # The hold's own pacing (new in #1247; ``create`` so this file runs on main).
     stack.enter_context(patch("c_lord.claude.tmux_runner._PERMISSION_HOLD_POLL", 0.01, create=True))
+    # A hold that never ends fails the test in seconds, not in 30 minutes.
+    stack.enter_context(
+        patch("c_lord.claude.tmux_runner._PERMISSION_HOLD_TIMEOUT", 2.0, create=True)
+    )
     return stack
 
 
@@ -271,3 +275,191 @@ async def test_the_hold_notice_is_posted_to_the_thread() -> None:
     assert "30 分" in embed.description
     assert "/workspace-stop" in embed.description
     repo.save.assert_not_awaited()  # not a session save
+
+
+# --- Review of 84fa59e ------------------------------------------------------
+
+PANES = Path(__file__).parent / "fixtures" / "panes"
+# Real captures of the Edit / Write dialogs a background agent raises in the
+# default permission mode (Claude Code 2.1.318). They carry no
+# ``_PERMISSION_PROMPT_MARKERS`` phrase.
+EDIT_PANE = (PANES / "i1247_edit_dialog_background_agent_v2_1_318.txt").read_text(encoding="utf-8")
+CREATE_PANE = (PANES / "i1247_create_dialog_background_agent_v2_1_318.txt").read_text(
+    encoding="utf-8"
+)
+# A second Bash dialog from another agent: the real dialog, another command.
+SECOND_DIALOG_PANE = PERMISSION_PANE.replace("rm -rf ./junk;", "rm -rf ./other-junk;")
+# A redraw between two states: neither the dialog's question nor the input box.
+TRANSIENT_PANE = '● Agent "Delete junk directory" is running…\n\n  ⎿  Bash(rm -rf ./junk)\n'
+
+
+async def _scripted_run(
+    tmux_manager: MagicMock, script: list[str]
+) -> tuple[list[StreamEvent], list[str]]:
+    """Run a turn whose pane shows ``script`` capture by capture (last one repeats).
+
+    Returns the events and the pane each ``send_input`` was typed into.
+    """
+    runner = _runner(tmux_manager)
+    shown = {"pane": script[0], "n": 0}
+    typed_into: list[str] = []
+
+    def capture(_tid: int, *args: object, **kwargs: object) -> str:
+        if typed_into:
+            shown["pane"] = DONE_PANE
+        else:
+            shown["pane"] = script[min(shown["n"], len(script) - 1)]
+            shown["n"] += 1
+        return shown["pane"]
+
+    def send_input(_tid: int, _prompt: str, **_kw: object) -> bool:
+        typed_into.append(shown["pane"])
+        return True
+
+    tmux_manager.capture_pane.side_effect = capture
+    tmux_manager.send_input.side_effect = send_input
+    events: list[StreamEvent] = []
+    with _fast(), patch("c_lord.tmux._run") as raw_tmux:
+        async for event in runner.run("<text>"):
+            events.append(event)
+    assert _keys_pressed(tmux_manager, raw_tmux) == [], "c-lord must not answer a dialog"
+    return events, typed_into
+
+
+@pytest.mark.asyncio
+async def test_a_second_dialog_right_after_the_first_is_held_too(tmux_manager: MagicMock) -> None:
+    """HIGH 1: agent 2's dialog opens as soon as agent 1's is answered."""
+    script = [PERMISSION_PANE] * 3 + [ANSWERED_PANE, SECOND_DIALOG_PANE, SECOND_DIALOG_PANE]
+    script += [SECOND_DIALOG_PANE] * 3 + [ANSWERED_PANE]
+    events, typed_into = await _scripted_run(tmux_manager, script)
+
+    assert typed_into == [ANSWERED_PANE], "the request was typed into the second dialog"
+    notices = [e.permission_dialog_hold for e in events if e.permission_dialog_hold]
+    assert len(notices) == 2 and "other-junk" in notices[1]
+
+
+@pytest.mark.asyncio
+async def test_the_hold_ends_only_when_the_input_box_is_back(tmux_manager: MagicMock) -> None:
+    """HIGH 1: a redraw with no dialog and no input box is not "answered"."""
+    script = [PERMISSION_PANE] * 3 + [TRANSIENT_PANE] * 3 + [ANSWERED_PANE]
+    _events, typed_into = await _scripted_run(tmux_manager, script)
+    assert typed_into == [ANSWERED_PANE]
+
+
+@pytest.mark.parametrize("pane", [EDIT_PANE, CREATE_PANE], ids=["edit", "create"])
+def test_edit_and_create_dialogs_hold_the_request(pane: str) -> None:
+    """MEDIUM 3: the real Edit / Write dialogs count as permission dialogs before a send."""
+    from c_lord.claude.tmux_runner import _permission_dialog_open
+
+    assert _permission_dialog_open(_normalize_capture(pane)) is True
+
+
+@pytest.mark.parametrize("pane", [EDIT_PANE, CREATE_PANE], ids=["edit", "create"])
+def test_in_turn_auto_accept_still_ignores_edit_and_create_dialogs(pane: str) -> None:
+    """Decision 4 unchanged: inside a turn these stay the unknown-prompt alert, not an Enter."""
+    norm = _normalize_capture(pane)
+    assert TmuxClaudeRunner._has_permission_prompt(norm) is False
+    assert TmuxClaudeRunner._has_unknown_interactive(norm) is True
+
+
+@pytest.mark.asyncio
+async def test_request_is_not_typed_into_an_edit_dialog(tmux_manager: MagicMock) -> None:
+    """MEDIUM 3: the Enter would approve the edit just like a Bash call."""
+    events, typed_into = await _scripted_run(tmux_manager, [EDIT_PANE] * 3 + [ANSWERED_PANE])
+    assert typed_into == [ANSWERED_PANE]
+    notices = [e.permission_dialog_hold for e in events if e.permission_dialog_hold]
+    assert notices and "notes.txt" in notices[0]
+
+
+@pytest.mark.parametrize("line", [">", "❯"])
+def test_a_command_line_that_looks_like_an_input_box_keeps_the_hold(line: str) -> None:
+    """MEDIUM 4: a bare ``>`` / ``❯`` row inside the command is not the input box."""
+    from c_lord.claude.tmux_runner import _permission_dialog_open
+
+    pane = PERMISSION_PANE.replace(' rm -rf ./junk; echo "exit=$?"', f" cat <<'EOF'\n {line}\n EOF")
+    assert pane != PERMISSION_PANE
+    assert _permission_dialog_open(_normalize_capture(pane)) is True
+
+
+def _ask_proceed_pane() -> str:
+    """The real AskUserQuestion menu (i751) whose question is "Do you want to proceed?"."""
+    pane = (PANES / "i751_ask_menu_open_v2_1_280.txt").read_text(encoding="utf-8")
+    asked = pane.replace("#751 の検証を続けますか?", "Do you want to proceed?")
+    assert asked != pane
+    return asked
+
+
+@pytest.mark.asyncio
+async def test_an_ask_menu_asking_to_proceed_is_not_held(tmux_manager: MagicMock) -> None:
+    """LOW 6: an AskUserQuestion menu goes the #358 way (Esc, then send), not a 30-min hold."""
+    runner = _runner(tmux_manager)
+    tmux_manager.capture_pane.side_effect = lambda *_a, **_k: (
+        DONE_PANE if tmux_manager.send_input.called else _ask_proceed_pane()
+    )
+    events: list[StreamEvent] = []
+    with _fast(), patch("c_lord.tmux._run"):
+        async for event in runner.run("<text>"):
+            events.append(event)
+
+    assert tmux_manager.send_input.called
+    assert not [e for e in events if e.permission_dialog_hold]
+    tmux_manager.send_keys.assert_any_call(THREAD_ID, "Escape")
+
+
+def test_the_quote_redacts_url_credentials() -> None:
+    """LOW 7: a token in the dialog's command does not reach Discord."""
+    from c_lord.claude.tmux_runner import _permission_dialog_summary
+
+    pane = PERMISSION_PANE.replace(
+        ' rm -rf ./junk; echo "exit=$?"',
+        " git push https://bot:ghp_SECRET123@github.com/o/r.git",
+    )
+    summary = _permission_dialog_summary(_normalize_capture(pane))
+    assert "github.com/o/r.git" in summary
+    assert "ghp_SECRET123" not in summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/compact", "/clear"])
+async def test_slash_command_is_not_typed_into_a_permission_dialog(command: str) -> None:
+    """HIGH 2: /compact and /clear with no turn running refuse instead of pressing Enter."""
+    import discord
+
+    from c_lord.cogs import claude_chat as cc
+
+    bot = MagicMock()
+    bot.channel_id = 999
+    chat = cc.ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = THREAD_ID
+    tmux = MagicMock()
+    tmux.is_claude_running.return_value = True
+    tmux.capture_pane.return_value = PERMISSION_PANE
+    tmux.pane_foreground_command.return_value = "claude"
+
+    refusal = await chat._deliver_slash_command(thread, tmux, command)
+
+    assert refusal is not None and "許可ダイアログ" in refusal and command in refusal
+    tmux.send_literal.assert_not_called()
+    tmux.send_keys.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_slash_command_goes_out_at_an_idle_prompt() -> None:
+    """HIGH 2 guard: with no dialog, /compact is typed as before."""
+    import discord
+
+    from c_lord.cogs import claude_chat as cc
+
+    bot = MagicMock()
+    bot.channel_id = 999
+    chat = cc.ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = THREAD_ID
+    tmux = MagicMock()
+    tmux.is_claude_running.return_value = True
+    tmux.capture_pane.return_value = DONE_PANE
+    tmux.send_literal.return_value = True
+
+    assert await chat._deliver_slash_command(thread, tmux, "/compact") is None
+    tmux.send_literal.assert_called_once_with(THREAD_ID, "/compact")

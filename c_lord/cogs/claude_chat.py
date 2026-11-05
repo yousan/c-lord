@@ -32,7 +32,11 @@ from .. import turn_events
 from ..api_error import advice
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
-from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
+from ..claude.tmux_runner import (
+    TmuxClaudeRunner,
+    pane_shows_permission_dialog,
+    wait_for_idle_prompt,
+)
 from ..command_gate import is_message_authorized, owns
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
@@ -2336,6 +2340,23 @@ class ClaudeChatCog(commands.Cog):
                     "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
                 )
 
+        # #1247: a permission dialog left open between turns (a background
+        # sub-agent's Bash call) has the keyboard — the Enter below would approve
+        # it and the command would be lost. Refuse; the human answers it first.
+        if pane_shows_permission_dialog(
+            await asyncio.to_thread(tmux_manager.capture_pane, thread_id)
+        ):
+            logger.warning(
+                "%s %s: a permission dialog is open in the pane; not typing (#1247)",
+                log_ctx(thread_id=thread_id),
+                command,
+            )
+            return (
+                f"⏸️ `{command}` は送っていません — Claude のペインで許可ダイアログが開いています"
+                "（バックグラウンドのサブエージェントのコマンド確認など）。"
+                "打ち込むとその Enter がダイアログを承認してしまうためです。"
+                "先にペインでダイアログに答えてから、もう一度実行してください。"
+            )
         if before_send is not None:
             await before_send()
         # send_literal (not send_input): no ZWSP prefix, so the leading "/" is

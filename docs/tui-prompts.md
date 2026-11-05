@@ -81,15 +81,26 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **検出パターン（現行）** | `_PERMISSION_PROMPT_MARKERS = ("Do you want to proceed?", "This command requires approval")` |
 | **課題** | JSONL パスを使えば文字列マッチ不要。`permission_request` フィールドがあれば確定。Discord に `AskView` でボタン表示 → `request_id` で承認応答が理想 |
 
-**ターンの外で開いたダイアログには依頼を打ち込まない (#1247)。** 自動承認（上の `_accept_permission_prompt`）は、runner がターンの中でペインを見ている間だけの動き。親のターンが終わったあとにバックグラウンドのサブエージェントの Bash が許可を求めると、ダイアログはターンの外で開いたままになる（実キャプチャ: `tests/fixtures/panes/i1247_permission_dialog_background_agent_v2_1_318.txt`、Claude Code 2.1.318、`Bash command · from the general-purpose agent` / `This command requires approval` / `Do you want to proceed?` / `❯ 1. Yes` … `4. No`。入力欄は描かれない）。以前はこの状態で次の依頼が来ると、本文と Enter をそのまま打ち込み、**Enter がダイアログを「Yes」で承認し、依頼の本文は Claude に届かなかった**（本番では `safetyCheck` / `dangerousRemoval` の付いた削除が人の判断なしに通った）。
+**ターンとターンの間に開いたダイアログには依頼を打ち込まない (#1247)。** 自動承認（上の `_accept_permission_prompt`）は、runner がターンの中でペインを見ている間だけの動き。親のターンが終わったあとにバックグラウンドのサブエージェントの Bash が許可を求めると、ダイアログはターンの外で開いたままになる（実キャプチャ: `tests/fixtures/panes/i1247_permission_dialog_background_agent_v2_1_318.txt`、Claude Code 2.1.318、`Bash command · from the general-purpose agent` / `This command requires approval` / `Do you want to proceed?` / `❯ 1. Yes` … `4. No`。入力欄は描かれない）。以前はこの状態で次の依頼が来ると、本文と Enter をそのまま打ち込み、**Enter がダイアログを「Yes」で承認し、依頼の本文は Claude に届かなかった**（本番では `safetyCheck` / `dangerousRemoval` の付いた削除が人の判断なしに通った）。
 
-いまは送る直前にペインを見て、許可ダイアログが開いていれば（`_permission_dialog_open`: 許可マーカーがあり、**かつ入力欄が無い** — Claude 自身の文の「Do you want to proceed?」を拾わないため）:
+Edit / Write の許可ダイアログも同じ形で出る（default モード。実キャプチャ: `i1247_edit_dialog_background_agent_v2_1_318.txt` の `Edit file · from the general-purpose agent` / `Do you want to make this edit to notes.txt?`、`i1247_create_dialog_background_agent_v2_1_318.txt` の `Create file …` / `Do you want to create created.txt?`）。
+
+**守っているのはターンとターンの間だけ。** 送る直前（次の依頼、`/compact`・`/clear`）にペインを見て、許可ダイアログが開いていれば保留する。**ターンの中で開いた許可ダイアログは、これまでどおり決定 4 の自動承認（`_accept_permission_prompt`）が Enter で答える** — バックグラウンドのサブエージェントのものも、`dangerousRemoval` のような安全確認付きのものも含む。「すべての許可ダイアログに c-lord は答えない」わけではない。ターン中の扱いは別 Issue。
+
+許可ダイアログが開いているかの判定（`_permission_dialog_open`）:
+
+- 下の行（`_PERMISSION_SCAN_LINES`）に問いの行がある。問いは `_PERMISSION_PROMPT_MARKERS` と、保留のときだけ使う `_EDIT_PERMISSION_MARKERS`（`Do you want to make this edit to ` / `Do you want to create `）。後者はターン中の自動承認には**入れていない**ので、ターン中の Edit / Write ダイアログはこれまでどおり「Unknown TUI prompt」の通知になる（自動では答えない）
+- **問いの行より下に**入力欄が無い — Claude 自身の文の「Do you want to proceed?」の下には入力欄があるので拾わない。問いより上（コマンドの中）の `>` や `❯` だけの行は入力欄と見なさない
+- AskUserQuestion / plan のメニューとして読めない — 問いの文がたまたま同じでも、メニューは #358 どおり Esc で閉じてから送る
+
+開いていれば:
 
 - **何も打たない・キーも押さない**（本文も Enter も C-c も）。c-lord はこのダイアログに答えない
-- スレッドに 1 回だけ「⏸️ 許可ダイアログが開いているため、依頼をまだ送っていません」を出す。ダイアログの行（ツール・依頼元・コマンド。約 300 字まで）を引用し、ペインで答えるか `/workspace-stop` で止めるよう書く
-- 2 秒ごと（`_PERMISSION_HOLD_POLL`）にペインを見直し、閉じたら依頼をそのまま送る
-- 30 分（`_PERMISSION_HOLD_TIMEOUT`）たっても閉じなければ、**依頼を送らずに**ターンをエラーで終える（エラー文に「依頼は Claude に送られていません」と書くので、もう一度送ればよい）
+- スレッドに「⏸️ 許可ダイアログが開いているため、依頼をまだ送っていません」を、**ダイアログ 1 つにつき 1 回**出す。ダイアログの行（ツール・依頼元・コマンドや差分。約 300 字まで、URL の認証情報は伏せる）を引用し、ペインで答えるか `/workspace-stop` で止めるよう書く
+- 2 秒ごと（`_PERMISSION_HOLD_POLL`）にペインを見直す。**問いの行が消え、かつ入力欄が戻ったら**答えられたと見なし、もう一度ペインを見てから送る。別のエージェントのダイアログがすぐ開いていたら、それにも同じく保留する（どちらも無い描き直しの途中は、答えとは見なさない）
+- 30 分（`_PERMISSION_HOLD_TIMEOUT`。ターン内のダイアログ全部で 1 つの期限）たっても答えが無ければ、**依頼を送らずに**ターンをエラーで終える（エラー文に「依頼は Claude に送られていません」と書くので、もう一度送ればよい）
 - 待っている間の停止・次のメッセージでの割り込みは効く。割り込みでも C-c は押さない（ダイアログに答えてしまうため）
+- `/compact`・`/clear` は待たずに断る:「`/compact` は送っていません — Claude のペインで許可ダイアログが開いています …先にペインでダイアログに答えてから、もう一度実行してください」
 
 ### 2-2. Plan Mode Approval（ExitPlanMode）
 
