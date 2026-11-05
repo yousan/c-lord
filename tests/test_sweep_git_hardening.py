@@ -118,10 +118,10 @@ def test_probe_fetch_has_the_ls_remote_timeout_and_a_failure_costs_once(
             return super().communicate(input, timeout)
 
     monkeypatch.setattr(sd.subprocess, "Popen", Hang)
-    assert not sd.worktree_status(str(ws)).clean
+    assert not sd.worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
     _upstream_moves(tmp_path)  # a new head, same branch: the failure still stands
     sd._ls_remote_cache.pop(next(k for k in sd._ls_remote_cache if "\0" not in k))
-    assert not sd.worktree_status(str(ws)).clean
+    assert not sd.worktree_status(str(ws), sessions_root=str(tmp_path / "sessions")).clean
     # One fetch, with the ls-remote timeout (the 5 s is _run draining the killed group).
     assert [t for t in timeouts if t != 5] == [sd._LS_REMOTE_TIMEOUT_SECONDS], timeouts
 

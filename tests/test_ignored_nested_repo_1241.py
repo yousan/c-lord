@@ -65,7 +65,7 @@ def test_ignored_repo_fully_pushed_is_still_regenerable(tmp_path: Path) -> None:
     ws, subr = _workspace(tmp_path)
     _ignore(ws, "vendor/")
     git(tmp_path, "clone", "-q", str(subr), str(ws / "vendor" / "lib"))
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
 
@@ -92,7 +92,7 @@ def test_regenerable_files_inside_an_ignored_repo_are_not_work(tmp_path: Path) -
     (lib / ".git" / "info" / "exclude").write_text("__pycache__/\n")
     (lib / "__pycache__").mkdir()
     (lib / "__pycache__" / "m.pyc").write_bytes(b"\0")
-    st = worktree_status(str(ws))
+    st = worktree_status(str(ws), sessions_root=str(tmp_path / "sessions"))
     assert st.clean, describe_changes(st)
 
 
