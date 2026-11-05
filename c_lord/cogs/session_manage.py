@@ -1964,6 +1964,17 @@ class SessionManageCog(commands.Cog):
             return 0
         return int(await asyncio.to_thread(tmux_mgr.count_tool_shells, thread_id))
 
+    async def _gone_host_wide(self, thread_id: int) -> bool:
+        """True only when tmux answers that no pane runs this thread's claude (#1213/#1219).
+
+        The same source the resident cap counts with. "Could not tell" is not gone.
+        """
+        import asyncio
+
+        from .. import tmux as _tmux
+
+        return await asyncio.to_thread(_tmux.is_resident_anywhere, thread_id) is False
+
     async def _sleep_workspace_impl(
         self,
         *,
@@ -1993,8 +2004,9 @@ class SessionManageCog(commands.Cog):
         ``None`` — there was no window to kill (already asleep, or its claude
         ended on its own); ``False`` — the window may still be there and could
         not be killed (no manager, ``kill-window`` failed — a stalled tmux also
-        fails it, so a failed kill is never read as gone — or its claude still
-        runs in another tmux session, #1213). The resident cap makes
+        fails it, so a failed kill is read as gone only when tmux then answers
+        that the window is nowhere, #1219 — or its claude still runs in another
+        tmux session, #1213). The resident cap makes
         up for ``False`` with the next candidate and only for that (#1094).
 
         There is no slash command on purpose. Being invisible is the feature; a
@@ -2035,19 +2047,14 @@ class SessionManageCog(commands.Cog):
             # made up for it. Still there (or could not tell) is ``False``: the
             # next candidate makes up. It is not killed from here — the move is
             # create_session's job, and this manager does not own that window.
-            from .. import tmux as _tmux
-
-            elsewhere = await asyncio.to_thread(_tmux.is_resident_anywhere, thread_id)
-            if elsewhere is not False:
-                logger.warning(
-                    "%s sleep: no window in this thread's session but %s — counted as still there",
-                    log_ctx(thread_id=thread_id),
-                    "tmux did not answer host-wide"
-                    if elsewhere is None
-                    else "its claude runs in another session",
-                )
-                return False
-            return None
+            if await self._gone_host_wide(thread_id):
+                return None
+            logger.warning(
+                "%s sleep: no window in this thread's session but its claude still runs "
+                "elsewhere (or tmux did not answer) — counted as still there",
+                log_ctx(thread_id=thread_id),
+            )
+            return False
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the
         # harness write a final ``<task-notification>`` row into the transcript,
@@ -2056,11 +2063,20 @@ class SessionManageCog(commands.Cog):
         await self._stop_transcript_mirror(thread_id)
 
         if not await asyncio.to_thread(tmux_mgr.kill_session, thread_id):
-            # #1192: the window was there a moment ago and the kill failed. Not
-            # "gone": asking tmux again cannot tell "vanished in between" from
-            # "tmux stalled" (the kill's own likely cause — a stalled lookup also
-            # answers "no window"), and reading a stall as gone left the cap
-            # above its limit. At worst the cap sleeps one more thread than needed.
+            # #1192: the window was there a moment ago and the kill failed. A
+            # stall is the kill's likely cause and must not read as gone — that
+            # left the cap above its limit. #1219: but a ``kill-window`` that
+            # timed out may still have been carried out, and counting every such
+            # kill as "still there" slept the whole fleet in one tick. So ask
+            # again with lookups that can say "did not answer": gone only when
+            # tmux answers that the window is nowhere on the host.
+            again = await asyncio.to_thread(tmux_mgr.window_present, thread_id)
+            if again is False and await self._gone_host_wide(thread_id):
+                logger.info(
+                    "%s sleep: the kill reported failure but the window is gone",
+                    log_ctx(thread_id=thread_id),
+                )
+                return None
             logger.warning(
                 "%s sleep: could not kill the tmux window — counted as still there",
                 log_ctx(thread_id=thread_id),
