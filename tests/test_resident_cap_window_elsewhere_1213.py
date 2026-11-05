@@ -120,3 +120,69 @@ async def test_host_wide_lookup_that_stalls_is_not_gone() -> None:
             channel=_thread3(), reason=MagicMock(), idle_label="x"
         )
     assert out is False
+
+
+# --- independent review of the #1213 fix: another c-lord's window is not ours ---
+#
+# prod and staging share one tmux server. A pane of *another* instance
+# (``@clord_owner`` differs) that carries one of our thread ids is not a window
+# we could ever sleep. Counting it as "still there" made the cap sleep one of our
+# live workspaces in its place (on main it read as gone and nothing extra slept).
+
+
+def _foreign_elsewhere(argv: list[str]) -> MagicMock:
+    if argv[:2] == ["tmux", "-V"]:
+        return MagicMock(returncode=0, stdout="tmux 3.4", stderr="")
+    if argv[:2] == ["tmux", "list-windows"] and "-a" not in argv:
+        return MagicMock(returncode=0, stdout="", stderr="")
+    if argv[:3] == ["tmux", "list-panes", "-a"]:
+        if any(T.OWNER_OPTION in a for a in argv):
+            return MagicMock(returncode=0, stdout="3\tclaude\t%7\tother-bot\n", stderr="")
+        return MagicMock(returncode=0, stdout="3\tclaude\t%7\n", stderr="")
+    if argv[:2] == ["tmux", "kill-window"]:
+        raise AssertionError(f"killed a window: {argv}")
+    return MagicMock(returncode=1, stdout="", stderr="unexpected")
+
+
+async def test_another_instances_window_does_not_make_us_sleep_ours() -> None:
+    resident = {1, 2, 3}
+    slept: list[int] = []
+    real = _real_impl_cog(_new_session_mgr())
+
+    async def impl(*, channel: object, reason: object, idle_label: object) -> bool | None:
+        if channel.id == 3:  # type: ignore[attr-defined]
+            with (
+                patch("c_lord.tmux._run", side_effect=_foreign_elsewhere),
+                patch("c_lord.tmux.instance_owner", return_value="this-bot"),
+            ):
+                return await real._sleep_workspace_impl(
+                    channel=channel, reason=reason, idle_label=idle_label
+                )
+        slept.append(channel.id)  # type: ignore[attr-defined]
+        resident.discard(channel.id)  # type: ignore[attr-defined]
+        return True
+
+    cog = MagicMock()
+    cog._sleep_workspace_impl = AsyncMock(side_effect=impl)
+    ch = {i: MagicMock(id=i, parent_id=10) for i in (1, 2)}
+    ch[3] = _thread3()
+    loop = ResidentCapLoop(
+        _bot(cog=cog, channels=ch),
+        _repo([_rec(i, hours_ago=i) for i in range(1, 4)]),
+        limit=2,
+        resident_fn=lambda: set(resident),
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+        activity_fn=lambda r: None,
+    )
+    with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
+        await loop.tick()
+    assert slept == [], f"slept our live workspace(s) {slept} for another bot's window"
+
+
+def test_is_resident_anywhere_ignores_another_instances_pane() -> None:
+    with (
+        patch("c_lord.tmux._run", side_effect=_foreign_elsewhere),
+        patch("c_lord.tmux.instance_owner", return_value="this-bot"),
+    ):
+        assert T.is_resident_anywhere(3) is False

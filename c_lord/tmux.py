@@ -4075,11 +4075,15 @@ def _claude_panes_by_thread() -> dict[int, str]:
     return _claude_panes_listing() or {}
 
 
-def _claude_panes_listing() -> dict[int, str] | None:
+def _claude_panes_listing(*, owned_only: bool = False) -> dict[int, str] | None:
     """:func:`_claude_panes_by_thread`, but ``None`` when tmux could not be asked (#1034).
 
     No tmux at all, or no server, is an answer — nothing can be running claude.
     A ``list-panes`` that fails otherwise (a timeout, #699) is not.
+
+    *owned_only* keeps only panes of this instance (or of no instance — windows
+    from before #790), the rule :func:`close_thread_windows` uses: another
+    c-lord on the same tmux server is not ours to count (review of #1213).
     """
     global _last_tmux_answer
     _last_tmux_answer = None
@@ -4089,24 +4093,21 @@ def _claude_panes_listing() -> dict[int, str] | None:
         # stall wait twice (#1193).
         return {} if _last_tmux_answer is False else None
 
-    result = _run(
-        [
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{@thread_id}\t#{pane_current_command}\t#{pane_id}",
-        ]
-    )
+    fmt = "#{@thread_id}\t#{pane_current_command}\t#{pane_id}"
+    if owned_only:
+        fmt += f"\t#{{{OWNER_OPTION}}}"
+    result = _run(["tmux", "list-panes", "-a", "-F", fmt])
     if result.returncode != 0:
         return {} if _NO_SERVER_RE.search(result.stderr or "") else None
 
+    mine = instance_owner() if owned_only else ""
     panes: dict[int, str] = {}
     for line in result.stdout.splitlines():
-        tid, _, rest = line.partition("\t")
-        command, _, pane_id = rest.partition("\t")
+        tid, command, pane_id, owner = ([*line.split("\t"), "", "", ""])[:4]
         tid = tid.strip()
         pane_id = pane_id.strip()
+        if owned_only and owner.strip() not in ("", mine):
+            continue
         if tid.isdigit() and "claude" in command.strip().lower():
             panes[int(tid)] = pane_id
     return panes
@@ -4260,8 +4261,11 @@ def is_resident_anywhere(thread_id: int) -> bool | None:
     The same source the resident cap counts with (#1213): a window that sits in
     a session other than the one the thread's binding now resolves to (moved on
     the next turn) is still a resident. ``None`` is "could not tell" (#1034).
+    Only this instance's panes (or unowned ones) count: a window of another
+    c-lord on the shared server is none we could sleep, and counting it made
+    the cap sleep one of ours in its place (review of #1213).
     """
-    panes = _claude_panes_listing()
+    panes = _claude_panes_listing(owned_only=True)
     if panes is None:
         return None
     return thread_id in panes

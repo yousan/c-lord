@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
@@ -139,3 +139,87 @@ async def test_a_failed_kill_is_not_reported_not_resident(repo) -> None:
         assert body == {"status": "failed", "thread_id": str(THREAD)}
     finally:
         await client.close()
+
+
+# --- independent review of #1214: only a failed kill is ``failed`` ---
+#
+# ``staging.sh release`` closes a pane by id when the bot answers
+# ``not_resident``. A window in another tmux session of ours (binding changed,
+# not moved yet), a channel that is not a thread, or no tmux manager say nothing
+# about a window *this* sleep could kill: answered ``not_resident`` as before
+# #1214, so release still closes the pane. The resident cap keeps making up for
+# them (``False``) — that is the impl's default, unchanged.
+
+
+def _real_cog(mgr: object) -> object:
+    from c_lord.cogs.session_manage import SessionManageCog
+
+    cog = SessionManageCog.__new__(SessionManageCog)
+    cog._resolve_tmux_manager = AsyncMock(return_value=mgr)  # type: ignore[method-assign]
+    cog._stop_transcript_mirror = AsyncMock()  # type: ignore[method-assign]
+    cog.repo = MagicMock()
+    cog.repo.set_slept = AsyncMock()
+    return cog
+
+
+def _real_bot(cog: object, channel: object) -> MagicMock:
+    bot = MagicMock()
+    bot.cogs = {"SessionManageCog": cog}
+    bot.get_channel.return_value = channel
+    return bot
+
+
+def _mgr(*, present: list[bool | None], killed: bool = False) -> MagicMock:
+    mgr = MagicMock()
+    mgr.window_present = MagicMock(side_effect=present)
+    mgr.kill_session = MagicMock(return_value=killed)
+    return mgr
+
+
+def _real_thread() -> MagicMock:
+    thread = _thread()
+    thread.parent_id = 10
+    return thread
+
+
+async def _post(repo: NotificationRepository, bot: MagicMock) -> tuple[int, dict]:
+    client = await _client(repo, bot)
+    try:
+        resp = await client.post(f"/api/threads/{THREAD}/sleep")
+        return resp.status, await resp.json()
+    finally:
+        await client.close()
+
+
+async def test_window_in_another_session_of_ours_is_not_resident(repo) -> None:
+    cog = _real_cog(_mgr(present=[False]))
+    with patch("c_lord.tmux.is_resident_anywhere", return_value=True):
+        status, body = await _post(repo, _real_bot(cog, _real_thread()))
+    assert (status, body.get("status")) == (200, "not_resident"), body
+
+
+async def test_a_channel_that_is_not_a_thread_is_not_resident(repo) -> None:
+    status, body = await _post(repo, _real_bot(_real_cog(_mgr(present=[True])), MagicMock()))
+    assert (status, body.get("status")) == (200, "not_resident"), body
+
+
+async def test_no_tmux_manager_is_not_resident(repo) -> None:
+    status, body = await _post(repo, _real_bot(_real_cog(None), _real_thread()))
+    assert (status, body.get("status")) == (200, "not_resident"), body
+
+
+async def test_a_real_failed_kill_is_still_failed(repo) -> None:
+    cog = _real_cog(_mgr(present=[True, True]))
+    with patch("c_lord.tmux.is_resident_anywhere", return_value=True):
+        status, body = await _post(repo, _real_bot(cog, _real_thread()))
+    assert (status, body.get("status")) == (503, "failed"), body
+
+
+async def test_tmux_that_does_not_answer_is_still_failed(repo) -> None:
+    cog = _real_cog(_mgr(present=[None]))
+    status, body = await _post(repo, _real_bot(cog, _real_thread()))
+    assert (status, body.get("status")) == (503, "failed"), body
+    cog = _real_cog(_mgr(present=[False]))
+    with patch("c_lord.tmux.is_resident_anywhere", return_value=None):
+        status, body = await _post(repo, _real_bot(cog, _real_thread()))
+    assert (status, body.get("status")) == (503, "failed"), body

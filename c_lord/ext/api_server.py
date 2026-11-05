@@ -1081,7 +1081,9 @@ class ApiServer:
         — ``not_resident`` when the thread had no window to close.
         Returns (503): ``{"status": "failed", "thread_id": "..."}`` when the sleep
         could not close a window that may still be there (#1214) — a failed kill,
-        a tmux that did not answer, or its claude running in another session.
+        or a tmux that did not answer. A window this sleep cannot reach (in
+        another tmux session of ours, no tmux manager, not a thread) is
+        ``not_resident``, as before #1214, so release closes the pane by id.
         """
         thread_id = _as_int(request.match_info.get("thread_id"))
         if thread_id is None:
@@ -1105,7 +1107,12 @@ class ApiServer:
                 return web.json_response({"error": "thread not found"}, status=404)
 
         try:
-            slept = await impl(channel=channel, reason=WorkspaceReason.MANUAL)
+            # Review of #1214: only a failed kill (or a tmux that did not answer)
+            # is ``failed``; a window this sleep could not reach is ``not_resident``
+            # as before, so ``staging.sh release`` closes that pane by id.
+            slept = await impl(
+                channel=channel, reason=WorkspaceReason.MANUAL, unkillable_is_absent=True
+            )
         except Exception as exc:
             logger.exception("%s sleep: failed", log_ctx(thread_id=thread_id))
             return web.json_response({"error": str(exc)}, status=500)

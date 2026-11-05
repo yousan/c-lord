@@ -1981,6 +1981,7 @@ class SessionManageCog(commands.Cog):
         channel: object,
         reason: WorkspaceReason = WorkspaceReason.IDLE,
         idle_label: str | None = None,
+        unkillable_is_absent: bool = False,
     ) -> bool | None:
         """スリープ — stop this workspace's Claude and nothing else (#572).
 
@@ -2009,12 +2010,21 @@ class SessionManageCog(commands.Cog):
         tmux session, #1213). The resident cap makes
         up for ``False`` with the next candidate and only for that (#1094).
 
+        *unkillable_is_absent* is for the REST API (review of #1214): answers
+        that say nothing about a window *this* sleep could kill — not a thread,
+        no tmux manager, the window alive in another tmux session of ours — are
+        ``None`` instead of ``False``, so ``staging.sh release`` still closes the
+        pane by id as it did before #1214. A failed kill and a tmux that did not
+        answer stay ``False``. The resident cap and the idle sleep leave it off
+        and keep making up for those.
+
         There is no slash command on purpose. Being invisible is the feature; a
         手動 twin would add a concept ("how is this different from 停止?") that
         buys the user nothing.
         """
+        unkillable: bool | None = None if unkillable_is_absent else False
         if not isinstance(channel, discord.Thread):
-            return False
+            return unkillable
 
         import asyncio
 
@@ -2023,7 +2033,7 @@ class SessionManageCog(commands.Cog):
 
         tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is None:
-            return False
+            return unkillable
         # #1206: one lookup that can say "did not answer". A stalled tmux
         # (``tmux -V`` / ``show-option`` / ``list-windows`` timing out) made
         # ``session_exists`` answer "no window", which the resident cap counted
@@ -2047,14 +2057,19 @@ class SessionManageCog(commands.Cog):
             # made up for it. Still there (or could not tell) is ``False``: the
             # next candidate makes up. It is not killed from here — the move is
             # create_session's job, and this manager does not own that window.
-            if await self._gone_host_wide(thread_id):
+            from .. import tmux as _tmux
+
+            elsewhere = await asyncio.to_thread(_tmux.is_resident_anywhere, thread_id)
+            if elsewhere is False:
                 return None
             logger.warning(
-                "%s sleep: no window in this thread's session but its claude still runs "
-                "elsewhere (or tmux did not answer) — counted as still there",
+                "%s sleep: no window in this thread's session but %s — counted as still there",
                 log_ctx(thread_id=thread_id),
+                "tmux did not answer host-wide"
+                if elsewhere is None
+                else "its claude runs in another session",
             )
-            return False
+            return False if elsewhere is None else unkillable
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the
         # harness write a final ``<task-notification>`` row into the transcript,
