@@ -91,6 +91,12 @@ MAX_UNSURE_PER_TICK = 5
 # A slow ``False`` does not count toward ``_MAX_UNSURE`` (#1236): tmux stalling
 # says nothing about the window, so it is tried again once tmux answers.
 _STALL_SECONDS = 2.0
+
+# #1236 review: slow ``False`` answers in a row, on ticks that were not a stall
+# (fewer than ``MAX_UNSURE_PER_TICK`` slow answers), before a thread is left
+# alone like after ``_MAX_UNSURE``. One window whose ``kill-window`` always
+# times out was otherwise tried — 30 s each — on every tick, forever.
+_MAX_SLOW = 10
 _clock = time.monotonic
 
 #: Every 10 minutes. The threshold is hours, so this is already 24× finer than
@@ -239,6 +245,11 @@ class IdleSleepLoop(IdleSweepLoop):
         # first: otherwise the same five would take every stalled tick.
         self._stalled: dict[int, int] = {}
         self._stall_seq = 0
+        # #1236 review: slow ``False`` answers in a row per thread, keyed with
+        # ``last_used_at`` like ``_unsure_counts``; counted at the end of a tick
+        # that was not a stall (``_slow_now``), toward ``_MAX_SLOW``.
+        self._slow_counts: dict[int, tuple[str, int]] = {}
+        self._slow_now: list[int] = []
         # Where Claude Code keeps its transcripts. None = its real location;
         # tests point it at a tmp dir.
         self._projects_root: Path | None = None
@@ -357,6 +368,7 @@ class IdleSleepLoop(IdleSweepLoop):
                 # tried then awake after tmux recovered, until someone spoke.
                 # ``MAX_UNSURE_PER_TICK`` still bounds what a stall costs a tick.
                 self._unsure_this_tick += 1
+                self._slow_now.append(thread_id)
                 self._stall_seq += 1
                 self._stalled[thread_id] = self._stall_seq
                 self._busy.add(thread_id)
@@ -378,12 +390,43 @@ class IdleSleepLoop(IdleSweepLoop):
             )
             return False
         self._unsure_counts.pop(thread_id, None)
+        self._slow_counts.pop(thread_id, None)
         self._stalled.pop(thread_id, None)
         return bool(slept)
 
     async def tick(self) -> int:
         self._unsure_this_tick = 0
-        return await super().tick()
+        self._slow_now = []
+        try:
+            return await super().tick()
+        finally:
+            self._count_slow()
+
+    def _count_slow(self) -> None:
+        """Count this tick's slow failures toward ``_MAX_SLOW`` (#1236 review).
+
+        Not when the tick itself was a stall (``MAX_UNSURE_PER_TICK`` slow
+        answers): then tmux is to blame, not the windows.
+        """
+        slow, self._slow_now = self._slow_now, []
+        if self._unsure_this_tick >= MAX_UNSURE_PER_TICK:
+            return
+        for thread_id in slow:
+            last_used = self._last_used.get(thread_id, "")
+            counted_at, count = self._slow_counts.get(thread_id, (last_used, 0))
+            count = (count if counted_at == last_used else 0) + 1
+            if count < _MAX_SLOW:
+                self._slow_counts[thread_id] = (last_used, count)
+                continue
+            self._slow_counts.pop(thread_id, None)
+            self._stalled.pop(thread_id, None)
+            self._visited[thread_id] = last_used
+            logger.info(
+                "idle-sleep: thread=%d timed out %d ticks in a row while tmux answered "
+                "the others — not trying again until someone speaks there (#1236)",
+                thread_id,
+                count,
+            )
 
     def _order(self, due: list[int]) -> list[int]:
         stalled = self._stalled

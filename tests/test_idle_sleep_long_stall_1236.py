@@ -172,3 +172,40 @@ async def test_a_30_minute_stall_leaves_windows_awake_after_recovery() -> None:
                 await loop.tick()
     awake = sorted(set(range(1, N + 1)) - killed)
     assert not awake, f"still awake after tmux recovered (until someone speaks): {awake}"
+
+
+async def test_one_window_that_always_times_out() -> None:
+    """Review of 4ef0710: a slow failure never counted toward giving up, so a
+    window whose ``kill-window`` always times out (30 s) — tmux itself fine, the
+    other windows sleeping normally — was tried again on every tick, forever.
+    It now has its own, larger budget of slow failures and is then given up on
+    like after three ordinary ones; the other windows are slept."""
+    loop, _, _ = _setup(real_count=False)
+    clock = Clock()
+    killed: set[int] = set()
+    tries: list[int] = []
+    real_impl = loop._bot.get_cog.return_value._sleep_workspace_impl
+
+    async def spy(**kw):  # type: ignore[no-untyped-def]
+        if kw["channel"].id == 1:
+            tries.append(1)
+        r = await real_impl(**kw)
+        if r:
+            killed.add(kw["channel"].id)
+        return r
+
+    def run(argv: list[str]) -> MagicMock:
+        if argv[1] == "kill-window" and "@1" in argv:
+            clock.t += tmux_mod._RUN_TIMEOUT_SECONDS
+            return MagicMock(
+                returncode=tmux_mod._RUN_TIMEOUT_RETURNCODE, stdout="", stderr="timed out"
+            )
+        return _healthy(argv)
+
+    loop._bot.get_cog.return_value._sleep_workspace_impl = spy
+    cs = patch("c_lord.cogs.session_manage.containers_for_session_dir", AsyncMock(return_value=[]))
+    with patch.object(idle_sleep_mod, "_clock", clock), cs, patch("c_lord.tmux._run", run):
+        for _ in range(60):
+            await loop.tick()
+    assert killed == set(range(2, N + 1))
+    assert 1 <= len(tries) <= 10, len(tries)
