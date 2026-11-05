@@ -817,39 +817,70 @@ def _input_box_retains(pane_text: str, payload: str) -> bool | None:
 
 
 # A fold placeholder in a whitespace-free box: ``[Pastedtext#3+22lines]``. The
-# count is the pasted text's newline count (measured on 2.1.318: a piece with 22
-# newlines folds to ``+22 lines``).
-_FOLD_RE = re.compile(r"\[Pastedtext#\d+(?:\+(\d+)lines?)?\]")
+# count is the pasted text's line-break count (measured on 2.1.318: a piece with
+# 22 newlines folds to ``+22 lines``).
+_FOLD_RE = re.compile(r"\[Pastedtext#(\d+)(?:\+(\d+)lines?)?\]")
+# What the TUI counts as a line break in a paste (review of #1263: a piece with
+# bare ``\r`` endings folded to ``+42 lines`` while it held no ``\n``).
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 
 
-def _first_piece_state(pane_text: str, piece: str) -> str | None:
+def _folds(box: str) -> dict[int, int | None]:
+    """``{#N: line count or None}`` for each fold placeholder in a squashed box."""
+    return {
+        int(m.group(1)): int(m.group(2)) if m.group(2) else None for m in _FOLD_RE.finditer(box)
+    }
+
+
+def _holds_piece_fragment(box: str, piece: str) -> bool:
+    """Does the box show any of *piece* itself? Positive evidence only.
+
+    The piece's first or last :data:`_PAYLOAD_FINGERPRINT` characters, the box
+    being a tail of the piece (only its end arrived), or a U+FFFD (a character
+    cut at a byte boundary). An idle box's greyed hint (``Try "refactor
+    <filepath>"``) or a suggestion is none of these.
+    """
+    squashed = _squash(piece)
+    if not squashed or not box:
+        return False
+    return (
+        "\ufffd" in box
+        or squashed[:_PAYLOAD_FINGERPRINT] in box
+        or squashed[-_PAYLOAD_FINGERPRINT:] in box
+        or squashed.endswith(box)
+    )
+
+
+def _first_piece_state(pane_text: str, piece: str, before: str | None = None) -> str | None:
     """Did the first piece of a multi-piece message land whole? (#872, #1263)
 
     Read right after the first piece is typed, while the box is still small —
     after the rest it may be taller than the box's maximum height and show
-    only its last rows (#1263), which says nothing about the start.
+    only its last rows (#1263), which says nothing about the start. *before*
+    is the pane as captured just before the piece was typed: only folds that
+    were not in it count, so a stale fold cannot pass for the piece.
 
-    * ``"landed"`` — the box holds a ``[Pasted text …]`` fold whose line count
-      is the piece's own (or has none to compare), or the piece's first
-      characters typed as text.
-    * ``"empty"`` — nothing arrived (yet).
-    * ``"lost"`` — something else: only the piece's end, a U+FFFD, a fold of
-      another size. The piece did not arrive whole.
+    * ``"landed"`` — new fold(s) whose line counts add up to the piece's own
+      (or carry none to compare), or the piece's first characters as text.
+    * ``"lost"`` — positive evidence of a damaged piece: new fold(s) of
+      another size, or only its end / a U+FFFD in the box.
+    * ``"empty"`` — no sign of the piece at all. The box may be empty or show
+      a greyed hint or a suggestion, which ``capture-pane`` reads as text.
     * ``None`` — no box to read (#544: never act without evidence).
     """
     box = _input_box_text(pane_text)
     if box is None:
         return None
-    if not box:
-        return "empty"
-    counts = [m.group(1) for m in _FOLD_RE.finditer(box)]
-    if counts:
-        known = [int(c) for c in counts if c is not None]
-        if not known or sum(known) == piece.count("\n") or known[-1] == piece.count("\n"):
+    old = _folds(_input_box_text(before) or "") if before is not None else {}
+    new = {n: c for n, c in _folds(box).items() if n not in old}
+    if new:
+        known = [c for c in new.values() if c is not None]
+        if len(known) < len(new) or sum(known) == len(_LINE_BREAK_RE.findall(piece)):
             return "landed"
         return "lost"
-    head = _squash(piece)[:_PAYLOAD_FINGERPRINT]
-    return "landed" if head and head in box else "lost"
+    if _squash(piece)[:_PAYLOAD_FINGERPRINT] and _squash(piece)[:_PAYLOAD_FINGERPRINT] in box:
+        return "landed"
+    return "lost" if _holds_piece_fragment(box, piece) else "empty"
 
 
 def _pane_has_open_menu(pane_text: str) -> bool:
@@ -3219,11 +3250,15 @@ class TmuxSessionManager:
         """
         piece = _chunk_for_send_keys(payload)[0]
         for attempt in range(1, 3):
+            # Review of #1263: the folds already in the box, so that only a
+            # fold this typing produced can count as the piece.
+            capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
+            before = capture.stdout if capture.returncode == 0 else None
             errors: list[str] = []
             if not self._type_literal(target, piece, what="send_input", errors=errors):
                 self._note_send_failure(thread_id, errors)
                 return False
-            state = self._read_first_piece(target, piece)
+            state = self._read_first_piece(target, piece, before)
             if state in (None, "landed"):
                 if attempt > 1:
                     logger.info(
@@ -3252,11 +3287,12 @@ class TmuxSessionManager:
         )
         return False
 
-    def _read_first_piece(self, target: str, piece: str) -> str | None:
+    def _read_first_piece(self, target: str, piece: str, before: str | None) -> str | None:
         """:func:`_first_piece_state` after the fold settles; an empty box is re-read.
 
-        One capture in the normal case. Only an empty box — the piece may still
-        be on its way to a busy TUI — is looked at again, for up to
+        One capture in the normal case. Only a box with no sign of the piece
+        (empty, or showing just a hint or suggestion) — the piece may still be
+        on its way to a busy TUI — is looked at again, for up to
         :data:`_FIRST_PIECE_LOOKS` × :data:`_PASTE_SETTLE`, before it counts.
         """
         state: str | None = None
@@ -3265,7 +3301,7 @@ class TmuxSessionManager:
             capture = _run(["tmux", "capture-pane", "-p", "-J", "-t", target])
             if capture.returncode != 0:
                 return None
-            state = _first_piece_state(capture.stdout, piece)
+            state = _first_piece_state(capture.stdout, piece, before)
             if state != "empty":
                 return state
         return state
@@ -3275,7 +3311,10 @@ class TmuxSessionManager:
 
         Unlike :meth:`_clear_box`, this does not first look for *typed* in the
         box: what is there is a damaged copy of it (only its end, a U+FFFD…),
-        which is exactly what must not be left to join the next message.
+        which is exactly what must not be left to join the next message. The
+        box counts as empty once it shows no fold and nothing of *typed* — an
+        idle box's greyed hint or a suggestion stays and is fine (review of
+        #1263: reading the hint as "still full" failed every retype).
         """
         lines = typed.count("\n") + 2
         for _attempt in range(_CLEAR_ATTEMPTS):
@@ -3285,7 +3324,7 @@ class TmuxSessionManager:
             if capture.returncode != 0:
                 return True
             box = _input_box_text(capture.stdout)
-            if not box:
+            if not box or (not _folds(box) and not _holds_piece_fragment(box, typed)):
                 return True
         return False
 

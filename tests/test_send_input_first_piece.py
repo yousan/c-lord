@@ -46,6 +46,10 @@ P1_FOLD_1263 = _frame("i1263_after_first_piece_1263_v2_1_318")
 HEAD_LOST_872 = _frame("input_box_head_lost")
 PASTED_872 = _frame("input_box_multichunk_pasted")
 SCROLLED_1263 = _frame("i1263_long_input_box_scrolled_v2_1_318")
+# Idle boxes that are not empty to capture-pane: a greyed hint or a suggestion.
+VIM_HINT = _frame("vim_enabled_insert")  # ❯ Try "refactor <filepath>"
+SUGGEST_2026 = _frame("i858_input_box_suggestion_2026_v2_1_283")
+SUGGEST_833 = _frame("i858_input_box_suggestion_8_33_v2_1_283")
 
 _LINE_872 = "試作の発注文。ふりがなを小さくしてセーフエリアに収める指示を詳しく書いた行です。"
 LONG_872 = (
@@ -91,31 +95,49 @@ def _mgr() -> TmuxSessionManager:
 
 class _Pane:
     """A pane whose box shows ``after_first[n]`` once the first piece is typed
-    for the n-th time, and ``after_rest`` once the message's last piece is."""
+    for the n-th time, and ``after_rest`` once the message's last piece is.
 
-    def __init__(self, payload: str, after_first: list[str], after_rest: str) -> None:
+    An ``after_first`` entry may be a list: one frame per capture, the last one
+    staying — a slow TUI whose fold appears only on a later look. ``idle`` is
+    what the box shows once emptied (an Enter or the clearing keys).
+    """
+
+    def __init__(
+        self,
+        payload: str,
+        after_first: list,  # list[str | list[str]]
+        after_rest: str,
+        *,
+        idle: str = BOX_EMPTY,
+        initial: str | None = None,
+    ) -> None:
         self.chunks = _chunk_for_send_keys(payload)
         self.after_first = after_first
         self.after_rest = after_rest
-        self.frame = BOX_EMPTY
+        self.idle = idle
+        self.frames: list[str] = [initial if initial is not None else idle]
         self.first_typings = 0
         self.keys: list[list[str]] = []
 
+    def _show(self, frame) -> None:  # noqa: ANN001
+        self.frames = list(frame) if isinstance(frame, list) else [frame]
+
     def run(self, args: list[str]) -> MagicMock:
         if "capture-pane" in args:
-            return MagicMock(returncode=0, stdout=self.frame, stderr="")
+            frame = self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+            return MagicMock(returncode=0, stdout=frame, stderr="")
         if "send-keys" in args:
             self.keys.append(list(args))
             if "-l" in args:
                 text = args[-1]
                 if text == self.chunks[0]:
                     index = min(self.first_typings, len(self.after_first) - 1)
-                    self.frame = self.after_first[index]
+                    self._show(self.after_first[index])
                     self.first_typings += 1
                 if text == self.chunks[-1]:
-                    self.frame = self.after_rest
+                    self._show(self.after_rest)
             elif "C-u" in args or "Enter" in args:
-                self.frame = BOX_EMPTY
+                self._show(self.idle)
         return MagicMock(returncode=0, stdout="", stderr="")
 
     @property
@@ -126,12 +148,18 @@ class _Pane:
         return sum(1 for k in self.keys if "-l" in k and k[-1] == text)
 
 
-def _send(payload: str, after_first: list[str], after_rest: str):  # noqa: ANN202
-    pane = _Pane(payload, after_first, after_rest)
+def _send(payload: str, after_first: list, after_rest: str, **kw):  # noqa: ANN202, ANN003
+    pane = _Pane(payload, after_first, after_rest, **kw)
     mgr = _mgr()
     with patch("c_lord.tmux._run", side_effect=pane.run):
         sent = mgr.send_input(THREAD, payload)
     return sent, pane, mgr
+
+
+# The hint line seen in this fix's own captures (CLI 2.1.318, isolated tmux).
+HINT_1263 = _with_box(P1_FOLD_872, 'Try "edit <filepath> to..."')
+IDLE_FRAMES = [HINT_1263, VIM_HINT, SUGGEST_2026, SUGGEST_833]
+IDLE_IDS = ["hint-2.1.318", "vim-hint", "i858-2026", "i858-8.33"]
 
 
 def _assert_refused(sent: bool, pane: _Pane, mgr: TmuxSessionManager) -> None:
@@ -238,3 +266,59 @@ def test_classifier_accepts_the_piece_typed_as_text() -> None:
     """Should a CLI stop folding, the piece's own first characters are the evidence."""
     p872 = _chunk_for_send_keys(LONG_872)[0]
     assert _first_piece_state(_with_box(BOX_EMPTY, p872[:200]), p872) == "landed"
+
+
+# ── review of 3038018: idle hints, \r line endings, stale folds ───────────
+
+
+@pytest.mark.parametrize("idle", IDLE_FRAMES, ids=IDLE_IDS)
+def test_an_idle_hint_or_suggestion_is_not_part_of_the_piece(idle: str) -> None:
+    """capture-pane reads the greyed hint as text; it is no evidence of a loss."""
+    for msg in (LONG_872, LONG_1263):
+        assert _first_piece_state(idle, _chunk_for_send_keys(msg)[0]) == "empty"
+
+
+@pytest.mark.parametrize("idle", IDLE_FRAMES, ids=IDLE_IDS)
+def test_a_slow_first_piece_behind_a_hint_is_waited_for(idle: str) -> None:
+    """The fold shows up on the third look; until then the box shows the hint."""
+    sent, pane, _ = _send(LONG_872, [[idle, idle, P1_FOLD_872]], PASTED_872, idle=idle)
+    assert sent is True
+    assert pane.first_typings == 1, "a slow piece must not be cleared and typed again"
+    assert not any("C-u" in k for k in pane.keys)
+    assert pane.enters == 1
+
+
+@pytest.mark.parametrize("idle", IDLE_FRAMES, ids=IDLE_IDS)
+def test_a_lost_first_piece_behind_a_hint_is_typed_again(idle: str) -> None:
+    """Clearing a box that then shows the hint is a successful clear."""
+    sent, pane, _ = _send(LONG_872, [idle, P1_FOLD_872], PASTED_872, idle=idle)
+    assert sent is True
+    assert pane.first_typings == 2
+    assert pane.enters == 1
+
+
+@pytest.mark.parametrize("idle", IDLE_FRAMES, ids=IDLE_IDS)
+def test_a_first_piece_lost_twice_behind_a_hint_is_refused(idle: str) -> None:
+    _assert_refused(*_send(LONG_1263, [idle], SCROLLED_1263, idle=idle))
+
+
+def test_a_piece_with_bare_cr_line_endings_matches_its_fold() -> None:
+    """Review LOW 1: ``\r`` ends a line for the TUI too."""
+    piece = "".join(f"行{i}: " + "あ" * 40 + "\r" for i in range(42))
+    folded = _with_box(BOX_EMPTY, "[Pasted text #1 +42 lines]")
+    assert _first_piece_state(folded, piece) == "landed"
+
+
+def test_a_stale_fold_already_in_the_box_is_not_the_piece() -> None:
+    """Review LOW 2: only a fold that appeared after typing counts."""
+    piece = _chunk_for_send_keys(LONG_872)[0]
+    assert _first_piece_state(P1_FOLD_872, piece, before=P1_FOLD_872) != "landed"
+    fresh = _with_box(P1_FOLD_872, "[Pasted text #1 +22 lines][Pasted text #2 +22 lines]")
+    assert _first_piece_state(fresh, piece, before=P1_FOLD_872) == "landed"
+
+
+def test_a_lost_first_piece_behind_a_stale_fold_is_refused() -> None:
+    """Review LOW 2 through send_input: the stale fold is there before and after."""
+    _assert_refused(
+        *_send(LONG_872, [P1_FOLD_872], PASTED_872, initial=P1_FOLD_872, idle=P1_FOLD_872)
+    )
