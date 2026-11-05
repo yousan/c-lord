@@ -822,12 +822,27 @@ def _turn_state_at_end(
 LAST_SILENT_FILENAME = ".clord-last-silent"
 
 
-def _write_last_silent(project_dir: Path, uuid: str) -> None:
+#: #1226: a project dir that cannot be written fails on every silent post.
+_LAST_SILENT_FAILURE_LOG = LogSampler(3600.0)
+
+
+def _write_last_silent(project_dir: Path, uuid: str, thread_id: int | None = None) -> None:
     """Record *uuid* as posted (#1187). Blocking; never raises."""
     try:
         (project_dir / LAST_SILENT_FILENAME).write_text(uuid, encoding="utf-8")
     except OSError:
-        logger.debug("could not record the last silent text in %s", project_dir, exc_info=True)
+        # #1226: without the record a restart in this turn cannot tell the text
+        # was posted, and the rescue posts it again — not a DEBUG matter (#678).
+        sample = _LAST_SILENT_FAILURE_LOG.sample(str(project_dir))
+        if sample.emit:
+            logger.warning(
+                "%s TranscriptMirror: could not record the last silent text in %s — a "
+                "restart before this turn ends will post it again (#1226)%s",
+                log_ctx(thread_id=thread_id),
+                project_dir,
+                sample.suffix,
+                exc_info=True,
+            )
 
 
 def _read_last_silent(project_dir: Path) -> str | None:
@@ -1349,7 +1364,7 @@ class TranscriptMirror:
                 if _pending_uuid and sent is not None:
                     # #1187: proof for the next process that this one posted it.
                     await asyncio.to_thread(
-                        _write_last_silent, Path(self.project_dir), _pending_uuid
+                        _write_last_silent, Path(self.project_dir), _pending_uuid, self.thread_id
                     )
             else:
                 _last_silent = None
