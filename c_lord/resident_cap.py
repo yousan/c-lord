@@ -451,22 +451,26 @@ class ResidentCapLoop:
             return resident_thread_ids()
         return set()
 
-    def _left_residents(self, thread_id: int) -> bool:
-        """True only when a fresh read **answers** that *thread_id* is no longer resident (#1219).
+    async def _left_residents(self, thread_id: int) -> bool | None:
+        """Whether a fresh read **answers** that *thread_id* is no longer resident (#1219).
 
-        A read that fails (tmux did not answer) is "still there" — the #1192 rule.
+        ``True``: gone. ``False``: still there (the #1192 case — made up for).
+        ``None``: tmux did not answer, so nothing can be said. Run off the event
+        loop: the read is ``tmux -V`` plus ``list-panes`` with 30 s timeouts each,
+        and it is asked once per failed victim (review of e971435).
         """
         if self._resident_fn is not None:
             try:
                 return thread_id not in set(self._resident_fn())  # type: ignore[operator]
             except Exception:
-                return False
+                return None
         from .tmux import is_resident_anywhere
 
         try:
-            return is_resident_anywhere(thread_id) is False
+            still = await asyncio.to_thread(is_resident_anywhere, thread_id)
         except Exception:
-            return False
+            return None
+        return None if still is None else not still
 
     async def _turns_in_flight(self, candidates: set[int]) -> set[int]:
         """Everything in *candidates* with a turn running, by both kinds of evidence.
@@ -796,12 +800,25 @@ class ResidentCapLoop:
                 # no slot to make up for — close it and lower the bar instead.
                 await self._close_gone(thread_id)
                 over -= 1
-            elif self._left_residents(thread_id):
-                # #1219: the sleep said it failed, but the window is gone (a
-                # ``kill-window`` that timed out and was carried out anyway).
-                # Making up for it slept the whole fleet in one tick when every
-                # kill behaved that way. Like ``None``: one fewer over.
-                over -= 1
+            else:
+                left = await self._left_residents(thread_id)
+                if left:
+                    # #1219: the sleep said it failed, but the window is gone (a
+                    # ``kill-window`` that timed out and was carried out anyway).
+                    # Making up for it slept the whole fleet in one tick when
+                    # every kill behaved that way. Like ``None``: one fewer over.
+                    over -= 1
+                elif left is None:
+                    # #1219 (review): tmux is not answering, and a kill that
+                    # timed out may still be carried out — making up for each
+                    # one slept the whole fleet under a sustained stall. Stop for
+                    # this tick; the next one counts again.
+                    logger.warning(
+                        "%s resident-cap: the sleep failed and tmux did not answer the "
+                        "re-read — not making up for it this tick",
+                        log_ctx(thread_id=thread_id),
+                    )
+                    break
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
         if slept < over:

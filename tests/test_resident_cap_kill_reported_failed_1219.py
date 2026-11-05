@@ -72,10 +72,12 @@ async def test_kill_reported_failed_but_window_died_sleeps_whole_fleet_in_one_ti
     assert len(resident) >= 3, f"over was 1, but one tick left {sorted(resident)} resident"
 
 
-async def test_unreadable_residents_after_a_failed_kill_count_as_still_there() -> None:
-    """#1192 holds: when the second look cannot be read, the failure is made up for."""
+async def test_unreadable_residents_after_a_failed_kill_stop_this_tick() -> None:
+    """Review of e971435: a failed kill whose second look cannot be read stops the
+    making-up for this tick (tmux is not answering, and a kill that timed out may
+    still be carried out). The next tick counts again and makes up then."""
     resident = {1, 2, 3}
-    stalled = {"on": False}
+    stalled = {"on": False, "once": True}
 
     def resident_fn() -> set[int]:
         if stalled["on"]:  # tmux stopped answering when the kill timed out
@@ -84,7 +86,7 @@ async def test_unreadable_residents_after_a_failed_kill_count_as_still_there() -
 
     async def impl(*, channel, reason, idle_label):  # noqa: ANN001
         if channel.id == 3:
-            stalled["on"] = True
+            stalled["on"], stalled["once"] = stalled["once"], False
             return False
         resident.discard(channel.id)
         return True
@@ -99,8 +101,84 @@ async def test_unreadable_residents_after_a_failed_kill_count_as_still_there() -
         activity_fn=lambda r: None,
     )
     with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
+        assert await loop._enforce_cap() == 0
+        assert resident == {1, 2, 3}
+        stalled["on"] = False  # tmux answers again: the next tick makes up (#1192)
         assert await loop._enforce_cap() == 1
     assert resident == {1, 3}
+
+
+def _production_loop(cog, resident: set[int], n: int, limit: int) -> ResidentCapLoop:  # noqa: ANN001
+    """No ``resident_fn``: the loop reads tmux itself, as in production."""
+    return ResidentCapLoop(
+        _bot(cog=cog),
+        _repo([_rec(i, hours_ago=i) for i in range(1, n + 1)]),
+        limit=limit,
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+        activity_fn=lambda r: None,
+    )
+
+
+async def test_sustained_stall_sleeps_at_most_over_plus_one_in_one_tick() -> None:
+    """Review of e971435: every kill times out but is carried out, and the re-read
+    right after also times out. Made up for each time, one tick with over=1 slept
+    all five."""
+    resident = {1, 2, 3, 4, 5}
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        resident.discard(channel.id)  # the window is gone ...
+        return False  # ... the kill said it failed, and tmux is not answering
+
+    loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 5, 4)
+    with (
+        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
+        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        await loop._enforce_cap()
+    assert len(resident) >= 5 - 2, f"over was 1, but one tick left {sorted(resident)} resident"
+
+
+async def test_the_re_read_after_a_failed_kill_does_not_block_the_event_loop() -> None:
+    """Review of e971435: the re-read is ``tmux -V`` plus ``list-panes`` (30 s
+    timeouts each) and ran on the event loop, freezing the whole bot."""
+    import asyncio
+    import time
+
+    resident = {1, 2, 3}
+    beats = {"n": 0}
+    seen: list[int] = []
+
+    async def heartbeat() -> None:
+        while True:
+            beats["n"] += 1
+            await asyncio.sleep(0.01)
+
+    def slow_re_read(thread_id: int) -> bool:
+        before = beats["n"]
+        time.sleep(0.3)
+        seen.append(beats["n"] - before)
+        return True  # still there
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        if channel.id == 3:
+            return False
+        resident.discard(channel.id)
+        return True
+
+    loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 3, 2)
+    task = asyncio.create_task(heartbeat())
+    try:
+        with (
+            patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
+            patch("c_lord.tmux.is_resident_anywhere", side_effect=slow_re_read),
+            patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+        ):
+            assert await loop._enforce_cap() == 1
+    finally:
+        task.cancel()
+    assert seen and seen[0] >= 5, f"the event loop was blocked during the re-read ({seen})"
 
 
 def _failed_kill_mgr(second_look: bool | None) -> MagicMock:
