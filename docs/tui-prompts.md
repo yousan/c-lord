@@ -81,6 +81,16 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **検出パターン（現行）** | `_PERMISSION_PROMPT_MARKERS = ("Do you want to proceed?", "This command requires approval")` |
 | **課題** | JSONL パスを使えば文字列マッチ不要。`permission_request` フィールドがあれば確定。Discord に `AskView` でボタン表示 → `request_id` で承認応答が理想 |
 
+**ターンの外で開いたダイアログには依頼を打ち込まない (#1247)。** 自動承認（上の `_accept_permission_prompt`）は、runner がターンの中でペインを見ている間だけの動き。親のターンが終わったあとにバックグラウンドのサブエージェントの Bash が許可を求めると、ダイアログはターンの外で開いたままになる（実キャプチャ: `tests/fixtures/panes/i1247_permission_dialog_background_agent_v2_1_318.txt`、Claude Code 2.1.318、`Bash command · from the general-purpose agent` / `This command requires approval` / `Do you want to proceed?` / `❯ 1. Yes` … `4. No`。入力欄は描かれない）。以前はこの状態で次の依頼が来ると、本文と Enter をそのまま打ち込み、**Enter がダイアログを「Yes」で承認し、依頼の本文は Claude に届かなかった**（本番では `safetyCheck` / `dangerousRemoval` の付いた削除が人の判断なしに通った）。
+
+いまは送る直前にペインを見て、許可ダイアログが開いていれば（`_permission_dialog_open`: 許可マーカーがあり、**かつ入力欄が無い** — Claude 自身の文の「Do you want to proceed?」を拾わないため）:
+
+- **何も打たない・キーも押さない**（本文も Enter も C-c も）。c-lord はこのダイアログに答えない
+- スレッドに 1 回だけ「⏸️ 許可ダイアログが開いているため、依頼をまだ送っていません」を出す。ダイアログの行（ツール・依頼元・コマンド。約 300 字まで）を引用し、ペインで答えるか `/workspace-stop` で止めるよう書く
+- 2 秒ごと（`_PERMISSION_HOLD_POLL`）にペインを見直し、閉じたら依頼をそのまま送る
+- 30 分（`_PERMISSION_HOLD_TIMEOUT`）たっても閉じなければ、**依頼を送らずに**ターンをエラーで終える（エラー文に「依頼は Claude に送られていません」と書くので、もう一度送ればよい）
+- 待っている間の停止・次のメッセージでの割り込みは効く。割り込みでも C-c は押さない（ダイアログに答えてしまうため）
+
 ### 2-2. Plan Mode Approval（ExitPlanMode）
 
 | 項目 | 内容 |

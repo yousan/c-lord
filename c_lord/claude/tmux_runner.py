@@ -215,6 +215,17 @@ _MENU_NAV_DELAY = 0.25
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
 
+# #1247: a permission dialog left open between turns (typically a background
+# sub-agent's Bash call) holds the next request instead of receiving it — the
+# request's Enter would answer the dialog "Yes" and the text would be lost.
+# c-lord never answers that dialog; it re-reads the pane every
+# ``_PERMISSION_HOLD_POLL`` seconds and sends the request once a human has
+# answered, or ends the turn unsent after ``_PERMISSION_HOLD_TIMEOUT``.
+_PERMISSION_HOLD_POLL = 2.0
+_PERMISSION_HOLD_TIMEOUT = 30 * 60.0
+# How much of the dialog (its command / summary rows) the thread is shown.
+_PERMISSION_SUMMARY_MAX = 300
+
 # Startup grace after sending ``claude --continue`` before its outcome is
 # judged at all (issue #123 Part 2).  The pane still runs zsh for a moment
 # while claude execs, so a liveness probe taken any earlier reads every start
@@ -289,6 +300,21 @@ def _missing_window(action: str, thread_id: int) -> str:
         "ウィンドウがそもそも存在しない状態です。"
         "チャンネルが `/clord-init` で repo に紐づいているか、"
         "ホストで tmux が使えるかを確認してください。"
+    )
+
+
+def permission_hold_minutes() -> int:
+    """How long a request waits behind an open permission dialog, in minutes (#1247)."""
+    return max(1, round(_PERMISSION_HOLD_TIMEOUT / 60))
+
+
+def _permission_hold_timed_out() -> str:
+    """User-facing text for a request that a permission dialog kept from Claude (#1247)."""
+    minutes = permission_hold_minutes()
+    return (
+        f"依頼は Claude に送られていません — Claude のペインで許可ダイアログが {minutes} 分以上"
+        "開いたままでした。c-lord はこのダイアログに答えません（依頼を打ち込むと、その Enter が"
+        "ダイアログを承認してしまうため）。ペインでダイアログに答えてから、依頼をもう一度送ってください。"
     )
 
 
@@ -784,6 +810,53 @@ def _permission_zone(text: str) -> str:
     while lines and not lines[-1].strip():
         lines.pop()
     return "\n".join(lines[-_PERMISSION_SCAN_LINES:])
+
+
+# A full-width rule (``────``) above a dialog, or the dashed rules (``╌╌╌``)
+# that frame its command.
+_DIALOG_RULE_RE = re.compile(r"^[─━═╌┄┈\-\s]+$")
+
+
+def _permission_dialog_open(pane: str) -> bool:
+    """True when a permission dialog — not prose — has the keyboard (#1247).
+
+    ``_has_permission_prompt`` alone reads Claude's own last sentence ("Do you
+    want to proceed?") in the bottom rows as a dialog (#156). Inside a turn a
+    false hit costs an Enter on an idle prompt; before a send it would hold the
+    request for half an hour. A real dialog replaces the input box (verified on
+    ``i1247_permission_dialog_background_agent_v2_1_318.txt``), so a visible
+    input box means the marker is prose.
+    """
+    return TmuxClaudeRunner._has_permission_prompt(pane) and not TmuxClaudeRunner._has_input_prompt(
+        pane
+    )
+
+
+def _permission_dialog_summary(pane: str) -> str:
+    """The dialog's own rows above its question, trimmed for Discord (#1247).
+
+    On the real dialog that is the tool, the requester ("from the
+    general-purpose agent"), Claude's description and the command itself. Tips
+    and frame rules are dropped; backticks are neutralised so the text cannot
+    close the code block it is shown in.
+    """
+    lines = _permission_zone(pane).splitlines()
+    end = next(
+        (i for i, line in enumerate(lines) if any(m in line for m in _PERMISSION_PROMPT_MARKERS)),
+        len(lines),
+    )
+    rows: list[str] = []
+    for line in reversed(lines[:end]):
+        stripped = line.strip()
+        if stripped.startswith("─") and _DIALOG_RULE_RE.match(stripped):
+            break  # the rule above the dialog: everything higher is conversation
+        if not stripped or _DIALOG_RULE_RE.match(stripped) or stripped.startswith("Tip:"):
+            continue
+        rows.append(stripped)
+    text = "\n".join(reversed(rows)).replace("`", "ˋ")
+    if len(text) > _PERMISSION_SUMMARY_MAX:
+        text = text[: _PERMISSION_SUMMARY_MAX - 1] + "…"
+    return text
 
 
 # Matches a numbered menu item line, with or without the leading ❯ cursor:
@@ -1593,6 +1666,12 @@ class TmuxClaudeRunner:
         self._resume_baseline = 0
         self._stopped = False
         self._silent_stop = False
+        # #1247: the prompt is on hold behind an open permission dialog. Until
+        # it is sent, a stop must not press C-c — in the dialog that answers it.
+        self._held_for_permission = False
+        # #1247: the normalised pane the last ``peek_pending_ask`` read (None
+        # when it read nothing — a dead pane, or a peek a test replaced).
+        self._last_peek_pane: str | None = None
         # #1170: the run ended because its pane is a menu waiting for an answer
         # (the #751 backstop), not because the turn finished.
         self.ended_awaiting_answer = False
@@ -1872,7 +1951,20 @@ class TmuxClaudeRunner:
             # instead of clicking a button means "I'm not answering that menu, do
             # this instead", so dismiss the menu (Esc) first and let the TUI
             # settle back to the input prompt before delivering the message.
-            if await self.peek_pending_ask() is not None:
+            pending = await self.peek_pending_ask()
+            # #1247: a permission dialog left open between turns (a background
+            # sub-agent's Bash call) has the keyboard. Typing the request would
+            # answer it "Yes" with the Enter and lose the text, so hold the
+            # request — no text, no key — until a human answers it in the pane.
+            # Judged on the pane the peek above just read (no extra capture).
+            if (peeked := self._last_peek_pane) is not None and _permission_dialog_open(peeked):
+                async for held in self._hold_for_permission_dialog(peeked):
+                    yield held
+                    if held.message_type == MessageType.RESULT:
+                        return
+                if not self._stopped:
+                    pending = await self.peek_pending_ask()
+            if pending is not None:
                 logger.info(
                     "Open menu detected before delivering new input; dismissing it "
                     "(Esc) so the message is not consumed as a menu selection (thread=%d)",
@@ -2978,6 +3070,65 @@ class TmuxClaudeRunner:
         """
         return self._stopped and self._silent_stop
 
+    async def _hold_for_permission_dialog(self, pane: str) -> AsyncGenerator[StreamEvent, None]:
+        """Keep the prompt out of an open permission dialog (#1247).
+
+        *pane* is the normalised pane that showed the dialog. Yields one SYSTEM
+        notice (``permission_dialog_hold``) and polls the pane until the dialog
+        closes — then returns and the caller sends as usual — or until a stop
+        (the caller's ``_stopped_before_delivery`` ends the turn), or until
+        ``_PERMISSION_HOLD_TIMEOUT``, when it yields the turn's error RESULT.
+
+        Never presses a key: this dialog is answered by a human only. The
+        in-turn auto-accept (``_accept_permission_prompt``) is a separate path.
+        """
+        if self._stopped:
+            return
+        logger.warning(
+            "%s permission dialog open in the pane; holding the request until a human "
+            "answers it (#1247)",
+            log_ctx(thread_id=self._thread_id),
+        )
+        self._held_for_permission = True
+        try:
+            yield StreamEvent(
+                raw={},
+                message_type=MessageType.SYSTEM,
+                permission_dialog_hold=_permission_dialog_summary(pane)
+                or "(内容を読めませんでした)",
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _PERMISSION_HOLD_TIMEOUT
+            while not self._stopped:
+                if loop.time() >= deadline:
+                    logger.error(
+                        "%s permission dialog still open after %.0fs; ending the turn "
+                        "without sending the request (#1247)",
+                        log_ctx(thread_id=self._thread_id),
+                        _PERMISSION_HOLD_TIMEOUT,
+                    )
+                    yield StreamEvent(
+                        raw={},
+                        message_type=MessageType.RESULT,
+                        is_complete=True,
+                        error=_permission_hold_timed_out(),
+                    )
+                    return
+                await asyncio.sleep(_PERMISSION_HOLD_POLL)
+                if self._stopped:
+                    return
+                raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+                if not raw.strip():
+                    continue  # a capture hiccup is not evidence the dialog closed (#485)
+                if not _permission_dialog_open(_normalize_capture(raw)):
+                    logger.info(
+                        "%s permission dialog closed; sending the held request (#1247)",
+                        log_ctx(thread_id=self._thread_id),
+                    )
+                    return
+        finally:
+            self._held_for_permission = False
+
     def _stopped_before_delivery(self) -> StreamEvent | None:
         """The turn's RESULT when it was interrupted before its prompt was sent (#800).
 
@@ -3016,6 +3167,10 @@ class TmuxClaudeRunner:
         """
         self._stopped = True
         self._silent_stop = silent
+        if self._held_for_permission:
+            # #1247: nothing was sent, and the pane is a permission dialog —
+            # C-c there would answer it. The hold loop sees the flag and ends.
+            return True
         return bool(await asyncio.to_thread(self._tmux.send_interrupt, self._thread_id))
 
     def withdraw(self, *, silent: bool = False) -> None:
@@ -3857,10 +4012,12 @@ class TmuxClaudeRunner:
         Recovers both AskUserQuestion and plan-approval (#251) menus, which share
         the pane_ask bridge.
         """
+        self._last_peek_pane = None
         if await self._pane_is_dead():
             return None
         raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
         pane = _normalize_capture(raw)
+        self._last_peek_pane = pane  # #1247: the pre-send permission check reads it too
         return _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
 
     async def _pane_is_dead(self) -> bool:

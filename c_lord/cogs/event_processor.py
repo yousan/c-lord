@@ -21,12 +21,14 @@ from ..claude.tmux_runner import (
     STOPPED_BY_USER_ERROR,
     TRUST_START_FAILED_ERROR_PREFIX,
     TRUST_STUCK_ERROR_PREFIX,
+    permission_hold_minutes,
     unavailable_model,
 )
 from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
 from ..discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
 from ..discord_ui.embeds import (
     elicitation_embed,
+    permission_dialog_hold_embed,
     permission_embed,
     plan_embed,
     redacted_thinking_embed,
@@ -234,6 +236,16 @@ class EventProcessor:
         # answer the open TUI menu by sending keystrokes back to the pane (#166).
         if event.pane_ask is not None:
             await self._handle_pane_ask(event)
+            return
+
+        # #1247: the request is on hold behind a permission dialog in the pane.
+        if event.permission_dialog_hold is not None:
+            with contextlib.suppress(Exception):
+                await self._config.thread.send(
+                    embed=permission_dialog_hold_embed(
+                        event.permission_dialog_hold, permission_hold_minutes()
+                    )
+                )
             return
 
         # Unknown TUI interactive prompt — warn Discord so the session doesn't stall silently

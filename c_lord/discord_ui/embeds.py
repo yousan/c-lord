@@ -212,6 +212,31 @@ def unknown_tui_prompt_embed(pane_snapshot: str) -> discord.Embed:
     )
 
 
+def permission_dialog_hold_embed(summary: str, timeout_minutes: int) -> discord.Embed:
+    """The request is on hold: a permission dialog is open in Claude's pane (#1247).
+
+    Typically a background sub-agent's Bash call asking for approval after the
+    parent's turn ended. Typing the request would answer the dialog "Yes" with
+    its Enter and lose the text, so c-lord holds it and says so here. *summary*
+    is the dialog's own rows (already trimmed by the runner).
+    """
+    return discord.Embed(
+        title="⏸️ 許可ダイアログが開いているため、依頼をまだ送っていません",
+        description=(
+            "Claude のペインで許可ダイアログが開いています"
+            "（バックグラウンドのサブエージェントのコマンド確認など）。"
+            "このまま依頼を打ち込むと、その Enter がダイアログを承認してしまい、"
+            "依頼も Claude に届きません。c-lord はこのダイアログに答えません。\n\n"
+            "**すること:** ホストの tmux でこのスレッドのペインを開き、ダイアログに答えてください。"
+            "答えればこの依頼はそのまま送られます。やめるなら `/workspace-stop`。\n"
+            f"{timeout_minutes} 分たっても開いたままなら、依頼は送らずにこのターンを終えます"
+            "（そのときはもう一度送ってください）。\n\n"
+            f"**ダイアログ:**\n```\n{summary[:1000]}\n```"
+        ),
+        color=0xF1C40F,  # Yellow-warning, like the unknown-prompt notice
+    )
+
+
 def error_embed(error: str) -> discord.Embed:
     """Create an embed for errors."""
     return discord.Embed(
