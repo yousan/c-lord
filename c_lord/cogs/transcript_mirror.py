@@ -135,6 +135,14 @@ class TranscriptMirrorCog(commands.Cog):
         if only is None or self._trigger_messages.get(thread_id) == only:
             self._trigger_messages.pop(thread_id, None)
 
+    def restore_trigger_message(self, thread_id: int, message_id: int, *, only: int) -> None:
+        """Put *message_id* (an earlier, delivered turn's trigger) back while the
+        remembered trigger is still *only* — a turn whose prompt never reached
+        the pane gives the answer back to the turn before it (#1270). Unlike
+        :meth:`set_trigger_message`, no new turn starts here."""
+        if self._trigger_messages.get(thread_id) == only:
+            self._trigger_messages[thread_id] = message_id
+
     def set_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Record the Discord message ID that triggered the current Claude turn.
 

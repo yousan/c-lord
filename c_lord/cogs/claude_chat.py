@@ -4449,6 +4449,9 @@ class ClaudeChatCog(commands.Cog):
         can take ~20s), the keys may well have landed and Claude may answer
         after the restart — so the trigger stays. A turn cancelled before the
         send began delivered nothing and is dropped like any other (W57 r14).
+
+        Dropped means replaced by the trigger of the turn delivered last when
+        nothing newer was recorded (#1270), else forgotten.
         """
         try:
             unsent = self.repo.end_trigger_in_flight(thread_id, message_id) is True
@@ -4457,6 +4460,25 @@ class ClaudeChatCog(commands.Cog):
         if not unsent or send_may_have_landed:
             return
         mirror = getattr(self.bot, "transcript_mirror_cog", None)
+        # #1270: when nothing newer was recorded, the turn delivered last (still
+        # being answered, maybe) gets its trigger back — dropping to nothing
+        # would post its answer unquoted and ping the owner after a restart.
+        restored: int | None = None
+        try:
+            restored = await self.repo.restore_sent_trigger(thread_id, replacing=message_id)
+        except Exception:
+            logger.warning(
+                "%s could not give the trigger back to the turn delivered last; "
+                "forgetting the undelivered one instead (#1270)",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
+        if isinstance(restored, int):
+            restore = getattr(mirror, "restore_trigger_message", None)
+            if callable(restore):
+                with contextlib.suppress(Exception):
+                    restore(thread_id, restored, only=message_id)
+            return
         forget = getattr(mirror, "forget_trigger_message", None)
         if callable(forget):
             with contextlib.suppress(Exception):

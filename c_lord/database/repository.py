@@ -578,6 +578,31 @@ class SessionRepository:
         else:
             self._unapplied_clears.pop(thread_id, None)
 
+    async def restore_sent_trigger(self, thread_id: int, *, replacing: int) -> int | None:
+        """Put the last delivered turn's trigger back in place of *replacing* — #1270.
+
+        For a message turn whose prompt never reached the pane: it owns no
+        answer, and the turn before it (:meth:`note_trigger_sent`) is still the
+        one the pane answers. The row gets that turn's trigger only while it
+        still holds *replacing* (nothing newer was recorded). Returns the
+        trigger put back, or ``None`` when there was none to put back — no
+        delivered turn, or a ``/skill`` reached the pane after it — and the
+        caller clears *replacing* instead. Raises when the database refuses.
+        """
+        sent = self._sent_triggers.get(thread_id)
+        if sent is None or sent == replacing:
+            return None
+        if self._unwritten_triggers.get(thread_id) == replacing:
+            self._unwritten_triggers[thread_id] = sent  # #1254: not written yet either
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE sessions SET trigger_message_id = ?"
+                " WHERE thread_id = ? AND trigger_message_id = ?",
+                (sent, thread_id, replacing),
+            )
+            await db.commit()
+        return sent
+
     def clear_is_waiting(self, thread_id: int, message_id: int) -> bool:
         """Whether *message_id* is a refused clear still waiting to land (#1262)."""
         return message_id in self._unapplied_clears.get(thread_id, ())

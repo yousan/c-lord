@@ -7,12 +7,17 @@ still named the wrong person:
 * #1254: B's message turn could not write its trigger (the database was locked).
   The failure was swallowed without a log, the row kept A's earlier message, and
   after a restart the ❌ pinged A, who had not asked.
+* #1270: A1's prompt reached the pane and Claude is answering it; A2 is recorded
+  and its send fails. A2's trigger was dropped as "never delivered" (#1262) and
+  nothing was left: A1's answer was not a reply to A1, and after a restart the
+  ❌ pinged the owner instead of A1's author.
 
 Real SQLite throughout (``SessionRepository``), real ``ClaudeChatCog._run_claude``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,7 +28,13 @@ from c_lord import turn_events
 from c_lord.database.models import init_db
 from c_lord.database.repository import SessionRepository
 from tests.test_trigger_on_record import _api_error, _bot, _msg
-from tests.test_trigger_skill_races_1262 import _locked, _row_trigger
+from tests.test_trigger_skill_races_1262 import (
+    _after_restart,
+    _chat_turn,
+    _locked,
+    _row_trigger,
+    _setup,
+)
 from tests.test_workspace_failure import _make_cog as _make_chat_cog
 from tests.test_workspace_failure import _message as _chat_message
 
@@ -180,4 +191,70 @@ async def test_a_refused_write_that_is_cleared_is_not_written(tmp_path) -> None:
     assert record is not None and record.trigger_message_id is None
     await repo.save(42, "sess-1")
     await repo.flush_unapplied_clears()
+    assert _row_trigger(repo.db_path) is None
+
+
+# -- #1270: an undelivered A2 dropped while A1 is being answered --------------------
+
+
+async def test_a2_undelivered_while_a1_answering_keeps_a1(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A1 (556) is in the pane and Claude answers it. A2 (557) is recorded and
+    its send fails. A1's answer still replies to A1, and a restart's ❌ pings
+    A1's author — not the owner."""
+    _quiet(monkeypatch)
+    repo, _b, _c, mirror = await _setup(tmp_path)
+    gate = asyncio.Event()
+    parked = asyncio.Event()
+
+    async def a1_answering() -> None:  # A1's prompt is in the pane; Claude answers
+        repo.note_trigger_sent(42, 556)  # what on_prompt_sent does
+        parked.set()
+        await gate.wait()
+
+    t1 = asyncio.create_task(_chat_turn(repo, mirror, 556, before_send=a1_answering))
+    try:
+        await parked.wait()
+        await _chat_turn(repo, mirror, 557, delivered=False)  # A2 never reaches the pane
+        ref = await mirror._build_trigger_reference(42)  # A1's answer arrives now
+        mem, row = mirror.trigger_message(42), _row_trigger(repo.db_path)
+        after = await _after_restart(repo.db_path)  # bot restarts mid-answer
+    finally:
+        gate.set()
+        await t1
+        turn_events.reset()
+    assert ref is not None and ref.message_id == 556, ("A1's answer replies to", ref, mem, row)
+    assert after.endswith(f"<@{B}>"), ("restart ❌ pings", after, mem, row)
+
+
+async def test_a2_undelivered_does_not_replace_a_newer_trigger(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A1 (556) was delivered; A2 (557) is recorded; A3 (558) is recorded after
+    it; then A2's send fails. A3's trigger is the newer one and stays."""
+    _quiet(monkeypatch)
+    repo, _b, _c, mirror = await _setup(tmp_path)
+    repo.note_trigger_sent(42, 556)
+
+    async def a3_arrives() -> None:  # A2's send is failing; A3 is recorded meanwhile
+        mirror.set_trigger_message(42, 558)
+        await repo.update_trigger_message(42, 558)
+
+    try:
+        await _chat_turn(repo, mirror, 557, before_send=a3_arrives, delivered=False)
+    finally:
+        turn_events.reset()
+    assert mirror.trigger_message(42) == 558
+    assert _row_trigger(repo.db_path) == 558
+
+
+async def test_a2_undelivered_after_a_skill_restores_nothing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A /skill reached the pane after A1: the pane answers the /skill, so an
+    undelivered A2 is dropped without bringing A1 back."""
+    _quiet(monkeypatch)
+    repo, _b, _c, mirror = await _setup(tmp_path)
+    repo.note_trigger_sent(42, 556)
+    repo.note_trigger_sent(42, None)  # a /skill's prompt reached the pane
+    try:
+        await _chat_turn(repo, mirror, 557, delivered=False)
+    finally:
+        turn_events.reset()
+    assert mirror.trigger_message(42) is None
     assert _row_trigger(repo.db_path) is None
