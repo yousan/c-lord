@@ -25,9 +25,11 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,24 +66,41 @@ def _run(
 
     #1198: a call that takes longer than *timeout* comes back as a failure
     (exit 124) — callers read a failure as "unknown", which keeps a workspace,
-    instead of hanging the sweep. ``GIT_NO_LAZY_FETCH=1``: in a partial clone a
+    instead of hanging the sweep. The call runs in its own process group and
+    the whole group is killed: ``git status`` runs ``git status`` in each
+    submodule and clean filters, which outlived a kill of ``git`` alone.
+    ``GIT_OPTIONAL_LOCKS=0``: ``git status`` otherwise holds ``index.lock``
+    while it runs, and a killed one left it behind — the next ``git commit`` in
+    the kept workspace failed. ``GIT_NO_LAZY_FETCH=1``: in a partial clone a
     missing object would otherwise be fetched over the network mid-inspection
-    (ignored by git before 2.44). ``git clone`` passes ``timeout=None``.
+    (ignored by git before 2.44). ``git clone`` passes ``timeout=None`` and
+    keeps the caller's process group.
     """
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0"}
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE if stdin is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+        start_new_session=timeout is not None,
+    )
     try:
-        return subprocess.run(
-            args,
-            input=stdin,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=timeout,
-            env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
-        )
+        out, err = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:  # a child left the group and holds a pipe
+            proc.kill()
+            proc.wait()
         return subprocess.CompletedProcess(
             args, _TIMEOUT_RETURNCODE, "", f"timed out after {timeout}s"
         )
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
 #: Files c-lord itself writes into every session dir (#749). They show up in
@@ -183,6 +202,9 @@ class WorktreeStatus:
     #: ``False`` when git could not answer — not a repo, or git failed.
     #: Cleanliness then cannot be established, so the dir is never clean.
     is_repo: bool
+    #: Why ``git status`` gave no answer when it is known (``"git timed out"``,
+    #: #1198) — told apart from "not a git repo" in the reason.
+    unknown: str = ""
     #: Changes that count as work. One is enough to keep the directory.
     user_changes: tuple[str, ...] = ()
     #: Changes c-lord made itself (or clean Claude Code worktrees) — not work.
@@ -322,21 +344,37 @@ def _remote_head_shas(path: str) -> frozenset[str] | None:
 
 
 def _start_refs(path: str) -> dict[str, str] | None:
-    """HEAD and every local branch, as ref → commit. ``None``: git failed.
+    """Every local ref and HEAD, as ref → commit. ``None``: git failed.
 
-    Not the stash: its entries are counted on their own (:func:`_stash_entries`,
-    #1045) — a stash commit is no "unpushed commit" a user could push.
-    A failed (or timed-out) call is unknown, never "no branches" (#1198).
+    Not only branches (#1198): a commit held only by a local tag, notes or
+    ``refs/original`` was deleted with the workspace. Remote-tracking refs are
+    what the count subtracts, and the stash is counted on its own
+    (:func:`_stash_entries`, #1045) — a stash commit is no "unpushed commit" a
+    user could push. A tag is peeled to what it points at; a ref to no commit
+    (a tag of a tree) holds no commit to lose. A failed (or timed-out) call is
+    unknown, never "no refs".
     """
     tips: dict[str, str] = {}
-    branches = _run(
-        ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], cwd=path
+    refs = _run(
+        [
+            "git",
+            "for-each-ref",
+            "--format=%(objecttype) %(objectname) %(*objecttype) %(*objectname) %(refname)",
+        ],
+        cwd=path,
     )
-    if branches.returncode != 0:
+    if refs.returncode != 0:
         return None
-    for line in branches.stdout.splitlines():
-        sha, _, ref = line.partition(" ")
-        if ref:
+    for line in refs.stdout.splitlines():
+        parts = line.split(" ", 4)
+        if len(parts) != 5:
+            continue
+        kind, sha, peeled_kind, peeled, ref = parts
+        if ref.startswith("refs/remotes/") or ref == "refs/stash":
+            continue
+        if peeled_kind:
+            kind, sha = peeled_kind, peeled
+        if kind == "commit":
             tips[ref] = sha
     # Only when present: an unborn HEAD would fail rev-list.
     found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)
@@ -416,7 +454,8 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
 
     Cost, all local (no network): one ``git ls-files`` for the workspace, then
     per checked-out submodule one ``rev-parse`` (stash), one ``rev-list``
-    (unpushed) and — while nesting may go deeper — one ``ls-files`` of its own.
+    (unpushed) and one ``ls-files`` of its own — at the deepest level too,
+    where a checked-out repo below is reported as too deep (unknown, kept).
     Each unclaimed module git dir costs one ``rev-parse`` and one ``rev-list``.
     Tags never count as pushed (:func:`_local_only_commits`). Linked
     worktrees' HEADs are read from files, not asked. An embedded repo's own
@@ -441,8 +480,6 @@ def _submodule_stashes(path: str, *, prefix: str = "", depth: int = 0) -> list[s
 def _checked_out_submodule_stashes(
     path: str, *, prefix: str, depth: int, seen: set[Path]
 ) -> list[str]:
-    if depth >= _MAX_SUBMODULE_DEPTH:
-        return []
     listed = _run(["git", "ls-files", "--stage", "-z"], cwd=path)
     if listed.returncode != 0:
         if depth == 0:
@@ -458,6 +495,9 @@ def _checked_out_submodule_stashes(
         sub = Path(path) / rel
         if not (sub / ".git").exists():
             continue  # not checked out — its git dir, if any, is walked below (#1181)
+        if depth >= _MAX_SUBMODULE_DEPTH:
+            # #1198: past the limit a nested repo is unknown, never "nothing".
+            return [f"{prefix.rstrip('/')}: nested repos too deep to check"]
         linked = _linked_git_dir(sub)
         if linked is not None:
             seen.add(linked)
@@ -492,7 +532,12 @@ def _module_dir_stashes(modules: Path, *, prefix: str, depth: int, seen: set[Pat
     its nested submodules.
     """
     if depth >= _MAX_SUBMODULE_DEPTH * 4:
-        return []
+        # #1198: past the bound whatever is there is unknown, never "nothing".
+        try:
+            anything = any(True for _ in modules.iterdir())
+        except OSError:
+            anything = True
+        return [f"{prefix.rstrip('/')}: modules too deep to check"] if anything else []
     found: list[str] = []
     try:
         children = sorted(p for p in modules.iterdir() if p.is_dir())
@@ -693,10 +738,11 @@ def _count_not_on(path: str, tips: list[str], also_on: frozenset[str] = frozense
 def _unpushed_commits(path: str, *, ask_remote: bool) -> tuple[int | None, bool]:
     """How many commits exist here and on no remote branch (#903). ``None``: unknown.
 
-    Counts from HEAD (a detached commit is on no branch), every local branch
-    and what the linked worktrees hold — their detached HEADs and
-    per-worktree refs, read from files (#1198: ``git worktree add --detach``
-    elsewhere kept its commit only in this git dir). The stash is counted
+    Counts from HEAD (a detached commit is on no branch), every local ref
+    (branches, tags, notes, ``refs/original`` — #1198) and what the linked
+    worktrees hold — their detached HEADs and per-worktree refs, read from
+    files (#1198: ``git worktree add --detach`` elsewhere kept its commit
+    only in this git dir). The stash is counted
     apart (#1045). A repository with no remote at all counts every commit —
     there is nowhere else they exist. A worktree file that cannot be read is
     unknown (``None``).
@@ -759,6 +805,8 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
         ],
         cwd=path,
     )
+    if result.returncode == _TIMEOUT_RETURNCODE:
+        return WorktreeStatus(is_repo=False, unknown="git timed out")
     if result.returncode != 0:
         return WorktreeStatus(is_repo=False)
 
@@ -807,6 +855,8 @@ def describe_changes(status: WorktreeStatus) -> str:
     show as ``!! name``; commits on no remote branch as a count.
     """
     if not status.is_repo:
+        if status.unknown:
+            return f"status unknown ({status.unknown})"
         return "not a git repo (cannot tell work from leftovers)"
     reasons: list[str] = []
     if status.unpushed_commits is None:

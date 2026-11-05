@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -651,29 +652,40 @@ def test_many_refs_in_the_workspace_own_worktree_do_not_break_the_count(tmp_path
 
 
 def test_git_calls_have_a_timeout_and_never_lazy_fetch(monkeypatch) -> None:
-    """A partial clone's missing object must not start a network fetch, and no
-    inspection call may hang the sweep forever."""
+    """A partial clone's missing object must not start a network fetch, no
+    inspection call may hang the sweep forever, and none takes optional locks."""
     seen: dict[str, object] = {}
+    real = subprocess.Popen
 
-    def fake(args, **kw):
-        seen.update(kw)
-        return subprocess.CompletedProcess(args, 0, "", "")
+    class Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, args, **kw):  # noqa: ANN001, ANN003
+            seen.update(kw)
+            super().__init__(args, **kw)
 
-    monkeypatch.setattr(sd.subprocess, "run", fake)
-    sd._run(["git", "rev-list", "--count", "--all"], cwd="/")
-    assert seen["env"]["GIT_NO_LAZY_FETCH"] == "1"  # type: ignore[index]
+        def communicate(self, input=None, timeout=None):  # noqa: A002, ANN001, ANN201
+            seen["timeout"] = timeout
+            return super().communicate(input, timeout)
+
+    monkeypatch.setattr(sd.subprocess, "Popen", Spy)
+    sd._run(["git", "--version"], cwd="/")
+    env = seen["env"]
+    assert env["GIT_NO_LAZY_FETCH"] == "1"  # type: ignore[index]
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"  # type: ignore[index]
+    assert seen["start_new_session"] is True
     assert seen["timeout"] and float(seen["timeout"]) <= 120  # type: ignore[arg-type]
 
 
 def _time_out(monkeypatch, match) -> None:  # noqa: ANN001
-    real = subprocess.run
+    """Make the git calls *match* selects time out (a real process, killed by group)."""
+    real = subprocess.Popen
 
-    def slow(args, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
-        if match(args):
-            raise subprocess.TimeoutExpired(args, kw.get("timeout") or 0)
-        return real(args, *a, **kw)
+    class Slow(real):  # type: ignore[misc, valid-type]
+        def communicate(self, input=None, timeout=None):  # noqa: A002, ANN001, ANN201
+            if timeout is not None and timeout > 5 and match(self.args):
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return super().communicate(input, timeout)
 
-    monkeypatch.setattr(sd.subprocess, "run", slow)
+    monkeypatch.setattr(sd.subprocess, "Popen", Slow)
 
 
 def test_a_timed_out_stash_check_is_not_no_stash(tmp_path: Path, monkeypatch) -> None:
@@ -687,14 +699,14 @@ def test_a_timed_out_stash_check_is_not_no_stash(tmp_path: Path, monkeypatch) ->
 
 
 def test_a_timed_out_branch_listing_is_not_no_branches(tmp_path: Path, monkeypatch) -> None:
-    """Only the workspace's ``for-each-ref refs/heads`` times out; a branch has a commit."""
+    """Only the workspace's ``for-each-ref`` times out; a branch has a commit."""
     ws, _ = _workspace(tmp_path)
     git(ws, "checkout", "-q", "-b", "work")
     (ws / "w.txt").write_text("w\n")
     git(ws, "add", "w.txt")
     git(ws, "commit", "-qm", "work")
     git(ws, "checkout", "-q", "main")
-    _time_out(monkeypatch, lambda a: "for-each-ref" in a and "refs/heads" in a)
+    _time_out(monkeypatch, lambda a: "for-each-ref" in a)
     st = worktree_status(str(ws))
     assert not st.clean and st.unpushed_commits is None, describe_changes(st)
 
@@ -709,3 +721,226 @@ def test_a_timed_out_ls_files_is_not_no_submodules(tmp_path: Path, monkeypatch) 
     _time_out(monkeypatch, lambda a: "ls-files" in a)
     st = worktree_status(str(ws))
     assert not st.clean, describe_changes(st)
+
+
+# ---- W57 round 8 and review of f30cacc ----
+
+
+def _commit(repo: Path, name: str, text: str = "x\n") -> str:
+    (repo / name).write_text(text)
+    git(repo, "add", name)
+    git(repo, "commit", "-qm", name)
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def _kept(ws: Path) -> sd.CleanupResult:
+    st = worktree_status(str(ws))
+    res = _delete(ws)
+    assert not res.removed and ws.exists(), (
+        f"deleted: clean={st.clean} why={describe_changes(st)!r} reason={res.reason!r}"
+    )
+    return res
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_timed_out_status_leaves_no_index_lock_and_no_orphans(tmp_path: Path, monkeypatch) -> None:
+    """``git status`` holds ``index.lock`` while it runs ``git status`` in a
+    submodule; killed at the timeout, the lock stayed and the next ``git
+    commit`` in the kept workspace failed — and the submodule's status and its
+    filter kept running."""
+    ws, _ = _workspace(tmp_path)
+    sub = ws / "sub"
+    pidfile = tmp_path / "filter.pid"
+    git(sub, "config", "filter.slow.clean", f"echo $$ > {pidfile}; sleep 20; cat")
+    info = ws / ".git" / "modules" / "sub" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text("* filter=slow\n")
+    os.utime(sub / "README.md", (2_000_000_000, 2_000_000_000))  # same size, new mtime
+    monkeypatch.setattr(sd._run, "__kwdefaults__", {"stdin": None, "timeout": 2.0})
+    try:
+        st = worktree_status(str(ws))
+        assert not (ws / ".git" / "index.lock").exists(), "index.lock left behind"
+        assert pidfile.exists(), "setup: the slow filter should have started"
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 3
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_alive(pid), "the submodule's filter outlived the timeout"
+        assert not st.clean
+        assert "git timed out" in describe_changes(st), describe_changes(st)
+    finally:
+        if pidfile.exists() and _pid_alive(int(pidfile.read_text())):
+            os.kill(int(pidfile.read_text()), 9)
+
+
+def test_workspace_commit_held_only_by_a_local_tag_is_kept(tmp_path: Path) -> None:
+    """Detached commit → ``git tag wip`` → ``checkout main``: only the tag holds it."""
+    ws, _ = _workspace(tmp_path)
+    git(ws, "checkout", "-q", "--detach")
+    _commit(ws, "w.txt")
+    git(ws, "tag", "wip")
+    git(ws, "checkout", "-q", "main")
+    res = _kept(ws)
+    assert "1 unpushed commit(s)" in res.reason
+
+
+@pytest.mark.parametrize("ref", ["refs/notes/commits", "refs/original/refs/heads/main"])
+def test_workspace_commit_held_only_by_notes_or_original_is_kept(tmp_path: Path, ref: str) -> None:
+    ws, _ = _workspace(tmp_path)
+    git(ws, "checkout", "-q", "--detach")
+    sha = _commit(ws, "w.txt")
+    git(ws, "update-ref", ref, sha)
+    git(ws, "checkout", "-q", "main")
+    _kept(ws)
+
+
+def test_workspace_pushed_with_fetched_tag_is_clean(tmp_path: Path) -> None:
+    """Control: a tag on a pushed commit adds nothing."""
+    ws, _ = _workspace(tmp_path)
+    git(ws, "tag", "v0")
+    assert worktree_status(str(ws)).clean
+
+
+def test_depth4_embedded_repo_under_three_submodules(tmp_path: Path) -> None:
+    """a/b/c are pushed submodules; c embeds d (gitlink, no .gitmodules) whose
+    only commit is local. Past the depth limit the search must say "unknown"."""
+    parent = _bare_with_commit(tmp_path, "parent")
+    cr = _bare_with_commit(tmp_path, "cr")
+    cseed = tmp_path / "cr-seed"
+    d = cseed / "d"
+    d.mkdir()
+    git(d, "init", "-q")
+    _commit(d, "d.txt")
+    git(cseed, "add", "d")
+    git(cseed, "commit", "-qm", "embed d")
+    git(cseed, "push", "-q", "origin", "HEAD:main")
+    br = _bare_with_commit(tmp_path, "br")
+    git(tmp_path / "br-seed", "submodule", "add", "-q", str(cr), "c")
+    git(tmp_path / "br-seed", "commit", "-qm", "c")
+    git(tmp_path / "br-seed", "push", "-q", "origin", "HEAD:main")
+    ar = _bare_with_commit(tmp_path, "ar")
+    git(tmp_path / "ar-seed", "submodule", "add", "-q", str(br), "b")
+    git(tmp_path / "ar-seed", "commit", "-qm", "b")
+    git(tmp_path / "ar-seed", "push", "-q", "origin", "HEAD:main")
+    base = tmp_path / "sessions"
+    base.mkdir()
+    ws = base / "4242"
+    git(tmp_path, "clone", "-q", str(parent), str(ws))
+    git(ws, "submodule", "add", "-q", str(ar), "a")
+    git(ws / "a", "submodule", "update", "-q", "--init")
+    git(ws / "a" / "b", "submodule", "update", "-q", "--init")
+    git(ws, "commit", "-qm", "a")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    dd = ws / "a" / "b" / "c" / "d"
+    if not (dd / ".git").exists():
+        subprocess.run(["rm", "-rf", str(dd)], check=True)
+        git(tmp_path, "clone", "-q", str(d), str(dd))
+        git(dd, "remote", "remove", "origin")
+    _commit(dd, "only-here.txt")
+    git(ws / "a" / "b" / "c", "add", "d")
+    git(ws / "a" / "b" / "c", "commit", "-qm", "bump d")
+    git(ws / "a" / "b" / "c", "push", "-q", "origin", "HEAD:refs/heads/main")
+    git(ws / "a" / "b", "add", "c")
+    git(ws / "a" / "b", "commit", "-qm", "bump c")
+    git(ws / "a" / "b", "push", "-q", "origin", "HEAD:refs/heads/main")
+    git(ws / "a", "add", "b")
+    git(ws / "a", "commit", "-qm", "bump b")
+    git(ws / "a", "push", "-q", "origin", "HEAD:refs/heads/main")
+    git(ws, "add", "a")
+    git(ws, "commit", "-qm", "bump a")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    assert git(ws, "status", "--porcelain").strip() == ""
+    res = _kept(ws)
+    assert "a/b/c: nested repos too deep to check" in res.reason
+
+
+def test_depth3_embedded_repo_control(tmp_path: Path) -> None:
+    """Same as above one level shallower: a/b pushed submodules, b embeds d."""
+    parent = _bare_with_commit(tmp_path, "parent")
+    br = _bare_with_commit(tmp_path, "br")
+    bseed = tmp_path / "br-seed"
+    d = bseed / "d"
+    d.mkdir()
+    git(d, "init", "-q")
+    _commit(d, "d.txt")
+    git(bseed, "add", "d")
+    git(bseed, "commit", "-qm", "embed d")
+    git(bseed, "push", "-q", "origin", "HEAD:main")
+    ar = _bare_with_commit(tmp_path, "ar")
+    git(tmp_path / "ar-seed", "submodule", "add", "-q", str(br), "b")
+    git(tmp_path / "ar-seed", "commit", "-qm", "b")
+    git(tmp_path / "ar-seed", "push", "-q", "origin", "HEAD:main")
+    base = tmp_path / "sessions"
+    base.mkdir()
+    ws = base / "4242"
+    git(tmp_path, "clone", "-q", str(parent), str(ws))
+    git(ws, "submodule", "add", "-q", str(ar), "a")
+    git(ws / "a", "submodule", "update", "-q", "--init")
+    git(ws, "commit", "-qm", "a")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    dd = ws / "a" / "b" / "d"
+    subprocess.run(["rm", "-rf", str(dd)], check=True)
+    git(tmp_path, "clone", "-q", str(d), str(dd))
+    git(dd, "remote", "remove", "origin")
+    assert git(ws, "status", "--porcelain").strip() == ""
+    _kept(ws)
+
+
+def test_module_dirs_past_the_depth_limit_are_unknown(tmp_path: Path) -> None:
+    """The ``.git/modules`` walk stops at its bound too — and says so."""
+    deep = tmp_path / "m"
+    (deep / "x").mkdir(parents=True)
+    notes = sd._module_dir_stashes(deep, prefix="p/", depth=sd._MAX_SUBMODULE_DEPTH * 4, seen=set())
+    assert notes and "too deep" in notes[0]
+
+
+def test_upstream_tag_on_no_branch_is_kept_known_over_keep(tmp_path: Path) -> None:
+    """Known over-keep (documented): the submodule's upstream tags a commit no
+    branch holds (a deleted release branch). Nothing local, yet tags never
+    count as pushed, so the workspace is kept with a reason naming the module."""
+    parent = _bare_with_commit(tmp_path, "parent")
+    subr = _bare_with_commit(tmp_path, "subremote")
+    seed = tmp_path / "subremote-seed"
+    git(seed, "checkout", "-q", "-b", "release")
+    _commit(seed, "rel.txt")
+    git(seed, "tag", "v1.0")
+    git(seed, "push", "-q", "origin", "release", "v1.0")
+    git(seed, "push", "-q", "origin", "--delete", "release")
+    base = tmp_path / "sessions"
+    base.mkdir()
+    ws = base / "4242"
+    git(tmp_path, "clone", "-q", "--single-branch", str(parent), str(ws))
+    git(ws, "submodule", "add", "-q", str(subr), "sub")
+    git(ws, "commit", "-qm", "add sub")
+    git(ws, "push", "-q", "origin", "HEAD:main")
+    assert "v1.0" in git(ws / "sub", "tag")
+    res = _kept(ws)
+    assert "sub: 1 unpushed commit(s)" in res.reason
+    git(ws / "sub", "tag", "-d", "v1.0")  # how a user clears it (spec)
+    assert _delete(ws).removed
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="known limit: a branch pushed and then deleted on the remote still has a stale "
+    "local tracking ref; telling that apart needs the network (pre-existing, spec)",
+)
+def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
+    ws, subr = _workspace(tmp_path)
+    git(ws / "sub", "checkout", "-q", "-b", "work")
+    sha = _commit(ws / "sub", "w.txt")
+    git(ws / "sub", "push", "-q", "origin", "work")
+    git(ws / "sub", "checkout", "-q", "--detach", "HEAD~1")
+    git(ws / "sub", "branch", "-q", "-D", "work")
+    git(subr, "update-ref", "-d", "refs/heads/work")
+    git(subr, "gc", "-q", "--prune=now")
+    assert not _object_exists(subr, sha)
+    assert git(ws, "status", "--porcelain").strip() == ""
+    _kept(ws)
