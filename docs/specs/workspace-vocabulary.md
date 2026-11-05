@@ -195,9 +195,12 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 #903 まではどちらも「クリーン」と見なされて消えていた（2026-10-16 に本番コードで確認）:
 
 - **どの remote ブランチにも載っていないコミット** — Claude がブランチに commit したが
-  push していない作業。HEAD（detached を含む）と**手元の ref**（ブランチ・notes・`refs/original` など。
-  `refs/remotes/*`・別に数える stash・タグを除く）から辿れて、`refs/remotes/*` のどれからも辿れないコミットを数える
-  （#1198。以前はブランチと HEAD だけを見ていて、notes や `refs/original` にしか無いコミットを消していた）。
+  push していない作業。HEAD（detached を含む）と**手元の ref**（ブランチ・`refs/original`・`refs/keep/*` など。
+  `refs/remotes/*`・別に数える stash・タグ・notes を除く）から辿れて、`refs/remotes/*` のどれからも辿れないコミットを数える
+  （#1198。以前はブランチと HEAD だけを見ていて、`refs/original` などにしか無いコミットを消していた）。
+  タグと notes を数えないのは、fetch したもの（push したもの）と手元だけのものを見分けられず、数えると
+  `git fetch --tags` や notes を取り込んだワークスペースを永久に残してしまうため。タグや notes にしか無いコミットは
+  消える（既知の限界）。
   annotated tag を指す ref も中のコミットまで辿る（ref の名前のまま `git rev-list` に渡す）。
   - **ワークスペース自身のタグにしか無いコミットは数えない**（既知の限界。サブモジュールではタグも数える）。
     手元では fetch したタグと手で打った `git tag wip` を見分けられず、タグを数えると、タグを取ってきただけの

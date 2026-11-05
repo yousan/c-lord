@@ -357,7 +357,10 @@ def _start_refs(path: str) -> list[str] | None:
       counting them kept every workspace that fetched tags (a ``--depth=1``
       clone after ``git fetch --tags``, a tag on a deleted branch: the
       ``ls-remote`` heads cannot vouch for those). A commit held only by a
-      local tag is therefore not counted — a known limit (spec).
+      local tag is therefore not counted — a known limit (spec);
+    - ``refs/notes/*`` — the same: notes fetched from (or pushed to) the
+      remote are on no remote branch, so counting them kept such workspaces
+      forever, and notes annotate commits rather than hold work.
 
     Names, not object names: ``rev-list`` peels a ref to an annotated tag
     fully (one level of ``%(*objectname)`` did not). A failed (or timed-out)
@@ -369,7 +372,8 @@ def _start_refs(path: str) -> list[str] | None:
     tips = [
         ref
         for ref in refs.stdout.split()
-        if not ref.startswith(("refs/remotes/", "refs/tags/")) and ref != "refs/stash"
+        if not ref.startswith(("refs/remotes/", "refs/tags/", "refs/notes/"))
+        and ref != "refs/stash"
     ]
     # Only when present: an unborn HEAD would fail rev-list.
     found = _run(["git", "rev-parse", "-q", "--verify", "HEAD^{commit}"], cwd=path)

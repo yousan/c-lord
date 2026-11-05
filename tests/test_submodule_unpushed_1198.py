@@ -797,7 +797,7 @@ def test_workspace_commit_held_only_by_a_local_tag_is_kept(tmp_path: Path) -> No
     assert "1 unpushed commit(s)" in res.reason
 
 
-@pytest.mark.parametrize("ref", ["refs/notes/commits", "refs/original/refs/heads/main"])
+@pytest.mark.parametrize("ref", ["refs/keep/wip", "refs/original/refs/heads/main"])
 def test_workspace_commit_held_only_by_notes_or_original_is_kept(tmp_path: Path, ref: str) -> None:
     ws, _ = _workspace(tmp_path)
     git(ws, "checkout", "-q", "--detach")
@@ -1058,3 +1058,13 @@ def test_a_timed_out_ls_remote_leaves_no_child_running(tmp_path: Path, monkeypat
         sd._ls_remote_cache.clear()
         if pidfile.exists() and _pid_alive(int(pidfile.read_text())):
             os.kill(int(pidfile.read_text()), 9)
+
+
+def test_workspace_with_pushed_notes_is_clean(tmp_path: Path) -> None:
+    """Review of 8479268: notes pushed to (or fetched from) the remote are on no
+    remote branch. Counting them kept the workspace forever."""
+    ws, _ = _workspace(tmp_path)
+    git(ws, "notes", "add", "-m", "a note")
+    git(ws, "push", "-q", "origin", "refs/notes/commits")
+    st = worktree_status(str(ws))
+    assert st.clean, st
